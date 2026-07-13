@@ -455,6 +455,7 @@ fn validate_outlet_ucan(
 /// See ADR-013 §4, SCP-212, spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // Bridge mirrors the runtime's economy entry point.
+#[allow(clippy::too_many_lines)] // §7.3.8 caveat resolution + executor closure + 3-phase dispatch.
 fn outlet_invoke_impl(
     bi: &PyBridgeInstance,
     py: Python<'_>,
@@ -508,6 +509,40 @@ fn outlet_invoke_impl(
             })
         })
         .transpose()?;
+
+    // §7.3.8 value-caveat resolution. The invocation caveats live in the `nb`
+    // of the VALIDATED INVOCATION UCAN (`ucan_token`, the token that grants the
+    // `outlet_call:*` / `outlet_query:*` capability) — NOT the spending UCAN,
+    // which is a SEPARATE economy token (§19.5). `narrow()` folds every parent's
+    // value-caveats into the leaf, so the leaf's `nb` IS the effective,
+    // validated-narrowed caveat set. We parse the same token string
+    // `validate_outlet_ucan` validated above and resolve its `nb` via
+    // `TokenNbCaveatResolver`. `ucan_cid` (present iff caveats are) keys the
+    // owned Class-S counters to this invocation delegation's revocation CID.
+    let invocation_ucan_token =
+        scp_core::crypto::ucan::validate::parse_ucan(ucan_token).map_err(|e| {
+            ScpPyError::ucan(format!(
+                "invalid invocation UCAN for outlet '{outlet_id}': {e}"
+            ))
+        })?;
+    // Mint the caveats and their counter key TOGETHER, from the ONE validated
+    // invocation token, into a single `InvocationCaveatBinding` — the `ucan_cid`
+    // is computed only inside `.map` over the resolved caveats, so the runtime
+    // receives "caveats present ⟹ cid present" by construction (§7.3.8
+    // fail-closed coupling), not as a bridge-side convention.
+    let caveat_binding = {
+        use scp_core::crypto::ucan::validate::CaveatResolver as _;
+        scp_core::crypto::ucan::validate::TokenNbCaveatResolver
+            .resolve_caveats(&invocation_ucan_token)
+            .map(
+                |caveats| scp_core::context::outlets::InvocationCaveatBinding {
+                    caveats,
+                    ucan_cid: scp_core::crypto::ucan::revoke::compute_revocation_cid(
+                        &invocation_ucan_token.encoded,
+                    ),
+                },
+            )
+    };
 
     // Snapshot the bridge-owned outlet registry and (optionally) the
     // registered handler closure BEFORE entering the runtime call. The
@@ -577,6 +612,7 @@ fn outlet_invoke_impl(
                     input_json,
                     &invoker_did_typed,
                     spending_ucan_token.as_ref(),
+                    caveat_binding,
                     None,
                     executor,
                 )

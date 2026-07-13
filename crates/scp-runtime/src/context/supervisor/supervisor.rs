@@ -10312,11 +10312,14 @@ impl Supervisor {
     ///
     /// [`ContextError::ContextNotRegistered`] when no actor is registered
     /// for `context_id`; otherwise any error the reserve handler emits.
+    #[allow(clippy::too_many_arguments)]
     async fn reserve_outlet_economy_via_actor(
         &self,
         context_id: &str,
         invoker_did: &DID,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        input: serde_json::Value,
         now_secs: u64,
     ) -> Result<crate::context::outlets_helpers::OutletEconomyReservation, ContextError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -10324,6 +10327,8 @@ impl Supervisor {
             context_id: context_id.to_owned(),
             invoker_did: invoker_did.clone(),
             spending_ucan: spending_ucan.map(|u| Box::new(u.clone())),
+            caveat_binding: caveat_binding.map(Box::new),
+            input: Box::new(input),
             now_secs,
             reply: reply_tx,
         };
@@ -10427,6 +10432,7 @@ impl Supervisor {
         input: serde_json::Value,
         invoker_did: &DID,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
         timeout_ms: Option<u32>,
         executor: F,
     ) -> Result<crate::context::outlets_helpers::ManagedOutletInvocationOutput, ContextError>
@@ -10443,6 +10449,26 @@ impl Supervisor {
             })?
             .now_secs();
 
+        // §7.3.8 value-caveat enforcement. `caveat_binding` is resolved by the
+        // CALLER (the FFI bridge) from the VALIDATED INVOCATION UCAN — the token
+        // that grants the `outlet_call:*` / `outlet_query:*` capability — whose
+        // signed `nb` field carries the VALIDATED-NARROWED effective caveats (a
+        // delegation inherits its parents' value-caveats through `narrow()`, so
+        // the leaf `nb` IS the effective narrowed set). The bridge captures them
+        // at the `validate_outlet_invocation_ucan` site, where it has already
+        // parsed and validated that token against the proof chain, and bundles
+        // them with that token's revocation CID (the owned Class-S counter key)
+        // so "caveats present ⟹ cid present" holds by construction. They are NOT
+        // re-derived from `spending_ucan` — that is a SEPARATE economy token
+        // (§19.5) whose `nb` does NOT carry invocation caveats. When the
+        // invocation UCAN carried no caveats (or a surface authorizes purely via
+        // role-state) the binding is `None` and the counter gate stays inert.
+        //
+        // The reserve phase needs the input to check it against the caveat's
+        // `input_schema`; the executor phase (below) consumes the original, so
+        // clone once for the reserve mailbox round-trip.
+        let reserve_input = input.clone();
+
         crate::context::outlets_helpers::invoke_outlet_with_economy(
             registry,
             outlet_id,
@@ -10455,6 +10481,8 @@ impl Supervisor {
                     context_id,
                     invoker_did,
                     spending_ucan,
+                    caveat_binding,
+                    reserve_input,
                     now_secs,
                 )
             },
@@ -11763,6 +11791,8 @@ impl Supervisor {
                 xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
                     crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
                 ),
+                // §7.3.8 value-caveat counters: a fresh joiner carries none.
+                caveat_counters: HashMap::new(),
             },
             pending_broadcast_publishes: HashMap::new(),
             // Transient join-handshake state; the fused join already consumed
@@ -16125,6 +16155,7 @@ mod tests {
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: HashMap::new(),
             xctx_nonce_dedup: HashMap::new(),
+            caveat_counters: HashMap::new(),
             broadcast: None,
         }
     }

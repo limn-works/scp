@@ -731,6 +731,49 @@ fn send_message_calls_seal() {
     );
 }
 
+// §7.3.8 value-caveat runtime enforcement: the reserve phase of the outlet
+// economy pipeline MUST run the synchronous local caveat check
+// (`check_invocation_local`), consume the counter-bearing caps
+// (`consume_caveat_counters`, which calls `try_consume` on the owned Class-S
+// record), and do so through a fail-closed `commit_class_s_keep`-family
+// combinator so a consumed cap can never un-consume across a crash. This is
+// the wiring-coverage assertion for the caveat gate (adds coverage; it does
+// not weaken any existing check).
+#[test]
+fn reserve_outlet_economy_enforces_value_caveats() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "reserve_outlet_economy",
+            "check_invocation_local"
+        ),
+        "reserve_outlet_economy must run the §7.3.8 synchronous local caveat \
+         check (check_invocation_local) before consuming counter capacity"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "reserve_outlet_economy",
+            "consume_caveat_counters"
+        ),
+        "reserve_outlet_economy must consume the counter-bearing §7.3.8 caveats \
+         (consume_caveat_counters)"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "consume_caveat_counters", "try_consume"),
+        "consume_caveat_counters must call CaveatCounters::try_consume"
+    );
+    // The counter consume rides a fail-closed KEEP combinator on BOTH the paid
+    // path (folded into commit_class_s_keep_compensating) and the free path
+    // (dedicated commit_class_s_keep) — a consumed cap must survive a persist
+    // failure rather than un-consume (ADR-049 §9).
+    assert!(
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "commit_class_s_keep"),
+        "reserve_outlet_economy must consume caveat counters through a \
+         commit_class_s_keep-family combinator (KEEP on persist failure)"
+    );
+}
+
 // Manager level: send_message delegates to encrypt_and_send which calls transport.send_message
 #[test]
 fn send_message_calls_transport_send() {

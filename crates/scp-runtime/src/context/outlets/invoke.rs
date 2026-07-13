@@ -118,6 +118,24 @@ pub enum InvocationError {
         /// The remaining budget for the invoker.
         remaining: u64,
     },
+
+    /// A §7.3.8 invocation caveat rejected the call — either a synchronous
+    /// local check ([`InvocationCaveats::check_invocation_local`](scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local):
+    /// `input_schema` / `amount_max_per_call` / `allowed_adapters` /
+    /// `allowed_target_dids`) or a counter-bearing cap
+    /// ([`CaveatCounters::try_consume`](crate::trust::caveat_counters::CaveatCounters::try_consume):
+    /// `max_calls` / `amount_max_cumulative` / `rate_window`).
+    ///
+    /// Every variant maps to the Authorization-class code
+    /// (`SCP-OUTLET-6110`); `slug` disambiguates which caveat rule fired in the
+    /// wire envelope (§5.4.4 / §7.3.8).
+    #[error("caveat violation [{slug}]: {message}")]
+    CaveatViolation {
+        /// The §5.4.4 / §7.3.8 slug identifying the caveat rule that fired.
+        slug: String,
+        /// Human-readable diagnostic for the SDK error envelope.
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

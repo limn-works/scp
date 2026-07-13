@@ -1155,6 +1155,22 @@ pub struct ContextSnapshot {
     /// snapshots deserialize as an empty cache.
     #[serde(default)]
     pub xctx_nonce_dedup: HashMap<[u8; 16], u64>,
+
+    /// §7.3.8 value-caveat runtime enforcement counters, keyed by the
+    /// invocation-authorizing UCAN CID. The serialized projection of
+    /// [`PerContextState::caveat_counters`](crate::context::actor::state::ClassSState::caveat_counters).
+    ///
+    /// **Class S** — synchronously-persisted, fail-closed (ADR-049 §9). A
+    /// consumed `max_calls` / `amount_max_cumulative` / `rate_window` cap must
+    /// NEVER un-consume: a coalesce-window crash that rolled a consume back
+    /// behind an acked invocation would re-open the spend/rate window the
+    /// counter closes. Same-node restore REHYDRATES the map; cross-node public
+    /// export STRIPS it to empty (a foreign node starts its own accounting,
+    /// exactly like the budget tracker and the xctx witnesses).
+    /// `#[serde(default)]` so legacy / stripped snapshots deserialize empty.
+    #[serde(default)]
+    pub caveat_counters: HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
+
     /// Broadcast context security + roster state (§5.14, §5.14.8).
     ///
     /// **Class S** — the per-author key epochs, block lists, and the subscriber

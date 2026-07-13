@@ -64,7 +64,9 @@ use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::economy::antispam::VelocityRollbackToken;
 use scp_protocol::economy::policy::ObservableMetrics;
-use scp_protocol::economy::types::Amount;
+use scp_protocol::economy::types::{Amount, PaymentAdapterRef};
+use scp_protocol::trust::CaveatKind;
+use scp_protocol::trust::caveats::InvocationCaveats;
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
@@ -470,6 +472,31 @@ impl std::fmt::Debug for OutletEconomyReservation {
     }
 }
 
+/// §7.3.8 fail-closed coupling of the validated-narrowed effective invocation
+/// caveats to the revocation CID of the delegation that carried them.
+///
+/// The counter-bearing consume ([`consume_caveat_counters`]) needs BOTH the
+/// caveat set (to know which caps to enforce) AND the `ucan_cid` (the
+/// per-delegation counter key). Bundling them into one value makes "caveats
+/// present ⟹ cid present" a COMPILE-TIME invariant rather than a three-bridge
+/// convention: a caveat set for which
+/// [`InvocationCaveats::has_counter_bearing_caveat`] is `true` can never reach
+/// the counter gate without its counter key, so the fail-closed contract on
+/// that method cannot be silently skipped by a `(Some(caveats), None)` pair.
+///
+/// Minted at the FFI bridge from the ONE validated invocation UCAN: the
+/// `caveats` come from that token's `nb` (via `TokenNbCaveatResolver`), the
+/// `ucan_cid` from `compute_revocation_cid` over the same token — the two are
+/// derived together, from the same token, or the whole binding is `None`.
+#[derive(Debug, Clone)]
+pub struct InvocationCaveatBinding {
+    /// The validated-narrowed effective invocation caveats (the leaf `nb`).
+    pub caveats: InvocationCaveats,
+    /// Revocation CID of the invocation UCAN — the per-delegation key for the
+    /// owned Class-S caveat counters.
+    pub ucan_cid: String,
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1: reserve_outlet_economy (actor handler entry point)
 // ---------------------------------------------------------------------------
@@ -489,6 +516,33 @@ impl std::fmt::Debug for OutletEconomyReservation {
 ///
 /// Propagates [`ContextError`] for rate-limit, budget, spending-UCAN, and
 /// escrow-authorization failures.
+/// # §7.3.8 value-caveat enforcement
+///
+/// When `caveat_binding` is `Some` (the VALIDATED INVOCATION UCAN — the
+/// token granting `outlet_call:*` / `outlet_query:*` — carried a
+/// validated-narrowed `nb` caveat set, resolved by the FFI bridge via
+/// `TokenNbCaveatResolver` at its `validate_outlet_invocation_ucan` site and
+/// threaded here as an internal runtime param, bundled with the delegation's
+/// `ucan_cid` so "caveats present ⟹ cid present" holds by construction; NOT
+/// sourced from `spending_ucan`, a separate §19.5 economy token), this function
+/// runs the two-stage §7.3.8 gate:
+///
+/// 1. [`InvocationCaveats::check_invocation_local`] — the SYNCHRONOUS stateless
+///    checks (`input_schema` / `amount_max_per_call` / `allowed_adapters` /
+///    `allowed_target_dids`). Runs FIRST, so a bad schema / adapter / target /
+///    per-call amount rejects BEFORE any Class-S consume — velocity and the
+///    hard rate limit are refunded and no nonce / budget / counter capacity is
+///    spent.
+/// 2. [`consume_caveat_counters`] — the counter-bearing caps (`max_calls` /
+///    `amount_max_cumulative` / `rate_window`). Consumed as a Class-S mutation
+///    folded into the paid-path `commit_class_s_keep_compensating` (one persist
+///    per invocation) or a dedicated `commit_class_s_keep` on the free path.
+///    A consumed cap is KEPT on persist failure (ADR-049 §9) and KEPT across a
+///    later executor failure (attempt-based, not success-based).
+///
+/// `negotiated_adapter` is derived here from `deps.payment_adapter` (the
+/// adapter the paid path will use); `target_did` is `None` for this single-shot
+/// same-context slice (cross-context target threading is a later slice).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reserve_outlet_economy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -496,6 +550,8 @@ pub async fn reserve_outlet_economy(
     context_id: &str,
     invoker_did: &DID,
     spending_ucan: Option<&UcanToken>,
+    caveat_binding: Option<&InvocationCaveatBinding>,
+    input: &serde_json::Value,
     now_secs: u64,
 ) -> Result<OutletEconomyReservation, ContextError> {
     // ADR-049 §9 Class-S cell seam. The spending-nonce consume + budget charge
@@ -632,6 +688,38 @@ pub async fn reserve_outlet_economy(
                 "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
             ));
         }
+
+        // §7.3.8 SYNCHRONOUS caveat gate (stateless local checks). Runs HERE —
+        // after `action_cost` is known but BEFORE any Class-S consume (spending
+        // nonce, budget, or counter capacity) — so a bad `input_schema` /
+        // `amount_max_per_call` / `allowed_adapters` / `allowed_target_dids`
+        // rejects the invocation without spending anything. On rejection the
+        // velocity tick + hard-rate token consumed above are refunded inline
+        // (mirroring the missing-spending-UCAN arm), and NO counter is touched.
+        //
+        // `negotiated_adapter` is the adapter the paid path would use
+        // (`deps.payment_adapter.adapter_id()`); `target_did` is `None` for this
+        // single-shot same-context slice — a token whose `allowed_target_dids`
+        // is populated therefore cannot authorize a same-context call, which is
+        // the correct fail-closed behaviour (cross-context targets are a later
+        // slice).
+        if let Some(binding) = caveat_binding {
+            let caveats = &binding.caveats;
+            let negotiated_adapter: Option<PaymentAdapterRef> =
+                payment_adapter.as_ref().map(|a| a.adapter_id().to_owned());
+            if let Err(err) = caveats.check_invocation_local(
+                input,
+                action_cost,
+                negotiated_adapter.as_ref(),
+                None,
+            ) {
+                let gov = view.governance_class_c_mut();
+                gov.velocity_tracker_mut()
+                    .rollback(invoker_did, velocity_token);
+                gov.hard_rate_limit_mut().refund(invoker_did);
+                return Err(check_invocation_error_to_context(&err));
+            }
+        }
         // `view` is dropped here, releasing `cell` for the combinator call.
     }
 
@@ -739,6 +827,41 @@ pub async fn reserve_outlet_economy(
                         )));
                     }
 
+                    // §7.3.8 counter-bearing caveat consume (Class-S), folded
+                    // into THIS combinator so the paid path persists exactly
+                    // once. It is the LAST mutation in the closure: on a
+                    // `CounterExhausted` reject the just-charged budget + velocity
+                    // are rolled back inline (the spending nonce stays consumed —
+                    // un-consuming it re-opens the replay window; a caller who
+                    // trips their own cap after presenting a valid spending UCAN
+                    // burns that nonce, an acceptable self-inflicted cost). The
+                    // consume is all-or-nothing across the three kinds, so a
+                    // partial increment never persists. On success the record
+                    // rides the fail-closed persist below and is KEPT on persist
+                    // failure (a consumed cap must never un-consume).
+                    if let Some(binding) = caveat_binding
+                        && binding.caveats.has_counter_bearing_caveat()
+                        && let Err(err) = consume_caveat_counters(
+                            &mut state.class_s.caveat_counters,
+                            &binding.ucan_cid,
+                            &binding.caveats,
+                            action_cost,
+                            now_secs,
+                        )
+                    {
+                        if let Some(cost) = deducted_cost {
+                            state
+                                .governance
+                                .budget_tracker
+                                .reverse_spend(invoker_did, cost);
+                        }
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        return Err(err);
+                    }
+
                     // `value` = the deducted cost; `external` = the handle the
                     // persist-failure reversal needs to reverse the Class-C
                     // budget reservation.
@@ -781,6 +904,39 @@ pub async fn reserve_outlet_economy(
             }
         }
     } else {
+        // FREE path (`action_cost == 0`, no spending nonce / budget). A free
+        // outlet may still carry a counter-bearing caveat (`max_calls` /
+        // `rate_window`, or an `amount_max_cumulative` that consumes 0 but still
+        // asserts its cap), so the counter consume gets its OWN dedicated
+        // fail-closed `commit_class_s_keep` — KEEP on persist failure (a consumed
+        // cap must never un-consume). On reject / persist failure the velocity
+        // tick + hard-rate token are refunded (they were consumed in the Class-C
+        // pre-block above and, on this path, would otherwise ride only the
+        // best-effort coalesce persist).
+        if let Some(binding) = caveat_binding
+            && binding.caveats.has_counter_bearing_caveat()
+        {
+            let consume_result = cell
+                .commit_class_s_keep(deps, context_id, |mut view| {
+                    let state = view.rest_mut();
+                    consume_caveat_counters(
+                        &mut state.class_s.caveat_counters,
+                        &binding.ucan_cid,
+                        &binding.caveats,
+                        action_cost,
+                        now_secs,
+                    )
+                })
+                .await;
+            if let Err(err) = consume_result {
+                let mut view = cell.class_c_view();
+                let gov = view.governance_class_c_mut();
+                gov.velocity_tracker_mut()
+                    .rollback(invoker_did, velocity_token);
+                gov.hard_rate_limit_mut().refund(invoker_did);
+                return Err(err);
+            }
+        }
         None
     };
 
@@ -1362,6 +1518,96 @@ pub async fn settle_outlet_economy(
     }
 }
 
+// ---------------------------------------------------------------------------
+// §7.3.8 value-caveat counter enforcement (reserve-phase helpers)
+// ---------------------------------------------------------------------------
+
+/// Atomically consumes every counter-bearing §7.3.8 caveat for one invocation
+/// against the owned Class-S [`CaveatCounters`](crate::trust::caveat_counters::CaveatCounters)
+/// record keyed by `ucan_cid`.
+///
+/// **All-or-nothing.** The consume is applied to a *clone* of the record and
+/// written back ONLY if every counter-bearing kind admits — so a rejection on
+/// the second/third kind never leaves the first kind's increment stranded in
+/// the map. On any [`CounterExhausted`](crate::trust::caveat_counters::CounterExhausted)
+/// the map is left unchanged and a mapped [`ContextError`] is returned BEFORE
+/// the caller persists (nothing consumed).
+///
+/// Callers invoke this ONLY inside a `commit_class_s_keep`-family closure
+/// (ADR-049 §9): a successful consume is Class-S and MUST ride the fail-closed
+/// persist so a coalesce-window crash cannot un-consume it.
+///
+/// Field→counter map (§7.3.8): `max_calls` = `try_consume(MaxCalls, 1, cap)`;
+/// `amount_max_cumulative` = `try_consume(AmountCumulative, action_cost, cap)`;
+/// `rate_window` = `try_consume(RateWindow, 0, max, window_secs)`.
+fn consume_caveat_counters(
+    counters: &mut std::collections::HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
+    ucan_cid: &str,
+    caveats: &InvocationCaveats,
+    action_cost: Amount,
+    now_secs: u64,
+) -> Result<(), ContextError> {
+    let mut record = counters.get(ucan_cid).cloned().unwrap_or_default();
+
+    if let Some(cap) = caveats.max_calls {
+        record
+            .try_consume(CaveatKind::MaxCalls, 1, cap, 0, now_secs)
+            .map_err(|e| counter_exhausted_to_context(ucan_cid, &e))?;
+    }
+    if let Some(cap) = caveats.amount_max_cumulative {
+        record
+            .try_consume(
+                CaveatKind::AmountCumulative,
+                action_cost.value(),
+                cap.value(),
+                0,
+                now_secs,
+            )
+            .map_err(|e| counter_exhausted_to_context(ucan_cid, &e))?;
+    }
+    if let Some(rate_window) = caveats.rate_window {
+        record
+            .try_consume(
+                CaveatKind::RateWindow,
+                0,
+                u64::from(rate_window.max),
+                rate_window.window_secs,
+                now_secs,
+            )
+            .map_err(|e| counter_exhausted_to_context(ucan_cid, &e))?;
+    }
+
+    // Every counter-bearing kind admitted — commit the fully-updated record.
+    counters.insert(ucan_cid.to_owned(), record);
+    Ok(())
+}
+
+/// Maps a [`CounterExhausted`](crate::trust::caveat_counters::CounterExhausted)
+/// onto the Authorization-class [`InvocationError::CaveatViolation`] → typed
+/// [`ContextError`], naming the caveat kind that fired (slug) and the owning
+/// UCAN CID.
+fn counter_exhausted_to_context(
+    ucan_cid: &str,
+    err: &crate::trust::caveat_counters::CounterExhausted,
+) -> ContextError {
+    invocation_error_to_context(InvocationError::CaveatViolation {
+        slug: err.kind().as_str().to_owned(),
+        message: format!("ucan_cid={ucan_cid}: {err}"),
+    })
+}
+
+/// Maps a synchronous [`CheckInvocationError`](scp_protocol::trust::caveats::CheckInvocationError)
+/// onto the Authorization-class [`InvocationError::CaveatViolation`] → typed
+/// [`ContextError`], carrying the §5.4.4 / §7.3.8 slug for the rule that fired.
+fn check_invocation_error_to_context(
+    err: &scp_protocol::trust::caveats::CheckInvocationError,
+) -> ContextError {
+    invocation_error_to_context(InvocationError::CaveatViolation {
+        slug: err.slug().to_owned(),
+        message: err.to_string(),
+    })
+}
+
 fn invocation_error_to_context(err: InvocationError) -> ContextError {
     match err {
         InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
@@ -1395,6 +1641,12 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         } => ContextError::PermissionDenied(format!(
             "SCP-ECON-12010: budget exceeded for {did}: cost {cost}, remaining {remaining}"
         )),
+        // §7.3.8 caveat violations (synchronous local check or counter-bearing
+        // cap) surface as an Authorization-class permission denial; the slug
+        // names the exact caveat rule that fired (§5.4.4 / §7.3.8).
+        InvocationError::CaveatViolation { slug, message } => ContextError::PermissionDenied(
+            format!("SCP-OUTLET-6110: caveat violation [{slug}]: {message}"),
+        ),
     }
 }
 
@@ -1808,6 +2060,1021 @@ mod tests {
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
+        }
+    }
+
+    /// §7.3.8 value-caveat runtime-enforcement KATs.
+    ///
+    /// Covers (1) the pure `consume_caveat_counters` helper (all-or-nothing
+    /// across kinds, per-`ucan_cid` isolation, Authorization-class slug
+    /// mapping); (2) the TOKEN-SOURCE correctness — effective caveats are
+    /// sourced from the INVOCATION UCAN's `nb`, never from `spending_ucan`
+    /// (`nb: None` on a spending token yields no caveats, which is exactly why
+    /// the earlier `spending_ucan`-sourced resolution silently dropped every
+    /// caveat); (3) the Class-S snapshot round-trip; and (4) end-to-end
+    /// enforcement driven through `reserve_outlet_economy` (the actor-shape
+    /// reserve seam where the gate lives) for the free-path counter bounds,
+    /// the synchronous local bounds, the sync-before-counter ordering, and the
+    /// no-rollback (KEEP-on-persist-failure) guarantee.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    mod caveat_enforcement {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use scp_clock::Clock as _;
+        use scp_did::DID;
+        use scp_protocol::crypto::ucan::validate::{CaveatResolver, TokenNbCaveatResolver};
+        use scp_protocol::crypto::ucan::{UcanHeader, UcanPayload, UcanToken};
+        use scp_protocol::economy::types::Amount;
+        use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
+
+        use super::super::InvocationCaveatBinding;
+        use crate::context::ContextError;
+        use crate::context::ContextState;
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::deps::ActorDeps;
+        use crate::context::actor::state::PerContextState;
+        use crate::trust::caveat_counters::CaveatCounters;
+
+        const INVOKER: &str = "did:dht:z6MkCaveatInvoker";
+        const CTX_BYTE: u8 = 0xCA;
+
+        fn ctx_key() -> String {
+            hex::encode([CTX_BYTE; 32])
+        }
+
+        fn max_calls_caveats(cap: u64) -> InvocationCaveats {
+            let mut c = InvocationCaveats::empty();
+            c.max_calls = Some(cap);
+            c
+        }
+
+        // -------------------------------------------------------------------
+        // Pure `consume_caveat_counters` helper
+        // -------------------------------------------------------------------
+
+        /// All-or-nothing across counter kinds: a consume that ADMITS on
+        /// `max_calls` but REJECTS on `amount_max_cumulative` must leave the map
+        /// UNCHANGED — the earlier kind's increment is never stranded (the
+        /// helper mutates a clone and writes back only on full success).
+        #[test]
+        fn consume_caveat_counters_is_all_or_nothing_across_kinds() {
+            let cid = "cid-aon";
+            let mut counters: HashMap<String, CaveatCounters> = HashMap::new();
+            counters.insert(
+                cid.to_owned(),
+                CaveatCounters {
+                    amount_cumulative_used: 3,
+                    ..Default::default()
+                },
+            );
+            let mut caveats = InvocationCaveats::empty();
+            caveats.max_calls = Some(5); // admits (0 -> 1)
+            caveats.amount_max_cumulative = Some(Amount::new(3)); // 3 + 1 > 3 rejects
+            let err = super::super::consume_caveat_counters(
+                &mut counters,
+                cid,
+                &caveats,
+                Amount::new(1),
+                1_000,
+            )
+            .expect_err("amount cap already met — the consume must reject");
+            assert!(
+                format!("{err}").contains("amountMaxCumulative"),
+                "must reject on the amount kind: {err}"
+            );
+            let rec = &counters[cid];
+            assert_eq!(
+                rec.max_calls_used, 0,
+                "max_calls must NOT be incremented when a later kind rejects (all-or-nothing)"
+            );
+            assert_eq!(
+                rec.amount_cumulative_used, 3,
+                "the amount counter must be unchanged on reject"
+            );
+        }
+
+        /// Counters are keyed by `ucan_cid`: exhausting one delegation's cap
+        /// leaves every other delegation's counters untouched.
+        #[test]
+        fn consume_caveat_counters_isolates_per_ucan_cid() {
+            let mut counters: HashMap<String, CaveatCounters> = HashMap::new();
+            let caveats = max_calls_caveats(1);
+            super::super::consume_caveat_counters(
+                &mut counters,
+                "cid-a",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect("cid-a first admits");
+            super::super::consume_caveat_counters(
+                &mut counters,
+                "cid-b",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect("cid-b is independent and admits");
+            assert_eq!(counters["cid-a"].max_calls_used, 1);
+            assert_eq!(counters["cid-b"].max_calls_used, 1);
+            super::super::consume_caveat_counters(
+                &mut counters,
+                "cid-a",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect_err("cid-a second exceeds its cap");
+            assert_eq!(
+                counters["cid-b"].max_calls_used, 1,
+                "cid-b must be unaffected by cid-a's exhaustion"
+            );
+        }
+
+        /// A `CounterExhausted` maps to the Authorization-class caveat-violation
+        /// code (`SCP-OUTLET-6110`) carrying the §7.3.8 slug of the kind that
+        /// fired.
+        #[test]
+        fn consume_caveat_counters_maps_exhaustion_to_authorization_slug() {
+            let mut counters: HashMap<String, CaveatCounters> = HashMap::new();
+            let caveats = max_calls_caveats(1);
+            super::super::consume_caveat_counters(
+                &mut counters,
+                "cid",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect("first admits");
+            let err = super::super::consume_caveat_counters(
+                &mut counters,
+                "cid",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect_err("second exceeds cap");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("SCP-OUTLET-6110") && msg.contains("maxCalls"),
+                "exhaustion must map to the Authorization code + kind slug: {msg}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Token-source correctness (resolver)
+        // -------------------------------------------------------------------
+
+        fn ucan_with_nb(nb: Option<InvocationCaveats>) -> UcanToken {
+            UcanToken {
+                header: UcanHeader::new(),
+                payload: UcanPayload {
+                    iss: INVOKER.to_owned(),
+                    aud: "did:dht:z6MkCaveatCtx".to_owned(),
+                    exp: 9_999_999_999,
+                    nbf: None,
+                    nnc: "0-00000000000000000000000000000000".to_owned(),
+                    att: vec![],
+                    prf: vec![],
+                    fct: None,
+                    nb,
+                },
+                signature: vec![],
+                encoded: "header.payload.sig".to_owned(),
+            }
+        }
+
+        /// THE token-source KAT. The value-caveats live in the INVOCATION UCAN's
+        /// `nb`; a spending UCAN (§19.5 economy token) carries `nb: None`. The
+        /// resolver the bridges use reads exactly the `nb` field, so the
+        /// invocation token IS the caveat source and a spending token yields
+        /// NONE — the precise reason the prior `spending_ucan`-sourced
+        /// resolution left §7.3.8 caveats entirely inert.
+        #[test]
+        fn caveats_sourced_from_invocation_nb_never_from_spending_ucan() {
+            let caveats = max_calls_caveats(2);
+            let invocation = ucan_with_nb(Some(caveats.clone()));
+            let spending = ucan_with_nb(None);
+            assert_eq!(
+                TokenNbCaveatResolver.resolve_caveats(&invocation),
+                Some(caveats),
+                "the invocation UCAN's nb must resolve to its caveats"
+            );
+            assert_eq!(
+                TokenNbCaveatResolver.resolve_caveats(&spending),
+                None,
+                "a spending UCAN (nb None) must resolve to NO caveats — never a source"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Class-S snapshot round-trip
+        // -------------------------------------------------------------------
+
+        /// Consumed counters survive a Class-S snapshot → clear → restore cycle
+        /// (the on-disk `ContextSnapshot` mirror rehydrates them after a crash).
+        #[test]
+        fn caveat_counters_survive_class_s_snapshot_round_trip() {
+            let mut state = active_state();
+            state.class_s.caveat_counters.insert(
+                "cid-snap".to_owned(),
+                CaveatCounters {
+                    max_calls_used: 3,
+                    amount_cumulative_used: 42,
+                    rate_window_timestamps: vec![1, 2, 3],
+                },
+            );
+            let snap = state.class_s.snapshot();
+            state.class_s.caveat_counters.clear();
+            assert!(state.class_s.caveat_counters.is_empty());
+            state.class_s.restore(snap);
+            let rec = &state.class_s.caveat_counters["cid-snap"];
+            assert_eq!(rec.max_calls_used, 3);
+            assert_eq!(rec.amount_cumulative_used, 42);
+            assert_eq!(rec.rate_window_timestamps, vec![1, 2, 3]);
+        }
+
+        // -------------------------------------------------------------------
+        // End-to-end enforcement via `reserve_outlet_economy`
+        // -------------------------------------------------------------------
+
+        /// Persistence double whose `persist_context` always SUCCEEDS — the
+        /// happy path for the counter consume's fail-closed persist.
+        struct OkPersistence;
+        #[async_trait::async_trait]
+        impl crate::context::persistence::ContextPersistence for OkPersistence {
+            async fn persist_context(
+                &self,
+                _: &str,
+                _: &crate::context::state::ContextSnapshot,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn load_context(
+                &self,
+                _: &str,
+            ) -> Result<
+                Option<crate::context::state::ContextSnapshot>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(None)
+            }
+            async fn delete_context(
+                &self,
+                _: &str,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn list_persisted_contexts(
+                &self,
+            ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn build_deps(
+            persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+        ) -> ActorDeps {
+            use crate::context::supervisor::supervisor::Supervisor;
+            use scp_platform::testing::InMemoryStorage;
+
+            let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                INVOKER.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ));
+            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+                Box::new(crate::context::providers::MerkleEventLogProvider::new());
+            let key_resolver: scp_protocol::context::governance::KeyResolver =
+                Arc::new(|_, _| None);
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let clock: Arc<dyn scp_clock::Clock> =
+                Arc::new(scp_clock::TestClock::new(1_700_000_000));
+            // No payment adapter: a free outlet (action_cost == 0) whose
+            // counter consume rides the dedicated free-path commit_class_s_keep.
+            let supervisor = Supervisor::with_providers(
+                crypto,
+                transport,
+                event_log,
+                key_resolver,
+                Some(persistence),
+                None,
+                None,
+                Some(clock),
+                mls_storage,
+            );
+            supervisor
+                .build_actor_deps(&DID(INVOKER.to_owned()))
+                .await
+                .expect("build_actor_deps")
+        }
+
+        fn active_state() -> PerContextState {
+            let state = PerContextState::new_for_test_encrypted(
+                [CTX_BYTE; 32],
+                1_700_000_000,
+                DID(INVOKER.to_owned()),
+            );
+            state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("transition to Active");
+            state
+        }
+
+        /// Drive one reserve step. On success, consume the returned ticket (its
+        /// `#[must_use]` Drop balance guard would otherwise fire); the counter
+        /// consume already committed as Class-S BEFORE the ticket was built, and
+        /// the void does not touch `caveat_counters`.
+        async fn reserve_step(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            caveats: Option<&InvocationCaveats>,
+            cid: Option<&str>,
+            input: &serde_json::Value,
+            now: u64,
+        ) -> Result<(), ContextError> {
+            // Mirror the bridge: caveats + cid are minted together from the
+            // ONE invocation UCAN, so they bundle into one binding or neither.
+            let binding = caveats.zip(cid).map(|(c, id)| InvocationCaveatBinding {
+                caveats: c.clone(),
+                ucan_cid: id.to_owned(),
+            });
+            let reservation = super::super::reserve_outlet_economy(
+                cell,
+                deps,
+                &ctx_key(),
+                &DID(INVOKER.to_owned()),
+                None,
+                binding.as_ref(),
+                input,
+                now,
+            )
+            .await?;
+            reservation.ticket.void_external_and_consume(None).await;
+            Ok(())
+        }
+
+        /// `max_calls` (counter bound): the first invocation admits and consumes
+        /// the single slot; the second is rejected as `maxCalls`. Sourced from
+        /// the `effective_caveats` param — exactly what the bridge derives from
+        /// the invocation UCAN's `nb`.
+        #[tokio::test]
+        async fn reserve_free_path_enforces_max_calls() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let caveats = max_calls_caveats(1);
+            let cid = "cid-mc";
+            let input = serde_json::json!({});
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &input,
+                1_700_000_100,
+            )
+            .await
+            .expect("first invocation within max_calls=1 must admit");
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &input,
+                1_700_000_101,
+            )
+            .await
+            .expect_err("second invocation must exceed max_calls=1");
+            assert!(
+                format!("{err}").contains("maxCalls"),
+                "reject must name the maxCalls caveat: {err}"
+            );
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "exactly one call consumed"
+            );
+        }
+
+        /// TOKEN-SOURCE at the reserve seam: the reserve enforces the
+        /// `effective_caveats` param and consults NO other token's `nb`. With
+        /// caveats present the cap is enforced; with `effective_caveats == None`
+        /// (the invocation UCAN carried no `nb`) NO cap exists and every call
+        /// admits, creating no counter record.
+        #[tokio::test]
+        async fn reserve_enforces_effective_caveats_param_not_spending_nb() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let input = serde_json::json!({});
+
+            let mut cell = ClassSCell::new(active_state());
+            let caveats = max_calls_caveats(1);
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some("cid-src"),
+                &input,
+                1_700_000_100,
+            )
+            .await
+            .expect("admit");
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some("cid-src"),
+                &input,
+                1_700_000_101,
+            )
+            .await
+            .expect_err("cap enforced when sourced from the invocation caveats");
+
+            let mut cell2 = ClassSCell::new(active_state());
+            for i in 0..3 {
+                reserve_step(&mut cell2, &deps, None, None, &input, 1_700_000_200 + i)
+                    .await
+                    .expect("no invocation caveats => always admit");
+            }
+            assert!(
+                cell2.class_s.caveat_counters.is_empty(),
+                "no caveats resolved => no counter record — reserve never fabricates caveats"
+            );
+        }
+
+        /// Sync-first ordering: a bad `input_schema` is rejected by the
+        /// synchronous local check BEFORE the `max_calls` counter is touched, so
+        /// the single slot survives for a subsequent conforming call.
+        #[tokio::test]
+        async fn reserve_sync_check_precedes_counter_consume() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let mut caveats = InvocationCaveats::empty();
+            caveats.max_calls = Some(1);
+            caveats.input_schema = Some(serde_json::json!({
+                "type": "object",
+                "required": ["x"],
+                "properties": {"x": {"type": "string"}}
+            }));
+            let cid = "cid-order";
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &serde_json::json!({}),
+                1_700_000_100,
+            )
+            .await
+            .expect_err("input missing required 'x' must reject on the schema");
+            assert!(
+                format!("{err}").contains("input"),
+                "must reject on the input_schema sync check: {err}"
+            );
+            assert!(
+                !cell.class_s.caveat_counters.contains_key(cid),
+                "a sync-rejected call must NOT create or consume a counter record"
+            );
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &serde_json::json!({"x": "ok"}),
+                1_700_000_101,
+            )
+            .await
+            .expect(
+                "conforming input within max_calls=1 must admit — the rejected call spent nothing",
+            );
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "the single slot was consumed only by the conforming call"
+            );
+        }
+
+        /// `rate_window` (counter bound): admits until the window cap, then
+        /// rejects as `rateWindow`.
+        #[tokio::test]
+        async fn reserve_free_path_enforces_rate_window() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let mut caveats = InvocationCaveats::empty();
+            caveats.rate_window = Some(RateWindow {
+                max: 1,
+                window_secs: 100,
+            });
+            let cid = "cid-rw";
+            let input = serde_json::json!({});
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &input,
+                1_700_000_100,
+            )
+            .await
+            .expect("first within the rate window admits");
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &input,
+                1_700_000_101,
+            )
+            .await
+            .expect_err("second within the same window exceeds max=1");
+            assert!(
+                format!("{err}").contains("rateWindow"),
+                "reject must name the rateWindow caveat: {err}"
+            );
+        }
+
+        /// `allowed_target_dids` (sync bound): single-shot same-context passes
+        /// `target_did = None`, so a populated allow-list is unsatisfiable and
+        /// fail-closed rejects — touching no counter.
+        #[tokio::test]
+        async fn reserve_sync_rejects_disallowed_target_did() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let mut caveats = InvocationCaveats::empty();
+            caveats.allowed_target_dids = Some(vec![DID::from("did:dht:z6MkOtherTarget")]);
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some("cid-target"),
+                &serde_json::json!({}),
+                1_700_000_100,
+            )
+            .await
+            .expect_err("populated allowed_target_dids must reject a same-context call");
+            assert!(
+                format!("{err}").contains("SCP-OUTLET-6110"),
+                "target-DID reject must surface a caveat violation: {err}"
+            );
+            assert!(
+                cell.class_s.caveat_counters.is_empty(),
+                "a sync reject touches no counter"
+            );
+        }
+
+        /// `allowed_adapters` (sync bound): the free path negotiates no payment
+        /// adapter, so a populated adapter allow-list is unsatisfiable and
+        /// fail-closed rejects.
+        #[tokio::test]
+        async fn reserve_sync_rejects_disallowed_adapter() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let mut caveats = InvocationCaveats::empty();
+            caveats.allowed_adapters = Some(vec!["x402".to_owned()]);
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some("cid-adapter"),
+                &serde_json::json!({}),
+                1_700_000_100,
+            )
+            .await
+            .expect_err("populated allowed_adapters must reject when no adapter is negotiated");
+            assert!(
+                format!("{err}").contains("SCP-OUTLET-6110"),
+                "adapter reject must surface a caveat violation: {err}"
+            );
+        }
+
+        /// No-rollback: the free-path counter consume rides a fail-closed
+        /// `commit_class_s_keep`. A persist FAILURE surfaces an error to the
+        /// caller, but the consumed cap is KEPT in memory (a consumed cap must
+        /// never un-consume — ADR-049 §9). No ticket is built on this path, so
+        /// there is no Drop-guard obligation.
+        #[tokio::test]
+        async fn reserve_counter_consume_is_kept_on_persist_failure() {
+            let deps = build_deps(Box::new(super::FailOutletPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let caveats = max_calls_caveats(1);
+            let cid = "cid-keep";
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &serde_json::json!({}),
+                1_700_000_100,
+            )
+            .await
+            .expect_err("a persist failure must surface fail-closed");
+            assert!(
+                format!("{err}").to_lowercase().contains("persist"),
+                "expected a fail-closed persistence error: {err}"
+            );
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "the consumed cap must be KEPT across the persist failure (no un-consume)"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // End-to-end enforcement via `reserve_outlet_economy` — PAID path
+        // -------------------------------------------------------------------
+        //
+        // The free-path tests above drive the counter consume through the
+        // dedicated `commit_class_s_keep` (outlets_helpers.rs ~919). The PAID
+        // path folds the counter consume into `commit_class_s_keep_compensating`
+        // (outlets_helpers.rs ~842-863) — a different combinator with its own
+        // budget/velocity compensation. This block exercises THAT path with a
+        // real `action_cost > 0` and a VALID signed spending UCAN.
+
+        /// Deterministic Ed25519 seed from a DID (mirrors the outlet-economy
+        /// wiring test's `did_to_seed` so signing and verification agree).
+        fn did_to_seed(did: &DID) -> [u8; 32] {
+            let mut s = [0u8; 32];
+            for (i, b) in did.as_ref().as_bytes().iter().enumerate() {
+                s[i % 32] ^= *b;
+            }
+            s
+        }
+
+        /// Signing key for `did` — the private half of what `mock_key_resolver`
+        /// returns, so a spending UCAN issued by `did` verifies against it.
+        fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
+            ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
+        }
+
+        /// Key resolver that returns the verifying key `signing_key_for_did`
+        /// signs with. Wired into the paid deps so
+        /// `validate_spending_ucan_or_error` (called inside
+        /// `commit_class_s_keep_compensating`) can resolve the spending-UCAN
+        /// issuer DID → key and verify the Ed25519 signature. The free-path
+        /// `build_deps` uses a `|_, _| None` resolver, which would fail signature
+        /// verification — a paid test MUST supply real keys.
+        fn mock_key_resolver() -> scp_protocol::context::governance::KeyResolver {
+            Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
+                Some(ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did)).verifying_key())
+            })
+        }
+
+        /// A paid economic policy: a per-outlet-call cost > 0 makes
+        /// `economy_pre_check` return `action_cost > 0`, routing the reserve
+        /// through the PAID `commit_class_s_keep_compensating` branch.
+        fn paid_policy() -> scp_protocol::economy::types::EconomicPolicy {
+            use scp_protocol::economy::types::{CostSchedule, CurrencyCode, EconomicPolicy};
+            EconomicPolicy {
+                locked: false,
+                cost_schedule: CostSchedule {
+                    currency: CurrencyCode::from("USD"),
+                    per_message: None,
+                    per_outlet_call: Some(Amount::new(5)),
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:key:caveat-payee"),
+            }
+        }
+
+        /// Fully-signed spending UCAN bound to `actor_did` (iss == aud), valid at
+        /// wall-clock time. Mirrors the outlet-economy wiring test's
+        /// `signed_spending_ucan_for`: `kid: "#agent"` + `scp_key_scope: "#agent"`
+        /// fact, a `scp:spending:*` attenuation, a capability that comfortably
+        /// covers the per-call cost, and a FRESH single-use nonce (each call
+        /// generates a new one). The token is signed over the base64url
+        /// `header.payload` and `encoded` carries the full three-segment JWT so
+        /// `verify_signature` reconstructs the signing input.
+        fn signed_spending_ucan_for(actor_did: &DID) -> UcanToken {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use scp_protocol::crypto::ucan::nonce::generate_nonce;
+            use scp_protocol::crypto::ucan::spending::{
+                Amount as SpendAmount, CurrencyCode as SpendCurrency, SpendingCapability,
+            };
+            use scp_protocol::crypto::ucan::{Attenuation, UcanHeader};
+
+            let cap = SpendingCapability {
+                max_per_action: SpendAmount(u64::MAX),
+                max_total: SpendAmount(u64::MAX),
+                currency: SpendCurrency::from_code("USD").expect("USD is a valid code"),
+                time_window: std::time::Duration::from_hours(1),
+                allowed_adapters: vec![],
+            };
+            let mut fct = serde_json::Map::new();
+            fct.insert(
+                "spending_capability".to_owned(),
+                cap.to_fact_value()
+                    .expect("capability serializes to a fact value"),
+            );
+            fct.insert(
+                "scp_key_scope".to_owned(),
+                serde_json::Value::String("#agent".to_owned()),
+            );
+
+            // Wall-clock times: the paid deps use a `SystemClock`, and the
+            // in-state spending-nonce tracker (built by `new_for_test_encrypted`)
+            // also uses `SystemClock`, so expiry + nonce-freshness both validate
+            // against real time.
+            let now = scp_clock::SystemClock.now_secs();
+            let header = UcanHeader::with_kid("#agent".to_owned());
+            let payload = UcanPayload {
+                iss: actor_did.as_ref().to_owned(),
+                aud: actor_did.as_ref().to_owned(),
+                exp: now + 3600,
+                nbf: Some(now.saturating_sub(60)),
+                nnc: generate_nonce(&scp_clock::SystemClock),
+                att: vec![Attenuation {
+                    with: "scp:spending:*".to_owned(),
+                    can: "spend".to_owned(),
+                }],
+                prf: vec![],
+                fct: Some(serde_json::Value::Object(fct)),
+                nb: None,
+            };
+
+            let header_json = serde_json::to_vec(&header).expect("header serializes");
+            let payload_json = serde_json::to_vec(&payload).expect("payload serializes");
+            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+            let signing_input = format!("{header_b64}.{payload_b64}");
+            let signing_key = signing_key_for_did(actor_did);
+            let signature = ed25519_dalek::Signer::sign(&signing_key, signing_input.as_bytes());
+            let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+            let encoded = format!("{signing_input}.{sig_b64}");
+
+            UcanToken {
+                header,
+                payload,
+                signature: signature.to_bytes().to_vec(),
+                encoded,
+            }
+        }
+
+        /// Paid deps: a real-time `SystemClock` (so the spending UCAN's expiry
+        /// and nonce freshness validate against the same wall clock the in-state
+        /// nonce tracker uses) and a `mock_key_resolver` that resolves the
+        /// spending-UCAN issuer DID → verifying key. No payment adapter is
+        /// configured: the reserve's escrow authorization only runs when BOTH a
+        /// policy AND an adapter are present (`outlets_helpers.rs` ~948), so with no
+        /// adapter the escrow is skipped and the PAID
+        /// `commit_class_s_keep_compensating` (spending-nonce + budget + counter
+        /// consume) is exactly the path under test. This matches the committed
+        /// outlet-economy wiring reference, whose paid happy path also configures
+        /// no adapter and asserts `payment_receipt.is_none()`.
+        async fn build_deps_paid(
+            persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+        ) -> ActorDeps {
+            use crate::context::supervisor::supervisor::Supervisor;
+            use scp_platform::testing::InMemoryStorage;
+
+            let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                INVOKER.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ));
+            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+                Box::new(crate::context::providers::MerkleEventLogProvider::new());
+            let key_resolver = mock_key_resolver();
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
+            let supervisor = Supervisor::with_providers(
+                crypto,
+                transport,
+                event_log,
+                key_resolver,
+                Some(persistence),
+                None,
+                None,
+                Some(clock),
+                mls_storage,
+            );
+            supervisor
+                .build_actor_deps(&DID(INVOKER.to_owned()))
+                .await
+                .expect("build_actor_deps")
+        }
+
+        /// `active_state()` plus a paid economic policy and a funded budget for
+        /// INVOKER, so `economy_pre_check` yields `action_cost > 0` and
+        /// `record_spend` succeeds on the paid branch.
+        fn paid_active_state() -> PerContextState {
+            let mut state = active_state();
+            state.governance.economic_policy = Some(paid_policy());
+            state
+                .governance
+                .budget_tracker
+                .grant(&DID(INVOKER.to_owned()), Amount::new(1_000));
+            state
+        }
+
+        /// Drive one PAID reserve step: thread a signed spending UCAN into the
+        /// `spending_ucan` slot (the free-path `reserve_step` passes `None`
+        /// there) alongside the counter-bearing caveat binding. On success,
+        /// consume the returned ticket (its `#[must_use]` Drop balance guard
+        /// would otherwise fire); with no payment adapter there is no escrow to
+        /// void, and the counter consume already committed as Class-S before the
+        /// ticket was built.
+        async fn paid_reserve_step(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            spending: &UcanToken,
+            caveats: &InvocationCaveats,
+            cid: &str,
+            input: &serde_json::Value,
+            now: u64,
+        ) -> Result<(), ContextError> {
+            let binding = InvocationCaveatBinding {
+                caveats: caveats.clone(),
+                ucan_cid: cid.to_owned(),
+            };
+            let reservation = super::super::reserve_outlet_economy(
+                cell,
+                deps,
+                &ctx_key(),
+                &DID(INVOKER.to_owned()),
+                Some(spending),
+                Some(&binding),
+                input,
+                now,
+            )
+            .await?;
+            reservation.ticket.void_external_and_consume(None).await;
+            Ok(())
+        }
+
+        /// PAID-path caveat KAT (§7.3.8). Drives `reserve_outlet_economy` on the
+        /// PAID branch (`action_cost > 0` + a VALID signed spending UCAN) and
+        /// proves the counter consume folded into
+        /// `commit_class_s_keep_compensating` (outlets_helpers.rs ~842-863) is
+        /// live on that path:
+        ///
+        /// (a) a `max_calls = 1` caveat IS consumed on the paid path — after one
+        ///     successful paid reserve the owned Class-S counter reads
+        ///     `max_calls_used == 1`, and a SECOND paid reserve (same cid, a FRESH
+        ///     spending UCAN) rejects naming `maxCalls`.
+        ///
+        /// (b) On the `CounterExhausted` reject the paid-path compensation runs
+        ///     (outlets_helpers.rs ~852-862): the just-charged budget is rolled
+        ///     back inline while the spending nonce stays consumed (the closure
+        ///     returns Err AFTER `commit_spending_ucan_nonce`). The governance
+        ///     budget tracker is `pub(crate)` and thus observable from this test
+        ///     module, so the rollback is asserted directly — the invoker's
+        ///     remaining budget after the REJECTED second call equals its
+        ///     remaining budget after the first (ADMITTED) call, so only the one
+        ///     admitted charge stuck. The nonce's single-use is proven separately:
+        ///     re-presenting the first UCAN rejects on replay INSIDE
+        ///     `validate_spending_ucan_or_error` (which runs before the counter
+        ///     consume), so each paid reserve genuinely needs a distinct fresh
+        ///     spending UCAN.
+        #[tokio::test]
+        async fn reserve_paid_path_enforces_max_calls_and_compensates() {
+            let deps = build_deps_paid(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(paid_active_state());
+            let invoker = DID(INVOKER.to_owned());
+            let caveats = max_calls_caveats(1);
+            let cid = "cid-paid-mc";
+            let input = serde_json::json!({});
+            // `now` here feeds the velocity / hard-rate / caveat bookkeeping; the
+            // spending UCAN's own expiry + nonce validate against the deps'
+            // `SystemClock`, independent of this value.
+            let now = scp_clock::SystemClock.now_secs();
+
+            let remaining_start = cell.governance.budget_tracker.remaining(&invoker).0;
+            assert_eq!(remaining_start, 1_000, "seeded invoker budget");
+
+            // FIRST paid reserve: valid signed UCAN, action_cost = 5 (> 0 → paid
+            // branch). The counter consume in `commit_class_s_keep_compensating`
+            // admits and consumes the single max_calls slot.
+            let spending1 = signed_spending_ucan_for(&invoker);
+            paid_reserve_step(&mut cell, &deps, &spending1, &caveats, cid, &input, now)
+                .await
+                .expect("first paid reserve within max_calls=1 must admit on the PAID branch");
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "the PAID path consumed exactly one max_calls slot"
+            );
+            let remaining_after_first = cell.governance.budget_tracker.remaining(&invoker).0;
+            assert_eq!(
+                remaining_after_first,
+                remaining_start - 5,
+                "the first paid reserve charged the per_outlet_call cost (5) exactly once"
+            );
+
+            // SECOND paid reserve: a DISTINCT fresh spending UCAN (single-use
+            // nonce — reusing spending1 would reject on nonce replay, not the
+            // caveat). The max_calls slot is exhausted, so the counter consume —
+            // the LAST mutation in the paid closure — rejects with
+            // CounterExhausted (maxCalls).
+            let spending2 = signed_spending_ucan_for(&invoker);
+            let err = paid_reserve_step(&mut cell, &deps, &spending2, &caveats, cid, &input, now)
+                .await
+                .expect_err("second paid reserve must exceed max_calls=1");
+            assert!(
+                format!("{err}").contains("maxCalls"),
+                "the PAID-path reject must name the maxCalls caveat: {err}"
+            );
+
+            // (b) Compensation ran: the CounterExhausted reject rolled the
+            // just-charged budget back inline (outlets_helpers.rs ~852-862), so
+            // the net remaining budget is unchanged from after the first
+            // (admitted) charge — the rejected call left NO budget stuck.
+            let remaining_after_second = cell.governance.budget_tracker.remaining(&invoker).0;
+            assert_eq!(
+                remaining_after_second, remaining_after_first,
+                "the rejected paid reserve rolled back its budget charge (compensation) — \
+                 only the first, admitted call's charge stuck"
+            );
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "a rejected paid reserve does not advance the exhausted counter past its cap"
+            );
+
+            // Single-use nonce: re-presenting the FIRST spending UCAN (its nonce
+            // was committed on the admitted call) rejects on replay INSIDE
+            // `validate_spending_ucan_or_error`, which runs BEFORE the counter
+            // consume in the paid closure — proving every paid reserve needs a
+            // distinct fresh spending UCAN, never a replay.
+            let err_replay =
+                paid_reserve_step(&mut cell, &deps, &spending1, &caveats, cid, &input, now)
+                    .await
+                    .expect_err(
+                        "re-presenting a consumed spending UCAN must reject on nonce replay",
+                    );
+            let replay_msg = format!("{err_replay}").to_lowercase();
+            assert!(
+                replay_msg.contains("scp-econ-12065")
+                    || replay_msg.contains("nonce")
+                    || replay_msg.contains("replay"),
+                "a reused spending-UCAN nonce must reject inside spending validation \
+                 (before the counter): {err_replay}"
+            );
+        }
+
+        /// PAID-path `amount_max_cumulative` KAT (§7.3.8). This is the one
+        /// counter-bearing caveat that can ONLY be exhausted on the paid branch:
+        /// its consume charges `action_cost` (the free path's `action_cost == 0`
+        /// never advances the cumulative sum against a positive cap). Drives
+        /// `reserve_outlet_economy` on the paid branch (`per_outlet_call` = 5)
+        /// with a cumulative cap of 12: two calls admit (5, then 10), the third
+        /// (would-be 15 > 12) rejects naming `amountMaxCumulative`. Proves the
+        /// `consume_caveat_counters` `AmountCumulative` arm (`outlets_helpers.rs`
+        /// ~1557) is live on the paid path and that the running total — not a
+        /// per-call amount — is what trips the cap.
+        #[tokio::test]
+        async fn reserve_paid_path_enforces_amount_max_cumulative() {
+            let deps = build_deps_paid(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(paid_active_state());
+            let mut caveats = InvocationCaveats::empty();
+            // Cap = 12; each paid call charges the per_outlet_call cost (5), so the
+            // cumulative sum is 5 -> 10 -> (would-be 15, rejected).
+            caveats.amount_max_cumulative = Some(Amount::new(12));
+            let cid = "cid-paid-amt";
+            let input = serde_json::json!({});
+            let now = scp_clock::SystemClock.now_secs();
+
+            let spending1 = signed_spending_ucan_for(&DID(INVOKER.to_owned()));
+            paid_reserve_step(&mut cell, &deps, &spending1, &caveats, cid, &input, now)
+                .await
+                .expect("first paid reserve: cumulative 5 <= 12 admits");
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].amount_cumulative_used, 5,
+                "the paid path charged the per_outlet_call cost against the cumulative counter"
+            );
+
+            let spending2 = signed_spending_ucan_for(&DID(INVOKER.to_owned()));
+            paid_reserve_step(&mut cell, &deps, &spending2, &caveats, cid, &input, now)
+                .await
+                .expect("second paid reserve: cumulative 10 <= 12 admits");
+            assert_eq!(cell.class_s.caveat_counters[cid].amount_cumulative_used, 10);
+
+            let spending3 = signed_spending_ucan_for(&DID(INVOKER.to_owned()));
+            let err = paid_reserve_step(&mut cell, &deps, &spending3, &caveats, cid, &input, now)
+                .await
+                .expect_err("third paid reserve: cumulative would be 15 > 12");
+            assert!(
+                format!("{err}").contains("amountMaxCumulative"),
+                "the reject must name the amountMaxCumulative caveat: {err}"
+            );
+            // The rejected call did not advance the cumulative counter past its
+            // last admitted value (all-or-nothing consume on a clone).
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].amount_cumulative_used, 10,
+                "a rejected paid reserve leaves the cumulative counter at its last admitted total"
+            );
         }
     }
 }

@@ -65,6 +65,8 @@ pub(crate) async fn dispatch(
             context_id,
             invoker_did,
             spending_ucan,
+            caveat_binding,
+            input,
             now_secs,
             reply,
         } => {
@@ -74,6 +76,8 @@ pub(crate) async fn dispatch(
                 &context_id,
                 &invoker_did,
                 spending_ucan.as_deref(),
+                caveat_binding.as_deref(),
+                &input,
                 now_secs,
                 reply,
             )
@@ -183,6 +187,8 @@ async fn handle_reserve_outlet_economy(
     context_id: &str,
     invoker_did: &scp_did::DID,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    caveat_binding: Option<&crate::context::outlets_helpers::InvocationCaveatBinding>,
+    input: &serde_json::Value,
     now_secs: u64,
     reply: oneshot::Sender<
         Result<Box<crate::context::outlets_helpers::OutletEconomyReservation>, ContextError>,
@@ -194,6 +200,8 @@ async fn handle_reserve_outlet_economy(
         context_id,
         invoker_did,
         spending_ucan,
+        caveat_binding,
+        input,
         now_secs,
     );
 

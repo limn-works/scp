@@ -122,6 +122,9 @@ pub mod context {
     }
     pub mod outlets {
         pub use scp_protocol::context::outlets::*;
+        // §7.3.8 caveat/CID coupling minted by the FFI bridges (see
+        // `Supervisor::invoke_outlet_with_economy`).
+        pub use scp_runtime::context::InvocationCaveatBinding;
         pub use scp_runtime::context::outlets::invoke;
         pub use scp_runtime::context::outlets::invoke::{
             InvocationError, has_outlet_call_capability, has_outlet_invocation_capability,

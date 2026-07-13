@@ -512,29 +512,42 @@ async fn prepare_a(
     let now_secs = deps.clock.now_secs();
     // `reserve_outlet_economy` is the spending-nonce-bearing leaf and takes the
     // cell; the prior `state` borrow has ended (NLL) so `cell` is free here.
-    let reservation =
-        match reserve_outlet_economy(cell, deps, &context_id_hex, caller_did, None, now_secs).await
-        {
-            Ok(reservation) => reservation,
-            Err(err) => {
-                // reserve_outlet_economy rolls back its OWN staged bookkeeping on
-                // every failure branch, so no escrow/velocity/budget leaked — and
-                // its Class-S state is rolled back too, leaving nothing security-
-                // critical to durably land here. The §6.2.0.2 budget consumed above
-                // is NOT rolled back (non-refundable at initiation); persist so it
-                // durably lands, then reply. This is an already-failing terminal
-                // error: no success is acked and the only durable state is the soft
-                // Class-C anti-spam window increment, so best-effort — not fail-
-                // closed — is the honest intent; a persist failure just records the
-                // metric. `persist_state_best_effort` takes a SHARED
-                // `&PerContextState`, so this reads through the cell's `Deref`
-                // (`&*cell`) — no `state_mut()`.
-                persist_state_best_effort(&*cell, deps, &context_id_hex).await;
-                let sketch = outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                return Outcome::err_mutated(sketch);
-            }
-        };
+    // §7.3.8 value-caveat enforcement is scoped to single-shot SAME-context
+    // invocation. The cross-context saga Prepare-A leg is a later slice, so no
+    // caveat binding is threaded here and the input is not schema-checked
+    // against a caveat (`Null`); the counter gate stays inert.
+    let reservation = match reserve_outlet_economy(
+        cell,
+        deps,
+        &context_id_hex,
+        caller_did,
+        None,
+        None,
+        &serde_json::Value::Null,
+        now_secs,
+    )
+    .await
+    {
+        Ok(reservation) => reservation,
+        Err(err) => {
+            // reserve_outlet_economy rolls back its OWN staged bookkeeping on
+            // every failure branch, so no escrow/velocity/budget leaked — and
+            // its Class-S state is rolled back too, leaving nothing security-
+            // critical to durably land here. The §6.2.0.2 budget consumed above
+            // is NOT rolled back (non-refundable at initiation); persist so it
+            // durably lands, then reply. This is an already-failing terminal
+            // error: no success is acked and the only durable state is the soft
+            // Class-C anti-spam window increment, so best-effort — not fail-
+            // closed — is the honest intent; a persist failure just records the
+            // metric. `persist_state_best_effort` takes a SHARED
+            // `&PerContextState`, so this reads through the cell's `Deref`
+            // (`&*cell`) — no `state_mut()`.
+            persist_state_best_effort(&*cell, deps, &context_id_hex).await;
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Outcome::err_mutated(sketch);
+        }
+    };
 
     // 4. Stage the DURABLE caller-reservation reversal record (spec §6.2.4
     //    "Reservation release on every terminal path"), keyed by `SagaId`,

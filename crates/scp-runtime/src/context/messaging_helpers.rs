@@ -2769,6 +2769,10 @@ pub fn build_snapshot_from_state(
         // the caller deduction + void the escrow without the in-memory carrier.
         xctx_caller_reservations: xctx_caller_reservations_snapshot(state),
         xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
+        // §7.3.8 Class S: persist the value-caveat counters so a consumed
+        // `max_calls` / `amount_max_cumulative` / `rate_window` cap survives an
+        // actor crash rather than un-consuming. See [`caveat_counters_snapshot`].
+        caveat_counters: caveat_counters_snapshot(state),
         // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold the broadcast
         // security + roster state (per-author key epochs, block lists, subscriber
         // registry) into the fail-closed snapshot so a block / governance ban /
@@ -2885,6 +2889,21 @@ pub(in crate::context) fn xctx_nonce_dedup_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<[u8; 16], u64> {
     state.class_s.xctx_nonce_dedup.entries()
+}
+
+/// Build the Class-S snapshot projection of the actor's §7.3.8 value-caveat
+/// counters (ADR-049 §9). The live
+/// [`CaveatCounters`](crate::trust::caveat_counters::CaveatCounters) is a plain
+/// `Clone` serde value, so — like `xctx_committed_invocations_snapshot` — the
+/// snapshot stores the map directly. Exists so EVERY snapshot builder projects
+/// this Class-S field through ONE helper, exactly like its siblings — no Class-S
+/// field is centralized by convention alone. Without persisting it, a crash that
+/// rolled a consumed cap back behind an acked invocation would re-open the
+/// spend/rate window the counter closes.
+pub(in crate::context) fn caveat_counters_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<String, crate::trust::caveat_counters::CaveatCounters> {
+    state.class_s.caveat_counters.clone()
 }
 
 // ---------------------------------------------------------------------------
