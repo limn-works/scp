@@ -1628,6 +1628,9 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-CONTEXT-EXPORT-V1:"` | Signed context export snapshot signing | §23.16.8 |
 | `"SCP-XCTX-RECEIPT-V1:"` | Cross-context outlet receipt signing | §6.2.4 |
 | `"SCP-XCTX-DIVERGENCE-V1:"` | Cross-context divergence marker signing | §6.2.4 |
+| `"SCP-OUTLET-CHUNK-SIG-V1:"` | Per-chunk operator signature (outlet stream) | §5.4.5 |
+| `"SCP-OUTLET-CHUNK-V1:"` | Outlet-stream chunk Merkle manifest leaf/interior domain | §5.4.5 |
+| `"SCP-XCTX-STREAM-RECEIPT-V1:"` | Cross-context streaming-saga receipt signing | §6.2.4 |
 | `"SCP-INVITATION-BUNDLE-V1:"` | InvitationBundle signing — over the full genesis `ContextParams` (per-field JCS hashes) | §5.12.3.1 |
 | `"SCP-JOIN-RESPONSE-V1:"` | JoinResponse signing | §5.12.3.2 |
 | `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction over a §9.5.1 length-prefixed body, NOT a §9.5.1 signature-preimage separator (`"standing-"` is an output id-prefix) | §5.15.8 |
