@@ -3073,6 +3073,16 @@ async fn run_stream_pump_v2(
         }
     };
 
+    // §5.4.5 manifest-derived reference `chunks_billed` (count of `Data`
+    // leaves at or below `cancel_ack_seq`). Computed ONCE here from the
+    // operator-signed outer manifest so BOTH the audit event AND the
+    // money-moving settlement receipt anchor to the SAME value. The pump's
+    // running `summary.billed_count` is a runtime self-count that agrees
+    // with this reference on the honest path and diverges only on a runtime
+    // self-mismatch — precisely the case where neither the event nor the
+    // receipt may out-run the signed manifest.
+    let manifest_reference = reference_chunks_billed(&summary.manifest, summary.cancel_ack_seq);
+
     // §5.4.5 OutletInvokedEvent emission. The dispatch pump owns the
     // outer manifest (renumbered, cancel-ack-truncated) — the only
     // manifest that matches what SDK consumers actually received. We
@@ -3096,7 +3106,6 @@ async fn run_stream_pump_v2(
         // — that is the reference value; we cross-check it here and only
         // emit when it matches `reference_chunks_billed`.
         let pump_recorded = summary.billed_count;
-        let manifest_reference = reference_chunks_billed(&summary.manifest, summary.cancel_ack_seq);
         let audit_anomaly = if pump_recorded == manifest_reference {
             None
         } else {
@@ -3165,13 +3174,19 @@ async fn run_stream_pump_v2(
                 .value()
                 .saturating_add(summary.refund_amount.value()),
         );
+        // §5.4.5 round-9 (Fix-B, crypto MED) — anchor the RECEIPT to the
+        // operator-signed manifest exactly as the OutletInvokedEvent above is.
+        // See `anchor_settlement_receipt_to_manifest` for the full rationale.
+        let cost_per_chunk = event_inputs.counter_reserve.cost_per_chunk;
+        let (manifest_billed_amount, manifest_refund_amount) =
+            anchor_settlement_receipt_to_manifest(manifest_reference, cost_per_chunk, reserved);
         settlement_sink.settle(StreamSettlement {
             context_id: event_inputs.context_id.clone(),
             invoker_did: event_inputs.invoker_did.clone(),
             reserved,
-            billed_amount: summary.billed_amount,
-            refund_amount: summary.refund_amount,
-            billed_count: summary.billed_count,
+            billed_amount: manifest_billed_amount,
+            refund_amount: manifest_refund_amount,
+            billed_count: manifest_reference,
             request_id,
             outlet_id: event_inputs.outlet_id.clone(),
             // §5.4.5 MED-HIGH — carry the open-time economic snapshot so
@@ -3183,7 +3198,7 @@ async fn run_stream_pump_v2(
             amount_cumulative_reserved: event_inputs.counter_reserve.amount_cumulative_reserved,
             reserved_chunks: event_inputs.counter_reserve.reserved_chunks,
             ucan_cid: event_inputs.counter_reserve.ucan_cid.clone(),
-            cost_per_chunk: event_inputs.counter_reserve.cost_per_chunk,
+            cost_per_chunk,
         });
     }
 
@@ -3243,6 +3258,51 @@ pub fn verify_summary_chunks_billed(
 pub fn reference_chunks_billed(manifest: &[OutletStreamChunk], cancel_ack_seq: Option<u64>) -> u32 {
     let ceiling = cancel_ack_seq.unwrap_or(u64::MAX);
     compute_chunks_billed_ref(manifest, ceiling)
+}
+
+/// Re-derives the settlement receipt's `(billed_amount, refund_amount)` split
+/// from the operator-signed manifest reference count (§5.4.5 Fix-B).
+///
+/// The settlement receipt is the money-moving, non-repudiation billing
+/// artifact — unlike the lower-stakes audit event, it MUST bill only what the
+/// operator-signed chunk manifest supports, never the pump's un-verified
+/// escrow-ledger self-count. The dispatch pump therefore hands this the
+/// manifest-derived `reference_chunks_billed` (the SAME value the event's
+/// [`AuditAnomaly::ChunksBilledSelfMismatch`] check keys off) rather than the
+/// ledger's running `billed_count`, and this re-derives the billed/refund split
+/// from it:
+///
+/// - `billed = cost_per_chunk × manifest_reference`, with a `cost × count`
+///   overflow FAILING CLOSED to `0` (bill nothing rather than a bogus amount),
+///   then capped at the total `reserved` hold. The cap ensures the receipt can
+///   neither OUT-RUN the manifest (the divergence where the ledger over-counted)
+///   NOR exceed the escrow the manager actually debited (the divergence where
+///   the manifest over-counts the hold).
+/// - `refund = reserved − billed` (saturating), preserving the conservation
+///   identity `billed + refund == reserved` in EVERY case, so a corrected
+///   (lower) bill returns the difference to the invoker rather than stranding it.
+///
+/// On the honest path `manifest_reference == ledger billed_count`, so
+/// `cost × manifest_reference == ledger billed_amount ≤ reserved` and the result
+/// is byte-identical to the escrow ledger's own `settle_at_close` split. Only
+/// the runtime-self-mismatch case changes: the receipt follows the signed
+/// manifest, not the ledger. Mirrors the money-conservation cap the sink-side
+/// [`crate::context::outlets_helpers::settle_outlet_stream`] already applies.
+#[must_use]
+pub fn anchor_settlement_receipt_to_manifest(
+    manifest_reference: u32,
+    cost_per_chunk: Amount,
+    reserved: Amount,
+) -> (Amount, Amount) {
+    let billed = Amount::new(
+        cost_per_chunk
+            .value()
+            .checked_mul(u64::from(manifest_reference))
+            .unwrap_or(0)
+            .min(reserved.value()),
+    );
+    let refund = Amount::new(reserved.value().saturating_sub(billed.value()));
+    (billed, refund)
 }
 
 // ---------------------------------------------------------------------------
@@ -3323,6 +3383,92 @@ mod tests {
             pump_exited: false,
             context_handle,
         }))
+    }
+
+    /// §5.4.5 Fix-B (crypto MED) — the settlement RECEIPT (the money-moving,
+    /// non-repudiation billing artifact) MUST bill the manifest-derived count,
+    /// exactly as the audit event is anchored, NOT the pump's escrow-ledger
+    /// self-count. On the honest path the two agree; a runtime self-mismatch is
+    /// the ONLY case where they diverge — and it is precisely then that the
+    /// receipt must follow the operator-signed manifest, not the ledger.
+    ///
+    /// This unit-tests `anchor_settlement_receipt_to_manifest` — the pump→sink
+    /// boundary logic that re-derives the receipt's `(billed, refund)` split
+    /// from the manifest reference — across the honest path and both divergence
+    /// directions, since the honest pump keeps ledger and manifest consistent by
+    /// construction (a genuine self-mismatch cannot be driven through it, only
+    /// simulated by feeding a reference that differs from what the ledger
+    /// accrued).
+    #[test]
+    fn settlement_receipt_anchored_to_manifest_not_ledger_self_count() {
+        let cost_per_chunk = Amount::new(7);
+
+        // ---- Honest path: ledger count == manifest reference ----
+        // Ledger accrued 10 chunks: billed 70, reserved 70, refund 0.
+        // The manifest reference is also 10 → receipt identical to the ledger.
+        let reserved = Amount::new(70);
+        let (billed, refund) = anchor_settlement_receipt_to_manifest(10, cost_per_chunk, reserved);
+        assert_eq!(
+            (billed.value(), refund.value()),
+            (70, 0),
+            "honest path: receipt == escrow-ledger split (byte-identical)"
+        );
+
+        // ---- Divergence, ledger OVER-counts (the finding's core case) ----
+        // Simulate a self-mismatch: the escrow ledger self-counted 10 billable
+        // chunks (ledger billed_amount would be 70), but the operator-signed
+        // manifest only supports 8 (e.g. a cancel-ack truncation the ledger
+        // failed to honor). The receipt MUST bill the MANIFEST count (8 × 7 =
+        // 56), NOT the inflated ledger count (70), and refund the difference so
+        // no money is stranded.
+        let (billed, refund) = anchor_settlement_receipt_to_manifest(8, cost_per_chunk, reserved);
+        assert_eq!(
+            billed.value(),
+            56,
+            "divergence: receipt bills the MANIFEST-derived count (8×7), not the \
+             inflated escrow-ledger self-count (70)"
+        );
+        assert_eq!(
+            refund.value(),
+            14,
+            "divergence: the over-counted difference is refunded, not stranded"
+        );
+        assert_eq!(
+            billed.value() + refund.value(),
+            reserved.value(),
+            "conservation identity billed + refund == reserved holds under divergence"
+        );
+
+        // ---- Divergence, manifest OVER-counts the hold ----
+        // A manifest reference that would bill MORE than the escrow the manager
+        // actually debited is capped at `reserved` — the receipt can never
+        // exceed the hold. billed capped at 70, refund 0.
+        let (billed, refund) = anchor_settlement_receipt_to_manifest(100, cost_per_chunk, reserved);
+        assert_eq!(
+            (billed.value(), refund.value()),
+            (70, 0),
+            "receipt capped at the reserved hold — never bills more than was debited"
+        );
+
+        // ---- Overflow fails closed ----
+        // A `cost × count` multiplication overflow bills NOTHING (rather than a
+        // bogus wrapped amount) and refunds the whole hold.
+        let (billed, refund) =
+            anchor_settlement_receipt_to_manifest(u32::MAX, Amount::new(u64::MAX), reserved);
+        assert_eq!(
+            (billed.value(), refund.value()),
+            (0, 70),
+            "overflow fails closed: bill nothing, refund the full hold"
+        );
+
+        // ---- Zero-cost stream ----
+        let (billed, refund) =
+            anchor_settlement_receipt_to_manifest(5, Amount::new(0), Amount::new(0));
+        assert_eq!(
+            (billed.value(), refund.value()),
+            (0, 0),
+            "zero-cost stream settles to (0, 0)"
+        );
     }
 
     /// §5.4.4:426 grant-after-close lifecycle gate (HIGH-1). A credit
