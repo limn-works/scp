@@ -11228,6 +11228,20 @@ impl Supervisor {
             per_outlet: ctx_params.max_concurrent_inbound_streams_per_outlet,
         };
 
+        // §5.4.5 / SCP-OUT-034 — the four streaming timing/window policy fields
+        // are ALSO server policy, sourced AUTHORITATIVELY from the hosting
+        // context's live `ContextParams` (fetched above), NOT from anything the
+        // caller supplied on `OpenStreamParams`. A caller must not set its own
+        // initial credit window, credit-stall timeout, cancel-ack timeout, or
+        // UCAN-recheck cadence: those are the context creator's declared
+        // parameters, exactly like the admission caps overwritten just above.
+        // Overwriting here (the production open entry point) makes the
+        // caller-supplied values on `params` irrelevant — ContextParams wins.
+        params.credit_window = ctx_params.stream_window_default;
+        params.stream_credit_stall_secs = ctx_params.stream_credit_stall_secs;
+        params.stream_cancel_ack_secs = ctx_params.stream_cancel_ack_secs;
+        params.stream_ucan_recheck_secs = ctx_params.stream_ucan_recheck_secs;
+
         // Per-context admission tracker (per-invoker + per-outlet) +
         // operator-scoped origin admission tracker (per-origin-invoker,
         // §05-contexts.md:448) + node-level pump semaphore.
@@ -28075,6 +28089,20 @@ mod open_outlet_stream_tests {
         // with the hosting economic policy set (for the close-time receipt).
         let role_state = authorizing_role_state();
         let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+        // §5.4.5 / SCP-OUT-034 — the stream timing/window policy is AUTHORITATIVE
+        // from the hosting context's `ContextParams`, not the caller-supplied
+        // `OpenStreamParams`. Pin a 1-second cancel-ack timeout on the CONTEXT so
+        // the blocked executor's stream is force-terminated fast after the signed
+        // cancel drains to the terminal chunk within the 5s deadline below.
+        // (`params.stream_cancel_ack_secs` is set to a large sentinel to prove
+        // `ContextParams` — not the caller — is what governs the timeout.)
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key(),
+            scp_protocol::context::ContextParams {
+                stream_cancel_ack_secs: 1,
+                ..scp_protocol::context::ContextParams::default()
+            },
+        );
         state
             .handle
             .transition_to(&ContextState::Active)
@@ -28138,13 +28166,20 @@ mod open_outlet_stream_tests {
             available_balance: Amount::new(1_000_000),
             reserved_escrow: Amount::new(0),
             declared_estimated_chunk_count: Some(DECLARED_ESTIMATE),
-            credit_window: 32,
+            // These four timing/window fields are SERVER POLICY: `open_outlet_stream`
+            // OVERWRITES them from the hosting context's `ContextParams`
+            // (§5.4.5 / SCP-OUT-034), so the caller-supplied values here are
+            // IRRELEVANT. `stream_cancel_ack_secs` in particular is a large
+            // sentinel: if the caller value were (wrongly) honored the blocked
+            // executor's forced terminal would not fire within the 5s drain
+            // deadline and the test would fail — proving `ContextParams` (1s) wins.
+            credit_window: 999,
             caveats: caveats.clone(),
             invoker_pk,
             operator_signer: Arc::clone(&operator_signer),
-            stream_credit_stall_secs: 30,
-            stream_cancel_ack_secs: 1,
-            stream_ucan_recheck_secs: 3_600,
+            stream_credit_stall_secs: 999,
+            stream_cancel_ack_secs: 3_600,
+            stream_ucan_recheck_secs: 999,
             ucan_cid: UCAN_CID.to_owned(),
             request_id,
             revocation_checker: Arc::new(
@@ -28402,13 +28437,20 @@ mod open_outlet_stream_tests {
             available_balance: Amount::new(one_reservation),
             reserved_escrow: Amount::new(0),
             declared_estimated_chunk_count: Some(DECLARED_ESTIMATE),
-            credit_window: 32,
+            // These four timing/window fields are SERVER POLICY: `open_outlet_stream`
+            // OVERWRITES them from the hosting context's `ContextParams`
+            // (§5.4.5 / SCP-OUT-034), so the caller-supplied values here are
+            // IRRELEVANT. This open is rejected at the Phase-2 admission gate
+            // (per-invoker == 0) BEFORE the pump ever spawns, so no timer runs —
+            // the sentinels below never take effect and simply document the
+            // caller-supplied values as non-authoritative.
+            credit_window: 999,
             caveats: caveats.clone(),
             invoker_pk,
             operator_signer,
-            stream_credit_stall_secs: 30,
-            stream_cancel_ack_secs: 1,
-            stream_ucan_recheck_secs: 3_600,
+            stream_credit_stall_secs: 999,
+            stream_cancel_ack_secs: 3_600,
+            stream_ucan_recheck_secs: 999,
             ucan_cid: UCAN_CID.to_owned(),
             request_id,
             revocation_checker: Arc::new(
