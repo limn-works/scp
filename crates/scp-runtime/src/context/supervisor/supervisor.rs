@@ -11206,6 +11206,28 @@ impl Supervisor {
                 ),
             );
 
+        // §5.4.5 / §9.18.B — the three-tier concurrent-stream admission caps
+        // are AUTHORITATIVE from the hosting context's live `ContextParams`,
+        // NOT from the caller-supplied `params.caps`. Sourcing them here (the
+        // production open entry point) means a caller cannot inflate its own
+        // ceilings on the wire: the caps a stream is admitted against are
+        // exactly what the context creator declared. Fetched through the actor
+        // mailbox, the same path every other supervisor query uses. A vanished
+        // context (raced close between the reserve and this read) fails the
+        // open closed through the transport-fault admission slug; the escrow
+        // ticket armed above reverses the reserve's debited hold on the early
+        // return.
+        let Some(ctx_params) = self.context_params(context_id).await else {
+            return Err(dispatch::OpenStreamRejection::AdmissionRateLimited {
+                slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+            });
+        };
+        params.caps = crate::context::outlets::stream::AdmissionCaps {
+            per_invoker: ctx_params.max_concurrent_inbound_streams_per_invoker,
+            per_origin_invoker: ctx_params.max_concurrent_inbound_streams_per_origin_invoker,
+            per_outlet: ctx_params.max_concurrent_inbound_streams_per_outlet,
+        };
+
         // Per-context admission tracker (per-invoker + per-outlet) +
         // operator-scoped origin admission tracker (per-origin-invoker,
         // §05-contexts.md:448) + node-level pump semaphore.
@@ -28295,6 +28317,19 @@ mod open_outlet_stream_tests {
 
         let role_state = authorizing_role_state();
         let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+        // §5.4.5 / §9.18.B — the admission caps are AUTHORITATIVE from the
+        // hosting context's `ContextParams`, not the caller-supplied
+        // `params.caps`. Pin a zero per-invoker ceiling on the context so the
+        // Phase-2 admission gate rejects the open AFTER the reserve has debited
+        // the hold. (`params.caps` below is set HIGH to prove `ContextParams`
+        // wins.)
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key(),
+            scp_protocol::context::ContextParams {
+                max_concurrent_inbound_streams_per_invoker: 0,
+                ..scp_protocol::context::ContextParams::default()
+            },
+        );
         state
             .handle
             .transition_to(&ContextState::Active)
@@ -28352,12 +28387,14 @@ mod open_outlet_stream_tests {
 
         let params = OpenStreamParams {
             identity,
-            // Zero admission capacity forces a Phase-2 rejection AFTER the
-            // reserve has debited the hold.
+            // Deliberately HIGH: `open_outlet_stream` OVERWRITES `caps` from the
+            // context's `ContextParams` (per-invoker == 0, set above), so the
+            // Phase-2 admission gate rejects even though these caller-supplied
+            // caps would admit. This proves `ContextParams` is authoritative.
             caps: AdmissionCaps {
-                per_invoker: 0,
-                per_origin_invoker: 0,
-                per_outlet: 0,
+                per_invoker: 999,
+                per_origin_invoker: 999,
+                per_outlet: 999,
             },
             invoker_did: invoker().0,
             origin_invoker_did: invoker().0,
@@ -28446,5 +28483,190 @@ mod open_outlet_stream_tests {
              follow-up reserve of the full budget succeeds only once the \
              refund lands"
         );
+    }
+
+    /// §5.4.5 round-5 per-invoker admission tier + §9.18.B: the concurrent-
+    /// stream caps enforced in the production `open_outlet_stream` path are
+    /// sourced from the hosting context's `ContextParams`, NOT from the
+    /// caller-supplied `params.caps`. With `ContextParams` pinning
+    /// `max_concurrent_inbound_streams_per_invoker == 1` (and `params.caps`
+    /// deliberately set to `999` on every open), the second concurrent open by
+    /// the same invoker is rejected with the per-invoker transport slug —
+    /// proving the caps come from `ContextParams` and that the caller cannot
+    /// inflate its own ceiling on the wire (SCP-OUT-034 AC "per-invoker cap").
+    #[tokio::test]
+    async fn open_outlet_stream_per_invoker_cap_sourced_from_context_params() {
+        use scp_protocol::context::outlets::error_codes::SLUG_TRANSPORT_CONCURRENT_STREAMS_PER_INVOKER;
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let supervisor = build_supervisor(&captured);
+
+        // Host a context whose ContextParams pins per_invoker == 1.
+        let role_state = authorizing_role_state();
+        let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key(),
+            scp_protocol::context::ContextParams {
+                max_concurrent_inbound_streams_per_invoker: 1,
+                ..scp_protocol::context::ContextParams::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        state.role_state = role_state.clone();
+        state
+            .membership
+            .add_member(invoker(), "owner".to_owned(), Vec::new());
+        // Budget for two concurrent holds (2 × cost 10 × estimate 5 == 100),
+        // with headroom — the second open still reaches (and debits at) the
+        // reserve before the admission gate rejects it.
+        state
+            .governance
+            .budget_tracker
+            .grant(&invoker(), Amount::new(1_000_000));
+        state.governance.economic_policy = Some(policy());
+        let deps = supervisor
+            .build_actor_deps(&invoker())
+            .await
+            .expect("build_actor_deps");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn_actor_with_state");
+
+        let mut registry = OutletRegistry::new();
+        register_outlet(&mut registry, &role_state, registration(), &invoker().0)
+            .expect("register streaming outlet");
+
+        let invoker_key = SigningKey::from_bytes(&[0x24; 32]);
+        let invoker_pk = invoker_key.verifying_key();
+        let outlet_id: OutletId = "calculator".to_owned();
+
+        // Builds a well-formed open (params + matching caveat binding) for a
+        // distinct request_id. `caps` is HIGH (999) so any admission rejection
+        // is attributable ONLY to the context's per_invoker == 1 ceiling.
+        let make_open = |req_byte: u8| {
+            let mut caveats = InvocationCaveats::empty();
+            caveats.amount_max_cumulative = Some(Amount::new(1_000));
+            let request_id: RequestId = [req_byte; 16];
+            let caveats_jcs = caveats.to_canonical_json_bytes().expect("jcs");
+            let caveats_binding = compute_caveats_binding(
+                UCAN_CID.as_bytes(),
+                &request_id,
+                &invoker().0,
+                DECLARED_ESTIMATE,
+                &caveats_jcs,
+            );
+            let identity = StreamIdentity {
+                context_id: ctx_key(),
+                outlet_id: "calculator".to_owned(),
+                stream_epoch: 1,
+                caveats_binding,
+            };
+            let operator_signer: Arc<dyn StreamSigner> =
+                Arc::new(InProcessStreamSigner::new(invoker_key.clone()));
+            let params = OpenStreamParams {
+                identity,
+                caps: AdmissionCaps {
+                    per_invoker: 999,
+                    per_origin_invoker: 999,
+                    per_outlet: 999,
+                },
+                invoker_did: invoker().0,
+                origin_invoker_did: invoker().0,
+                cost_per_chunk: Amount::new(COST_PER_CHUNK),
+                available_balance: Amount::new(1_000_000),
+                reserved_escrow: Amount::new(0),
+                declared_estimated_chunk_count: Some(DECLARED_ESTIMATE),
+                credit_window: 32,
+                caveats: caveats.clone(),
+                invoker_pk,
+                operator_signer,
+                stream_credit_stall_secs: 30,
+                stream_cancel_ack_secs: 1,
+                stream_ucan_recheck_secs: 3_600,
+                ucan_cid: UCAN_CID.to_owned(),
+                request_id,
+                revocation_checker: Arc::new(
+                    scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+                ),
+                economic_policy_snapshot: None,
+            };
+            let binding = InvocationCaveatBinding {
+                caveats,
+                ucan_cid: UCAN_CID.to_owned(),
+            };
+            (params, binding)
+        };
+
+        // First open — admitted (per_invoker count 0 → 1). The blocking
+        // executor never emits a terminal chunk, so the admission slot stays
+        // occupied for the whole test.
+        let (params1, binding1) = make_open(0x11);
+        let exec1: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
+        let first = supervisor
+            .open_outlet_stream(
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                exec1,
+                None,
+                None,
+                None,
+                Some(binding1),
+                params1,
+            )
+            .await;
+        assert!(
+            first.is_ok(),
+            "the first open is admitted under the per_invoker == 1 ceiling"
+        );
+
+        // Second open by the SAME invoker while the first is still open — the
+        // per-invoker ceiling of 1 (from ContextParams) is saturated. Rejected
+        // with the per-invoker transport slug, even though params.caps == 999.
+        let (params2, binding2) = make_open(0x22);
+        let exec2: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
+        let second = supervisor
+            .open_outlet_stream(
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                exec2,
+                None,
+                None,
+                None,
+                Some(binding2),
+                params2,
+            )
+            .await;
+        match second {
+            Ok(_) => {
+                panic!("the (N+1)-th open must be rejected by the ContextParams per_invoker cap")
+            }
+            Err(crate::context::outlets::dispatch::OpenStreamRejection::AdmissionRateLimited {
+                slug,
+            }) => {
+                assert_eq!(
+                    slug, SLUG_TRANSPORT_CONCURRENT_STREAMS_PER_INVOKER,
+                    "rejection carries the per-invoker concurrent-streams slug \
+                     (caps sourced from ContextParams, not params.caps)"
+                );
+            }
+            Err(other) => {
+                panic!("expected AdmissionRateLimited per-invoker, got {other:?}")
+            }
+        }
+
+        // Keep the first stream's admission slot occupied through the assertion.
+        drop(first);
     }
 }

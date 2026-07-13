@@ -184,6 +184,7 @@ async fn context_params_all_fields() {
         consequence_rules: Vec::new(),
         consequence_config: ConsequenceConfig::default(),
         sybil_policy: None,
+        ..ContextParams::default()
     };
 
     assert_eq!(params.mode, ContextMode::Broadcast);

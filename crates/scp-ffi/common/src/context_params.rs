@@ -192,6 +192,11 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         consequence_rules,
         consequence_config,
         sybil_policy: None,
+        // §9.18.B streaming ContextParams fields (SCP-OUT-034) are not yet
+        // projected onto the FFI `CommonContextParams` surface; a context
+        // created through the bridges takes the protocol defaults until the
+        // outlet-streaming FFI surface wires them explicitly.
+        ..ContextParams::default()
     })
 }
 
