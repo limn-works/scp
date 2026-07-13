@@ -3174,6 +3174,43 @@ impl InnerPumpSigningContext {
     }
 }
 
+/// SCP-OUT-021 — caveat post-input check hook (§7.3.8).
+///
+/// The §7.3.8 caveat-enforcement seam: a boxed one-shot closure that owns
+/// the synchronous local checks
+/// ([`InvocationCaveats::check_invocation_local`](scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local))
+/// AND the asynchronous counter-store calls
+/// (`max_calls`, `amount_max_cumulative`, `rate_window`) — combining both
+/// into one closure preserves the §7.3.8 ordering invariant: synchronous
+/// caveats first (so a fast rejection does not consume counter capacity),
+/// counter-store next (atomic per-UCAN CAS).
+///
+/// A stream validates its input ONCE at open (§5.4.5), so the streaming
+/// dispatch open path
+/// ([`open_stream_session`](crate::context::outlets::dispatch::open_stream_session))
+/// runs this hook at that single open-time validation point, immediately
+/// after input-schema validation and before the pump spawns. The type is
+/// defined here in `invoke` because it is the shared §7.3.8 caveat seam
+/// built identically for the streaming and non-streaming paths.
+///
+/// On failure the hook returns [`InvocationError`] (typically
+/// [`InvocationError::InputValidationFailed`] or a manager-mapped
+/// authorization error); on success it returns `Ok(())` and the caller
+/// proceeds.
+///
+/// The hook receives a borrowed reference to the input `serde_json::Value`
+/// so the same value the executor will see (and the input hash will be
+/// computed from) is what the schema check observes. The hook MUST NOT
+/// mutate the input.
+pub type CaveatPostInputCheck<'a> = Box<
+    dyn FnOnce(
+            &serde_json::Value,
+        )
+            -> std::pin::Pin<Box<dyn Future<Output = Result<(), InvocationError>> + Send + 'a>>
+        + Send
+        + 'a,
+>;
+
 /// Streaming entry point for outlet invocation (SCP-OUT-033).
 ///
 /// Returns a `mpsc::Receiver<OutletStreamChunk>` that yields the chunks

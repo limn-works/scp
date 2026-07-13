@@ -248,6 +248,76 @@ pub fn prune_expired_window_entries(timestamps: &mut Vec<u64>, now: u64, window_
 }
 
 // ---------------------------------------------------------------------------
+// Off-mailbox durable counter-store seam (CaveatCounterApi / CounterError)
+// ---------------------------------------------------------------------------
+
+/// Failure surface for the durable §7.3.8 counter-store seam
+/// ([`CaveatCounterApi`]).
+///
+/// Two distinct failure surfaces share one return type: caveat exhaustion
+/// ([`CounterExhausted`]) is an authorization decision that flows back to the
+/// invoking SDK; storage failures ([`StoreError`](crate::store::StoreError))
+/// are infrastructure errors that bubble up to the runtime's general error
+/// handling. Splitting them lets callers pattern-match on the difference
+/// without a stringly-typed dispatch.
+#[derive(Debug, thiserror::Error)]
+pub enum CounterError {
+    /// The caveat counter would exceed its cap. Authorization rejection.
+    #[error(transparent)]
+    Exhausted(#[from] CounterExhausted),
+    /// The underlying persistent storage failed. Infrastructure error.
+    #[error("counter store error: {0}")]
+    Store(#[from] crate::store::StoreError),
+}
+
+/// SCP-OUT-021: type-erased durable counter-store seam for the off-mailbox
+/// streaming pump and the manager/FFI wiring.
+///
+/// The per-context actor owns [`CaveatCounters`] and mutates it under the
+/// mailbox for the unary/on-mailbox invocation path (see the module docs).
+/// The §5.4.5 streaming pump, however, runs OFF the actor mailbox
+/// (supervisor-side) and cannot take `&mut` to actor-owned Class-S state, so
+/// its open-time counter reservation and close-time release
+/// ([`crate::context::outlets::dispatch::StreamCounterReservation`]) go
+/// through this type-erased trait object. Boxing the concrete store as
+/// `Arc<dyn CaveatCounterApi>` removes the storage generic from the pump and
+/// manager call sites while preserving the CAS-style
+/// `check_and_increment` / `release` operations.
+///
+/// The concrete durable implementation (a `ProtocolRepository`-backed store)
+/// is supplied by the manager/FFI wiring; this crate defines only the seam so
+/// the off-mailbox pump compiles against the trait object. The trait is
+/// `Send + Sync` because invocation enforcement runs from async tasks shared
+/// across executors (napi, uniffi, etc.).
+pub trait CaveatCounterApi: Send + Sync {
+    /// Atomically checks the `(context_id, ucan_cid, kind)` counter against
+    /// `cap` (within `window_secs` for the rate window) and, on success,
+    /// increments it by `amount`. Returns
+    /// [`CounterError::Exhausted`] when the increment would breach the cap
+    /// and [`CounterError::Store`] on a persistence failure.
+    fn check_and_increment<'a>(
+        &'a self,
+        context_id: &'a str,
+        ucan_cid: &'a str,
+        kind: scp_protocol::trust::CaveatKind,
+        amount: u64,
+        cap: u64,
+        window_secs: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CounterError>> + Send + 'a>>;
+
+    /// Returns the unspent portion of a stream's open-time reservation to the
+    /// counter at close-time settlement (SCP R4 HIGH-1). Decrements the
+    /// `(context_id, ucan_cid, kind)` counter by `amount`.
+    fn release<'a>(
+        &'a self,
+        context_id: &'a str,
+        ucan_cid: &'a str,
+        kind: scp_protocol::trust::CaveatKind,
+        amount: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CounterError>> + Send + 'a>>;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
