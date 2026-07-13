@@ -94,6 +94,51 @@ class OutletError(ScpError):
     _default_code: str = "SCP-OUTLET-6000"
 
 
+class ProtocolError(OutletError):
+    """Protocol-class outlet failure (``OutletErrorClass::Protocol``, §5.4.4).
+
+    The common parent for every protocol-class condition — stream-lifecycle
+    violations, stream-already-open, unknown-session — so a ``catch``/``except``
+    author can handle all protocol-class errors through one branch. It is a
+    DIRECT subclass of :class:`OutletError`; its protocol-class siblings sit at
+    this same inheritance depth (the round-5 cross-SDK symmetry rule of
+    SCP-OUT-038: lifecycle errors sit at the same depth as their
+    semantic-class siblings).
+
+    On the wire the class renders as the lowercase variant ``"protocol"`` and
+    carries a code in the ``SCP-OUTLET-6100..6101`` Protocol sub-range.
+    """
+
+    _default_code: str = "SCP-OUTLET-6100"
+
+
+class InvalidGrant(ProtocolError):
+    """A stream-credit grant value outside the valid ``u32`` range (§5.4.5).
+
+    Raised at :class:`~scp_sdk.outlets.Credit` construction — ``Credit(0)``,
+    ``Credit(-1)``, and ``Credit(2**32)`` all raise this UNIFORMLY (never a bare
+    ``TypeError`` / ``ValueError`` / ``RangeError``), matching the SCP-OUT-031
+    round-6 uniform ``InvalidGrant`` rule across all four SDKs. The valid range
+    is the non-zero ``u32`` interval ``[1, 2**32)``.
+    """
+
+    _default_code: str = "SCP-OUTLET-6100"
+
+
+class StreamAlreadyClosed(ProtocolError):
+    """A control-plane call on a handle whose stream already reached a terminal.
+
+    Raised by :meth:`~scp_sdk.outlets.InvocationHandle.grant_credit` and
+    :meth:`~scp_sdk.outlets.InvocationHandle.cancel` when the handle's stream
+    has already delivered a terminal chunk (an ``End`` or a terminal
+    ``Error``) — the §5.4.5 InvocationHandle lifecycle guard (SCP-OUT-038,
+    API MAJOR 24). Sits at the same inheritance depth as its protocol-class
+    siblings under :class:`ProtocolError`.
+    """
+
+    _default_code: str = "SCP-OUTLET-6100"
+
+
 class ValidationError(ScpError):
     """Input validation failure (schema, parameters)."""
 
@@ -241,11 +286,14 @@ __all__ = [
     "ContextError",
     "CryptoError",
     "IdentityError",
+    "InvalidGrant",
     "OutletError",
+    "ProtocolError",
     "SagaAbortedError",
     "SagaBusyError",
     "SagaNeedsRepairError",
     "ScpError",
+    "StreamAlreadyClosed",
     "TransportError",
     "UcanPermissionError",
     "ValidationError",

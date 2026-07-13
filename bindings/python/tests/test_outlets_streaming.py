@@ -1,0 +1,509 @@
+"""Contract tests for the single-verb outlet streaming surface (SCP-OUT-038).
+
+These exercise the SDK-layer InvocationHandle contract — the awaitable +
+async-iterable handle, the ``Credit`` newtype, ``grant_credit`` / ``cancel``
+control-plane methods, and the lifecycle guard — against a scripted mock
+``_native`` bridge that plays back a JSON chunk sequence in the exact §5.4.5
+``OutletStreamChunk`` wire shape (``serde_bytes`` fields as integer arrays).
+
+The scripted bridge lets these tests validate ALL of the SDK's iteration /
+aggregation / control-plane / lifecycle logic without a built Rust extension —
+the same mock-``_native`` convention every other Python outlet test uses. The
+LIVE wire path (a real stream pumped over MLS with funded escrow and a granted
+capability) is covered by the Rust PyO3 live-poll test in
+``crates/scp-ffi/src/outlet_stream.rs`` (C7); it is NOT re-faked here.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from scp_sdk.context import Context
+from scp_sdk.errors import (
+    InvalidGrant,
+    OutletError,
+    ProtocolError,
+    StreamAlreadyClosed,
+)
+from scp_sdk.outlets import (
+    Aggregate,
+    Credit,
+    InvocationHandle,
+    Outlets,
+    OutletStreamChunk,
+)
+
+# ---------------------------------------------------------------------------
+# Wire-shape chunk builders (match §5.4.5 OutletStreamChunk serialization).
+# ---------------------------------------------------------------------------
+
+_REQUEST_ID = list(b"\x01" * 16)
+_SIG = list(b"\x22" * 64)
+
+
+def _chunk(sequence: int, payload: dict[str, Any]) -> bytes:
+    """Serialize one OutletStreamChunk exactly as ``outlet_stream_poll_next``
+    returns it: request_id / sig as ``serde_bytes`` integer arrays, payload
+    internally tagged by ``@type``."""
+    return json.dumps(
+        {
+            "request_id": _REQUEST_ID,
+            "sequence": sequence,
+            "payload": payload,
+            "sig": _SIG,
+        }
+    ).encode()
+
+
+def _data(sequence: int, value: Any) -> bytes:
+    return _chunk(sequence, {"@type": "data", "value": value})
+
+
+def _progress(sequence: int, pct: int, note: str | None = None) -> bytes:
+    payload: dict[str, Any] = {"@type": "progress", "pct": pct}
+    if note is not None:
+        payload["note"] = note
+    return _chunk(sequence, payload)
+
+
+def _end(sequence: int, aggregate: Any, execution_time_ms: int = 42) -> bytes:
+    return _chunk(
+        sequence,
+        {
+            "@type": "end",
+            "aggregate": aggregate,
+            "provenance": {"source": "outlet", "quality": "verified"},
+            "execution_time_ms": execution_time_ms,
+        },
+    )
+
+
+def _error(sequence: int, code: str, message: str, terminal: bool = True) -> bytes:
+    return _chunk(
+        sequence,
+        {"@type": "error", "code": code, "message": message, "terminal": terminal},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scripted mock bridge.
+# ---------------------------------------------------------------------------
+
+
+class _FakeNative:
+    """A thread-safe scripted ``_scp_core.SCP`` stand-in.
+
+    ``outlet_stream_poll_next`` plays back ``chunks`` in order then returns
+    ``None``; open / grant / cancel calls are recorded for assertions.
+    """
+
+    def __init__(self, chunks: list[bytes], handle_id: str = "stream-1") -> None:
+        self._chunks = list(chunks)
+        self._i = 0
+        self._lock = threading.Lock()
+        self._handle_id = handle_id
+        self.open_calls: list[tuple[Any, ...]] = []
+        self.grant_calls: list[tuple[str, str, int]] = []
+        self.cancel_calls: list[tuple[str, str]] = []
+
+    def outlet_stream_open(
+        self,
+        context_id: str,
+        outlet_id: str,
+        input: dict[str, Any],
+        caller_did: str,
+        ucan_token: str,
+        proof_tokens: list[str] | None,
+        spending_ucan: str | None,
+        timeout_ms: int | None,
+        estimated_chunk_count: int | None,
+    ) -> str:
+        self.open_calls.append(
+            (context_id, outlet_id, input, caller_did, ucan_token, estimated_chunk_count)
+        )
+        return self._handle_id
+
+    def outlet_stream_poll_next(self, handle_id: str) -> bytes | None:
+        with self._lock:
+            if self._i >= len(self._chunks):
+                return None
+            chunk = self._chunks[self._i]
+            self._i += 1
+            return chunk
+
+    def outlet_stream_grant_credit(self, handle_id: str, caller_did: str, grant: int) -> None:
+        self.grant_calls.append((handle_id, caller_did, grant))
+
+    def outlet_stream_cancel(self, handle_id: str, caller_did: str) -> None:
+        self.cancel_calls.append((handle_id, caller_did))
+
+
+def _make_ctx(
+    native: _FakeNative,
+    context_id: str = "ctx-1",
+    identity_did: str = "did:dht:caller",
+) -> Context:
+    scp = SimpleNamespace(_native=native)
+    raw_handle = SimpleNamespace(context_id=context_id, state="active")
+    return Context(raw_handle, identity_did=identity_did, scp=scp)
+
+
+def _invoke(native: _FakeNative, **kwargs: Any) -> InvocationHandle:
+    ctx = _make_ctx(native)
+    defaults: dict[str, Any] = {"ucan_token": "ucan-abc"}
+    defaults.update(kwargs)
+    return ctx.outlets.invoke("outlet-1", {"q": "x"}, **defaults)
+
+
+# ---------------------------------------------------------------------------
+# Credit newtype.
+# ---------------------------------------------------------------------------
+
+
+class TestCredit:
+    def test_valid_credit(self) -> None:
+        assert Credit(1).value == 1
+        assert Credit(10).value == 10
+        assert Credit(2**32 - 1).value == 2**32 - 1
+
+    def test_zero_raises_invalid_grant(self) -> None:
+        with pytest.raises(InvalidGrant):
+            Credit(0)
+
+    def test_negative_raises_invalid_grant_not_value_error(self) -> None:
+        with pytest.raises(InvalidGrant):
+            Credit(-1)
+        # Must be InvalidGrant specifically, never a bare ValueError.
+        try:
+            Credit(-5)
+        except InvalidGrant:
+            pass
+        except ValueError:  # pragma: no cover - would be a regression
+            pytest.fail("Credit(-5) raised ValueError, expected InvalidGrant")
+
+    def test_at_or_above_u32_ceiling_raises_invalid_grant(self) -> None:
+        with pytest.raises(InvalidGrant):
+            Credit(2**32)
+        with pytest.raises(InvalidGrant):
+            Credit(2**32 + 100)
+
+    def test_bool_rejected(self) -> None:
+        # bool is an int subclass; Credit(True) must not silently become Credit(1).
+        with pytest.raises(InvalidGrant):
+            Credit(True)
+
+    def test_non_int_rejected_as_invalid_grant_not_type_error(self) -> None:
+        with pytest.raises(InvalidGrant):
+            Credit("10")  # type: ignore[arg-type]
+
+    def test_invalid_grant_hierarchy(self) -> None:
+        assert issubclass(InvalidGrant, ProtocolError)
+        assert issubclass(ProtocolError, OutletError)
+        assert issubclass(StreamAlreadyClosed, ProtocolError)
+
+    def test_credit_equality_and_repr(self) -> None:
+        assert Credit(4) == Credit(4)
+        assert Credit(4) != Credit(5)
+        assert repr(Credit(4)) == "Credit(4)"
+
+
+# ---------------------------------------------------------------------------
+# invoke() surface + accessor.
+# ---------------------------------------------------------------------------
+
+
+class TestOutletsAccessor:
+    def test_ctx_outlets_returns_outlets(self) -> None:
+        ctx = _make_ctx(_FakeNative([]))
+        assert isinstance(ctx.outlets, Outlets)
+
+    def test_invoke_returns_handle_without_blocking(self) -> None:
+        native = _FakeNative([_data(0, {"n": 1}), _end(1, {"n": 1})])
+        handle = _invoke(native)
+        assert isinstance(handle, InvocationHandle)
+        # Lazy open: invoke() must not have opened the stream yet.
+        assert native.open_calls == []
+
+    def test_context_without_scp_raises(self) -> None:
+        from scp_sdk.errors import ContextError
+
+        raw_handle = SimpleNamespace(context_id="ctx-x", state="active")
+        bare = Context(raw_handle, identity_did="did:dht:x")
+        with pytest.raises(ContextError):
+            _ = bare.outlets
+
+
+# ---------------------------------------------------------------------------
+# Iteration + aggregation.
+# ---------------------------------------------------------------------------
+
+
+class TestStreaming:
+    async def test_async_iterates_all_chunks_including_progress(self) -> None:
+        chunks = [
+            _data(0, {"n": 0}),
+            _progress(1, 5000, note="halfway"),
+            _data(2, {"n": 1}),
+            _end(3, {"total": 2}),
+        ]
+        native = _FakeNative(chunks)
+        handle = _invoke(native)
+
+        collected = [chunk async for chunk in handle]
+
+        assert [c.kind for c in collected] == ["data", "progress", "data", "end"]
+        # Progress chunk is surfaced, not filtered.
+        progress = collected[1]
+        assert progress.kind == "progress"
+        assert progress.payload["pct"] == 5000
+        assert progress.payload["note"] == "halfway"
+        # Chunk decoding: sequence + opaque hex request_id/signature.
+        assert collected[0].sequence == 0
+        assert collected[0].request_id == bytes(_REQUEST_ID).hex()
+        assert collected[0].signature == bytes(_SIG).hex()
+        assert collected[-1].is_terminal is True
+
+    async def test_await_returns_aggregate(self) -> None:
+        native = _FakeNative([_data(0, {"n": 1}), _end(1, {"total": 1}, execution_time_ms=77)])
+        handle = _invoke(native)
+
+        result = await handle
+
+        assert isinstance(result, Aggregate)
+        assert result.value == {"total": 1}
+        assert result.execution_time_ms == 77
+        assert result.provenance == {"source": "outlet", "quality": "verified"}
+
+    async def test_await_helper_after_full_iteration_returns_cached_aggregate(self) -> None:
+        # AC: 10 Data + End -> iterator yields 11 chunks AND the await helper
+        # returns End.aggregate (same handle, no re-drain).
+        chunks = [_data(i, {"n": i}) for i in range(10)]
+        chunks.append(_end(10, {"total": 10}))
+        native = _FakeNative(chunks)
+        handle = _invoke(native)
+
+        collected = [chunk async for chunk in handle]
+        assert len(collected) == 11
+        assert sum(1 for c in collected if c.kind == "data") == 10
+
+        result = await handle
+        assert result.value == {"total": 10}
+
+    async def test_stream_opens_exactly_once(self) -> None:
+        native = _FakeNative([_data(0, {"n": 1}), _end(1, {"n": 1})])
+        handle = _invoke(native)
+        _ = [chunk async for chunk in handle]
+        assert len(native.open_calls) == 1
+        # open forwarded the caller identity + ucan.
+        ctx_id, outlet_id, _inp, caller, ucan, _est = native.open_calls[0]
+        assert (ctx_id, outlet_id, caller, ucan) == (
+            "ctx-1",
+            "outlet-1",
+            "did:dht:caller",
+            "ucan-abc",
+        )
+
+    async def test_error_terminal_raises_typed_outlet_error_on_await(self) -> None:
+        native = _FakeNative([_data(0, {"n": 1}), _error(1, "SCP-OUTLET-6130", "handler panic")])
+        handle = _invoke(native)
+
+        with pytest.raises(OutletError) as excinfo:
+            await handle
+        assert excinfo.value.code == "SCP-OUTLET-6130"
+        assert "handler panic" in str(excinfo.value)
+
+    async def test_stream_without_end_raises_protocol_error(self) -> None:
+        # Sender drops without a terminal chunk (poll_next -> None).
+        native = _FakeNative([_data(0, {"n": 1})])
+        handle = _invoke(native)
+        with pytest.raises(ProtocolError):
+            await handle
+
+    async def test_caller_did_override(self) -> None:
+        native = _FakeNative([_end(0, {"ok": True})])
+        handle = _invoke(native, caller_did="did:dht:other")
+        await handle
+        assert native.open_calls[0][3] == "did:dht:other"
+
+
+# ---------------------------------------------------------------------------
+# Control plane: grant_credit / cancel.
+# ---------------------------------------------------------------------------
+
+
+class TestControlPlane:
+    async def test_grant_credit_forwards_to_bridge(self) -> None:
+        native = _FakeNative([_data(0, {"n": 0}), _data(1, {"n": 1}), _end(2, {"n": 1})])
+        handle = _invoke(native)
+
+        await handle.grant_credit(Credit(4))
+
+        assert native.grant_calls == [("stream-1", "did:dht:caller", 4)]
+
+    async def test_grant_credit_mid_stream_reflected(self) -> None:
+        # AC: call grantCredit mid-stream; the grant reaches the bridge and the
+        # stream continues to its terminal.
+        chunks = [_data(i, {"n": i}) for i in range(4)]
+        chunks.append(_end(4, {"total": 4}))
+        native = _FakeNative(chunks)
+        handle = _invoke(native)
+
+        seen = 0
+        async for chunk in handle:
+            seen += 1
+            if seen == 2:
+                await handle.grant_credit(Credit(8))
+        assert native.grant_calls == [("stream-1", "did:dht:caller", 8)]
+        assert seen == 5
+
+    async def test_grant_credit_requires_credit_newtype_at_runtime(self) -> None:
+        native = _FakeNative([_end(0, {"n": 1})])
+        handle = _invoke(native)
+        with pytest.raises(InvalidGrant):
+            await handle.grant_credit(10)  # type: ignore[arg-type]
+        # A raw int never reached the bridge.
+        assert native.grant_calls == []
+
+    async def test_cancel_forwards_to_bridge(self) -> None:
+        native = _FakeNative([_data(0, {"n": 0}), _end(1, {"n": 0})])
+        handle = _invoke(native)
+
+        await handle.cancel()
+
+        assert native.cancel_calls == [("stream-1", "did:dht:caller")]
+
+    async def test_cancel_mid_stream_then_terminal(self) -> None:
+        # AC: cancel mid-stream; a terminal chunk still arrives and closes it.
+        chunks = [_data(0, {"n": 0}), _data(1, {"n": 1}), _end(2, {"cancelled": True})]
+        native = _FakeNative(chunks)
+        handle = _invoke(native)
+
+        seen = 0
+        async for chunk in handle:
+            seen += 1
+            if seen == 1:
+                await handle.cancel()
+        assert native.cancel_calls == [("stream-1", "did:dht:caller")]
+        assert seen == 3
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle guard: control plane after terminal raises StreamAlreadyClosed.
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleGuard:
+    async def test_grant_after_end_raises_stream_already_closed(self) -> None:
+        native = _FakeNative([_data(0, {"n": 1}), _end(1, {"n": 1})])
+        handle = _invoke(native)
+        await handle  # drain to End
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.grant_credit(Credit(10))
+        assert native.grant_calls == []
+
+    async def test_cancel_after_end_raises_stream_already_closed(self) -> None:
+        native = _FakeNative([_end(0, {"n": 1})])
+        handle = _invoke(native)
+        await handle
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.cancel()
+        assert native.cancel_calls == []
+
+    async def test_grant_after_terminal_error_raises_stream_already_closed(self) -> None:
+        native = _FakeNative([_error(0, "SCP-OUTLET-6130", "boom", terminal=True)])
+        handle = _invoke(native)
+        # Consume the terminal error chunk via iteration (observable), which
+        # closes the stream without raising in the iterator.
+        collected = [chunk async for chunk in handle]
+        assert collected[-1].kind == "error"
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.grant_credit(Credit(10))
+
+    async def test_grant_after_end_via_iteration_raises(self) -> None:
+        native = _FakeNative([_data(0, {"n": 0}), _end(1, {"n": 0})])
+        handle = _invoke(native)
+        _ = [chunk async for chunk in handle]
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Public-surface invariant: no public invoke_stream / invokeStream (SCP-OUT-006).
+# ---------------------------------------------------------------------------
+
+
+class TestPublicSurfaceInvariant:
+    def test_no_public_invoke_stream_symbol(self) -> None:
+        import scp_sdk
+        import scp_sdk.outlets as outlets_mod
+
+        assert not hasattr(scp_sdk, "invoke_stream")
+        assert not hasattr(outlets_mod, "invoke_stream")
+        assert not hasattr(InvocationHandle, "invoke_stream")
+        # The public verb is invoke; poll_next/grant_credit are not free funcs.
+        assert not hasattr(outlets_mod, "poll_next")
+        assert not hasattr(outlets_mod, "grant_credit")
+
+    def test_no_invoke_stream_token_in_bindings_sources(self) -> None:
+        # Mirrors the SCP-OUT-006 grep AC:
+        #   grep -rn 'invoke_stream\|invokeStream' bindings/ -> 0
+        bindings = Path(__file__).resolve().parents[2]
+        assert bindings.name == "bindings"
+        assert bindings.is_dir()
+        # The AC scopes the ban to the PUBLIC surface. Exempt (per the AC):
+        #   - test files (reference the token in negative assertions),
+        #   - generated / internal bridge wrappers the user never calls
+        #     directly (Swift Internal/ScpBindings, TS internal/napi|wasm),
+        #   - comment lines (a doc-comment naming the token is not a symbol).
+        skip_parts = {
+            "node_modules",
+            "build",
+            "tests",
+            "Tests",
+            ".build",
+            "dist",
+            "Internal",
+            "internal",
+        }
+        comment_starts = ("#", "//", "*", "/*", '"', "'")
+        offenders: list[str] = []
+        for path in bindings.rglob("*"):
+            if path.suffix not in {".py", ".ts", ".swift", ".kt"}:
+                continue
+            if skip_parts & set(path.parts):
+                continue
+            if path.name.startswith("test_") or path.name.endswith((".test.ts", "Tests.swift")):
+                continue
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith(comment_starts):
+                    continue
+                if "invoke_stream" in line or "invokeStream" in line:
+                    offenders.append(f"{path}: {line.strip()}")
+        assert offenders == [], f"public invoke_stream found in: {offenders}"
+
+
+class TestChunkParsing:
+    def test_malformed_chunk_raises_outlet_error(self) -> None:
+        with pytest.raises(OutletError):
+            OutletStreamChunk._from_bridge_bytes(b"not json")
+
+    def test_hex_string_request_id_accepted(self) -> None:
+        raw = json.dumps(
+            {
+                "request_id": "aabb",
+                "sequence": 0,
+                "payload": {"@type": "data", "value": 1},
+                "sig": "ccdd",
+            }
+        ).encode()
+        chunk = OutletStreamChunk._from_bridge_bytes(raw)
+        assert chunk.request_id == "aabb"
+        assert chunk.signature == "ccdd"
+        assert chunk.kind == "data"

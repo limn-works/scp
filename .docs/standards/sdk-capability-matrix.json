@@ -643,6 +643,32 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "stream_grant_credit",
+          "python": true,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "notes": "InvocationHandle control-plane method that extends the executor's billable credit window (§5.4.5, SCP-OUT-038). Wrapped BEHIND the single public invoke() verb: Python InvocationHandle.grant_credit(Credit) (bindings/python/scp_sdk/outlets.py), dispatching to the PyO3 outlet_stream_grant_credit export (crates/scp-ffi/src/outlet_stream.rs). Consumes a validated Credit newtype (non-zero u32; Credit(0)/negative/>=2**32 raise InvalidGrant), never a raw int. Python is the reference SDK (C11a); TypeScript/Swift/Kotlin mirrors are the remaining SCP-OUT-038 slices.",
+          "exemptions": {
+            "typescript": "SCP-OUT-038 TypeScript mirror not yet written; NAPI outlet_stream_grant_credit export is live, awaiting the InvocationHandle.grantCredit wrapper",
+            "kotlin": "SCP-OUT-038 Kotlin mirror not yet written; UniFFI outlet_stream_grant_credit export is live, awaiting the InvocationHandle.grantCredit wrapper",
+            "swift": "SCP-OUT-038 Swift mirror not yet written; UniFFI outlet_stream_grant_credit export is live, awaiting the InvocationHandle.grantCredit wrapper"
+          }
+        },
+        {
+          "name": "stream_cancel",
+          "python": true,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "notes": "InvocationHandle control-plane method that requests stream cancellation (§5.4.5, SCP-OUT-038). Wrapped BEHIND the single public invoke() verb: Python InvocationHandle.cancel() (bindings/python/scp_sdk/outlets.py), dispatching to the PyO3 outlet_stream_cancel export (crates/scp-ffi/src/outlet_stream.rs); the bridge signs the OutletCancel internally at the runtime-derived cursor. Python is the reference SDK (C11a); TypeScript/Swift/Kotlin mirrors are the remaining SCP-OUT-038 slices.",
+          "exemptions": {
+            "typescript": "SCP-OUT-038 TypeScript mirror not yet written; NAPI outlet_stream_cancel export is live, awaiting the InvocationHandle.cancel wrapper",
+            "kotlin": "SCP-OUT-038 Kotlin mirror not yet written; UniFFI outlet_stream_cancel export is live, awaiting the InvocationHandle.cancel wrapper",
+            "swift": "SCP-OUT-038 Swift mirror not yet written; UniFFI outlet_stream_cancel export is live, awaiting the InvocationHandle.cancel wrapper"
+          }
         }
       ]
     },

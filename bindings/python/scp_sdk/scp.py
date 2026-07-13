@@ -1007,7 +1007,7 @@ class SCP:
         from scp_sdk.context import Context
 
         raw = await asyncio.to_thread(self._native.context_create, identity_did, params)
-        return Context(raw, identity_did=identity_did)
+        return Context(raw, identity_did=identity_did, scp=self)
 
     async def context_drain_events(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_drain_events``."""
@@ -1034,7 +1034,7 @@ class SCP:
         raw = await asyncio.to_thread(self._native.context_import, data, importer_did)
         if raw is None:
             return None
-        return Context(raw, identity_did=importer_did)
+        return Context(raw, identity_did=importer_did, scp=self)
 
     async def context_is_member(self, handle: Any, did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_is_member``."""
@@ -1165,7 +1165,7 @@ class SCP:
             native_sealed,
             reservation_id,
         )
-        return Context(raw, identity_did=owning_did)
+        return Context(raw, identity_did=owning_did, scp=self)
 
     async def invite_member(
         self,

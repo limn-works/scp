@@ -126,6 +126,23 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Identity", "verify_attestation"): {
         "kotlin": ["verifyLinkAttestation"],
     },
+    # Outlets streaming control plane (SCP-OUT-038): the grant/cancel methods
+    # live on the InvocationHandle returned by the single public invoke() verb,
+    # so their SDK symbols are the bare method names (grant_credit / cancel),
+    # not a domain-prefixed free function. Only Python (the reference SDK) is
+    # wired today; the TS/Swift/Kotlin cells are false-with-exemption.
+    ("Outlets", "stream_grant_credit"): {
+        "python": ["grant_credit", "InvocationHandle.grant_credit"],
+        "typescript": ["grantCredit"],
+        "kotlin": ["grantCredit"],
+        "swift": ["grantCredit"],
+    },
+    ("Outlets", "stream_cancel"): {
+        "python": ["cancel", "InvocationHandle.cancel"],
+        "typescript": ["cancel"],
+        "kotlin": ["cancel"],
+        "swift": ["cancel"],
+    },
     # Context validation helpers
     ("Context", "metadata_record_serialize"): {
         "python": ["metadata_record_to_json"],
