@@ -1995,7 +1995,6 @@ impl Supervisor {
     // Wired by the `open_outlet_stream` orchestrator (chunk 3e), which hands
     // the returned tracker to `dispatch::open_stream_session`. Tested here in
     // chunk 3d (`outlet_stream_admission_for_is_get_or_create`).
-    #[allow(dead_code)]
     #[must_use]
     pub(in crate::context) fn outlet_stream_admission_for(
         &self,
@@ -10593,12 +10592,6 @@ impl Supervisor {
     /// channel closes; otherwise any error the reserve handler emits
     /// (rate-limit, not-a-member, escrow overflow / insufficient funds,
     /// persist failure).
-    #[allow(
-        dead_code,
-        reason = "streaming open reserve seam (sub-chunk 3a): the caller is \
-                  `Supervisor::open_outlet_stream<E>`, landed in a later sub-chunk of the \
-                  outlet-streaming runtime port. Exercised by unit tests now."
-    )]
     async fn reserve_outlet_stream_economy_via_actor(
         &self,
         context_id: &str,
@@ -10919,6 +10912,241 @@ impl Supervisor {
             executor,
         )
         .await
+    }
+
+    /// §5.4.5 streaming-native outlet invocation — the actor-model orchestrator
+    /// (chunk 3e). The streaming counterpart of [`Self::invoke_outlet_with_economy`].
+    ///
+    /// Threads the reserve → off-mailbox pump → settle bracket:
+    ///
+    /// 1. **Reserve (mailbox).** [`Self::reserve_outlet_stream_economy_via_actor`]
+    ///    runs the open-time economy reserve INSIDE the per-context actor on
+    ///    owned Class-S state (hard-rate + velocity + `cost_per_chunk ×
+    ///    estimated_chunk_count` escrow debit + seq-authority-B allocation),
+    ///    returning the `Send` [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation).
+    /// 2. **Pump (off-mailbox).** [`dispatch::open_stream_session`](crate::context::outlets::dispatch::open_stream_session)
+    ///    runs here, supervisor-side, driving the non-`Send` executor with the
+    ///    reservation's `handle` + `role_state` snapshots (NOT caller-supplied —
+    ///    the reserve snapshots them in-actor for a consistent lifecycle +
+    ///    membership view), the actor-owned counter store, the per-context
+    ///    admission tracker, and the node-level pump semaphore.
+    /// 3. **Settle (mailbox).** The [`ActorStreamSettlementSink`](crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink)
+    ///    fires from the pump's terminal-chunk block back onto the actor mailbox
+    ///    to refund the unspent escrow, release the unspent cumulative counter
+    ///    reserve, and capture the §19.15.5 `PaymentReceipt`.
+    ///
+    /// # Escrow refund on open failure
+    ///
+    /// The reserve DEBITS `reserved_escrow` before the pump spawns.
+    /// `open_stream_session` refunds nothing on its own rejection paths — it
+    /// rolls back only the admission slot / pump permit / counter it consumed.
+    /// So this orchestrator guards the debited hold with a
+    /// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+    /// backed by an [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink):
+    /// on a successful open the ticket is `consume`d (the pump's close-time
+    /// settlement now owns the unspent-portion refund); on ANY rejection the
+    /// ticket's `Drop` reverses the full hold via
+    /// [`OutletsCommand::ReverseStreamEscrow`]. Exactly one refund path fires,
+    /// never both — the two are mutually exclusive (`settlement_sink` fires only
+    /// once the pump spawns `Ok`, which is exactly when the ticket is consumed).
+    ///
+    /// # Sequence allocation (`base_sequence`)
+    ///
+    /// The reserve allocates the per-sender MLS send-sequence
+    /// (`reservation.base_sequence`, seq-authority-B). It is NOT consumed here:
+    /// per §5.4.5 the pump's per-chunk cursor starts at `0` per `request_id`
+    /// (`invoke.rs` "sequence starts at 0"), a DISTINCT counter from the message
+    /// send-sequence. `base_sequence` is surfaced to / released by the transport
+    /// send path (the later FFI/transport wiring chunk) — no `open_stream_session`
+    /// / `StreamSessionHandle` slot exists for it in this chunk.
+    ///
+    /// # Errors
+    ///
+    /// The reserve's [`ContextError`] is reverse-mapped into the open-time
+    /// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
+    /// taxonomy via
+    /// [`reserve_error_to_open_rejection`](crate::context::outlets_helpers::reserve_error_to_open_rejection);
+    /// any rejection `open_stream_session` returns propagates verbatim.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn open_outlet_stream<E>(
+        self: &Arc<Self>,
+        context_id: &str,
+        registry: &scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &scp_protocol::context::outlets::OutletId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        timeout_ms: Option<u32>,
+        executor: Arc<E>,
+        invoked_event_sink: Option<
+            Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink>,
+        >,
+        misdeclaration_sink: Option<
+            Arc<dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
+        >,
+        handler_panic_sink: Option<Arc<dyn crate::context::outlets::invoke::HandlerPanicSink>>,
+        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        mut params: crate::context::outlets::dispatch::OpenStreamParams,
+    ) -> Result<
+        crate::context::outlets::dispatch::StreamSessionHandle,
+        crate::context::outlets::dispatch::OpenStreamRejection,
+    >
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
+    {
+        use crate::context::outlets::dispatch;
+        use scp_protocol::context::outlets::error_codes;
+
+        // `now_secs` from the injected clock. A missing clock fails the open
+        // closed (no timestamp for the reserve's rate-limit / velocity /
+        // counter bookkeeping), routed through the transport-fault admission
+        // slug so the FFI surface shapes it like any other pre-open rejection.
+        let now_secs = match self.clock_ref() {
+            Some(clock) => {
+                use scp_clock::Clock as _;
+                clock.now_secs()
+            }
+            None => {
+                return Err(dispatch::OpenStreamRejection::AdmissionRateLimited {
+                    slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+                });
+            }
+        };
+
+        // The dispatch pump coerces the effective `estimated_chunk_count` from
+        // `(declared_estimated_chunk_count, caveats)`; the reserve MUST debit
+        // `cost_per_chunk × THE SAME estimate` or the escrow ledger the pump
+        // bills against would disagree with the debited hold. Coerce once here
+        // and thread the identical value into the reserve.
+        let estimated_chunk_count = crate::context::outlets::stream::coerce_estimated_chunk_count(
+            params.declared_estimated_chunk_count,
+            &params.caveats,
+        );
+
+        // Phase 1 — reserve via the actor mailbox. `max_per_action` is `None`:
+        // the streaming open surface negotiates no §19.5 SpendingCapability
+        // (parity with the reference build hook, which passes no adapter /
+        // target DID); cumulative spend is instead bounded by the §7.3.8
+        // `amount_max_cumulative` counter reserve committed at the pump's final
+        // gate.
+        let reservation = self
+            .reserve_outlet_stream_economy_via_actor(
+                context_id,
+                invoker_did,
+                params.cost_per_chunk,
+                estimated_chunk_count,
+                None,
+                now_secs,
+            )
+            .await
+            .map_err(|err| {
+                crate::context::outlets_helpers::reserve_error_to_open_rejection(&err)
+            })?;
+
+        // Fill the manager-debited escrow hold + the acceptance-time economic
+        // policy snapshot into `params` (the pump's Step 3 ledger + close-time
+        // settlement read these). A caller-supplied snapshot wins (mirrors the
+        // reference: a bridge that already computed it is not overridden).
+        params.reserved_escrow = reservation.reserved_escrow;
+        if params.economic_policy_snapshot.is_none() {
+            params.economic_policy_snapshot = reservation.economic_policy.clone().map(|policy| {
+                crate::context::outlets::invoke::EconomicPolicySnapshot { policy }
+            });
+        }
+
+        // The actor-owned durable caveat-counter store: routes the §7.3.8
+        // counter CAS onto the target context's Class-S `caveat_counters` via
+        // the mailbox. Always constructible in the actor architecture, so the
+        // helper's "no store → fail closed" branch is unreachable here.
+        let counter_store: Arc<dyn crate::trust::CaveatCounterApi> = Arc::new(
+            crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter::new(
+                Arc::clone(self),
+            ),
+        );
+
+        // §7.3.8 — build the synchronous local-check hook + the durable counter
+        // reservation from the VALIDATED-NARROWED effective caveats bound to the
+        // invocation UCAN. `None` binding ⇒ no post-input constraint ⇒ neither a
+        // hook nor a reservation (parity with the non-streaming free path).
+        // Caller-built `params.caveats` / `params.ucan_cid` mirror this binding
+        // (both minted from the same validated UCAN), so the pump's estimate
+        // coercion, `max_billable` ceiling, and counter-CAS key all agree.
+        let (caveat_post_input_check, counter_reservation) = match caveat_binding {
+            Some(binding) => crate::context::outlets_helpers::build_stream_post_input_hook(
+                &binding.caveats,
+                params.cost_per_chunk,
+                Some(&counter_store),
+            )?,
+            None => (None, None),
+        };
+
+        // Close-time settlement sink, holding the reservation's spawn-generation
+        // (the confused-deputy guard compares it to the live actor's generation
+        // at settle time, dropping a settlement aimed at a respawned instance).
+        let settlement_sink: Arc<dyn crate::context::outlets::invoke::StreamSettlementSink> =
+            Arc::new(
+                crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink::new(
+                    Arc::clone(self),
+                    reservation.generation,
+                ),
+            );
+
+        // Open-failure escrow guard (see the method doc). The reserve already
+        // debited `reserved_escrow`; if `open_stream_session` rejects, this
+        // ticket's `Drop` reverses the hold. Consumed on success — the pump's
+        // settlement then owns the unspent-portion refund.
+        let escrow_refund_sink: Arc<dyn dispatch::StreamEscrowRefundSink> = Arc::new(
+            crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
+                Arc::clone(self),
+            ),
+        );
+        let escrow_ticket = dispatch::StreamEscrowTicket::new(
+            escrow_refund_sink,
+            context_id.to_owned(),
+            invoker_did.clone(),
+            reservation.reserved_escrow,
+        );
+
+        // Per-context admission tracker + node-level pump semaphore (chunk 3d).
+        let admission = self.outlet_stream_admission_for(context_id);
+        let pump_semaphore = self.outlet_stream_pump_semaphore();
+
+        // Phase 2 — hand the executor + seams to the off-mailbox pump.
+        let open_result = dispatch::open_stream_session(
+            &reservation.handle,
+            registry,
+            &reservation.role_state,
+            outlet_id,
+            input,
+            invoker_did,
+            timeout_ms,
+            executor,
+            misdeclaration_sink,
+            handler_panic_sink,
+            invoked_event_sink,
+            Some(settlement_sink),
+            params,
+            admission,
+            pump_semaphore,
+            caveat_post_input_check,
+            counter_reservation,
+        )
+        .await;
+
+        match open_result {
+            Ok(handle) => {
+                // Pump spawned `Ok` — the close-time settlement now owns the
+                // unspent-escrow refund, so the open-path guard must NOT refund.
+                escrow_ticket.consume();
+                Ok(handle)
+            }
+            Err(rejection) => {
+                // The pump never spawned; drop the ticket so its `Drop` reverses
+                // the reserve's debited hold (the sole refund path on failure —
+                // the settlement sink never fires).
+                drop(escrow_ticket);
+                Err(rejection)
+            }
+        }
     }
 
     // AXIS: bridge-external (ADR-049 §5 placement invariant). `create_context`

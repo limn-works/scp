@@ -58,16 +58,8 @@ pub(crate) struct ActorClassSCaveatCounterAdapter {
 impl ActorClassSCaveatCounterAdapter {
     /// Wrap a supervisor `Arc` as the streaming counter store.
     ///
-    /// `dead_code` allow: the sole non-test constructor is the streaming open
-    /// orchestrator (`Supervisor::open_outlet_stream<E>`), landed in a later
-    /// sub-chunk of the outlet-streaming runtime port. Exercised by this
-    /// module's unit tests today.
-    #[allow(
-        dead_code,
-        reason = "streaming counter-store seam (sub-chunk 3b): the sole non-test caller is \
-                  the streaming open orchestrator, landed in a later sub-chunk. Exercised by \
-                  unit tests now."
-    )]
+    /// The non-test constructor is the streaming open orchestrator
+    /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
     pub(crate) const fn new(supervisor: Arc<Supervisor>) -> Self {
         Self { supervisor }
     }

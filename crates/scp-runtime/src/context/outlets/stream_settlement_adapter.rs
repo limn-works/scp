@@ -54,16 +54,8 @@ impl ActorEscrowRefundSink {
     /// open orchestrator — always runs on the runtime; the captured handle then
     /// outlives it into the `Drop` that may run off-runtime).
     ///
-    /// `dead_code` allow: the sole non-test constructor is the streaming open
-    /// orchestrator (`Supervisor::open_outlet_stream<E>`), landed in a later
-    /// sub-chunk of the outlet-streaming runtime port. Exercised by this
-    /// module's unit tests today.
-    #[allow(
-        dead_code,
-        reason = "streaming escrow-refund seam (sub-chunk 3c): the sole non-test caller is the \
-                  streaming open orchestrator, landed in a later sub-chunk. Exercised by unit \
-                  tests now."
-    )]
+    /// The non-test constructor is the streaming open orchestrator
+    /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
     pub(crate) fn new(supervisor: Arc<Supervisor>) -> Self {
         Self {
             supervisor,
@@ -123,16 +115,8 @@ impl ActorStreamSettlementSink {
     /// Wrap a supervisor `Arc` + the reservation's spawn-`generation` as the
     /// streaming settlement sink, capturing the current runtime handle.
     ///
-    /// `dead_code` allow: the sole non-test constructor is the streaming open
-    /// orchestrator (`Supervisor::open_outlet_stream<E>`), landed in a later
-    /// sub-chunk of the outlet-streaming runtime port. Exercised by this
-    /// module's unit tests today.
-    #[allow(
-        dead_code,
-        reason = "streaming settlement seam (sub-chunk 3c): the sole non-test caller is the \
-                  streaming open orchestrator, landed in a later sub-chunk. Exercised by unit \
-                  tests now."
-    )]
+    /// The non-test constructor is the streaming open orchestrator
+    /// (`Supervisor::open_outlet_stream<E>`, chunk 3e).
     pub(crate) fn new(supervisor: Arc<Supervisor>, generation: u64) -> Self {
         Self {
             supervisor,

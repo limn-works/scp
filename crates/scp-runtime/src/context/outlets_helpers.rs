@@ -2269,6 +2269,160 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming open orchestrator helpers (chunk 3e)
+// ---------------------------------------------------------------------------
+
+/// Reverse-maps the streaming reserve's [`ContextError`] into the open-time
+/// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
+/// taxonomy for the [`Supervisor::open_outlet_stream`](crate::context::supervisor::supervisor::Supervisor::open_outlet_stream)
+/// orchestrator.
+///
+/// # Mapping direction (documented per the chunk-3 plan §3a note)
+///
+/// The streaming reserve ([`reserve_outlet_stream_economy`]) runs INSIDE the
+/// per-context actor and can only reply with a `Send` [`ContextError`] across
+/// the mailbox, so it encodes its two economic open-time rejections through the
+/// LOSSLESS forward direction —
+/// [`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)
+/// → [`invocation_error_to_context`] — which embeds the §5.4.4 slug verbatim in
+/// the resulting `PermissionDenied` message. This function is the REVERSE map,
+/// applied supervisor-side once the reservation error crosses back over the
+/// mailbox: it recovers `EscrowOverflow` / `InsufficientFunds` by matching the
+/// embedded slug against the SAME `error_codes::SLUG_*` constants the reserve
+/// stamped (so the two ends move together if a slug is ever renamed), maps the
+/// hard-rate-limit reject to the transport-fault admission slug, and routes
+/// every other reserve error (not-a-member, persist failure, transport) through
+/// that same transport-fault admission slug — the identical defensive fallback
+/// [`open_stream_session`](crate::context::outlets::dispatch::open_stream_session)
+/// itself uses for a synchronous failure outside the OUT-034 open taxonomy.
+// The `RateLimited` arm and the catch-all fallback intentionally share a body
+// (both surface the transport-fault admission slug) but are SEMANTICALLY
+// distinct — one is the reserve's hard-rate reject, the other the defensive
+// fallback for errors outside the OUT-034 taxonomy. Keep them separate for the
+// documented mapping rather than collapsing the meaning into one arm.
+#[allow(clippy::match_same_arms)]
+pub fn reserve_error_to_open_rejection(
+    err: &ContextError,
+) -> crate::context::outlets::dispatch::OpenStreamRejection {
+    use crate::context::outlets::dispatch::OpenStreamRejection;
+    use scp_protocol::context::outlets::error_codes;
+
+    match err {
+        ContextError::RateLimited { .. } => OpenStreamRejection::AdmissionRateLimited {
+            slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+        },
+        ContextError::PermissionDenied(msg)
+            if msg.contains(error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW) =>
+        {
+            OpenStreamRejection::EscrowOverflow
+        }
+        ContextError::PermissionDenied(msg)
+            if msg.contains(error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS) =>
+        {
+            OpenStreamRejection::InsufficientFunds
+        }
+        _ => OpenStreamRejection::AdmissionRateLimited {
+            slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+        },
+    }
+}
+
+/// The pair returned by [`build_stream_post_input_hook`]: the synchronous
+/// §7.3.8 local-check hook and the durable counter reservation committed at the
+/// dispatch pump's final open-time gate.
+type StreamPostInputBuild = (
+    Option<crate::context::outlets::invoke::CaveatPostInputCheck<'static>>,
+    Option<crate::context::outlets::dispatch::StreamCounterReservation>,
+);
+
+/// Builds the §7.3.8 post-input caveat hook for a streaming open, ENTIRELY
+/// inside the runtime, from the streaming open's own inputs — so every bridge
+/// gets identical, complete enforcement without supplying any hook. Ported from
+/// the reference `ContextManager::build_stream_post_input_hook` onto the actor
+/// architecture (the counter store is the actor-owned
+/// [`ActorClassSCaveatCounterAdapter`](crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter)).
+///
+/// A stream validates its input ONCE at open (§5.4.5), so this hook is run
+/// exactly once by `open_stream_session` before the pump spawns. It composes
+/// the SAME enforcement the non-streaming `invoke` path runs:
+///
+/// - synchronous local checks — `input_schema`, `amount_max_per_call` (gated
+///   against `cost_per_chunk`, the §19.5 per-invocation pricing unit),
+///   `allowed_adapters`, `allowed_target_dids`;
+/// - the durable counter CAS — `max_calls`, `amount_max_cumulative`,
+///   `rate_window` — committed NOT here but at the FINAL open-time gate via the
+///   returned [`StreamCounterReservation`](crate::context::outlets::dispatch::StreamCounterReservation)
+///   (R4 HIGH-2), so a rejected open burns no counter capacity.
+///
+/// `negotiated_adapter` and `target_did` are `None` — the streaming open
+/// surface (parity with `outlet_invoke`) negotiates neither a payment adapter
+/// nor a cross-context target DID.
+///
+/// Returns:
+/// - `Ok((None, None))` when the effective caveat set carries no §7.3.8
+///   post-input constraint;
+/// - `Ok((Some(hook), reservation))` otherwise (`reservation` is `Some` iff a
+///   counter-bearing cap is present AND a counter store is configured);
+/// - `Err(CaveatPostInputViolation)` — FAIL CLOSED — when the effective caveats
+///   carry a counter-bearing cap but no counter store is available (unreachable
+///   in the actor architecture, where the adapter store is always constructible,
+///   but retained for a faithful port).
+pub fn build_stream_post_input_hook(
+    caveats: &InvocationCaveats,
+    cost_per_chunk: Amount,
+    counter_store: Option<&Arc<dyn crate::trust::CaveatCounterApi>>,
+) -> Result<StreamPostInputBuild, crate::context::outlets::dispatch::OpenStreamRejection> {
+    use scp_protocol::context::outlets::error_codes;
+
+    if !caveats.requires_post_input_check() {
+        return Ok((None, None));
+    }
+
+    let reservation = if caveats.has_counter_bearing_caveat() {
+        match counter_store {
+            Some(store) => Some(crate::context::outlets::dispatch::StreamCounterReservation {
+                counter_store: Arc::clone(store),
+                caveats: caveats.clone(),
+            }),
+            None => {
+                return Err(
+                    crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation {
+                        slug: error_codes::SLUG_AUTHORIZATION_DENIED.to_owned(),
+                    },
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let caveats_owned = caveats.clone();
+    let hook: crate::context::outlets::invoke::CaveatPostInputCheck<'static> =
+        Box::new(move |input: &serde_json::Value| {
+            let caveats = caveats_owned.clone();
+            let input = input.clone();
+            Box::pin(async move {
+                caveats
+                    .check_invocation_local(&input, cost_per_chunk, None, None)
+                    .map_err(|err| {
+                        use scp_protocol::trust::caveats::CheckInvocationError;
+                        let message = err.to_string();
+                        match err {
+                            CheckInvocationError::InputSchemaViolation { .. } => {
+                                InvocationError::InputValidationFailed { message }
+                            }
+                            other => InvocationError::CaveatViolation {
+                                slug: other.slug().to_owned(),
+                                message,
+                            },
+                        }
+                    })
+            })
+        });
+    Ok((Some(hook), reservation))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
