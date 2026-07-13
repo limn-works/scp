@@ -1304,11 +1304,34 @@ pub async fn reserve_outlet_stream_economy(
 // reference `ContextManager::outlet_stream_settle`.
 // ---------------------------------------------------------------------------
 
+/// Outcome of [`settle_outlet_stream`] — distinguishes a confused-deputy DROP
+/// (which touched nothing, so the handler must NOT flag a mutation) from a
+/// real settlement (which mutated owned state and owes a coalesced persist).
+#[derive(Debug)]
+pub enum StreamSettleOutcome {
+    /// The reservation's `generation` no longer matches the live actor — the
+    /// settlement was dropped without touching any state.
+    Dropped,
+    /// The settlement ran; the inner `Option` is the captured receipt (`None`
+    /// when nothing was billed / no adapter / capture failed).
+    Settled(Option<PaymentReceipt>),
+}
+
 /// §5.4.5 close-time economic settlement of a streaming-native invocation, run
-/// inside the per-context actor on owned state. The generation guard is applied
-/// by the [`SettleOutletStream`](crate::context::actor::commands::OutletsCommand::SettleOutletStream)
-/// handler BEFORE this call (a mismatch drops the settlement without reaching
-/// here).
+/// inside the per-context actor on owned state.
+///
+/// # Confused-deputy guard
+///
+/// The reservation was made against a specific actor-instance `generation`. If
+/// this actor's generation differs, the original instance was despawned and a
+/// NEW instance respawned for the same `context_id` between reserve and settle
+/// (an import replace / node teardown+respawn). Releasing the cumulative counter
+/// or refunding budget against THIS instance's owned state would corrupt the
+/// WRONG context's economy. Unlike the unary settle there is NO external payment
+/// escrow to void (the §5.4.5 open-time hold is a budget-tracker debit only, not
+/// a payment-rail authorization), so on a mismatch the settlement is DROPPED
+/// silently — [`StreamSettleOutcome::Dropped`], touching nothing. `generation`
+/// is a Class-C structural field read through the cell `Deref`.
 ///
 /// Order (matches the reference "release FIRST"): (1) RELEASE the unspent R4
 /// HIGH-1 cumulative-counter reserve back to the owned §7.3.8 `AmountCumulative`
@@ -1337,7 +1360,19 @@ pub async fn settle_outlet_stream(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     settlement: crate::context::outlets::invoke::StreamSettlement,
-) -> Option<PaymentReceipt> {
+    generation: u64,
+) -> StreamSettleOutcome {
+    if generation != cell.generation {
+        tracing::debug!(
+            context_id = %settlement.context_id,
+            reserved_generation = generation,
+            live_generation = cell.generation,
+            "outlet stream settlement landed on a replaced actor instance — dropping \
+             (no external escrow to void)"
+        );
+        return StreamSettleOutcome::Dropped;
+    }
+
     let crate::context::outlets::invoke::StreamSettlement {
         context_id,
         invoker_did,
@@ -1359,7 +1394,9 @@ pub async fn settle_outlet_stream(
     // [`CounterReserveSettlement::unspent_release_amount`](crate::context::outlets::dispatch::CounterReserveSettlement::unspent_release_amount).
     let unspent_release = u64::from(billed_count)
         .checked_mul(cost_per_chunk.value())
-        .map_or(0, |billed| amount_cumulative_reserved.saturating_sub(billed));
+        .map_or(0, |billed| {
+            amount_cumulative_reserved.saturating_sub(billed)
+        });
     // An empty `ucan_cid` (legacy / test caller with no durable counter
     // reservation) has no counter to release to.
     let should_release = unspent_release > 0 && !ucan_cid.is_empty();
@@ -1418,10 +1455,10 @@ pub async fn settle_outlet_stream(
     // zero-cost / no-payment-rail default).
     let (Some(adapter), Some(policy)) = (deps.payment_adapter.as_ref(), capture_policy.as_ref())
     else {
-        return None;
+        return StreamSettleOutcome::Settled(None);
     };
     if billed_amount.value() == 0 {
-        return None;
+        return StreamSettleOutcome::Settled(None);
     }
     match authorize_and_capture_stream_billed(
         adapter.as_ref(),
@@ -1441,7 +1478,7 @@ pub async fn settle_outlet_stream(
                 receipt_id = %hex::encode(receipt.receipt_id),
                 "outlet stream settlement captured PaymentReceipt"
             );
-            Some(receipt)
+            StreamSettleOutcome::Settled(Some(receipt))
         }
         Err(err) => {
             // Capture failed AFTER service was rendered (H8): the billed budget
@@ -1464,7 +1501,7 @@ pub async fn settle_outlet_stream(
                 &context_id,
                 deps.event_tx.as_ref(),
             );
-            None
+            StreamSettleOutcome::Settled(None)
         }
     }
 }

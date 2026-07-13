@@ -2398,9 +2398,8 @@ pub enum OutletsCommand {
         /// Oneshot reply carrying the captured receipt (`None` when nothing was
         /// billed / no adapter / capture failed / dropped on generation
         /// mismatch), or the dispatch / transport infra error.
-        reply: oneshot::Sender<
-            Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>,
-        >,
+        reply:
+            oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
     },
 }
 

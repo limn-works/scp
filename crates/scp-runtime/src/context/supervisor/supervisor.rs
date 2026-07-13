@@ -13035,9 +13035,7 @@ impl Supervisor {
             | OutletsCommand::ReleaseStreamCaveatCounter { context_id, .. }
             | OutletsCommand::ReverseStreamEscrow { context_id, .. }
             | OutletsCommand::SettleOutletEconomy { context_id, .. } => context_id.as_str(),
-            OutletsCommand::SettleOutletStream { settlement, .. } => {
-                settlement.context_id.as_str()
-            }
+            OutletsCommand::SettleOutletStream { settlement, .. } => settlement.context_id.as_str(),
         }
     }
 

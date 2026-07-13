@@ -166,7 +166,9 @@ pub(crate) async fn dispatch(
             member_did,
             amount,
             reply,
-        } => handle_reverse_stream_escrow(cell, deps, &context_id, &member_did, amount, reply).await,
+        } => {
+            handle_reverse_stream_escrow(cell, deps, &context_id, &member_did, amount, reply).await
+        }
         OutletsCommand::SettleOutletStream {
             settlement,
             generation,
@@ -317,20 +319,17 @@ async fn handle_reverse_stream_escrow(
 /// §5.4.5 close-time economic settlement.
 ///
 /// The actor-mailbox port of the reference `ContextManager::outlet_stream_settle`.
-///
-/// # Confused-deputy guard
-///
-/// The reservation was made against a specific actor-instance
-/// `generation`. If this actor's generation differs, the original instance was
-/// despawned and a NEW instance respawned for the same `context_id` between
-/// reserve and settle (an import replace / node teardown+respawn). Releasing the
-/// cumulative counter or refunding budget against THIS instance's owned state
-/// would corrupt the WRONG context's economy. Unlike the unary settle there is
-/// NO external payment escrow to void (the §5.4.5 open-time hold is a
-/// budget-tracker debit only, not a payment-rail authorization), so the correct
-/// action on mismatch is to DROP the settlement silently — reply `Ok(None)` and
-/// touch nothing. `generation` is a Class-C structural field read through the
-/// cell `Deref`.
+/// The confused-deputy generation guard (drop-on-mismatch), the
+/// release→refund→capture ordering, and the service-rendered capture-failure
+/// handling all live in
+/// [`outlets_helpers::settle_outlet_stream`](crate::context::outlets_helpers::settle_outlet_stream);
+/// this handler maps its
+/// [`StreamSettleOutcome`](crate::context::outlets_helpers::StreamSettleOutcome)
+/// onto the reply + the actor
+/// [`Outcome`]. A DROP touched no state (`Outcome::ok` — no coalesced persist);
+/// a real settlement mutated owned state (`Outcome::ok_mutated`). The helper
+/// never returns `Err` (a persist failure is KEEP'd + logged, service-rendered
+/// capture runs regardless), so the reply always carries the billing outcome.
 async fn handle_settle_outlet_stream(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -338,27 +337,19 @@ async fn handle_settle_outlet_stream(
     generation: u64,
     reply: oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
 ) -> Outcome<()> {
-    if generation != cell.generation {
-        tracing::debug!(
-            context_id = %settlement.context_id,
-            reserved_generation = generation,
-            live_generation = cell.generation,
-            "outlet stream settlement landed on a replaced actor instance — dropping \
-             (no external escrow to void)"
-        );
-        let _ = reply.send(Ok(None));
-        return Outcome::ok(());
+    use crate::context::outlets_helpers::StreamSettleOutcome;
+    match crate::context::outlets_helpers::settle_outlet_stream(cell, deps, *settlement, generation)
+        .await
+    {
+        StreamSettleOutcome::Dropped => {
+            let _ = reply.send(Ok(None));
+            Outcome::ok(())
+        }
+        StreamSettleOutcome::Settled(receipt) => {
+            let _ = reply.send(Ok(receipt));
+            Outcome::ok_mutated(())
+        }
     }
-
-    // Generations match: release the unspent cumulative reserve → refund the
-    // unspent escrow → capture the billed receipt. `settle_outlet_stream`
-    // performs the owned-state mutations under a fail-closed persist and the
-    // off-persist receipt capture; it never returns `Err` (a persist failure is
-    // KEEP'd + logged, service-rendered capture runs regardless), so the reply
-    // always carries the billing outcome.
-    let receipt = crate::context::outlets_helpers::settle_outlet_stream(cell, deps, *settlement).await;
-    let _ = reply.send(Ok(receipt));
-    Outcome::ok_mutated(())
 }
 
 /// Handle [`OutletsCommand::ReserveOutletEconomy`] — Phase 1 of the outlet
