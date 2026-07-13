@@ -2272,7 +2272,10 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
 /// `outlet_stream_open_path_wired_and_control_plane_not_found`. The outlet is
 /// ZERO-cost (`build_outlet_reg` declares no `cost`), so no escrow / funding
 /// fixture is needed — the reserve is `Amount(0)`.
-#[cfg(feature = "testing")]
+// Requires `testing` (test_insert_member + in-memory harness) AND the dedicated
+// non-leaking `outlet-capability-test-grant` feature (the capability-escalation
+// seam that authorizes the member invoker — see scp-runtime/Cargo.toml).
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
 #[test]
 #[allow(clippy::too_many_lines)] // single linear §5.4.5 live-stream flow — readability favors one test
 fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {

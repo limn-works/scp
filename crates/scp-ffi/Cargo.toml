@@ -33,6 +33,12 @@ server = ["scp-ffi-common/server", "dep:scp-node"]
 # an arbitrary value within the challenge window, which is a parity-test
 # construct, not a protocol feature.
 testing = ["scp-core/testing"]
+# Forwards the non-leaking capability-escalation test seam feature so the
+# outlet-stream live-flow e2e test can authorize a member invoker. Deliberately
+# NOT implied by `testing` / `allow_in_memory_custody` (see
+# scp-runtime/Cargo.toml) so the capability-escalation seam is never compiled
+# into a custody-escape-hatch bridge build.
+outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
 async-trait = { workspace = true }

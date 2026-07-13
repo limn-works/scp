@@ -30,6 +30,18 @@ allow_unencrypted_storage = []
 # `actor_saga_crash_recovery` test targets, so no production or FFI build can
 # reach the witness back-door.
 saga-witness-test-mint = []
+# Gates `Supervisor::test_grant_member_capability` — the test-only seam that
+# grants a §7.2.2 Tier-2 capability (e.g. `OutletCallAll`) directly into a
+# member's `role_state.member_capabilities`, bypassing the governance role-
+# assignment round-trip. This is an AUTHORITY-ESCALATION primitive, so it is
+# deliberately NOT implied by `testing`: a `testing`-gated grant would leak into
+# every `allow_in_memory_custody` build via `scp-ffi → dep:scp-testing →
+# scp-core{testing} → scp-runtime/testing`, compiling a capability-escalation
+# back-door into custody-escape-hatch builds. Enabled ONLY by the
+# `required-features` / explicit `--features` of the outlet-stream live-flow test
+# that needs to authorize a member invoker, so no production or FFI build can
+# reach it. Follows the `saga-witness-test-mint` precedent above.
+outlet-capability-test-grant = []
 
 [dependencies]
 openmls = { workspace = true }

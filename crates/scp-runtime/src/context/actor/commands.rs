@@ -383,9 +383,15 @@ pub enum MessagingCommand {
     /// the capability the same way an executed role assignment would populate
     /// the Tier-2 cache.
     ///
-    /// Gated behind the `testing` feature — never compiled into production
-    /// builds, never reachable from any FFI bridge.
-    #[cfg(feature = "testing")]
+    /// Gated behind the dedicated `outlet-capability-test-grant` feature —
+    /// NOT `testing`. `testing` leaks into every `allow_in_memory_custody`
+    /// bridge build (`scp-ffi → dep:scp-testing → scp-core{testing} →
+    /// scp-runtime/testing`), which would compile this authority-escalation
+    /// primitive into a custody-escape-hatch build; the dedicated feature is
+    /// enabled ONLY by the outlet-stream live-flow test. It has ZERO FFI/SDK
+    /// exports (only that test calls it), but the dedicated gate keeps the
+    /// primitive out of every non-test binary.
+    #[cfg(feature = "outlet-capability-test-grant")]
     TestGrantMemberCapability {
         /// Context identifier.
         context_id: String,

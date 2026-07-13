@@ -132,7 +132,7 @@ pub(crate) async fn dispatch(
             role,
             reply,
         } => handle_test_insert_member(cell, deps, &member_did, &role, reply),
-        #[cfg(feature = "testing")]
+        #[cfg(feature = "outlet-capability-test-grant")]
         MessagingCommand::TestGrantMemberCapability {
             context_id,
             member_did,
@@ -311,7 +311,7 @@ fn handle_test_insert_member(
 /// durable write fails, and the run loop retries it). Rejects an inactive
 /// context (pre-mutation gate → clean `err`, `mutated:false`) and an
 /// unrecognized capability stem.
-#[cfg(feature = "testing")]
+#[cfg(feature = "outlet-capability-test-grant")]
 async fn handle_test_grant_member_capability(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,

@@ -13046,16 +13046,20 @@ impl Supervisor {
     /// state as defense-in-depth alongside the UCAN gate, and the default
     /// `admin` / `member` roles grant only `messages:*`. Single-node outlet
     /// tests use this to authorize a member the same way the runtime fixture
-    /// `authorizing_role_state` does. Gated behind the `testing` feature —
-    /// never compiled into production builds, never reachable from any FFI
-    /// bridge.
+    /// `authorizing_role_state` does. This is an AUTHORITY-ESCALATION primitive,
+    /// so it is gated behind the dedicated `outlet-capability-test-grant`
+    /// feature — deliberately NOT `testing`, which leaks into every
+    /// `allow_in_memory_custody` bridge build and would compile the primitive
+    /// into a custody-escape-hatch binary. The dedicated feature is enabled ONLY
+    /// by the outlet-stream live-flow test, and the seam has ZERO FFI/SDK
+    /// exports (only that test calls it).
     ///
     /// # Errors
     ///
     /// - [`ContextError::MembershipFailed`] if the context is inactive or the
     ///   capability stem is unrecognized.
     /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
-    #[cfg(feature = "testing")]
+    #[cfg(feature = "outlet-capability-test-grant")]
     pub async fn test_grant_member_capability(
         &self,
         context_id: &str,
