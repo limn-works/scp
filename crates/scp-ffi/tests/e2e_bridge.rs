@@ -2181,7 +2181,6 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
             )
             .expect_err("a non-member invoker is rejected at the runtime membership gate");
         let msg = open_err.to_string();
-        eprintln!("PROBE_OPEN_ERR_MSG={msg}");
         assert!(
             msg.contains("SCP-OUTLET-6160"),
             "the open reached the runtime and mapped its rejection to a canonical \
