@@ -64,6 +64,10 @@ const SUPERVISOR_SRC: &str =
 // the bridge → runtime delegation so a future refactor cannot silently
 // regress to the bypass path.
 const PYO3_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C7). The PyO3
+// reference bridge for the streaming open + control plane.
+const PYO3_OUTLET_STREAM_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/src/outlet_stream.rs");
 const NAPI_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 
@@ -1962,6 +1966,51 @@ fn c4_pyo3_outlet_invoke_accepts_spending_ucan() {
         body.contains("parse_ucan"),
         "PyO3 outlet_invoke_impl must parse the spending UCAN JWT into a UcanToken \
          before passing it to invoke_outlet_with_economy."
+    );
+}
+
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C7). The PyO3
+// reference bridge's streaming open MUST (a) validate the invocation UCAN at
+// the bridge (the §5.4.5 "UCAN check locus" — validated exactly ONCE at open)
+// and (b) drive the runtime pump via `Supervisor::open_outlet_stream`. A
+// refactor that skipped either would disable authorization or leave the
+// producer unwired for Python streaming clients.
+#[test]
+fn c7_pyo3_outlet_invoke_stream_validates_ucan_and_reaches_open_outlet_stream() {
+    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "context_outlet_invoke_stream_impl")
+        .expect("context_outlet_invoke_stream_impl body must exist");
+    assert!(
+        body.contains("validate_outlet_ucan"),
+        "PyO3 streaming open must validate the invocation UCAN at the bridge \
+         (§5.4.5 UCAN check locus) before opening the stream."
+    );
+    assert!(
+        body.contains("open_outlet_stream"),
+        "PyO3 streaming open must reach Supervisor::open_outlet_stream — the \
+         runtime reserve → off-mailbox pump → settle orchestrator. Without it the \
+         §5.4.5 producer is unwired for Python streaming clients."
+    );
+}
+
+// The streaming cancel MUST use the runtime-derived cursor: the bridge NEVER
+// supplies a `next_seq` (a caller-supplied cursor forges `cancel_ack_seq` to
+// zero-out or over-bill delivered chunks — §5.4.5 CRITICAL #3). The bridge
+// cancel routes through `apply_outlet_cancel_signed`, which reads the live
+// emission cursor and signs internally.
+#[test]
+fn c7_pyo3_outlet_stream_cancel_uses_runtime_derived_cursor() {
+    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "outlet_stream_cancel_impl")
+        .expect("outlet_stream_cancel_impl body must exist");
+    assert!(
+        body.contains("apply_outlet_cancel_signed"),
+        "PyO3 streaming cancel must route through apply_outlet_cancel_signed \
+         (the runtime signs over its OWN live cursor — §5.4.5 CRITICAL #3). A \
+         caller-supplied next_seq would forge cancel_ack_seq."
+    );
+    assert!(
+        !body.contains("next_seq"),
+        "PyO3 streaming cancel must NOT construct or pass a next_seq — the cursor \
+         is runtime-derived (§5.4.5 CRITICAL #3)."
     );
 }
 

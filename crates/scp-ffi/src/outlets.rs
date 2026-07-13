@@ -321,7 +321,11 @@ fn outlet_register_impl(
 /// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
 /// or `outlet_call:*` capability. Extracted to keep `outlet_invoke_impl` within
 /// the 100-line clippy limit.
-fn validate_outlet_ucan(
+///
+/// `pub(crate)` so the §5.4.5 streaming open path in `outlet_stream.rs` reuses
+/// the IDENTICAL bridge-layer UCAN validation (the stream is validated exactly
+/// once at open — "UCAN check locus").
+pub(crate) fn validate_outlet_ucan(
     bi: &PyBridgeInstance,
     context_id: &str,
     outlet_id: &str,

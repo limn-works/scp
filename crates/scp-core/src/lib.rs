@@ -137,6 +137,27 @@ pub mod context {
             DEFAULT_SESSION_CAP_PER_CALLER, OutletSession, SessionStore, cleanup_expired,
             create_session, invoke_session,
         };
+        // §5.4.5 streaming-native outlet invocation — the runtime control
+        // surface the native FFI bridges wrap (SCP-OUT-037). The bridges
+        // depend on `scp-core`, not `scp-runtime` directly, so the
+        // open-time parameter bundle, the returned session handle, the
+        // open-rejection taxonomy, the control-plane identities/errors,
+        // the operator chunk signer trait, and the executor trait are
+        // surfaced here.
+        pub use scp_runtime::context::outlets::dispatch::{
+            CancelIdentity, OpenStreamParams, OpenStreamRejection, StreamCloseSummary,
+            StreamSessionHandle, TerminateError,
+        };
+        pub use scp_runtime::context::outlets::invoke::{
+            MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
+        };
+        pub use scp_runtime::context::outlets::signer::{
+            StreamSigner, StreamSignerCustodyCategory, StreamSignerError,
+        };
+        pub use scp_runtime::context::outlets::stream::{
+            AdmissionCaps, CancelError, GrantError, StreamIdentity, cancel_error_to_code,
+            grant_error_to_code,
+        };
     }
 }
 

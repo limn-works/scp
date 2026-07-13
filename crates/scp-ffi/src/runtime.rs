@@ -469,6 +469,19 @@ pub struct PyBridgeInstance {
     /// currently bound to an active `TransportManager`.
     pub(crate) connected_relay_url: RwLock<Option<String>>,
 
+    /// Per-instance active outlet-stream registry (§5.4.5, SCP-OUT-037).
+    ///
+    /// Maps a `StreamHandleId` (the stream's `request_id` as lowercase hex)
+    /// to the live [`StreamEntry`](crate::outlet_stream::StreamEntry) that
+    /// owns the returned `StreamSessionHandle` (control plane) and its
+    /// detached chunk receiver (data plane), plus the `invoker_did` pinned
+    /// at open. Per-INSTANCE (not a process-global) so handle-affinity and
+    /// no-bridge-globals hold: a stream opened on one bridge instance is
+    /// invisible to another, and instance shutdown drops every live stream
+    /// with the `Arc`. Entries are evicted when `poll_next` observes the
+    /// terminal (channel-closed) sentinel.
+    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+
     /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
     ///
     /// Migrated from a process-global
@@ -496,6 +509,7 @@ impl PyBridgeInstance {
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
             connected_relay_url: RwLock::new(None),
+            outlet_stream_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
         }
@@ -539,6 +553,7 @@ impl PyBridgeInstance {
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
             connected_relay_url: RwLock::new(None),
+            outlet_stream_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
         }
@@ -630,6 +645,7 @@ impl PyBridgeInstance {
                         scp_core::bridge::credentials::InMemoryCredentialStore::new(),
                     ),
                     connected_relay_url: RwLock::new(None),
+                    outlet_stream_registry: Arc::new(DashMap::new()),
                     #[cfg(feature = "allow_in_memory_custody")]
                     network: std::sync::Mutex::new(None),
                 };
@@ -760,6 +776,11 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Clear the outlet-stream registry so every live stream's
+        // `StreamSessionHandle` (and its detached chunk receiver) drops —
+        // dropping the receiver closes the channel and lets the off-mailbox
+        // pump observe the close and settle out during instance shutdown.
+        self.outlet_stream_registry.clear();
         // Reset lifecycle-owned typed slots so their held URLs / networks
         // do not survive past shutdown. Best-effort: on lock poisoning
         // we swallow the error and leave the slot alone — a poisoned

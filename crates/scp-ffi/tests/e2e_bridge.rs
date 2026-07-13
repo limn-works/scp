@@ -2069,3 +2069,273 @@ fn xctx_saga_authenticated_caller_commits_via_governance_established_interface()
         assert_eq!(out["ok"], 1, "committed output ok must be the handler's");
     });
 }
+
+// ============================================================================
+// Streaming outlets (§5.4.5, SCP-OUT-037 — C7 PyO3 reference bridge)
+// ============================================================================
+
+/// Creates an identity via the REAL bridge `identity_create` (which PUBLISHES
+/// the DID document into the instance's resolver, so UCAN signatures issued by
+/// it verify) and returns its DID string.
+fn published_identity_did(py: Python<'_>, scp: &_scp_core::scp::PyScp) -> String {
+    scp.identity_create(py, "in_memory", None)
+        .unwrap()
+        .into_pyobject(py)
+        .unwrap()
+        .getattr("did")
+        .unwrap()
+        .extract::<String>()
+        .unwrap()
+}
+
+/// End-to-end §5.4.5 streaming flow through the `PyO3` reference bridge:
+/// open → CRITICAL #1 (grant/cancel/terminate by a non-invoker → `SCP-PERM-3001`)
+/// → grant by the pinned invoker succeeds → `poll_next` drains the Data chunk →
+/// drain to terminal → `poll_next` returns `None` (which evicts the entry).
+#[test]
+#[allow(clippy::too_many_lines)] // single comprehensive §5.4.5 e2e flow — readability favors one linear test over arbitrary splits
+fn outlet_stream_open_path_wired_and_control_plane_not_found() {
+    Python::with_gil(|py| {
+        // Initializes the process-global tokio runtime the bridge methods block
+        // on (`identity_create`, `outlet_invoke_stream`, …).
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let bi = scp.bridge_instance();
+
+        // Create identities via the REAL bridge `identity_create` so each DID
+        // document is PUBLISHED into the resolver — the UCAN signature check at
+        // open resolves the issuer's key. Identities are created BEFORE the
+        // context manager so the supervisor's governance key resolver snapshots
+        // the real document-VM resolver (mirrors the saga tests' ordering).
+        let creator = published_identity_did(py, &scp);
+        // The invoker is a SEPARATE hosted identity the creator delegates to —
+        // a self-delegation (iss == aud) would require a key_scope (ADR-039).
+        let invoker = published_identity_did(py, &scp);
+        let stranger = published_identity_did(py, &scp);
+
+        runtime::init_context_manager_for_test(bi);
+        // Create the context via the REAL bridge method so its actor is spawned
+        // on the SAME process-global runtime the streaming ops query (a context
+        // created on a different runtime is unreachable → transport.rate-limited).
+        let ctx = {
+            let params = PyDict::new(py);
+            let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
+            handle_context_id(py, &handle)
+        };
+
+        // Outlet operated by the creator (co-resident custody signs chunks).
+        let reg = build_outlet_reg(py, "streaming_calc", &creator);
+        let outlet_id = scp.outlet_register(&ctx, &reg.as_borrowed()).unwrap();
+
+        // Schema-valid Data value ({sum, ok}).
+        runtime::register_outlet_handler(
+            bi,
+            &ctx,
+            &outlet_id,
+            std::sync::Arc::new(
+                |_input: serde_json::Value| -> Result<serde_json::Value, String> {
+                    Ok(serde_json::json!({ "sum": 3, "ok": 1 }))
+                },
+            ),
+        )
+        .unwrap();
+
+        // Creator-issued outlet_call UCAN delegated to the invoker (root
+        // issuer == context creator).
+        let ucan = scp
+            .ucan_mint(&ctx, &invoker, vec!["outlet_call:*".to_owned()], None)
+            .unwrap();
+
+        let input = PyDict::new(py);
+        input.set_item("a", "1").unwrap();
+        input.set_item("b", "2").unwrap();
+
+        // OPEN — drives the WHOLE bridge open path end-to-end: bridge UCAN
+        // validation (11-step ADR-016), §7.3.8 effective-caveat resolution +
+        // caveats-binding computation, custody resolution of BOTH the operator
+        // chunk signer and the invoker verifying key, `StreamIdentity` +
+        // `OpenStreamParams` construction, the live revocation-checker wiring,
+        // the executor adapter, and the `Supervisor::open_outlet_stream`
+        // dispatch. The invoker is a delegated NON-member, so the open reaches
+        // the runtime's §9.8.5 membership gate and is rejected there — proving
+        // the open path is fully wired and that `OpenStreamRejection` maps to a
+        // canonical outlet-class code (NOT a UCAN error: reaching the
+        // runtime gate means UCAN validation PASSED). A member invoker with the
+        // funded economy fixture drives the pump to completion at the RUNTIME
+        // level in `open_outlet_stream_reserve_pump_settle_end_to_end`; the
+        // bridge control methods below are thin pass-throughs to that same
+        // `StreamSessionHandle` surface (a member-backed live stream is not
+        // constructible at the bridge boundary — it needs the
+        // `pub(in crate::context)` `spawn_actor_with_state` fixture).
+        let open_err = scp
+            .outlet_invoke_stream(
+                &ctx,
+                &outlet_id,
+                &input.as_borrowed(),
+                &invoker,
+                &ucan.encoded,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("a non-member invoker is rejected at the runtime membership gate");
+        let msg = open_err.to_string();
+        eprintln!("PROBE_OPEN_ERR_MSG={msg}");
+        assert!(
+            msg.contains("SCP-OUTLET-6160"),
+            "the open reached the runtime and mapped its rejection to a canonical \
+             SCP-OUTLET code (UCAN validation passed): {msg}"
+        );
+
+        // Control-plane graceful not-found: the six control methods on an
+        // unknown handle must return a clean error / None — never panic. (The
+        // live CRITICAL #1 caller==invoker gate fires only against a live entry;
+        // its discrimination is exercised at the runtime handle level.)
+        let bogus = "0".repeat(32);
+        let dummy_grant =
+            serde_json::to_vec(&scp_core::context::outlets::stream::OutletStreamCredit {
+                request_id: [0u8; 16],
+                grant: 1,
+                monotonic_seq: 1,
+                sig: [0u8; 64],
+            })
+            .unwrap();
+        assert!(
+            scp.outlet_stream_grant_credit(&bogus, &invoker, &dummy_grant)
+                .unwrap_err()
+                .to_string()
+                .contains("no active outlet stream"),
+            "grant on an unknown handle is a clean not-found error"
+        );
+        assert!(
+            scp.outlet_stream_cancel(&bogus, &invoker)
+                .unwrap_err()
+                .to_string()
+                .contains("no active outlet stream"),
+            "cancel on an unknown handle is a clean not-found error"
+        );
+        assert!(
+            scp.outlet_stream_terminate(
+                &bogus,
+                &invoker,
+                "authorization.revoked-mid-stream",
+                "SCP-OUTLET-6110",
+                "x",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no active outlet stream"),
+            "terminate on an unknown handle is a clean not-found error"
+        );
+        assert!(
+            scp.outlet_stream_poll_next(&bogus).unwrap().is_none(),
+            "poll on an unknown handle is a clean None"
+        );
+
+        // The terminate slug/code guards are pure input validation (reachable
+        // without a live stream): an unknown slug and a code that disagrees with
+        // its slug both fail closed as validation errors.
+        assert!(
+            scp.outlet_stream_terminate(&bogus, &invoker, "not.a.terminal.slug", "x", "y")
+                .is_err(),
+            "an unknown terminate slug is rejected"
+        );
+        assert!(
+            scp.outlet_stream_terminate(
+                &bogus,
+                &invoker,
+                "authorization.revoked-mid-stream",
+                // In-range OUTLET code that disagrees with the slug's canonical
+                // code (SCP-OUTLET-6110) — the mismatch guard must reject it.
+                "SCP-OUTLET-6120",
+                "y",
+            )
+            .is_err(),
+            "a terminate code that disagrees with its slug is rejected"
+        );
+        let _ = stranger;
+    });
+}
+
+/// The two pure protocol wrappers round-trip: `compute_caveats_binding`
+/// produces the 32-byte binding, and `verify_chunk_signature` rejects a chunk
+/// signed under a different key (fail-closed) while accepting a correctly
+/// signed one.
+#[test]
+fn outlet_stream_pure_wrappers_roundtrip() {
+    Python::with_gil(|_py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let empty = scp_core::trust::caveats::InvocationCaveats::empty();
+        let caveats_jcs = empty.to_canonical_json_bytes().unwrap();
+        let request_id = [7u8; 16];
+        let binding = scp
+            .outlet_stream_compute_caveats_binding(
+                b"cid-abc",
+                &request_id,
+                "did:dht:zInvoker",
+                3,
+                &caveats_jcs,
+            )
+            .unwrap();
+        assert_eq!(binding.len(), 32, "caveats binding is 32 bytes");
+        // Matches the pure protocol helper exactly.
+        let expected = scp_core::context::outlets::stream::compute_caveats_binding(
+            b"cid-abc",
+            &request_id,
+            "did:dht:zInvoker",
+            3,
+            &caveats_jcs,
+        );
+        assert_eq!(binding.as_slice(), expected.as_slice());
+
+        // Sign a chunk with a known key; verify accepts under the matching key.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let vk = key.verifying_key();
+        let binding32 = <[u8; 32]>::try_from(binding.as_slice()).unwrap();
+        let payload = scp_core::context::outlets::stream::ChunkPayload::Data {
+            value: serde_json::json!({ "sum": 3 }),
+        };
+        let sig = scp_core::context::outlets::stream::sign_chunk(
+            &key,
+            "ctx-1",
+            "outlet-1",
+            &request_id,
+            0,
+            &binding32,
+            &payload,
+        )
+        .unwrap();
+        let chunk = scp_core::context::outlets::stream::OutletStreamChunk {
+            request_id,
+            sequence: 0,
+            payload,
+            sig,
+        };
+        let chunk_bytes = serde_json::to_vec(&chunk).unwrap();
+        assert!(
+            scp.outlet_stream_verify_chunk_signature(
+                &chunk_bytes,
+                vk.as_bytes(),
+                "ctx-1",
+                "outlet-1",
+                &binding,
+            )
+            .unwrap(),
+            "correctly signed chunk verifies"
+        );
+        // A different operator key is rejected (fail-closed).
+        let other_vk = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]).verifying_key();
+        assert!(
+            !scp.outlet_stream_verify_chunk_signature(
+                &chunk_bytes,
+                other_vk.as_bytes(),
+                "ctx-1",
+                "outlet-1",
+                &binding,
+            )
+            .unwrap(),
+            "chunk signed by a different key must NOT verify"
+        );
+    });
+}

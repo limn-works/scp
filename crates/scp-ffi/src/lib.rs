@@ -62,6 +62,7 @@ pub mod event_log;
 pub mod identity;
 pub mod mcp;
 pub mod media;
+pub mod outlet_stream;
 pub mod outlets;
 pub mod provenance;
 pub mod runtime;
