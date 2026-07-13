@@ -69,6 +69,10 @@ const PYO3_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/outl
 const PYO3_OUTLET_STREAM_SRC: &str =
     include_str!("../../../../crates/scp-ffi/src/outlet_stream.rs");
 const NAPI_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8a). The NAPI
+// bridge for the streaming open + control plane (mirrors the PyO3 reference).
+const NAPI_OUTLET_STREAM_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/napi/src/outlet_stream.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 
 // NAPI context bridge — the only bridge with a live relay subscribe loop
@@ -2010,6 +2014,51 @@ fn c7_pyo3_outlet_stream_cancel_uses_runtime_derived_cursor() {
     assert!(
         !body.contains("next_seq"),
         "PyO3 streaming cancel must NOT construct or pass a next_seq — the cursor \
+         is runtime-derived (§5.4.5 CRITICAL #3)."
+    );
+}
+
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8a). The NAPI
+// bridge's streaming open MUST (a) validate the invocation UCAN at the bridge
+// (the §5.4.5 "UCAN check locus" — validated exactly ONCE at open) and (b)
+// drive the runtime pump via `Supervisor::open_outlet_stream`. A refactor that
+// skipped either would disable authorization or leave the producer unwired for
+// Node/Bun streaming clients. Mirrors the PyO3 C7 assertion.
+#[test]
+fn c8_napi_outlet_stream_open_validates_ucan_and_reaches_open_outlet_stream() {
+    let body = extract_fn_body(NAPI_OUTLET_STREAM_SRC, "outlet_stream_open_on")
+        .expect("outlet_stream_open_on body must exist");
+    assert!(
+        body.contains("validate_ucan_for_outlet"),
+        "NAPI streaming open must validate the invocation UCAN at the bridge \
+         (§5.4.5 UCAN check locus) before opening the stream."
+    );
+    assert!(
+        body.contains("open_outlet_stream"),
+        "NAPI streaming open must reach Supervisor::open_outlet_stream — the \
+         runtime reserve → off-mailbox pump → settle orchestrator. Without it the \
+         §5.4.5 producer is unwired for Node/Bun streaming clients."
+    );
+}
+
+// The NAPI streaming cancel MUST use the runtime-derived cursor: the bridge
+// NEVER supplies a `next_seq` (a caller-supplied cursor forges `cancel_ack_seq`
+// to zero-out or over-bill delivered chunks — §5.4.5 CRITICAL #3). It routes
+// through `apply_outlet_cancel_signed`, which reads the live emission cursor and
+// signs internally. Mirrors the PyO3 C7 assertion.
+#[test]
+fn c8_napi_outlet_stream_cancel_uses_runtime_derived_cursor() {
+    let body = extract_fn_body(NAPI_OUTLET_STREAM_SRC, "outlet_stream_cancel_on")
+        .expect("outlet_stream_cancel_on body must exist");
+    assert!(
+        body.contains("apply_outlet_cancel_signed"),
+        "NAPI streaming cancel must route through apply_outlet_cancel_signed \
+         (the runtime signs over its OWN live cursor — §5.4.5 CRITICAL #3). A \
+         caller-supplied next_seq would forge cancel_ack_seq."
+    );
+    assert!(
+        !body.contains("next_seq"),
+        "NAPI streaming cancel must NOT construct or pass a next_seq — the cursor \
          is runtime-derived (§5.4.5 CRITICAL #3)."
     );
 }

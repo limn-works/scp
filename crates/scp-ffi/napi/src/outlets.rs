@@ -21,7 +21,7 @@ use crate::error::ScpNapiError;
 /// Validates a UCAN token for outlet invocation authorization.
 ///
 /// Performs the full 11-step ADR-016 validation pipeline.
-fn validate_ucan_for_outlet(
+pub(crate) fn validate_ucan_for_outlet(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
     outlet_id: &str,
