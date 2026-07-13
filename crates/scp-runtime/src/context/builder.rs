@@ -22,7 +22,7 @@ use scp_protocol::context::{
 
 pub use scp_protocol::context::builder::{
     AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
-    MAX_MANAGEMENT_PAYLOAD_SIZE, OpenResult, OpenedEnvelope, RemoveMemberOutput,
+    MAX_MANAGEMENT_PAYLOAD_SIZE, OpenResult, OpenedEnvelope, ReceiveFloor, RemoveMemberOutput,
     try_strip_management_prefix,
 };
 

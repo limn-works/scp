@@ -75,7 +75,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use scp_did::DID;
-use scp_protocol::context::builder::ContextCreationError;
+use scp_protocol::context::builder::{ContextCreationError, ReceiveFloor};
 use scp_protocol::context::governance::GovernanceModelConfig;
 use scp_protocol::context::governance::mls_integration::EpochCoordinator;
 use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
@@ -1824,7 +1824,18 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
             "floor-registry follower epoch seed failed on restore (non-fatal in PR-4; provider authoritative)"
         );
     }
-    let seeded_recv_floors = deps.crypto.export_recv_sequence_floors(ctx_id_bytes);
+    // The provider export still yields `(u64, u64)` tuples (its
+    // `recv_sequence_tracker` mirror is untouched until the atomic read-authority
+    // switch); adapt each to the supervisor registry's `ReceiveFloor` newtype at
+    // this seam with an explicit NAMED-field bind (never a tuple `.into()`, which
+    // would reintroduce the epoch/sequence transposition hazard the newtype
+    // retires). Same values, so the follower seed is byte-for-byte unchanged.
+    let seeded_recv_floors: Vec<(String, ReceiveFloor)> = deps
+        .crypto
+        .export_recv_sequence_floors(ctx_id_bytes)
+        .into_iter()
+        .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+        .collect();
     if let Err(e) = deps.supervisor.validate_and_merge_recv_sequence_floors(
         ctx_id_bytes,
         seeded_recv_floors,

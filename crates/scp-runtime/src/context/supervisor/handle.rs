@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use scp_did::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::builder::ReceiveFloor;
 
 use crate::context::supervisor::floors::FloorAdvanceError;
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
@@ -138,7 +139,7 @@ impl SupervisorHandle {
         &self,
         ctx: &[u8; 32],
         did: &str,
-        next: (u64, u64),
+        next: ReceiveFloor,
         max_advance: u64,
     ) -> Result<(), FloorAdvanceError> {
         self.supervisor
@@ -175,7 +176,7 @@ impl SupervisorHandle {
     pub(in crate::context) fn export_recv_sequence_floors(
         &self,
         ctx: &[u8; 32],
-    ) -> Vec<(String, (u64, u64))> {
+    ) -> Vec<(String, ReceiveFloor)> {
         self.supervisor.export_recv_sequence_floors(ctx)
     }
 
@@ -206,7 +207,7 @@ impl SupervisorHandle {
     pub(in crate::context) fn validate_and_merge_recv_sequence_floors(
         &self,
         ctx: &[u8; 32],
-        incoming: Vec<(String, (u64, u64))>,
+        incoming: Vec<(String, ReceiveFloor)>,
         trusted_local: bool,
     ) -> Result<(), FloorAdvanceError> {
         self.supervisor

@@ -879,7 +879,10 @@ mod mock_providers {
                     sender_did,
                     // ADR-049 PR-4: mock open() has no live recv tracker; the
                     // follower mirror-forward drop is non-fatal.
-                    receive_floor: (0, 0),
+                    receive_floor: scp_core::context::builder::ReceiveFloor {
+                        epoch: 0,
+                        sequence: 0,
+                    },
                 }),
             ))
         }

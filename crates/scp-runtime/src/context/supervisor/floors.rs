@@ -23,6 +23,8 @@
 
 use std::collections::HashMap;
 
+use scp_protocol::context::builder::ReceiveFloor;
+
 use super::supervisor::Supervisor;
 
 /// Per-context Class-M floor bundle held by the supervisor registry.
@@ -50,10 +52,11 @@ pub(in crate::context::supervisor) struct ContextFloors {
     /// must preserve it (or split the two counters into separate maps) before the
     /// gate becomes read-authoritative.
     pub(in crate::context::supervisor) sender_epochs: HashMap<String, u64>,
-    /// `sender_did` → highest `(epoch, sequence)` accepted from that sender —
-    /// the intra-epoch anti-replay floor (spec §23.17.3). LEXICOGRAPHIC order.
-    /// Mirrors the provider's `recv_sequence_tracker`.
-    pub(in crate::context::supervisor) recv_sequence: HashMap<String, (u64, u64)>,
+    /// `sender_did` → highest [`ReceiveFloor`] (`epoch`, `sequence`) accepted
+    /// from that sender — the intra-epoch anti-replay floor (spec §23.17.3).
+    /// LEXICOGRAPHIC (epoch-major) order. Mirrors the provider's
+    /// `recv_sequence_tracker`.
+    pub(in crate::context::supervisor) recv_sequence: HashMap<String, ReceiveFloor>,
 }
 
 /// Rejection reason from a floor-advance gate.
@@ -93,9 +96,9 @@ pub enum FloorAdvanceError {
         /// The sender whose floor was consulted.
         did: String,
         /// The floor currently recorded.
-        current: (u64, u64),
-        /// The rejected proposed `(epoch, sequence)`.
-        proposed: (u64, u64),
+        current: ReceiveFloor,
+        /// The rejected proposed [`ReceiveFloor`] (`epoch`, `sequence`).
+        proposed: ReceiveFloor,
     },
     /// A receive-side epoch beyond the sender's epoch floor `+ max_advance`
     /// (the follower's analogue of the provider's H9 receive-side epoch ceiling
@@ -253,7 +256,7 @@ impl Supervisor {
         &self,
         ctx: &[u8; 32],
         did: &str,
-        next: (u64, u64),
+        next: ReceiveFloor,
         max_advance: u64,
     ) -> Result<(), FloorAdvanceError> {
         // THE single guard. Everything below runs under it — no second acquire.
@@ -276,11 +279,11 @@ impl Supervisor {
         // epoch floor from THIS SAME entry (absent read as 0).
         let epoch_floor = floors.sender_epochs.get(did).copied().unwrap_or(0);
         let ceiling = epoch_floor.saturating_add(max_advance);
-        if next.0 > ceiling {
+        if next.epoch > ceiling {
             return Err(FloorAdvanceError::RecvSequenceOvershoot {
                 did: did.to_owned(),
                 ceiling,
-                proposed: next.0,
+                proposed: next.epoch,
             });
         }
         // write UNDER the same guard.
@@ -329,7 +332,7 @@ impl Supervisor {
     pub(in crate::context) fn export_recv_sequence_floors(
         &self,
         ctx: &[u8; 32],
-    ) -> Vec<(String, (u64, u64))> {
+    ) -> Vec<(String, ReceiveFloor)> {
         self.floors.get(ctx).map_or_else(Vec::new, |entry| {
             entry
                 .value()
@@ -417,7 +420,7 @@ impl Supervisor {
     pub(in crate::context) fn validate_and_merge_recv_sequence_floors(
         &self,
         ctx: &[u8; 32],
-        incoming: Vec<(String, (u64, u64))>,
+        incoming: Vec<(String, ReceiveFloor)>,
         trusted_local: bool,
     ) -> Result<(), FloorAdvanceError> {
         // PR-4 follower: `trusted_local` is reserved for the PR-6 fail-closed
@@ -490,11 +493,16 @@ mod tests {
 
     use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
 
-    use super::{FloorAdvanceError, Supervisor};
+    use super::{FloorAdvanceError, ReceiveFloor, Supervisor};
     use crate::context::supervisor::handle::SupervisorHandle;
 
     const CTX: [u8; 32] = [0xA5u8; 32];
     const DID: &str = "did:dht:z6MkFloorSenderFloorSenderFloorSenderAA";
+
+    /// Terse [`ReceiveFloor`] constructor for the recv-sequence tests.
+    const fn rf(epoch: u64, sequence: u64) -> ReceiveFloor {
+        ReceiveFloor { epoch, sequence }
+    }
 
     fn sup() -> Arc<Supervisor> {
         // The registry needs no providers, so the provider-free query shim is
@@ -568,39 +576,39 @@ mod tests {
         // First observation for an absent sender is accepted (matches open()'s
         // Some-guarded replay check).
         assert!(
-            s.check_and_advance_recv_sequence(&CTX, DID, (0, 3), MAX_EPOCH_ADVANCE)
+            s.check_and_advance_recv_sequence(&CTX, DID, rf(0, 3), MAX_EPOCH_ADVANCE)
                 .is_ok()
         );
         // Same (epoch, seq) is a replay — rejected.
         assert!(matches!(
-            s.check_and_advance_recv_sequence(&CTX, DID, (0, 3), MAX_EPOCH_ADVANCE),
+            s.check_and_advance_recv_sequence(&CTX, DID, rf(0, 3), MAX_EPOCH_ADVANCE),
             Err(FloorAdvanceError::RecvSequenceNotMonotonic { .. })
         ));
         // Lower sequence at the same epoch — rejected.
         assert!(matches!(
-            s.check_and_advance_recv_sequence(&CTX, DID, (0, 2), MAX_EPOCH_ADVANCE),
+            s.check_and_advance_recv_sequence(&CTX, DID, rf(0, 2), MAX_EPOCH_ADVANCE),
             Err(FloorAdvanceError::RecvSequenceNotMonotonic { .. })
         ));
         // Higher sequence at the same epoch — accepted.
         assert!(
-            s.check_and_advance_recv_sequence(&CTX, DID, (0, 4), MAX_EPOCH_ADVANCE)
+            s.check_and_advance_recv_sequence(&CTX, DID, rf(0, 4), MAX_EPOCH_ADVANCE)
                 .is_ok()
         );
         // Advance to a higher epoch — accepted (epoch 1 is within the ceiling
         // `sender_epoch_floor(0) + MAX_EPOCH_ADVANCE`).
         assert!(
-            s.check_and_advance_recv_sequence(&CTX, DID, (1, 0), MAX_EPOCH_ADVANCE)
+            s.check_and_advance_recv_sequence(&CTX, DID, rf(1, 0), MAX_EPOCH_ADVANCE)
                 .is_ok()
         );
         // Lower epoch, even with a much higher seq — rejected (lexicographic on
         // the `(epoch, seq)` pair: `(0, 99) < (1, 0)`).
         assert!(matches!(
-            s.check_and_advance_recv_sequence(&CTX, DID, (0, 99), MAX_EPOCH_ADVANCE),
+            s.check_and_advance_recv_sequence(&CTX, DID, rf(0, 99), MAX_EPOCH_ADVANCE),
             Err(FloorAdvanceError::RecvSequenceNotMonotonic { .. })
         ));
         assert_eq!(
             s.export_recv_sequence_floors(&CTX),
-            vec![(DID.to_owned(), (1, 0))]
+            vec![(DID.to_owned(), rf(1, 0))]
         );
     }
 
@@ -615,7 +623,7 @@ mod tests {
             s.check_and_advance_recv_sequence(
                 &CTX,
                 DID,
-                (5 + MAX_EPOCH_ADVANCE + 1, 0),
+                rf(5 + MAX_EPOCH_ADVANCE + 1, 0),
                 MAX_EPOCH_ADVANCE
             ),
             Err(FloorAdvanceError::RecvSequenceOvershoot {
@@ -629,7 +637,7 @@ mod tests {
             s.check_and_advance_recv_sequence(
                 &CTX,
                 DID,
-                (5 + MAX_EPOCH_ADVANCE, 0),
+                rf(5 + MAX_EPOCH_ADVANCE, 0),
                 MAX_EPOCH_ADVANCE
             )
             .is_ok()
@@ -675,13 +683,13 @@ mod tests {
         // recv merge twin — monotone max, lexicographic.
         s.validate_and_merge_recv_sequence_floors(
             &CTX,
-            vec![(DID.to_owned(), (2, 9)), (DID.to_owned(), (1, 0))],
+            vec![(DID.to_owned(), rf(2, 9)), (DID.to_owned(), rf(1, 0))],
             true,
         )
         .unwrap();
         assert_eq!(
             s.export_recv_sequence_floors(&CTX),
-            vec![(DID.to_owned(), (2, 9))]
+            vec![(DID.to_owned(), rf(2, 9))]
         );
         // empty merge is a no-op that does not error.
         assert!(
@@ -705,13 +713,13 @@ mod tests {
         // One gate → exactly one context entry created.
         assert_eq!(s.floors.len(), 1, "one entry() per gate (Decision-13)");
         // A recv gate on the same ctx reuses the SAME entry — no second insert.
-        s.check_and_advance_recv_sequence(&CTX, DID, (1, 1), MAX_EPOCH_ADVANCE)
+        s.check_and_advance_recv_sequence(&CTX, DID, rf(1, 1), MAX_EPOCH_ADVANCE)
             .unwrap();
         assert_eq!(s.floors.len(), 1, "recv gate reuses the same ctx entry");
         // Both floors live under that single entry.
         let entry = s.floors.get(&CTX).expect("ctx entry");
         assert_eq!(entry.sender_epochs.get(DID).copied(), Some(1));
-        assert_eq!(entry.recv_sequence.get(DID).copied(), Some((1, 1)));
+        assert_eq!(entry.recv_sequence.get(DID).copied(), Some(rf(1, 1)));
     }
 
     // -- Decision-14: gate work is O(1) — independent of sender count -----------
@@ -815,12 +823,12 @@ mod tests {
                 .is_ok()
         );
         assert!(
-            h.check_and_advance_recv_sequence(&CTX, DID, (3, 1), MAX_EPOCH_ADVANCE)
+            h.check_and_advance_recv_sequence(&CTX, DID, rf(3, 1), MAX_EPOCH_ADVANCE)
                 .is_ok()
         );
         h.validate_and_merge_epoch_floors(&CTX, vec![(DID.to_owned(), 8)], MAX_EPOCH_ADVANCE, true)
             .unwrap();
-        h.validate_and_merge_recv_sequence_floors(&CTX, vec![(DID.to_owned(), (8, 2))], true)
+        h.validate_and_merge_recv_sequence_floors(&CTX, vec![(DID.to_owned(), rf(8, 2))], true)
             .unwrap();
 
         // The handle reads must agree with the direct Supervisor reads.
@@ -835,7 +843,7 @@ mod tests {
         assert_eq!(h.export_sender_key_epochs(&CTX), vec![(DID.to_owned(), 8)]);
         assert_eq!(
             h.export_recv_sequence_floors(&CTX),
-            vec![(DID.to_owned(), (8, 2))]
+            vec![(DID.to_owned(), rf(8, 2))]
         );
     }
 }
