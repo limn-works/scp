@@ -3023,5 +3023,58 @@ mod tests {
                  (before the counter): {err_replay}"
             );
         }
+
+        /// PAID-path `amount_max_cumulative` KAT (§7.3.8). This is the one
+        /// counter-bearing caveat that can ONLY be exhausted on the paid branch:
+        /// its consume charges `action_cost` (the free path's `action_cost == 0`
+        /// never advances the cumulative sum against a positive cap). Drives
+        /// `reserve_outlet_economy` on the paid branch (`per_outlet_call` = 5)
+        /// with a cumulative cap of 12: two calls admit (5, then 10), the third
+        /// (would-be 15 > 12) rejects naming `amountMaxCumulative`. Proves the
+        /// `consume_caveat_counters` `AmountCumulative` arm (`outlets_helpers.rs`
+        /// ~1557) is live on the paid path and that the running total — not a
+        /// per-call amount — is what trips the cap.
+        #[tokio::test]
+        async fn reserve_paid_path_enforces_amount_max_cumulative() {
+            let deps = build_deps_paid(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(paid_active_state());
+            let mut caveats = InvocationCaveats::empty();
+            // Cap = 12; each paid call charges the per_outlet_call cost (5), so the
+            // cumulative sum is 5 -> 10 -> (would-be 15, rejected).
+            caveats.amount_max_cumulative = Some(Amount::new(12));
+            let cid = "cid-paid-amt";
+            let input = serde_json::json!({});
+            let now = scp_clock::SystemClock.now_secs();
+
+            let spending1 = signed_spending_ucan_for(&DID(INVOKER.to_owned()));
+            paid_reserve_step(&mut cell, &deps, &spending1, &caveats, cid, &input, now)
+                .await
+                .expect("first paid reserve: cumulative 5 <= 12 admits");
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].amount_cumulative_used, 5,
+                "the paid path charged the per_outlet_call cost against the cumulative counter"
+            );
+
+            let spending2 = signed_spending_ucan_for(&DID(INVOKER.to_owned()));
+            paid_reserve_step(&mut cell, &deps, &spending2, &caveats, cid, &input, now)
+                .await
+                .expect("second paid reserve: cumulative 10 <= 12 admits");
+            assert_eq!(cell.class_s.caveat_counters[cid].amount_cumulative_used, 10);
+
+            let spending3 = signed_spending_ucan_for(&DID(INVOKER.to_owned()));
+            let err = paid_reserve_step(&mut cell, &deps, &spending3, &caveats, cid, &input, now)
+                .await
+                .expect_err("third paid reserve: cumulative would be 15 > 12");
+            assert!(
+                format!("{err}").contains("amountMaxCumulative"),
+                "the reject must name the amountMaxCumulative caveat: {err}"
+            );
+            // The rejected call did not advance the cumulative counter past its
+            // last admitted value (all-or-nothing consume on a clone).
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].amount_cumulative_used, 10,
+                "a rejected paid reserve leaves the cumulative counter at its last admitted total"
+            );
+        }
     }
 }
