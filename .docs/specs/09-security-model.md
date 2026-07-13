@@ -1630,6 +1630,9 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-XCTX-DIVERGENCE-V1:"` | Cross-context divergence marker signing | §6.2.4 |
 | `"SCP-OUTLET-CHUNK-SIG-V1:"` | Per-chunk operator signature (outlet stream) | §5.4.5 |
 | `"SCP-OUTLET-CHUNK-V1:"` | Outlet-stream chunk Merkle manifest leaf/interior domain | §5.4.5 |
+| `"SCP-OUTLET-CAVEAT-BIND-V1:"` | Outlet-stream caveats-binding preimage (`ucan_cid`/`request_id`/`invoker_did`/`estimated_chunk_count`/narrowed caveats) | §5.4.5 |
+| `"SCP-OUTLET-CREDIT-V1:"` | Outlet-stream credit-grant signing preimage | §5.4.5 |
+| `"SCP-OUTLET-CANCEL-V1:"` | Outlet-stream cancel signing preimage | §5.4.5 |
 | `"SCP-XCTX-STREAM-RECEIPT-V1:"` | Cross-context streaming-saga receipt signing | §6.2.4 |
 | `"SCP-INVITATION-BUNDLE-V1:"` | InvitationBundle signing — over the full genesis `ContextParams` (per-field JCS hashes) | §5.12.3.1 |
 | `"SCP-JOIN-RESPONSE-V1:"` | JoinResponse signing | §5.12.3.2 |
