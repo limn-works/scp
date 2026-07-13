@@ -50,7 +50,7 @@ use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::outlets::stream::StreamAdmissionTracker;
+use crate::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
 use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
@@ -1498,6 +1498,22 @@ pub struct Supervisor {
     /// tracker alive until the pump ends.
     outlet_stream_admission:
         Arc<std::sync::RwLock<HashMap<String, Arc<std::sync::RwLock<StreamAdmissionTracker>>>>>,
+    /// Operator-scoped §05-contexts.md:448 per-origin-invoker admission
+    /// tracker. A SINGLE instance for the whole supervisor (operator) —
+    /// deliberately NOT keyed by `context_id` like
+    /// [`Self::outlet_stream_admission`] — so the per-origin-invoker
+    /// concurrent-stream cap is enforced across EVERY context the operator
+    /// hosts. This is the spec-mandated defense against a caller fanning
+    /// out across a cluster of the operator's interfaces (contexts) to open
+    /// `N × max_concurrent_inbound_streams_per_origin_invoker` streams and
+    /// saturate the node-wide pump semaphore (§5.4.5 round-8). Handed to
+    /// `dispatch::open_stream_session` alongside the per-context tracker;
+    /// the off-mailbox pump increments it on admit and decrements it on
+    /// stream close. Entries self-remove at zero, so it needs no teardown
+    /// reap. `std::sync::RwLock` is the sanctioned off-mailbox primitive
+    /// (matching [`Self::outlet_stream_admission`]); its guard is only ever
+    /// taken in synchronous critical sections, never across an `.await`.
+    outlet_stream_origin_admission: Arc<std::sync::RwLock<OriginAdmissionTracker>>,
 }
 
 /// The two durable providers — the saga journal and the `OpenMLS` `mls_storage`
@@ -1741,6 +1757,15 @@ impl Supervisor {
             // on the first stream open).
             outlet_stream_pump_semaphore,
             outlet_stream_admission: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            // §05-contexts.md:448: a SINGLE operator-scoped origin
+            // admission tracker, shared across every context this
+            // supervisor (operator) hosts. NOT keyed by context — that is
+            // the whole point: the per-origin-invoker cap must span all of
+            // the operator's contexts so one origin cannot fan out across a
+            // cluster of interfaces to bypass the per-context limit.
+            outlet_stream_origin_admission: Arc::new(std::sync::RwLock::new(
+                OriginAdmissionTracker::new(),
+            )),
         }
     }
 
@@ -2029,6 +2054,22 @@ impl Supervisor {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(context_id);
+    }
+
+    /// Returns an `Arc` clone of the operator-scoped §05-contexts.md:448
+    /// per-origin-invoker admission tracker.
+    ///
+    /// Unlike [`Self::outlet_stream_admission_for`], this is NOT keyed by
+    /// `context_id`: there is exactly ONE tracker per supervisor (operator),
+    /// so the per-origin-invoker concurrent-stream cap is enforced across
+    /// every context the operator hosts. Handed to
+    /// `dispatch::open_stream_session` alongside the per-context tracker.
+    /// Never reaped — entries self-remove at zero on stream close.
+    #[must_use]
+    pub(in crate::context) fn outlet_stream_origin_admission(
+        &self,
+    ) -> Arc<std::sync::RwLock<OriginAdmissionTracker>> {
+        Arc::clone(&self.outlet_stream_origin_admission)
     }
 
     // -------------------------------------------------------------------
@@ -11112,8 +11153,11 @@ impl Supervisor {
                 ),
             );
 
-        // Per-context admission tracker + node-level pump semaphore (chunk 3d).
+        // Per-context admission tracker (per-invoker + per-outlet) +
+        // operator-scoped origin admission tracker (per-origin-invoker,
+        // §05-contexts.md:448) + node-level pump semaphore.
         let admission = self.outlet_stream_admission_for(context_id);
+        let origin_admission = self.outlet_stream_origin_admission();
         let pump_semaphore = self.outlet_stream_pump_semaphore();
 
         // Phase 2 — hand the executor + seams to the off-mailbox pump.
@@ -11132,6 +11176,7 @@ impl Supervisor {
             Some(settlement_sink),
             params,
             admission,
+            origin_admission,
             pump_semaphore,
             caveat_post_input_check,
             counter_reservation,

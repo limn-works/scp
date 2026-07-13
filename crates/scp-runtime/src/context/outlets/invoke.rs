@@ -2476,17 +2476,22 @@ pub const fn accrue_data_chunk_if_billable(
 /// Releases the §5.4.5 round-5 admission counters for a stream that
 /// terminated. Called by the pump on terminal-chunk emission.
 ///
-/// Decrements per-invoker, per-origin-invoker, and per-outlet counters
-/// atomically under the admission tracker's critical section. Idempotent
-/// on a never-admitted triple (matches
-/// [`super::stream::StreamAdmissionTracker::release`] semantics).
+/// Decrements the per-invoker and per-outlet counters on the per-context
+/// `admission` tracker AND the per-origin-invoker counter on the
+/// operator-scoped `origin_admission` tracker (§05-contexts.md:448),
+/// under both trackers' critical sections. Idempotent on a
+/// never-admitted triple (matches
+/// [`super::stream::StreamAdmissionTracker::release`] semantics). The
+/// caller MUST hold both write guards with the per-context lock acquired
+/// before the operator-scoped one (the sanctioned lock order).
 pub fn release_stream_admission(
     admission: &mut super::stream::StreamAdmissionTracker,
+    origin_admission: &mut super::stream::OriginAdmissionTracker,
     invoker_did: &str,
     origin_invoker_did: &str,
     outlet_id: &str,
 ) {
-    admission.release(invoker_did, origin_invoker_did, outlet_id);
+    admission.release(origin_admission, invoker_did, origin_invoker_did, outlet_id);
 }
 
 // ---------------------------------------------------------------------------

@@ -43,7 +43,10 @@
 //!    - calls [`StreamEscrow::settle_at_close`] to derive
 //!      `(billed_amount, refund_amount, billed_count)`,
 //!    - calls [`StreamAdmissionTracker::release`] to decrement all three
-//!      cap counters,
+//!      cap counters — the per-invoker + per-outlet counters on the
+//!      per-context tracker and the per-origin-invoker counter on the
+//!      operator-scoped [`OriginAdmissionTracker`] (§05-contexts.md:448),
+//!      both under the sanctioned lock order,
 //!    - publishes the `chunks_billed` value into the
 //!      `OutletInvokedEvent` field and verifies it via
 //!      [`super::stream::verify_chunks_billed`] before handing the
@@ -99,10 +102,10 @@ use super::invoke::{
 };
 use super::stream::{
     AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, GrantError, OpenError,
-    StreamAdmissionTracker, StreamEscrow, StreamIdentity, admission_outcome_to_slug,
-    coerce_estimated_chunk_count, compute_chunks_billed_ref, cumulative_reserve_amount,
-    effective_max_billable_chunks, enforce_estimated_chunk_count_bound, open_error_to_slug,
-    verify_chunks_billed,
+    OriginAdmissionTracker, StreamAdmissionTracker, StreamEscrow, StreamIdentity,
+    admission_outcome_to_slug, coerce_estimated_chunk_count, compute_chunks_billed_ref,
+    cumulative_reserve_amount, effective_max_billable_chunks, enforce_estimated_chunk_count_bound,
+    open_error_to_slug, verify_chunks_billed,
 };
 
 use scp_protocol::context::outlets::registry::OutletRegistry;
@@ -560,8 +563,14 @@ pub(crate) struct SharedSessionState {
     /// Cancel-ack lifecycle tracker.
     pub cancel_ack: CancelAckTracker,
     /// Admission tracker reference (shared per-context). The pump
-    /// releases counters here at terminal-chunk emission.
+    /// releases the per-invoker + per-outlet counters here at
+    /// terminal-chunk emission.
     pub admission: Arc<RwLock<StreamAdmissionTracker>>,
+    /// Operator-scoped origin admission tracker (§05-contexts.md:448):
+    /// a SINGLE instance shared across every context the operator hosts.
+    /// The pump releases the per-origin-invoker counter here at
+    /// terminal-chunk emission, in lock-step with `admission`.
+    pub origin_admission: Arc<RwLock<OriginAdmissionTracker>>,
     /// Identity triple used to release admission counters.
     pub admission_release_keys: AdmissionReleaseKeys,
     /// `true` when the §5.4.5 cancel-ack timer has armed.
@@ -650,6 +659,7 @@ impl core::fmt::Debug for SharedSessionState {
             .field("escrow", &self.escrow)
             .field("cancel_ack", &self.cancel_ack)
             .field("admission", &"<Arc<RwLock<StreamAdmissionTracker>>>")
+            .field("origin_admission", &"<Arc<RwLock<OriginAdmissionTracker>>>")
             .field("admission_release_keys", &self.admission_release_keys)
             .field("cancel_ack_armed", &self.cancel_ack_armed)
             .field("credit_stall_armed_at", &self.credit_stall_armed_at)
@@ -1264,13 +1274,26 @@ impl StreamSessionHandle {
 /// envelope on cap breach.
 fn run_admission_gate(
     admission: &Arc<RwLock<StreamAdmissionTracker>>,
+    origin_admission: &Arc<RwLock<OriginAdmissionTracker>>,
     params: &OpenStreamParams,
 ) -> Result<(), OpenStreamRejection> {
     let admission_outcome = {
+        // LOCK ORDER (§05-contexts.md:448 split): the per-context
+        // `admission` lock is ALWAYS acquired before the operator-scoped
+        // `origin_admission` lock. `origin_admission` is a single leaf
+        // lock always taken innermost, so no acquisition cycle is
+        // possible even under concurrent opens across different contexts.
+        // Holding both across `try_admit` keeps the 3-tier check-and-
+        // increment a single atomic critical section (partial increments
+        // across tiers are forbidden).
         let mut guard = admission
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut origin_guard = origin_admission
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.try_admit(
+            &mut origin_guard,
             params.caps,
             &params.invoker_did,
             &params.origin_invoker_did,
@@ -1291,11 +1314,21 @@ fn run_admission_gate(
 
 /// Releases admission counters held by `params`. Used on every
 /// open-time failure path after admission has been granted.
-fn release_admission(admission: &Arc<RwLock<StreamAdmissionTracker>>, params: &OpenStreamParams) {
+fn release_admission(
+    admission: &Arc<RwLock<StreamAdmissionTracker>>,
+    origin_admission: &Arc<RwLock<OriginAdmissionTracker>>,
+    params: &OpenStreamParams,
+) {
+    // Same LOCK ORDER as `run_admission_gate`: per-context `admission`
+    // first, operator-scoped `origin_admission` second.
     let mut guard = admission
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut origin_guard = origin_admission
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.release(
+        &mut origin_guard,
         &params.invoker_did,
         &params.origin_invoker_did,
         &params.identity.outlet_id,
@@ -1655,6 +1688,7 @@ fn build_shared_state(
     params: &OpenStreamParams,
     escrow: StreamEscrow,
     admission: &Arc<RwLock<StreamAdmissionTracker>>,
+    origin_admission: &Arc<RwLock<OriginAdmissionTracker>>,
     context_handle: ContextHandle,
 ) -> Arc<RwLock<SharedSessionState>> {
     // §5.4.5:758 HARD billable-chunk ceiling = the EFFECTIVE ceiling: the
@@ -1686,6 +1720,7 @@ fn build_shared_state(
         escrow,
         cancel_ack,
         admission: Arc::clone(admission),
+        origin_admission: Arc::clone(origin_admission),
         admission_release_keys,
         cancel_ack_armed: false,
         credit_stall_armed_at: None,
@@ -2026,6 +2061,15 @@ pub async fn open_stream_session<E>(
     settlement_sink: Option<Arc<dyn StreamSettlementSink>>,
     params: OpenStreamParams,
     admission: Arc<RwLock<StreamAdmissionTracker>>,
+    // §05-contexts.md:448: the operator-scoped origin admission tracker,
+    // a SINGLE instance the supervisor owns and shares across every
+    // context it hosts. Carries the per-origin-invoker dimension so a
+    // caller cannot fan out across N of the operator's contexts to open
+    // `N × per_origin_invoker` streams. Consulted alongside the
+    // per-context `admission` tracker in `run_admission_gate` /
+    // `release_admission` and stored in `SharedSessionState` for the
+    // pump's close-time release.
+    origin_admission: Arc<RwLock<OriginAdmissionTracker>>,
     // §5.4.5 round-8 (F5): the per-instance node-level concurrent-pump
     // semaphore. A permit is acquired AFTER all per-context gates pass
     // (admission / estimate / escrow / binding) and moved into the spawned
@@ -2069,7 +2113,7 @@ where
     verify_caveats_binding_at_open(&params)?;
 
     // Step 1: admission gate.
-    run_admission_gate(&admission, &params)?;
+    run_admission_gate(&admission, &origin_admission, &params)?;
 
     // Step 2: estimated_chunk_count coercion + bound.
     let estimated_chunk_count =
@@ -2079,7 +2123,7 @@ where
         params.credit_window,
         &params.caveats,
     ) {
-        release_admission(&admission, &params);
+        release_admission(&admission, &origin_admission, &params);
         return Err(match open_err {
             OpenError::EstimateExceedsBound => {
                 let _ = open_error_to_slug(open_err);
@@ -2103,7 +2147,7 @@ where
     if let Some(check) = caveat_post_input_check
         && let Err(invocation_err) = check(&input).await
     {
-        release_admission(&admission, &params);
+        release_admission(&admission, &origin_admission, &params);
         // The §7.3.8 hook returns `CaveatViolation { slug }` for caveat
         // rules and `InputValidationFailed` for schema failures. Map both
         // to the open-time caveat-violation rejection carrying the precise
@@ -2141,7 +2185,7 @@ where
     let pump_permit = match Arc::clone(&pump_semaphore).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_closed_or_no_permits) => {
-            release_admission(&admission, &params);
+            release_admission(&admission, &origin_admission, &params);
             return Err(OpenStreamRejection::StreamCapExhausted);
         }
     };
@@ -2149,7 +2193,13 @@ where
     // Step 4: tracker init. Snapshot a cheap (Arc-backed) clone of the
     // context handle so the pump can consult live lifecycle state for
     // the §5.4.5 round-8 context-teardown re-check.
-    let shared = build_shared_state(&params, escrow, &admission, context.clone());
+    let shared = build_shared_state(
+        &params,
+        escrow,
+        &admission,
+        &origin_admission,
+        context.clone(),
+    );
     let grant_wake = Arc::new(Notify::new());
     let cancel_wake = Arc::new(Notify::new());
     let terminate_wake = Arc::new(Notify::new());
@@ -2214,7 +2264,7 @@ where
         // Synchronous validation failures (context not active, schema,
         // etc.) do not match the OUT-034 rejection taxonomy; route
         // through the rate-limited slug as a defensive fallback.
-        release_admission(&admission, &params);
+        release_admission(&admission, &origin_admission, &params);
         let _ = err;
         OpenStreamRejection::AdmissionRateLimited {
             slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
@@ -2263,7 +2313,7 @@ where
                 "outlet stream open denied: durable counter CAS exhausted or \
                  counter-store fault — rejected fail-closed (§7.3.8 / §5.4.5)"
             );
-            release_admission(&admission, &params);
+            release_admission(&admission, &origin_admission, &params);
         })?,
         None => CounterCommitOutcome {
             amount_cumulative_reserved: 0,
@@ -3044,20 +3094,30 @@ async fn run_stream_pump_v2(
         // `TerminateError::AlreadyTerminated` rather than arming a
         // `pending_terminate` no consumer will ever drain.
         guard.pump_exited = true;
-        // Take the admission Arc out of the guard so we can release
+        // Take both admission Arcs out of the guard so we can release
         // through the invoke.rs public helper (which lifts the type
-        // reference into invoke.rs for grep enforcement).
+        // reference into invoke.rs for grep enforcement). The
+        // operator-scoped `origin_admission` MUST be decremented here too
+        // (§05-contexts.md:448) — else the origin's operator-wide count
+        // leaks and permanently caps the origin.
         let admission_arc = Arc::clone(&guard.admission);
+        let origin_admission_arc = Arc::clone(&guard.origin_admission);
         let invoker_did_owned = guard.admission_release_keys.invoker_did.clone();
         let origin_invoker_did_owned = guard.admission_release_keys.origin_invoker_did.clone();
         let outlet_id_owned = guard.admission_release_keys.outlet_id.clone();
         drop(guard);
         {
+            // Same LOCK ORDER as the open-path gate: per-context
+            // `admission` first, operator-scoped `origin_admission` second.
             let mut admission_guard = admission_arc
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut origin_admission_guard = origin_admission_arc
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             release_stream_admission(
                 &mut admission_guard,
+                &mut origin_admission_guard,
                 &invoker_did_owned,
                 &origin_invoker_did_owned,
                 &outlet_id_owned,
@@ -3352,6 +3412,7 @@ mod tests {
         let credit = CreditTracker::new(32, *signer.verifying_key(), identity, None);
         let cancel_ack = CancelAckTracker::new(5);
         let admission = Arc::new(RwLock::new(StreamAdmissionTracker::new()));
+        let origin_admission = Arc::new(RwLock::new(OriginAdmissionTracker::new()));
         // A fresh context handle (in `Creating`) so the F6 round-8
         // context-teardown re-check observes a live context by default —
         // both `Creating` and `Active` are treated as live, so a default
@@ -3366,6 +3427,7 @@ mod tests {
             escrow: super::super::stream::StreamEscrow::zero_escrow(),
             cancel_ack,
             admission,
+            origin_admission,
             admission_release_keys: AdmissionReleaseKeys {
                 invoker_did: "did:dht:invoker".to_owned(),
                 origin_invoker_did: "did:dht:origin".to_owned(),
@@ -3601,6 +3663,7 @@ mod tests {
         };
         let credit = CreditTracker::new(32, verifying_key, identity, None);
         let admission = Arc::new(RwLock::new(StreamAdmissionTracker::new()));
+        let origin_admission = Arc::new(RwLock::new(OriginAdmissionTracker::new()));
         let context_handle = ContextHandle::new(
             "ctx-test".to_owned(),
             scp_protocol::context::ContextParams::default(),
@@ -3613,6 +3676,7 @@ mod tests {
             ),
             cancel_ack: CancelAckTracker::new(5),
             admission,
+            origin_admission,
             admission_release_keys: AdmissionReleaseKeys {
                 invoker_did: "did:dht:invoker".to_owned(),
                 origin_invoker_did: "did:dht:origin".to_owned(),

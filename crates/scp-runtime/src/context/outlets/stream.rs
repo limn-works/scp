@@ -1138,19 +1138,36 @@ impl CancelAckTracker {
 // StreamAdmissionTracker — §5.4.5 round-5 5-step open sequence
 // =====================================================================
 
-/// Per-context per-DID concurrent-stream counter triplet.
+/// Per-context per-DID concurrent-stream counters.
 ///
-/// Three independent ceilings (§5.4.5):
+/// Two of the three §5.4.5 ceilings are per-context and live here; the
+/// third — per-origin-invoker — is tracked at OPERATOR scope in
+/// [`OriginAdmissionTracker`], NOT in this per-context tracker:
 /// - per_invoker — bounded by
 ///   `ContextParams::max_concurrent_inbound_streams_per_invoker`
 ///   (default 8). Keyed by immediate-previous-hop `invoker_did`.
-/// - per_origin_invoker — bounded by
-///   `ContextParams::max_concurrent_inbound_streams_per_origin_invoker`
-///   (default 16). Keyed by *outermost* `iss` in the delegation
-///   chain.
 /// - per_outlet — bounded by
 ///   `ContextParams::max_concurrent_inbound_streams_per_outlet`
 ///   (default 128). Keyed by `outlet_id`.
+///
+/// The per-origin-invoker ceiling
+/// (`max_concurrent_inbound_streams_per_origin_invoker`, default 16,
+/// keyed by the *outermost* `iss` in the delegation chain) is
+/// deliberately ABSENT from this per-context tracker. §05-contexts.md:448
+/// mandates it be tracked at operator scope — "shared across every
+/// context the operator hosts" — so a caller cannot fan out across a
+/// cluster of interfaces hosted by the same operator to bypass the
+/// per-context limit. Keying it per-context (as the other two are)
+/// would reset the origin counter per context, letting one origin DID
+/// open `per_origin_invoker` streams in EACH of N contexts and fan out
+/// `N × cap` streams against a single operator — saturating the
+/// node-wide pump semaphore (§5.4.5 round-8) and mounting a node-wide
+/// DoS the spec's named defense is designed to prevent. That dimension
+/// therefore lives in the operator-owned [`OriginAdmissionTracker`];
+/// [`Self::try_admit`] and [`Self::release`] consult BOTH trackers
+/// under a single combined critical section (per-context lock acquired
+/// before the operator-scoped lock) so the §5.4.5 "partial increments
+/// across tiers are forbidden" invariant is preserved across the split.
 ///
 /// All three caps are enforced atomically: a forge-`iss` open that
 /// fails UCAN validation does NOT increment any counter (the §5.4.5
@@ -1158,8 +1175,71 @@ impl CancelAckTracker {
 #[derive(Debug, Clone, Default)]
 pub struct StreamAdmissionTracker {
     per_invoker: BTreeMap<String, u32>,
-    per_origin_invoker: BTreeMap<String, u32>,
     per_outlet: BTreeMap<String, u32>,
+}
+
+/// Operator-scoped concurrent-stream counter for the per-origin-invoker
+/// ceiling (§05-contexts.md:448).
+///
+/// Keyed by the *outermost* `iss` in the delegation chain. A single
+/// instance is owned by the supervisor (operator) and shared across
+/// EVERY context that supervisor hosts — this is precisely what enforces
+/// the spec's operator-scope mandate: the count for an origin DID is the
+/// SUM of its open streams across all of the operator's contexts, so a
+/// caller cannot open `per_origin_invoker` streams in each of N contexts
+/// to fan out `N × cap` streams against one operator.
+///
+/// Bounded by
+/// `ContextParams::max_concurrent_inbound_streams_per_origin_invoker`
+/// (default 16, range [1, 1024]). Maintained in lock-step with the
+/// per-context [`StreamAdmissionTracker`]:
+/// [`StreamAdmissionTracker::try_admit`] increments this on admit and
+/// [`StreamAdmissionTracker::release`] decrements it on stream close,
+/// both under a combined critical section. Entries self-remove at zero,
+/// so the map is naturally bounded by the number of origins with a live
+/// stream — no teardown reap is required.
+#[derive(Debug, Clone, Default)]
+pub struct OriginAdmissionTracker {
+    per_origin_invoker: BTreeMap<String, u32>,
+}
+
+impl OriginAdmissionTracker {
+    /// Constructs an empty operator-scoped origin tracker. The runtime
+    /// maintains exactly ONE instance per supervisor (operator).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current concurrent-stream count for `origin_invoker_did` summed
+    /// across every context the operator hosts.
+    #[must_use]
+    pub fn count_per_origin_invoker(&self, origin_invoker_did: &str) -> u32 {
+        self.per_origin_invoker
+            .get(origin_invoker_did)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Increments the origin count. The caller MUST have already
+    /// confirmed headroom against the per-origin cap inside the same
+    /// combined critical section (see [`StreamAdmissionTracker::try_admit`]).
+    fn increment(&mut self, origin_invoker_did: &str) {
+        let count = self.count_per_origin_invoker(origin_invoker_did);
+        self.per_origin_invoker
+            .insert(origin_invoker_did.to_owned(), count.saturating_add(1));
+    }
+
+    /// Decrements the origin count, removing the entry at zero.
+    /// Idempotent on a never-admitted origin (returns silently).
+    fn decrement(&mut self, origin_invoker_did: &str) {
+        if let Some(count) = self.per_origin_invoker.get_mut(origin_invoker_did) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_origin_invoker.remove(origin_invoker_did);
+            }
+        }
+    }
 }
 
 /// Outcome of the 5-step `OutletStreamOpen` admission check.
@@ -1206,10 +1286,12 @@ pub struct AdmissionCaps {
 }
 
 impl StreamAdmissionTracker {
-    /// Constructs an empty tracker. The runtime maintains one
-    /// instance per hosting context (per-origin-invoker is tracked
-    /// at operator scope per §5.4.5; the operator's tracker is
-    /// shared across every context they host).
+    /// Constructs an empty per-context tracker. The runtime maintains
+    /// one instance per hosting context for the per-invoker and
+    /// per-outlet ceilings. The per-origin-invoker ceiling is tracked
+    /// separately at operator scope in [`OriginAdmissionTracker`] (a
+    /// single instance shared across every context the operator hosts),
+    /// per §05-contexts.md:448.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -1237,22 +1319,24 @@ impl StreamAdmissionTracker {
     /// are forbidden).
     pub fn try_admit(
         &mut self,
+        origin: &mut OriginAdmissionTracker,
         caps: AdmissionCaps,
         invoker_did: &str,
         origin_invoker_did: &str,
         outlet_id: &str,
     ) -> AdmissionOutcome {
-        // Cap comparisons in §5.4.5 lexical order. NO mutation
-        // until all three pass.
+        // Cap comparisons in §5.4.5 lexical order (per_invoker →
+        // per_origin_invoker → per_outlet). NO mutation until all three
+        // pass. The middle tier reads the OPERATOR-scoped `origin`
+        // tracker (§05-contexts.md:448), not a per-context map; the
+        // caller holds both this per-context lock and the operator-scoped
+        // `origin` lock across this whole method so the three-tier check
+        // and increment remain a single atomic critical section.
         let invoker_count = self.per_invoker.get(invoker_did).copied().unwrap_or(0);
         if invoker_count >= caps.per_invoker {
             return AdmissionOutcome::RateLimitedPerInvoker;
         }
-        let origin_count = self
-            .per_origin_invoker
-            .get(origin_invoker_did)
-            .copied()
-            .unwrap_or(0);
+        let origin_count = origin.count_per_origin_invoker(origin_invoker_did);
         if origin_count >= caps.per_origin_invoker {
             return AdmissionOutcome::RateLimitedPerOriginInvoker;
         }
@@ -1261,13 +1345,12 @@ impl StreamAdmissionTracker {
             return AdmissionOutcome::RateLimitedPerOutlet;
         }
 
-        // All three caps cleared — atomic 3-counter increment.
+        // All three caps cleared — atomic 3-counter increment across the
+        // per-context tracker (per_invoker + per_outlet) and the
+        // operator-scoped origin tracker.
         self.per_invoker
             .insert(invoker_did.to_owned(), invoker_count.saturating_add(1));
-        self.per_origin_invoker.insert(
-            origin_invoker_did.to_owned(),
-            origin_count.saturating_add(1),
-        );
+        origin.increment(origin_invoker_did);
         self.per_outlet
             .insert(outlet_id.to_owned(), outlet_count.saturating_add(1));
         AdmissionOutcome::Admitted
@@ -1276,19 +1359,23 @@ impl StreamAdmissionTracker {
     /// Step 5 of the §5.4.5 round-5 sequence: atomic 3-counter
     /// decrement on terminal chunk emission OR cancel-ack closure.
     /// Idempotent on a never-admitted triple (returns silently).
-    pub fn release(&mut self, invoker_did: &str, origin_invoker_did: &str, outlet_id: &str) {
+    pub fn release(
+        &mut self,
+        origin: &mut OriginAdmissionTracker,
+        invoker_did: &str,
+        origin_invoker_did: &str,
+        outlet_id: &str,
+    ) {
         if let Some(count) = self.per_invoker.get_mut(invoker_did) {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.per_invoker.remove(invoker_did);
             }
         }
-        if let Some(count) = self.per_origin_invoker.get_mut(origin_invoker_did) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.per_origin_invoker.remove(origin_invoker_did);
-            }
-        }
+        // Decrement the OPERATOR-scoped origin counter (§05-contexts.md:448)
+        // so a closed stream frees the origin's operator-wide capacity —
+        // else the origin count leaks and permanently caps the origin.
+        origin.decrement(origin_invoker_did);
         if let Some(count) = self.per_outlet.get_mut(outlet_id) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -1301,15 +1388,6 @@ impl StreamAdmissionTracker {
     #[must_use]
     pub fn count_per_invoker(&self, invoker_did: &str) -> u32 {
         self.per_invoker.get(invoker_did).copied().unwrap_or(0)
-    }
-
-    /// Read-only: count of streams open under outermost `iss`.
-    #[must_use]
-    pub fn count_per_origin_invoker(&self, origin_invoker_did: &str) -> u32 {
-        self.per_origin_invoker
-            .get(origin_invoker_did)
-            .copied()
-            .unwrap_or(0)
     }
 
     /// Read-only: count of streams open against `outlet_id`.
@@ -1988,14 +2066,17 @@ mod tests {
     #[test]
     fn admission_per_invoker_cap_enforced() {
         let mut tracker = StreamAdmissionTracker::new();
+        let mut origin = OriginAdmissionTracker::new();
         let caps = caps_default();
         // Open 8 streams under DID-A.
         for i in 0..8 {
-            let outcome = tracker.try_admit(caps, "did:dht:A", "did:dht:Origin", "outlet-x");
+            let outcome =
+                tracker.try_admit(&mut origin, caps, "did:dht:A", "did:dht:Origin", "outlet-x");
             assert_eq!(outcome, AdmissionOutcome::Admitted, "iteration {i}");
         }
         // 9th rejected.
-        let outcome = tracker.try_admit(caps, "did:dht:A", "did:dht:Origin", "outlet-x");
+        let outcome =
+            tracker.try_admit(&mut origin, caps, "did:dht:A", "did:dht:Origin", "outlet-x");
         assert_eq!(outcome, AdmissionOutcome::RateLimitedPerInvoker);
         // Counter NOT incremented on rejection.
         assert_eq!(tracker.count_per_invoker("did:dht:A"), 8);
@@ -2004,6 +2085,7 @@ mod tests {
     #[test]
     fn admission_per_origin_invoker_cap_cross_outlet() {
         let mut tracker = StreamAdmissionTracker::new();
+        let mut origin = OriginAdmissionTracker::new();
         let caps = caps_default();
         // 16 successful opens under outermost iss "Origin", spread
         // across two interfaces (outlet-a, outlet-b) under different
@@ -2011,22 +2093,83 @@ mod tests {
         // We open 8 against outlet-a as DID-1 and 8 against outlet-b
         // as DID-2.
         for _ in 0..8 {
-            let o = tracker.try_admit(caps, "did:dht:1", "did:dht:Origin", "outlet-a");
+            let o = tracker.try_admit(&mut origin, caps, "did:dht:1", "did:dht:Origin", "outlet-a");
             assert_eq!(o, AdmissionOutcome::Admitted);
         }
         for _ in 0..8 {
-            let o = tracker.try_admit(caps, "did:dht:2", "did:dht:Origin", "outlet-b");
+            let o = tracker.try_admit(&mut origin, caps, "did:dht:2", "did:dht:Origin", "outlet-b");
             assert_eq!(o, AdmissionOutcome::Admitted);
         }
         // 17th open against either outlet rejected by per-origin cap.
-        let outcome = tracker.try_admit(caps, "did:dht:3", "did:dht:Origin", "outlet-c");
+        let outcome =
+            tracker.try_admit(&mut origin, caps, "did:dht:3", "did:dht:Origin", "outlet-c");
         assert_eq!(outcome, AdmissionOutcome::RateLimitedPerOriginInvoker);
-        assert_eq!(tracker.count_per_origin_invoker("did:dht:Origin"), 16);
+        assert_eq!(origin.count_per_origin_invoker("did:dht:Origin"), 16);
+    }
+
+    /// §05-contexts.md:448 core assertion: the per-origin-invoker cap is
+    /// OPERATOR-scoped, NOT per-context. One origin DID fanning across N
+    /// distinct per-context trackers (each a separate hosted context)
+    /// shares ONE operator-scoped `OriginAdmissionTracker`, so it hits
+    /// the per-origin cap at 16 total — NOT 16 × N. This is the defense
+    /// against a caller fanning out across a cluster of the operator's
+    /// interfaces to saturate the node-wide pump semaphore.
+    #[test]
+    fn admission_per_origin_cap_operator_scoped_across_contexts() {
+        // The operator's single origin tracker, shared across all
+        // contexts it hosts.
+        let mut origin = OriginAdmissionTracker::new();
+        // Four distinct per-context trackers (four hosted contexts).
+        let mut ctx_a = StreamAdmissionTracker::new();
+        let mut ctx_b = StreamAdmissionTracker::new();
+        let mut ctx_c = StreamAdmissionTracker::new();
+        let mut ctx_d = StreamAdmissionTracker::new();
+        // per_origin_invoker = 16, per_invoker = 8, per_outlet = 128.
+        let caps = caps_default();
+
+        let origin_did = "did:dht:FanoutOrigin";
+        let mut admitted = 0u32;
+        let mut rejected_by_origin = 0u32;
+
+        // 5 opens in EACH of the 4 contexts (20 total) by the SAME origin
+        // DID. Per context, 5 <= per_invoker(8) and 5 <= per_outlet(128),
+        // so neither PER-CONTEXT cap binds. Only the OPERATOR-scoped
+        // per-origin cap (16) can stop these — and it must, at 16 total.
+        // If the per-origin dimension were (wrongly) per-context, every
+        // context would independently admit all 5 → 20 admits → the
+        // §05-contexts.md:448 fan-out DoS.
+        for (i, ctx) in [&mut ctx_a, &mut ctx_b, &mut ctx_c, &mut ctx_d]
+            .into_iter()
+            .enumerate()
+        {
+            let outlet = format!("outlet-{i}");
+            let invoker = format!("did:dht:hop-{i}");
+            for _ in 0..5 {
+                match ctx.try_admit(&mut origin, caps, &invoker, origin_did, &outlet) {
+                    AdmissionOutcome::Admitted => admitted += 1,
+                    AdmissionOutcome::RateLimitedPerOriginInvoker => rejected_by_origin += 1,
+                    other => panic!("unexpected per-context rejection: {other:?}"),
+                }
+            }
+        }
+
+        // Exactly the operator-scoped cap admitted — NOT 4 × per-context.
+        assert_eq!(
+            admitted, 16,
+            "operator-scoped per-origin cap must bound the origin to 16 streams \
+             TOTAL across all contexts (§05-contexts.md:448)"
+        );
+        assert_eq!(
+            rejected_by_origin, 4,
+            "20 attempts - 16 admits = 4 rejections by the per-origin cap"
+        );
+        assert_eq!(origin.count_per_origin_invoker(origin_did), 16);
     }
 
     #[test]
     fn admission_per_outlet_cap_across_invokers() {
         let mut tracker = StreamAdmissionTracker::new();
+        let mut origin = OriginAdmissionTracker::new();
         // Custom caps that allow many invokers to focus the test on
         // the per-outlet cap (default 128).
         let caps = AdmissionCaps {
@@ -2036,11 +2179,12 @@ mod tests {
         };
         for i in 0..128 {
             let invoker = format!("did:dht:invoker-{i}");
-            let outcome = tracker.try_admit(caps, &invoker, &invoker, "outlet-Y");
+            let outcome = tracker.try_admit(&mut origin, caps, &invoker, &invoker, "outlet-Y");
             assert_eq!(outcome, AdmissionOutcome::Admitted);
         }
         // 129th rejected.
         let outcome = tracker.try_admit(
+            &mut origin,
             caps,
             "did:dht:invoker-extra",
             "did:dht:invoker-extra",
@@ -2053,13 +2197,59 @@ mod tests {
     #[test]
     fn admission_release_on_terminal_decrements_all_three() {
         let mut tracker = StreamAdmissionTracker::new();
+        let mut origin = OriginAdmissionTracker::new();
         let caps = caps_default();
-        tracker.try_admit(caps, "did:dht:A", "did:dht:Origin", "outlet-x");
+        tracker.try_admit(&mut origin, caps, "did:dht:A", "did:dht:Origin", "outlet-x");
         assert_eq!(tracker.count_per_invoker("did:dht:A"), 1);
-        tracker.release("did:dht:A", "did:dht:Origin", "outlet-x");
+        assert_eq!(origin.count_per_origin_invoker("did:dht:Origin"), 1);
+        tracker.release(&mut origin, "did:dht:A", "did:dht:Origin", "outlet-x");
         assert_eq!(tracker.count_per_invoker("did:dht:A"), 0);
-        assert_eq!(tracker.count_per_origin_invoker("did:dht:Origin"), 0);
+        assert_eq!(origin.count_per_origin_invoker("did:dht:Origin"), 0);
         assert_eq!(tracker.count_per_outlet("outlet-x"), 0);
+    }
+
+    /// §05-contexts.md:448: a closed stream frees the origin's
+    /// operator-wide capacity. Fill the per-origin cap across two
+    /// contexts, close one stream, and confirm the origin can open one
+    /// more (the released slot is reusable, in ANY of the operator's
+    /// contexts).
+    #[test]
+    fn admission_origin_release_frees_operator_capacity() {
+        let mut origin = OriginAdmissionTracker::new();
+        let mut ctx_a = StreamAdmissionTracker::new();
+        let mut ctx_b = StreamAdmissionTracker::new();
+        // Cap the per-origin dimension low to keep the test tight;
+        // per-invoker/per-outlet high so only the origin cap binds.
+        let caps = AdmissionCaps {
+            per_invoker: 100,
+            per_origin_invoker: 2,
+            per_outlet: 100,
+        };
+        // Two opens by the same origin, one in each context — fills the
+        // operator-wide per-origin cap of 2.
+        assert_eq!(
+            ctx_a.try_admit(&mut origin, caps, "did:dht:h", "did:dht:O", "outlet-a"),
+            AdmissionOutcome::Admitted
+        );
+        assert_eq!(
+            ctx_b.try_admit(&mut origin, caps, "did:dht:h", "did:dht:O", "outlet-b"),
+            AdmissionOutcome::Admitted
+        );
+        assert_eq!(origin.count_per_origin_invoker("did:dht:O"), 2);
+        // A third open (any context) is rejected — origin cap saturated.
+        assert_eq!(
+            ctx_a.try_admit(&mut origin, caps, "did:dht:h", "did:dht:O", "outlet-a2"),
+            AdmissionOutcome::RateLimitedPerOriginInvoker
+        );
+        // Close the ctx-a stream — frees one operator-wide origin slot.
+        ctx_a.release(&mut origin, "did:dht:h", "did:dht:O", "outlet-a");
+        assert_eq!(origin.count_per_origin_invoker("did:dht:O"), 1);
+        // The freed slot is reusable — even in a DIFFERENT context.
+        assert_eq!(
+            ctx_b.try_admit(&mut origin, caps, "did:dht:h", "did:dht:O", "outlet-b2"),
+            AdmissionOutcome::Admitted
+        );
+        assert_eq!(origin.count_per_origin_invoker("did:dht:O"), 2);
     }
 
     #[test]
@@ -2069,6 +2259,7 @@ mod tests {
         // real iss DID's counter remains at 0 even after 100
         // simulated rejections.
         let mut tracker = StreamAdmissionTracker::new();
+        let mut origin = OriginAdmissionTracker::new();
         let caps = caps_default();
         // Simulate 100 forged rejections — they bypass try_admit.
         for _ in 0..100 {
@@ -2076,11 +2267,17 @@ mod tests {
             // calling try_admit. Counter under the real iss DID
             // stays at 0.
         }
-        assert_eq!(tracker.count_per_origin_invoker("did:dht:RealOrigin"), 0);
+        assert_eq!(origin.count_per_origin_invoker("did:dht:RealOrigin"), 0);
         // A subsequent valid open by the real DID succeeds.
-        let outcome = tracker.try_admit(caps, "did:dht:RealHop", "did:dht:RealOrigin", "outlet-x");
+        let outcome = tracker.try_admit(
+            &mut origin,
+            caps,
+            "did:dht:RealHop",
+            "did:dht:RealOrigin",
+            "outlet-x",
+        );
         assert_eq!(outcome, AdmissionOutcome::Admitted);
-        assert_eq!(tracker.count_per_origin_invoker("did:dht:RealOrigin"), 1);
+        assert_eq!(origin.count_per_origin_invoker("did:dht:RealOrigin"), 1);
     }
 
     #[test]
