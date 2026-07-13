@@ -44,7 +44,7 @@ rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 openmls = { version = "0.8", features = ["libcrux-provider"] }
 openmls_traits = "0.5"
 openmls_basic_credential = "0.5"

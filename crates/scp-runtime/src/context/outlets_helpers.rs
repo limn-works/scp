@@ -1287,6 +1287,11 @@ where
         invoker_did,
         timeout_ms,
         executor,
+        // SCP-OUT-028: the manager wrapper does not yet wire a
+        // handler-panic sink — the panic guard still recovers panics into
+        // `InvocationError::HandlerPanic`; only the §5.4.2 OutletVerified
+        // attribution emission is skipped when the sink is `None`.
+        None,
     )
     .await
     {
@@ -1647,6 +1652,30 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         InvocationError::CaveatViolation { slug, message } => ContextError::PermissionDenied(
             format!("SCP-OUTLET-6110: caveat violation [{slug}]: {message}"),
         ),
+        // §5.4.2 Protocol-class violations (SCP-OUT-013): Query cost rule,
+        // ReadOnlyInvocation write-deny, and executor kind mismatch all map
+        // to the Protocol code family.
+        InvocationError::OutletQueryCostViolation { reason } => ContextError::PermissionDenied(
+            format!("SCP-OUTLET-6100: Query outlet cost violation (§5.4.2): {reason}"),
+        ),
+        InvocationError::QueryViolation {
+            outlet_id,
+            operation,
+        } => ContextError::PermissionDenied(format!(
+            "SCP-OUTLET-6100: Query outlet {outlet_id} attempted write {operation} through ReadOnlyInvocation (§5.4.2)"
+        )),
+        InvocationError::KindMismatch { outlet_id, kind } => {
+            ContextError::PermissionDenied(format!(
+                "SCP-OUTLET-6100: outlet {outlet_id} registered as {kind:?} but executor returned KindMismatch (§5.4.2)"
+            ))
+        }
+        // §5.4.2 / §5.4.4 executor panic (SCP-OUT-028): Execution-class fault.
+        InvocationError::HandlerPanic {
+            outlet_id,
+            panic_message,
+        } => ContextError::PermissionDenied(format!(
+            "SCP-OUTLET-6130: outlet {outlet_id} handler panicked (execution.handler-panic): {panic_message}"
+        )),
     }
 }
 
