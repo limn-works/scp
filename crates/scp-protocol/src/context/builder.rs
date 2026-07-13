@@ -25,6 +25,18 @@ pub struct OpenedEnvelope {
     pub inner: InnerEnvelope,
     /// The sender's DID extracted from MLS credentials.
     pub sender_did: String,
+    /// The receive-side `(sender_key_epoch, sequence)` this envelope advanced
+    /// the anti-replay tracker to inside `MlsCryptoProvider::open` (spec
+    /// §23.17.3).
+    ///
+    /// ADR-049 PR-4: surfaced SOLELY so the supervisor floor-registry follower
+    /// mirror-forward (`decrypt_and_dispatch`) can track the just-advanced
+    /// receive floor in O(1), without an O(senders) `export_recv_sequence_floors`
+    /// re-read (Decision-14 budget). It is the value `open()` ALREADY computed
+    /// and stored; exposing it does NOT change `open()`'s enforcement or advance
+    /// behavior, and NOTHING reads this field for enforcement — only the
+    /// follower mirror-forward consumes it.
+    pub receive_floor: (u64, u64),
 }
 
 /// Discriminated result of `MlsCryptoProvider::open` (in `scp-runtime`).

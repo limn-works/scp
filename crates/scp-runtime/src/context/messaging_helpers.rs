@@ -2906,7 +2906,36 @@ pub fn decrypt_and_dispatch(
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {
-        scp_protocol::context::builder::OpenResult::Application(env) => Ok(Some(*env)),
+        scp_protocol::context::builder::OpenResult::Application(env) => {
+            // ADR-049 PR-4 follower mirror-forward (recv-seq). `open()` already
+            // advanced + enforced the authoritative `recv_sequence_tracker`; we
+            // only TRACK the just-advanced `(epoch, sequence)` — surfaced O(1)
+            // on `env.receive_floor` — into the supervisor floor registry.
+            // NON-FATAL: the provider remains authoritative in PR-4, so a
+            // rejected/failed follow-on advance is logged and dropped.
+            //
+            // Single-writer / security separation (verbatim, mirror-forward
+            // seam): SECURITY — "never accept a key below the floor" — is
+            // STRUCTURAL and caller-topology-independent (the single-`entry()`
+            // gate); the per-context single-writer actor preserves only
+            // LIVENESS. A cross-actor call would stay FAIL-SAFE (spurious
+            // reject), never fail-open. Security is the structural gate;
+            // single-writer is a liveness convention.
+            if let Err(e) = deps.supervisor.check_and_advance_recv_sequence(
+                context_id_bytes,
+                &env.sender_did,
+                env.receive_floor,
+                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+            ) {
+                tracing::debug!(
+                    sender_did = %env.sender_did,
+                    context_id = %context_id,
+                    error = %e,
+                    "floor-registry follower recv-sequence mirror-forward rejected (non-fatal in PR-4; provider authoritative)"
+                );
+            }
+            Ok(Some(*env))
+        }
         scp_protocol::context::builder::OpenResult::Control => Ok(None),
         scp_protocol::context::builder::OpenResult::Management {
             sender_did,
@@ -2915,8 +2944,60 @@ pub fn decrypt_and_dispatch(
             tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
             deps.crypto
                 .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
+            // ADR-049 PR-4 follower mirror-forward (remote sender-epoch). The
+            // `set_checked` inside `process_incoming_sender_key` has advanced
+            // the authoritative floor; read the just-recorded epoch O(1) and
+            // TRACK it in the supervisor registry. NON-FATAL (see recv seam).
+            let epoch = deps.crypto.sender_key_epoch(context_id_bytes, &sender_did);
+            if let Err(e) = deps.supervisor.check_and_advance_sender_epoch(
+                context_id_bytes,
+                &sender_did,
+                epoch,
+                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+            ) {
+                tracing::debug!(
+                    sender_did = %sender_did,
+                    context_id = %context_id,
+                    error = %e,
+                    "floor-registry follower remote sender-epoch mirror-forward rejected (non-fatal in PR-4; provider authoritative)"
+                );
+            }
             Ok(None)
         }
+    }
+}
+
+/// ADR-049 PR-4 follower mirror-forward for a LOCAL sender-key rotation.
+///
+/// Call AFTER `deps.crypto.rotate_sender_key(ctx)` succeeds. `rotate_sender_key`
+/// increments the local epoch scalar (`state.sender_key_epoch`, which
+/// `set_unchecked` does NOT record in the store's per-sender epoch map), so the
+/// authoritative local floor is read via
+/// [`MlsCryptoProvider::local_sender_key_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::local_sender_key_epoch)
+/// and TRACKED in the supervisor floor registry keyed by the provider's local
+/// DID. NON-FATAL in PR-4: the provider remains authoritative, so a rejected
+/// follow-on advance is logged and dropped.
+///
+/// Single-writer / security separation (verbatim, mirror-forward seam):
+/// SECURITY — "never accept a key below the floor" — is STRUCTURAL and
+/// caller-topology-independent (the single-`entry()` gate); the per-context
+/// single-writer actor preserves only LIVENESS. A cross-actor call would stay
+/// FAIL-SAFE (spurious reject), never fail-open. Security is the structural
+/// gate; single-writer is a liveness convention.
+pub(in crate::context) fn mirror_forward_local_sender_epoch(deps: &ActorDeps, ctx: &[u8; 32]) {
+    let epoch = deps.crypto.local_sender_key_epoch(ctx);
+    let local_did = deps.crypto.local_did();
+    if let Err(e) = deps.supervisor.check_and_advance_sender_epoch(
+        ctx,
+        local_did,
+        epoch,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+    ) {
+        tracing::debug!(
+            local_did = %local_did,
+            error = %e,
+            "floor-registry follower local sender-epoch mirror-forward rejected (non-fatal in PR-4; provider authoritative)"
+        );
     }
 }
 

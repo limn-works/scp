@@ -991,6 +991,12 @@ pub async fn execute_revoke(
                 error = %e,
                 "rotate_sender_key failed after access revocation"
             );
+        } else {
+            // ADR-049 PR-4: track the rotated local epoch in the floor registry.
+            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                deps,
+                &context_id_bytes,
+            );
         }
         // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape
         // and operates directly on `state` + `deps`.
@@ -1404,6 +1410,12 @@ pub async fn execute_remove_member(
                 )
                 .map(|()| (String::new(), None));
             }
+            // ADR-049 PR-4: rotate succeeded (the Err arm returns above) — track
+            // the rotated local epoch in the floor registry.
+            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                deps,
+                &context_id_bytes,
+            );
 
             state.membership.remove_member(did);
             // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
@@ -2519,6 +2531,12 @@ pub async fn execute_reset_member(
             context_id,
             error = %e,
             "rotate_sender_key failed after MLS reset"
+        );
+    } else {
+        // ADR-049 PR-4: track the rotated local epoch in the floor registry.
+        crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+            deps,
+            &context_id_bytes,
         );
     }
 

@@ -1238,6 +1238,19 @@ pub struct Supervisor {
     /// first time an actor for that context crashes. Lock-free reads via
     /// `DashMap` per ADR-049 §Decision 12.
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
+    /// ADR-049 PR-4 — supervisor-owned Class-M **floor registry** (epoch side).
+    /// Keyed by the 32-byte context id. Each [`ContextFloors`] bundles the
+    /// per-sender epoch high-water and the receive-side `(epoch, sequence)`
+    /// anti-replay floor. In PR-4 this is a NON-AUTHORITATIVE FOLLOWER: the
+    /// `MlsCryptoProvider` remains the authoritative floor store and nothing
+    /// reads this map for enforcement/capture/merge (write-only until PR-6).
+    /// Lives on `Arc<Supervisor>` so it survives an actor task unwind — the
+    /// Class-M requirement the floors exist to satisfy. Lock-free entry-scoped
+    /// reads/writes via `DashMap` (ADR-049 Decision 12); an entry mutation does
+    /// NOT take [`Self::write_lock`] (that guards the multi-field ArcSwap write
+    /// path per Decision 2). Precedent: `crash_windows` above.
+    pub(in crate::context::supervisor) floors:
+        DashMap<[u8; 32], crate::context::supervisor::floors::ContextFloors>,
     /// Test-only completion signal for the KeyPackage-actor watchdog.
     ///
     /// A monotonically-incrementing counter bumped by [`Self::kp_actor_watchdog`]
@@ -1614,6 +1627,8 @@ impl Supervisor {
             key_package_stores: DashMap::new(),
             health_config,
             crash_windows: DashMap::new(),
+            // ADR-049 PR-4: supervisor-owned Class-M floor registry (follower).
+            floors: DashMap::new(),
             // Test-only KP-watchdog completion signal (see field docs). The
             // paired receiver is created on demand via `kp_watchdog_processed_tx.subscribe()`;
             // dropping the initial one here is fine — `watch::Sender::send_modify`
@@ -18149,6 +18164,16 @@ mod tests {
         // The PERSISTED snapshot captures the floor at epoch 5 (the coalesced
         // state at snapshot time).
         crypto.seed_sender_key_epoch_for_test(&ctx_id_bytes, sender_did, 5);
+        // ADR-049 PR-4: the supervisor floor registry is a FOLLOWER. Seed it in
+        // parallel to epoch 5 (as the mirror-forward seams would have) so we can
+        // assert after respawn that the follower tracks the provider.
+        sup.check_and_advance_sender_epoch(
+            &ctx_id_bytes,
+            sender_did,
+            5,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        )
+        .expect("seed follower registry to epoch 5");
 
         let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
@@ -18180,6 +18205,14 @@ mod tests {
         // survives the crash (it lives in the supervisor-owned crypto provider,
         // which a mailbox/handle despawn does not tear down).
         crypto.seed_sender_key_epoch_for_test(&ctx_id_bytes, sender_did, 12);
+        // Advance the follower registry in parallel to the live floor (12).
+        sup.check_and_advance_sender_epoch(
+            &ctx_id_bytes,
+            sender_did,
+            12,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        )
+        .expect("advance follower registry to epoch 12");
 
         // Crash before any re-persist of the advanced floor.
         induce_panic(&handle, "SECRET_SENTINEL_lagged").await;
@@ -18207,6 +18240,17 @@ mod tests {
         assert!(
             merged.iter().any(|(d, e)| d == sender_did && *e == 12),
             "merged floor must be the higher live value (12), got {merged:?}"
+        );
+
+        // ADR-049 PR-4: the FOLLOWER registry tracks the provider after respawn.
+        // The additive post-merge restore seed in
+        // `restore_crypto_state_with_floor_guard` mirrors the provider's
+        // post-merge floor (12) into the supervisor registry, so the follower
+        // reports 12 too — never the stale snapshot's 5.
+        let follower = sup.export_sender_key_epochs(&ctx_id_bytes);
+        assert!(
+            follower.iter().any(|(d, e)| d == sender_did && *e == 12),
+            "follower registry must track the provider's merged floor (12) after respawn, got {follower:?}"
         );
     }
 
