@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "scp-python"
-version = "0.1.0b2"
+version = "0.1.0b3"
 description = "SCP (Shared Context Protocol) Python SDK — cryptographic identity, governed contexts, and trust for AI agents"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
@@ -35,7 +35,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13"]
 scp-mcp = "scp_sdk.mcp:cli_main"
 
 [project.urls]
-Repository = "https://github.com/limn-scp/scp-protocol-core"
+Repository = "https://github.com/limn-works/scp"
 Documentation = "https://scp.dev/docs"
 
 [tool.pytest.ini_options]
