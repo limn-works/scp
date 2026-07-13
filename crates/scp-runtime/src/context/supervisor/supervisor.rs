@@ -11048,9 +11048,10 @@ impl Supervisor {
         // reference: a bridge that already computed it is not overridden).
         params.reserved_escrow = reservation.reserved_escrow;
         if params.economic_policy_snapshot.is_none() {
-            params.economic_policy_snapshot = reservation.economic_policy.clone().map(|policy| {
-                crate::context::outlets::invoke::EconomicPolicySnapshot { policy }
-            });
+            params.economic_policy_snapshot = reservation
+                .economic_policy
+                .clone()
+                .map(|policy| crate::context::outlets::invoke::EconomicPolicySnapshot { policy });
         }
 
         // The actor-owned durable caveat-counter store: routes the §7.3.8
@@ -27748,5 +27749,421 @@ mod tests {
             .reservation
             .ticket
             .consume_abandoning_escrow();
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines
+)]
+mod open_outlet_stream_tests {
+    //! Chunk 3e integration crux — `Supervisor::open_outlet_stream<E>` end to
+    //! end through the reserve (mailbox) → off-mailbox pump → settle (mailbox)
+    //! bracket against a REAL spawned actor: open a stream, grant credit, drain
+    //! the executor's data chunks, send a signed cancel, and assert the pump's
+    //! billing split plus that the close-time settlement RAN ON THE ACTOR (its
+    //! §19.15.5 receipt capture — which, in `outlet_stream_settle`, runs only
+    //! after the unspent-escrow refund and the cumulative-counter release).
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use ed25519_dalek::SigningKey;
+    use scp_did::DID;
+    use scp_platform::testing::InMemoryStorage;
+    use scp_protocol::context::ContextState;
+    use scp_protocol::context::outlets::registry::{OutletRegistry, register_outlet};
+    use scp_protocol::context::outlets::stream::{
+        ChunkPayload, CreditGrantSigningInputs, OutletStreamCredit, RequestId,
+        compute_caveats_binding, sign_credit_grant,
+    };
+    use scp_protocol::context::outlets::{OutletId, OutletKind, OutletRegistration, OutletSchema};
+    use scp_protocol::context::roles::{Capability, ContextRoleState, default_ceiling};
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    use super::Supervisor;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::outlets::dispatch::{CancelIdentity, OpenStreamParams};
+    use crate::context::outlets::invoke::{MutableInvocation, OutletExecutor, OutletExecutorError};
+    use crate::context::outlets::signer::{InProcessStreamSigner, StreamSigner};
+    use crate::context::outlets::stream::{AdmissionCaps, StreamIdentity};
+    use crate::context::outlets_helpers::InvocationCaveatBinding;
+    use crate::economy::adapter::{CountingPaymentAdapter, PaymentAdapterDyn};
+
+    const NOW: u64 = 1_700_000_000;
+    const CTX_BYTE: u8 = 0x3e;
+    const COST_PER_CHUNK: u64 = 10;
+    const DATA_CHUNKS: u32 = 3;
+    const DECLARED_ESTIMATE: u32 = 5;
+    const UCAN_CID: &str = "cid-3e-orchestrator";
+
+    fn ctx_key() -> String {
+        hex::encode([CTX_BYTE; 32])
+    }
+    fn invoker() -> DID {
+        DID("did:dht:z6MkStreamOrch3e".to_owned())
+    }
+
+    /// Emits `DATA_CHUNKS` `Data` chunks, then blocks forever so the stream
+    /// stays open until the signed cancel drives the terminal (a natural `End`
+    /// would race the cancel). The blocked task is aborted at runtime shutdown.
+    struct BlockingStreamExecutor;
+    #[async_trait::async_trait]
+    impl OutletExecutor for BlockingStreamExecutor {
+        async fn exec_action_stream(
+            &self,
+            _ctx: &mut MutableInvocation<'_>,
+            _input: serde_json::Value,
+            tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+        ) -> Result<(), OutletExecutorError> {
+            for i in 0..DATA_CHUNKS {
+                let _ = tx
+                    .send(ChunkPayload::Data {
+                        value: serde_json::json!({ "tick": i }),
+                    })
+                    .await;
+            }
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    fn build_supervisor(captured: &Arc<AtomicUsize>) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            invoker().0,
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(crate::context::providers::MerkleEventLogProvider::new());
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let payment_adapter: Arc<dyn PaymentAdapterDyn> = Arc::new(CountingPaymentAdapter {
+            captured: Arc::clone(captured),
+            ..Default::default()
+        });
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(NOW));
+        Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(Box::new(
+                crate::context::persistence::NoopContextPersistence,
+            )),
+            Some(payment_adapter),
+            None,
+            Some(clock),
+            mls_storage,
+        )
+    }
+
+    fn policy() -> EconomicPolicy {
+        EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode::from("USD"),
+                per_message: None,
+                per_outlet_call: Some(Amount::new(COST_PER_CHUNK)),
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID::from("did:key:stream-orch-payee"),
+        }
+    }
+
+    fn authorizing_role_state() -> ContextRoleState {
+        let mut role_state = ContextRoleState::new(
+            ctx_key(),
+            &invoker().0,
+            default_ceiling(),
+            vec![],
+            &scp_clock::TestClock::new(NOW),
+        )
+        .expect("role state");
+        role_state.members.insert(invoker().0);
+        let caps = role_state
+            .member_capabilities
+            .entry(invoker().0)
+            .or_default();
+        caps.insert(Capability::OutletCallAll);
+        caps.insert(Capability::OutletRegister);
+        role_state
+    }
+
+    fn registration() -> OutletRegistration {
+        OutletRegistration {
+            outlet_id: "calculator".to_owned(),
+            kind: OutletKind::Action,
+            name: "Calculator".to_owned(),
+            description: "A simple streaming calculator".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "result": {"type": "number"} }
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0xAA; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkOperator".into(),
+            cost: None,
+            message_catalog: Vec::new(),
+            registered_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Open → grant → drain N Data → signed cancel → close → assert the pump's
+    /// billing split (billed 3×10, refund 50−30=20) AND that the close-time
+    /// settlement ran on the actor (its receipt capture is observed, proving the
+    /// preceding escrow refund + cumulative-counter release also executed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_outlet_stream_reserve_pump_settle_end_to_end() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let supervisor = build_supervisor(&captured);
+
+        // Spawn a live actor: invoker is the funded, OutletCall-capable owner
+        // with the hosting economic policy set (for the close-time receipt).
+        let role_state = authorizing_role_state();
+        let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        state.role_state = role_state.clone();
+        state
+            .membership
+            .add_member(invoker(), "owner".to_owned(), Vec::new());
+        state
+            .governance
+            .budget_tracker
+            .grant(&invoker(), Amount::new(1_000_000));
+        state.governance.economic_policy = Some(policy());
+        let deps = supervisor
+            .build_actor_deps(&invoker())
+            .await
+            .expect("build_actor_deps");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn_actor_with_state");
+
+        let mut registry = OutletRegistry::new();
+        register_outlet(&mut registry, &role_state, registration(), &invoker().0)
+            .expect("register streaming outlet");
+
+        // A counter-bearing caveat so the §7.3.8 cumulative-counter reserve
+        // (Step 5.5) is committed at open and RELEASED at settle.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        let request_id: RequestId = [CTX_BYTE; 16];
+        let caveats_jcs = caveats.to_canonical_json_bytes().expect("jcs");
+        let caveats_binding = compute_caveats_binding(
+            UCAN_CID.as_bytes(),
+            &request_id,
+            &invoker().0,
+            DECLARED_ESTIMATE,
+            &caveats_jcs,
+        );
+        let identity = StreamIdentity {
+            context_id: ctx_key(),
+            outlet_id: "calculator".to_owned(),
+            stream_epoch: 1,
+            caveats_binding,
+        };
+        let invoker_key = SigningKey::from_bytes(&[0x24; 32]);
+        let invoker_pk = invoker_key.verifying_key();
+        let operator_signer: Arc<dyn StreamSigner> =
+            Arc::new(InProcessStreamSigner::new(invoker_key.clone()));
+
+        let params = OpenStreamParams {
+            identity: identity.clone(),
+            caps: AdmissionCaps {
+                per_invoker: 10,
+                per_origin_invoker: 10,
+                per_outlet: 10,
+            },
+            invoker_did: invoker().0,
+            origin_invoker_did: invoker().0,
+            cost_per_chunk: Amount::new(COST_PER_CHUNK),
+            available_balance: Amount::new(1_000_000),
+            reserved_escrow: Amount::new(0),
+            declared_estimated_chunk_count: Some(DECLARED_ESTIMATE),
+            credit_window: 32,
+            caveats: caveats.clone(),
+            invoker_pk,
+            operator_signer: Arc::clone(&operator_signer),
+            stream_credit_stall_secs: 30,
+            stream_cancel_ack_secs: 1,
+            stream_ucan_recheck_secs: 3_600,
+            ucan_cid: UCAN_CID.to_owned(),
+            request_id,
+            revocation_checker: Arc::new(
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+            ),
+            economic_policy_snapshot: None,
+        };
+        let invocation_binding = Some(InvocationCaveatBinding {
+            caveats,
+            ucan_cid: UCAN_CID.to_owned(),
+        });
+
+        let executor: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
+        let outlet_id: OutletId = "calculator".to_owned();
+        let mut handle = supervisor
+            .open_outlet_stream(
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                executor,
+                None,
+                None,
+                None,
+                invocation_binding,
+                params,
+            )
+            .await
+            .expect("open_outlet_stream must accept a well-formed streaming open");
+
+        let mut rx = handle.receiver().expect("receiver");
+        let summary_rx = handle.close_summary().expect("close summary");
+
+        // Grant credit via the handle (exercise the control surface).
+        let grant = OutletStreamCredit {
+            request_id,
+            grant: 8,
+            monotonic_seq: 1,
+            sig: sign_credit_grant(
+                &invoker_key,
+                &CreditGrantSigningInputs {
+                    context_id: &ctx_key(),
+                    outlet_id: "calculator",
+                    request_id: &request_id,
+                    grant: 8,
+                    monotonic_seq: 1,
+                    stream_epoch: 1,
+                    caveats_binding: &caveats_binding,
+                },
+            ),
+        };
+        handle
+            .apply_credit_grant(&grant, Amount::new(0))
+            .expect("signed credit grant applies");
+
+        // Drain the executor's DATA_CHUNKS `Data` chunks.
+        let mut data_seen = 0u32;
+        for _ in 0..DATA_CHUNKS {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("data chunk within 5s")
+                .expect("data chunk present");
+            match chunk.payload {
+                ChunkPayload::Data { .. } => data_seen += 1,
+                other => panic!("expected Data, got {other:?}"),
+            }
+        }
+        assert_eq!(data_seen, DATA_CHUNKS, "all executor Data chunks delivered");
+
+        // Send a signed cancel — the runtime derives next_seq from its live
+        // cursor (== 3), pinning the billing boundary at the 3 delivered chunks.
+        let cancel_signer = InProcessStreamSigner::new(invoker_key.clone());
+        let cancel_identity = CancelIdentity {
+            context_id: ctx_key(),
+            outlet_id: "calculator".to_owned(),
+            caveats_binding,
+        };
+        let cancel_ack_seq = handle
+            .apply_outlet_cancel_signed(&cancel_signer, &cancel_identity)
+            .await
+            .expect("signed cancel applies");
+        assert_eq!(
+            cancel_ack_seq,
+            Some(u64::from(DATA_CHUNKS)),
+            "cancel-ack seq pins to the runtime cursor after 3 emissions"
+        );
+
+        // Drain to the terminal chunk (the cancel-ack-timeout forced terminal,
+        // since the blocked executor emits none).
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(chunk)
+                        if matches!(
+                            chunk.payload,
+                            ChunkPayload::End { .. } | ChunkPayload::Error { terminal: true, .. }
+                        ) =>
+                    {
+                        break true;
+                    }
+                    Some(_) => {}
+                    None => break false,
+                }
+            }
+        })
+        .await
+        .expect("terminal chunk within 5s");
+        assert!(terminal, "the stream reaches a terminal chunk");
+
+        // The pump's close summary carries the economic reconciliation.
+        let summary = tokio::time::timeout(Duration::from_secs(5), summary_rx)
+            .await
+            .expect("close summary resolves within 5s")
+            .expect("summary channel not dropped");
+        assert_eq!(summary.billed_count, DATA_CHUNKS, "3 Data chunks billed");
+        assert_eq!(
+            summary.billed_amount,
+            Amount::new(COST_PER_CHUNK * u64::from(DATA_CHUNKS)),
+            "billed amount == 3 × cost_per_chunk"
+        );
+        assert_eq!(
+            summary.refund_amount,
+            Amount::new(COST_PER_CHUNK * u64::from(DECLARED_ESTIMATE - DATA_CHUNKS)),
+            "unspent escrow refunded: reserved 50 − billed 30 == 20"
+        );
+
+        // The close-time settlement RAN ON THE ACTOR (via the mailbox): its
+        // §19.15.5 receipt capture is observed. `outlet_stream_settle` releases
+        // the unspent cumulative counter and refunds the escrow BEFORE the
+        // capture, so an observed capture proves the full settlement executed.
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if captured.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "close-time settlement (receipt capture) must run on the actor within 5s"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            1,
+            "exactly one §19.15.5 receipt captured for the billed count"
+        );
     }
 }

@@ -2381,10 +2381,12 @@ pub fn build_stream_post_input_hook(
 
     let reservation = if caveats.has_counter_bearing_caveat() {
         match counter_store {
-            Some(store) => Some(crate::context::outlets::dispatch::StreamCounterReservation {
-                counter_store: Arc::clone(store),
-                caveats: caveats.clone(),
-            }),
+            Some(store) => Some(
+                crate::context::outlets::dispatch::StreamCounterReservation {
+                    counter_store: Arc::clone(store),
+                    caveats: caveats.clone(),
+                },
+            ),
             None => {
                 return Err(
                     crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation {
