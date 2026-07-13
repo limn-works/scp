@@ -1124,12 +1124,14 @@ impl StreamSessionHandle {
     ///   not verify under the pinned key + triple.
     /// - [`super::stream::CancelError::CursorAdvanced`] — `cancel.next_seq`
     ///   does not match the runtime's live next-to-emit cursor.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "verbatim-apply path is exercised by cross-context forwarding waves and tests; retained as the single verify+record primitive"
-        )
+    // `allow` (not `expect`): the verbatim-apply path is the single
+    // verify+record primitive for cross-context forwarding waves, which —
+    // with their tests — land in a later chunk, so it currently has no
+    // caller in either cfg on this branch. `allow` tolerates the later
+    // caller without churn; `expect` would then fire "unfulfilled".
+    #[allow(
+        dead_code,
+        reason = "retained as the single verify+record primitive; cross-context forwarding callers + tests land in a later chunk"
     )]
     pub(crate) fn apply_outlet_cancel_verbatim(
         &self,
@@ -4147,11 +4149,9 @@ mod tests {
         };
         ctx_handle
             .transition_to(&scp_protocol::context::ContextState::Active)
-            .await
             .expect("Creating -> Active");
         ctx_handle
             .transition_to(&scp_protocol::context::ContextState::Closing)
-            .await
             .expect("Active -> Closing");
 
         let request_id: RequestId = [0x20; 16];
