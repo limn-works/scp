@@ -114,11 +114,11 @@ pub enum GrantError {
     /// channel closed, or forced terminate) — a credit grant arriving
     /// after the stream reached its terminal state is a session-lifecycle
     /// violation, not an authorization denial. Maps to the Protocol-class
-    /// `protocol.stream-already-closed` slug (`SCP-TOOL-6101`,
+    /// `protocol.stream-already-closed` slug (`SCP-OUTLET-6101`,
     /// `CODE_PROTOCOL_SESSION`) per §5.4.4:426. Gated in
     /// `apply_credit_grant` BEFORE the signature/replay checks run, so a
     /// grant against a closed stream never mutates escrow or the credit
-    /// counter. Distinct from the Authorization-class `SCP-TOOL-6110`
+    /// counter. Distinct from the Authorization-class `SCP-OUTLET-6110`
     /// band: the caller's right to grant was never withdrawn; the stream's
     /// substrate is simply gone.
     StreamClosed,
@@ -224,7 +224,7 @@ pub const fn grant_error_to_code(err: GrantError) -> &'static str {
         }
         // §5.4.4:426 — a control-plane call against an already-terminal
         // stream is a Protocol-class session-lifecycle violation
-        // (`SCP-TOOL-6101`), NOT the Authorization-class `SCP-TOOL-6110`.
+        // (`SCP-OUTLET-6101`), NOT the Authorization-class `SCP-OUTLET-6110`.
         GrantError::StreamClosed => error_codes::CODE_PROTOCOL_SESSION,
     }
 }
@@ -709,7 +709,7 @@ pub enum OpenError {
     /// `estimated_chunk_count` exceeds
     /// `min(credit_window, caveats.max_calls.unwrap_or(u32::MAX))`.
     /// Maps to `OutletErrorClass::Input::EstimateExceedsBound`
-    /// (`SCP-TOOL-6120` / `input.estimate-exceeds-bound`).
+    /// (`SCP-OUTLET-6120` / `input.estimate-exceeds-bound`).
     EstimateExceedsBound,
 }
 
@@ -1092,7 +1092,7 @@ impl CancelAckTracker {
     /// cancel-ack timer has fired. Callers MUST check this every
     /// pump iteration after entering `Pending` state and emit a
     /// framework-generated terminal `Error` chunk
-    /// (`SCP-TOOL-6135` / `execution.cancel-ack-timeout`) when
+    /// (`SCP-OUTLET-6135` / `execution.cancel-ack-timeout`) when
     /// `true`.
     #[must_use]
     pub fn should_force_close(&self, now: Instant) -> bool {
@@ -1106,7 +1106,7 @@ impl CancelAckTracker {
 
     /// Builds the framework-generated terminal `Error` chunk emitted
     /// when the cancel-ack timer fires before the executor responds
-    /// (§5.4.5 `SCP-TOOL-6135`).
+    /// (§5.4.5 `SCP-OUTLET-6135`).
     #[must_use]
     pub fn cancel_ack_timeout_payload() -> ChunkPayload {
         ChunkPayload::Error {
@@ -1120,7 +1120,7 @@ impl CancelAckTracker {
     }
 
     /// Builds the terminal `Error` chunk emitted when the credit
-    /// stall timer fires (§5.4.5 `SCP-TOOL-6133`).
+    /// stall timer fires (§5.4.5 `SCP-OUTLET-6133`).
     #[must_use]
     pub fn credit_stall_payload() -> ChunkPayload {
         ChunkPayload::Error {
@@ -2553,7 +2553,7 @@ mod tests {
         // 33rd call — stall.
         assert_eq!(tracker.try_consume(), Err(OutOfCredit::Exhausted));
         // After stall, the framework would arm the credit-stall
-        // timer and emit a terminal Error chunk (SCP-TOOL-6133)
+        // timer and emit a terminal Error chunk (SCP-OUTLET-6133)
         // when the timer fires.
         let payload = CancelAckTracker::credit_stall_payload();
         match payload {

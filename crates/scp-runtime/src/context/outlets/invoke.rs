@@ -149,7 +149,7 @@ pub enum InvocationError {
 
     /// A Query outlet's declared cost violated the §5.4.2 Query cost rules.
     ///
-    /// Error code: `SCP-TOOL-6100` (the registry maps the
+    /// Error code: `SCP-OUTLET-6100` (the registry maps the
     /// `query-cost-violation` slug to `CODE_PROTOCOL_VIOLATION`; the
     /// registry is truth).
     #[error("Query outlet cost violation (§5.4.2): {reason}")]
@@ -162,7 +162,7 @@ pub enum InvocationError {
     /// (or otherwise tripped the [`ReadOnlyInvocation`] deny-list), per spec
     /// §5.4.2 "`ReadOnlyInvocation` guard at invocation" (SCP-OUT-013).
     ///
-    /// Maps to `OutletErrorClass::Protocol::QueryViolation` (SCP-TOOL-6100,
+    /// Maps to `OutletErrorClass::Protocol::QueryViolation` (SCP-OUTLET-6100,
     /// slug `query-violation`) and triggers an
     /// `OutletVerifiedEvent { integrity_ok: false, reason:
     /// QueryMisdeclaration }` operator-attributable signal per §5.4.2.
@@ -198,7 +198,7 @@ pub enum InvocationError {
     /// outlet's `operator_did` — not SDK-internal bugs. The runtime emits a
     /// parallel `OutletVerifiedEvent { integrity_ok: false, reason:
     /// HandlerPanicked }` alongside this error. On the wire this maps to
-    /// `OutletError { code: SCP-TOOL-6130, slug: "execution.handler-panic",
+    /// `OutletError { code: SCP-OUTLET-6130, slug: "execution.handler-panic",
     /// class: Execution, retry: Never, ... }`. The `panic_message` is
     /// truncated to `MESSAGE_MAX_BYTES` (1 KiB) at a UTF-8 boundary.
     #[error(
@@ -2466,7 +2466,7 @@ pub enum StreamGateOutcome {
     /// further billable chunk MUST NOT be forwarded. The pump maps this to
     /// a terminal `Error { terminal: true }` with slug
     /// `execution.credit-exhausted` (`CODE_EXECUTION_CREDIT`,
-    /// `SCP-TOOL-6131`) and closes the stream. Distinct from
+    /// `SCP-OUTLET-6131`) and closes the stream. Distinct from
     /// [`Self::Stall`] (transient — credit may be replenished) and
     /// [`Self::DropAboveCancelAck`] (a single dropped chunk, stream
     /// continues): `CreditExhausted` is terminal.
@@ -5434,7 +5434,7 @@ mod tests {
     }
 
     /// AC10 — a panicking executor produces a single terminal `Error` chunk
-    /// with code `SCP-TOOL-6130` (`CODE_EXECUTION_FAULT`), `terminal: true`,
+    /// with code `SCP-OUTLET-6130` (`CODE_EXECUTION_FAULT`), `terminal: true`,
     /// and emits the §5.4.2 `OutletVerified` `HandlerPanicked` signal through
     /// the panic sink.
     #[tokio::test]
@@ -5495,7 +5495,7 @@ mod tests {
             } => {
                 assert_eq!(
                     code, CODE_EXECUTION_FAULT,
-                    "code must be SCP-TOOL-6130 (CODE_EXECUTION_FAULT)"
+                    "code must be SCP-OUTLET-6130 (CODE_EXECUTION_FAULT)"
                 );
                 assert!(*terminal, "terminal must be true (PRD AC6)");
                 assert!(

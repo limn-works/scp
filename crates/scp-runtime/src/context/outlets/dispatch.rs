@@ -271,7 +271,7 @@ pub enum OpenStreamRejection {
     /// bind to B and bypass set A's restrictions. Recomputing the
     /// binding at open from the trusted, parsed UCAN closes the gap.
     /// Slug: `authorization.attenuation-violation`; code:
-    /// `SCP-TOOL-6110` (the Authorization-class umbrella per §5.4.4).
+    /// `SCP-OUTLET-6110` (the Authorization-class umbrella per §5.4.4).
     CaveatsBindingMismatch,
     /// The node-level concurrent-pump ceiling
     /// (`ContextManager::max_concurrent_outlet_stream_pumps`) was already
@@ -280,7 +280,7 @@ pub enum OpenStreamRejection {
     /// pass, so a rejected open here does NOT consume a per-context
     /// admission slot or an escrow reservation; the caller's prior gates
     /// are rolled back before this rejection is returned. Slug:
-    /// `execution.stream-cap-exhausted`; code: `SCP-TOOL-6131`
+    /// `execution.stream-cap-exhausted`; code: `SCP-OUTLET-6131`
     /// (`CODE_EXECUTION_CREDIT`, the shared Execution resource-exhaustion
     /// band per §5.4.5 round-8).
     StreamCapExhausted,
@@ -295,7 +295,7 @@ pub enum OpenStreamRejection {
     /// the precise §5.4.4 slug from the rule that fired so the FFI / SDK
     /// surface routes identically to the non-streaming caveat path. The
     /// slug determines the class: `input.schema-violation` →
-    /// `SCP-TOOL-6120`, every other caveat slug → `SCP-TOOL-6110`.
+    /// `SCP-OUTLET-6120`, every other caveat slug → `SCP-OUTLET-6110`.
     CaveatPostInputViolation {
         /// The §5.4.4 slug of the violated caveat rule.
         ///
@@ -341,8 +341,8 @@ impl OpenStreamRejection {
             Self::CaveatsBindingMismatch => error_codes::CODE_AUTHORIZATION_DENIED,
             Self::StreamCapExhausted => error_codes::CODE_EXECUTION_CREDIT,
             // Mirror `caveat_violation_chunk`'s slug→code routing: the
-            // input-schema slug is Input-class (`SCP-TOOL-6120`), every
-            // other caveat slug is Authorization-class (`SCP-TOOL-6110`).
+            // input-schema slug is Input-class (`SCP-OUTLET-6120`), every
+            // other caveat slug is Authorization-class (`SCP-OUTLET-6110`).
             Self::CaveatPostInputViolation { slug } => {
                 if slug.as_str() == error_codes::SLUG_INPUT_SCHEMA_VIOLATION {
                     error_codes::CODE_INPUT_VIOLATION
@@ -715,7 +715,7 @@ pub(crate) struct AdmissionReleaseKeys {
 
 /// Failure modes for [`StreamSessionHandle::terminate_with_error`]
 /// (§5.4.5 receiver-side revocation re-check, `RevokedMidStream` /
-/// `SCP-TOOL-6110`).
+/// `SCP-OUTLET-6110`).
 ///
 /// All variants are recoverable from the SDK's perspective — they
 /// indicate the stream has already left the pump's control plane (e.g.
@@ -794,7 +794,7 @@ pub struct StreamSessionHandle {
     /// Notifier used to wake the pump when the receiver-side framework
     /// requests a forced terminal via
     /// [`StreamSessionHandle::terminate_with_error`] (§5.4.5
-    /// `RevokedMidStream` / `SCP-TOOL-6110`). The pump's select arm for
+    /// `RevokedMidStream` / `SCP-OUTLET-6110`). The pump's select arm for
     /// this notifier checks `pending_terminate`, builds the synthetic
     /// terminal chunk under the pinned operator key, and breaks the
     /// loop into the settlement block. Settlement runs identically to
@@ -3103,7 +3103,7 @@ async fn run_stream_pump_v2(
                 // pinned operator key on the next iteration, then breaks
                 // into settlement — escrow refund, audit event, and
                 // admission release all run end-to-end. The slug/code
-                // (`execution.credit-exhausted` / `SCP-TOOL-6131`) are
+                // (`execution.credit-exhausted` / `SCP-OUTLET-6131`) are
                 // derived from the enum, never caller-controlled.
                 {
                     let mut guard = state
@@ -3629,7 +3629,7 @@ mod tests {
         assert_eq!(
             super::super::stream::grant_error_to_code(err),
             scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
-            "StreamClosed routes to the Protocol-class SCP-TOOL-6101 code",
+            "StreamClosed routes to the Protocol-class SCP-OUTLET-6101 code",
         );
 
         // Escrow and credit state must be byte-for-byte unchanged.
@@ -4308,7 +4308,7 @@ mod tests {
     /// pinned `max_billable=10`, the pump forwards at most 10 billable Data
     /// chunks regardless of how much credit is granted, then emits a
     /// terminal `Error{terminal:true}` with `execution.credit-exhausted` /
-    /// `SCP-TOOL-6131`. The executor here floods 100 Data chunks; only 10
+    /// `SCP-OUTLET-6131`. The executor here floods 100 Data chunks; only 10
     /// reach the consumer before the cumulative cap fires.
     #[tokio::test]
     async fn pump_enforces_cumulative_max_calls_ceiling() {
@@ -4381,7 +4381,7 @@ mod tests {
         assert_eq!(
             code,
             scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT,
-            "cumulative cap maps to SCP-TOOL-6131",
+            "cumulative cap maps to SCP-OUTLET-6131",
         );
         assert!(
             message.starts_with(&format!(
@@ -4400,7 +4400,7 @@ mod tests {
     }
 
     /// F6 (a): a context closed mid-stream terminates with
-    /// `protocol.context-closed-mid-stream` / `SCP-TOOL-6101` (Protocol
+    /// `protocol.context-closed-mid-stream` / `SCP-OUTLET-6101` (Protocol
     /// class), NOT `authorization.revoked-mid-stream`.
     #[tokio::test]
     async fn f6_context_closed_mid_stream_terminates_protocol_class() {
@@ -4447,7 +4447,7 @@ mod tests {
         assert_eq!(
             code,
             scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
-            "context teardown must carry the Protocol-session code SCP-TOOL-6101, not the \
+            "context teardown must carry the Protocol-session code SCP-OUTLET-6101, not the \
              Authorization revoked code"
         );
         assert!(
