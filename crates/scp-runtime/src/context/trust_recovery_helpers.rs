@@ -48,7 +48,6 @@
 
 use scp_did::DID;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::context::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
 };
@@ -491,17 +490,14 @@ fn persist_state_best_effort<'d, 'c>(
     // AC3 bug 2: on export failure, mark the snapshot
     // `needs_reconnect = true` and persist an empty crypto blob.
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    // ADR-049 PR-6: floors threaded as parameters, still provider-sourced from
-    // the `export_*` twins (byte-identical to the prior internal read). The
-    // atomic read-authority core swaps these to the supervisor registry.
+    // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
+    // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
+    // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
+    // durable-blob params. The provider floor mirrors are deleted.
     match deps.crypto.export_crypto_state(
         &ctx_id_bytes,
-        deps.crypto.export_sender_key_epochs(&ctx_id_bytes),
-        deps.crypto
-            .export_recv_sequence_floors(&ctx_id_bytes)
-            .into_iter()
-            .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-            .collect(),
+        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
+        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {

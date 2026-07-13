@@ -992,11 +992,12 @@ pub async fn execute_revoke(
                 "rotate_sender_key failed after access revocation"
             );
         } else {
-            // ADR-049 PR-4: track the rotated local epoch in the floor registry.
+            // ADR-049 PR-6: advance the rotated local epoch in the authoritative
+            // floor registry (fail-closed).
             crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
                 deps,
                 &context_id_bytes,
-            );
+            )?;
         }
         // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape
         // and operates directly on `state` + `deps`.
@@ -1398,6 +1399,11 @@ pub async fn execute_remove_member(
                 )
                 .map(|()| (String::new(), None));
             }
+            // ADR-049 PR-6: prune the departed member's Class-M registry floors
+            // (member-granular; siblings + the local scalar retained). See
+            // `Supervisor::remove_member_floors` for why no membership sweep.
+            deps.supervisor
+                .remove_member_floors(&context_id_bytes, did.as_ref());
 
             if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
                 return fail_close_remove_member(
@@ -1410,12 +1416,12 @@ pub async fn execute_remove_member(
                 )
                 .map(|()| (String::new(), None));
             }
-            // ADR-049 PR-4: rotate succeeded (the Err arm returns above) — track
-            // the rotated local epoch in the floor registry.
+            // ADR-049 PR-6: rotate succeeded (the Err arm returns above) — advance
+            // the rotated local epoch in the authoritative floor registry (fail-closed).
             crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
                 deps,
                 &context_id_bytes,
-            );
+            )?;
 
             state.membership.remove_member(did);
             // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
@@ -2526,6 +2532,10 @@ pub async fn execute_reset_member(
              sender key layer may retain stale key"
         );
     }
+    // ADR-049 PR-6: prune the departed member's Class-M registry floors
+    // (member-granular; siblings + the local scalar retained).
+    deps.supervisor
+        .remove_member_floors(&context_id_bytes, did.as_ref());
     if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
         tracing::warn!(
             context_id,
@@ -2533,11 +2543,12 @@ pub async fn execute_reset_member(
             "rotate_sender_key failed after MLS reset"
         );
     } else {
-        // ADR-049 PR-4: track the rotated local epoch in the floor registry.
+        // ADR-049 PR-6: advance the rotated local epoch in the authoritative
+        // floor registry (fail-closed).
         crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
             deps,
             &context_id_bytes,
-        );
+        )?;
     }
 
     // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.

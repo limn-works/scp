@@ -820,12 +820,24 @@ impl FullStackNode {
             .map_err(|e| {
                 ContextError::CryptoFailed(format!("incumbent open sender-key response: {e}"))
             })?;
-            incumbent.crypto.provider.store_member_sender_key(
+            // ADR-049 PR-6: `store_member_sender_key` verifies the context and
+            // RETURNS the authenticated `(key, epoch)` (it no longer installs),
+            // mirroring the push seam. The install is then an EXPLICIT, separate
+            // `set_sender_key_unchecked` — the same shape as production seam 2. In
+            // production the registry gate sits between the two; this
+            // incumbent-stores-joiner-key step is trusted welcome setup and the
+            // capability-reduced registry is not reachable from this harness, so
+            // it installs directly.
+            let (joiner_key, _epoch) = incumbent.crypto.provider.store_member_sender_key(
                 context_id,
                 &joiner_did,
                 joiner_key,
                 response.epoch,
             )?;
+            incumbent
+                .crypto
+                .provider
+                .set_sender_key_unchecked(context_id, &joiner_did, joiner_key);
         }
         Ok(())
     }
@@ -1039,11 +1051,16 @@ impl FullStackNode {
                 sender_did: mgmt_sender,
                 payload,
             } => {
-                self.crypto.provider.process_incoming_sender_key(
+                // ADR-049 PR-6: install the authenticated key (decomposed
+                // process_incoming no longer installs). Trusted harness path.
+                let (key, _epoch) = self.crypto.provider.process_incoming_sender_key(
                     context_id,
                     &mgmt_sender,
                     &payload,
                 )?;
+                self.crypto
+                    .provider
+                    .set_sender_key_unchecked(context_id, &mgmt_sender, key);
                 return Err(ContextError::CryptoFailed(
                     "open returned Management".into(),
                 ));

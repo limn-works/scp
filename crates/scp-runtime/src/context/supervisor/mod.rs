@@ -113,11 +113,11 @@
 // vector at the compiler instead of via a source-text scanner.
 #![deny(non_local_definitions)]
 
-// ADR-049 PR-4: the supervisor-owned Class-M floor registry (epoch side).
+// ADR-049 (read-authority switch): the supervisor-owned Class-M floor registry.
 // Private to `supervisor` — the `ContextFloors` type and `FloorAdvanceError`
 // are reachable only through the `Supervisor` gate primitives + `SupervisorHandle`
-// accessors, keeping the registry an internal follower store (nothing outside
-// the supervisor module names it in PR-4).
+// accessors, keeping the registry internal (nothing outside the supervisor
+// module names it directly).
 mod floors;
 pub mod handle;
 pub(in crate::context) mod identity_capability;

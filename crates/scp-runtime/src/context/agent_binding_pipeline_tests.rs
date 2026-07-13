@@ -700,8 +700,12 @@ mod live_supervisor_send {
                     sender_did,
                     payload,
                 } => {
-                    bob.process_incoming_sender_key(&ctx_bytes, &sender_did, &payload)
+                    // ADR-049 PR-6: process returns (key, epoch) without
+                    // installing; install unchecked (trusted bootstrap path).
+                    let (key, _epoch) = bob
+                        .process_incoming_sender_key(&ctx_bytes, &sender_did, &payload)
                         .expect("bob processes Alice's sender key");
+                    bob.set_sender_key_unchecked(&ctx_bytes, &sender_did, key);
                 }
                 OpenResult::Control => {}
                 OpenResult::Application(_) => {

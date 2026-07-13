@@ -222,8 +222,17 @@ impl E2eCryptoProvider {
                     sender_did,
                     payload,
                 } => {
+                    // ADR-049 PR-6: `process_incoming_sender_key` now returns the
+                    // authenticated `(key, epoch)` without installing; install it
+                    // via `set_sender_key_unchecked`. This full-stack harness is a
+                    // trusted pickup path (no adversarial-exporter registry gate).
+                    let (key, _epoch) = self.provider.process_incoming_sender_key(
+                        context_id,
+                        &sender_did,
+                        &payload,
+                    )?;
                     self.provider
-                        .process_incoming_sender_key(context_id, &sender_did, &payload)?;
+                        .set_sender_key_unchecked(context_id, &sender_did, key);
                 }
                 // A non-management message in the sender-key channel means
                 // the wrong bytes were deposited — fail loudly rather than

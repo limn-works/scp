@@ -50,8 +50,8 @@ use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::crypto::sender_keys::{
-    MAX_EPOCH_ADVANCE, NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse,
-    SenderKeyStore, generate_sender_key, generate_wrapping_keypair,
+    NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse, SenderKeyStore,
+    generate_sender_key, generate_wrapping_keypair,
 };
 
 // ---------------------------------------------------------------------------
@@ -265,9 +265,13 @@ struct ContextCryptoState {
     /// Remote members' X25519 wrapping public keys, keyed by DID.
     /// Populated from key packages during [`MlsCryptoProvider::add_member`].
     member_wrapping_keys: HashMap<String, [u8; 32]>,
-    /// Receive-side sequence tracking for replay detection.
-    /// Maps `sender_did` -> (`last_epoch`, `last_sequence`).
-    recv_sequence_tracker: HashMap<String, (u64, u64)>,
+    // ADR-049 PR-6 (read-authority switch): the node-only receive-side
+    // `(epoch, sequence)` anti-replay mirror has been DELETED. The
+    // authoritative Class-M home is now the Supervisor-owned floor registry
+    // (`context/supervisor/floors.rs`), gated fail-closed at the messaging
+    // seam. The durable blob field [`MlsCryptoSnapshot::recv_sequence_tracker`]
+    // is retained and threaded through `export_crypto_state` /
+    // `restore_crypto_state` as a parameter, not read from a live provider map.
 }
 
 // ---------------------------------------------------------------------------
@@ -335,9 +339,6 @@ pub struct OwnedMlsCryptoState {
     pub nonce_dedup: NonceDedup,
     /// Remote members' X25519 wrapping public keys (by DID).
     pub member_wrapping_keys: HashMap<String, [u8; 32]>,
-    /// Receive-side sender-key sequence tracker (by DID →
-    /// `(last_epoch, last_sequence)`).
-    pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
 }
 
 // SECURITY: Redacts the MLS group (holds OpenMLS epoch secrets) and
@@ -361,12 +362,32 @@ impl std::fmt::Debug for OwnedMlsCryptoState {
                 "member_wrapping_keys",
                 &format_args!("[{} entries]", self.member_wrapping_keys.len()),
             )
-            .field(
-                "recv_sequence_tracker",
-                &format_args!("[{} entries]", self.recv_sequence_tracker.len()),
-            )
             .finish()
     }
+}
+
+/// Per-context Class-M floors reconstructed from a persisted snapshot.
+///
+/// Returned by [`MlsCryptoProvider::restore_crypto_state`] for the caller to
+/// merge into the authoritative Supervisor-owned floor registry (ADR-049 PR-6).
+///
+/// `restore_crypto_state` installs the MLS group + sender-key MATERIAL into the
+/// live provider but NO LONGER seeds any epoch / recv-sequence floor there (the
+/// provider mirrors are deleted). Instead it returns the floors the snapshot
+/// carried — including the legacy back-compat lower bound derived from a
+/// pre-`sender_key_epochs` snapshot's global `sender_key_epoch` counter — so
+/// `restore_crypto_state_with_floor_guard` can run them through the registry's
+/// fail-closed `validate_and_merge_*` sink.
+#[derive(Debug, Default)]
+pub struct RestoredFloors {
+    /// `(sender_did, epoch)` high-water floors to merge into the registry's
+    /// `sender_epochs` map. Preserves the legacy back-compat computation: a
+    /// snapshot with no per-sender epoch map contributes
+    /// `snapshot.sender_key_epoch.max(1)` for every sender that has key material.
+    pub sender_epochs: Vec<(String, u64)>,
+    /// `(sender_did, ReceiveFloor)` intra-epoch anti-replay floors to merge into
+    /// the registry's `recv_sequence` map.
+    pub recv_sequence: Vec<(String, ReceiveFloor)>,
 }
 
 /// Production `ContextCryptoProvider` backed by `OpenMLS`.
@@ -670,7 +691,6 @@ impl MlsCryptoProvider {
             pending_distributions,
             nonce_dedup,
             member_wrapping_keys,
-            recv_sequence_tracker,
         } = state;
         Ok(OwnedMlsCryptoState {
             mls_group,
@@ -681,7 +701,6 @@ impl MlsCryptoProvider {
             pending_distributions,
             nonce_dedup,
             member_wrapping_keys,
-            recv_sequence_tracker,
         })
     }
 
@@ -879,7 +898,6 @@ impl MlsCryptoProvider {
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
-            recv_sequence_tracker: HashMap::new(),
         };
 
         // Occupy the reserved vacant slot. No overwrite is possible: if
@@ -964,7 +982,6 @@ impl MlsCryptoProvider {
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
-            recv_sequence_tracker: HashMap::new(),
         };
 
         slot.insert(state);
@@ -1426,20 +1443,16 @@ impl MlsCryptoProvider {
         state.sender_key_store.remove(&ctx_id_hex, member_did);
         // Also remove the member's wrapping key — they are no longer a member.
         state.member_wrapping_keys.remove(member_did);
-        // Prune replay tracker entry for this specific member.
-        state.recv_sequence_tracker.remove(member_did);
-        // D3 defensive sweep: also drop any recv_sequence_tracker entries
-        // for DIDs that are no longer in member_wrapping_keys. This catches
-        // the re-population edge case where in-flight messages from a
-        // previously-removed member arrive after their explicit prune and
-        // re-populate the tracker via `open()`. Without this sweep the
-        // tracker could slowly accumulate entries for non-members across a
-        // churning context. Bounded by current membership size.
-        let current_members: std::collections::HashSet<String> =
-            state.member_wrapping_keys.keys().cloned().collect();
-        state
-            .recv_sequence_tracker
-            .retain(|did, _| current_members.contains(did));
+        // ADR-049 PR-6 (read-authority switch): the receive-side anti-replay
+        // floor for the departed member now lives in the Supervisor-owned
+        // Class-M registry, not a provider mirror. The member-granular prune is
+        // performed by the caller at each removal seam via
+        // `deps.supervisor.remove_member_floors(ctx, did)` (see
+        // `context/supervisor/floors.rs::remove_member_floors`, whose doc
+        // records why the provider's whole-membership D3 sweep is deliberately
+        // NOT reconstructed on the registry — a lingering floor can only
+        // over-reject, never admit a replay, and a membership sweep would
+        // re-couple the Class-M registry to the membership set).
         Ok(())
     }
 
@@ -1586,25 +1599,25 @@ impl MlsCryptoProvider {
     }
 
     /// Processes an incoming sender key distribution message from a remote
-    /// member.
+    /// member, returning the AUTHENTICATED `(sender_key, epoch)`.
     ///
-    /// Deserializes the message, extracts the sender key, and stores it in
-    /// the local sender key store so subsequent messages from `sender_did`
-    /// can be decrypted.
-    ///
-    /// The default implementation is a no-op. Production providers that
-    /// support HPKE sender key distribution should override this.
+    /// Deserializes the message and HPKE-opens + DID-verifies the recovered
+    /// sender key. ADR-049 PR-6: it does NOT install the key or enforce any
+    /// epoch floor — the caller (the `decrypt_and_dispatch` messaging seam)
+    /// gates the returned `epoch` against the authoritative Class-M floor
+    /// registry and then installs the key via
+    /// [`Self::set_sender_key_unchecked`] (gate-before-install = fail-safe).
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if deserialization, HPKE
-    /// decryption, or storage fails.
+    /// decryption, or the sender-DID authentication check fails.
     pub fn process_incoming_sender_key(
         &self,
         context_id: &[u8; 32],
         sender_did: &str,
         message_bytes: &[u8],
-    ) -> Result<(), ContextError> {
+    ) -> Result<(SenderKey, u64), ContextError> {
         let ctx_id_hex = hex::encode(context_id);
 
         // Deserialize the distribution message.
@@ -1629,35 +1642,25 @@ impl MlsCryptoProvider {
                 .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
                 drop(wrapping_secret_guard);
 
-                // Verify the sender DID matches the claimed sender.
+                // Verify the sender DID matches the claimed sender. This is
+                // AUTHENTICATION (the HPKE tag + DID binding), NOT floor gating,
+                // so it stays here.
                 if response.sender_did != sender_did {
                     return Err(ContextError::CryptoFailed(
                         "sender DID mismatch in sender key distribution".into(),
                     ));
                 }
 
-                // Store the recovered sender key with epoch monotonicity check (#1608).
-                // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
-                let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
-                    ContextError::CryptoFailed("no MLS group for this context".to_string())
-                })?;
-                let state = entry.value_mut();
-
-                // Epoch poisoning defense: reject sender keys with unreasonably
-                // high epoch values. An attacker could set epoch=u64::MAX to
-                // permanently block future key rotations via epoch monotonicity.
-                let current_epoch = state.sender_key_store.epoch(&ctx_id_hex, sender_did);
-                if response.epoch > current_epoch.saturating_add(MAX_EPOCH_ADVANCE) {
-                    return Err(ContextError::CryptoFailed(
-                        "epoch poisoning: claimed epoch exceeds acceptable advance".into(),
-                    ));
-                }
-
-                state
-                    .sender_key_store
-                    .set_checked(&ctx_id_hex, sender_did, sender_key, response.epoch)
-                    .map_err(|e| ContextError::CryptoFailed(format!("epoch check failed: {e}")))?;
-                Ok(())
+                // ADR-049 PR-6 (read-authority switch): epoch monotonicity
+                // (#1608) + the epoch-poisoning ceiling are NO LONGER enforced
+                // here. They are now the sole responsibility of the authoritative
+                // Class-M floor registry, gated fail-closed at the messaging seam
+                // (`decrypt_and_dispatch`) BEFORE the caller installs this key via
+                // [`Self::set_sender_key_unchecked`] (gate-before-install =
+                // fail-safe). Return the AUTHENTICATED key and its claimed epoch
+                // for the caller to gate + install; this method no longer touches
+                // the sender-key store.
+                Ok((sender_key, response.epoch))
             }
             _ => Err(ContextError::CryptoFailed(
                 "expected SenderKeyDistributionMessage::KeyResponse".to_string(),
@@ -1678,44 +1681,73 @@ impl MlsCryptoProvider {
     /// by presenting a response that opens under the requester's own ephemeral
     /// secret.
     ///
-    /// Applies the SAME epoch monotonicity (`set_checked`) and epoch-poisoning
-    /// (`MAX_EPOCH_ADVANCE`) defenses as the push path (§9.16.1, §9.16.5), so a
-    /// stale or artificially-inflated epoch cannot rewind or wedge the store.
+    /// ADR-049 PR-6 (read-authority switch): the pull-response ingest half —
+    /// verifies the destination context is registered and returns the ALREADY-
+    /// AUTHENTICATED `(sender_key, epoch)` for the caller to gate + install,
+    /// mirroring the push path [`Self::process_incoming_sender_key`] EXACTLY. It
+    /// does NOT install (no silent write): the caller gates the `epoch` against
+    /// the authoritative Class-M registry and then installs via
+    /// [`Self::set_sender_key_unchecked`] — the SAME shape as seam 2, so no
+    /// pull-vs-push asymmetry and no method that installs without a conscious,
+    /// separate call.
+    ///
+    /// The `sender_key` was opened (and its AEAD tag + context/sender/epoch
+    /// binding verified) by the caller with the requester's EPHEMERAL wrapping
+    /// secret (`key_protocol::open_sender_key_response`) BEFORE this call, so the
+    /// authentication lives at that open, not here — the provider does not hold
+    /// the ephemeral secret and cannot re-open it.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if no group is registered for
-    /// `context_id`, if `epoch` exceeds `current_epoch + MAX_EPOCH_ADVANCE`
-    /// (epoch poisoning), or if the monotonicity check rejects a rewind.
+    /// `context_id`.
     pub fn store_member_sender_key(
         &self,
         context_id: &[u8; 32],
         sender_did: &str,
         sender_key: SenderKey,
         epoch: u64,
-    ) -> Result<(), ContextError> {
-        let ctx_id_hex = hex::encode(context_id);
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
-        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
-            ContextError::CryptoFailed("no MLS group for this context".to_string())
-        })?;
-        let state = entry.value_mut();
-
-        // Epoch poisoning defense (mirrors `process_incoming_sender_key`):
-        // reject a claimed epoch unreasonably far above the current one so an
-        // attacker cannot set epoch=u64::MAX to permanently block future
-        // rotations via the monotonicity check.
-        let current_epoch = state.sender_key_store.epoch(&ctx_id_hex, sender_did);
-        if epoch > current_epoch.saturating_add(MAX_EPOCH_ADVANCE) {
+    ) -> Result<(SenderKey, u64), ContextError> {
+        // Verify the destination context is registered (fail-closed) — the same
+        // precondition the install path checked — WITHOUT installing.
+        if !self.contexts.contains_key(context_id) {
             return Err(ContextError::CryptoFailed(
-                "epoch poisoning: claimed epoch exceeds acceptable advance".into(),
+                "no MLS group for this context".to_string(),
             ));
         }
-        state
-            .sender_key_store
-            .set_checked(&ctx_id_hex, sender_did, sender_key, epoch)
-            .map_err(|e| ContextError::CryptoFailed(format!("epoch check failed: {e}")))?;
-        Ok(())
+        let _ = sender_did; // named for API symmetry with process_incoming.
+        Ok((sender_key, epoch))
+    }
+
+    /// ADR-049 PR-6 (read-authority switch): install an AUTHENTICATED sender
+    /// key WITHOUT epoch gating.
+    ///
+    /// The epoch monotonicity + poisoning ceiling are enforced by the
+    /// authoritative Class-M floor registry at the messaging seam BEFORE the key
+    /// is installed here (gate-before-install = fail-safe). This is the install
+    /// half of the decomposed [`Self::process_incoming_sender_key`] push path: a
+    /// thin wrapper over [`SenderKeyStore::set_unchecked`].
+    ///
+    /// A no-op when no crypto state is resident for `context_id`. In the
+    /// production seam the context is guaranteed present (the enclosing
+    /// `decrypt_and_dispatch` already MLS-opened against it), so the no-op branch
+    /// is unreachable there; the registry gate has already advanced the floor,
+    /// so even a (hypothetical) missing-context skip is fail-safe (the floor
+    /// advanced, no key below it can ever be admitted).
+    pub fn set_sender_key_unchecked(
+        &self,
+        context_id: &[u8; 32],
+        sender_did: &str,
+        sender_key: SenderKey,
+    ) {
+        let ctx_id_hex = hex::encode(context_id);
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        if let Some(mut entry) = self.contexts.get_mut(context_id) {
+            entry
+                .value_mut()
+                .sender_key_store
+                .set_unchecked(&ctx_id_hex, sender_did, sender_key);
+        }
     }
 
     /// Handles an incoming sender key request from a remote member.
@@ -2073,41 +2105,17 @@ impl MlsCryptoProvider {
                     )
                     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-                    // Receive-side epoch ceiling (H9): reject messages whose
-                    // claimed sender-key epoch exceeds the highest legitimately
-                    // distributed epoch for that sender by more than
-                    // `MAX_EPOCH_ADVANCE`. Without this guard a sender could
-                    // craft a single message with `epoch = u64::MAX`, which
-                    // updates `recv_sequence_tracker` and permanently locks
-                    // out all subsequent legitimate messages from that sender
-                    // (self-DoS / persistent per-receiver poisoning). The
-                    // `process_incoming_sender_key` path enforces the same
-                    // ceiling on key distributions; this mirrors that bound
-                    // on the message receive path so the two cannot diverge.
-                    let stored_high_water = state.sender_key_store.epoch(&ctx_id_hex, &sender_did);
-                    let allowed_epoch_ceiling = stored_high_water.saturating_add(MAX_EPOCH_ADVANCE);
-                    if epoch > allowed_epoch_ceiling {
-                        return Err(ContextError::CryptoFailed(format!(
-                            "sender key epoch {epoch} exceeds ceiling \
-                             {allowed_epoch_ceiling} (stored high-water \
-                             {stored_high_water}, MAX_EPOCH_ADVANCE \
-                             {MAX_EPOCH_ADVANCE})",
-                        )));
-                    }
-
-                    // Receive-side replay detection: reject messages with
-                    // epoch/sequence <= last seen for this sender.
-                    if let Some(&(last_epoch, last_seq)) =
-                        state.recv_sequence_tracker.get(&sender_did)
-                        && (epoch < last_epoch || (epoch == last_epoch && sequence <= last_seq))
-                    {
-                        return Err(ContextError::CryptoFailed(
-                            "replay or reorder detected".into(),
-                        ));
-                    }
-                    state
-                        .recv_sequence_tracker
-                        .insert(sender_did.clone(), (epoch, sequence));
+                    // ADR-049 PR-6 (read-authority switch): the receive-side
+                    // epoch ceiling (H9), the intra-epoch `(epoch, sequence)`
+                    // replay check, and the tracker insert have MOVED out of the
+                    // provider. They are now enforced fail-closed at the
+                    // messaging seam (`decrypt_and_dispatch`) against the
+                    // authoritative Class-M floor registry — `open()` is pure
+                    // decrypt + an O(1) floor SURFACE, no enforcement. The
+                    // `receive_floor` surfaced below feeds that registry gate;
+                    // the gate's `?` fires BEFORE any `OpenedEnvelope` is
+                    // dispatched, so a replay decrypts harmlessly and is then
+                    // rejected without surfacing.
 
                     // Step 4: Deserialize as InnerEnvelope.
                     // The inner envelope is returned with its padded payload intact.
@@ -2125,12 +2133,12 @@ impl MlsCryptoProvider {
                         Box::new(scp_protocol::context::builder::OpenedEnvelope {
                             inner,
                             sender_did,
-                            // ADR-049 PR-4: surface the just-advanced receive
-                            // floor (recorded into `recv_sequence_tracker`
-                            // above) for the supervisor-registry follower
-                            // mirror-forward. Read-only export of a value
-                            // already computed + stored; does not alter
-                            // enforcement.
+                            // ADR-049 PR-6: surface the received `(epoch,
+                            // sequence)` floor for the authoritative Class-M
+                            // registry gate in `decrypt_and_dispatch`. Read-only
+                            // O(1) surface of values parsed from the header; the
+                            // enforcement (monotonicity + overshoot) happens at
+                            // that seam, fail-closed, not here.
                             receive_floor: scp_protocol::context::builder::ReceiveFloor {
                                 epoch,
                                 sequence,
@@ -2255,12 +2263,10 @@ impl MlsCryptoProvider {
     /// The two floor collections — `sender_key_epochs` (per-sender epoch
     /// high-water marks) and `recv_sequence_floors` (per-sender intra-epoch
     /// `(epoch, sequence)` anti-replay floors) — are supplied by the caller
-    /// rather than read from this provider's stores. Callers source them from
-    /// the provider's own `export_sender_key_epochs` / `export_recv_sequence_floors`
-    /// twins, so the persisted values are byte-identical to the previous
-    /// internally-sourced ones. Threading them as parameters freezes this
-    /// signature so the later read-authority switch (ADR-049 PR-6) is a pure
-    /// source swap at the call sites, with no further ripple here.
+    /// rather than read from this provider's stores. ADR-049 PR-6 (read-authority
+    /// switch): callers source them from the AUTHORITATIVE Supervisor-owned
+    /// Class-M registry (`Supervisor::export_*`); the provider's former floor
+    /// mirrors + `export_*` twins are deleted.
     ///
     /// **Caller contract.** `sender_key_epochs` and `recv_sequence_floors` MUST
     /// be sourced for the SAME `context_id` passed to this call. Nothing binds
@@ -2354,15 +2360,12 @@ impl MlsCryptoProvider {
             .collect();
 
         // Persist per-sender epoch high-water marks so the `#1608`
-        // rollback-protection invariant survives a restart
-        // (`SenderKeyStore::set_checked` will reject any restored epoch
-        // that regresses below the persisted floor). Includes entries
-        // for senders whose key has been removed but whose floor is
-        // still retained — `remove` intentionally preserves the epoch
-        // as a high-water mark. The values arrive via the `sender_key_epochs`
-        // parameter (caller-sourced from `export_sender_key_epochs`, which reads
-        // this same store) rather than being read here — see the guard-span
-        // invariant on this method.
+        // rollback-protection invariant survives a restart (the restored floors
+        // are merged back into the Class-M registry, which rejects any regressing
+        // epoch). Includes entries for senders whose key has been removed but
+        // whose floor is still retained. ADR-049 PR-6: the values arrive via the
+        // `sender_key_epochs` parameter, caller-sourced from the AUTHORITATIVE
+        // registry (`Supervisor::export_sender_key_epochs`), not read here.
 
         // Read the provider-level wrapping keypair for persistence.
         // ADR-049 commit 12c.9f: load through `ArcSwap` and copy the
@@ -2434,14 +2437,18 @@ impl MlsCryptoProvider {
     }
 
     /// Restores per-context cryptographic state from a previously exported
-    /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)).
+    /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)),
+    /// returning the Class-M [`RestoredFloors`] the caller merges into the
+    /// authoritative Supervisor-owned floor registry (ADR-049 PR-6).
     ///
-    /// Called during `Supervisor::restore_context` to reinstate MLS
-    /// groups and sender keys after a process restart. If `data` is empty,
-    /// this is a no-op (the provider was never persisted or is a mock).
-    ///
-    /// The default implementation is a no-op. Production providers that
-    /// manage MLS groups MUST override this.
+    /// Called during `Supervisor::restore_context` to reinstate MLS groups and
+    /// sender keys after a process restart. Installs the MLS group + sender-key
+    /// MATERIAL but NO LONGER seeds any epoch / recv-sequence floor into the
+    /// provider (the provider mirrors are deleted); the snapshot's floors —
+    /// including the legacy back-compat lower bound — are returned via
+    /// [`RestoredFloors`] for the registry sink. If `data` is empty, this is a
+    /// no-op returning empty floors (the provider was never persisted or is a
+    /// mock).
     ///
     /// # Errors
     ///
@@ -2451,9 +2458,9 @@ impl MlsCryptoProvider {
         &self,
         context_id: &[u8; 32],
         data: &[u8],
-    ) -> Result<(), ContextError> {
+    ) -> Result<RestoredFloors, ContextError> {
         if data.is_empty() {
-            return Ok(());
+            return Ok(RestoredFloors::default());
         }
 
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(data)
@@ -2503,20 +2510,18 @@ impl MlsCryptoProvider {
         let ctx_id_hex = hex::encode(context_id);
         let mut sender_key_store = SenderKeyStore::new();
 
-        // Restore the per-sender epoch high-water map FIRST so it acts
-        // as a floor for the `set_checked` path going forward. The
-        // restored values are authoritative high-water marks (not
-        // user-supplied receive traffic), so `restore_epoch_high_water`
-        // bypasses the monotonicity check.
+        // ADR-049 PR-6: collect the per-sender epoch high-water marks for the
+        // caller to merge into the authoritative Class-M registry, instead of
+        // seeding a provider-side floor. The restored values are authoritative
+        // high-water marks (not user-supplied receive traffic).
         //
-        // `sender_key_epochs` can cover DIDs that no longer have a key
-        // entry (e.g., removed members whose floor was preserved by
-        // `SenderKeyStore::remove`) — those entries still matter for
-        // rollback protection and must be restored.
+        // `sender_key_epochs` can cover DIDs that no longer have a key entry
+        // (e.g., removed members whose floor was preserved by
+        // `SenderKeyStore::remove`) — those entries still matter for rollback
+        // protection and are returned so the registry retains them.
         let had_epoch_map = !snapshot.sender_key_epochs.is_empty();
-        for (did, epoch) in snapshot.sender_key_epochs.drain(..) {
-            sender_key_store.restore_epoch_high_water(&ctx_id_hex, &did, epoch);
-        }
+        let mut restored_sender_epochs: Vec<(String, u64)> =
+            snapshot.sender_key_epochs.drain(..).collect();
 
         // Legacy-snapshot back-compat hardening: snapshots without a
         // `sender_key_epochs` field leave the map above empty. If
@@ -2554,13 +2559,14 @@ impl MlsCryptoProvider {
         for (did, key) in snapshot.sender_key_entries.drain(..) {
             // Install key material via `set_unchecked` — the restored
             // key IS authoritative (it was persisted by this same
-            // provider). `set_checked` would be rejected when the
-            // restored key's epoch equals an already-restored floor.
+            // provider), and the floor is enforced by the registry.
             sender_key_store.set_unchecked(&ctx_id_hex, &did, key);
-            // Legacy-path only: seed a floor from the global
-            // `sender_key_epoch` if no per-sender map was persisted.
+            // Legacy-path only: contribute a floor from the global
+            // `sender_key_epoch` if no per-sender map was persisted, so the
+            // registry merge seeds a non-zero lower bound (closing the one-shot
+            // post-upgrade rollback window).
             if let Some(floor) = legacy_floor {
-                sender_key_store.restore_epoch_high_water(&ctx_id_hex, &did, floor);
+                restored_sender_epochs.push((did, floor));
             }
         }
 
@@ -2580,10 +2586,14 @@ impl MlsCryptoProvider {
             SenderKey::from_bytes([0u8; 32]),
         );
 
-        let recv_sequence_tracker: HashMap<String, (u64, u64)> = snapshot
+        // ADR-049 PR-6: return the durable-blob receive floors for the registry
+        // sink instead of reconstructing a provider mirror. Explicit named-field
+        // bind (never a tuple `.into()`, which would reintroduce the
+        // epoch/sequence transposition hazard).
+        let restored_recv_sequence: Vec<(String, ReceiveFloor)> = snapshot
             .recv_sequence_tracker
             .drain(..)
-            .map(|(did, epoch, seq)| (did, (epoch, seq)))
+            .map(|(did, epoch, sequence)| (did, ReceiveFloor { epoch, sequence }))
             .collect();
 
         let crypto_state = ContextCryptoState {
@@ -2595,7 +2605,6 @@ impl MlsCryptoProvider {
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys,
-            recv_sequence_tracker,
         };
 
         // Restore the provider-level X25519 wrapping keypair BEFORE inserting
@@ -2633,7 +2642,10 @@ impl MlsCryptoProvider {
         // ADR-049 commit 12c.9f: lock-free `DashMap::insert`.
         self.contexts.insert(*context_id, crypto_state);
 
-        Ok(())
+        Ok(RestoredFloors {
+            sender_epochs: restored_sender_epochs,
+            recv_sequence: restored_recv_sequence,
+        })
     }
 
     /// Reads the `scp_context_params` (`0xFF02`) group-context extension
@@ -2671,63 +2683,20 @@ impl MlsCryptoProvider {
         })
     }
 
-    /// Returns the per-sender epoch high-water marks for a given context.
-    ///
-    /// Each `(sender_did, epoch)` pair represents the highest sender key epoch
-    /// seen from that participant.  Used by `lifecycle_helpers::import_context`
-    /// to capture the local floors **before** destroying existing crypto state
-    /// so the incoming snapshot can be validated against them.
-    ///
-    /// Returns an empty `Vec` when the context has no epoch state (mock
-    /// providers, broadcast-only contexts, or providers that do not track
-    /// epochs).
-    ///
-    /// The default implementation returns an empty `Vec`.  Production
-    /// providers that maintain a `SenderKeyStore` MUST override this.
-    pub fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
-        let Some(entry) = self.contexts.get(context_id) else {
-            return Vec::new();
-        };
-        let ctx_id_hex = hex::encode(context_id);
-        entry
-            .value()
-            .sender_key_store
-            .epochs_for_context(&ctx_id_hex)
-    }
-
-    /// Returns the stored epoch high-water for a SINGLE `(context, sender_did)`
-    /// pair — `0` when absent, matching `SenderKeyStore::epoch`.
-    ///
-    /// ADR-049 PR-4: the remote-sender-epoch follower mirror-forward reads this
-    /// (O(1)) AFTER `process_incoming_sender_key` / `store_member_sender_key`
-    /// have advanced the authoritative floor via `set_checked`, to forward the
-    /// just-recorded value into the supervisor floor registry. It surfaces the
-    /// value already computed inside those paths without an O(senders)
-    /// `export_sender_key_epochs` clone (Decision-14 budget). `pub(crate)` — an
-    /// internal follower read with no FFI surface.
-    #[must_use]
-    pub(crate) fn sender_key_epoch(&self, context_id: &[u8; 32], sender_did: &str) -> u64 {
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
-        let Some(entry) = self.contexts.get(context_id) else {
-            return 0;
-        };
-        let ctx_id_hex = hex::encode(context_id);
-        entry
-            .value()
-            .sender_key_store
-            .epoch(&ctx_id_hex, sender_did)
-    }
+    // ADR-049 PR-6 (read-authority switch): the provider `export_sender_key_epochs`
+    // and single-sender `sender_key_epoch` follower-read twins are DELETED. The
+    // authoritative per-sender epoch floors now live in — and are read from — the
+    // Supervisor-owned Class-M registry (`Supervisor::export_sender_key_epochs`).
 
     /// Returns the LOCAL sender-key epoch scalar (`state.sender_key_epoch`) for
     /// `context_id` — `0` when the context has no crypto state.
     ///
-    /// ADR-049 PR-4: the local-sender-epoch follower mirror-forward reads this
-    /// (O(1)) AFTER `rotate_sender_key` increments the local epoch, and forwards
-    /// it (keyed by [`Self::local_did`]) into the supervisor floor registry.
-    /// `rotate_sender_key` stores the local key via `set_unchecked`, which does
-    /// NOT populate the store's per-sender epoch map — so the authoritative
-    /// local floor is this scalar, not `export_sender_key_epochs`. `pub(crate)`.
+    /// ADR-049 PR-6: the local-rotation seam `mirror_forward_local_sender_epoch`
+    /// reads this (O(1)) AFTER `rotate_sender_key` increments the local epoch, and
+    /// advances it (keyed by [`Self::local_did`]) fail-closed into the
+    /// authoritative floor registry. `rotate_sender_key` stores the local key via
+    /// `set_unchecked`, which does NOT populate the store's per-sender epoch map —
+    /// so the local floor is this scalar. `pub(crate)`.
     #[must_use]
     pub(crate) fn local_sender_key_epoch(&self, context_id: &[u8; 32]) -> u64 {
         // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
@@ -2737,376 +2706,20 @@ impl MlsCryptoProvider {
     }
 
     /// Returns this provider's local member DID — the key under which the local
-    /// sender's epoch is recorded in the floor registry. `pub(crate)` — internal
-    /// follower read with no FFI surface.
+    /// sender's epoch is recorded in the authoritative floor registry, and the
+    /// value the recv seam's F-3 `debug_assert_ne!` checks against. `pub(crate)` —
+    /// internal read with no FFI surface.
     #[must_use]
     pub(crate) fn local_did(&self) -> &str {
         &self.local_did
     }
 
-    /// Test-only: seed a per-sender epoch high-water floor directly into the
-    /// live sender-key store, simulating a floor that advanced AFTER the last
-    /// coalesced snapshot was persisted (the exact §23.17.2 Invariant 2
-    /// scenario the respawn floor-guard must tolerate). Gated on the `testing`
-    /// feature (and `test`) so it never compiles into any non-test build, and so
-    /// a plain `cargo test` (without `--features testing`) — which excludes its
-    /// sole caller, a fault-injection respawn test — does not see it as dead.
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn seed_sender_key_epoch_for_test(
-        &self,
-        context_id: &[u8; 32],
-        sender_did: &str,
-        epoch: u64,
-    ) {
-        let ctx_id_hex = hex::encode(context_id);
-        if let Some(mut entry) = self.contexts.get_mut(context_id) {
-            entry.value_mut().sender_key_store.restore_epoch_high_water(
-                &ctx_id_hex,
-                sender_did,
-                epoch,
-            );
-        }
-    }
-
-    /// Merges the per-sender epoch floors of the just-restored crypto state
-    /// against the captured live `local_floors`, applying a max-merge so
-    /// `max(local, restored)` is the effective floor for every sender (spec
-    /// §23.17 Invariant 4, append-only dominance).
-    ///
-    /// Call this AFTER `restore_crypto_state`, passing the floors captured via
-    /// `export_sender_key_epochs` **before** the destroy+restore cycle.
-    ///
-    /// `trusted_local` selects the spec §23.17.2 lower-bound policy:
-    /// - `true` (Invariant 2 — restoring the node's OWN snapshot: crash
-    ///   recovery / actor respawn / process restart): a restored floor BELOW
-    ///   the live floor is the expected coalesce-lag case; max-merge and
-    ///   PROCEED, never reject. Only an overshoot beyond `max_advance_per_sender`
-    ///   is rejected.
-    /// - `false` (Invariant 3 — importing an UNTRUSTED peer snapshot): reject
-    ///   the entire merge if ANY restored floor regresses below its live floor
-    ///   (snapshot-mediated replay guard), or overshoots
-    ///   `local_floor + max_advance_per_sender` (epoch-poisoning guard).
-    ///
-    /// No state is mutated on failure (atomic, both paths).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::SnapshotFloorRegression`] on a regression
-    /// (import path only) or a ceiling overshoot (both paths).
-    // Parameter type `Vec<(String, u64)>` is fixed by the `ContextCryptoProvider`
-    // trait signature (the forwarder impl below passes ownership through from a
-    // trait-object call). Switching to `&[(String, u64)]` is a signature change
-    // that belongs with trait deletion in commit 12c.9e.6 of ADR-049.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn validate_and_merge_epoch_floors(
-        &self,
-        context_id: &[u8; 32],
-        local_floors: Vec<(String, u64)>,
-        max_advance_per_sender: u64,
-        trusted_local: bool,
-    ) -> Result<(), ContextError> {
-        // Cold-restart no-op (ADR-049 §9 / spec §23.17.2). This merge + its
-        // overshoot ceiling are a WARM-PATH protection: they bound the snapshot
-        // floors against the LIVE pre-crash floors. On a COLD process restart
-        // (`restore_all_contexts` into a fresh provider) there are no live
-        // floors — `local_floors` is empty — so there is nothing to merge
-        // against and nothing to ceiling against; the snapshot's floors load
-        // verbatim. This is NOT a security regression: a cold restart trusts the
-        // at-rest snapshot exactly as much as it already must (same
-        // at-rest-storage trust boundary; an attacker who can rewrite epoch
-        // floors in the snapshot can rewrite anything else in it too). Class M
-        // monotonicity (Invariant 2 max-merge, Invariant 4 append-only) still
-        // holds on every WARM respawn, where this function runs with non-empty
-        // live floors. The ceiling protects against a peer-influenced epoch
-        // advance racing a warm respawn; it does not police the at-rest snapshot
-        // a cold restart loads, and is not claimed to.
-        if local_floors.is_empty() {
-            return Ok(());
-        }
-
-        let ctx_id_hex = hex::encode(context_id);
-
-        // Step 1: read the imported (restored) epoch floors.
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
-        let import_floors: Vec<(String, u64)> =
-            self.contexts
-                .get(context_id)
-                .map_or_else(Vec::new, |entry| {
-                    entry
-                        .value()
-                        .sender_key_store
-                        .epochs_for_context(&ctx_id_hex)
-                });
-
-        // Step 2: build a temporary store seeded with the captured LIVE floors,
-        // then merge the restored/imported floors against them. The merge
-        // semantics depend on the trust origin of the snapshot (spec §23.17.2):
-        //
-        // - `trusted_local = true` (Invariant 2 — restoring the node's OWN
-        //   snapshot: crash recovery / actor respawn / process restart): a
-        //   lower restored floor is the expected coalesce-lag case (an epoch
-        //   advanced in the ≤50ms window before the crash, ADR-049 §9). MAX-
-        //   merge and PROCEED — never reject a regression (rejecting would fail
-        //   the respawn and poison a healthy context). Only the overshoot
-        //   (epoch-poisoning) ceiling is enforced.
-        // - `trusted_local = false` (Invariant 3 — importing an UNTRUSTED peer
-        //   snapshot): reject the entire merge if ANY restored floor regresses
-        //   below the live floor (snapshot-mediated replay guard), or overshoots
-        //   local + max_advance.
-        //
-        // Either way the merged floor is `max(live, restored)` per sender and is
-        // NEVER below the live floor (Invariant 4 append-only dominance).
-        let mut temp_store = SenderKeyStore::new();
-        for (did, floor) in &local_floors {
-            temp_store.restore_epoch_high_water(&ctx_id_hex, did, *floor);
-        }
-        let policy = if trusted_local {
-            scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal
-        } else {
-            scp_protocol::crypto::sender_keys::MergePolicy::RejectRegression
-        };
-        let merge_result = temp_store.merge_incoming_epochs(
-            &ctx_id_hex,
-            import_floors,
-            max_advance_per_sender,
-            policy,
-        );
-        merge_result.map_err(|per_sender_deltas| ContextError::SnapshotFloorRegression {
-            resource: "sender_key_epoch".to_owned(),
-            per_sender_deltas,
-        })?;
-
-        // Step 3: apply the merged floors (max of local and import) back into
-        // the real store. Ensures local-only senders (absent from the import
-        // snapshot) retain their floor (Invariant 4 append-only dominance).
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
-        let merged = temp_store.epochs_for_context(&ctx_id_hex);
-        if let Some(mut entry) = self.contexts.get_mut(context_id) {
-            let state = entry.value_mut();
-            for (did, epoch) in merged {
-                state
-                    .sender_key_store
-                    .restore_epoch_high_water(&ctx_id_hex, &did, epoch);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Returns the per-sender receive-side sequence floors for a given context.
-    ///
-    /// Each `(sender_did, (last_epoch, last_sequence))` pair is the highest
-    /// `(epoch, sequence)` accepted from that participant — the intra-epoch
-    /// anti-replay floor (spec §23.17.3). The floor order is LEXICOGRAPHIC on
-    /// `(epoch, sequence)`: a higher epoch dominates; at an equal epoch a higher
-    /// sequence dominates (`(u64, u64)` derives this ordering).
-    ///
-    /// This is the receive-side twin of [`Self::export_sender_key_epochs`]. It
-    /// is called by `restore_crypto_state_with_floor_guard` to capture the LIVE
-    /// floors **before** destroying existing crypto state so the incoming
-    /// snapshot can be validated/merged against them. A mailbox/handle despawn
-    /// does NOT tear down the supervisor-owned crypto provider, so these live
-    /// pre-crash floors are still authoritative on a warm respawn.
-    ///
-    /// Returns an empty `Vec` when the context has no crypto state (never
-    /// created / evicted / owned by an actor) — the cold-restart case, where
-    /// there is nothing to merge against.
-    pub fn export_recv_sequence_floors(&self, context_id: &[u8; 32]) -> Vec<(String, (u64, u64))> {
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
-        let Some(entry) = self.contexts.get(context_id) else {
-            return Vec::new();
-        };
-        entry
-            .value()
-            .recv_sequence_tracker
-            .iter()
-            .map(|(did, floor)| (did.clone(), *floor))
-            .collect()
-    }
-
-    /// Merges the per-sender receive-side sequence floors of the just-restored
-    /// crypto state against the captured live `local_floors`, applying a
-    /// max-merge so `max(local, restored)` is the effective floor for every
-    /// sender (spec §23.17.3; Invariant 2 `max(snapshot, retained)` / Invariant
-    /// 4 append-only dominance — "Gaps are bugs"). This is the receive-side twin
-    /// of [`Self::validate_and_merge_epoch_floors`]: the sender-key EPOCH
-    /// high-water is already max-merged there; the `recv_sequence_tracker` is
-    /// the missing twin that a warm respawn would otherwise reload VERBATIM from
-    /// the ≤50ms-stale coalesced snapshot, rolling an intra-epoch replay floor
-    /// BACKWARD (ADR-049 §9 Class M).
-    ///
-    /// Call this AFTER `restore_crypto_state`, passing the floors captured via
-    /// [`Self::export_recv_sequence_floors`] **before** the destroy+restore
-    /// cycle.
-    ///
-    /// The per-sender floor order is LEXICOGRAPHIC on `(epoch, sequence)`: a
-    /// higher epoch wins; at an equal epoch a higher sequence wins.
-    ///
-    /// `trusted_local` selects the spec §23.17.2 lower-bound policy:
-    /// - `true` (Invariant 2 — restoring the node's OWN snapshot: crash
-    ///   recovery / actor respawn / process restart): a restored floor BELOW the
-    ///   live floor is the expected coalesce-lag case; max-merge and PROCEED,
-    ///   never reject (rejecting would fail the respawn and poison a healthy
-    ///   context).
-    /// - `false` (Invariant 3 — importing an UNTRUSTED peer snapshot): reject
-    ///   the entire merge if ANY restored floor regresses below its live floor
-    ///   (snapshot-mediated replay guard), OR if any imported recv floor's epoch
-    ///   overshoots the sender's already-merged sender-key epoch floor by more
-    ///   than `MAX_EPOCH_ADVANCE` (epoch-poisoning guard — mirrors the epoch
-    ///   twin, so a malicious exporter cannot set a third party's recv floor to
-    ///   `epoch = u64::MAX` and permanently lock that sender out).
-    ///
-    /// Either way the applied floor is `max(live, restored)` per sender and is
-    /// NEVER below the live floor (Invariant 4). Local-only senders absent from
-    /// the snapshot retain their live floor; senders present only in the
-    /// snapshot keep their imported floor.
-    ///
-    /// A cold-restart no-op when `local_floors` is empty (same rationale as
-    /// [`Self::validate_and_merge_epoch_floors`]: no live floors to merge or
-    /// regress against; the snapshot loads verbatim under the same
-    /// at-rest-storage trust boundary).
-    ///
-    /// No state is mutated on failure (atomic, both paths).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::SnapshotFloorRegression`] with
-    /// `resource: "recv_sequence"` on the import path only. Each
-    /// `per_sender_deltas` entry reports either the counter that rolled back
-    /// (`(local_epoch, incoming_epoch)` when the epoch regressed, else
-    /// `(local_sequence, incoming_sequence)` at an equal epoch) or, for an
-    /// overshoot, `(ceiling, incoming_epoch)` where `ceiling` is the enforced
-    /// `sender_key_epoch + MAX_EPOCH_ADVANCE` bound.
-    // Parameter type `Vec<(String, (u64, u64))>` mirrors the by-value ownership
-    // convention of `validate_and_merge_epoch_floors` (captured live floors are
-    // consumed into the merge).
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn validate_and_merge_recv_sequence_floors(
-        &self,
-        context_id: &[u8; 32],
-        local_floors: Vec<(String, (u64, u64))>,
-        trusted_local: bool,
-    ) -> Result<(), ContextError> {
-        // Cold-restart no-op (spec §23.17.2 / ADR-049 §9): with no captured live
-        // floors there is nothing to merge or regress against, so the snapshot's
-        // floors load verbatim. Class M monotonicity still holds on every WARM
-        // respawn, where this runs with non-empty live floors.
-        if local_floors.is_empty() {
-            return Ok(());
-        }
-
-        // Step 1: read the imported (restored) recv-sequence floors. In the real
-        // flow `restore_crypto_state` has already written these from the snapshot
-        // bytes into the live `recv_sequence_tracker`.
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
-        let import_floors: HashMap<String, (u64, u64)> = self
-            .contexts
-            .get(context_id)
-            .map_or_else(HashMap::new, |entry| {
-                entry.value().recv_sequence_tracker.clone()
-            });
-
-        // Step 2: validate the UNTRUSTED import path (two guards, mirroring the
-        // sender-key epoch twin `validate_and_merge_epoch_floors` /
-        // `SenderKeyStore::merge_incoming_epochs`). The TRUSTED-LOCAL respawn
-        // path gets NEITHER — a lower restored floor is the expected coalesce-lag
-        // case (Invariant 2) and a healthy respawn must never be rejected.
-        //
-        // 2a. Regression guard (Invariant 3, replay): a restored floor
-        //     lexicographically below the captured live floor for a sender
-        //     present in BOTH is a snapshot-mediated replay vector. `(u64, u64)`
-        //     compares lexicographically, so `<` is exactly the
-        //     `(epoch, sequence)` floor order.
-        //
-        // 2b. Epoch-poisoning overshoot ceiling (mirrors the epoch twin's
-        //     `MAX_EPOCH_ADVANCE` bound): an imported recv floor whose epoch
-        //     exceeds the sender's ALREADY-MERGED sender-key epoch floor by more
-        //     than `MAX_EPOCH_ADVANCE` is rejected, so a signature-valid but
-        //     malicious/compromised exporter cannot set a third party's recv
-        //     floor to `epoch = u64::MAX` and permanently lock that sender out.
-        //     The bound is keyed off `sender_key_store.epoch(ctx, did)` — the
-        //     epoch floor `validate_and_merge_epoch_floors` (which runs BEFORE
-        //     this merge in `restore_crypto_state_with_floor_guard`) has already
-        //     max-merged and validated. Keying off THAT (a) covers senders
-        //     present only in the import (no live recv floor to bound against),
-        //     and (b) avoids false-positives on legitimate imports (a real recv
-        //     floor tracks the real sender-key epoch). `saturating_add` clamps
-        //     the bound at `u64::MAX`.
-        if !trusted_local {
-            let ctx_id_hex = hex::encode(context_id);
-            let mut per_sender_deltas: Vec<(String, u64, u64)> = Vec::new();
-
-            // 2a. Regression: senders present in both live and import.
-            for (did, live_floor) in &local_floors {
-                if let Some(import_floor) = import_floors.get(did)
-                    && import_floor < live_floor
-                {
-                    // Report whichever counter rolled back: the epoch if the
-                    // epoch regressed, else the sequence (equal-epoch case).
-                    let (local_scalar, incoming_scalar) = if import_floor.0 < live_floor.0 {
-                        (live_floor.0, import_floor.0)
-                    } else {
-                        (live_floor.1, import_floor.1)
-                    };
-                    per_sender_deltas.push((did.clone(), local_scalar, incoming_scalar));
-                }
-            }
-
-            // 2b. Overshoot ceiling: every imported recv floor (including
-            // import-only senders) bounded against the merged sender-key epoch
-            // floor + MAX_EPOCH_ADVANCE. One read-lock across the loop.
-            //
-            // NOTE: only the EPOCH axis is bounded here; the sequence axis is a
-            // deliberate, documented residual (#2076). No sound
-            // `MAX_SEQUENCE_ADVANCE` exists — there is no per-`(sender, epoch)`
-            // sequence high-water oracle (unlike `sender_key_store.epoch` for the
-            // epoch axis), so any constant would either false-positive legitimate
-            // high-volume catch-up imports or stop nothing; and spec §23.17.2
-            // Invariant 3 mandates accepting a floor `>= local` via max-merge. The
-            // residual — an untrusted import (creator-signed; `exporter_did ==
-            // creator_did`) setting `(valid_epoch, u64::MAX)` to silence a sender
-            // for the CURRENT epoch — is LOW: creator-gated, append-only-safe (a
-            // DoS, not a replay hole), and self-heals on the next sender-key
-            // rotation. See #2076.
-            if let Some(entry) = self.contexts.get(context_id) {
-                let store = &entry.value().sender_key_store;
-                for (did, (imp_epoch, _imp_seq)) in &import_floors {
-                    let ceiling = store
-                        .epoch(&ctx_id_hex, did)
-                        .saturating_add(MAX_EPOCH_ADVANCE);
-                    if *imp_epoch > ceiling {
-                        // local = the ceiling (bound), incoming = the overshoot.
-                        per_sender_deltas.push((did.clone(), ceiling, *imp_epoch));
-                    }
-                }
-            }
-
-            if !per_sender_deltas.is_empty() {
-                return Err(ContextError::SnapshotFloorRegression {
-                    resource: "recv_sequence".to_owned(),
-                    per_sender_deltas,
-                });
-            }
-        }
-
-        // Step 3: apply `max(live, restored)` per sender back into the real
-        // tracker. A sender in `local_floors` but absent from the import snapshot
-        // retains its live floor (Invariant 4 append-only dominance); a sender
-        // present only in the import snapshot keeps its imported floor (untouched
-        // here). Lexicographic `max` on `(u64, u64)`.
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
-        if let Some(mut entry) = self.contexts.get_mut(context_id) {
-            let tracker = &mut entry.value_mut().recv_sequence_tracker;
-            for (did, live_floor) in local_floors {
-                let merged = tracker
-                    .get(&did)
-                    .map_or(live_floor, |restored| (*restored).max(live_floor));
-                tracker.insert(did, merged);
-            }
-        }
-
-        Ok(())
-    }
+    // ADR-049 PR-6 (read-authority switch): the provider `validate_and_merge_epoch_floors`,
+    // `export_recv_sequence_floors`, and `validate_and_merge_recv_sequence_floors` twins are
+    // DELETED. The authoritative floors now live in the Supervisor-owned Class-M registry,
+    // whose `validate_and_merge_*` sinks (`context/supervisor/floors.rs`) enforce the same
+    // §23.17.2 Inv-2/Inv-3/Inv-4 + epoch-poisoning-overshoot merge; the restore/import guard
+    // routes the snapshot floors there via the returned `RestoredFloors`.
 }
 
 #[cfg(test)]
@@ -3121,7 +2734,6 @@ mod tests {
     use scp_clock::SystemClock;
     use scp_mls::encrypt::{encrypt, serialize_ciphertext};
     use scp_mls::group::generate_key_package;
-    use scp_protocol::crypto::sender_keys::SenderKeyError;
     use tls_codec::Serialize as TlsSerializeTrait;
 
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
@@ -3895,9 +3507,13 @@ mod tests {
             .unwrap();
         assert_eq!(pending.len(), 1);
 
-        bob_provider
+        // ADR-049 PR-6: process returns the authenticated (key, epoch) WITHOUT
+        // installing; install it via set_sender_key_unchecked (the floor gate is
+        // the registry's job at the messaging seam).
+        let (recovered_key, _epoch) = bob_provider
             .process_incoming_sender_key(&ctx_id, TEST_DID, &pending[0].1)
             .unwrap();
+        bob_provider.set_sender_key_unchecked(&ctx_id, TEST_DID, recovered_key);
 
         {
             let bob_entry = bob_provider.contexts.get(&ctx_id).unwrap();
@@ -3991,15 +3607,7 @@ mod tests {
         let provider = make_provider();
         let unknown_ctx = [0xFFu8; 32];
         let exported = provider
-            .export_crypto_state(
-                &unknown_ctx,
-                provider.export_sender_key_epochs(&unknown_ctx),
-                provider
-                    .export_recv_sequence_floors(&unknown_ctx)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&unknown_ctx, Vec::new(), Vec::new())
             .unwrap();
         assert!(
             exported.is_empty(),
@@ -4068,15 +3676,7 @@ mod tests {
 
         // Export crypto state.
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
             .unwrap();
         assert!(!exported.is_empty(), "exported state should be non-empty");
 
@@ -4172,94 +3772,67 @@ mod tests {
         let bob = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let carol = "did:dht:z6MkCarolCarolCarolCarolCarolCarolCarolCa";
 
-        // Seed a per-sender epoch high-water floor (sender-key side) and two
-        // distinct intra-epoch recv floors so both twin outputs are non-empty
-        // and the set comparison actually exercises data.
-        {
-            let ctx_id_hex = hex::encode(ctx_id);
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state
-                .sender_key_store
-                .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
-            state
-                .sender_key_store
-                .restore_epoch_high_water(&ctx_id_hex, bob, 7);
-            state.recv_sequence_tracker.insert(bob.to_owned(), (7, 3));
-            state.recv_sequence_tracker.insert(carol.to_owned(), (2, 9));
-        }
+        // ADR-049 PR-6: floors are AUTHORITATIVE in the registry and threaded
+        // into `export_crypto_state` as PARAMETERS (the provider no longer holds
+        // an epoch/recv mirror). Pass explicit floor params and assert they land
+        // in the durable snapshot blob verbatim, with epoch/sequence in the right
+        // positions (no transposition).
+        let sender_key_epochs = vec![(bob.to_owned(), 7u64), (carol.to_owned(), 2u64)];
+        let recv_sequence_floors = vec![
+            (
+                bob.to_owned(),
+                ReceiveFloor {
+                    epoch: 7,
+                    sequence: 3,
+                },
+            ),
+            (
+                carol.to_owned(),
+                ReceiveFloor {
+                    epoch: 2,
+                    sequence: 9,
+                },
+            ),
+        ];
 
-        // Export with the exact production provider-sourced floor params.
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, sender_key_epochs, recv_sequence_floors)
             .unwrap();
         assert!(!exported.is_empty(), "keyed context must export non-empty");
 
         let snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
 
-        // Sender-key epoch floors: blob field == twin report (as a set).
+        // Sender-key epoch floors: blob field == params (as a set).
         let snap_epochs: std::collections::BTreeSet<(String, u64)> =
             snapshot.sender_key_epochs.iter().cloned().collect();
-        let twin_epochs: std::collections::BTreeSet<(String, u64)> = provider
-            .export_sender_key_epochs(&ctx_id)
-            .into_iter()
-            .collect();
         assert_eq!(
-            snap_epochs, twin_epochs,
-            "sender-key epoch floors in the blob must equal the twin's report"
-        );
-        assert!(
-            twin_epochs.contains(&(bob.to_owned(), 7)),
-            "the seeded epoch floor must be present"
+            snap_epochs,
+            std::collections::BTreeSet::from([(bob.to_owned(), 7), (carol.to_owned(), 2)]),
+            "sender-key epoch floor params must land in the blob verbatim"
         );
 
-        // Recv (epoch, sequence) floors: blob field == twin report (as a set),
-        // with epoch and sequence in the right positions (no transposition).
+        // Recv (epoch, sequence) floors: blob field == params (as a set), with
+        // epoch and sequence in the right positions (no transposition).
         let snap_recv: std::collections::BTreeSet<(String, u64, u64)> =
             snapshot.recv_sequence_tracker.iter().cloned().collect();
-        let twin_recv: std::collections::BTreeSet<(String, u64, u64)> = provider
-            .export_recv_sequence_floors(&ctx_id)
-            .into_iter()
-            .map(|(did, (epoch, sequence))| (did, epoch, sequence))
-            .collect();
         assert_eq!(
-            snap_recv, twin_recv,
-            "recv (epoch, sequence) floors in the blob must equal the twin's \
-             report with no epoch/sequence transposition"
-        );
-        assert!(
-            snap_recv.contains(&(bob.to_owned(), 7, 3))
-                && snap_recv.contains(&(carol.to_owned(), 2, 9)),
-            "both seeded recv floors must round-trip with epoch and sequence \
-             in the correct positions"
+            snap_recv,
+            std::collections::BTreeSet::from([(bob.to_owned(), 7, 3), (carol.to_owned(), 2, 9)]),
+            "recv (epoch, sequence) floor params must land in the blob verbatim \
+             with no epoch/sequence transposition"
         );
     }
 
     #[test]
     fn restore_preserves_sender_key_epoch_high_water_mark() {
-        // Regression for #1608 rollback-protection across restart.
-        //
-        // Scenario:
-        //   1. Alice stores Bob's sender key via set_checked at epoch=5.
-        //   2. Alice exports the crypto state (snapshot).
-        //   3. Alice restarts and restores the snapshot into a fresh
-        //      provider.
-        //   4. An attacker replays an older-epoch distribution (epoch=3)
-        //      or attempts same-epoch (epoch=5) — BOTH must be rejected.
-        //   5. A legitimate post-snapshot rotation (epoch=6) must be
-        //      accepted.
-        //
-        // Without persistence of the per-sender epoch map, the fresh
-        // in-memory store would have no floor and accept any epoch,
-        // silently re-opening the rollback window.
+        // Regression for #1608 rollback-protection across restart. ADR-049 PR-6:
+        // the per-sender epoch floor survives the snapshot round-trip by being
+        // RETURNED from `restore_crypto_state` in `RestoredFloors` (for the
+        // authoritative Class-M registry to re-enforce), not by being re-seeded
+        // into the provider store (the provider floor mirror is deleted). This
+        // test pins the round-trip: a floor exported as the registry-sourced
+        // param lands in the snapshot and comes back out of restore verbatim, and
+        // the key MATERIAL is reinstalled so decryption still works.
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
@@ -4268,114 +3841,60 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let ctx_id_hex = hex::encode(ctx_id);
 
-        // Step 1: install Bob's epoch-5 key via set_checked so the
-        // epoch map is populated exactly as it would be in production.
+        // Install Bob's key MATERIAL (the floor is carried by the registry and
+        // passed as the export param, exactly as `build_snapshot_for_persist`
+        // threads it).
         {
             let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state
-                .sender_key_store
-                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 5)
-                .expect("first set_checked at epoch 5 must succeed");
-            assert_eq!(
-                state.sender_key_store.epoch(&ctx_id_hex, bob_did),
-                5,
-                "pre-snapshot epoch must be 5"
+            entry.value_mut().sender_key_store.set_unchecked(
+                &ctx_id_hex,
+                bob_did,
+                generate_sender_key(),
             );
         }
 
-        // Step 2: export snapshot.
+        // Export with the authoritative floor (epoch 5) as the param.
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, vec![(bob_did.to_owned(), 5)], Vec::new())
             .unwrap();
         assert!(!exported.is_empty());
 
-        // Step 3: simulate restart — fresh provider, restore state.
+        // Restart: fresh provider, restore. The floor comes back in RestoredFloors.
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        let restored = provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        assert!(
+            restored
+                .sender_epochs
+                .iter()
+                .any(|(did, epoch)| did == bob_did && *epoch == 5),
+            "the epoch-5 floor must survive the snapshot round-trip in RestoredFloors, \
+             got {:?}",
+            restored.sender_epochs
+        );
 
-        // Verify the restored floor exactly matches the persisted epoch.
+        // The key MATERIAL is reinstalled (so decryption still works); the floor
+        // itself is re-enforced by the registry once the caller merges
+        // RestoredFloors (tested in the registry unit + cold-restart integration
+        // tests).
         {
             let entry = provider2.contexts.get(&ctx_id).unwrap();
-            let state = entry.value();
-            assert_eq!(
-                state.sender_key_store.epoch(&ctx_id_hex, bob_did),
-                5,
-                "post-restore epoch floor must match persisted value"
-            );
-        }
-
-        // Step 4a: replay of pre-snapshot epoch=3 MUST be rejected.
-        {
-            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            let err = state
-                .sender_key_store
-                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 3)
-                .expect_err("replay of epoch 3 must be rejected after restore");
             assert!(
-                matches!(
-                    err,
-                    SenderKeyError::EpochNotMonotonic {
-                        current: 5,
-                        received: 3,
-                        ..
-                    }
-                ),
-                "expected EpochNotMonotonic(current=5, received=3), got {err:?}"
-            );
-        }
-
-        // Step 4b: same-epoch replay at 5 MUST also be rejected.
-        {
-            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            let err = state
-                .sender_key_store
-                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 5)
-                .expect_err("same-epoch replay at 5 must be rejected after restore");
-            assert!(
-                matches!(
-                    err,
-                    SenderKeyError::EpochNotMonotonic {
-                        current: 5,
-                        received: 5,
-                        ..
-                    }
-                ),
-                "expected EpochNotMonotonic(current=5, received=5), got {err:?}"
-            );
-        }
-
-        // Step 5: legitimate post-snapshot rotation to epoch=6 is accepted.
-        {
-            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state
-                .sender_key_store
-                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 6)
-                .expect("post-snapshot rotation at epoch 6 must succeed");
-            assert_eq!(
-                state.sender_key_store.epoch(&ctx_id_hex, bob_did),
-                6,
-                "epoch floor should advance to 6 after legitimate rotation"
+                entry
+                    .value()
+                    .sender_key_store
+                    .get(&ctx_id_hex, bob_did)
+                    .is_some(),
+                "restored provider must reinstall Bob's key material"
             );
         }
     }
 
     #[test]
     fn restore_preserves_epoch_floor_for_removed_members() {
-        // Removed members still have their epoch floor retained (see
-        // `SenderKeyStore::remove`) so a rejoining member cannot replay
-        // an earlier-epoch key. This invariant must survive a restart.
+        // A removed member's retained epoch floor must survive a restart so a
+        // rejoining member cannot replay an earlier-epoch key. ADR-049 PR-6: the
+        // floor is carried by the registry (no key material remains) and comes
+        // back out of restore in `RestoredFloors` for the registry to re-enforce.
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
@@ -4384,629 +3903,35 @@ mod tests {
         let carol_did = "did:dht:z6MkCarolCarolCarolCarolCarolCarolCarolCa";
         let ctx_id_hex = hex::encode(ctx_id);
 
-        // Install then remove Carol's epoch-9 key. The key is gone but
-        // the floor is retained.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state
-                .sender_key_store
-                .set_checked(&ctx_id_hex, carol_did, generate_sender_key(), 9)
-                .unwrap();
-            state.sender_key_store.remove(&ctx_id_hex, carol_did);
-            assert!(
-                state.sender_key_store.get(&ctx_id_hex, carol_did).is_none(),
-                "key must be gone after remove"
-            );
-            assert_eq!(
-                state.sender_key_store.epoch(&ctx_id_hex, carol_did),
-                9,
-                "epoch floor must be retained post-remove"
-            );
-        }
-
-        // Snapshot + restart.
+        // Carol has NO key material (removed), but her floor (9) is retained in
+        // the registry and exported as a param.
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, vec![(carol_did.to_owned(), 9)], Vec::new())
             .unwrap();
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        let restored = provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
-        // Restored store has no key for Carol but still has the floor.
+        // The removed-member floor survives in RestoredFloors …
+        assert!(
+            restored
+                .sender_epochs
+                .iter()
+                .any(|(did, epoch)| did == carol_did && *epoch == 9),
+            "removed-member floor (9) must survive restart in RestoredFloors, got {:?}",
+            restored.sender_epochs
+        );
+        // … and no key material reappears for the removed member.
         {
             let entry = provider2.contexts.get(&ctx_id).unwrap();
-            let state = entry.value();
             assert!(
-                state.sender_key_store.get(&ctx_id_hex, carol_did).is_none(),
+                entry
+                    .value()
+                    .sender_key_store
+                    .get(&ctx_id_hex, carol_did)
+                    .is_none(),
                 "removed key must not reappear after restore"
             );
-            assert_eq!(
-                state.sender_key_store.epoch(&ctx_id_hex, carol_did),
-                9,
-                "removed-member floor must survive restart"
-            );
         }
-
-        // Attempt to install an earlier-epoch key (rejoin attack) — rejected.
-        {
-            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            let err = state
-                .sender_key_store
-                .set_checked(&ctx_id_hex, carol_did, generate_sender_key(), 4)
-                .expect_err("rejoin at older epoch must be rejected");
-            assert!(matches!(err, SenderKeyError::EpochNotMonotonic { .. }));
-        }
-    }
-
-    #[test]
-    fn validate_and_merge_epoch_floors_rejects_regression_on_import() {
-        // §23.17 Invariant 3 (replay guard) — the UNTRUSTED IMPORT path
-        // (`trusted_local = false`): an imported peer snapshot whose per-sender
-        // epoch floor is BELOW the live floor must be rejected entirely, because
-        // a peer-supplied stale floor is a snapshot-mediated replay vector. This
-        // is the policy `import_context` / `PrepareForReplace` apply. NOTE: the
-        // RESPAWN/restore path (`trusted_local = true`, Invariant 2) does NOT
-        // reject here — see `validate_and_merge_epoch_floors_max_merges_on_restore`.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
-        let ctx_id_hex = hex::encode(ctx_id);
-
-        // Live floor for Dave is epoch 12.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .sender_key_store
-                .restore_epoch_high_water(&ctx_id_hex, dave_did, 12);
-        }
-        let live_floors = provider.export_sender_key_epochs(&ctx_id);
-        assert!(
-            live_floors.iter().any(|(d, e)| d == dave_did && *e == 12),
-            "live floor for Dave must be epoch 12 before the regression check"
-        );
-
-        // The "restored" crypto now carries a LOWER floor (epoch 5) for Dave —
-        // simulate a stale snapshot by lowering the store directly. (In the
-        // real flow `restore_crypto_state` writes these from snapshot bytes;
-        // here we exercise the validate/merge guard in isolation, passing the
-        // captured live floors exactly as `restore_crypto_state_with_floor_guard`
-        // does.)
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .sender_key_store
-                .restore_epoch_high_water(&ctx_id_hex, dave_did, 5);
-        }
-
-        // IMPORT path (`trusted_local = false`): a regression is rejected.
-        let err = provider
-            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE, false)
-            .expect_err("an import floor regression (5 < live 12) must be rejected");
-        assert!(
-            matches!(err, ContextError::SnapshotFloorRegression { .. }),
-            "expected SnapshotFloorRegression, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_and_merge_epoch_floors_max_merges_on_restore() {
-        // §23.17 Invariant 2 (own-snapshot restore) — the TRUSTED-LOCAL RESPAWN
-        // path (`trusted_local = true`): a restored floor BELOW the live floor
-        // is the EXPECTED coalesce-lag case (an epoch advanced in the ≤50ms
-        // window before the crash, ADR-049 §9). It MUST max-merge and PROCEED —
-        // NOT reject (rejecting would fail the respawn and poison a healthy
-        // context: the round-2 HIGH bug this corrects). The merged floor is the
-        // higher LIVE value (12), and no error is returned.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
-        let ctx_id_hex = hex::encode(ctx_id);
-
-        // Live floor for Dave is epoch 12 (advanced just before the crash).
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .sender_key_store
-                .restore_epoch_high_water(&ctx_id_hex, dave_did, 12);
-        }
-        let live_floors = provider.export_sender_key_epochs(&ctx_id);
-
-        // The restored (coalesced) snapshot carries a LOWER floor (epoch 5) for
-        // Dave — it predates the live epoch-12 advance.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .sender_key_store
-                .restore_epoch_high_water(&ctx_id_hex, dave_did, 5);
-        }
-
-        // RESPAWN path (`trusted_local = true`): max-merge and proceed.
-        provider
-            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE, true)
-            .expect(
-                "a respawn from a coalesce-lagged snapshot must max-merge and proceed, not fail",
-            );
-
-        let merged = provider.export_sender_key_epochs(&ctx_id);
-        assert!(
-            merged.iter().any(|(d, e)| d == dave_did && *e == 12),
-            "Dave's floor must be the higher LIVE value (12), never lowered to the stale snapshot's 5"
-        );
-    }
-
-    #[test]
-    fn validate_and_merge_epoch_floors_restore_rejects_overshoot() {
-        // §23.17 Invariant 2 still enforces the epoch-poisoning overshoot
-        // ceiling on the trusted-local path: a corrupt snapshot floor that
-        // exceeds the live floor by more than `MAX_EPOCH_ADVANCE` is rejected
-        // even on respawn, so a garbage snapshot cannot wedge a sender's
-        // monotonicity guard at `epoch = u64::MAX`.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let gina_did = "did:dht:z6MkGinaGinaGinaGinaGinaGinaGinaGinaGinaGi";
-        let ctx_id_hex = hex::encode(ctx_id);
-
-        // Live floor for Gina is epoch 1.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .sender_key_store
-                .restore_epoch_high_water(&ctx_id_hex, gina_did, 1);
-        }
-        let live_floors = provider.export_sender_key_epochs(&ctx_id);
-
-        // Corrupt snapshot floor overshoots live (1) + MAX_EPOCH_ADVANCE.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry.value_mut().sender_key_store.restore_epoch_high_water(
-                &ctx_id_hex,
-                gina_did,
-                1 + MAX_EPOCH_ADVANCE + 1,
-            );
-        }
-
-        let err = provider
-            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE, true)
-            .expect_err("an overshoot beyond MAX_EPOCH_ADVANCE must be rejected even on restore");
-        assert!(
-            matches!(err, ContextError::SnapshotFloorRegression { .. }),
-            "expected SnapshotFloorRegression on overshoot, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_and_merge_epoch_floors_empty_live_floors_is_noop_both_paths() {
-        // Cryptographer Residual 1 (empty-floors bypass): when the captured
-        // LIVE floors are empty — e.g. the crypto was destroyed on close /
-        // migrate before the snapshot loaded — there is nothing to regress
-        // against, so the guard is a no-op `Ok(())` on BOTH paths. This is NOT
-        // a resurrection hazard: a closed/migrated context's snapshot.state is
-        // terminal (close sync-persists the transition, ADR-049 §9), so the
-        // respawn Active-only gate rejects it BEFORE the crypto restore runs
-        // (`respawn_skips_terminal_snapshot`). The floor guard never has to be
-        // the thing that stops a stale-Active resurrection; the lifecycle gate
-        // does. This test pins the benign no-op so a future change that makes
-        // empty-live-floors reject (and thus break legitimate first-restore of
-        // a context with no prior live state) is caught.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        // Empty captured live floors → early Ok, regardless of trust origin.
-        provider
-            .validate_and_merge_epoch_floors(&ctx_id, Vec::new(), MAX_EPOCH_ADVANCE, true)
-            .expect("empty live floors must be a no-op on the trusted-local restore path");
-        provider
-            .validate_and_merge_epoch_floors(&ctx_id, Vec::new(), MAX_EPOCH_ADVANCE, false)
-            .expect("empty live floors must be a no-op on the untrusted import path");
-    }
-
-    #[test]
-    fn validate_and_merge_epoch_floors_max_merges_non_regressing() {
-        // The guard is not over-eager: when the restored floor is at or above
-        // the live floor, it accepts and max-merges. A local-only sender
-        // (absent from the restored set) retains its floor (Invariant 4).
-        // Holds on BOTH paths; exercised here on the import path.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let erin_did = "did:dht:z6MkErinErinErinErinErinErinErinErinErinEr";
-        let frank_did = "did:dht:z6MkFrankFrankFrankFrankFrankFrankFrankFr";
-        let ctx_id_hex = hex::encode(ctx_id);
-
-        // Live floors: Erin=4, Frank=7.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let store = &mut entry.value_mut().sender_key_store;
-            store.restore_epoch_high_water(&ctx_id_hex, erin_did, 4);
-            store.restore_epoch_high_water(&ctx_id_hex, frank_did, 7);
-        }
-        let live_floors = provider.export_sender_key_epochs(&ctx_id);
-
-        // Restored set advances Erin to 9 and omits Frank entirely.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let store = &mut entry.value_mut().sender_key_store;
-            store.restore_epoch_high_water(&ctx_id_hex, erin_did, 9);
-            // Frank dropped from the restored snapshot.
-        }
-
-        provider
-            .validate_and_merge_epoch_floors(&ctx_id, live_floors, MAX_EPOCH_ADVANCE, false)
-            .expect("a non-regressing restore must be accepted and max-merged");
-
-        let merged = provider.export_sender_key_epochs(&ctx_id);
-        assert!(
-            merged.iter().any(|(d, e)| d == erin_did && *e == 9),
-            "Erin's floor must advance to the higher restored value (9)"
-        );
-        assert!(
-            merged.iter().any(|(d, e)| d == frank_did && *e == 7),
-            "Frank's local-only floor (7) must be retained (Invariant 4)"
-        );
-    }
-
-    // ---- §23.17.3 receive-side sequence-floor twin -----------------------
-
-    #[test]
-    fn validate_and_merge_recv_sequence_floors_max_merges_on_restore() {
-        // §23.17.3 Invariant 2 (own-snapshot restore) — the TRUSTED-LOCAL
-        // RESPAWN path (`trusted_local = true`): when the captured LIVE recv
-        // floor is AHEAD of the ≤50ms-stale coalesced snapshot, the merge MUST
-        // keep the higher LIVE `(epoch, sequence)` and never lower it — a
-        // rolled-back intra-epoch replay floor is the bug this corrects
-        // (ADR-049 §9 Class M). The floor order is lexicographic on
-        // `(epoch, sequence)`: a higher epoch dominates even a higher stale
-        // sequence.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
-
-        // Live floor for Dave is (epoch 5, seq 20) — advanced just before crash.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (5, 20));
-        }
-        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
-
-        // The restored (coalesced) snapshot carries a LOWER epoch (3) for Dave,
-        // even though its sequence (999) is higher — lexicographically stale.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (3, 999));
-        }
-
-        provider
-            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, true)
-            .expect(
-                "a respawn from a coalesce-lagged snapshot must max-merge and proceed, not fail",
-            );
-
-        let merged = provider.export_recv_sequence_floors(&ctx_id);
-        assert!(
-            merged.iter().any(|(d, f)| d == dave_did && *f == (5, 20)),
-            "Dave's recv floor must stay the higher LIVE value (5, 20), never the stale (3, 999)"
-        );
-    }
-
-    #[test]
-    fn validate_and_merge_recv_sequence_floors_equal_epoch_keeps_higher_live_sequence() {
-        // §23.17.3: at an EQUAL epoch the higher LIVE sequence must win. This is
-        // the core intra-epoch anti-replay case: a stale snapshot at the same
-        // epoch but a lower sequence must not roll the sequence floor back on a
-        // trusted-local respawn.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
-
-        // Live floor: (epoch 7, seq 200).
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (7, 200));
-        }
-        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
-
-        // Stale snapshot: same epoch, lower sequence.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (7, 50));
-        }
-
-        provider
-            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, true)
-            .expect("equal-epoch lower-sequence snapshot must max-merge and proceed");
-
-        let merged = provider.export_recv_sequence_floors(&ctx_id);
-        assert!(
-            merged.iter().any(|(d, f)| d == dave_did && *f == (7, 200)),
-            "Dave's recv floor must keep the higher LIVE sequence (7, 200), never (7, 50)"
-        );
-    }
-
-    #[test]
-    fn validate_and_merge_recv_sequence_floors_rejects_regression_on_import() {
-        // §23.17.3 Invariant 3 (replay guard) — the UNTRUSTED IMPORT path
-        // (`trusted_local = false`): an imported peer snapshot whose per-sender
-        // recv floor is lexicographically BELOW the live floor must be rejected
-        // entirely (snapshot-mediated replay vector). Mirrors the epoch-floor
-        // import guard.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
-
-        // Live floor: (epoch 12, seq 100).
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (12, 100));
-        }
-        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
-
-        // Restored crypto carries a LOWER sequence (40) at the same epoch.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (12, 40));
-        }
-
-        let err = provider
-            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, false)
-            .expect_err(
-                "an import recv-floor regression ((12,40) < live (12,100)) must be rejected",
-            );
-        match err {
-            ContextError::SnapshotFloorRegression {
-                resource,
-                per_sender_deltas,
-            } => {
-                assert_eq!(resource, "recv_sequence");
-                assert!(
-                    per_sender_deltas
-                        .iter()
-                        .any(|(d, local, incoming)| d == dave_did
-                            && *local == 100
-                            && *incoming == 40),
-                    "delta must report the rolled-back sequence (local 100, incoming 40), got {per_sender_deltas:?}"
-                );
-            }
-            other => panic!("expected SnapshotFloorRegression, got {other:?}"),
-        }
-
-        // The live floor must be untouched after a rejected import.
-        let after = provider.export_recv_sequence_floors(&ctx_id);
-        assert!(
-            after.iter().any(|(d, f)| d == dave_did && *f == (12, 40)),
-            "rejected import must not have merged; the tracker keeps whatever restore wrote"
-        );
-    }
-
-    #[test]
-    fn validate_and_merge_recv_sequence_floors_retains_local_only_sender() {
-        // §23.17.3 Invariant 4 (append-only dominance): a sender present in the
-        // captured LIVE floors but ABSENT from the restored snapshot must retain
-        // its live floor, while a sender the snapshot advances is max-merged
-        // upward. Exercised on the untrusted-import path (a non-regressing
-        // advance is accepted).
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
-        let erin_did = "did:dht:z6MkErinErinErinErinErinErinErinErinErinEr";
-
-        // Live floors: Dave=(4, 30), Erin=(7, 90).
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let tracker = &mut entry.value_mut().recv_sequence_tracker;
-            tracker.insert(dave_did.to_owned(), (4, 30));
-            tracker.insert(erin_did.to_owned(), (7, 90));
-        }
-        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
-
-        // Restored snapshot advances Dave to (9, 5) and omits Erin entirely.
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let tracker = &mut entry.value_mut().recv_sequence_tracker;
-            tracker.insert(dave_did.to_owned(), (9, 5));
-            tracker.remove(erin_did);
-        }
-
-        provider
-            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, false)
-            .expect("a non-regressing recv-floor restore must be accepted and max-merged");
-
-        let merged = provider.export_recv_sequence_floors(&ctx_id);
-        assert!(
-            merged.iter().any(|(d, f)| d == dave_did && *f == (9, 5)),
-            "Dave's floor must advance to the higher restored value (9, 5)"
-        );
-        assert!(
-            merged.iter().any(|(d, f)| d == erin_did && *f == (7, 90)),
-            "Erin's local-only floor (7, 90) must be retained (Invariant 4)"
-        );
-    }
-
-    #[test]
-    fn validate_and_merge_recv_sequence_floors_rejects_overshoot_on_import() {
-        // §23.17.3 Invariant 3 (epoch-poisoning guard) — the UNTRUSTED IMPORT
-        // path: an imported recv floor whose EPOCH overshoots the sender's
-        // already-merged sender-key epoch floor by more than MAX_EPOCH_ADVANCE
-        // must be rejected, so a signature-valid but malicious/compromised
-        // exporter cannot pin a third party's recv floor at epoch = u64::MAX and
-        // permanently lock that sender out. Mirrors the epoch twin's
-        // `validate_and_merge_epoch_floors_restore_rejects_overshoot`. The bound
-        // is keyed off `sender_key_store.epoch(ctx, did)` — the epoch floor the
-        // epoch merge has already validated (it runs BEFORE this merge in
-        // `restore_crypto_state_with_floor_guard`), which also covers senders
-        // present only in the import.
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
-        let ctx_id_hex = hex::encode(ctx_id);
-
-        // Sender-key epoch floor for Dave is 1 (already max-merged by the epoch
-        // twin). Live recv floor (1, 10) keeps `local_floors` non-empty (not the
-        // cold-restart no-op).
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state
-                .sender_key_store
-                .restore_epoch_high_water(&ctx_id_hex, dave_did, 1);
-            state
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (1, 10));
-        }
-        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
-
-        // Restore writes a recv floor whose epoch overshoots the ceiling
-        // (sender_key_epoch 1 + MAX_EPOCH_ADVANCE).
-        let overshoot_epoch = 1 + MAX_EPOCH_ADVANCE + 1;
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (overshoot_epoch, 5));
-        }
-
-        let err = provider
-            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, false)
-            .expect_err("an imported recv epoch overshooting the ceiling must be rejected");
-        match err {
-            ContextError::SnapshotFloorRegression {
-                resource,
-                per_sender_deltas,
-            } => {
-                assert_eq!(resource, "recv_sequence");
-                assert!(
-                    per_sender_deltas
-                        .iter()
-                        .any(|(d, ceiling, incoming)| d == dave_did
-                            && *ceiling == 1 + MAX_EPOCH_ADVANCE
-                            && *incoming == overshoot_epoch),
-                    "overshoot delta must report (ceiling, incoming_epoch), got {per_sender_deltas:?}"
-                );
-            }
-            other => panic!("expected SnapshotFloorRegression, got {other:?}"),
-        }
-
-        // Atomic reject: no merge applied — the tracker still holds exactly what
-        // restore wrote (the overshoot), unmodified.
-        let after = provider.export_recv_sequence_floors(&ctx_id);
-        assert!(
-            after
-                .iter()
-                .any(|(d, f)| d == dave_did && *f == (overshoot_epoch, 5)),
-            "a rejected overshoot must not merge; the tracker is unchanged"
-        );
-    }
-
-    #[test]
-    fn validate_and_merge_recv_sequence_floors_accepts_within_ceiling_import() {
-        // No false-positive: an imported recv floor whose epoch is within
-        // `sender_key_epoch + MAX_EPOCH_ADVANCE` is ACCEPTED on the untrusted
-        // path. The boundary is inclusive (only `> ceiling` rejects).
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
-        let ctx_id_hex = hex::encode(ctx_id);
-
-        // Sender-key epoch floor 5; live recv floor (5, 20).
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state
-                .sender_key_store
-                .restore_epoch_high_water(&ctx_id_hex, dave_did, 5);
-            state
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (5, 20));
-        }
-        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
-
-        // Restore advances the recv floor to EXACTLY the ceiling epoch
-        // (5 + MAX_EPOCH_ADVANCE) — allowed.
-        let ceiling_epoch = 5 + MAX_EPOCH_ADVANCE;
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            entry
-                .value_mut()
-                .recv_sequence_tracker
-                .insert(dave_did.to_owned(), (ceiling_epoch, 0));
-        }
-
-        provider
-            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, false)
-            .expect(
-                "a recv floor at exactly the ceiling epoch must be accepted (no false-positive)",
-            );
-
-        let merged = provider.export_recv_sequence_floors(&ctx_id);
-        assert!(
-            merged
-                .iter()
-                .any(|(d, f)| d == dave_did && *f == (ceiling_epoch, 0)),
-            "the within-ceiling import must merge to the higher (ceiling_epoch, 0)"
-        );
     }
 
     #[test]
@@ -5047,56 +3972,42 @@ mod tests {
 
         // Export, then hand-edit the msgpack to drop the epoch map.
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
             .unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        provider2
+        let restored = provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
             .expect("legacy snapshot (empty epoch map) must restore cleanly");
 
-        // The legacy snapshot had no per-sender epoch map, so the
-        // restore path seeds every sender with the global
-        // `sender_key_epoch` counter as a conservative lower bound.
-        // This closes the one-shot rollback window.
-        {
-            let mut entry = provider2.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            assert_eq!(
-                state.sender_key_store.epoch(&ctx_id_hex, bob_did),
-                7,
-                "legacy restore must seed per-sender floor from the global sender_key_epoch \
-                 counter (= 7 in this fixture), not leave it at zero"
-            );
-            // Replay of epoch <= 7 must be rejected — the one-shot
-            // window is closed.
-            let err = state
+        // The legacy snapshot had no per-sender epoch map, so restore seeds every
+        // sender WITH KEY MATERIAL from the global `sender_key_epoch` counter (7)
+        // as a conservative lower bound — RETURNED in RestoredFloors for the
+        // registry, closing the one-shot rollback window.
+        assert!(
+            restored
+                .sender_epochs
+                .iter()
+                .any(|(did, epoch)| did == bob_did && *epoch == 7),
+            "legacy restore must seed the floor from the global counter (7) in \
+             RestoredFloors, got {:?}",
+            restored.sender_epochs
+        );
+        // Sanity: `ctx_id_hex` is still the store key for the reinstalled material.
+        assert!(
+            provider2
+                .contexts
+                .get(&ctx_id)
+                .unwrap()
+                .value()
                 .sender_key_store
-                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 7)
-                .expect_err("same-epoch replay must be rejected under legacy seed");
-            assert!(matches!(err, SenderKeyError::EpochNotMonotonic { .. }));
-            let err = state
-                .sender_key_store
-                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 3)
-                .expect_err("older-epoch replay must be rejected under legacy seed");
-            assert!(matches!(err, SenderKeyError::EpochNotMonotonic { .. }));
-            // Legitimate rotation above the seeded floor is accepted.
-            state
-                .sender_key_store
-                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 8)
-                .expect("post-seed rotation at epoch 8 must succeed");
-        }
+                .get(&ctx_id_hex, bob_did)
+                .is_some(),
+            "legacy restore must reinstall Bob's key material"
+        );
     }
 
     #[test]
@@ -5142,48 +4053,36 @@ mod tests {
         // Export, then strip the per-sender epoch map to simulate a
         // legacy snapshot.
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
             .unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        provider2
+        let restored = provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
             .expect("legacy restore must succeed");
 
-        // OBSERVED BEHAVIOR: the peer's restored floor equals the
-        // LOCAL sender_key_epoch counter (1), NOT the true pre-snapshot
-        // peer floor (50). This is the documented residual window.
-        {
-            let entry = provider2.contexts.get(&ctx_id).unwrap();
-            let state = entry.value();
-            let seeded = state.sender_key_store.epoch(&ctx_id_hex, peer_did);
-            assert_eq!(
-                seeded, 1,
-                "legacy seed uses global sender_key_epoch (1), NOT the true peer floor (50). \
-                 This is the documented residual window bounded by MAX_EPOCH_ADVANCE in the \
-                 receive path. Fully closing it would require a format break."
-            );
-            // The residual window is `peer_floor - seeded_floor` = 49
-            // in this scenario, bounded from above by MAX_EPOCH_ADVANCE
-            // in the actual receive path.
-            assert!(
-                50 > seeded,
-                "gap exists: true peer floor ({}) > seeded floor ({})",
-                50,
-                seeded
-            );
-        }
+        // OBSERVED BEHAVIOR (ADR-049 PR-6): the peer's restored floor in
+        // RestoredFloors equals the LOCAL sender_key_epoch counter (1), NOT the
+        // true pre-snapshot peer floor (50). This is the documented residual
+        // window bounded by MAX_EPOCH_ADVANCE in the receive path; fully closing
+        // it would require a format break.
+        let seeded = restored
+            .sender_epochs
+            .iter()
+            .find(|(did, _)| did == peer_did)
+            .map(|(_, epoch)| *epoch)
+            .expect("peer with key material must be seeded a legacy floor");
+        assert_eq!(
+            seeded, 1,
+            "legacy seed uses global sender_key_epoch (1), NOT the true peer floor (50)"
+        );
+        assert!(
+            50 > seeded,
+            "gap exists: true peer floor (50) > seeded floor ({seeded})"
+        );
     }
 
     #[test]
@@ -5211,31 +4110,37 @@ mod tests {
         }
 
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
             .unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        provider2
+        let restored = provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
             .unwrap();
 
-        let entry = provider2.contexts.get(&ctx_id).unwrap();
-        let state = entry.value();
-        assert_eq!(
-            state.sender_key_store.epoch(&ctx_id_hex, bob_did),
-            1,
-            "legacy seed must clamp to at least 1 when global counter is 0"
+        // ADR-049 PR-6: the legacy seed (max(global, 1)) is returned in
+        // RestoredFloors, clamped to at least 1 when the global counter is 0.
+        assert!(
+            restored
+                .sender_epochs
+                .iter()
+                .any(|(did, epoch)| did == bob_did && *epoch == 1),
+            "legacy seed must clamp to at least 1 when global counter is 0, got {:?}",
+            restored.sender_epochs
+        );
+        // `ctx_id_hex` keys the reinstalled material.
+        assert!(
+            provider2
+                .contexts
+                .get(&ctx_id)
+                .unwrap()
+                .value()
+                .sender_key_store
+                .get(&ctx_id_hex, bob_did)
+                .is_some()
         );
     }
 
@@ -5249,15 +4154,7 @@ mod tests {
 
         // After destroy, export should return empty (context removed).
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
             .unwrap();
         assert!(
             exported.is_empty(),
@@ -5281,15 +4178,7 @@ mod tests {
         provider.create_mls_group(&ctx_id).unwrap();
 
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
             .unwrap();
 
         // Restore into a fresh provider twice — second should overwrite cleanly.
@@ -5319,15 +4208,7 @@ mod tests {
         };
 
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
             .unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
@@ -5368,15 +4249,7 @@ mod tests {
 
         // Export the crypto state.
         let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                provider.export_sender_key_epochs(&ctx_id),
-                provider
-                    .export_recv_sequence_floors(&ctx_id)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
             .unwrap();
         assert!(!exported.is_empty());
 
@@ -5470,153 +4343,10 @@ mod tests {
         crate::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap()
     }
 
-    /// Force Alice's local `sender_key_epoch` to a specific value so the
-    /// next `seal()` emits a sender-layer header with that epoch in the
-    /// clear, bypassing any sender-side bound. Bob's `open()` is what
-    /// the test exercises.
-    fn force_alice_sender_key_epoch(alice: &MlsCryptoProvider, context_id: &[u8; 32], epoch: u64) {
-        let mut entry = alice.contexts.get_mut(context_id).unwrap();
-        let state = entry.value_mut();
-        state.sender_key_epoch = epoch;
-    }
-
     fn ctx_routing_id(context_id: &[u8; 32]) -> Vec<u8> {
         // Any 32-byte routing id satisfies `create_outer_envelope`'s
         // length check; the open() path does not validate routing_id.
         context_id.to_vec()
-    }
-
-    #[test]
-    fn test_recv_epoch_ceiling_rejects_far_future() {
-        // H9: A crafted sender-layer header with `epoch = u64::MAX` must
-        // be rejected before it pollutes `recv_sequence_tracker` and
-        // permanently locks Bob out of subsequent legitimate messages
-        // from Alice. Bob's stored high-water for Alice is 1 (set by
-        // the legitimate distribution in `setup_alice_bob_two_party`),
-        // so the ceiling is `1 + MAX_EPOCH_ADVANCE = 1001`.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
-
-        force_alice_sender_key_epoch(&alice, &ctx_id, u64::MAX);
-
-        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let routing_id = ctx_routing_id(&ctx_id);
-        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
-
-        let err = bob
-            .open(&ctx_id, TEST_CTX_STR, &sealed)
-            .expect_err("u64::MAX epoch must be rejected by the H9 ceiling");
-        match err {
-            ContextError::CryptoFailed(msg) => {
-                assert!(
-                    msg.contains("exceeds ceiling"),
-                    "expected ceiling-rejection error, got: {msg}"
-                );
-            }
-            other => panic!("expected CryptoFailed, got {other:?}"),
-        }
-
-        // Bob's recv_sequence_tracker for Alice MUST NOT have been
-        // updated by the rejected message. Without this guarantee the
-        // attack still succeeds — the next legitimate message from
-        // Alice would be rejected as a "replay or reorder".
-        {
-            let entry = bob.contexts.get(&ctx_id).unwrap();
-            let state = entry.value();
-            assert!(
-                !state.recv_sequence_tracker.contains_key(&alice_did),
-                "rejected H9 message must not pollute recv_sequence_tracker"
-            );
-        }
-    }
-
-    #[test]
-    fn test_recv_epoch_ceiling_rejects_unreasonable_advance() {
-        // H9 boundary: stored high-water = 1, MAX_EPOCH_ADVANCE = 1000,
-        // so ceiling = 1001. An advance of 1001 (epoch = 1002) is one
-        // past the boundary and must be rejected.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
-
-        force_alice_sender_key_epoch(&alice, &ctx_id, 1002);
-
-        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let routing_id = ctx_routing_id(&ctx_id);
-        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
-
-        let err = bob
-            .open(&ctx_id, TEST_CTX_STR, &sealed)
-            .expect_err("epoch one past the ceiling must be rejected");
-        match err {
-            ContextError::CryptoFailed(msg) => {
-                assert!(
-                    msg.contains("exceeds ceiling"),
-                    "expected ceiling-rejection error, got: {msg}"
-                );
-            }
-            other => panic!("expected CryptoFailed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_recv_epoch_ceiling_allows_gap_fill() {
-        // H9 boundary: an advance of exactly MAX_EPOCH_ADVANCE must be
-        // accepted. Stored high-water = 1, ceiling = 1001, so an
-        // incoming epoch of 1001 sits exactly on the boundary.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
-
-        force_alice_sender_key_epoch(&alice, &ctx_id, 1001);
-
-        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let routing_id = ctx_routing_id(&ctx_id);
-        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
-
-        let result = bob
-            .open(&ctx_id, TEST_CTX_STR, &sealed)
-            .expect("epoch == ceiling must be accepted (boundary inclusive)");
-        match result {
-            scp_protocol::context::builder::OpenResult::Application(env) => {
-                assert_eq!(env.sender_did, alice_did);
-            }
-            other => panic!("expected Application, got {other:?}"),
-        }
-
-        // The receive tracker must have been updated with the boundary
-        // epoch so subsequent same-epoch messages don't replay.
-        let entry = bob.contexts.get(&ctx_id).unwrap();
-        let state = entry.value();
-        let entry = state.recv_sequence_tracker.get(&alice_did).copied();
-        assert_eq!(entry, Some((1001, 0)));
-    }
-
-    #[test]
-    fn test_recv_epoch_normal_path_unchanged() {
-        // Regression: the H9 ceiling must not break the happy path.
-        // A sequential epoch+sequence stream below the ceiling is
-        // accepted, and the receive tracker advances monotonically.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
-
-        let routing_id = ctx_routing_id(&ctx_id);
-        let inner1 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let inner2 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
-
-        // Two sequential seals at Alice's natural epoch=1, sequence
-        // increments handled by `seal()` itself.
-        let sealed1 = alice.seal(&ctx_id, &inner1, &routing_id, 300).unwrap();
-        let sealed2 = alice.seal(&ctx_id, &inner2, &routing_id, 300).unwrap();
-
-        bob.open(&ctx_id, TEST_CTX_STR, &sealed1)
-            .expect("first seal must open");
-        bob.open(&ctx_id, TEST_CTX_STR, &sealed2)
-            .expect("second seal must open");
-
-        let entry = bob.contexts.get(&ctx_id).unwrap();
-        let state = entry.value();
-        let (epoch, seq) = state
-            .recv_sequence_tracker
-            .get(&alice_did)
-            .copied()
-            .expect("tracker must be populated by happy-path opens");
-        assert_eq!(epoch, 1, "epoch should be Alice's natural epoch");
-        assert_eq!(seq, 1, "sequence should advance to the second message");
     }
 
     #[test]
@@ -5758,77 +4488,6 @@ mod tests {
                     msg, "inner envelope context_id does not resolve to the supplied context_id",
                     "expected the fail-fast resolve-consistency rejection, not a serialization, \
                      AEAD, or MLS-encrypt failure, got: {msg}"
-                );
-            }
-            other => panic!("expected CryptoFailed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_recv_epoch_reorder_still_rejected() {
-        // Regression: existing replay/reorder rejection must still
-        // fire even with the H9 ceiling in place. After a successful
-        // open at (epoch=1, seq=1), a replay of the same (epoch, seq)
-        // and a lower-sequence message must both be rejected.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
-
-        let routing_id = ctx_routing_id(&ctx_id);
-
-        // First, advance the receive tracker to (1, 1) via two
-        // legitimate messages.
-        let inner_a = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let inner_b = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
-        let sealed_a = alice.seal(&ctx_id, &inner_a, &routing_id, 300).unwrap();
-        let sealed_b = alice.seal(&ctx_id, &inner_b, &routing_id, 300).unwrap();
-        bob.open(&ctx_id, TEST_CTX_STR, &sealed_a).unwrap();
-        bob.open(&ctx_id, TEST_CTX_STR, &sealed_b).unwrap();
-
-        // Now force Alice's send_sequence backwards and re-seal. The
-        // resulting header has (epoch=1, sequence=0) which is below
-        // Bob's last-seen (epoch=1, sequence=1) — must be rejected by
-        // the existing replay guard, NOT silently accepted because
-        // the H9 ceiling check passed.
-        {
-            let mut entry = alice.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state.send_sequence = 0;
-        }
-        let inner_replay = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let sealed_replay = alice
-            .seal(&ctx_id, &inner_replay, &routing_id, 300)
-            .unwrap();
-        let err = bob.open(&ctx_id, TEST_CTX_STR, &sealed_replay).expect_err(
-            "lower-sequence message at the same epoch must still be rejected as replay",
-        );
-        match err {
-            ContextError::CryptoFailed(msg) => {
-                assert!(
-                    msg.contains("replay or reorder"),
-                    "expected replay/reorder rejection, got: {msg}"
-                );
-            }
-            other => panic!("expected CryptoFailed, got {other:?}"),
-        }
-
-        // Lower-epoch reorder: force Alice's epoch to 0 and re-seal.
-        // The header carries (epoch=0, sequence=...), which is below
-        // Bob's last-seen (epoch=1, ...) and must be rejected.
-        force_alice_sender_key_epoch(&alice, &ctx_id, 0);
-        {
-            let mut entry = alice.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state.send_sequence = 5;
-        }
-        let inner_lower = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let sealed_lower = alice.seal(&ctx_id, &inner_lower, &routing_id, 300).unwrap();
-        let err = bob
-            .open(&ctx_id, TEST_CTX_STR, &sealed_lower)
-            .expect_err("lower-epoch message must still be rejected as reorder");
-        match err {
-            ContextError::CryptoFailed(msg) => {
-                assert!(
-                    msg.contains("replay or reorder"),
-                    "expected replay/reorder rejection, got: {msg}"
                 );
             }
             other => panic!("expected CryptoFailed, got {other:?}"),

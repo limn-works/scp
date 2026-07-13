@@ -443,10 +443,19 @@ pub struct ContextCryptoState {
     pub member_wrapping_keys: HashMap<String, [u8; 32]>,
 
     /// Receive-side sequence tracking for MLS replay detection.
-    /// Maps `sender_did` -> (`last_epoch`, `last_sequence`). Mirror of
-    /// legacy field
-    /// `MlsCryptoProvider::ContextCryptoState::recv_sequence_tracker`
-    /// at `crates/scp-runtime/src/crypto/mls/provider.rs:229`.
+    /// Maps `sender_did` -> (`last_epoch`, `last_sequence`).
+    ///
+    /// # DOC-DRIFT / DORMANT (ADR-049 PR-6 read-authority switch)
+    ///
+    /// This field is a DORMANT PR-7 target and is NOT written or read by any
+    /// production path. The provider's former live `recv_sequence_tracker` mirror
+    /// has been DELETED and the AUTHORITATIVE receive-side `(epoch, sequence)`
+    /// anti-replay floor now lives in the Supervisor-owned Class-M registry
+    /// (`context/supervisor/floors.rs`), gated fail-closed at the
+    /// `decrypt_and_dispatch` seam. PR-7 (key-move / `take_crypto_state`) MUST NOT
+    /// rebuild a recv anti-replay mirror on this field — doing so would
+    /// reintroduce the split-brain / lagging-mirror class this switch closed. If
+    /// PR-7 needs the recv floor, it must read the registry, not this field.
     ///
     /// # Why this lives on `ContextCryptoState` (not `PerContextState`)
     ///

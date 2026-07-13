@@ -38,7 +38,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use scp_did::{DID, SigningKeyId};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_platform::{KeyCustody, KeyHandle, KeyType};
-use scp_protocol::context::builder::{OpenResult, ReceiveFloor};
+use scp_protocol::context::builder::OpenResult;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling};
 use scp_protocol::context::{
@@ -641,15 +641,7 @@ async fn spawn_from_welcome_yields_a_live_send_capable_actor() {
     // non-emptiness is the presence discriminator.
     assert!(
         !j.bob_crypto
-            .export_crypto_state(
-                &j.ctx_bytes,
-                j.bob_crypto.export_sender_key_epochs(&j.ctx_bytes),
-                j.bob_crypto
-                    .export_recv_sequence_floors(&j.ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "the joined MLS group is installed in the provider"
@@ -833,15 +825,7 @@ async fn persist_failure_leaves_no_half_keyed_actor() {
     // non-empty — see the happy-path test.)
     assert!(
         j.bob_crypto
-            .export_crypto_state(
-                &j.ctx_bytes,
-                j.bob_crypto.export_sender_key_epochs(&j.ctx_bytes),
-                j.bob_crypto
-                    .export_recv_sequence_floors(&j.ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "the just-installed group must be torn back out on a persist failure"
@@ -957,15 +941,7 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     );
     assert!(
         !bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "the first join's installed group is intact"
@@ -1058,15 +1034,7 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
     );
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no group may be installed after a pseudonym rejection"
@@ -1138,15 +1106,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
     );
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &collide_bytes,
-                bob_crypto.export_sender_key_epochs(&collide_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&collide_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&collide_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "the broadcast context's ENCRYPTED crypto slot is vacant (split registry) \
@@ -1322,15 +1282,7 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
     // has cleared, so this export reads normally → empty for the now-absent group.
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors once the one-shot seam has cleared")
             .is_empty(),
         "the installed group must be rolled back on a non-durable export"
@@ -1515,15 +1467,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     );
     assert!(
         target_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                target_crypto.export_sender_key_epochs(&ctx_bytes),
-                target_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no group may be installed after a durable-collision reject"
@@ -1653,15 +1597,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     // `destroy_mls_group` / `delete_context` no-op.)
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no MLS group may be installed after a timed-out join"
@@ -1908,15 +1844,7 @@ async fn assert_binding_refused_no_side_effects(
     // context exports an EMPTY blob; an installed one is non-empty).
     assert!(
         j.bob_crypto
-            .export_crypto_state(
-                &j.ctx_bytes,
-                j.bob_crypto.export_sender_key_epochs(&j.ctx_bytes),
-                j.bob_crypto
-                    .export_recv_sequence_floors(&j.ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no MLS group may be installed after a binding refusal"
@@ -2058,15 +1986,7 @@ async fn join_group_without_scp_context_extension_is_refused() {
     );
     assert!(
         j.bob_crypto
-            .export_crypto_state(
-                &j.ctx_bytes,
-                j.bob_crypto.export_sender_key_epochs(&j.ctx_bytes),
-                j.bob_crypto
-                    .export_recv_sequence_floors(&j.ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no MLS group may be installed after a rule-1 refusal"
@@ -2145,15 +2065,7 @@ async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
     // Reject fired before any state build — nothing installed, no actor.
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no group may be installed after a signature refusal"
@@ -2228,15 +2140,7 @@ async fn tampered_ciphertext_fails_aead_open() {
     );
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no group may be installed after an open failure"
@@ -2293,15 +2197,7 @@ async fn tampered_bundle_signature_is_rejected() {
     );
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no group may be installed after a signature refusal"
@@ -2382,15 +2278,7 @@ async fn structurally_inconsistent_bundle_is_rejected() {
     );
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no group may be installed after a structural refusal"
@@ -2497,15 +2385,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
     );
     assert!(
         !bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "bob's joined MLS group is installed"
@@ -3025,15 +2905,7 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     );
     assert!(
         bob_crypto
-            .export_crypto_state(
-                &ctx_bytes,
-                bob_crypto.export_sender_key_epochs(&ctx_bytes),
-                bob_crypto
-                    .export_recv_sequence_floors(&ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "no MLS group may be installed after a creator-binding rejection"
@@ -3075,15 +2947,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     );
     assert!(
         !j.bob_crypto
-            .export_crypto_state(
-                &j.ctx_bytes,
-                j.bob_crypto.export_sender_key_epochs(&j.ctx_bytes),
-                j.bob_crypto
-                    .export_recv_sequence_floors(&j.ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "the joined MLS group is resident in the crypto provider"
@@ -3097,7 +2961,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     );
 
     // Populate the supervisor-owned Class-M floor registry with a real
-    // per-sender follower floor for this ctx (as the mirror-forward would on
+    // per-sender registry floor for this ctx (as the mirror-forward would on
     // live traffic) so the teardown has non-empty state to prune (ADR-049
     // PR-4). `max_advance = u64::MAX` keeps the single +1 advance well within
     // the overshoot ceiling without importing the const.
@@ -3106,7 +2970,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
         .expect("first sender-epoch advance is accepted");
     assert!(
         j.sup.floors.contains_key(&j.ctx_bytes),
-        "a follower floor entry exists for the joined context before teardown"
+        "a registry floor entry exists for the joined context before teardown"
     );
 
     // --- COMPLETE teardown (the FFI compensating path). ---
@@ -3131,15 +2995,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     //    resident (`export_crypto_state` returns EMPTY for an absent context).
     assert!(
         j.bob_crypto
-            .export_crypto_state(
-                &j.ctx_bytes,
-                j.bob_crypto.export_sender_key_epochs(&j.ctx_bytes),
-                j.bob_crypto
-                    .export_recv_sequence_floors(&j.ctx_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
             .expect("export never errors")
             .is_empty(),
         "the resident MLS group is destroyed"
@@ -3162,13 +3018,13 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
 
     // 4. Supervisor-owned Class-M floor registry entry pruned (ADR-049 PR-4) —
     //    mirrors the provider's per-context floor-map prune inside
-    //    `destroy_mls_group`. Without this the follower registry would leak a
+    //    `destroy_mls_group`. Without this the authoritative registry would leak a
     //    `ContextFloors` entry (and its per-sender maps) for every torn-down
     //    context. Safe on permanent teardown: a re-created deterministic id is a
     //    NEW MLS group with fresh keys, so the discarded floors are moot.
     assert!(
         !j.sup.floors.contains_key(&j.ctx_bytes),
-        "the follower floor entry is pruned on permanent teardown — no leak"
+        "the registry floor entry is pruned on permanent teardown — no leak"
     );
 }
 
@@ -3467,9 +3323,14 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
     )
     .await
     .expect("alice opens bob's HPKE-sealed sender key with her ephemeral secret");
-    j.alice_crypto
+    // ADR-049 PR-6: store returns the authenticated (key, epoch); install is a
+    // separate explicit set_sender_key_unchecked (mirrors production seam 2).
+    let (bob_key, _epoch) = j
+        .alice_crypto
         .store_member_sender_key(&j.ctx_bytes, BOB_DID, bob_key, response.epoch)
-        .expect("alice stores bob's pulled sender key");
+        .expect("alice verifies + returns bob's pulled sender key");
+    j.alice_crypto
+        .set_sender_key_unchecked(&j.ctx_bytes, BOB_DID, bob_key);
 
     // Bob seals a REAL application message through the full send pipeline.
     let payload = b"application-data-from-the-welcome-joiner-\xc2\xa79b";

@@ -1131,6 +1131,113 @@ fn import_context_is_actor_native_not_dashmap_dual_write() {
     // variant were unhandled), so no string assertion is needed for those.
 }
 
+// ADR-049 PR-6 (read-authority switch) — the Supervisor-owned Class-M floor
+// registry is the AUTHORITATIVE home for the Class-M sender-key epoch +
+// recv-sequence anti-replay floors; the provider mirrors are deleted. These
+// additive structural assertions pin the fail-closed wiring so a regression
+// cannot silently reintroduce a log-and-drop seam (fail-OPEN) or re-source the
+// durable floors from the deleted provider twins.
+#[test]
+fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
+    // G1 — the receive seam GATES fail-closed on the registry, never
+    // log-and-drops. `decrypt_and_dispatch` must call the registry recv gate and
+    // install remote keys via the unchecked wrapper (gate-before-install), with
+    // no "non-fatal" mirror-forward drop.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "decrypt_and_dispatch",
+            "check_and_advance_recv_sequence"
+        ),
+        "decrypt_and_dispatch must gate the recv floor on the authoritative registry"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "decrypt_and_dispatch",
+            "set_sender_key_unchecked"
+        ),
+        "the remote-epoch seam must install via set_sender_key_unchecked AFTER gating"
+    );
+    // P1 (white-hat): the remote-epoch seam-2 D1 gate — the registry epoch gate
+    // — must be present AND must precede the key install (gate-BEFORE-install =
+    // fail-safe: a rejected epoch never reaches the sender-key store).
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "decrypt_and_dispatch",
+            "check_and_advance_sender_epoch"
+        ),
+        "decrypt_and_dispatch must gate the remote sender epoch on the registry"
+    );
+    {
+        let body = extract_fn_body(MANAGER_SRC, "decrypt_and_dispatch")
+            .expect("decrypt_and_dispatch body must be extractable");
+        let gate = body
+            .find("check_and_advance_sender_epoch")
+            .expect("seam-2 gate present");
+        let install = body
+            .find("set_sender_key_unchecked")
+            .expect("seam-2 install present");
+        assert!(
+            gate < install,
+            "the seam-2 registry epoch gate must PRECEDE set_sender_key_unchecked (gate-before-install)"
+        );
+    }
+    assert!(
+        !fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "non-fatal in PR-4"),
+        "decrypt_and_dispatch must NOT log-and-drop the floor advance (fail-open)"
+    );
+    // The local-rotation mirror-forward gates fail-closed (returns Result, `?`'d
+    // by callers); its body calls the registry gate and does not log-and-drop.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "mirror_forward_local_sender_epoch",
+            "check_and_advance_sender_epoch"
+        ),
+        "mirror_forward_local_sender_epoch must gate the local epoch on the registry"
+    );
+    assert!(
+        !fn_body_contains(
+            MANAGER_SRC,
+            "mirror_forward_local_sender_epoch",
+            "non-fatal"
+        ),
+        "mirror_forward_local_sender_epoch must be fail-closed, not log-and-drop"
+    );
+
+    // G2 — every production `export_crypto_state` caller sources the durable
+    // floors from the authoritative registry (`deps.supervisor.export_*`). The
+    // NEGATIVE (no `deps.crypto.export_*`) is compiler-enforced — the provider
+    // twins are DELETED, so such a call would not compile — so only the POSITIVE
+    // required clause is asserted here (simplifier E: no redundant weaker
+    // re-check of a type-system guarantee).
+    assert!(
+        MANAGER_SRC.contains("deps.supervisor.export_sender_key_epochs")
+            && MANAGER_SRC.contains("deps.supervisor.export_recv_sequence_floors"),
+        "export callers must source floors from the authoritative registry"
+    );
+
+    // restore-into-registry — the restore/import floor guard merges the snapshot
+    // floors INTO the registry sink under ONE cross-axis validating merge
+    // (`deps.supervisor.validate_and_merge_all_floors`). The NEGATIVE (no
+    // `deps.crypto.validate_and_merge`) is compiler-enforced (provider twins
+    // deleted), so only the POSITIVE is asserted.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "restore_crypto_state_with_floor_guard",
+            "validate_and_merge_all_floors"
+        ) && fn_body_contains(
+            MANAGER_SRC,
+            "restore_crypto_state_with_floor_guard",
+            "deps.supervisor"
+        ),
+        "the restore guard must merge blob floors INTO the registry sink"
+    );
+}
+
 // Timer level (ADR-049 Decision-1 / finding A3 — APPROVED enforcement
 // retarget): the TTL + governance timers are ACTOR-OWNED arms reconciled
 // from owned state inside the actor's own `run()` loop, NOT

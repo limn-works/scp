@@ -75,7 +75,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use scp_did::DID;
-use scp_protocol::context::builder::{ContextCreationError, ReceiveFloor};
+use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::GovernanceModelConfig;
 use scp_protocol::context::governance::mls_integration::EpochCoordinator;
 use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
@@ -286,6 +286,10 @@ pub async fn leave_context(
                          sender key layer may retain stale key"
                     );
                 }
+                // ADR-049 PR-6: prune the departed member's Class-M registry
+                // floors (member-granular; siblings + local scalar retained).
+                deps.supervisor
+                    .remove_member_floors(&context_id_bytes, member_did);
                 Some(remove_output.commit_bytes)
             };
 
@@ -403,11 +407,12 @@ pub async fn leave_context(
                  remaining members retain old sender key"
             );
         } else {
-            // ADR-049 PR-4: track the rotated local epoch in the floor registry.
+            // ADR-049 PR-6: advance the rotated local epoch in the authoritative
+            // floor registry (fail-closed).
             crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
                 deps,
                 &context_id_bytes,
-            );
+            )?;
         }
         if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes).await {
             tracing::warn!(
@@ -962,6 +967,10 @@ pub async fn join_context(
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
+        // ADR-049 PR-6: prune the departed member's Class-M registry floors
+        // (member-granular; siblings + the local scalar retained).
+        deps.supervisor
+            .remove_member_floors(&context_id_bytes, &member_did);
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before the existing escrow-void + ticket rollback.
         let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
@@ -989,6 +998,10 @@ pub async fn join_context(
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
+        // ADR-049 PR-6: prune the departed member's Class-M registry floors
+        // (member-granular; siblings + the local scalar retained).
+        deps.supervisor
+            .remove_member_floors(&context_id_bytes, &member_did);
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before the existing escrow-void + ticket rollback.
         let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
@@ -1020,6 +1033,10 @@ pub async fn join_context(
         let _ = deps
             .crypto
             .remove_member_sender_key(&context_id_bytes, &member_did);
+        // ADR-049 PR-6: prune the departed member's Class-M registry floors
+        // (member-granular; siblings + the local scalar retained).
+        deps.supervisor
+            .remove_member_floors(&context_id_bytes, &member_did);
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before the existing escrow-void + ticket rollback.
         let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
@@ -1715,15 +1732,21 @@ fn generate_initial_access_key_store(
 // ---------------------------------------------------------------------------
 
 /// §23.17 Invariant 3/4 — the SINGLE floor-guarded crypto-restore path for
-/// import. Captures per-sender epoch floors AND receive-side sequence floors
-/// (§23.17.3) BEFORE teardown, tears down the old crypto, restores the incoming
-/// `mls_state` (if any), then validates that neither per-sender floor regresses
-/// and merges the local floors back (max-merge).
-/// Rolls the restored crypto back on a regression so no half-restored or
-/// floor-regressed state persists. EVERY import crypto-restore site — the
-/// actor-side `PrepareForReplace` handler AND the supervisor-side fresh /
-/// stale-handle branches of `import_context` — routes through here so the
-/// replay (floor-regression) guard cannot be bypassed by any path.
+/// import / respawn / restore. Tears down the old transient crypto, restores the
+/// incoming `mls_state` (if any) — recovering the Class-M floors it carried —
+/// then merges those floors INTO the authoritative Supervisor-owned Class-M
+/// registry (ADR-049 PR-6). Rolls the restored crypto back on a rejected merge
+/// so no half-restored or floor-regressed state persists. EVERY import
+/// crypto-restore site — the actor-side `PrepareForReplace` handler AND the
+/// supervisor-side fresh / stale-handle branches of `import_context` — routes
+/// through here so the replay (floor-regression) guard cannot be bypassed.
+///
+/// The registry is the authoritative live floor home and is NOT torn down here,
+/// so there is no pre-teardown "capture" step: the snapshot floors are the merge
+/// INPUT (`incoming`) and the live registry floors are the merge target. The
+/// registry merge guards on `incoming.is_empty()` (NOT the live floors), so a
+/// COLD restart (empty live registry, non-empty snapshot) still POPULATES the
+/// registry — closing the cold-restart replay window (D2).
 ///
 /// # Errors
 ///
@@ -1732,129 +1755,87 @@ fn generate_initial_access_key_store(
 /// - `true` — restoring the node's OWN snapshot (Invariant 2): crash recovery,
 ///   actor respawn (`Supervisor::respawn_from_snapshot`), process restart
 ///   (`restore_all_contexts`). A lower restored floor is the expected
-///   coalesce-lag case and is MAX-merged with the live floor; the restore
-///   PROCEEDS (never rejected for a regression). Only an overshoot beyond
-///   `MAX_EPOCH_ADVANCE` (corrupt/garbage snapshot) is rejected.
+///   coalesce-lag case and is MAX-merged with the live registry floor; the
+///   restore PROCEEDS (never rejected for a regression). Only an overshoot
+///   beyond `MAX_EPOCH_ADVANCE` (corrupt/garbage snapshot) is rejected.
 /// - `false` — importing an UNTRUSTED peer snapshot (Invariant 3): any
 ///   per-sender floor regression is rejected (snapshot-mediated replay guard).
 ///
-/// Returns `ContextError::PersistenceFailed` if `restore_crypto_state` fails,
-/// or `ContextError::SnapshotFloorRegression` (the §23.17 replay-protection
-/// rejection — whatever `validate_and_merge_epoch_floors` returns) if a
-/// per-sender floor regresses (import path) or overshoots (both paths); the
-/// restored crypto is rolled back first.
+/// Returns `ContextError::PersistenceFailed` if `restore_crypto_state` fails, or
+/// `ContextError::CryptoFailed` (from `From<FloorAdvanceError>`, the §23.17
+/// replay-protection rejection the registry's `validate_and_merge_*` sink
+/// returns) if a per-sender floor regresses (import path) or overshoots (both
+/// paths); the restored crypto is rolled back first and the registry is left
+/// unchanged (atomic).
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
     ctx_id_bytes: &[u8; 32],
     mls_state: &[u8],
     trusted_local: bool,
 ) -> Result<(), ContextError> {
-    // §23.17 Inv 2/3: capture the LIVE floors BEFORE destroying crypto state.
-    // A mailbox/handle despawn does NOT tear down the supervisor-owned crypto
-    // provider, so these live pre-crash floors are still authoritative and are
-    // the max-merge input (Class M, ADR-049 §9).
-    let local_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
-    // §23.17.3 receive-side twin: capture the LIVE per-sender recv-sequence
-    // floors (the intra-epoch anti-replay high-water) BEFORE teardown, for the
-    // same reason as the epoch floors — a warm respawn would otherwise reload
-    // them VERBATIM from the ≤50ms-stale coalesced snapshot and roll an
-    // intra-epoch replay floor backward (ADR-049 §9 Class M).
-    let local_recv_floors = deps.crypto.export_recv_sequence_floors(ctx_id_bytes);
-
+    // ADR-049 PR-6 (read-authority switch): the AUTHORITATIVE Class-M floors
+    // live in the Supervisor-owned registry, which is NOT torn down by a
+    // mailbox/handle despawn or a crypto restore. So there is no pre-teardown
+    // "live capture" to take — the live floors are ALREADY in the registry and
+    // are the max-merge target. The transient crypto (MLS group + sender key)
+    // IS torn down and rebuilt below; the registry is untouched by that.
     let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
     let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
 
-    if !mls_state.is_empty() {
+    // Restore the transient crypto (installs MLS group + sender-key MATERIAL)
+    // and recover the Class-M floors the snapshot carried — including the legacy
+    // back-compat lower bound — as the merge INPUT (`incoming`). An empty
+    // `mls_state` yields empty floors (cold path / no snapshot).
+    let restored = if mls_state.is_empty() {
+        crate::crypto::mls::provider::RestoredFloors::default()
+    } else {
         deps.crypto
             .restore_crypto_state(ctx_id_bytes, mls_state)
             .map_err(|e| {
                 ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
-            })?;
-    }
+            })?
+    };
 
-    // §23.17 Inv 2/3/4: merge the live floors back. `trusted_local=true` max-
-    // merges and proceeds (Inv 2 — respawn of own snapshot); `false` rejects
-    // any regression (Inv 3 — untrusted peer import). Either way the merged
-    // floor is never below the live floor (Inv 4). Roll back on failure.
-    if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
-        ctx_id_bytes,
-        local_epoch_floors,
-        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-        trusted_local,
-    ) {
-        let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
-        let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
-        return Err(e);
-    }
-
-    // §23.17.3 Inv 2/3/4 (receive-side twin): merge the live recv-sequence
-    // floors back with the SAME rollback-on-Err discipline. `trusted_local=true`
-    // max-merges and proceeds (Inv 2 — respawn of own snapshot); `false` rejects
-    // any regression (Inv 3 — untrusted peer import). The applied floor is never
-    // below the live floor (Inv 4). Roll back on failure so no floor-regressed
-    // state persists.
-    if let Err(e) = deps.crypto.validate_and_merge_recv_sequence_floors(
-        ctx_id_bytes,
-        local_recv_floors,
-        trusted_local,
-    ) {
-        let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
-        let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
-        return Err(e);
-    }
-
-    // ADR-049 PR-4: additive FOLLOWER seed. The AUTHORITATIVE provider floors
-    // above are restored + merged and STAY authoritative (the `deps.crypto`
-    // export/merge calls are deliberately NOT rewired to `deps.supervisor`).
-    // Here we ADDITIONALLY mirror the post-merge provider floors into the
-    // supervisor-owned registry so the follower tracks the provider across a
-    // restore / import / respawn. Insert-if-absent-then-max (the registry merge
-    // never regresses). NON-FATAL: the provider remains authoritative in PR-4,
-    // so a follower seed failure is logged and dropped (PR-6 makes it
-    // fail-closed once the registry becomes authoritative).
     // Map the restore's `trusted_local` bool to the registry merge's §23.17.2
-    // `MergePolicy` (identical to the provider twin's mapping): a trusted-local
-    // respawn max-merges and tolerates the coalesce-lag regression (Inv-2); an
-    // untrusted import rejects any regression (Inv-3).
-    let follower_seed_policy = if trusted_local {
+    // `MergePolicy` (identical mapping to the deleted provider twin): a
+    // trusted-local respawn max-merges and tolerates the coalesce-lag regression
+    // (Inv-2); an untrusted import rejects any regression (Inv-3). BOTH enforce
+    // the epoch-poisoning overshoot ceiling.
+    let policy = if trusted_local {
         scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal
     } else {
         scp_protocol::crypto::sender_keys::MergePolicy::RejectRegression
     };
-    let seeded_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
-    if let Err(e) = deps.supervisor.validate_and_merge_epoch_floors(
-        ctx_id_bytes,
-        seeded_epoch_floors,
-        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-        follower_seed_policy,
-    ) {
-        tracing::debug!(
-            error = %e,
-            "floor-registry follower epoch seed failed on restore (non-fatal in PR-4; provider authoritative)"
-        );
-    }
-    // The provider export still yields `(u64, u64)` tuples (its
-    // `recv_sequence_tracker` mirror is untouched until the atomic read-authority
-    // switch); adapt each to the supervisor registry's `ReceiveFloor` newtype at
-    // this seam with an explicit NAMED-field bind (never a tuple `.into()`, which
-    // would reintroduce the epoch/sequence transposition hazard the newtype
-    // retires). Same values, so the follower seed is byte-for-byte unchanged.
-    let seeded_recv_floors: Vec<(String, ReceiveFloor)> = deps
-        .crypto
-        .export_recv_sequence_floors(ctx_id_bytes)
-        .into_iter()
-        .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-        .collect();
-    if let Err(e) = deps.supervisor.validate_and_merge_recv_sequence_floors(
-        ctx_id_bytes,
-        seeded_recv_floors,
-        follower_seed_policy,
-    ) {
-        tracing::debug!(
-            error = %e,
-            "floor-registry follower recv seed failed on restore (non-fatal in PR-4; provider authoritative)"
-        );
-    }
+
+    // THE D2 sink: merge the snapshot floors (`incoming`) INTO the authoritative
+    // registry (`local` = the live, non-torn-down registry). ONE cross-axis
+    // validating merge — BOTH the epoch AND the recv-sequence floors are validated
+    // before EITHER is applied, so a rejection on either axis leaves the WHOLE
+    // registry entry UNCHANGED (cross-axis atomicity; a prior sequential
+    // two-merge form could commit the epoch axis then reject the recv axis with no
+    // rollback). The merge guards on `incoming.is_empty()` — NOT on the live
+    // floors — so on a COLD restart (empty live registry, NON-empty snapshot) it
+    // RUNS and POPULATES the registry, closing D2. FAIL-CLOSED via `.map_err(..)?`
+    // (rollback-on-Err), NOT log-and-drop. `From<FloorAdvanceError>` maps a
+    // rejection to `ContextError::CryptoFailed`.
+    //
+    // Rollback: on rejection the just-restored transient crypto is destroyed so
+    // no floor-regressed / half-restored state persists (BUG-1 atomicity). The
+    // registry itself is left UNCHANGED (validate-before-apply, across both axes).
+    deps.supervisor
+        .validate_and_merge_all_floors(
+            ctx_id_bytes,
+            restored.sender_epochs,
+            restored.recv_sequence,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+            policy,
+        )
+        .map_err(|e| {
+            let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
+            let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
+            ContextError::from(e)
+        })?;
+
     Ok(())
 }
 
@@ -2824,10 +2805,11 @@ pub async fn restore_context(
         // floors by up to one coalesce interval (ADR-049 §9). Restoring such a
         // snapshot with a bare `restore_crypto_state` would silently lower a
         // per-sender replay floor — re-opening a replay window for any sender
-        // whose epoch advanced after the snapshot was written. The guard
-        // captures the LIVE floors (still held by the crypto provider, which a
-        // mailbox despawn does not tear down) before teardown, restores the
-        // snapshot crypto, then MAX-merges the live floors back. This is the
+        // whose epoch advanced after the snapshot was written. The guard leaves
+        // the AUTHORITATIVE Class-M registry (which a mailbox despawn does not
+        // tear down) untouched as the live merge target, restores the snapshot
+        // crypto, then MAX-merges the SNAPSHOT floors back into that registry.
+        // This is the
         // node restoring its OWN snapshot (Invariant 2, `trusted_local = true`):
         // a coalesce-lagged snapshot whose floor trails the live floor is the
         // NORMAL case (an epoch advanced in the ≤50ms pre-crash window), so the
@@ -3396,12 +3378,12 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // lookup still reports the poison until an operator clears it or the
         // process restarts.
         supervisor.reap_crash_window(ctx_id);
-        // Drop the supervisor-owned Class-M floor registry entry on the same
-        // teardown sweep (ADR-049 PR-4) — the floor-registry twin of the
-        // crash-window reap above. Harmless-but-tidy here (the whole Supervisor
-        // is about to be dropped), but it keeps the follower floors' lifecycle
-        // aligned 1:1 with crash_windows and leaves no per-context registry
-        // entry behind after a shutdown sweep.
+        // Drop the authoritative Class-M floor registry entry on the same
+        // teardown sweep (ADR-049) — the floor-registry twin of the crash-window
+        // reap above. Harmless-but-tidy here (the whole Supervisor is about to be
+        // dropped), but it keeps the registry floors' lifecycle aligned 1:1 with
+        // crash_windows and leaves no per-context registry entry behind after a
+        // shutdown sweep.
         let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx_id);
         supervisor.remove_context_floors(&ctx_id_bytes);
     }
