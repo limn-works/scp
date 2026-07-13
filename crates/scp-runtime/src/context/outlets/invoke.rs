@@ -15,6 +15,8 @@ use std::future::Future;
 use std::hash::BuildHasher;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use crate::context::ContextHandle;
 use scp_did::DID;
 use scp_protocol::context::ContextState;
@@ -24,7 +26,9 @@ use scp_protocol::context::outlets::lifecycle::{
 };
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::outlets::schema::validate_value_against_schema;
-use scp_protocol::context::outlets::stream::StreamTerminalStatus;
+use scp_protocol::context::outlets::stream::{
+    ChunkPayload, OutletStreamChunk, RequestId, StreamTerminalStatus,
+};
 use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
@@ -1245,6 +1249,1152 @@ where
     };
     let required_cap = CapabilityUri::new(context_id, resource, outlet_name);
     validate_ucan(&parsed, &required_cap, ctx)
+}
+
+// ===========================================================================
+// Streaming-native executor + settlement seams (ADR-049 §5 / spec §5.4.5).
+// Ported from the outlet-redesign reference invoke.rs. Prerequisite for the
+// dispatch pump (dispatch.rs). See ADR-061 + §6.2.5.
+//
+// NOTE: the reference's InMemory* sink impls are intentionally omitted —
+// they back their Vec with std::sync::Mutex, banned in scp-runtime by
+// ADR-049 §Decision 12 (crates/scp-runtime/clippy.toml). They are neither a
+// listed seam nor a transitive dependency of the pump; callers wire their own.
+// ===========================================================================
+
+/// Error returned by [`OutletExecutor`] methods.
+///
+/// Distinct from [`InvocationError`] because executor-level failures are an
+/// inner detail of the outlet implementation, not a protocol-level failure
+/// of the invocation pipeline. The [`OutletExecutor`] adapter
+/// ([`invoke_outlet_dispatch`]) maps these into the protocol-level
+/// taxonomy:
+///
+/// | Variant                 | Maps to                                         |
+/// |-------------------------|-------------------------------------------------|
+/// | [`KindMismatch`]        | [`InvocationError::KindMismatch`]               |
+/// | [`QueryViolation`]      | [`InvocationError::QueryViolation`]             |
+/// | [`Failed`]              | [`InvocationError::ExecutionFailed`]            |
+///
+/// [`KindMismatch`]: OutletExecutorError::KindMismatch
+/// [`QueryViolation`]: OutletExecutorError::QueryViolation
+/// [`Failed`]: OutletExecutorError::Failed
+#[derive(Debug, thiserror::Error)]
+pub enum OutletExecutorError {
+    /// Returned by the default [`OutletExecutor::exec_query`] /
+    /// [`OutletExecutor::exec_action`] implementation when an executor was
+    /// dispatched against the wrong half — i.e., a Query-registered outlet
+    /// whose implementor only overrode `exec_action` (or vice versa). This
+    /// is the structural misdeclaration signal: the runtime cannot dispatch
+    /// to a half the implementor did not provide.
+    #[error("outlet executor kind mismatch (expected {expected:?})")]
+    KindMismatch {
+        /// The kind for which the implementor failed to provide an executor
+        /// half. For Query, the misdeclaration signal in spec §5.4.2 fires.
+        expected: scp_protocol::context::outlets::OutletKind,
+    },
+    /// Returned by [`MutableInvocation`] write methods when the underlying
+    /// registered outlet is `OutletKind::Query` (defense-in-depth runtime
+    /// check against type-system bypass). Spec §5.4.2 `QueryViolation`.
+    #[error("Query outlet attempted write \"{operation}\" through MutableInvocation (§5.4.2)")]
+    QueryViolation {
+        /// The denied operation (e.g., `"send_message"`).
+        operation: &'static str,
+    },
+    /// Application-level executor failure. Equivalent to the `String` returned
+    /// by closure-based callers; preserved verbatim for compatibility.
+    #[error("outlet executor failed: {0}")]
+    Failed(String),
+}
+
+/// Pending mutation queued on a [`MutableInvocation`].
+///
+/// Action outlets describe their writes by enqueuing typed [`MutationIntent`]
+/// records on the handle. The runtime drains the intents after the executor
+/// returns successfully and applies them through the existing per-context
+/// mutation pipeline (governance, role assignment, registry updates,
+/// economic ledgers, caveat counter store, event log append). For
+/// [`OutletKind::Query`] outlets the intents are unreachable — write methods
+/// only exist on [`MutableInvocation`] which is only constructed for
+/// `OutletKind::Action` (type-system enforcement of the deny-list).
+///
+/// The runtime check on every [`MutableInvocation`] write method is
+/// defense-in-depth: a `MutableInvocation` whose `kind == Query` (constructed
+/// directly in tests, or surfaced through a future API misuse) refuses every
+/// mutation and emits the `QueryMisdeclaration` signal per §5.4.2.
+///
+/// [`OutletKind::Query`]: scp_protocol::context::outlets::OutletKind::Query
+#[derive(Debug, Clone)]
+pub enum MutationIntent {
+    /// Send an MLS application message into the context (deny-list:
+    /// "messages"). The runtime hands the payload to
+    /// `ContextManager::send_message` after `exec_action` returns.
+    SendMessage {
+        /// Opaque application payload.
+        payload: serde_json::Value,
+    },
+    /// Assign a role to a member (deny-list: "roles").
+    AssignRole {
+        /// The member receiving the role assignment.
+        member_did: String,
+        /// The role name to assign.
+        role: String,
+    },
+    /// Register a new outlet in the context registry (deny-list: "registry").
+    RegisterOutlet {
+        /// Canonical-bytes-equivalent registration payload (caller-prepared
+        /// so the runtime can verify against `OutletRegistration::validate`).
+        registration: serde_json::Value,
+    },
+    /// Append an event log entry (deny-list: "event log"). The runtime
+    /// appends through the per-context Merkle event log provider.
+    AppendEvent {
+        /// Caller-prepared event payload (kind + opaque data).
+        event: serde_json::Value,
+    },
+    /// Submit a governance proposal (deny-list: "governance proposals").
+    SubmitGovernanceProposal {
+        /// Caller-prepared proposal envelope.
+        proposal: serde_json::Value,
+    },
+    /// Cast a governance vote (deny-list: "governance votes").
+    CastGovernanceVote {
+        /// Proposal ID being voted on.
+        proposal_id: String,
+        /// Yes / No / Abstain encoded by the runtime.
+        vote: serde_json::Value,
+    },
+    /// Debit an economic ledger entry (deny-list: "economic ledgers").
+    DebitEconomicLedger {
+        /// The DID being charged.
+        did: String,
+        /// Amount in the context's economic policy currency.
+        amount: u64,
+    },
+    /// Credit an economic ledger entry (deny-list: "economic ledgers").
+    CreditEconomicLedger {
+        /// The DID receiving the credit.
+        did: String,
+        /// Amount in the context's economic policy currency.
+        amount: u64,
+    },
+    /// Increment a per-DID caveat counter (deny-list: "caveat counter store").
+    IncrementCaveatCounter {
+        /// Counter key (caveat-defined identifier).
+        key: String,
+        /// Increment delta — always positive by convention; counters are
+        /// monotonic per §7.3.8.
+        delta: u64,
+    },
+}
+
+/// Sink for misdeclaration `OutletVerifiedEvent` signals.
+///
+/// Receives `OutletVerified { integrity_ok: false, reason:
+/// QueryMisdeclaration }` events emitted when a Query outlet's executor
+/// trips the [`MutableInvocation`] write deny-list (spec §5.4.2
+/// "Misdeclaration signal").
+///
+/// Implementations are typically a `Vec<OutletVerifiedEvent>` collected by
+/// the dispatcher and returned to the caller alongside the invocation
+/// outcome. The trait is `Send + Sync` so the sink can be shared across
+/// `tokio::spawn`-ed executor tasks.
+pub trait QueryMisdeclarationSink: Send + Sync {
+    /// Records an integrity-failure signal. Implementations must be
+    /// non-blocking — emission happens inline with the executor's failed
+    /// write attempt and must not stall the invocation.
+    fn record(&self, event: scp_protocol::context::outlets::OutletVerifiedEvent);
+}
+
+/// Sink for `OutletVerifiedEvent { integrity_ok: false, reason:
+/// HandlerPanicked }` signals (SCP-OUT-028).
+///
+/// Receives a parallel `OutletVerified` event whenever the runtime's
+/// `catch_unwind` guard around an executor call recovers a panic (ADR-049
+/// §148). The signal is operator-attributable per spec §5.4.2 — panics are
+/// protocol-visible signals of an outlet operator's defect, NOT SDK-internal
+/// bugs (the SDK is the entity that catches the panic).
+///
+/// Implementations are typically a `Vec<OutletVerifiedEvent>` collected by
+/// the runtime and surfaced to the manager for event-log emission. The trait
+/// is `Send + Sync` so the sink can be shared across `tokio::spawn`-ed
+/// executor tasks.
+///
+/// This is a parallel sink to [`QueryMisdeclarationSink`] — both surface
+/// `OutletVerifiedEvent { integrity_ok: false, .. }` records but with
+/// distinct `reason` discriminants (`QueryMisdeclaration` vs
+/// `HandlerPanicked`). Two sinks rather than one shared trait keeps the
+/// runtime contract crisp: a caller wires only the panic guard or only the
+/// misdeclaration guard, not both.
+pub trait HandlerPanicSink: Send + Sync {
+    /// Records an integrity-failure signal for a handler panic.
+    /// Implementations must be non-blocking — emission happens inline with
+    /// the recovered panic and must not stall the invocation.
+    fn record(&self, event: scp_protocol::context::outlets::OutletVerifiedEvent);
+}
+
+/// Sink for the single [`OutletInvokedEvent`] emitted at the close of
+/// each outlet stream (§5.4.5 event-log shape; SCP-OUT-035).
+///
+/// The streaming executor task ([`run_streaming_executor_task`])
+/// accumulates the chunk sequence, builds the §5.4.5 event when the
+/// terminal chunk is delivered to the receiver, and calls
+/// [`Self::record`] once. The sink is the runtime-side hand-off from
+/// the spawned task to the caller's event-log append path: the caller
+/// owns the storage / Merkle bookkeeping, and the trait is `Send +
+/// Sync` so it can be shared across `tokio::spawn`-ed executor tasks
+/// without an extra mutex.
+///
+/// Per ADR-049 §5 / spec §5.4.5, EVERY outlet invocation produces
+/// exactly one `OutletInvokedEvent`, even when the executor never
+/// emits a `Data` chunk (e.g., a terminal `Error` before any payload).
+/// Implementations MUST be idempotent against double-record (the
+/// runtime guarantees a single call per task; defense-in-depth keeps
+/// the contract crisp).
+pub trait OutletInvokedEventSink: Send + Sync {
+    /// Records the §5.4.5 stream-close event. Called exactly once per
+    /// outlet stream, after the terminal chunk has been delivered to
+    /// the chunk receiver.
+    fn record(&self, event: OutletInvokedEvent);
+}
+
+/// The §5.4.5 close-time economic settlement of a streaming-native
+/// invocation (E1 remediation).
+///
+/// The open-time escrow HOLD was DEBITED against the invoker's
+/// `MemberBudgetTracker` at acceptance (and topped up per accepted credit
+/// grant). At terminal-chunk delivery the runtime knows the exact billed
+/// amount and the unspent refund:
+///
+/// - `reserved == billed_amount + refund_amount` — the total hold debited.
+/// - `billed_amount` — `cost_per_chunk × billable Data chunks at/below the
+///   cancel-ack sequence`. This is the amount the invoker actually pays.
+/// - `refund_amount` — the unspent portion, refunded to the invoker via
+///   `MemberBudgetTracker::reverse_spend` so net spent == `billed_amount`.
+///
+/// A stream that terminates with `Error { terminal: true }` before any
+/// Data chunk yields `billed_amount == 0` and a full refund.
+#[derive(Debug, Clone)]
+pub struct StreamSettlement {
+    /// Hosting context id — the lock the refund + receipt take.
+    pub context_id: String,
+    /// The §5.4.5 `invoker_did` whose budget was held and is now settled.
+    pub invoker_did: DID,
+    /// Total escrow debited at open + grants (`billed + refund`). Recorded
+    /// for audit / receipt provenance.
+    pub reserved: scp_protocol::economy::types::Amount,
+    /// Amount the invoker is billed (net spent after refund).
+    pub billed_amount: scp_protocol::economy::types::Amount,
+    /// Unspent escrow refunded to the invoker (`reserved - billed`).
+    pub refund_amount: scp_protocol::economy::types::Amount,
+    /// Count of billable Data chunks (the §5.4.5 `chunks_billed`).
+    pub billed_count: u32,
+    /// Stream `request_id` — receipt + event-log provenance.
+    pub request_id: RequestId,
+    /// Outlet id — receipt + event-log provenance.
+    pub outlet_id: OutletId,
+    /// §5.4.5 MED-HIGH — the economic policy snapshotted at
+    /// `OutletStreamOpen` acceptance (ADR-048 per-instance snapshot; H8
+    /// "service rendered is billed"). The settlement path prefers the LIVE
+    /// per-context policy when the hosting context is still registered, but
+    /// when the context was closed / evicted mid-stream the live policy is
+    /// gone — the snapshot lets the runtime STILL capture the
+    /// `PaymentReceipt` for service already rendered (and record a durable
+    /// `PaymentCaptureFailed` on capture failure) rather than stranding the
+    /// bill behind a `ContextNotRegistered` early-return. `None` for
+    /// zero-cost / Query streams and legacy/test callers without an
+    /// economic policy at open.
+    pub economic_policy_snapshot: Option<EconomicPolicySnapshot>,
+    /// The WORST-CASE cumulative amount RESERVED against the
+    /// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
+    /// counter at the open-time final gate — `cost_per_chunk ×
+    /// effective_max_billable_chunks` (`<= cap` by construction), from
+    /// [`super::stream::cumulative_reserve_amount`].
+    /// `0` when the cap is absent, `cost_per_chunk == 0`, or no counter store
+    /// was wired. Close-time settlement releases the UNSPENT portion —
+    /// `amount_cumulative_reserved − billed_count × cost_per_chunk` (saturating)
+    /// — back to the counter via [`crate::trust::CaveatCounterApi::release`], so
+    /// the cumulative cap is debited by exactly the billed spend rather than the
+    /// worst-case reservation, regardless of how small the declared estimate
+    /// was.
+    pub amount_cumulative_reserved: u64,
+    /// The invoker-declared `estimated_chunk_count` (diagnostics / event field
+    /// only). NOT the count the reserve was computed over — the reserve is the
+    /// worst-case spend and the close-time release reconciles by AMOUNT
+    /// (`unspent = amount_cumulative_reserved − billed_count × cost_per_chunk`).
+    pub reserved_chunks: u32,
+    /// R4 HIGH-1 — the opening UCAN CID, the key the
+    /// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
+    /// counter is stored under. Needed so the close-time release targets the
+    /// same counter the open-time reserve incremented. Empty for legacy / test
+    /// callers with no durable counter reservation.
+    pub ucan_cid: String,
+    /// R4 HIGH-1 — the per-billable-chunk cost, the unit the cumulative
+    /// release multiplies the unspent chunk count by. `Amount::new(0)` for
+    /// zero-cost / Query streams (release is then a no-op).
+    pub cost_per_chunk: scp_protocol::economy::types::Amount,
+}
+
+/// §5.4.5 MED-HIGH — economic state snapshotted at `OutletStreamOpen`
+/// acceptance so close-time settlement survives a mid-stream context
+/// teardown.
+///
+/// The hosting context's `economic_policy` (which carries the `payee` and
+/// `cost_schedule.currency` the payment adapter needs to authorize +
+/// capture) is cloned into this snapshot at open. If the context is still
+/// registered at settlement the runtime reads the LIVE policy (it may have
+/// changed via governance); if the context is GONE, the runtime falls back
+/// to this snapshot so the receipt for already-rendered service is still
+/// captured. The payment-adapter handle itself lives on the
+/// `ContextManager` (not per-context), so it is available regardless of
+/// context liveness and is not part of the snapshot.
+#[derive(Debug, Clone)]
+pub struct EconomicPolicySnapshot {
+    /// The hosting context's economic policy at open. Carries `payee` and
+    /// `cost_schedule.currency` for the `authorize → capture` adapter
+    /// sequence.
+    pub policy: scp_protocol::economy::types::EconomicPolicy,
+}
+
+/// Sink fired once at the close of each streaming-native outlet invocation.
+///
+/// Performs the §5.4.5 economic settlement (E1 remediation): refund the
+/// unspent escrow, issue a §19.15.5 `PaymentReceipt` for the billed amount,
+/// and append the close event to the event log.
+///
+/// The dispatch pump fires this from inside its spawned `tokio` task at the
+/// settlement block (gated by the `pump_exited` flag so it fires at most
+/// once). Because it runs ON the pump's tokio task, the implementation MUST
+/// NOT `block_on` — the production native-bridge impls hold a
+/// [`tokio::runtime::Handle`] and `Handle::spawn` the async
+/// `ContextManager::outlet_stream_settle`. The trait is `Send + Sync` so it
+/// can be shared into the spawned pump task without an extra mutex.
+///
+/// `None` (no sink wired) disables settlement — the legacy / test open
+/// paths that do not thread a `ContextManager` handle. The escrow ledger's
+/// `(billed, refund)` are still surfaced via the `StreamCloseSummary` for
+/// those callers.
+pub trait StreamSettlementSink: Send + Sync {
+    /// Settles the stream's economics exactly once. MUST NOT block — spawn
+    /// the async settlement onto a runtime handle.
+    fn settle(&self, settlement: StreamSettlement);
+}
+
+/// Read-only handle exposed to a [`OutletKind::Query`] outlet's executor.
+///
+/// Spec §5.4.2: "The runtime invokes Query outlets through a
+/// `ReadOnlyInvocation` handle that denies writes to context state
+/// (messages, roles, registry, event log, governance, economic ledgers).
+/// Any attempt by an executor to mutate through this handle returns
+/// `OutletErrorClass::Protocol::QueryViolation`."
+///
+/// The deny-list is enforced **at the type level** — none of the seven
+/// write surfaces (`messages`, `roles`, `registry`, `event log`,
+/// `governance proposals/votes`, `economic ledgers`, `caveat counter
+/// store`) have method definitions on this struct. The compiler refuses
+/// any executor that calls a write method on a `&ReadOnlyInvocation`.
+///
+/// Read-side surface (per PRD AC2): [`list_members`], [`get_member_role`],
+/// [`get_outlet`], [`list_outlets`], [`get_event`], [`current_epoch`],
+/// [`get_economic_policy`], [`get_caveat_counter`].
+///
+/// [`OutletKind::Query`]: scp_protocol::context::outlets::OutletKind::Query
+/// [`list_members`]: ReadOnlyInvocation::list_members
+/// [`get_member_role`]: ReadOnlyInvocation::get_member_role
+/// [`get_outlet`]: ReadOnlyInvocation::get_outlet
+/// [`list_outlets`]: ReadOnlyInvocation::list_outlets
+/// [`get_event`]: ReadOnlyInvocation::get_event
+/// [`current_epoch`]: ReadOnlyInvocation::current_epoch
+/// [`get_economic_policy`]: ReadOnlyInvocation::get_economic_policy
+/// [`get_caveat_counter`]: ReadOnlyInvocation::get_caveat_counter
+pub struct ReadOnlyInvocation<'a> {
+    context: &'a ContextHandle,
+    role_state: &'a ContextRoleState,
+    registry: &'a OutletRegistry,
+    invoker_did: &'a DID,
+    outlet_id: &'a OutletId,
+    /// Snapshot of event log entries available at invocation time.
+    events: &'a [scp_event_log::Event],
+    /// Current MLS group epoch at invocation time.
+    epoch: u64,
+    /// Optional economic policy snapshot for read-side accessors.
+    economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
+    /// Optional caveat counter store snapshot — `(member_did, counter_key) ->
+    /// current value`. Pure read view; writes go through Action outlets.
+    caveat_counters: Option<&'a std::collections::HashMap<(String, String), u64>>,
+}
+
+impl<'a> ReadOnlyInvocation<'a> {
+    /// Constructs a read-only invocation handle.
+    ///
+    /// Constructed by the runtime ([`invoke_outlet_dispatch`]) — outlets do
+    /// not build this themselves.
+    #[allow(clippy::too_many_arguments)] // matches the read-side accessor surface; cheap to extend
+    #[must_use]
+    pub const fn new(
+        context: &'a ContextHandle,
+        role_state: &'a ContextRoleState,
+        registry: &'a OutletRegistry,
+        invoker_did: &'a DID,
+        outlet_id: &'a OutletId,
+        events: &'a [scp_event_log::Event],
+        epoch: u64,
+        economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
+        caveat_counters: Option<&'a std::collections::HashMap<(String, String), u64>>,
+    ) -> Self {
+        Self {
+            context,
+            role_state,
+            registry,
+            invoker_did,
+            outlet_id,
+            events,
+            epoch,
+            economic_policy,
+            caveat_counters,
+        }
+    }
+
+    /// Context ID this invocation is scoped to.
+    #[must_use]
+    pub fn context_id(&self) -> &str {
+        self.context.context_id()
+    }
+
+    /// DID of the caller who invoked this Query outlet.
+    #[must_use]
+    pub const fn invoker_did(&self) -> &DID {
+        self.invoker_did
+    }
+
+    /// The Query outlet's own ID.
+    #[must_use]
+    pub const fn outlet_id(&self) -> &OutletId {
+        self.outlet_id
+    }
+
+    /// Lists all member DIDs currently in the context (PRD AC2).
+    #[must_use]
+    pub fn list_members(&self) -> Vec<&str> {
+        self.role_state.members.iter().map(String::as_str).collect()
+    }
+
+    /// Returns the role assigned to `member_did`, if any (PRD AC2).
+    #[must_use]
+    pub fn get_member_role(&self, member_did: &str) -> Option<&str> {
+        self.role_state
+            .assignments
+            .get(member_did)
+            .map(|a| a.role_name.as_str())
+    }
+
+    /// Returns the registered outlet metadata for `outlet_id`, if registered
+    /// (PRD AC2).
+    #[must_use]
+    pub fn get_outlet(
+        &self,
+        outlet_id: &OutletId,
+    ) -> Option<&scp_protocol::context::outlets::registry::OutletRegistration> {
+        self.registry.get(outlet_id)
+    }
+
+    /// Lists all registered outlet IDs in the context registry (PRD AC2).
+    #[must_use]
+    pub fn list_outlets(&self) -> Vec<&OutletId> {
+        self.registry.outlet_ids().collect()
+    }
+
+    /// Returns the event-log entry at `index` from the snapshot held for this
+    /// invocation, if present (PRD AC2). The snapshot is read-only — writes
+    /// through this handle are impossible (no method defined).
+    #[must_use]
+    pub fn get_event(&self, index: usize) -> Option<&scp_event_log::Event> {
+        self.events.get(index)
+    }
+
+    /// Returns the number of event-log entries visible to this invocation.
+    /// Companion to [`get_event`](Self::get_event).
+    #[must_use]
+    pub const fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Returns the MLS group epoch at the time this invocation was dispatched
+    /// (PRD AC2).
+    #[must_use]
+    pub const fn current_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns the context's current economic policy snapshot, if configured
+    /// (PRD AC2). Read-only — Query outlets cannot mutate economic state.
+    #[must_use]
+    pub const fn get_economic_policy(
+        &self,
+    ) -> Option<&scp_protocol::economy::types::EconomicPolicy> {
+        self.economic_policy
+    }
+
+    /// Returns the current caveat counter value for
+    /// `(member_did, counter_key)` if a counter store snapshot was supplied
+    /// (PRD AC2). Read-only — increments go through Action outlets'
+    /// [`MutableInvocation::increment_caveat_counter`].
+    #[must_use]
+    pub fn get_caveat_counter(&self, member_did: &str, counter_key: &str) -> Option<u64> {
+        self.caveat_counters
+            .and_then(|map| map.get(&(member_did.to_owned(), counter_key.to_owned())))
+            .copied()
+    }
+}
+
+/// Mutable handle exposed to a [`OutletKind::Action`] outlet's executor.
+///
+/// Spec §5.4.2: "Action executors may mutate context state through SDK-provided
+/// handles subject to role and capability checks." This is the SDK-provided
+/// handle. It exposes the same read methods as [`ReadOnlyInvocation`] plus
+/// the write methods that Action outlets need to mutate context state.
+///
+/// Writes are recorded as typed [`MutationIntent`] records and drained by the
+/// runtime after `exec_action` returns successfully — the executor never
+/// holds a manager reference and never directly mutates per-context state.
+/// The runtime is the sole entity that applies mutations, ensuring the
+/// existing locking and rollback contracts in
+/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// still hold.
+///
+/// **Defense-in-depth runtime check.** Every write method calls
+/// [`guard_kind`](Self::guard_kind) before enqueuing the intent. If the
+/// captured `kind` is [`OutletKind::Query`] (a misdeclaration the type
+/// system did not catch — for example, a test that constructs the handle
+/// directly), the method returns
+/// [`OutletExecutorError::QueryViolation`] and emits an
+/// `OutletVerifiedEvent { integrity_ok: false, reason: QueryMisdeclaration }`
+/// through the configured [`QueryMisdeclarationSink`].
+///
+/// [`OutletKind::Action`]: scp_protocol::context::outlets::OutletKind::Action
+/// [`OutletKind::Query`]: scp_protocol::context::outlets::OutletKind::Query
+pub struct MutableInvocation<'a> {
+    inner: ReadOnlyInvocation<'a>,
+    /// The kind the handle was constructed for. Action invocations get
+    /// `OutletKind::Action`; the runtime check refuses writes when this is
+    /// `Query` (defense-in-depth).
+    kind: scp_protocol::context::outlets::OutletKind,
+    /// Pending writes accumulated during executor execution.
+    pending: Vec<MutationIntent>,
+    /// Optional sink for `OutletVerified` integrity-failure events emitted
+    /// when [`guard_kind`](Self::guard_kind) refuses a write. `None` is
+    /// permitted (e.g. tests that only assert the error variant).
+    misdeclaration_sink: Option<&'a dyn QueryMisdeclarationSink>,
+}
+
+impl<'a> MutableInvocation<'a> {
+    /// Constructs a mutable invocation handle.
+    ///
+    /// `kind` should always be [`OutletKind::Action`] in production —
+    /// [`invoke_outlet_dispatch`] only constructs `MutableInvocation` after
+    /// confirming the outlet's registered kind is `Action`. Test code may
+    /// construct the handle with `kind == Query` to exercise the
+    /// defense-in-depth runtime deny-list (PRD AC7).
+    ///
+    /// [`OutletKind::Action`]: scp_protocol::context::outlets::OutletKind::Action
+    #[must_use]
+    pub fn new(
+        inner: ReadOnlyInvocation<'a>,
+        kind: scp_protocol::context::outlets::OutletKind,
+        misdeclaration_sink: Option<&'a dyn QueryMisdeclarationSink>,
+    ) -> Self {
+        Self {
+            inner,
+            kind,
+            pending: Vec::new(),
+            misdeclaration_sink,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Read-side surface — delegates to the inner ReadOnlyInvocation. Action
+    // outlets read context state the same way Query outlets do.
+    // -----------------------------------------------------------------------
+
+    /// See [`ReadOnlyInvocation::context_id`].
+    #[must_use]
+    pub fn context_id(&self) -> &str {
+        self.inner.context_id()
+    }
+
+    /// See [`ReadOnlyInvocation::invoker_did`].
+    #[must_use]
+    pub const fn invoker_did(&self) -> &DID {
+        self.inner.invoker_did()
+    }
+
+    /// See [`ReadOnlyInvocation::outlet_id`].
+    #[must_use]
+    pub const fn outlet_id(&self) -> &OutletId {
+        self.inner.outlet_id()
+    }
+
+    /// See [`ReadOnlyInvocation::list_members`].
+    #[must_use]
+    pub fn list_members(&self) -> Vec<&str> {
+        self.inner.list_members()
+    }
+
+    /// See [`ReadOnlyInvocation::get_member_role`].
+    #[must_use]
+    pub fn get_member_role(&self, member_did: &str) -> Option<&str> {
+        self.inner.get_member_role(member_did)
+    }
+
+    /// See [`ReadOnlyInvocation::get_outlet`].
+    #[must_use]
+    pub fn get_outlet(
+        &self,
+        outlet_id: &OutletId,
+    ) -> Option<&scp_protocol::context::outlets::registry::OutletRegistration> {
+        self.inner.get_outlet(outlet_id)
+    }
+
+    /// See [`ReadOnlyInvocation::list_outlets`].
+    #[must_use]
+    pub fn list_outlets(&self) -> Vec<&OutletId> {
+        self.inner.list_outlets()
+    }
+
+    /// See [`ReadOnlyInvocation::get_event`].
+    #[must_use]
+    pub fn get_event(&self, index: usize) -> Option<&scp_event_log::Event> {
+        self.inner.get_event(index)
+    }
+
+    /// See [`ReadOnlyInvocation::current_epoch`].
+    #[must_use]
+    pub const fn current_epoch(&self) -> u64 {
+        self.inner.current_epoch()
+    }
+
+    /// See [`ReadOnlyInvocation::get_economic_policy`].
+    #[must_use]
+    pub const fn get_economic_policy(
+        &self,
+    ) -> Option<&scp_protocol::economy::types::EconomicPolicy> {
+        self.inner.get_economic_policy()
+    }
+
+    /// See [`ReadOnlyInvocation::get_caveat_counter`].
+    #[must_use]
+    pub fn get_caveat_counter(&self, member_did: &str, counter_key: &str) -> Option<u64> {
+        self.inner.get_caveat_counter(member_did, counter_key)
+    }
+
+    /// Drains all pending [`MutationIntent`] records, leaving the handle
+    /// empty. Called by the dispatcher after `exec_action` returns
+    /// successfully.
+    #[must_use]
+    pub fn take_pending_mutations(&mut self) -> Vec<MutationIntent> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Returns the number of pending mutations (read-only inspection for
+    /// tests / debug logging).
+    #[must_use]
+    pub const fn pending_mutation_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Returns the kind this handle was constructed for. Test helper.
+    #[must_use]
+    pub const fn kind(&self) -> scp_protocol::context::outlets::OutletKind {
+        self.kind
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-side surface — present ONLY on MutableInvocation. The compiler
+    // refuses any executor that tries to call these on `&ReadOnlyInvocation`
+    // (PRD AC1: type-system deny-list).
+    //
+    // Each method runs `guard_kind` first — defense-in-depth runtime check
+    // (PRD AC7) for the case where a `MutableInvocation` is somehow
+    // constructed with `kind == Query` (e.g., a future API misuse or a
+    // misdeclared outlet whose dispatcher path is bypassed). On Query the
+    // method emits the §5.4.2 misdeclaration signal and returns
+    // `QueryViolation` without enqueuing the intent.
+    // -----------------------------------------------------------------------
+
+    /// Send a context message (deny-list: messages).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] when this handle's
+    /// kind is `Query` (defense-in-depth — the type system normally
+    /// prevents this).
+    pub fn send_message(&mut self, payload: serde_json::Value) -> Result<(), OutletExecutorError> {
+        self.guard_kind("send_message")?;
+        self.pending.push(MutationIntent::SendMessage { payload });
+        Ok(())
+    }
+
+    /// Assign a role to a member (deny-list: roles).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn assign_role(
+        &mut self,
+        member_did: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("assign_role")?;
+        self.pending.push(MutationIntent::AssignRole {
+            member_did: member_did.into(),
+            role: role.into(),
+        });
+        Ok(())
+    }
+
+    /// Register a new outlet in the context registry (deny-list: registry).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn register_outlet(
+        &mut self,
+        registration: serde_json::Value,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("register_outlet")?;
+        self.pending
+            .push(MutationIntent::RegisterOutlet { registration });
+        Ok(())
+    }
+
+    /// Append an entry to the context event log (deny-list: event log).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn append_event(&mut self, event: serde_json::Value) -> Result<(), OutletExecutorError> {
+        self.guard_kind("append_event")?;
+        self.pending.push(MutationIntent::AppendEvent { event });
+        Ok(())
+    }
+
+    /// Submit a governance proposal (deny-list: governance proposals).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn submit_governance_proposal(
+        &mut self,
+        proposal: serde_json::Value,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("submit_governance_proposal")?;
+        self.pending
+            .push(MutationIntent::SubmitGovernanceProposal { proposal });
+        Ok(())
+    }
+
+    /// Cast a governance vote on an active proposal (deny-list: governance
+    /// votes).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn cast_governance_vote(
+        &mut self,
+        proposal_id: impl Into<String>,
+        vote: serde_json::Value,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("cast_governance_vote")?;
+        self.pending.push(MutationIntent::CastGovernanceVote {
+            proposal_id: proposal_id.into(),
+            vote,
+        });
+        Ok(())
+    }
+
+    /// Debit an economic ledger entry (deny-list: economic ledgers).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn debit_economic_ledger(
+        &mut self,
+        did: impl Into<String>,
+        amount: u64,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("debit_economic_ledger")?;
+        self.pending.push(MutationIntent::DebitEconomicLedger {
+            did: did.into(),
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Credit an economic ledger entry (deny-list: economic ledgers).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn credit_economic_ledger(
+        &mut self,
+        did: impl Into<String>,
+        amount: u64,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("credit_economic_ledger")?;
+        self.pending.push(MutationIntent::CreditEconomicLedger {
+            did: did.into(),
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Increment a per-DID caveat counter (deny-list: caveat counter store).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn increment_caveat_counter(
+        &mut self,
+        key: impl Into<String>,
+        delta: u64,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("increment_caveat_counter")?;
+        self.pending.push(MutationIntent::IncrementCaveatCounter {
+            key: key.into(),
+            delta,
+        });
+        Ok(())
+    }
+
+    /// Defense-in-depth runtime check.
+    ///
+    /// On `Query` kind: emits the §5.4.2 misdeclaration signal through the
+    /// sink (if configured) and returns [`OutletExecutorError::QueryViolation`].
+    /// On `Action` kind: returns `Ok(())`.
+    fn guard_kind(&self, operation: &'static str) -> Result<(), OutletExecutorError> {
+        if matches!(self.kind, scp_protocol::context::outlets::OutletKind::Query) {
+            if let Some(sink) = self.misdeclaration_sink {
+                sink.record(scp_protocol::context::outlets::OutletVerifiedEvent {
+                    outlet_id: self.inner.outlet_id.clone(),
+                    passed: 0,
+                    failed: 1,
+                    integrity_ok: false,
+                    reason: Some(
+                        scp_protocol::context::outlets::OutletVerifiedReason::QueryMisdeclaration,
+                    ),
+                });
+            }
+            return Err(OutletExecutorError::QueryViolation { operation });
+        }
+        Ok(())
+    }
+}
+
+/// Per-outlet executor trait — Query/Action half-and-half.
+///
+/// Spec §5.4.2: outlets declare a kind and the runtime dispatches Query
+/// invocations through [`exec_query`] (read-only handle) and Action
+/// invocations through [`exec_action`] (write-capable handle). The trait's
+/// default implementations return [`OutletExecutorError::KindMismatch`] so
+/// that a misdeclaration — registering as one kind but only implementing
+/// the other half — is caught as a distinct, attributable failure rather
+/// than as a silent no-op.
+///
+/// PRD SCP-OUT-013 AC4: "trait `OutletExecutor` has signatures
+/// `exec_query(&self, ctx: ReadOnlyInvocation, input: Value) -> Result<Value,
+/// OutletError>` and `exec_action(&self, ctx: MutableInvocation, input:
+/// Value) -> Result<Value, OutletError>`. Default impls return
+/// `OutletError::KindMismatch`."
+///
+/// **Type-system deny-list (PRD AC1).** `exec_query` receives `&ReadOnlyInvocation`
+/// — the compiler refuses any call site that tries to invoke a write
+/// method on it because no write methods exist on the type. `exec_action`
+/// receives `&mut MutableInvocation` — only this half can enqueue
+/// [`MutationIntent`] records.
+///
+/// [`exec_query`]: OutletExecutor::exec_query
+/// [`exec_action`]: OutletExecutor::exec_action
+#[async_trait::async_trait]
+pub trait OutletExecutor: Send + Sync {
+    /// Executes a Query invocation against a read-only handle.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`OutletExecutorError::KindMismatch`]
+    /// so that a Query-registered outlet whose implementor only overrode
+    /// `exec_action` is caught at runtime per spec §5.4.2 misdeclaration
+    /// signal. Implementations override this method to provide the actual
+    /// Query semantics.
+    async fn exec_query(
+        &self,
+        ctx: &ReadOnlyInvocation<'_>,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, OutletExecutorError> {
+        let _ = (ctx, input);
+        Err(OutletExecutorError::KindMismatch {
+            expected: scp_protocol::context::outlets::OutletKind::Query,
+        })
+    }
+
+    /// Executes an Action invocation against a mutable handle.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`OutletExecutorError::KindMismatch`]
+    /// so that an Action-registered outlet whose implementor only overrode
+    /// `exec_query` is caught. Implementations override this method to
+    /// enqueue mutations through `ctx.send_message`, `ctx.assign_role`,
+    /// etc., subject to the runtime deny-list (`guard_kind`).
+    async fn exec_action(
+        &self,
+        ctx: &mut MutableInvocation<'_>,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, OutletExecutorError> {
+        let _ = (ctx, input);
+        Err(OutletExecutorError::KindMismatch {
+            expected: scp_protocol::context::outlets::OutletKind::Action,
+        })
+    }
+
+    /// Executes a Query invocation as a streaming producer (SCP-OUT-033).
+    ///
+    /// Spec §5.4.5: outlet invocations are streams by construction. The
+    /// streaming form lets executors emit `ChunkPayload::Data` /
+    /// `ChunkPayload::Progress` chunks as work proceeds rather than
+    /// returning a single aggregated value at the end. Non-streaming
+    /// executors override [`exec_query`](Self::exec_query) instead — the
+    /// default implementation here delegates to `exec_query` and
+    /// converts the single returned value into a `Data` chunk via
+    /// [`one_shot_to_stream`] (executors get streaming "for free" without
+    /// changing their existing code).
+    ///
+    /// Implementations that override this method MUST NOT emit a
+    /// terminal chunk (`End` / `Error { terminal: true }`); the
+    /// framework appends `End` after a successful return and `Error`
+    /// after a `Result::Err`. Emitting a terminal chunk from inside the
+    /// executor races with the framework's own emission and is
+    /// undefined behaviour.
+    ///
+    /// `tx` is bounded — the framework sets the capacity to the §5.4.5
+    /// `credit_window` (default 32). When the channel is full,
+    /// `tx.send` returns `Err` only if the receiver was dropped (i.e.,
+    /// the stream was cancelled); back-pressure stalls the executor
+    /// until a downstream consumer drains a slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError`] on any executor-internal failure
+    /// (`Failed`), kind mismatch (`KindMismatch`), or query violation
+    /// (`QueryViolation`). The framework maps each to a terminal
+    /// `ChunkPayload::Error { terminal: true, ... }` and closes the
+    /// stream — implementations never write the error chunk themselves.
+    async fn exec_query_stream(
+        &self,
+        ctx: &ReadOnlyInvocation<'_>,
+        input: serde_json::Value,
+        tx: mpsc::Sender<ChunkPayload>,
+    ) -> Result<(), OutletExecutorError> {
+        // Default: delegate to non-streaming `exec_query` and emit the
+        // single returned value as a `Data` chunk. Non-streaming
+        // executors get streaming for free — the framework appends the
+        // `End` terminal chunk after this returns successfully.
+        let value = self.exec_query(ctx, input).await?;
+        one_shot_to_stream(value, &tx).await;
+        Ok(())
+    }
+
+    /// Executes an Action invocation as a streaming producer (SCP-OUT-033).
+    ///
+    /// See [`exec_query_stream`](Self::exec_query_stream) for the
+    /// streaming contract. The default implementation delegates to
+    /// [`exec_action`](Self::exec_action) and emits the single returned
+    /// value as a `Data` chunk via [`one_shot_to_stream`].
+    ///
+    /// Implementations that override this method MUST NOT emit a
+    /// terminal chunk (`End` / `Error { terminal: true }`); the
+    /// framework owns terminal emission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError`] on any executor-internal failure.
+    /// The framework maps `Failed` / `KindMismatch` / `QueryViolation`
+    /// to a terminal `Error` chunk and closes the stream.
+    async fn exec_action_stream(
+        &self,
+        ctx: &mut MutableInvocation<'_>,
+        input: serde_json::Value,
+        tx: mpsc::Sender<ChunkPayload>,
+    ) -> Result<(), OutletExecutorError> {
+        let value = self.exec_action(ctx, input).await?;
+        one_shot_to_stream(value, &tx).await;
+        Ok(())
+    }
+}
+
+/// Pushes a single `Value` onto a `ChunkPayload::Data` chunk so a
+/// non-streaming executor's return value enters the §5.4.5 stream as a
+/// degenerate one-chunk producer (SCP-OUT-033).
+///
+/// Spec §5.4.5: "A non-streaming invocation is a stream that emits
+/// exactly two chunks: `Data(output)` followed by `End(output)`." This
+/// adapter emits ONLY the `Data` half — the framework appends the
+/// terminal `End` after the executor returns successfully (so callers
+/// using this adapter from inside `exec_*_stream` need not emit `End`
+/// themselves).
+///
+/// Returns silently when the receiver was dropped (cancelled stream) —
+/// the framework treats that as the cancellation path and emits a
+/// terminal chunk on behalf of the executor.
+pub async fn one_shot_to_stream(value: serde_json::Value, tx: &mpsc::Sender<ChunkPayload>) {
+    // `Sender::send` returns `Err` only if the receiver was dropped.
+    // That happens when the stream was cancelled or the consumer
+    // disconnected — in either case the framework's terminal emission
+    // path closes the stream, so we silently drop the failed send.
+    let _ = tx.send(ChunkPayload::Data { value }).await;
+}
+
+// ---------------------------------------------------------------------------
+// SCP-OUT-034 streaming dispatch hooks — wires CreditTracker + StreamEscrow
+// + CancelAckTracker + StreamAdmissionTracker into the per-chunk pump.
+// ---------------------------------------------------------------------------
+
+/// Per-chunk gate result for the SCP-OUT-034 pump.
+///
+/// Consulted under the shared session lock. `Forward` is the happy
+/// path (decrement credit, optionally accrue escrow). `Stall` arms
+/// the credit-stall timer. `DropAboveCancelAck` silently drops the
+/// chunk per §5.4.5 cancel-ack ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamGateOutcome {
+    /// Chunk passes the gate — caller forwards it and advances seq.
+    Forward,
+    /// Credit exhausted. Caller arms the stall timer and parks the
+    /// chunk until a fresh grant arrives.
+    Stall,
+    /// Cancel-ack ceiling exceeded. Caller drops without billing.
+    DropAboveCancelAck,
+    /// §5.4.5:758 cumulative billable ceiling reached — the stream has
+    /// already emitted `min(credit_window, max_calls)` billable Data
+    /// chunks, the HARD upper limit "regardless of executor behavior". A
+    /// further billable chunk MUST NOT be forwarded. The pump maps this to
+    /// a terminal `Error { terminal: true }` with slug
+    /// `execution.credit-exhausted` (`CODE_EXECUTION_CREDIT`,
+    /// `SCP-TOOL-6131`) and closes the stream. Distinct from
+    /// [`Self::Stall`] (transient — credit may be replenished) and
+    /// [`Self::DropAboveCancelAck`] (a single dropped chunk, stream
+    /// continues): `CreditExhausted` is terminal.
+    CreditExhausted,
+}
+
+/// §5.4.5 shared billable-chunk predicate.
+///
+/// A chunk is billable iff it is a `Data` chunk at or below the cancel-ack
+/// billing `ceiling`. Used by BOTH [`apply_stream_chunk_gate`] (the
+/// §5.4.5:758 cumulative-ceiling gate) and [`accrue_data_chunk_if_billable`]
+/// (escrow accrual) so the two paths can never drift on what counts as a
+/// billable chunk.
+#[must_use]
+pub const fn is_billable_chunk(chunk: &OutletStreamChunk, ceiling: u64) -> bool {
+    matches!(chunk.payload, ChunkPayload::Data { .. }) && chunk.sequence <= ceiling
+}
+
+/// Applies the SCP-OUT-034 per-chunk gate using the shared session
+/// trackers.
+///
+/// Called from the streaming pump for each upstream chunk. Terminal
+/// chunks (`End` / terminal `Error`) bypass the gate. Non-terminal
+/// chunks:
+///
+/// 1. Compare `chunk.sequence` against
+///    [`super::stream::CancelAckTracker::billing_ceiling`] —
+///    chunks above the ceiling return [`StreamGateOutcome::DropAboveCancelAck`].
+/// 2. §5.4.5:758 cumulative ceiling: if the chunk is billable (a `Data`
+///    chunk at/below the cancel-ack ceiling) AND the §5.4.5:758
+///    cumulative ceiling has already been reached
+///    ([`super::stream::CreditTracker::cumulative_ceiling_reached`]),
+///    return [`StreamGateOutcome::CreditExhausted`] WITHOUT consuming
+///    credit — the HARD `min(credit_window, max_calls)` cap is reached and
+///    the stream MUST terminate.
+/// 3. Call [`super::stream::CreditTracker::try_consume`]. On
+///    [`super::stream::OutOfCredit::Exhausted`], stamp
+///    `credit_stall_armed_at` to the current `Instant` and return
+///    [`StreamGateOutcome::Stall`].
+/// 4. Otherwise return [`StreamGateOutcome::Forward`].
+///
+/// The function takes a single mutex guard window so the
+/// (ceiling → cumulative → consume → bill) decision is atomic with respect
+/// to concurrent grant / cancel deliveries on
+/// [`super::stream::CreditTracker::grant_with_identity`] /
+/// [`super::stream::CancelAckTracker::record_cancel`].
+#[must_use]
+pub fn apply_stream_chunk_gate(
+    credit: &mut super::stream::CreditTracker,
+    cancel_ack: &super::stream::CancelAckTracker,
+    credit_stall_armed_at: &mut Option<std::time::Instant>,
+    chunk: &OutletStreamChunk,
+) -> StreamGateOutcome {
+    if chunk.payload.is_terminal() {
+        return StreamGateOutcome::Forward;
+    }
+    let ceiling = cancel_ack.billing_ceiling();
+    if chunk.sequence > ceiling {
+        return StreamGateOutcome::DropAboveCancelAck;
+    }
+    // §5.4.5:758 cumulative billable ceiling. Only billable (Data,
+    // at/below the cancel-ack ceiling) chunks are subject to the
+    // `max_calls` cap — Progress chunks below the ceiling still consume
+    // credit but are never billed, so they do not count toward the cap.
+    // Checked BEFORE `try_consume` so a chunk rejected by the cumulative
+    // ceiling does not burn credit.
+    if is_billable_chunk(chunk, ceiling) && credit.cumulative_ceiling_reached() {
+        return StreamGateOutcome::CreditExhausted;
+    }
+    if credit.try_consume().is_err() {
+        if credit_stall_armed_at.is_none() {
+            *credit_stall_armed_at = Some(std::time::Instant::now());
+        }
+        return StreamGateOutcome::Stall;
+    }
+    StreamGateOutcome::Forward
+}
+
+/// Accrues a Data chunk in the per-stream [`super::stream::StreamEscrow`].
+///
+/// Bills only when the chunk is billable (a `Data` chunk at or below the
+/// cancel-ack ceiling — see [`is_billable_chunk`]). Progress / End / Error
+/// chunks and chunks above the ceiling are NOT billed (§5.4.5).
+pub const fn accrue_data_chunk_if_billable(
+    escrow: &mut super::stream::StreamEscrow,
+    cancel_ack: &super::stream::CancelAckTracker,
+    chunk: &OutletStreamChunk,
+) {
+    if is_billable_chunk(chunk, cancel_ack.billing_ceiling()) {
+        escrow.accrue_one_chunk();
+    }
+}
+
+/// Releases the §5.4.5 round-5 admission counters for a stream that
+/// terminated. Called by the pump on terminal-chunk emission.
+///
+/// Decrements per-invoker, per-origin-invoker, and per-outlet counters
+/// atomically under the admission tracker's critical section. Idempotent
+/// on a never-admitted triple (matches
+/// [`super::stream::StreamAdmissionTracker::release`] semantics).
+pub fn release_stream_admission(
+    admission: &mut super::stream::StreamAdmissionTracker,
+    invoker_did: &str,
+    origin_invoker_did: &str,
+    outlet_id: &str,
+) {
+    admission.release(invoker_did, origin_invoker_did, outlet_id);
 }
 
 // ---------------------------------------------------------------------------
