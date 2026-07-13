@@ -2097,7 +2097,7 @@ fn published_identity_did(py: Python<'_>, scp: &_scp_core::scp::PyScp) -> String
 fn outlet_stream_open_path_wired_and_control_plane_not_found() {
     Python::with_gil(|py| {
         // Initializes the process-global tokio runtime the bridge methods block
-        // on (`identity_create`, `outlet_invoke_stream`, …).
+        // on (`identity_create`, `outlet_stream_open`, …).
         setup();
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         let bi = scp.bridge_instance();
@@ -2168,7 +2168,7 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         // constructible at the bridge boundary — it needs the
         // `pub(in crate::context)` `spawn_actor_with_state` fixture).
         let open_err = scp
-            .outlet_invoke_stream(
+            .outlet_stream_open(
                 &ctx,
                 &outlet_id,
                 &input.as_borrowed(),
@@ -2346,7 +2346,7 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
         // hex StreamHandleId promptly (Commit transition, never block-until-
         // terminal).
         let handle_id = scp
-            .outlet_invoke_stream(
+            .outlet_stream_open(
                 &ctx,
                 &outlet_id,
                 &input.as_borrowed(),

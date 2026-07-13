@@ -1976,9 +1976,9 @@ fn c4_pyo3_outlet_invoke_accepts_spending_ucan() {
 // refactor that skipped either would disable authorization or leave the
 // producer unwired for Python streaming clients.
 #[test]
-fn c7_pyo3_outlet_invoke_stream_validates_ucan_and_reaches_open_outlet_stream() {
-    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "context_outlet_invoke_stream_impl")
-        .expect("context_outlet_invoke_stream_impl body must exist");
+fn c7_pyo3_outlet_stream_open_validates_ucan_and_reaches_open_outlet_stream() {
+    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "outlet_stream_open_impl")
+        .expect("outlet_stream_open_impl body must exist");
     assert!(
         body.contains("validate_outlet_ucan"),
         "PyO3 streaming open must validate the invocation UCAN at the bridge \

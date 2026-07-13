@@ -1630,7 +1630,7 @@ fn counter_error_to_open_rejection(err: &crate::trust::CounterError) -> OpenStre
 ///
 /// Production FFI bridges always supply a non-empty `ucan_cid`
 /// (derived from the validated UCAN's encoded JWT — see
-/// `crates/scp-ffi/src/outlet_stream.rs::py_outlet_invoke_stream` and
+/// `crates/scp-ffi/src/outlet_stream.rs::outlet_stream_open` and
 /// its NAPI / `UniFFI` mirrors). An empty `ucan_cid` is the sentinel
 /// for legacy unit-test fixtures that hand-construct
 /// `OpenStreamParams` outside the bridge path. Those fixtures

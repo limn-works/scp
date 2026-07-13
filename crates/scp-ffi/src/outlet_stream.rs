@@ -7,7 +7,7 @@
 //! and [`StreamSessionHandle`] into six `PyScp` methods plus two pure 1:1
 //! wrappers:
 //!
-//! - [`PyScp::outlet_invoke_stream`] — open a stream (Commit-transition:
+//! - [`PyScp::outlet_stream_open`] — open a stream (Commit-transition:
 //!   returns a `StreamHandleId` PROMPTLY; NEVER blocks until terminal).
 //! - [`PyScp::outlet_stream_poll_next`] — drain one chunk (`None` == closed).
 //! - [`PyScp::outlet_stream_grant_credit`] — apply an invoker-signed grant.
@@ -367,7 +367,7 @@ fn authorized_control(
 }
 
 // ---------------------------------------------------------------------------
-// Open — context_outlet_invoke_stream
+// Open — outlet_stream_open
 // ---------------------------------------------------------------------------
 
 /// §5.4.5 streaming outlet open. Validates the UCAN at the bridge (mirroring
@@ -379,7 +379,7 @@ fn authorized_control(
 #[allow(clippy::too_many_arguments)] // Flat §5.4.5 open envelope — agent-first named params.
 #[allow(clippy::needless_pass_by_value)] // PyO3 owned Option params.
 #[allow(clippy::too_many_lines)] // UCAN validate + caveat binding + full OpenStreamParams build.
-fn context_outlet_invoke_stream_impl(
+fn outlet_stream_open_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
     outlet_id: &str,
@@ -1042,18 +1042,23 @@ impl crate::scp::PyScp {
     /// stream via `outlet_stream_poll_next` / `_grant_credit` / `_cancel` /
     /// `_terminate` with the SAME `caller_did`.
     ///
+    /// Named `outlet_stream_open` (not `outlet_invoke_stream`) so the whole
+    /// streaming surface groups under the `outlet_stream_*` prefix — an agent
+    /// searching that prefix finds the opener alongside `poll_next` /
+    /// `grant_credit` / `cancel` / `terminate` (agent-first API design).
+    ///
     /// # Errors
     ///
     /// Raises `UcanError` if authorization fails. Raises `ContextError`
     /// carrying a `SCP-OUTLET-NNNN` code if the open is rejected (admission
     /// caps, escrow, caveats binding, node pump ceiling, or a §7.3.8 caveat).
-    #[pyo3(name = "outlet_invoke_stream")]
+    #[pyo3(name = "outlet_stream_open")]
     #[pyo3(signature = (
         context_id, outlet_id, input, caller_did, ucan_token,
         proof_tokens=None, spending_ucan=None, timeout_ms=None, estimated_chunk_count=None,
     ))]
     #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
-    pub fn outlet_invoke_stream(
+    pub fn outlet_stream_open(
         &self,
         context_id: &str,
         outlet_id: &str,
@@ -1065,7 +1070,7 @@ impl crate::scp::PyScp {
         timeout_ms: Option<u32>,
         estimated_chunk_count: Option<u32>,
     ) -> PyResult<String> {
-        context_outlet_invoke_stream_impl(
+        outlet_stream_open_impl(
             &self.inner,
             context_id,
             outlet_id,
