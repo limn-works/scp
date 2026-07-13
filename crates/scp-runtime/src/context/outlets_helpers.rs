@@ -472,6 +472,68 @@ impl std::fmt::Debug for OutletEconomyReservation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// StreamEconomyReservation — the Send payload for the streaming open reserve
+// ---------------------------------------------------------------------------
+
+/// The `Send` output of the streaming open reserve
+/// ([`reserve_outlet_stream_economy`]). Mirrors [`OutletEconomyReservation`]
+/// for the streaming-native invocation path: produced inside the per-context
+/// actor on owned Class-S state, carried by the supervisor orchestrator across
+/// the non-`Send` off-mailbox pump, and consumed by the close-time settlement
+/// (a later sub-chunk).
+///
+/// Unlike the unary reservation this carries NO in-flight
+/// [`OutletEconomyTicket`]: the streaming path holds its economic reservation
+/// as a debited `reserved_escrow` against the invoker's budget (refunded, net
+/// of billed chunks, at stream close). The `economic_policy` is snapshotted at
+/// acceptance so close-time settlement can capture the §19.15.5
+/// `PaymentReceipt` for rendered service even if the context is torn down
+/// mid-stream.
+///
+/// The per-sender MLS send-sequence (`base_sequence`) is deliberately NOT
+/// carried here: it is allocated at the point of consumption by the
+/// transport/FFI send path (allocate-at-consumption), never at open. A
+/// rollback-in-place of a pre-allocated sequence across the off-mailbox pump
+/// window would corrupt a DIFFERENT message's sequence — the LIFO
+/// [`rollback_sequence_number`](scp_protocol::context::membership::MembershipState::rollback_sequence_number)
+/// `saturating_sub` is not request-scoped — so the allocation is deferred.
+#[must_use = "a StreamEconomyReservation debits open-time escrow and must be settled or reversed at stream close — dropping leaks the held reservation"]
+pub struct StreamEconomyReservation {
+    /// Context handle snapshot — the off-mailbox pump reads lifecycle state
+    /// and the supervisor threads it into the executor.
+    pub handle: ContextHandle,
+    /// Role-state snapshot for the capability re-check inside the off-mailbox
+    /// pump path.
+    pub role_state: ContextRoleState,
+    /// Spawn-generation of the actor instance this reservation was made
+    /// against (`PerContextState::generation`). Close-time settlement rejects
+    /// (drops) if the live actor's generation no longer matches — the actor
+    /// was despawned and a new instance respawned for the same `context_id`
+    /// between reserve and settle, so refunding/capturing against the new
+    /// instance's owned state would be a confused-deputy write to the WRONG
+    /// context instance.
+    pub generation: u64,
+    /// The §5.4.5 open-time escrow HOLD debited against the invoker's budget:
+    /// `cost_per_chunk × estimated_chunk_count` (`Amount(0)` for Query /
+    /// zero-cost outlets). The unspent portion is refunded at stream close.
+    pub reserved_escrow: Amount,
+    /// The §5.4.5 MED-HIGH economic policy snapshot at acceptance, so
+    /// close-time settlement can capture the receipt for rendered service even
+    /// if the context is torn down mid-stream. `None` when the context has no
+    /// economic policy.
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+}
+
+impl std::fmt::Debug for StreamEconomyReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamEconomyReservation")
+            .field("generation", &self.generation)
+            .field("reserved_escrow", &self.reserved_escrow)
+            .finish_non_exhaustive()
+    }
+}
+
 /// §7.3.8 fail-closed coupling of the validated-narrowed effective invocation
 /// caveats to the revocation CID of the delegation that carried them.
 ///
@@ -994,6 +1056,719 @@ pub async fn reserve_outlet_economy(
 }
 
 // ---------------------------------------------------------------------------
+// reserve_outlet_stream_economy (streaming open — actor handler entry point)
+// ---------------------------------------------------------------------------
+
+/// Streaming open-time economy reserve, run inside the per-context actor on
+/// owned Class-S state — the streaming-native counterpart of
+/// [`reserve_outlet_economy`].
+///
+/// Mirrors the unary reserve's shared prelude (handle + role-state snapshot,
+/// hard-rate-limit consume, velocity record, economic-policy snapshot) and
+/// then runs the streaming-specific open-time gates:
+///
+/// 1. **Membership gate** — the invoker must be on the §9.8.5 membership
+///    roster ([`MembershipState::contains`](scp_protocol::context::membership::MembershipState::contains));
+///    a non-member has no per-sender stream state and is rejected. The
+///    per-sender `base_sequence` is NOT allocated here — the transport/FFI
+///    send path allocates it at the point of consumption
+///    (allocate-at-consumption), because a rollback-in-place across the
+///    off-mailbox pump window would corrupt a DIFFERENT message's sequence
+///    (the LIFO `saturating_sub` is not request-scoped).
+/// 2. **Open-time escrow** — a faithful port of the reference
+///    `outlet_stream_reserve_escrow`: `reserved = cost_per_chunk ×
+///    estimated_chunk_count` (checked; overflow → `EscrowOverflow`), gated
+///    against the invoker's live remaining budget AND-folded with the §19.5
+///    `max_per_action` per-action ceiling, then DEBITED under a fail-closed
+///    persist. `cost_per_chunk == 0` (Query / zero-cost) short-circuits to
+///    `reserved = 0` with no debit and no balance consultation.
+///
+/// The §7.3.8 counter-bearing caveat reserve is NOT performed here — it stays
+/// at the pump's open-time Step 5.5 (a later sub-chunk), preserving the R4
+/// HIGH-2 ordering (counters are the LAST gate, after the pump permit).
+///
+/// On ANY failure branch after a consume the token is refunded / the mutation
+/// rolled back inline: the hard-rate token is refunded exactly once (on the
+/// early-return branches and in the single outer error arm around the
+/// combinator), the velocity tick is rolled back on whichever branch consumed
+/// it, and the budget debit is reversed by the persist-failure compensation —
+/// so a rejected reservation leaves observable state unchanged. No sequence is
+/// allocated here, so there is none to roll back.
+///
+/// # Errors
+///
+/// - [`ContextError::RateLimited`] — hard rate limit exceeded for the invoker.
+/// - [`ContextError::PermissionDenied`] — the invoker is not a member of the
+///   context (no per-sender stream state).
+/// - An escrow-overflow / insufficient-funds [`ContextError`] — reusing the
+///   [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
+///   `EscrowOverflow` / `InsufficientFunds` variants routed through
+///   [`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)
+///   — `cost × count` overflowed, or the effective remaining budget is below
+///   the reservation.
+/// - [`ContextError::PersistenceFailed`] — the fail-closed escrow-debit persist
+///   did not land (budget + velocity + sequence reversed by the compensation).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn reserve_outlet_stream_economy(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    invoker_did: &DID,
+    cost_per_chunk: Amount,
+    estimated_chunk_count: u32,
+    max_per_action: Option<Amount>,
+    now_secs: u64,
+) -> Result<StreamEconomyReservation, ContextError> {
+    use crate::context::outlets::dispatch::OpenStreamRejection;
+
+    // --- Shared prelude (mirrors reserve_outlet_economy ~588-626): handle +
+    // role-state snapshot, hard-rate consume, velocity record, economic-policy
+    // snapshot. All Class-C, routed through the non-persisting `class_c_view()`
+    // (the run loop coalesce-persists these bookkeeping mutations).
+    let handle;
+    let role_state;
+    let velocity_token;
+    let economic_policy;
+    {
+        let mut view = cell.class_c_view();
+        handle = view.handle_mut().clone();
+        role_state = view.role_state().clone();
+
+        let gov = view.governance_class_c_mut();
+        // Hard rate limit — the Matrix Synapse-style defense-in-depth cap.
+        // try_consume before any streaming-open bookkeeping.
+        if !gov.hard_rate_limit_mut().try_consume(invoker_did, now_secs) {
+            return Err(ContextError::RateLimited {
+                resource: "outlet_stream_open".to_owned(),
+                message: "hard rate limit exceeded for invoker".to_owned(),
+                // Token-bucket hard limit: no exact refill instant to surface.
+                retry_after_ms: None,
+            });
+        }
+        velocity_token = gov
+            .velocity_tracker_mut()
+            .record_message(invoker_did, now_secs);
+        economic_policy = gov.economic_policy_mut().clone();
+        // `view` dropped here.
+    }
+
+    // --- Membership gate (Class-C membership roster, §9.8.5). A non-member has
+    // no per-sender stream state — reject (rolling back the velocity tick +
+    // hard-rate token consumed above). The per-sender `base_sequence` is NOT
+    // allocated here: the transport/FFI send path allocates it at the point of
+    // consumption (allocate-at-consumption). Holding a pre-allocated sequence
+    // across the off-mailbox pump window and rolling it back in place would
+    // corrupt a DIFFERENT message's sequence — the LIFO `saturating_sub` in
+    // `rollback_sequence_number` is not request-scoped — so the allocation is
+    // deferred rather than reserved-and-rolled-back.
+    let invoker_did_str = invoker_did.to_string();
+    if !cell
+        .class_c_view()
+        .membership_class_c_mut()
+        .contains(&invoker_did_str)
+    {
+        let mut view = cell.class_c_view();
+        let gov = view.governance_class_c_mut();
+        gov.velocity_tracker_mut()
+            .rollback(invoker_did, velocity_token);
+        gov.hard_rate_limit_mut().refund(invoker_did);
+        return Err(ContextError::PermissionDenied(format!(
+            "SCP-OUTLET-6089: invoker {invoker_did} is not a member of context \
+             '{context_id}' — cannot open a stream"
+        )));
+    }
+
+    // --- Open-time escrow reserve (port of `outlet_stream_reserve_escrow`).
+    let reserved_escrow = if cost_per_chunk.value() == 0 {
+        // Zero-cost / Query: no debit, no balance consultation, no persist.
+        Amount::new(0)
+    } else {
+        // Overflow is a PURE check on `cost × count` — done BEFORE any debit so
+        // an overflow rejects without consulting or debiting the budget. On
+        // overflow the velocity tick + hard-rate token consumed above are
+        // rolled back (no sequence was allocated — see the membership gate).
+        let Some(reserved) = cost_per_chunk.checked_mul(u64::from(estimated_chunk_count)) else {
+            let mut view = cell.class_c_view();
+            let gov = view.governance_class_c_mut();
+            gov.velocity_tracker_mut()
+                .rollback(invoker_did, velocity_token);
+            gov.hard_rate_limit_mut().refund(invoker_did);
+            return Err(invocation_error_to_context(
+                OpenStreamRejection::EscrowOverflow.to_invocation_error(),
+            ));
+        };
+
+        // Gate + DEBIT under a fail-closed persist. The actor processes commands
+        // serially, so the check-and-debit is atomic without an external lock
+        // (the two-concurrent-opens race the reference closed with `arc.lock()`
+        // cannot occur on the mailbox). The budget debit is Class-C; on persist
+        // failure the compensation reverses it (mirroring the unary paid path),
+        // and the outer arm refunds the hard-rate token.
+        let debit_result = cell
+            .commit_class_s_keep_compensating(
+                deps,
+                context_id,
+                |mut view| {
+                    let state = view.rest_mut();
+                    let remaining = state.governance.budget_tracker.remaining(invoker_did);
+                    // §19.5 AND-composition: fold the per-action ceiling into the
+                    // effective spendable balance when a cap is present.
+                    let effective_remaining = max_per_action.map_or(remaining, |cap| {
+                        Amount::new(remaining.value().min(cap.value()))
+                    });
+                    if reserved.value() > effective_remaining.value() {
+                        // Insufficient funds: reject BEFORE the debit. Roll the
+                        // velocity tick back inline (reachable through the owned
+                        // state); the hard-rate token is refunded once in the
+                        // outer arm. No sequence was allocated to roll back.
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        return Err(invocation_error_to_context(
+                            OpenStreamRejection::InsufficientFunds.to_invocation_error(),
+                        ));
+                    }
+                    if state
+                        .governance
+                        .budget_tracker
+                        .record_spend(invoker_did, reserved)
+                        .is_err()
+                    {
+                        // Defensive: a `record_spend` reject (budget drained after
+                        // the local comparison). The serial actor makes this
+                        // unreachable, but fail closed — roll back the velocity
+                        // tick inline (no sequence was allocated).
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        return Err(invocation_error_to_context(
+                            OpenStreamRejection::InsufficientFunds.to_invocation_error(),
+                        ));
+                    }
+                    // `value` = the reserved hold returned to the caller;
+                    // `external` = the same hold the persist-failure reversal
+                    // needs to reverse the Class-C budget debit.
+                    Ok((reserved, reserved))
+                },
+                // KEEP-direction (no Class-S mutation to restore). On persist
+                // failure reverse the Class-C budget debit + velocity tick the
+                // failed persist did not make durable (no sequence was
+                // allocated). `view` is a `ClassCMut` — it cannot reach
+                // `hard_rate_limit`, which is refunded in the outer arm below.
+                async |reserved: Amount, mut view, _deps| {
+                    let gov = view.governance_class_c_mut();
+                    gov.budget_tracker_mut()
+                        .reverse_spend(invoker_did, reserved);
+                    gov.velocity_tracker_mut()
+                        .rollback(invoker_did, velocity_token);
+                },
+            )
+            .await;
+
+        match debit_result {
+            Ok(reserved) => reserved,
+            Err(err) => {
+                // Single hard-rate-limit refund site for every combinator error
+                // path (`f`-reject and persist-failure alike): `f` and the
+                // compensation reverse the velocity + budget they can reach; the
+                // hard-rate token is refunded here exactly once (it is
+                // not reachable through the compensation `ClassCMut` view). Routed
+                // through the non-persisting `class_c_view()` — the reserve's
+                // persist already ran in the combinator; this arm injects none.
+                cell.class_c_view()
+                    .governance_class_c_mut()
+                    .hard_rate_limit_mut()
+                    .refund(invoker_did);
+                return Err(err);
+            }
+        }
+    };
+
+    // `generation` is a Class-C structural field read through the cell `Deref`.
+    Ok(StreamEconomyReservation {
+        handle,
+        role_state,
+        generation: cell.generation,
+        reserved_escrow,
+        economic_policy,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Streaming close-time settlement (chunk 3c) — the actor-mailbox port of the
+// reference `ContextManager::outlet_stream_settle`.
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`settle_outlet_stream`] — distinguishes a confused-deputy DROP
+/// (which touched nothing, so the handler must NOT flag a mutation) from a
+/// real settlement (which mutated owned state and owes a coalesced persist).
+#[derive(Debug)]
+pub enum StreamSettleOutcome {
+    /// The reservation's `generation` no longer matches the live actor (an
+    /// import-replace / crash-respawn between reserve and settle). Fix-D: the
+    /// settlement STILL captures the §19.15.5 receipt for service already
+    /// rendered (H8) against the open-time policy SNAPSHOT, but touches NO owned
+    /// state — releasing/refunding against this (possibly replaced) instance
+    /// would corrupt the wrong economy, and the durable reserves are left for
+    /// the restore-time reconcile sweep. The handler must NOT flag a mutation.
+    /// The inner `Option` is the captured receipt (`None` when nothing was
+    /// billed / no adapter / policy snapshot / capture failed).
+    CapturedWithoutMutation(Option<PaymentReceipt>),
+    /// The settlement ran on the matching live instance; it released/refunded
+    /// the owned reserves, CLEARED the crash-recovery record, and captured the
+    /// receipt. The inner `Option` is the captured receipt (`None` when nothing
+    /// was billed / no adapter / capture failed). Owed a coalesced persist.
+    Settled(Option<PaymentReceipt>),
+}
+
+/// §5.4.5 close-time economic settlement of a streaming-native invocation, run
+/// inside the per-context actor on owned state.
+///
+/// # Confused-deputy guard
+///
+/// The reservation was made against a specific actor-instance `generation`. If
+/// this actor's generation differs, the original instance was despawned and a
+/// NEW instance respawned for the same `context_id` between reserve and settle
+/// (an import replace / node teardown+respawn). Releasing the cumulative counter
+/// or refunding budget against THIS instance's owned state would corrupt the
+/// WRONG context's economy. So on a mismatch the settlement does NOT touch owned
+/// state — it returns
+/// [`StreamSettleOutcome::CapturedWithoutMutation`](StreamSettleOutcome::CapturedWithoutMutation):
+/// it STILL captures the §19.15.5 receipt for rendered service against the
+/// open-time `economic_policy_snapshot` only (a payment-adapter call that mutates
+/// no owned Class-S state — H8 "service rendered is billed", matching the
+/// no-actor fallback), but SKIPS the cumulative-counter release and the budget
+/// refund. The unspent escrow and counter of the original (crash-restored)
+/// reservation are instead reconciled by the durable [`StreamReservationRecord`]
+/// and its restore sweep ([`reconcile_stream_reservations`]), which owns THIS
+/// context's own state. `generation` is a Class-C structural field read through
+/// the cell `Deref`.
+///
+/// Order (matches the reference "release FIRST"): (1) RELEASE the unspent R4
+/// HIGH-1 cumulative-counter reserve back to the owned §7.3.8 `AmountCumulative`
+/// counter, and (2) REFUND the unspent escrow to the invoker's budget tracker —
+/// both under ONE fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// so the two durable bookkeeping mutations land atomically; then (3) capture
+/// the §19.15.5 `PaymentReceipt` for the EXACT billed amount off-persist,
+/// against the LIVE per-context economic policy (falling back to the open-time
+/// [`EconomicPolicySnapshot`](crate::context::outlets::invoke::EconomicPolicySnapshot)
+/// only when the live policy is absent — H8 "service rendered is billed").
+///
+/// Capture runs INDEPENDENTLY of the release/refund persist: a persist failure
+/// is KEEP'd in memory (the actor run loop retries the durable write) and logged,
+/// and capture still proceeds. Returns the captured receipt, or `None` when
+/// nothing was billed, no payment adapter / policy is configured, or capture
+/// failed (a `PaymentCaptureFailed` local event records the failure — the billed
+/// budget is NOT reversed).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear close-time settlement: unspent math + live-policy read + \
+              combined release/refund persist + off-persist capture with capture-failure \
+              recording — splitting it would scatter the fixed ordering the doc-comment pins"
+)]
+pub async fn settle_outlet_stream(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    settlement: crate::context::outlets::invoke::StreamSettlement,
+    generation: u64,
+) -> StreamSettleOutcome {
+    // Destructure up front so the Fix-D generation-mismatch branch below can
+    // read the settlement for its snapshot-policy capture. `reserved`
+    // (= billed + refund) is the open-time escrow HOLD — it tells the clean
+    // path whether a crash-recovery record was persisted at open (only streams
+    // that held an escrow or a cumulative counter reserve persist one).
+    let crate::context::outlets::invoke::StreamSettlement {
+        context_id,
+        invoker_did,
+        reserved,
+        billed_amount,
+        refund_amount,
+        billed_count,
+        request_id,
+        economic_policy_snapshot,
+        amount_cumulative_reserved,
+        ucan_cid,
+        cost_per_chunk,
+        ..
+    } = settlement;
+
+    // Money-conservation fail-closed (crypto): `billed_amount` and the
+    // (`billed_count`, `cost_per_chunk`) pair are INDEPENDENT settlement fields,
+    // but the captured `PaymentReceipt` (a money artifact) must never bill MORE
+    // than `cost_per_chunk × billed_count`. Cap the captured amount at that
+    // per-chunk-derived figure so a settlement constructed with an inflated
+    // `billed_amount` can never OVER-charge the invoker (a `cost × count`
+    // overflow derives `0` — capture nothing rather than a bogus amount). `min`
+    // only ever REDUCES the captured amount; an under-stated `billed_amount`
+    // (e.g. a zero-cost / release-only settlement) is left as-is. The refund
+    // leg (`refund_amount`, computed independently as `reserved − billed`) is
+    // unaffected.
+    let derived_billed = cost_per_chunk
+        .value()
+        .checked_mul(u64::from(billed_count))
+        .unwrap_or(0);
+    let billed_amount = Amount::new(billed_amount.value().min(derived_billed));
+
+    // Fix-D confused-deputy handling. The reservation was made against a
+    // specific actor-instance `generation`. If this actor's generation differs,
+    // the original instance was despawned and a NEW one respawned for the same
+    // `context_id` (crash-respawn or import-replace) between reserve and settle.
+    // We CANNOT distinguish those here, and releasing/refunding against THIS
+    // instance's owned state could corrupt the WRONG context's economy — so we
+    // touch NO owned state. But the service WAS rendered (H8), so we STILL
+    // capture the §19.15.5 receipt against the OPEN-TIME policy SNAPSHOT (never
+    // the live per-context policy — this may be a different context), via the
+    // supervisor payment adapter, exactly like the no-actor fallback in
+    // `settle_outlet_stream_via_actor`. The durable escrow hold + cumulative
+    // counter reserve are left in place: on a crash-restore the restore-time
+    // `ReconcileStreamReservations` sweep releases them from the persisted
+    // recovery record; on an import-replace they were already dropped with the
+    // replaced state (the record is stripped on export). Either way this path
+    // does NOT clear the record.
+    if generation != cell.generation {
+        tracing::debug!(
+            context_id = %context_id,
+            reserved_generation = generation,
+            live_generation = cell.generation,
+            "outlet stream settlement landed on a replaced actor instance — \
+             capturing the rendered bill against the open-time policy snapshot \
+             without touching owned state (Fix-D)"
+        );
+        let (Some(adapter), Some(policy)) = (
+            deps.payment_adapter.as_ref(),
+            economic_policy_snapshot.map(|snap| snap.policy),
+        ) else {
+            return StreamSettleOutcome::CapturedWithoutMutation(None);
+        };
+        if billed_amount.value() == 0 {
+            return StreamSettleOutcome::CapturedWithoutMutation(None);
+        }
+        return match authorize_and_capture_stream_billed(
+            adapter.as_ref(),
+            &policy,
+            &invoker_did,
+            billed_amount,
+            request_id,
+            &context_id,
+        )
+        .await
+        {
+            Ok(receipt) => {
+                tracing::debug!(
+                    request_id = %hex::encode(request_id),
+                    billed = billed_amount.value(),
+                    receipt_id = %hex::encode(receipt.receipt_id),
+                    "outlet stream settlement captured PaymentReceipt on a replaced \
+                     instance (reserves left for the reconcile sweep)"
+                );
+                StreamSettleOutcome::CapturedWithoutMutation(Some(receipt))
+            }
+            Err(err) => {
+                // H8: service rendered but capture failed on a replaced instance.
+                // There is no trustworthy owned receive buffer to emit a
+                // `PaymentCaptureFailed` event into here (this may be the wrong
+                // context) — log only; the reserve record stays for the sweep.
+                tracing::warn!(
+                    context_id = %context_id,
+                    "outlet stream settlement: payment capture failed on a replaced \
+                     instance: {err}"
+                );
+                StreamSettleOutcome::CapturedWithoutMutation(None)
+            }
+        };
+    }
+
+    // ---- Matching live instance: the clean close-time settlement. ----
+
+    // The UNSPENT cumulative reserve to release: `reserved − billed_count ×
+    // cost_per_chunk` (saturating). A degenerate `billed × cost` overflow FAILS
+    // CLOSED — releases nothing, leaving the counter conservatively over-charged
+    // (never under-charged). Mirrors
+    // [`CounterReserveSettlement::unspent_release_amount`](crate::context::outlets::dispatch::CounterReserveSettlement::unspent_release_amount).
+    let unspent_release = u64::from(billed_count)
+        .checked_mul(cost_per_chunk.value())
+        .map_or(0, |billed| {
+            amount_cumulative_reserved.saturating_sub(billed)
+        });
+    // An empty `ucan_cid` (legacy / test caller with no durable counter
+    // reservation) has no counter to release to.
+    let should_release = unspent_release > 0 && !ucan_cid.is_empty();
+
+    // Read the LIVE per-context economic policy for capture BEFORE the commit
+    // borrows the cell. Prefer live (it may have changed via governance since
+    // open); fall back to the open-time snapshot (H8) when the live policy is
+    // absent. Routed through the non-persisting `class_c_view()`.
+    let capture_policy = cell
+        .class_c_view()
+        .governance_class_c_mut()
+        .economic_policy_mut()
+        .clone()
+        .or_else(|| economic_policy_snapshot.map(|snap| snap.policy));
+
+    // Release the cumulative reserve + refund the escrow under ONE fail-closed
+    // persist. Both are owned-state writes; combining them means either both
+    // survive a coalesce-window crash or the KEEP'd in-memory mutation is
+    // retried by the run loop.
+    // Fix-D: a crash-recovery record was persisted at open IFF the stream held a
+    // durable escrow hold (`reserved > 0`) or a cumulative counter reserve. On
+    // this clean terminal the reserves are being released here, so the record
+    // must be CLEARED in the SAME persist — otherwise a later restart's
+    // reconcile sweep would see a stale record and double-release.
+    let record_persisted = reserved.value() > 0 || amount_cumulative_reserved > 0;
+    let request_key = hex::encode(request_id);
+    if should_release || refund_amount.value() > 0 || record_persisted {
+        let invoker_for_commit = invoker_did.clone();
+        let ucan_for_commit = ucan_cid.clone();
+        let commit_result = cell
+            .commit_class_s_keep(deps, &context_id, move |mut view| {
+                let state = view.rest_mut();
+                if should_release {
+                    state
+                        .class_s
+                        .caveat_counters
+                        .entry(ucan_for_commit)
+                        .or_default()
+                        .release(CaveatKind::AmountCumulative, unspent_release);
+                }
+                if refund_amount.value() > 0 {
+                    state
+                        .governance
+                        .budget_tracker
+                        .reverse_spend(&invoker_for_commit, refund_amount);
+                }
+                if record_persisted {
+                    // Consumed on the clean terminal — the reserves this record
+                    // tracked were just released above, so the crash-recovery
+                    // sweep must never see it (double-release guard).
+                    state.class_s.stream_reservations.remove(&request_key);
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(err) = commit_result {
+            // KEEP semantics: the in-memory release/refund IS applied; the run
+            // loop retries the durable write. Capture runs regardless (H8).
+            tracing::warn!(
+                context_id = %context_id,
+                request_id = %hex::encode(request_id),
+                "outlet stream settlement: release/refund persist failed (kept in memory): {err}"
+            );
+        }
+    }
+
+    // Capture the §19.15.5 PaymentReceipt for the EXACT billed amount. Skip when
+    // nothing was billed or no adapter/policy is configured (the legitimate
+    // zero-cost / no-payment-rail default).
+    let (Some(adapter), Some(policy)) = (deps.payment_adapter.as_ref(), capture_policy.as_ref())
+    else {
+        return StreamSettleOutcome::Settled(None);
+    };
+    if billed_amount.value() == 0 {
+        return StreamSettleOutcome::Settled(None);
+    }
+    match authorize_and_capture_stream_billed(
+        adapter.as_ref(),
+        policy,
+        &invoker_did,
+        billed_amount,
+        request_id,
+        &context_id,
+    )
+    .await
+    {
+        Ok(receipt) => {
+            tracing::debug!(
+                request_id = %hex::encode(request_id),
+                billed = billed_amount.value(),
+                billed_count,
+                receipt_id = %hex::encode(receipt.receipt_id),
+                "outlet stream settlement captured PaymentReceipt"
+            );
+            StreamSettleOutcome::Settled(Some(receipt))
+        }
+        Err(err) => {
+            // Capture failed AFTER service was rendered (H8): the billed budget
+            // is NOT reversed — only the unspent refund (already applied above)
+            // is returned. Surface a `PaymentCaptureFailed` LOCAL event for the
+            // reconciliation audit trail (ADR-051 §6 — per-payee, non-durable).
+            tracing::warn!(
+                context_id = %context_id,
+                "outlet stream settlement: payment capture failed: {err}"
+            );
+            let event = scp_protocol::context::membership::ContextEvent::PaymentCaptureFailed {
+                action: "outlet_stream".to_owned(),
+                actor_did: invoker_did.clone(),
+                error: err.to_string(),
+                cost: Some(billed_amount.value()),
+            };
+            crate::context::state::emit_event_into(
+                cell.class_c_view().receive_buffer_mut(),
+                event,
+                &context_id,
+                deps.event_tx.as_ref(),
+            );
+            StreamSettleOutcome::Settled(None)
+        }
+    }
+}
+
+/// Fix-D restore-time streaming crash-recovery sweep core, run inside the
+/// per-context actor on owned state.
+///
+/// Drains `ClassSState.stream_reservations` under ONE fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep).
+/// For each unresolved record it REFUNDS the full `reserved_escrow` to the
+/// invoker's `MemberBudgetTracker` (`reverse_spend`, saturating) and RELEASES the
+/// full `amount_cumulative_reserved` back to the §7.3.8 `AmountCumulative` counter
+/// keyed by `ucan_cid` (`release`, saturating). The billed count is unknown once
+/// the pump is gone, so the FULL reserved amounts are returned — conservative:
+/// the invoker is never over-charged and the cumulative cap is never
+/// over-consumed. Billing for rendered service is authoritative only where a
+/// settle actually fired: on a SOFT respawn the pump survived the actor restart
+/// and its close-time
+/// [`CapturedWithoutMutation`](StreamSettleOutcome::CapturedWithoutMutation)
+/// settle captured the manifest-anchored bill before this sweep runs; on a HARD
+/// crash (the pump died with the process, no settle ever fired) no manifest
+/// reaches settle, so service rendered before the crash is un-billed — the
+/// operator absorbs it (the correct, invoker-favoring direction). Either way the
+/// sweep never bills; it only returns the unspent reserve. Runs REGARDLESS of
+/// generation — a restore overwrites
+/// `PerContextState::generation` with a fresh spawn generation, and the reserves
+/// are this restored context's OWN state. The releases + the clear land in the
+/// SAME persist, so the sweep is idempotent across restarts.
+///
+/// Returns the number of records reconciled.
+///
+/// # Errors
+///
+/// [`ContextError::PersistenceFailed`] if the fail-closed persist did not land.
+/// The in-memory releases + clear are KEEP'd regardless (the run loop retries
+/// the durable write; a restart before it lands re-runs the sweep from the
+/// restored record — idempotent).
+pub(in crate::context) async fn reconcile_stream_reservations(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+) -> Result<usize, ContextError> {
+    let count = cell.class_s.stream_reservations.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        let state = view.rest_mut();
+        // Take the map out so the per-record reversal can borrow the sibling
+        // governance / caveat-counter state mutably without aliasing.
+        let records = std::mem::take(&mut state.class_s.stream_reservations);
+        for record in records.into_values() {
+            if record.reserved_escrow.value() > 0 {
+                // Refund the FULL open-time escrow hold — the pump is gone and
+                // the billed count is unknown. Saturating (`reverse_spend`), so a
+                // benign over-refund of an already-settled hold is a no-op.
+                state
+                    .governance
+                    .budget_tracker
+                    .reverse_spend(&record.invoker_did, record.reserved_escrow);
+            }
+            if record.amount_cumulative_reserved > 0 && !record.ucan_cid.is_empty() {
+                // Release the FULL cumulative reserve back to the counter.
+                state
+                    .class_s
+                    .caveat_counters
+                    .entry(record.ucan_cid)
+                    .or_default()
+                    .release(
+                        CaveatKind::AmountCumulative,
+                        record.amount_cumulative_reserved,
+                    );
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(count)
+}
+
+/// §5.4.5 open-time escrow REVERSAL on actor-owned state — the actor-mailbox
+/// port of the reference `ContextManager::outlet_stream_reverse_spend`.
+///
+/// Credits `amount` back to `member_did`'s
+/// [`MemberBudgetTracker`](scp_protocol::economy::budget::MemberBudgetTracker)
+/// via [`reverse_spend`](scp_protocol::economy::budget::MemberBudgetTracker::reverse_spend)
+/// — infallible / SATURATING at `0`, so a double-refund (a Drop-guard reversal
+/// after an explicit settlement already returned the hold) is a safe no-op —
+/// under a fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep),
+/// so the returned budget survives a coalesce-window crash the same way the
+/// original debit does.
+///
+/// # Errors
+///
+/// [`ContextError::PersistenceFailed`] when the fail-closed persist does not land
+/// (the credit is KEEP'd in memory — the run loop retries the durable write).
+pub async fn reverse_stream_escrow(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    member_did: &DID,
+    amount: Amount,
+) -> Result<(), ContextError> {
+    let member_did_owned = member_did.clone();
+    cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        view.rest_mut()
+            .governance
+            .budget_tracker
+            .reverse_spend(&member_did_owned, amount);
+        Ok(())
+    })
+    .await
+}
+
+/// Authorize + capture the exact `billed_amount` for a closed §5.4.5 stream —
+/// the actor-mailbox port of the `authorize_dyn → capture_dyn` sequence in the
+/// reference `ContextManager::outlet_stream_settle`.
+///
+/// The streaming billed amount (`cost_per_chunk × billed_count`) is the
+/// AUTHORITATIVE figure — NOT a fresh policy evaluation — so it is authorized and
+/// captured verbatim; the receipt reflects exactly what the invoker consumed.
+/// The `request_id` is the idempotency key (a settlement is captured at most
+/// once per stream). Shared by the on-actor
+/// [`settle_outlet_stream`] and the supervisor-side no-actor fallback
+/// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor).
+///
+/// # Errors
+///
+/// Propagates the adapter's [`PaymentError`](crate::economy::adapter::PaymentError)
+/// from either the authorize or the capture leg (service was rendered — the
+/// caller records a `PaymentCaptureFailed` and does NOT reverse the budget).
+pub async fn authorize_and_capture_stream_billed(
+    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
+    policy: &scp_protocol::economy::types::EconomicPolicy,
+    invoker_did: &DID,
+    billed_amount: Amount,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
+    context_id: &str,
+) -> Result<PaymentReceipt, crate::economy::adapter::PaymentError> {
+    let metadata = crate::economy::adapter::PaymentMetadata {
+        action_type: scp_protocol::economy::types::PaidActionType::OutletCall,
+        context_id: Some(context_id.to_owned()),
+        idempotency_key: request_id,
+    };
+    let auth = adapter
+        .authorize_dyn(
+            invoker_did,
+            &policy.payee,
+            billed_amount,
+            policy.cost_schedule.currency,
+            metadata,
+        )
+        .await?;
+    adapter.capture_dyn(&auth).await
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3a: settle_outlet_economy_capture (actor handler entry point)
 // ---------------------------------------------------------------------------
 
@@ -1287,6 +2062,11 @@ where
         invoker_did,
         timeout_ms,
         executor,
+        // SCP-OUT-028: the manager wrapper does not yet wire a
+        // handler-panic sink — the panic guard still recovers panics into
+        // `InvocationError::HandlerPanic`; only the §5.4.2 OutletVerified
+        // attribution emission is skipped when the sink is `None`.
+        None,
     )
     .await
     {
@@ -1647,7 +2427,187 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         InvocationError::CaveatViolation { slug, message } => ContextError::PermissionDenied(
             format!("SCP-OUTLET-6110: caveat violation [{slug}]: {message}"),
         ),
+        // §5.4.2 Protocol-class violations (SCP-OUT-013): Query cost rule,
+        // ReadOnlyInvocation write-deny, and executor kind mismatch all map
+        // to the Protocol code family.
+        InvocationError::OutletQueryCostViolation { reason } => ContextError::PermissionDenied(
+            format!("SCP-OUTLET-6100: Query outlet cost violation (§5.4.2): {reason}"),
+        ),
+        InvocationError::QueryViolation {
+            outlet_id,
+            operation,
+        } => ContextError::PermissionDenied(format!(
+            "SCP-OUTLET-6100: Query outlet {outlet_id} attempted write {operation} through ReadOnlyInvocation (§5.4.2)"
+        )),
+        InvocationError::KindMismatch { outlet_id, kind } => {
+            ContextError::PermissionDenied(format!(
+                "SCP-OUTLET-6100: outlet {outlet_id} registered as {kind:?} but executor returned KindMismatch (§5.4.2)"
+            ))
+        }
+        // §5.4.2 / §5.4.4 executor panic (SCP-OUT-028): Execution-class fault.
+        InvocationError::HandlerPanic {
+            outlet_id,
+            panic_message,
+        } => ContextError::PermissionDenied(format!(
+            "SCP-OUTLET-6130: outlet {outlet_id} handler panicked (execution.handler-panic): {panic_message}"
+        )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming open orchestrator helpers (chunk 3e)
+// ---------------------------------------------------------------------------
+
+/// Reverse-maps the streaming reserve's [`ContextError`] into the open-time
+/// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
+/// taxonomy for the [`Supervisor::open_outlet_stream`](crate::context::supervisor::supervisor::Supervisor::open_outlet_stream)
+/// orchestrator.
+///
+/// # Mapping direction (documented per the chunk-3 plan §3a note)
+///
+/// The streaming reserve ([`reserve_outlet_stream_economy`]) runs INSIDE the
+/// per-context actor and can only reply with a `Send` [`ContextError`] across
+/// the mailbox, so it encodes its two economic open-time rejections through the
+/// LOSSLESS forward direction —
+/// [`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)
+/// → [`invocation_error_to_context`] — which embeds the §5.4.4 slug verbatim in
+/// the resulting `PermissionDenied` message. This function is the REVERSE map,
+/// applied supervisor-side once the reservation error crosses back over the
+/// mailbox: it recovers `EscrowOverflow` / `InsufficientFunds` by matching the
+/// embedded slug against the SAME `error_codes::SLUG_*` constants the reserve
+/// stamped (so the two ends move together if a slug is ever renamed), maps the
+/// hard-rate-limit reject to the transport-fault admission slug, and routes
+/// every other reserve error (not-a-member, persist failure, transport) through
+/// that same transport-fault admission slug — the identical defensive fallback
+/// [`open_stream_session`](crate::context::outlets::dispatch::open_stream_session)
+/// itself uses for a synchronous failure outside the OUT-034 open taxonomy.
+// The `RateLimited` arm and the catch-all fallback intentionally share a body
+// (both surface the transport-fault admission slug) but are SEMANTICALLY
+// distinct — one is the reserve's hard-rate reject, the other the defensive
+// fallback for errors outside the OUT-034 taxonomy. Keep them separate for the
+// documented mapping rather than collapsing the meaning into one arm.
+#[allow(clippy::match_same_arms)]
+pub fn reserve_error_to_open_rejection(
+    err: &ContextError,
+) -> crate::context::outlets::dispatch::OpenStreamRejection {
+    use crate::context::outlets::dispatch::OpenStreamRejection;
+    use scp_protocol::context::outlets::error_codes;
+
+    match err {
+        ContextError::RateLimited { .. } => OpenStreamRejection::AdmissionRateLimited {
+            slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+        },
+        ContextError::PermissionDenied(msg)
+            if msg.contains(error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW) =>
+        {
+            OpenStreamRejection::EscrowOverflow
+        }
+        ContextError::PermissionDenied(msg)
+            if msg.contains(error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS) =>
+        {
+            OpenStreamRejection::InsufficientFunds
+        }
+        _ => OpenStreamRejection::AdmissionRateLimited {
+            slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+        },
+    }
+}
+
+/// The pair returned by [`build_stream_post_input_hook`]: the synchronous
+/// §7.3.8 local-check hook and the durable counter reservation committed at the
+/// dispatch pump's final open-time gate.
+type StreamPostInputBuild = (
+    Option<crate::context::outlets::invoke::CaveatPostInputCheck<'static>>,
+    Option<crate::context::outlets::dispatch::StreamCounterReservation>,
+);
+
+/// Builds the §7.3.8 post-input caveat hook for a streaming open, ENTIRELY
+/// inside the runtime, from the streaming open's own inputs — so every bridge
+/// gets identical, complete enforcement without supplying any hook. Ported from
+/// the reference `ContextManager::build_stream_post_input_hook` onto the actor
+/// architecture (the counter store is the actor-owned
+/// [`ActorClassSCaveatCounterAdapter`](crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter)).
+///
+/// A stream validates its input ONCE at open (§5.4.5), so this hook is run
+/// exactly once by `open_stream_session` before the pump spawns. It composes
+/// the SAME enforcement the non-streaming `invoke` path runs:
+///
+/// - synchronous local checks — `input_schema`, `amount_max_per_call` (gated
+///   against `cost_per_chunk`, the §19.5 per-invocation pricing unit),
+///   `allowed_adapters`, `allowed_target_dids`;
+/// - the durable counter CAS — `max_calls`, `amount_max_cumulative`,
+///   `rate_window` — committed NOT here but at the FINAL open-time gate via the
+///   returned [`StreamCounterReservation`](crate::context::outlets::dispatch::StreamCounterReservation)
+///   (R4 HIGH-2), so a rejected open burns no counter capacity.
+///
+/// `negotiated_adapter` and `target_did` are `None` — the streaming open
+/// surface (parity with `outlet_invoke`) negotiates neither a payment adapter
+/// nor a cross-context target DID.
+///
+/// Returns:
+/// - `Ok((None, None))` when the effective caveat set carries no §7.3.8
+///   post-input constraint;
+/// - `Ok((Some(hook), reservation))` otherwise (`reservation` is `Some` iff a
+///   counter-bearing cap is present AND a counter store is configured);
+/// - `Err(CaveatPostInputViolation)` — FAIL CLOSED — when the effective caveats
+///   carry a counter-bearing cap but no counter store is available (unreachable
+///   in the actor architecture, where the adapter store is always constructible,
+///   but retained for a faithful port).
+pub fn build_stream_post_input_hook(
+    caveats: &InvocationCaveats,
+    cost_per_chunk: Amount,
+    counter_store: Option<&Arc<dyn crate::trust::CaveatCounterApi>>,
+) -> Result<StreamPostInputBuild, crate::context::outlets::dispatch::OpenStreamRejection> {
+    use scp_protocol::context::outlets::error_codes;
+
+    if !caveats.requires_post_input_check() {
+        return Ok((None, None));
+    }
+
+    let reservation = if caveats.has_counter_bearing_caveat() {
+        match counter_store {
+            Some(store) => Some(
+                crate::context::outlets::dispatch::StreamCounterReservation {
+                    counter_store: Arc::clone(store),
+                    caveats: caveats.clone(),
+                },
+            ),
+            None => {
+                return Err(
+                    crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation {
+                        slug: error_codes::SLUG_AUTHORIZATION_DENIED.to_owned(),
+                    },
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let caveats_owned = caveats.clone();
+    let hook: crate::context::outlets::invoke::CaveatPostInputCheck<'static> =
+        Box::new(move |input: &serde_json::Value| {
+            let caveats = caveats_owned.clone();
+            let input = input.clone();
+            Box::pin(async move {
+                caveats
+                    .check_invocation_local(&input, cost_per_chunk, None, None)
+                    .map_err(|err| {
+                        use scp_protocol::trust::caveats::CheckInvocationError;
+                        let message = err.to_string();
+                        match err {
+                            CheckInvocationError::InputSchemaViolation { .. } => {
+                                InvocationError::InputValidationFailed { message }
+                            }
+                            other => InvocationError::CaveatViolation {
+                                slug: other.slug().to_owned(),
+                                message,
+                            },
+                        }
+                    })
+            })
+        });
+    Ok((Some(hook), reservation))
 }
 
 #[cfg(test)]
@@ -2293,6 +3253,35 @@ mod tests {
             assert_eq!(rec.max_calls_used, 3);
             assert_eq!(rec.amount_cumulative_used, 42);
             assert_eq!(rec.rate_window_timestamps, vec![1, 2, 3]);
+        }
+
+        /// Fix-D: streaming reservation recovery records survive a Class-S
+        /// snapshot → clear → restore cycle (the ADR-049 §9 mirror rehydrates
+        /// them after a crash so the reconcile sweep can release the stranded
+        /// escrow hold + cumulative counter reserve).
+        #[test]
+        fn stream_reservations_survive_class_s_snapshot_round_trip() {
+            use crate::context::outlets::invoke::StreamReservationRecord;
+
+            let expected = StreamReservationRecord {
+                invoker_did: scp_did::DID::from("did:key:snap-invoker"),
+                ucan_cid: "cid-open".to_owned(),
+                cost_per_chunk: Amount::new(9),
+                amount_cumulative_reserved: 270,
+                reserved_escrow: Amount::new(180),
+                generation: 2,
+            };
+            let mut state = active_state();
+            state
+                .class_s
+                .stream_reservations
+                .insert("req-snap".to_owned(), expected.clone());
+
+            let snap = state.class_s.snapshot();
+            state.class_s.stream_reservations.clear();
+            assert!(state.class_s.stream_reservations.is_empty());
+            state.class_s.restore(snap);
+            assert_eq!(state.class_s.stream_reservations["req-snap"], expected);
         }
 
         // -------------------------------------------------------------------
@@ -3074,6 +4063,441 @@ mod tests {
             assert_eq!(
                 cell.class_s.caveat_counters[cid].amount_cumulative_used, 10,
                 "a rejected paid reserve leaves the cumulative counter at its last admitted total"
+            );
+        }
+    }
+
+    /// Sub-chunk 3a — streaming open-time economy reserve
+    /// ([`reserve_outlet_stream_economy`]).
+    ///
+    /// Covers the escrow-debit math (`cost × count`, `cost == 0 → 0`, checked
+    /// overflow), the generation/economic-policy capture, the not-a-member
+    /// reject, and the budget reversal on persist failure. No per-sender
+    /// sequence is allocated at reserve (allocate-at-consumption), so the tests
+    /// assert the membership sequence counter is left UNTOUCHED.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    mod stream_reserve {
+        use std::sync::Arc;
+
+        use scp_did::DID;
+        use scp_protocol::economy::types::{Amount, EconomicPolicy};
+
+        use crate::context::ContextError;
+        use crate::context::ContextState;
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::deps::ActorDeps;
+        use crate::context::actor::state::PerContextState;
+
+        const INVOKER: &str = "did:dht:z6MkStreamInvoker";
+        const CTX_BYTE: u8 = 0x57;
+        const NOW: u64 = 1_700_000_000;
+
+        fn ctx_key() -> String {
+            hex::encode([CTX_BYTE; 32])
+        }
+
+        fn invoker() -> DID {
+            DID(INVOKER.to_owned())
+        }
+
+        /// Persistence double whose `persist_context` always SUCCEEDS.
+        struct OkPersistence;
+        #[async_trait::async_trait]
+        impl crate::context::persistence::ContextPersistence for OkPersistence {
+            async fn persist_context(
+                &self,
+                _: &str,
+                _: &crate::context::state::ContextSnapshot,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn load_context(
+                &self,
+                _: &str,
+            ) -> Result<
+                Option<crate::context::state::ContextSnapshot>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(None)
+            }
+            async fn delete_context(
+                &self,
+                _: &str,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn list_persisted_contexts(
+                &self,
+            ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Vec::new())
+            }
+        }
+
+        /// Persistence double whose `persist_context` always FAILS — drives the
+        /// fail-closed escrow-debit compensation path.
+        struct FailPersistence;
+        #[async_trait::async_trait]
+        impl crate::context::persistence::ContextPersistence for FailPersistence {
+            async fn persist_context(
+                &self,
+                _: &str,
+                _: &crate::context::state::ContextSnapshot,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err("induced persist failure".into())
+            }
+            async fn load_context(
+                &self,
+                _: &str,
+            ) -> Result<
+                Option<crate::context::state::ContextSnapshot>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(None)
+            }
+            async fn delete_context(
+                &self,
+                _: &str,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn list_persisted_contexts(
+                &self,
+            ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn build_deps(
+            persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+        ) -> ActorDeps {
+            use crate::context::supervisor::supervisor::Supervisor;
+            use scp_platform::testing::InMemoryStorage;
+
+            let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                INVOKER.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ));
+            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+                Box::new(crate::context::providers::MerkleEventLogProvider::new());
+            let key_resolver: scp_protocol::context::governance::KeyResolver =
+                Arc::new(|_, _| None);
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(NOW));
+            let supervisor = Supervisor::with_providers(
+                crypto,
+                transport,
+                event_log,
+                key_resolver,
+                Some(persistence),
+                None,
+                None,
+                Some(clock),
+                mls_storage,
+            );
+            supervisor
+                .build_actor_deps(&invoker())
+                .await
+                .expect("build_actor_deps")
+        }
+
+        /// Active context with `INVOKER` a member holding `budget` spendable.
+        fn member_state(budget: u64) -> PerContextState {
+            let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+            state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("transition to Active");
+            state
+                .membership
+                .add_member(invoker(), "member".to_owned(), Vec::new());
+            if budget > 0 {
+                state
+                    .governance
+                    .budget_tracker
+                    .grant(&invoker(), Amount::new(budget));
+            }
+            state
+        }
+
+        fn economic_policy() -> EconomicPolicy {
+            use scp_protocol::economy::types::{CostSchedule, CurrencyCode};
+            EconomicPolicy {
+                locked: false,
+                cost_schedule: CostSchedule {
+                    currency: CurrencyCode::from("USD"),
+                    per_message: None,
+                    per_outlet_call: Some(Amount::new(10)),
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:key:stream-payee"),
+            }
+        }
+
+        async fn reserve(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            cost: u64,
+            count: u32,
+            max_per_action: Option<u64>,
+        ) -> Result<super::super::StreamEconomyReservation, ContextError> {
+            super::super::reserve_outlet_stream_economy(
+                cell,
+                deps,
+                &ctx_key(),
+                &invoker(),
+                Amount::new(cost),
+                count,
+                max_per_action.map(Amount::new),
+                NOW,
+            )
+            .await
+        }
+
+        /// Success: `reserved = cost × count` is DEBITED, and the reservation
+        /// captures the generation and economic-policy snapshot. No per-sender
+        /// sequence is allocated (allocate-at-consumption).
+        #[tokio::test]
+        async fn debits_escrow_and_captures_fields() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut state = member_state(1000);
+            state.governance.economic_policy = Some(economic_policy());
+            let mut cell = ClassSCell::new(state);
+            let generation = cell.generation;
+
+            let reservation = reserve(&mut cell, &deps, 10, 4, None)
+                .await
+                .expect("reserve admits within budget");
+
+            assert_eq!(
+                reservation.reserved_escrow,
+                Amount::new(40),
+                "reserved_escrow = cost 10 × count 4"
+            );
+            assert_eq!(
+                reservation.generation, generation,
+                "the reservation captures the actor generation"
+            );
+            assert_eq!(
+                reservation.economic_policy,
+                Some(economic_policy()),
+                "the reservation snapshots the economic policy at acceptance"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(40),
+                "the 40-unit escrow hold is DEBITED against the invoker's budget"
+            );
+            assert_eq!(
+                cell.membership.get(INVOKER).unwrap().sequence_number,
+                0,
+                "the reserve does NOT allocate a per-sender sequence \
+                 (allocate-at-consumption) — the counter is left at 0"
+            );
+        }
+
+        /// Successive opens each debit their own hold and NEVER touch the
+        /// per-sender sequence counter (allocate-at-consumption).
+        #[tokio::test]
+        async fn escrow_debits_across_opens_without_touching_sequence() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let _first = reserve(&mut cell, &deps, 10, 2, None)
+                .await
+                .expect("first open");
+            let _second = reserve(&mut cell, &deps, 10, 3, None)
+                .await
+                .expect("second open");
+
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(50),
+                "both holds (20 + 30) are debited"
+            );
+            assert_eq!(
+                cell.membership.get(INVOKER).unwrap().sequence_number,
+                0,
+                "neither open advanced the per-sender sequence counter"
+            );
+        }
+
+        /// `cost_per_chunk == 0` (Query / zero-cost) short-circuits to a zero
+        /// hold with no debit and no balance consultation — and, like every
+        /// open, allocates no per-sender sequence.
+        #[tokio::test]
+        async fn zero_cost_reserves_nothing() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            // No budget at all — a zero-cost open must not consult the balance.
+            let mut cell = ClassSCell::new(member_state(0));
+
+            let reservation = reserve(&mut cell, &deps, 0, 5, None)
+                .await
+                .expect("zero-cost open admits without budget");
+
+            assert_eq!(
+                reservation.reserved_escrow,
+                Amount::new(0),
+                "zero cost → zero hold"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "no debit for a zero-cost stream"
+            );
+            assert_eq!(
+                cell.membership.get(INVOKER).unwrap().sequence_number,
+                0,
+                "a zero-cost open allocates no per-sender sequence either"
+            );
+        }
+
+        /// `cost × count` overflow → an escrow-overflow error, with no budget
+        /// debited and the per-sender sequence counter left untouched.
+        #[tokio::test]
+        async fn overflow_rejects_and_rolls_back() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let err = reserve(&mut cell, &deps, u64::MAX, 2, None)
+                .await
+                .expect_err("cost u64::MAX × count 2 overflows");
+
+            assert!(
+                format!("{err}").contains("economic.escrow-overflow"),
+                "the overflow reject names the escrow-overflow slug: {err}"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "overflow rejects BEFORE any debit"
+            );
+            assert_eq!(
+                cell.membership.get(INVOKER).unwrap().sequence_number,
+                0,
+                "the per-sender sequence counter is never allocated at reserve"
+            );
+        }
+
+        /// `reserved > effective_remaining` → an insufficient-funds error, with
+        /// no budget debited and the per-sender sequence counter left untouched.
+        #[tokio::test]
+        async fn insufficient_funds_rejects_and_rolls_back() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            // Budget 50, but the reservation wants 10 × 100 = 1000.
+            let mut cell = ClassSCell::new(member_state(50));
+
+            let err = reserve(&mut cell, &deps, 10, 100, None)
+                .await
+                .expect_err("reserved 1000 > remaining 50");
+
+            assert!(
+                format!("{err}").contains("economic.insufficient-funds"),
+                "the reject names the insufficient-funds slug: {err}"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "insufficient funds rejects BEFORE any debit"
+            );
+            assert_eq!(
+                cell.membership.get(INVOKER).unwrap().sequence_number,
+                0,
+                "the per-sender sequence counter is never allocated at reserve"
+            );
+        }
+
+        /// The §19.5 `max_per_action` ceiling AND-folds into the effective
+        /// spendable balance: a reservation under the raw balance but over the
+        /// per-action cap is rejected.
+        #[tokio::test]
+        async fn max_per_action_ceiling_gates_reservation() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            // Balance 1000, but the per-action cap is 30 while the reservation
+            // wants 10 × 5 = 50.
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let err = reserve(&mut cell, &deps, 10, 5, Some(30))
+                .await
+                .expect_err("reserved 50 > per-action cap 30");
+
+            assert!(
+                format!("{err}").contains("economic.insufficient-funds"),
+                "the per-action ceiling reject reuses the insufficient-funds slug: {err}"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "the capped reservation debits nothing"
+            );
+        }
+
+        /// A non-member has no per-sender sequence counter → reject.
+        #[tokio::test]
+        async fn rejects_non_member() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+            state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("transition to Active");
+            state
+                .governance
+                .budget_tracker
+                .grant(&invoker(), Amount::new(1000));
+            // NOTE: no `add_member` — the invoker is not on the roster.
+            let mut cell = ClassSCell::new(state);
+
+            let err = reserve(&mut cell, &deps, 10, 4, None)
+                .await
+                .expect_err("a non-member cannot open a stream");
+
+            assert!(
+                matches!(err, ContextError::PermissionDenied(_)),
+                "a non-member open is a permission denial: {err:?}"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "a rejected non-member open debits nothing"
+            );
+        }
+
+        /// A fail-closed escrow-debit persist failure reverses the budget debit
+        /// (the compensation path); the per-sender sequence counter is never
+        /// allocated at reserve, so it stays untouched throughout.
+        #[tokio::test]
+        async fn persist_failure_reverses_budget_and_sequence() {
+            let deps = build_deps(Box::new(FailPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let err = reserve(&mut cell, &deps, 10, 4, None)
+                .await
+                .expect_err("a failed escrow-debit persist rejects the open");
+
+            assert!(
+                matches!(err, ContextError::PersistenceFailed(_)),
+                "a failed fail-closed persist surfaces PersistenceFailed: {err:?}"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "the budget debit is REVERSED when the persist does not land"
+            );
+            assert_eq!(
+                cell.membership.get(INVOKER).unwrap().sequence_number,
+                0,
+                "the per-sender sequence counter is never allocated at reserve"
             );
         }
     }

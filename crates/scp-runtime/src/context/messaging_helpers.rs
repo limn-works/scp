@@ -2781,6 +2781,11 @@ pub fn build_snapshot_from_state(
         // `max_calls` / `amount_max_cumulative` / `rate_window` cap survives an
         // actor crash rather than un-consuming. See [`caveat_counters_snapshot`].
         caveat_counters: caveat_counters_snapshot(state),
+        // Fix-D Class S: persist the streaming reservation recovery records so a
+        // crash-restore can RELEASE the escrow hold + cumulative counter reserve
+        // of any stream whose off-mailbox pump survived the crash. See
+        // [`stream_reservations_snapshot`].
+        stream_reservations: stream_reservations_snapshot(state),
         // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold the broadcast
         // security + roster state (per-author key epochs, block lists, subscriber
         // registry) into the fail-closed snapshot so a block / governance ban /
@@ -2912,6 +2917,21 @@ pub(in crate::context) fn caveat_counters_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<String, crate::trust::caveat_counters::CaveatCounters> {
     state.class_s.caveat_counters.clone()
+}
+
+/// Project [`ClassSState::stream_reservations`](crate::context::actor::state::ClassSState::stream_reservations)
+/// onto its snapshot map (Fix-D). The live
+/// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+/// is a plain `Clone` serde value, so — like [`caveat_counters_snapshot`] — the
+/// snapshot stores the map directly. Exists so EVERY snapshot builder projects
+/// this Class-S field through ONE helper, exactly like its siblings. Without
+/// persisting it, a crash while a stream's off-mailbox pump is mid-flight would
+/// strand the open-time escrow hold + cumulative counter reserve (the pump's
+/// close-time settle lands on the respawned generation and is dropped).
+pub(in crate::context) fn stream_reservations_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<String, crate::context::outlets::invoke::StreamReservationRecord> {
+    state.class_s.stream_reservations.clone()
 }
 
 // ---------------------------------------------------------------------------

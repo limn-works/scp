@@ -14,7 +14,7 @@ use scp_protocol::context::outlets::registry::{
 use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::{ContextParams, ContextState};
 use scp_runtime::context::ContextHandle;
-use scp_runtime::context::outlets::invoke::invoke_outlet;
+use scp_runtime::context::outlets::invoke::invoke_outlet_aggregating;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = serde_json::json!({"a": 7, "b": 3, "op": "mul"});
     println!("\nInvoking calculator with: {input}");
 
-    let (output, invoke_event, _consequences, _receipt) = invoke_outlet(
+    let (output, invoke_event, _consequences, _receipt) = invoke_outlet_aggregating(
         &handle,
         &registry,
         &role_state,
@@ -121,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None, // default timeout
         executor,
         None::<&mut scp_runtime::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None,
     )
     .await
     .map_err(|e| e.to_string())?;

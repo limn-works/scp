@@ -217,6 +217,16 @@ impl SupervisorHandle {
         self.supervisor.remove_member_floors(ctx, did);
     }
 
+    /// Permanent-teardown drop of the per-context outlet-stream admission
+    /// registry entry for `context_id` (spec §5.4.5) — the streaming twin of
+    /// [`Self::remove_context_floors`]. See
+    /// [`Supervisor::reap_stream_admission`] for the live-Arc safety
+    /// argument. Callers (the terminal close / TTL-expiry paths) invoke this
+    /// only when the context is permanently gone.
+    pub(in crate::context) fn reap_stream_admission(&self, context_id: &str) {
+        self.supervisor.reap_stream_admission(context_id);
+    }
+
     /// Start a cross-context saga. The ONLY way for an actor to affect
     /// state in another context.
     ///
@@ -818,6 +828,23 @@ impl SupervisorHandle {
                 "dispatch_start_ttl_timer: actor reported TTL timer install failure"
             );
         }
+    }
+
+    /// Fix-D — dispatch the restore-time streaming crash-recovery sweep to a
+    /// freshly-respawned actor, delegating to
+    /// [`Supervisor::reconcile_stream_reservations_via_actor`](crate::context::supervisor::Supervisor::reconcile_stream_reservations_via_actor).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the dispatch / reply-channel [`ContextError`] from the inner
+    /// supervisor (callers on the restore path treat it best-effort).
+    pub(in crate::context) async fn reconcile_stream_reservations_via_actor(
+        &self,
+        context_id: &str,
+    ) -> Result<usize, scp_protocol::context::ContextError> {
+        self.supervisor
+            .reconcile_stream_reservations_via_actor(context_id)
+            .await
     }
 }
 

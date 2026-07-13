@@ -812,6 +812,11 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // snapshot is never imported back into a live encrypted context, so no
         // spend/rate window is re-opened by stripping them here.
         caveat_counters: HashMap::new(),
+        // Fix-D: streaming reservation recovery records are local invoker-economy
+        // state with no authority on a foreign node — ALWAYS dropped from the
+        // public export (like the budget tracker and the caveat counters). A
+        // foreign node must never drive a local escrow refund / counter release.
+        stream_reservations: HashMap::new(),
         // Broadcast per-author keys and block lists are sensitive access-control
         // state; a public-scope export is for pre-join observers, so it is
         // redacted here (mirrors the empty `read_exclusion_list` / `membership`).
@@ -1013,6 +1018,8 @@ mod tests {
             // a fresh node starts its own replay window — dropped from export.
             xctx_nonce_dedup: HashMap::new(),
             caveat_counters: HashMap::new(),
+            // Fix-D: local invoker-economy recovery records — dropped from export.
+            stream_reservations: HashMap::new(),
             broadcast: None,
         }
     }
@@ -2707,6 +2714,74 @@ mod tests {
         assert!(
             stripped.caveat_counters.is_empty(),
             "a public export must never carry local caveat-counter accounting"
+        );
+    }
+
+    /// Fix-D: a populated streaming reservation recovery record MUST round-trip
+    /// value-stable through the ACTUAL persistence codec
+    /// (`rmp_serde::to_vec_named` / `from_slice`), or a crash+respawn would
+    /// silently reset it and strand the open-time escrow hold + cumulative
+    /// counter reserve it exists to release.
+    #[test]
+    fn stream_reservations_persistence_roundtrips_value_stable() {
+        use crate::context::outlets::invoke::StreamReservationRecord;
+        use scp_protocol::economy::types::Amount;
+
+        let expected = StreamReservationRecord {
+            invoker_did: DID::from("did:key:stream-invoker"),
+            ucan_cid: "bafy-open-ucan-cid".to_owned(),
+            cost_per_chunk: Amount::new(7),
+            amount_cumulative_reserved: 350,
+            reserved_escrow: Amount::new(210),
+            generation: 4,
+        };
+        let mut snapshot = test_snapshot("ctx-stream-reservations-roundtrip");
+        snapshot
+            .stream_reservations
+            .insert("deadbeef-request-id".to_owned(), expected.clone());
+
+        // MessagePack persistence round-trip (the path used by
+        // ContextPersistence::persist_context / load).
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let decoded: ContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded.stream_reservations.len(), 1);
+        let decoded_record = decoded
+            .stream_reservations
+            .get("deadbeef-request-id")
+            .expect("the streaming reservation record survives the persistence round-trip");
+        // Value-stable via the derived `PartialEq` — every field byte-for-byte.
+        assert_eq!(*decoded_record, expected);
+    }
+
+    /// Fix-D: streaming reservation recovery records are LOCAL invoker-economy
+    /// state with no authority on a foreign node, so `strip_snapshot_for_public`
+    /// MUST drop them from a public-scope export (identical to the caveat
+    /// counters and the budget tracker) — a foreign node must never be handed the
+    /// means to drive a local escrow refund / counter release.
+    #[test]
+    fn strip_snapshot_for_public_drops_stream_reservations() {
+        use crate::context::outlets::invoke::StreamReservationRecord;
+        use scp_protocol::economy::types::Amount;
+
+        let mut snapshot = test_snapshot("ctx-stream-reservations-strip");
+        snapshot.stream_reservations.insert(
+            "deadbeef-request-id".to_owned(),
+            StreamReservationRecord {
+                invoker_did: DID::from("did:key:stream-invoker"),
+                ucan_cid: "bafy-open-ucan-cid".to_owned(),
+                cost_per_chunk: Amount::new(7),
+                amount_cumulative_reserved: 350,
+                reserved_escrow: Amount::new(210),
+                generation: 4,
+            },
+        );
+
+        let stripped =
+            strip_snapshot_for_public(&snapshot).expect("public strip builds a minimal snapshot");
+        assert!(
+            stripped.stream_reservations.is_empty(),
+            "a public export must never carry local streaming reservation records"
         );
     }
 

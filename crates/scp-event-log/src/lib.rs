@@ -552,6 +552,23 @@ pub enum EventLogError {
     /// The signing operation failed during checkpoint generation.
     #[error("signing failed: {0}")]
     SigningFailed(String),
+
+    /// An `OutletInvokedEvent` whose recorded `chunks_billed` does not match
+    /// the value derivable from the manifest root, the sealed chunk sequence,
+    /// and the cancel-ack sequence is a wire-layer rejection — the event is
+    /// refused at log-insert time, not accepted-and-flagged (§5.4.5).
+    #[error(
+        "OutletInvokedEvent.chunks_billed mismatch (§5.4.5): recorded={recorded}, \
+         reference={reference}"
+    )]
+    ChunksBilledMismatch {
+        /// Recorded value carried by the rejected event.
+        recorded: u32,
+        /// Reference count derived from the chunk manifest +
+        /// cancel-ack sequence by
+        /// `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`.
+        reference: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------

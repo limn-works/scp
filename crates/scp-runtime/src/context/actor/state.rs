@@ -913,6 +913,29 @@ pub struct ClassSState {
     /// restore rehydrates the map; cross-node public export strips it (a
     /// foreign node starts its own accounting) — see the snapshot wiring.
     pub(crate) caveat_counters: HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
+
+    /// Fix-D durable crash-recovery records for in-flight STREAMING
+    /// reservations, keyed by the stream `request_id` (hex). Each
+    /// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+    /// captures the §5.4.5 open-time escrow HOLD + the §7.3.8 `AmountCumulative`
+    /// counter reserve a stream open debited, so the restore-time
+    /// [`ReconcileStreamReservations`](crate::context::actor::commands::OutletsCommand::ReconcileStreamReservations)
+    /// sweep can RELEASE them when the off-mailbox pump — a `tokio` task that
+    /// SURVIVES an actor crash + respawn — would otherwise strand them (its
+    /// close-time settle lands on the respawned instance, mismatches the bumped
+    /// generation, and is dropped by the confused-deputy guard).
+    ///
+    /// **Class S — a persisted reserve must NEVER lose its release handle.**
+    /// Inserted at pump open in the SAME fail-closed `commit_class_s_keep` family
+    /// as (after) the durable reservations it tracks, so the reserve and the
+    /// means to reverse it survive a coalesce-window crash together (ADR-049 §9).
+    /// Consumed (removed) on EVERY terminal path — the clean close-time settle
+    /// AND the crash-recovery sweep — so the map holds only genuinely in-flight
+    /// streams and does not accumulate. Same-node restore rehydrates it;
+    /// cross-node public export strips it (invoker economy + counters are local),
+    /// exactly like [`Self::caveat_counters`].
+    pub(crate) stream_reservations:
+        HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
 }
 
 /// Lossless, `Clone`-able mirror of [`ClassSState`] (ADR-049 §9).
@@ -953,6 +976,11 @@ pub struct ClassSStateSnapshot {
     /// Mirror of [`ClassSState::caveat_counters`]. [`CaveatCounters`] is
     /// `Clone`, so this snapshots by direct clone (no projection needed).
     pub(crate) caveat_counters: HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
+    /// Mirror of [`ClassSState::stream_reservations`] (Fix-D). The
+    /// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+    /// is `Clone` + serde, so this snapshots by direct clone (no projection).
+    pub(crate) stream_reservations:
+        HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
 }
 
 #[allow(
@@ -982,6 +1010,7 @@ impl ClassSState {
             xctx_committed_invocations: self.xctx_committed_invocations.clone(),
             xctx_caller_reservations: self.xctx_caller_reservations.clone(),
             caveat_counters: self.caveat_counters.clone(),
+            stream_reservations: self.stream_reservations.clone(),
         }
     }
 
@@ -1002,6 +1031,7 @@ impl ClassSState {
         self.xctx_committed_invocations = snap.xctx_committed_invocations;
         self.xctx_caller_reservations = snap.xctx_caller_reservations;
         self.caveat_counters = snap.caveat_counters;
+        self.stream_reservations = snap.stream_reservations;
     }
 }
 
@@ -1482,6 +1512,7 @@ impl PerContextState {
                 xctx_committed_invocations: std::collections::HashSet::new(),
                 xctx_caller_reservations: std::collections::HashMap::new(),
                 caveat_counters: HashMap::new(),
+                stream_reservations: HashMap::new(),
             },
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
@@ -1752,6 +1783,7 @@ mod tests {
             xctx_committed_invocations,
             xctx_caller_reservations,
             caveat_counters,
+            stream_reservations,
         } = class_s;
 
         // Identity + lifetime.
@@ -1822,6 +1854,8 @@ mod tests {
         assert!(xctx_caller_reservations.is_empty());
         // No §7.3.8 caveat counters recorded on a fresh context.
         assert!(caveat_counters.is_empty());
+        // No in-flight streaming reservation recovery records on a fresh context.
+        assert!(stream_reservations.is_empty());
         assert!(pending_broadcast_publishes.is_empty());
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
@@ -1877,6 +1911,7 @@ mod tests {
                     xctx_committed_invocations: _,
                     xctx_caller_reservations: _,
                     caveat_counters: _,
+                    stream_reservations: _,
                 },
             pending_broadcast_publishes: _,
             welcome_scratchpad: _,

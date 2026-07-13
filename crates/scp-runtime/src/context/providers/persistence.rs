@@ -207,6 +207,7 @@ mod tests {
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: std::collections::HashMap::new(),
             caveat_counters: std::collections::HashMap::new(),
+            stream_reservations: std::collections::HashMap::new(),
             broadcast: None,
         }
     }

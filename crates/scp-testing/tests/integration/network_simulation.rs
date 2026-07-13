@@ -1107,7 +1107,7 @@ async fn application_layer_demo() {
     use scp_core::context::manager::ContextManager;
     use scp_core::context::membership::{ContextEvent, KeyPackage};
     use scp_core::context::outlets::registry::{OutletRegistration, OutletRegistry, OutletSchema};
-    use scp_core::context::outlets::{invoke_outlet, register_outlet};
+    use scp_core::context::outlets::{invoke_outlet_aggregating, register_outlet};
     use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
     use scp_core::context::{Capability, ContextParams, ContextState, GovernanceAction};
     use scp_did::DID;
@@ -1469,7 +1469,7 @@ async fn application_layer_demo() {
     println!("    input: {search_input}");
 
     // The executor is a real async function that simulates the outlet.
-    let (output, invoke_event, _consequences, _receipt) = invoke_outlet(
+    let (output, invoke_event, _consequences, _receipt) = invoke_outlet_aggregating(
         &handle,
         &outlet_registry,
         &role_state,
@@ -1490,6 +1490,7 @@ async fn application_layer_demo() {
             }))
         },
         None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None,
     )
     .await
     .unwrap();
@@ -1511,7 +1512,7 @@ async fn application_layer_demo() {
     println!("  Invoking 'calculator' as Charlie:");
     println!("    input: {calc_input}");
 
-    let (calc_output, _, _consequences, _receipt) = invoke_outlet(
+    let (calc_output, _, _consequences, _receipt) = invoke_outlet_aggregating(
         &handle,
         &outlet_registry,
         &role_state,
@@ -1538,6 +1539,7 @@ async fn application_layer_demo() {
             }))
         },
         None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None,
     )
     .await
     .unwrap();

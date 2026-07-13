@@ -1635,6 +1635,8 @@ pub async fn create_context(
             ),
             // §7.3.8 value-caveat counters: fresh on create.
             caveat_counters: HashMap::new(),
+            // Fix-D streaming reservation recovery records: fresh on create.
+            stream_reservations: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2516,6 +2518,8 @@ pub async fn import_context(
             ),
             // §7.3.8 value-caveat counters: fresh on create.
             caveat_counters: HashMap::new(),
+            // Fix-D streaming reservation recovery records: fresh on create.
+            stream_reservations: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -3115,6 +3119,13 @@ pub async fn restore_context(
             // wall clock, so a restart can only ever DROP stale timestamps —
             // never widen a window. Cross-node public export strips this map.
             caveat_counters: ctx_snapshot.caveat_counters,
+            // Fix-D Class S: same-node restore REHYDRATES the streaming
+            // reservation recovery records so the post-restore reconcile sweep
+            // can RELEASE the escrow hold + cumulative counter reserve of any
+            // stream whose off-mailbox pump survived the crash (its close-time
+            // settle lands on the respawned generation and is dropped). Cross-
+            // node public export strips this map (invoker economy is local).
+            stream_reservations: ctx_snapshot.stream_reservations,
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -3134,6 +3145,41 @@ pub async fn restore_context(
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+    // Fix-D — restore-time streaming crash-recovery sweep. The actor is now
+    // resident with its Class-S state rehydrated (including any
+    // `stream_reservations` records). Drive the reconcile ON the freshly-
+    // respawned actor: it RELEASES the durable escrow hold + §7.3.8 cumulative
+    // counter reserve of any stream whose off-mailbox pump survived the crash
+    // (that pump's close-time settle now lands on the bumped generation and is
+    // dropped) and clears the records. This is the streaming analog of the
+    // §6.2.4 saga reconciliation, but scoped to the SAME restored context —
+    // streaming has no cross-context saga journal, and the reservation is this
+    // context's OWN owned state, so it runs regardless of generation. Best-
+    // effort: a dispatch miss (context despawned again) leaves the records for
+    // the next restart's sweep (idempotent) rather than failing the restore.
+    match deps
+        .supervisor
+        .reconcile_stream_reservations_via_actor(context_id)
+        .await
+    {
+        Ok(reconciled) if reconciled > 0 => {
+            tracing::info!(
+                context_id = %context_id,
+                reconciled,
+                "Fix-D: released stranded streaming reservations on restore \
+                 (pump survived a crash — escrow + cumulative counter reserve refunded)"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                context_id = %context_id,
+                "Fix-D: streaming reservation reconcile on restore failed \
+                 (records left for the next restart's sweep): {err}"
+            );
+        }
+    }
 
     // Governance timeouts (ADR-031 §5) are ACTOR-OWNED (ADR-049
     // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
@@ -3386,6 +3432,11 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // shutdown sweep.
         let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx_id);
         supervisor.remove_context_floors(&ctx_id_bytes);
+        // Drop the per-context stream admission-tracker registry entry on the
+        // same teardown sweep (spec §5.4.5) — the streaming twin of the
+        // crash-window / floor-registry reaps above, keeping the admission
+        // registry from leaking past a shutdown.
+        supervisor.reap_stream_admission(ctx_id);
     }
 
     // Supervisor-level state clear. Acquired under the write_lock once

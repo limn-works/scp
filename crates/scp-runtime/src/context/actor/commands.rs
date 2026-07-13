@@ -2249,6 +2249,207 @@ pub enum OutletsCommand {
             Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>,
         >,
     },
+
+    /// Streaming open-time economy reserve on actor-owned state — the
+    /// streaming-native counterpart of [`Self::ReserveOutletEconomy`].
+    /// Consumes the hard rate limit, records the velocity entry, snapshots the
+    /// economic policy, gates on membership, and DEBITS the §5.4.5 open-time
+    /// escrow hold (`cost_per_chunk × estimated_chunk_count`) under a
+    /// fail-closed persist. The per-sender `base_sequence` is NOT allocated here
+    /// — the transport/FFI send path allocates it at consumption.
+    /// Replies with a `Send`
+    /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
+    /// the supervisor carries across the off-mailbox stream pump.
+    ///
+    /// See [`crate::context::outlets_helpers::reserve_outlet_stream_economy`].
+    ReserveOutletStreamEconomy {
+        /// Context identifier string.
+        context_id: String,
+        /// Invoker DID.
+        invoker_did: scp_did::DID,
+        /// Per-Data-chunk cost. `Amount::new(0)` for Query / zero-cost outlets
+        /// (short-circuits the escrow debit to a zero hold).
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        /// Declared estimated Data-chunk count — the escrow hold multiplier.
+        estimated_chunk_count: u32,
+        /// Optional §19.5 per-action ceiling AND-folded into the effective
+        /// spendable balance when a spending UCAN caps per-action spend.
+        max_per_action: Option<scp_protocol::economy::types::Amount>,
+        /// Current Unix time in seconds — caller supplies to keep the handler
+        /// deterministic.
+        now_secs: u64,
+        /// Oneshot reply channel carrying the streaming open reservation.
+        reply: oneshot::Sender<
+            Result<Box<crate::context::outlets_helpers::StreamEconomyReservation>, ContextError>,
+        >,
+    },
+
+    /// Off-mailbox streaming §7.3.8 value-caveat counter reservation on
+    /// actor-owned Class-S state — the streaming-pump counterpart of the
+    /// unary `consume_caveat_counters` gate. The stream pump runs
+    /// supervisor-side (it holds no `&mut` to actor-owned state) and routes
+    /// its open-time per-kind `check_and_increment` back through this command
+    /// via [`crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter`].
+    ///
+    /// The handler runs [`crate::trust::CaveatCounters::try_consume`] against
+    /// the owned `ClassSState.caveat_counters` record keyed by `ucan_cid`. An
+    /// ADMITTED consume rides a fail-closed `commit_class_s_keep` (durable via
+    /// the ADR-049 §9 snapshot); an EXHAUSTED consume mutates nothing and does
+    /// NOT persist. The reply's outer `Result` carries the persist / transport
+    /// infrastructure outcome; the inner `Result` carries the structured
+    /// [`crate::trust::CounterExhausted`] so the pump maps the precise §7.3.8
+    /// slug (`maxCalls` / `amountMaxCumulative` / `rateWindow`).
+    ReserveStreamCaveatCounter {
+        /// Context identifier string.
+        context_id: String,
+        /// The delegation CID keying the per-UCAN counter record.
+        ucan_cid: String,
+        /// Which §7.3.8 counter kind to consume.
+        kind: scp_protocol::trust::CaveatKind,
+        /// Amount to consume (per-kind semantics — ignored for `MaxCalls` /
+        /// `RateWindow`, added to the cumulative used for `AmountCumulative`).
+        amount: u64,
+        /// The counter's cap.
+        cap: u64,
+        /// Sliding-window length in seconds (`RateWindow` only; `0` otherwise).
+        window_secs: u32,
+        /// Current Unix time in seconds — the supervisor-side adapter sources
+        /// this from the injected clock, keeping the handler deterministic.
+        now_secs: u64,
+        /// Oneshot reply: outer `Result` = persist/transport infra outcome;
+        /// inner `Result` = the structured admission decision.
+        reply: oneshot::Sender<Result<Result<(), crate::trust::CounterExhausted>, ContextError>>,
+    },
+
+    /// Off-mailbox streaming §7.3.8 value-caveat counter RELEASE on actor-owned
+    /// Class-S state — returns the unspent portion of a stream's open-time
+    /// reservation to the counter at close-time settlement (SCP R4 HIGH-1), or
+    /// rolls back an earlier-kind increment when a later kind rejects the open.
+    ///
+    /// The handler runs [`crate::trust::CaveatCounters::release`] (infallible /
+    /// saturating at `0`) against the owned record keyed by `ucan_cid` under a
+    /// fail-closed `commit_class_s_keep`. The reply carries only the persist /
+    /// transport infrastructure outcome — release itself never rejects.
+    ReleaseStreamCaveatCounter {
+        /// Context identifier string.
+        context_id: String,
+        /// The delegation CID keying the per-UCAN counter record.
+        ucan_cid: String,
+        /// Which §7.3.8 counter kind to release.
+        kind: scp_protocol::trust::CaveatKind,
+        /// Amount to return to the counter (saturating at `0`).
+        amount: u64,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Off-mailbox streaming §5.4.5 open-time escrow REVERSAL on actor-owned
+    /// state — the actor-mailbox port of the reference
+    /// `ContextManager::outlet_stream_reverse_spend`. Fired by
+    /// [`crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink`]
+    /// from the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+    /// Drop-guard when an open-time escrow HOLD was debited against the
+    /// invoker's `MemberBudgetTracker` but the pump never spawned (an
+    /// early-return between the reserve debit and the spawn).
+    ///
+    /// The handler runs
+    /// [`MemberBudgetTracker::reverse_spend`](scp_protocol::economy::budget::MemberBudgetTracker::reverse_spend)
+    /// (infallible / saturating at `0`, so a double-refund — a Drop after an
+    /// explicit settlement — is a safe no-op) against the owned budget tracker
+    /// under a fail-closed `commit_class_s_keep`. The reply carries only the
+    /// persist / transport infrastructure outcome; the refund itself never
+    /// rejects.
+    ReverseStreamEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker whose budget hold is being refunded.
+        member_did: scp_did::DID,
+        /// The debited hold amount to return (saturating at `0`).
+        amount: scp_protocol::economy::types::Amount,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Off-mailbox streaming §5.4.5 close-time economic SETTLEMENT on
+    /// actor-owned state — the actor-mailbox port of the reference
+    /// `ContextManager::outlet_stream_settle`. Fired by
+    /// [`crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink`]
+    /// at stream close (terminal chunk delivered).
+    ///
+    /// The handler is generation-guarded (confused-deputy protection): if the
+    /// reservation's `generation` no longer matches the live actor's
+    /// `PerContextState::generation` — the original instance was despawned and a
+    /// new one respawned for the same `context_id` between reserve and settle —
+    /// it DROPS the settlement silently (touching no state; there is no external
+    /// payment escrow to void, unlike the unary settle). On a match it (1)
+    /// RELEASES the unspent R4 HIGH-1 cumulative-counter reserve, (2) REFUNDS
+    /// the unspent escrow to the invoker's budget tracker, both under one
+    /// fail-closed `commit_class_s_keep`, then (3) captures the §19.15.5
+    /// `PaymentReceipt` for the exact billed amount off-persist. The no-actor
+    /// fallback (context torn down mid-stream) is handled supervisor-side in
+    /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)
+    /// BEFORE this command is dispatched.
+    SettleOutletStream {
+        /// The close-time settlement inputs (boxed — the largest
+        /// [`OutletsCommand`] payload).
+        settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+        /// Spawn-generation the reservation was made against. Compared to the
+        /// live actor's `PerContextState::generation`; a mismatch DROPS.
+        generation: u64,
+        /// Oneshot reply carrying the captured receipt (`None` when nothing was
+        /// billed / no adapter / capture failed / dropped on generation
+        /// mismatch), or the dispatch / transport infra error.
+        reply:
+            oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
+    },
+
+    /// Fix-D — durably persist the streaming crash-recovery
+    /// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+    /// on actor-owned Class-S state at pump open, AFTER both open-time
+    /// reservations (the §5.4.5 escrow hold + the §7.3.8 cumulative counter
+    /// reserve) are durable. Fired by
+    /// [`ActorStreamSettlementSink::persist_reservation`](crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink)
+    /// from the off-mailbox open path.
+    ///
+    /// The handler inserts the record (keyed by the hex `request_id`) into
+    /// `ClassSState.stream_reservations` under a fail-closed `commit_class_s_keep`
+    /// (durable via the ADR-049 §9 snapshot), stamping the record's `generation`
+    /// with the live cell generation. The reply carries only the persist /
+    /// transport infrastructure outcome.
+    PersistStreamReservation {
+        /// Context identifier string.
+        context_id: String,
+        /// The stream `request_id` — the recovery record's key.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        /// The crash-recovery record (boxed — a large economy payload).
+        record: Box<crate::context::outlets::invoke::StreamReservationRecord>,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Fix-D — restore-time crash-recovery sweep: reconcile every unresolved
+    /// streaming reservation recovery record on actor-owned Class-S state. Fired
+    /// once per context from the restore path
+    /// ([`restore_context`](crate::context::lifecycle_helpers)) after the actor
+    /// is respawned, mirroring the §6.2.4 saga-recovery reconciliation but
+    /// scoped to the SAME restored context (streaming has no cross-context saga
+    /// journal — the reservation is this context's own owned state).
+    ///
+    /// The handler drains `ClassSState.stream_reservations` under ONE fail-closed
+    /// `commit_class_s_keep`, and for each record REFUNDS the full `reserved_escrow`
+    /// to the invoker's budget tracker + RELEASES the full `amount_cumulative_reserved`
+    /// back to the §7.3.8 `AmountCumulative` counter (the billed count is unknown
+    /// once the pump is gone — full release is conservative, never over-charging),
+    /// then clears the map. Runs REGARDLESS of generation (a restore overwrites
+    /// `PerContextState::generation` with a fresh spawn generation; the reserves
+    /// are this restored context's OWN state). The reply carries the number of
+    /// records reconciled, or the persist / transport infra error.
+    ReconcileStreamReservations {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply carrying the reconciled-record count, or the infra error.
+        reply: oneshot::Sender<Result<usize, ContextError>>,
+    },
 }
 
 /// See [`ContextCommand::Queries`]. Pure-read variants — handlers MUST

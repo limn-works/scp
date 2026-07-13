@@ -42,7 +42,9 @@ use scp_protocol::context::roles::{
 };
 use scp_protocol::context::{ContextParams, ContextState, MemoryScope};
 use scp_runtime::context::ContextHandle;
-use scp_runtime::context::outlets::invoke::{has_outlet_call_capability, invoke_outlet};
+use scp_runtime::context::outlets::invoke::{
+    has_outlet_call_capability, invoke_outlet_aggregating,
+};
 use scp_runtime::event_log::KeyCustodySigner;
 
 // ---------------------------------------------------------------------------
@@ -542,7 +544,7 @@ async fn phase2_end_to_end_integration() {
 
     let outlet_input = serde_json::json!({"operation": "add", "a": 1, "b": 2});
 
-    let (outlet_output, outlet_invoked_event, _consequences, _receipt) = invoke_outlet(
+    let (outlet_output, outlet_invoked_event, _consequences, _receipt) = invoke_outlet_aggregating(
         &context,
         &outlet_registry,
         &role_state,
@@ -552,6 +554,7 @@ async fn phase2_end_to_end_integration() {
         None,
         calculator_executor,
         None::<&mut scp_runtime::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None,
     )
     .await
     .expect("outlet invocation should succeed");

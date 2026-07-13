@@ -1171,6 +1171,25 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub caveat_counters: HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
 
+    /// Fix-D durable crash-recovery records for in-flight STREAMING
+    /// reservations, keyed by the stream `request_id` (hex). The serialized
+    /// projection of
+    /// [`ClassSState::stream_reservations`](crate::context::actor::state::ClassSState::stream_reservations).
+    ///
+    /// **Class S** — synchronously-persisted, fail-closed (ADR-049 §9). Each
+    /// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+    /// is the only durable handle to RELEASE a stream's open-time escrow hold +
+    /// §7.3.8 cumulative counter reserve when the off-mailbox pump — a `tokio`
+    /// task that SURVIVES an actor crash + respawn — would otherwise strand them
+    /// (its close-time settle lands on the respawned generation and is dropped).
+    /// Same-node restore REHYDRATES the map so the post-restore reconcile sweep
+    /// can drain it; cross-node public export STRIPS it to empty (a foreign node
+    /// must never drive a local invoker-economy release). `#[serde(default)]` so
+    /// legacy / stripped snapshots deserialize empty.
+    #[serde(default)]
+    pub stream_reservations:
+        HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
+
     /// Broadcast context security + roster state (§5.14, §5.14.8).
     ///
     /// **Class S** — the per-author key epochs, block lists, and the subscriber

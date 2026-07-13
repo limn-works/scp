@@ -12,4 +12,6 @@ pub use crate::store::trust::ProtocolRepositoryTrustBridge;
 
 /// Owned Class-S §7.3.8 caveat-counter primitives (value-caveat runtime
 /// enforcement). See [`caveat_counters`].
-pub use caveat_counters::{CaveatCounters, CounterExhausted, prune_expired_window_entries};
+pub use caveat_counters::{
+    CaveatCounterApi, CaveatCounters, CounterError, CounterExhausted, prune_expired_window_entries,
+};
