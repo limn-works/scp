@@ -1497,6 +1497,72 @@ pub const fn chunks_billed_error_to_event_log_error(
 }
 
 // =====================================================================
+// Event-local wire-invariant — enforced at the event-log APPEND boundary
+// =====================================================================
+
+/// Enforces the §5.4.5 `chunks_billed` wire-invariant that is verifiable
+/// from an [`OutletInvokedEvent`] **alone** — the form the event-log
+/// appender holds, which does NOT carry the chunk sequence.
+///
+/// # What §5.4.5 grants an event-local appender
+///
+/// §5.4.5 ("`chunks_billed` is verifiable from the manifest") states the
+/// FULL check — `chunks_billed == chunks_billed_ref` — is derivable from
+/// "the manifest root, the sealed chunk sequence, and the cancel-ack
+/// sequence." The appender has only the **event**: it holds the manifest
+/// *root* (`stream_manifest_hash`) but neither the chunk *sequence* (needed
+/// to re-hash leaves and count `@type == "data"`) nor the `cancel_ack_seq`
+/// (the event's [`StreamTerminalStatus::Cancelled`] is a bare unit variant
+/// — the cancel-ack sequence is NOT a field of `OutletInvokedEvent`).
+/// Therefore the appender CANNOT re-derive `chunks_billed_ref`; claiming to
+/// would be dishonest.
+///
+/// # The invariant it CAN and MUST enforce
+///
+/// §5.4.5 defines `chunks_billed` as "the count of `Data` chunks at or
+/// below the cancel-ack sequence" and `stream_chunk_count` as "the total
+/// chunk count \[which\] includes Progress/End/Error". The billable set is
+/// a strict **subset** of the total, so
+///
+/// ```text
+/// chunks_billed <= stream_chunk_count
+/// ```
+///
+/// holds for EVERY well-formed event — and this bound uses only two fields
+/// the event carries. An event that records more billable `Data` chunks
+/// than the total number of chunks it claims to have emitted is
+/// structurally impossible; it is a wire-layer violation the appender
+/// refuses at log-insert time (§5.4.5: "refused at log-insert time, not
+/// accepted-and-flagged"), so ANY malformed `OutletInvokedEvent` — from any
+/// source — is durably rejected. The non-streaming/unary case (no chunks)
+/// is covered by the same bound: `stream_chunk_count == 0` forces
+/// `chunks_billed == 0`.
+///
+/// The tighter, manifest-derived equality remains enforced UPSTREAM at
+/// chunk-emission time (the dispatch pump's gate drops above-cancel-ack
+/// `Data` chunks before they are billed or committed to the manifest
+/// frontier); this function is the durable event-local backstop, not a
+/// replacement for it.
+///
+/// # Errors
+///
+/// Returns [`ChunksBilledError::ChunksBilledMismatch`] when
+/// `chunks_billed > stream_chunk_count`. The `reference` field carries the
+/// event-local ceiling (`stream_chunk_count`) that `chunks_billed`
+/// exceeded.
+pub const fn verify_outlet_invoked_event_local(
+    event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+) -> Result<(), ChunksBilledError> {
+    if event.chunks_billed > event.stream_chunk_count {
+        return Err(ChunksBilledError::ChunksBilledMismatch {
+            recorded: event.chunks_billed,
+            reference: event.stream_chunk_count,
+        });
+    }
+    Ok(())
+}
+
+// =====================================================================
 // Tests
 // =====================================================================
 
@@ -1511,8 +1577,10 @@ pub const fn chunks_billed_error_to_event_log_error(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
     use scp_protocol::context::outlets::stream::{
-        CreditGrantSigningInputs, OutletStreamCredit, RequestId, sign_credit_grant,
+        CreditGrantSigningInputs, OutletStreamCredit, RequestId, StreamTerminalStatus,
+        sign_credit_grant,
     };
     use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 
@@ -2363,6 +2431,54 @@ mod tests {
             }
             _ => panic!("expected ChunksBilledMismatch, got {err:?}"),
         }
+    }
+
+    // -------------- Event-local wire-invariant (C1) --------------
+
+    fn outlet_invoked_event(stream_chunk_count: u32, chunks_billed: u32) -> OutletInvokedEvent {
+        OutletInvokedEvent {
+            request_id: "req".to_owned(),
+            outlet_id: "outlet".to_owned(),
+            invoker_did: scp_did::DID("did:dht:z6MkInvoker".to_owned()),
+            status: scp_protocol::context::outlets::OutletStatus::Success,
+            execution_time_ms: 1,
+            input_hash: "0".repeat(64),
+            output_hash: None,
+            cost: None,
+            stream_chunk_count,
+            chunks_billed,
+            stream_manifest_hash: [0u8; 32],
+            stream_terminal_status: StreamTerminalStatus::Ok,
+            audit_anomaly: None,
+        }
+    }
+
+    #[test]
+    fn event_local_invariant_accepts_billed_le_count() {
+        // billed < count, billed == count, and the zero/unary case all pass.
+        verify_outlet_invoked_event_local(&outlet_invoked_event(5, 3)).unwrap();
+        verify_outlet_invoked_event_local(&outlet_invoked_event(4, 4)).unwrap();
+        verify_outlet_invoked_event_local(&outlet_invoked_event(0, 0)).unwrap();
+    }
+
+    #[test]
+    fn event_local_invariant_rejects_billed_over_count() {
+        let err = verify_outlet_invoked_event_local(&outlet_invoked_event(5, 6));
+        match err {
+            Err(ChunksBilledError::ChunksBilledMismatch {
+                recorded,
+                reference,
+            }) => {
+                assert_eq!(recorded, 6, "recorded = tampered chunks_billed");
+                assert_eq!(
+                    reference, 5,
+                    "reference = event-local ceiling stream_chunk_count"
+                );
+            }
+            _ => panic!("expected ChunksBilledMismatch, got {err:?}"),
+        }
+        // Even a single over-count (billed == count + 1) is rejected.
+        assert!(verify_outlet_invoked_event_local(&outlet_invoked_event(0, 1)).is_err());
     }
 
     // -------------- Integration scenarios --------------

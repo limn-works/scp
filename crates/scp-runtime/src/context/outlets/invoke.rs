@@ -3540,10 +3540,15 @@ where
     let mut sequence: u64 = 0;
     let outlet_id_for_emit = outlet_id.clone();
     let invoker_did_for_event = invoker_did.clone();
-    // SCP-OUT-035: accumulate every chunk emitted by the stream so
-    // the runtime can build the §5.4.5 chunk-manifest Merkle root and
-    // count `Data` chunks for billing at terminal-chunk delivery.
-    let mut emitted_chunks: Vec<OutletStreamChunk> = Vec::new();
+    // SCP-OUT-035 / ADR-061: fold every emitted chunk into the O(log n)
+    // RFC-6962 Merkle frontier (running manifest root + counts) and the
+    // O(1) terminal summary — never retain the full payload set (ADR-061:
+    // the pump "never accumulates the full payload set in memory"). The
+    // inner capture pump has no cancel/credit gate, so the frontier's
+    // billing ceiling is unbounded (`MerkleFrontier::new`): every `Data`
+    // chunk is billable, matching the pre-refactor batch count.
+    let mut frontier = scp_protocol::context::outlets::stream::MerkleFrontier::new();
+    let mut terminal_summary = StreamTerminalSummary::default();
 
     // Build the executor future under `catch_unwind` so panics inside
     // the executor body recover into a terminal `Error` chunk
@@ -3575,7 +3580,8 @@ where
         request_id,
         executor_future,
         timeout_duration,
-        &mut emitted_chunks,
+        &mut frontier,
+        &mut terminal_summary,
         &signing_ctx,
     )
     .await;
@@ -3595,7 +3601,7 @@ where
     if !pump_outcome.timed_out {
         while let Ok(payload) = payload_rx.try_recv() {
             let chunk = wrap_chunk(&signing_ctx, request_id, &mut sequence, payload).await;
-            emitted_chunks.push(chunk.clone());
+            ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
             if chunk_tx.send(chunk).await.is_err() {
                 // Receiver dropped during late drain; same rationale
                 // as above — skip the event-log emission.
@@ -3618,7 +3624,7 @@ where
 
     let terminal_chunk =
         wrap_chunk(&signing_ctx, request_id, &mut sequence, terminal_payload).await;
-    emitted_chunks.push(terminal_chunk.clone());
+    ingest_stream_chunk(&mut frontier, &mut terminal_summary, &terminal_chunk);
     let delivered = chunk_tx.send(terminal_chunk).await.is_ok();
 
     if !delivered {
@@ -3636,9 +3642,12 @@ where
             &invoker_did_for_event,
             input_hash,
             elapsed_ms(start),
-            &emitted_chunks,
+            u32::try_from(frontier.leaf_count()).unwrap_or(u32::MAX),
+            u32::try_from(frontier.billed_count()).unwrap_or(u32::MAX),
+            frontier.root(),
+            &terminal_summary,
             // Inner invoke pump has no separate running tally to diverge
-            // from — the manifest IS the tally — so no anomaly is possible
+            // from — the frontier IS the tally — so no anomaly is possible
             // here.
             None,
         );
@@ -3653,83 +3662,141 @@ where
 /// stores the request id as a hex-encoded string for cross-bridge
 /// stability — the bytes themselves remain the canonical form on the
 /// stream wire types.
+/// Terminal-derived fields of an [`OutletInvokedEvent`] — the pieces the
+/// batch builder used to recompute by scanning the whole chunk slice
+/// (`output_hash`, `stream_terminal_status`, legacy `status`).
+///
+/// Only `End` and terminal `Error` chunks mutate the summary, and both
+/// are terminal (the last chunk a stream emits), so folding one chunk at
+/// a time via [`Self::observe`] yields the identical result as a batch
+/// scan of the full sequence — while retaining `O(1)` state instead of
+/// the chunk Vec (ADR-061: the pump "never accumulates the full payload
+/// set in memory"). The Merkle root, `stream_chunk_count`, and
+/// `chunks_billed` come from the sibling
+/// [`scp_protocol::context::outlets::stream::MerkleFrontier`].
+#[derive(Debug, Clone)]
+pub struct StreamTerminalSummary {
+    output_hash: Option<String>,
+    terminal_status: StreamTerminalStatus,
+    legacy_status: OutletStatus,
+}
+
+impl Default for StreamTerminalSummary {
+    /// A stream that ends WITHOUT an `End` or terminal `Error` chunk (the
+    /// receiver dropped, signing failed, upstream closed) records the
+    /// §5.4.5 default `Error(CODE_EXECUTION_FAULT)` terminal — the same
+    /// value the batch builder started its scan from.
+    fn default() -> Self {
+        Self {
+            output_hash: None,
+            terminal_status: StreamTerminalStatus::Error(CODE_EXECUTION_FAULT.to_owned()),
+            legacy_status: OutletStatus::Error,
+        }
+    }
+}
+
+impl StreamTerminalSummary {
+    /// Folds one emitted chunk's payload into the terminal summary. `Data`
+    /// and `Progress` (and non-terminal `Error`) leave it unchanged; `End`
+    /// sets `Ok` + `output_hash`; a terminal `Error` sets `Error(code)`.
+    /// Chunks MUST be observed in emission order (last write wins, exactly
+    /// as the batch scan resolved it).
+    pub fn observe(&mut self, payload: &ChunkPayload) {
+        match payload {
+            ChunkPayload::Data { .. } | ChunkPayload::Progress { .. } => {}
+            ChunkPayload::End { aggregate, .. } => {
+                self.terminal_status = StreamTerminalStatus::Ok;
+                self.legacy_status = OutletStatus::Success;
+                self.output_hash = Some(scp_protocol::context::outlets::lifecycle::sha256_json(
+                    aggregate,
+                ));
+            }
+            ChunkPayload::Error { code, terminal, .. } => {
+                if *terminal {
+                    self.terminal_status = StreamTerminalStatus::Error(code.clone());
+                    self.legacy_status = OutletStatus::Error;
+                }
+            }
+        }
+    }
+}
+
+/// Folds one emitted chunk into the streaming aggregates: its leaf hash
+/// into the RFC-6962 [`MerkleFrontier`](scp_protocol::context::outlets::stream::MerkleFrontier)
+/// (running manifest root + counts) and its payload into the
+/// [`StreamTerminalSummary`]. Shared by the inner capture pump and the
+/// outer dispatch pump so both fold identically.
+///
+/// A JCS leaf-hash failure is unreachable for an operator-signed chunk
+/// (signing canonicalizes the same payload before this call), but is
+/// logged rather than swallowed so a genuine encoding fault surfaces
+/// instead of silently dropping a chunk from the manifest.
+pub(crate) fn ingest_stream_chunk(
+    frontier: &mut scp_protocol::context::outlets::stream::MerkleFrontier,
+    terminal: &mut StreamTerminalSummary,
+    chunk: &OutletStreamChunk,
+) {
+    if let Err(err) = frontier.push(chunk) {
+        tracing::error!(
+            sequence = chunk.sequence,
+            %err,
+            "outlet stream chunk failed JCS leaf-hash during Merkle-frontier ingest — \
+             manifest root will not cover this chunk"
+        );
+    }
+    terminal.observe(&chunk.payload);
+}
+
+/// Assembles the §5.4.5 `OutletInvokedEvent` from the precomputed stream
+/// aggregates (SCP-OUT-035). The `stream_manifest_hash`,
+/// `stream_chunk_count`, and `chunks_billed` are produced incrementally
+/// by the [`MerkleFrontier`](scp_protocol::context::outlets::stream::MerkleFrontier)
+/// as chunks are emitted; the terminal-derived fields come from
+/// [`StreamTerminalSummary`]. This is the seam ADR-061 requires: the pump
+/// builds the event from an `O(log n)` frontier + `O(1)` terminal summary,
+/// never a retained chunk Vec.
+#[allow(clippy::too_many_arguments)] // Assembles one flat event record from independent scalar aggregates (ids, hashes, counts, terminal summary); a wrapper struct would just relocate the same fields.
 pub(crate) fn build_streaming_outlet_event(
     request_id: RequestId,
     outlet_id: &OutletId,
     invoker_did: &DID,
     input_hash: String,
     execution_time_ms: u64,
-    chunks: &[OutletStreamChunk],
+    stream_chunk_count: u32,
+    chunks_billed: u32,
+    stream_manifest_hash: [u8; 32],
+    terminal: &StreamTerminalSummary,
     // §5.4.5 round-8 (F2): set when the dispatch pump detected a divergence
-    // between its own running `chunks_billed` tally and the manifest-derived
-    // reference. The event carries the manifest-derived value (computed
-    // below from `chunks`) regardless; this marker records the divergence so
-    // it is durably attributable in the audit log instead of dropping the
-    // event. `None` on the happy path and for the inner-invoke pump (which
-    // does not maintain a separate running tally to diverge from).
+    // between its own running `chunks_billed` tally and the frontier-derived
+    // reference. The event carries the frontier-derived value regardless;
+    // this marker records the divergence so it is durably attributable in
+    // the audit log instead of dropping the event. `None` on the happy path
+    // and for the inner-invoke pump (which does not maintain a separate
+    // running tally to diverge from).
     audit_anomaly: Option<scp_protocol::context::outlets::lifecycle::AuditAnomaly>,
 ) -> OutletInvokedEvent {
-    use scp_protocol::context::outlets::stream::compute_chunk_manifest_root;
-
-    // u32::try_from clamps to u32::MAX per the workspace convention
-    // for length-prefix conversions.
-    let stream_chunk_count = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
-    let mut billed_count: usize = 0;
-    let mut output_hash: Option<String> = None;
-    let mut terminal_status = StreamTerminalStatus::Error(CODE_EXECUTION_FAULT.to_owned());
-    let mut legacy_status = OutletStatus::Error;
-
-    for chunk in chunks {
-        match &chunk.payload {
-            ChunkPayload::Data { value } => {
-                billed_count = billed_count.saturating_add(1);
-                // The output_hash is only updated for terminal-Data
-                // semantics; the `End.aggregate` field carries the
-                // canonical aggregate value and overrides this hash
-                // when present.
-                let _ = value;
-            }
-            ChunkPayload::Progress { .. } => {}
-            ChunkPayload::End { aggregate, .. } => {
-                terminal_status = StreamTerminalStatus::Ok;
-                legacy_status = OutletStatus::Success;
-                output_hash = Some(scp_protocol::context::outlets::lifecycle::sha256_json(
-                    aggregate,
-                ));
-            }
-            ChunkPayload::Error { code, terminal, .. } => {
-                if *terminal {
-                    terminal_status = StreamTerminalStatus::Error(code.clone());
-                    legacy_status = OutletStatus::Error;
-                }
-            }
-        }
-    }
-
-    let chunks_billed = u32::try_from(billed_count).unwrap_or(u32::MAX);
-
-    let stream_manifest_hash = compute_chunk_manifest_root(chunks).unwrap_or([0u8; 32]);
-
     OutletInvokedEvent {
         request_id: hex::encode(request_id),
         outlet_id: outlet_id.to_owned(),
         invoker_did: invoker_did.clone(),
-        status: legacy_status,
+        status: terminal.legacy_status,
         execution_time_ms,
         input_hash,
-        output_hash,
+        output_hash: terminal.output_hash.clone(),
         cost: None,
         stream_chunk_count,
         chunks_billed,
         stream_manifest_hash,
-        stream_terminal_status: terminal_status,
+        stream_terminal_status: terminal.terminal_status.clone(),
         audit_anomaly,
     }
 }
 
-/// Variant of a payload pump that captures every chunk emitted by the
-/// executor into `recorded_chunks` (SCP-OUT-035) so the runtime can
-/// compute the §5.4.5 chunk-manifest Merkle root at stream close.
+/// Variant of a payload pump that folds every chunk emitted by the
+/// executor into the RFC-6962 Merkle `frontier` + `terminal` summary
+/// (SCP-OUT-035 / ADR-061) so the runtime can compute the §5.4.5
+/// chunk-manifest Merkle root at stream close WITHOUT retaining the
+/// payload set.
 #[allow(clippy::too_many_arguments)] // signing_ctx is the wire-signing addition; bundling it would require a wrapper struct that obscures the small parameter set.
 async fn pump_payload_stream_capture<F>(
     payload_rx: &mut mpsc::Receiver<ChunkPayload>,
@@ -3738,7 +3805,8 @@ async fn pump_payload_stream_capture<F>(
     request_id: RequestId,
     executor_future: std::pin::Pin<&mut F>,
     timeout_duration: Duration,
-    recorded_chunks: &mut Vec<OutletStreamChunk>,
+    frontier: &mut scp_protocol::context::outlets::stream::MerkleFrontier,
+    terminal: &mut StreamTerminalSummary,
     signing_ctx: &InnerPumpSigningContext,
 ) -> PumpOutcome
 where
@@ -3766,7 +3834,7 @@ where
                     Some(payload) => {
                         let chunk =
                             wrap_chunk(signing_ctx, request_id, sequence, payload).await;
-                        recorded_chunks.push(chunk.clone());
+                        ingest_stream_chunk(frontier, terminal, &chunk);
                         if chunk_tx.send(chunk).await.is_err() {
                             chunk_tx_alive = false;
                             break;

@@ -1158,6 +1158,185 @@ pub fn compute_chunk_manifest_root(chunks: &[OutletStreamChunk]) -> Result<[u8; 
 }
 
 // ---------------------------------------------------------------------------
+// MerkleFrontier — incremental O(log n) RFC-6962 root (§5.4.5 / ADR-061)
+// ---------------------------------------------------------------------------
+
+/// An incremental, append-only RFC-6962 Merkle frontier over an outlet
+/// chunk stream (§5.4.5 chunk manifest; ADR-061 "seal phase").
+///
+/// The batch [`compute_chunk_manifest_root`] retains the **entire** chunk
+/// slice to compute the root; ADR-061 forbids the streaming pump from
+/// accumulating the full payload set in memory (the durable capture must
+/// be "an O(log n) frontier, not the payload set"). This type ingests one
+/// chunk at a time via [`Self::push`], retains only `≤ ⌈log2(n)⌉ + 1`
+/// subtree hashes, and yields the running root, leaf count, and billed
+/// count in `O(log n)` space.
+///
+/// # Root equivalence (invariant)
+///
+/// For **any** chunk sequence — length 0, 1, 2, 3, odd, even, large —
+/// [`Self::root`] equals [`compute_chunk_manifest_root`] over the same
+/// sequence. `compute_chunk_manifest_root` remains the batch **oracle**
+/// (the auditor's re-derivation path per §5.4.5 "Inclusion proofs" and
+/// this type's equivalence property test); the frontier is the streaming
+/// producer of the identical value. Both implement the RFC-6962 §2.1
+/// Merkle-tree hash: the batch via level-by-level pair-and-promote, this
+/// type via a forest of perfect subtrees folded right-to-left. Both equal
+/// the RFC-6962 recursive `MTH`, hence each other.
+///
+/// # Billed count
+///
+/// [`Self::billed_count`] tracks the §5.4.5 reference billable-chunk count
+///
+/// ```text
+/// chunks_billed_ref = |{ i : chunk_i.payload.@type == "data"
+///                            && chunk_i.sequence <= cancel_ack_ceiling }|
+/// ```
+///
+/// matching `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`
+/// (which filters on `chunk.sequence`, the renumbered outer-pump sequence,
+/// not the slice index). The ceiling is fixed at construction:
+/// [`Self::new`] uses `u64::MAX` (no cancel — the predicate reduces to
+/// `@type == "data"`); [`Self::with_ceiling`] pins a `cancel_ack_seq`. The
+/// dispatch pump uses [`Self::new`] because it never *pushes* an
+/// above-ceiling `Data` chunk (those are dropped at the gate before
+/// emission), so the unbounded ceiling yields the identical count over the
+/// emitted manifest.
+#[derive(Debug, Clone)]
+pub struct MerkleFrontier {
+    /// Perfect-subtree roots, bottom (largest, leftmost) → top (smallest,
+    /// rightmost). Each entry is `(level, hash)` where a level-`L` subtree
+    /// covers exactly `2^L` leaves. Levels are strictly decreasing from
+    /// bottom to top, so `stack.len() <= ⌈log2(n)⌉ + 1`.
+    stack: Vec<(u8, [u8; 32])>,
+    /// Total number of leaves (chunks) ingested.
+    leaf_count: u64,
+    /// Count of `Data` chunks with `sequence <= ceiling` ingested so far.
+    billed_count: u64,
+    /// Cancel-ack ceiling; `u64::MAX` when the stream has no cancel.
+    ceiling: u64,
+}
+
+impl Default for MerkleFrontier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MerkleFrontier {
+    /// Creates an empty frontier with an **unbounded** billing ceiling
+    /// (`u64::MAX`) — every `Data` chunk is billable regardless of
+    /// sequence. This is the dispatch-pump constructor: the pump drops
+    /// above-cancel-ack `Data` chunks before emission, so no pushed `Data`
+    /// chunk ever exceeds the real cancel-ack sequence and the unbounded
+    /// ceiling produces the same billed count as the pinned one.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::with_ceiling(u64::MAX)
+    }
+
+    /// Creates an empty frontier that only bills `Data` chunks whose
+    /// `sequence <= cancel_ack_ceiling` (§5.4.5 cancel-ack billing
+    /// boundary). Pass `u64::MAX` for a stream that terminated without
+    /// cancel.
+    #[must_use]
+    pub const fn with_ceiling(cancel_ack_ceiling: u64) -> Self {
+        Self {
+            stack: Vec::new(),
+            leaf_count: 0,
+            billed_count: 0,
+            ceiling: cancel_ack_ceiling,
+        }
+    }
+
+    /// Ingests one chunk: folds its leaf hash into the Merkle forest and
+    /// updates the leaf/billed counters. Chunks MUST be pushed in the
+    /// stream's emission order (the same order the batch oracle hashes
+    /// them) — the RFC-6962 tree is order-dependent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the JCS canonicalization error from
+    /// [`compute_chunk_leaf_hash`] if the chunk cannot be serialized. This
+    /// is unreachable for a chunk that was already operator-signed (signing
+    /// JCS-canonicalizes the same payload), but is surfaced rather than
+    /// swallowed so a genuine encoding fault is never silently folded as a
+    /// zero leaf.
+    pub fn push(&mut self, chunk: &OutletStreamChunk) -> Result<(), String> {
+        let leaf = compute_chunk_leaf_hash(chunk)?;
+
+        // Fold the new leaf into the forest of perfect subtrees: push it as
+        // a level-0 subtree, then while the top two subtrees share a level,
+        // combine them into their parent (RFC-6962 interior node). This
+        // maintains the invariant that levels strictly decrease from the
+        // bottom of the stack to the top.
+        self.stack.push((0, leaf));
+        loop {
+            // Match the top two subtrees (last = right, second-last = left)
+            // WITHOUT indexing. `(u8, [u8; 32])` is `Copy`, so the parent is
+            // computed inside the borrow and the pair copied out; the borrow
+            // ends before the pops, satisfying the borrow checker.
+            let parent = match self.stack.as_slice() {
+                [.., (below_level, below_hash), (top_level, top_hash)]
+                    if below_level == top_level =>
+                {
+                    Some((
+                        *top_level + 1,
+                        compute_chunk_interior_hash(below_hash, top_hash),
+                    ))
+                }
+                _ => None,
+            };
+            let Some(parent) = parent else { break };
+            self.stack.pop();
+            self.stack.pop();
+            self.stack.push(parent);
+        }
+
+        self.leaf_count = self.leaf_count.saturating_add(1);
+        if chunk.sequence <= self.ceiling && matches!(chunk.payload, ChunkPayload::Data { .. }) {
+            self.billed_count = self.billed_count.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Returns the running RFC-6962 Merkle root over every chunk pushed so
+    /// far. Equal to [`compute_chunk_manifest_root`] over the same
+    /// sequence. `O(log n)`.
+    ///
+    /// An empty frontier returns the all-zero sentinel `[0u8; 32]`,
+    /// matching the batch oracle's empty-slice convention.
+    #[must_use]
+    pub fn root(&self) -> [u8; 32] {
+        let mut iter = self.stack.iter().rev();
+        let Some(&(_, mut root)) = iter.next() else {
+            return [0u8; 32];
+        };
+        // Fold the forest right-to-left: the rightmost (smallest) subtree
+        // is the deepest-right of the RFC-6962 tree; each subtree to its
+        // left is the left child at the next level up.
+        for &(_, left) in iter {
+            root = compute_chunk_interior_hash(&left, &root);
+        }
+        root
+    }
+
+    /// Total number of chunks ingested (all `@type`s, including the
+    /// terminal chunk) — the §5.4.5 `stream_chunk_count`.
+    #[must_use]
+    pub const fn leaf_count(&self) -> u64 {
+        self.leaf_count
+    }
+
+    /// Count of billable `Data` chunks at or below the cancel-ack ceiling —
+    /// the §5.4.5 `chunks_billed` reference value.
+    #[must_use]
+    pub const fn billed_count(&self) -> u64 {
+        self.billed_count
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session × stream invariants — §6.2.1.1
 // ---------------------------------------------------------------------------
 
@@ -2714,6 +2893,154 @@ mod tests {
                 !msg.contains(": "),
                 "default message must not carry its own slug prefix: {msg:?}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MerkleFrontier — incremental root/billed equivalence (§5.4.5 / ADR-061)
+    // -----------------------------------------------------------------------
+
+    /// Batch reference for the billed count, mirroring
+    /// `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`
+    /// (kept here as an independent oracle so the frontier is checked
+    /// against a second implementation, not against itself).
+    fn billed_ref(chunks: &[OutletStreamChunk], ceiling: u64) -> u64 {
+        chunks
+            .iter()
+            .filter(|c| c.sequence <= ceiling && matches!(c.payload, ChunkPayload::Data { .. }))
+            .count() as u64
+    }
+
+    /// Builds a chunk of a given `@type` at `sequence`. `kind`:
+    /// 0 = Data, 1 = Progress, 2 = End (terminal), 3 = Error.
+    fn chunk_of_kind(sequence: u64, kind: u8) -> OutletStreamChunk {
+        let payload = match kind % 4 {
+            0 => ChunkPayload::Data {
+                value: serde_json::json!({ "seq": sequence }),
+            },
+            1 => ChunkPayload::Progress {
+                pct: (sequence % 10_001) as u16,
+                note: None,
+            },
+            2 => ChunkPayload::End {
+                aggregate: serde_json::json!({ "final": sequence }),
+                provenance: sample_provenance(),
+                execution_time_ms: sequence,
+            },
+            _ => ChunkPayload::Error {
+                code: "SCP-OUTLET-6130".to_owned(),
+                message: "err".to_owned(),
+                terminal: true,
+            },
+        };
+        OutletStreamChunk {
+            request_id: fixed_request_id(),
+            sequence,
+            // Non-zero, sequence-varied sig so the leaf preimage exercises
+            // the full canonical chunk (request_id, sequence, payload, sig).
+            payload,
+            sig: [(sequence & 0xFF) as u8 ^ 0x5A; 64],
+        }
+    }
+
+    /// Feeds `chunks` (in order) through a fresh frontier with `ceiling`
+    /// and returns `(root, leaf_count, billed_count)`.
+    fn drive_frontier(chunks: &[OutletStreamChunk], ceiling: u64) -> ([u8; 32], u64, u64) {
+        let mut f = MerkleFrontier::with_ceiling(ceiling);
+        for c in chunks {
+            f.push(c).expect("valid chunk hashes without JCS error");
+        }
+        (f.root(), f.leaf_count(), f.billed_count())
+    }
+
+    /// Hand-worked edge cases: 0, 1, 2, 3 chunks and a cancel ceiling that
+    /// truncates billing. Root MUST equal the batch oracle; billed MUST
+    /// equal the batch billed reference; `leaf_count` MUST equal the length.
+    #[test]
+    fn frontier_matches_oracle_small_cases() {
+        // n = 0 (empty stream): both yield the all-zero sentinel.
+        let (root, leaves, billed) = drive_frontier(&[], u64::MAX);
+        assert_eq!(root, compute_chunk_manifest_root(&[]).unwrap());
+        assert_eq!(root, [0u8; 32]);
+        assert_eq!(leaves, 0);
+        assert_eq!(billed, 0);
+
+        // n = 1..=3 with mixed @types, unbounded ceiling.
+        for n in 1_u64..=3 {
+            let chunks: Vec<_> = (0..n).map(|i| chunk_of_kind(i, (i % 4) as u8)).collect();
+            let (root, leaves, billed) = drive_frontier(&chunks, u64::MAX);
+            assert_eq!(
+                root,
+                compute_chunk_manifest_root(&chunks).unwrap(),
+                "root mismatch at n={n}"
+            );
+            assert_eq!(leaves, n, "leaf_count mismatch at n={n}");
+            assert_eq!(
+                billed,
+                billed_ref(&chunks, u64::MAX),
+                "billed mismatch at n={n}"
+            );
+        }
+
+        // Cancel ceiling truncates billing: 5 Data chunks at seq 0..5,
+        // ceiling = 2 → only seq {0,1,2} are billable.
+        let data: Vec<_> = (0..5).map(|i| chunk_of_kind(i, 0)).collect();
+        let (root, leaves, billed) = drive_frontier(&data, 2);
+        assert_eq!(root, compute_chunk_manifest_root(&data).unwrap());
+        assert_eq!(leaves, 5);
+        assert_eq!(billed, 3);
+        assert_eq!(billed, billed_ref(&data, 2));
+    }
+
+    proptest::proptest! {
+        // Deterministic: proptest uses a fixed default RNG seed unless the
+        // PROPTEST_SEED env var overrides it, so CI runs are reproducible.
+
+        /// For random chunk sequences (length 0..=257, mixed @types, mixed
+        /// sequence numbers) and a random cancel-ack ceiling, the frontier's
+        /// running root equals the batch oracle, its leaf_count equals the
+        /// length, and its billed_count equals the batch billed reference —
+        /// for ALL n (0, 1, 2, 3, odd, even, large).
+        #[test]
+        fn frontier_root_and_billed_match_oracle(
+            kinds in proptest::collection::vec(0u8..4, 0usize..=257),
+            ceiling_pick in 0u64..300,
+            use_unbounded in proptest::bool::ANY,
+        ) {
+            // Sequence numbers are the renumbered outer-pump seq: strictly
+            // monotonic from 0, matching how the dispatch pump stamps chunks.
+            let chunks: Vec<OutletStreamChunk> = kinds
+                .iter()
+                .enumerate()
+                .map(|(i, &k)| chunk_of_kind(i as u64, k))
+                .collect();
+            let ceiling = if use_unbounded { u64::MAX } else { ceiling_pick };
+
+            let (root, leaves, billed) = drive_frontier(&chunks, ceiling);
+            let oracle_root = compute_chunk_manifest_root(&chunks).unwrap();
+
+            proptest::prop_assert_eq!(root, oracle_root, "root diverged from batch oracle");
+            proptest::prop_assert_eq!(leaves, chunks.len() as u64, "leaf_count diverged");
+            proptest::prop_assert_eq!(
+                billed,
+                billed_ref(&chunks, ceiling),
+                "billed_count diverged from batch reference"
+            );
+
+            // The running root must also match the oracle at EVERY prefix,
+            // not just at the end — the pump reads the root at close but the
+            // frontier must be correct incrementally.
+            let mut f = MerkleFrontier::with_ceiling(ceiling);
+            for (i, c) in chunks.iter().enumerate() {
+                f.push(c).unwrap();
+                let prefix_oracle = compute_chunk_manifest_root(&chunks[..=i]).unwrap();
+                proptest::prop_assert_eq!(
+                    f.root(),
+                    prefix_oracle,
+                    "prefix root diverged at len {}",
+                    i + 1
+                );
+            }
         }
     }
 }
