@@ -2362,9 +2362,32 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
             )
             .expect("member invoker opens a live stream");
 
+        // GIL DEADLOCK GUARD — this MUST be the FIRST call that touches the live
+        // pump, BEFORE any grant_credit. The context's default credit window
+        // (>= 1) admits the first Data chunk with NO grant, so this poll_next
+        // PARKS on the pump: it awaits a chunk the Python handler must produce by
+        // reacquiring the GIL. If poll_next held the GIL across recv() (the
+        // pre-fix bug) the producer could never run and this call would HANG
+        // FOREVER. It only returns because poll_next's `allow_threads` releases
+        // the GIL. (Ordering matters: a preceding grant_credit — which has its
+        // OWN allow_threads — would let the pump buffer both chunks into the mpsc
+        // channel, so a later poll would read a buffered chunk without the pump
+        // needing to run during poll, defeating the guard. Reverting ONLY
+        // poll_next's allow_threads must make THIS call hang.)
+        let first = scp
+            .outlet_stream_poll_next(py, &handle_id)
+            .unwrap()
+            .expect("first poll parks on the live pump and returns its first chunk");
+        let first_chunk: OutletStreamChunk = serde_json::from_slice(&first).unwrap();
+        assert!(
+            matches!(first_chunk.payload, ChunkPayload::Data { .. }),
+            "the first parked poll_next forwarded the Python handler's Data chunk"
+        );
+
         // CRITICAL #1: a non-invoker caller cannot steer the stream. The
         // caller==invoker gate fires on the registry lookup BEFORE any signing /
-        // reserve, so this is deterministic regardless of pump progress.
+        // reserve, so this is deterministic regardless of pump progress. The
+        // entry is still live (the Data chunk above is not terminal).
         assert!(
             scp.outlet_stream_grant_credit(py, &handle_id, &stranger, 1)
                 .unwrap_err()
@@ -2388,10 +2411,7 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
             );
         }
 
-        // Drive poll_next to the terminal. Each poll PARKS on the runtime while
-        // the Python handler runs (reacquiring the GIL) — reaching the terminal
-        // instead of hanging is the proof the GIL is released across recv().
-        let mut saw_data = false;
+        // Drive the REST of the stream to its terminal.
         let mut saw_terminal = false;
         for _ in 0..16 {
             let Some(bytes) = scp.outlet_stream_poll_next(py, &handle_id).unwrap() else {
@@ -2399,19 +2419,12 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
                 break;
             };
             let chunk: OutletStreamChunk = serde_json::from_slice(&bytes).unwrap();
-            if matches!(chunk.payload, ChunkPayload::Data { .. }) {
-                saw_data = true;
-            }
             if chunk.payload.is_terminal() {
                 saw_terminal = true;
                 break;
             }
         }
 
-        assert!(
-            saw_data,
-            "the pump forwarded the Python handler's Data chunk through poll_next"
-        );
         assert!(
             saw_terminal,
             "poll_next reached the stream's terminal chunk without deadlocking on the GIL"
