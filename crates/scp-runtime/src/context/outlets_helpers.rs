@@ -1296,6 +1296,113 @@ pub async fn reserve_outlet_stream_economy(
     })
 }
 
+/// §5.4.5 GRANT-time escrow top-up on actor-owned state — the mid-stream
+/// counterpart of the escrow-debit block in [`reserve_outlet_stream_economy`].
+///
+/// Spec §5.4.5 "Credit-grant escrow top-up": each validly accepted
+/// `OutletStreamCredit` grant on an Action outlet with `cost > 0` tops up the
+/// stream's escrow by `cost_per_chunk × grant`, computed via `checked_mul`
+/// (overflow → `EscrowOverflow`), rejecting with `InsufficientFunds` when the
+/// invoker's available balance is below the top-up. This function performs
+/// exactly that check-and-DEBIT against the invoker's
+/// [`MemberBudgetTracker`](scp_protocol::economy::budget::MemberBudgetTracker),
+/// returning the reserved hold the FFI bridge threads into
+/// [`apply_credit_grant`](crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant)
+/// as `reserved_top_up`.
+///
+/// It DELIBERATELY runs NO hard-rate / velocity / membership gate — those are
+/// admission-time concerns already paid at open; a grant is a mid-stream
+/// top-up on an already-admitted stream. The §5.4.5:758 cumulative billable
+/// ceiling (`min(credit_window, max_calls)`) is enforced separately by the
+/// pump's `CreditTracker::max_billable`, so no quantity of grants can bill past
+/// the invoker's caveat ceiling regardless of how much escrow is held.
+///
+/// # Money-conservation
+///
+/// The debit is the ONLY authority for billing the granted chunks: the pump
+/// bills at most `reserved_top_up / cost_per_chunk` further Data chunks against
+/// this hold, and the unspent remainder is refunded at close by the same
+/// settlement path that refunds the open-time hold. If the grant apply then
+/// rejects, the caller MUST reverse this exact amount via
+/// [`ReverseStreamEscrow`](crate::context::actor::commands::OutletsCommand::ReverseStreamEscrow)
+/// so `billed + refund == reserved` holds across open + every grant.
+///
+/// # Errors
+///
+/// Propagates [`ContextError`] for `EscrowOverflow` (arithmetic) and
+/// `InsufficientFunds` (balance), plus any fail-closed persist failure.
+pub async fn reserve_stream_grant_escrow(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    member_did: &DID,
+    cost_per_chunk: Amount,
+    grant: u32,
+) -> Result<Amount, ContextError> {
+    use crate::context::outlets::dispatch::OpenStreamRejection;
+
+    // Zero-cost / Query outlets, or a zero grant: no debit, no balance
+    // consultation, no persist (spec: "no top-up is performed").
+    if cost_per_chunk.value() == 0 || grant == 0 {
+        return Ok(Amount::new(0));
+    }
+
+    // Overflow is a PURE check on `cost × grant` — done BEFORE any debit so an
+    // overflow rejects without consulting or debiting the budget.
+    let Some(reserved) = cost_per_chunk.checked_mul(u64::from(grant)) else {
+        return Err(invocation_error_to_context(
+            OpenStreamRejection::EscrowOverflow.to_invocation_error(),
+        ));
+    };
+
+    // Gate + DEBIT under a fail-closed persist. The actor processes commands
+    // serially, so the check-and-debit is atomic without an external lock. The
+    // budget debit is Class-C; on persist failure the compensation reverses it
+    // (mirroring the open path's debit block). NO velocity / hard-rate token is
+    // consumed by a grant, so there is nothing to roll back on rejection beyond
+    // the (not-yet-applied) debit itself.
+    cell.commit_class_s_keep_compensating(
+        deps,
+        context_id,
+        |mut view| {
+            let state = view.rest_mut();
+            let remaining = state.governance.budget_tracker.remaining(member_did);
+            if reserved.value() > remaining.value() {
+                // Insufficient funds: reject BEFORE the debit.
+                return Err(invocation_error_to_context(
+                    OpenStreamRejection::InsufficientFunds.to_invocation_error(),
+                ));
+            }
+            if state
+                .governance
+                .budget_tracker
+                .record_spend(member_did, reserved)
+                .is_err()
+            {
+                // Defensive: `record_spend` reject (budget drained after the
+                // local comparison). The serial actor makes this unreachable,
+                // but fail closed.
+                return Err(invocation_error_to_context(
+                    OpenStreamRejection::InsufficientFunds.to_invocation_error(),
+                ));
+            }
+            // `value` = the reserved hold returned to the caller; `external` =
+            // the same hold the persist-failure reversal needs to reverse the
+            // Class-C budget debit.
+            Ok((reserved, reserved))
+        },
+        // KEEP-direction (no Class-S mutation to restore). On persist failure
+        // reverse the Class-C budget debit the failed persist did not make
+        // durable.
+        async |reserved: Amount, mut view, _deps| {
+            view.governance_class_c_mut()
+                .budget_tracker_mut()
+                .reverse_spend(member_did, reserved);
+        },
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Streaming close-time settlement (chunk 3c) — the actor-mailbox port of the
 // reference `ContextManager::outlet_stream_settle`.
@@ -4498,6 +4605,200 @@ mod tests {
                 cell.membership.get(INVOKER).unwrap().sequence_number,
                 0,
                 "the per-sender sequence counter is never allocated at reserve"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // reserve_stream_grant_escrow — §5.4.5 mid-stream GRANT top-up
+        // -------------------------------------------------------------------
+
+        async fn grant_reserve(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            cost: u64,
+            grant: u32,
+        ) -> Result<Amount, ContextError> {
+            super::super::reserve_stream_grant_escrow(
+                cell,
+                deps,
+                &ctx_key(),
+                &invoker(),
+                Amount::new(cost),
+                grant,
+            )
+            .await
+        }
+
+        /// Success: a grant DEBITS `cost_per_chunk × grant` from the invoker's
+        /// budget and returns exactly that hold — the amount the bridge threads
+        /// into `apply_credit_grant` as `reserved_top_up`.
+        #[tokio::test]
+        async fn grant_debits_incremental_escrow() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let reserved = grant_reserve(&mut cell, &deps, 10, 4)
+                .await
+                .expect("grant reserve admits within budget");
+
+            assert_eq!(reserved, Amount::new(40), "reserved = cost 10 × grant 4");
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(40),
+                "the 40-unit grant hold is DEBITED against the invoker's budget"
+            );
+        }
+
+        /// A grant does NOT run the hard-rate / velocity / membership gates the
+        /// OPEN reserve does — successive grants each debit their own hold and
+        /// accumulate (bounding real spend behind every credit extension).
+        #[tokio::test]
+        async fn successive_grants_accumulate_debits() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let _a = grant_reserve(&mut cell, &deps, 10, 2)
+                .await
+                .expect("grant a");
+            let _b = grant_reserve(&mut cell, &deps, 10, 3)
+                .await
+                .expect("grant b");
+
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(50),
+                "both grant holds (20 + 30) are debited"
+            );
+        }
+
+        /// Zero-cost / Query outlets perform NO grant top-up (spec §5.4.5).
+        #[tokio::test]
+        async fn zero_cost_grant_reserves_nothing() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(0));
+
+            let reserved = grant_reserve(&mut cell, &deps, 0, 5)
+                .await
+                .expect("zero-cost grant admits without budget");
+
+            assert_eq!(reserved, Amount::new(0), "zero cost → zero hold");
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "no debit for a zero-cost grant"
+            );
+        }
+
+        /// A zero-chunk grant is a no-op debit (defensive; the bridge never
+        /// signs a `grant == 0`).
+        #[tokio::test]
+        async fn zero_grant_reserves_nothing() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let reserved = grant_reserve(&mut cell, &deps, 10, 0)
+                .await
+                .expect("zero-chunk grant admits");
+
+            assert_eq!(reserved, Amount::new(0), "grant 0 → zero hold");
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "no debit for a zero-chunk grant"
+            );
+        }
+
+        /// `cost × grant` overflow → an escrow-overflow error with no debit.
+        #[tokio::test]
+        async fn grant_overflow_rejects_before_debit() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let err = grant_reserve(&mut cell, &deps, u64::MAX, 2)
+                .await
+                .expect_err("cost u64::MAX × grant 2 overflows");
+
+            assert!(
+                format!("{err}").contains("economic.escrow-overflow"),
+                "the overflow reject names the escrow-overflow slug: {err}"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "overflow rejects BEFORE any debit"
+            );
+        }
+
+        /// `cost × grant > remaining` → insufficient-funds with no debit — the
+        /// budget cap keeps bounding real spend across grants.
+        #[tokio::test]
+        async fn grant_insufficient_funds_rejects_before_debit() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(50));
+
+            let err = grant_reserve(&mut cell, &deps, 10, 100)
+                .await
+                .expect_err("grant 10 × 100 = 1000 > remaining 50");
+
+            assert!(
+                format!("{err}").contains("economic.insufficient-funds"),
+                "the reject names the insufficient-funds slug: {err}"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "insufficient funds rejects BEFORE any debit"
+            );
+        }
+
+        /// A grant hold that a rejected apply must reverse round-trips to a net
+        /// ZERO debit: reserve DEBITS, then `reverse_stream_escrow` CREDITS the
+        /// same amount back — the money-conservation invariant the bridge upholds
+        /// on an apply rejection.
+        #[tokio::test]
+        async fn grant_reserve_then_reverse_conserves_budget() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let reserved = grant_reserve(&mut cell, &deps, 10, 4)
+                .await
+                .expect("grant reserve");
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(40),
+                "the grant hold is debited"
+            );
+
+            super::super::reverse_stream_escrow(&mut cell, &deps, &ctx_key(), &invoker(), reserved)
+                .await
+                .expect("reverse the grant hold");
+
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "reverse credits the full hold back — net-zero debit (billed + refund == reserved)"
+            );
+        }
+
+        /// A fail-closed persist failure during the grant debit reverses the
+        /// debit (the compensation path) — no funds are stranded.
+        #[tokio::test]
+        async fn grant_persist_failure_reverses_debit() {
+            let deps = build_deps(Box::new(FailPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000));
+
+            let err = grant_reserve(&mut cell, &deps, 10, 4)
+                .await
+                .expect_err("a failed grant-debit persist rejects the top-up");
+
+            assert!(
+                matches!(err, ContextError::PersistenceFailed(_)),
+                "a failed fail-closed persist surfaces PersistenceFailed: {err:?}"
+            );
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "the grant debit is REVERSED when the persist does not land"
             );
         }
     }

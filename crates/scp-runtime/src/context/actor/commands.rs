@@ -2317,6 +2317,40 @@ pub enum OutletsCommand {
         >,
     },
 
+    /// Streaming GRANT-time escrow top-up reserve on actor-owned state — the
+    /// mid-stream counterpart of [`Self::ReserveOutletStreamEconomy`] for a
+    /// §5.4.5 credit grant. DEBITS `cost_per_chunk × grant` from the invoker's
+    /// `MemberBudgetTracker` under a fail-closed persist so the operator can
+    /// bill the newly-granted billable chunks against a real held escrow —
+    /// closing the budget-cap under-enforcement where a grant extended the
+    /// credit window with NO corresponding debit (§5.4.5 "Credit-grant escrow
+    /// top-up"). Unlike the open reserve it runs NO hard-rate / velocity /
+    /// membership gate (those are admission-time concerns already paid at open);
+    /// it is purely the incremental escrow debit. Replies with the reserved
+    /// `Amount` the FFI bridge threads into
+    /// [`StreamSessionHandle::apply_credit_grant`](crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant)
+    /// as `reserved_top_up`, and reverses via [`Self::ReverseStreamEscrow`] if
+    /// the grant apply then rejects (signature / replay / stream-closed).
+    ///
+    /// See [`crate::context::outlets_helpers::reserve_stream_grant_escrow`].
+    ReserveStreamGrantEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker (== the pinned stream invoker) whose budget is debited.
+        member_did: scp_did::DID,
+        /// Per-Data-chunk cost. `Amount::new(0)` (Query / zero-cost) short-
+        /// circuits to a zero hold with no balance consultation (spec: "For
+        /// Query outlets and zero-cost outlets no top-up is performed").
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        /// Number of additional billable chunks the grant authorizes — the
+        /// escrow-hold multiplier.
+        grant: u32,
+        /// Oneshot reply carrying the reserved (DEBITED) hold amount, or a
+        /// `SCP-OUTLET-6120`/`6089`-class escrow rejection
+        /// (`EscrowOverflow` / `InsufficientFunds`).
+        reply: oneshot::Sender<Result<scp_protocol::economy::types::Amount, ContextError>>,
+    },
+
     /// Off-mailbox streaming §7.3.8 value-caveat counter reservation on
     /// actor-owned Class-S state — the streaming-pump counterpart of the
     /// unary `consume_caveat_counters` gate. The stream pump runs

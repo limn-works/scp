@@ -62,7 +62,7 @@ use tokio::sync::mpsc;
 
 use scp_core::context::outlets::stream::{
     OutletStreamChunk, OutletStreamCredit, TerminateReason, compute_caveats_binding,
-    verify_chunk_signature,
+    compute_credit_sig_preimage, verify_chunk_signature,
 };
 use scp_core::context::outlets::{
     AdmissionCaps, CancelIdentity, OpenStreamParams, OpenStreamRejection, OutletExecutor,
@@ -100,12 +100,32 @@ pub struct StreamEntry {
     /// The invoker DID pinned at open (CRITICAL #1). Every control-plane
     /// call verifies `caller_did == invoker_did`.
     invoker_did: String,
-    /// Hosting context id pinned at open (for the [`CancelIdentity`]).
+    /// Hosting context id pinned at open (for the [`CancelIdentity`] and the
+    /// §5.4.5 `SCP-OUTLET-CREDIT-V1:` grant preimage).
     context_id: String,
-    /// Outlet id pinned at open (for the [`CancelIdentity`]).
+    /// Outlet id pinned at open (for the [`CancelIdentity`] and the credit
+    /// preimage).
     outlet_id: String,
-    /// 32-byte `caveats_binding` pinned at open (for the [`CancelIdentity`]).
+    /// 32-byte `caveats_binding` pinned at open (for the [`CancelIdentity`] and
+    /// the credit preimage).
     caveats_binding: [u8; 32],
+    /// The stream's 16-byte `request_id` pinned at open — bound into every
+    /// [`OutletStreamCredit`] grant preimage this bridge signs internally.
+    request_id: [u8; 16],
+    /// The hosting context's MLS epoch captured at open (§6.2.1.1(e)) — the
+    /// SAME value pinned in the runtime `StreamIdentity`. Bound into the credit
+    /// preimage; the runtime rejects a grant whose epoch disagrees.
+    stream_epoch: scp_core::context::outlets::stream::MlsEpoch,
+    /// Per-Data-chunk cost pinned at open — the multiplier for the grant-time
+    /// escrow reserve (`cost_per_chunk × grant`). `Amount(0)` for Query /
+    /// zero-cost outlets (no top-up).
+    cost_per_chunk: scp_core::economy::Amount,
+    /// Per-stream monotonic grant counter (§5.4.5 `monotonic_seq`, starts at 0).
+    /// The bridge assigns each internally-signed grant a strictly-increasing
+    /// value via `fetch_add`, so callers never track or forge it — closing the
+    /// caller-tracked-`monotonic_seq` unauthorability the pre-signed grant
+    /// required.
+    grant_seq: std::sync::atomic::AtomicU64,
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +620,12 @@ fn context_outlet_invoke_stream_impl(
             context_id: context_id.to_owned(),
             outlet_id: outlet_id.to_owned(),
             caveats_binding,
+            request_id,
+            stream_epoch,
+            cost_per_chunk,
+            // §5.4.5 `monotonic_seq` starts at 0; the first grant's `fetch_add`
+            // returns 0, the next 1, and so on — strictly increasing.
+            grant_seq: std::sync::atomic::AtomicU64::new(0),
         },
     );
     Ok(handle_id)
@@ -682,38 +708,160 @@ fn outlet_stream_poll_next_impl(
 // grant_credit
 // ---------------------------------------------------------------------------
 
-/// Applies an invoker-signed [`OutletStreamCredit`] grant (JSON bytes). CRITICAL
-/// #1: rejects a `caller_did` that is not the pinned invoker with
+/// Grants `grant` additional billable chunks of credit to a live stream. The
+/// bridge SIGNS the [`OutletStreamCredit`] INTERNALLY under the pinned invoker's
+/// custody key (mirroring how `cancel` signs internally) and auto-assigns the
+/// §5.4.5 `monotonic_seq` from the per-`StreamEntry` counter — so no SDK ever
+/// needs the invoker key (ADR-006) or a caller-tracked replay counter, and the
+/// public surface is a plain `u32`.
+///
+/// CRITICAL #1: rejects a `caller_did` that is not the pinned invoker with
 /// `SCP-PERM-3001` before touching runtime state.
 ///
-/// `reserved_top_up` is `Amount(0)`: the open-time escrow ceiling is the HARD
-/// billing bound and there is no public grant-time escrow-reserve API on the
-/// supervisor, so a nonzero top-up here would extend the billable ceiling
-/// WITHOUT a corresponding budget debit — i.e. authorize billing beyond
-/// reserved funds. Passing `0` keeps the invariant fail-safe: a grant relaxes
-/// backpressure WITHIN the already-escrowed budget; it never raises the ceiling.
+/// # Escrow / money-conservation
+///
+/// A grant EXTENDS the billable credit window, so it MUST be backed by a
+/// corresponding escrow debit or the operator could bill beyond debited funds.
+/// This routes through the runtime reserve/apply/reverse discipline:
+///
+/// 1. `Supervisor::outlet_stream_reserve_grant` DEBITS `cost_per_chunk × grant`
+///    from the invoker's member budget (spec §5.4.5 "Credit-grant escrow
+///    top-up"; `InsufficientFunds` / `EscrowOverflow` reject BEFORE any credit
+///    is applied).
+/// 2. `apply_credit_grant(credit, reserved)` extends the pump's escrow ledger by
+///    exactly the debited hold.
+/// 3. On ANY apply rejection (signature / replay / stream-closed) the debited
+///    hold is REVERSED via `outlet_stream_reverse_grant`.
+///
+/// So `billed + refund == reserved` holds across open + every grant. The
+/// fund-safety BACKSTOP that no quantity of grants can over-bill is the
+/// invoker's CAVEAT CEILING — the §5.4.5:758 cumulative billable ceiling
+/// `min(credit_window, max_calls)` pinned in the pump's `CreditTracker`
+/// (`max_billable`), which clamps every replenishment. It is NOT `billed ≤
+/// reserved` (which does not hold once grants extend the window — that is
+/// exactly why each grant debits incrementally here).
 fn outlet_stream_grant_credit_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     handle_id: &str,
     caller_did: &str,
-    grant: &[u8],
+    grant: u32,
 ) -> PyResult<()> {
     validate::validate_did(caller_did)?;
-    let credit: OutletStreamCredit = serde_json::from_slice(grant).map_err(|e| {
-        ScpPyError::validation(format!("invalid OutletStreamCredit grant bytes: {e}"))
-    })?;
-    let (handle, _ctx, _outlet, _binding) = authorized_control(bi, handle_id, caller_did)?;
+
+    // Look up the live stream, verify caller == pinned invoker (CRITICAL #1),
+    // and copy/clone every pinned field the credit preimage + reserve need OUT
+    // of the DashMap shard guard so no ref is held across the block_on (the
+    // DashMap-ref-across-await hazard). The monotonic grant counter is bumped
+    // here under the guard (a sync atomic op) — the first grant gets seq 0.
+    let (
+        handle,
+        context_id,
+        outlet_id,
+        caveats_binding,
+        request_id,
+        stream_epoch,
+        cost_per_chunk,
+        monotonic_seq,
+    ) = {
+        let entry = bi
+            .outlet_stream_registry
+            .get(handle_id)
+            .ok_or_else(|| no_active_stream_err(handle_id))?;
+        if caller_did != entry.invoker_did {
+            return Err(caller_not_invoker_err(caller_did, &entry.invoker_did).into());
+        }
+        let monotonic_seq = entry
+            .grant_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (
+            Arc::clone(&entry.handle),
+            entry.context_id.clone(),
+            entry.outlet_id.clone(),
+            entry.caveats_binding,
+            entry.request_id,
+            entry.stream_epoch,
+            entry.cost_per_chunk,
+            monotonic_seq,
+        )
+    };
+
+    // Resolve the invoker's custody-backed signer (the key never enters the
+    // runtime address space — ADR-006). Done off the DashMap ref.
+    let signer = resolve_stream_signer(bi, caller_did)?;
+    // §5.4.5 SCP-OUTLET-CREDIT-V1 preimage over the pinned stream identity.
+    let preimage = compute_credit_sig_preimage(
+        &context_id,
+        &outlet_id,
+        &request_id,
+        grant,
+        monotonic_seq,
+        stream_epoch,
+        &caveats_binding,
+    );
+
+    let supervisor = crate::runtime::supervisor(bi)?.clone();
+    let invoker_did_typed: scp_did::DID = caller_did.to_owned().into();
     let rt = crate::runtime()?;
-    rt.block_on(async {
-        handle
-            .lock()
-            .await
-            .apply_credit_grant(&credit, scp_core::economy::Amount::new(0))
-    })
-    .map_err(|e| ScpPyError::ContextError {
-        message: format!("credit grant rejected: {e:?}"),
-        code: grant_error_to_code(e).to_owned(),
-    })?;
+
+    // Sign (via custody) → reserve (DEBIT) → apply → reverse-on-reject, all with
+    // the GIL released: the reserve routes through the actor mailbox and the
+    // apply wakes the pump, which reacquires the GIL to produce chunks (the same
+    // deadlock surface as `poll_next`). Every value below is `Ungil` (Arc /
+    // String / arrays / DID / the plain `ScpPyError`); the `PyErr` conversion
+    // happens outside `allow_threads`.
+    let outcome: Result<(), ScpPyError> = py.allow_threads(|| {
+        rt.block_on(async {
+            // 1. Sign the credit grant through custody.
+            let sig = signer
+                .sign(&preimage)
+                .await
+                .map_err(|e| ScpPyError::context(format!("failed to sign credit grant: {e:?}")))?;
+            let credit = OutletStreamCredit {
+                request_id,
+                grant,
+                monotonic_seq,
+                sig,
+            };
+
+            // 2. Reserve (DEBIT) the incremental escrow BEFORE extending credit.
+            //    A reject here (InsufficientFunds / EscrowOverflow) leaves the
+            //    credit window unchanged — no billing authorized.
+            let reserved = supervisor
+                .outlet_stream_reserve_grant(&context_id, &invoker_did_typed, cost_per_chunk, grant)
+                .await
+                .map_err(ScpPyError::from)?;
+
+            // 3. Apply the signed grant against the debited hold. On rejection,
+            //    REVERSE the reserve so the debit is not stranded
+            //    (money-conservation). The reverse is infallible/saturating; a
+            //    reverse failure is logged-and-swallowed (the original grant
+            //    error is the caller-facing outcome).
+            let apply = handle.lock().await.apply_credit_grant(&credit, reserved);
+            match apply {
+                Ok(_new_total) => Ok(()),
+                Err(grant_err) => {
+                    if let Err(reverse_err) = supervisor
+                        .outlet_stream_reverse_grant(&context_id, &invoker_did_typed, reserved)
+                        .await
+                    {
+                        tracing::warn!(
+                            handle_id = %handle_id,
+                            %reverse_err,
+                            "outlet_stream_grant_credit: grant apply rejected AND the escrow \
+                             reverse failed — the debited hold is reconciled at stream close \
+                             by the settlement/reconcile sweep"
+                        );
+                    }
+                    Err(ScpPyError::ContextError {
+                        message: format!("credit grant rejected: {grant_err:?}"),
+                        code: grant_error_to_code(grant_err).to_owned(),
+                    })
+                }
+            }
+        })
+    });
+    outcome.map_err(PyErr::from)?;
     Ok(())
 }
 
@@ -947,21 +1095,29 @@ impl crate::scp::PyScp {
         outlet_stream_poll_next_impl(py, &self.inner, handle_id)
     }
 
-    /// Applies an invoker-signed `OutletStreamCredit` grant (JSON bytes).
+    /// Grants `grant` additional billable chunks of credit to a live stream.
+    /// The bridge signs the `OutletStreamCredit` internally under the pinned
+    /// invoker's custody key and auto-assigns the monotonic sequence, so the
+    /// caller supplies only a `u32` — no key access, no replay-counter tracking.
+    /// The grant debits `cost_per_chunk × grant` of escrow first
+    /// (money-conservation), reversing it if the grant apply then rejects.
     ///
     /// # Errors
     ///
     /// Raises `ContextError` with `SCP-PERM-3001` if `caller_did` is not the
-    /// pinned invoker; `SCP-OUTLET-NNNN` if the grant is rejected (bad
-    /// signature, replay, or the stream already closed).
+    /// pinned invoker; an escrow rejection (`InsufficientFunds` /
+    /// `EscrowOverflow`) if the top-up debit fails; `SCP-OUTLET-NNNN` if the
+    /// grant apply is rejected (bad signature, replay, or the stream already
+    /// closed).
     #[pyo3(name = "outlet_stream_grant_credit")]
     pub fn outlet_stream_grant_credit(
         &self,
+        py: Python<'_>,
         handle_id: &str,
         caller_did: &str,
-        grant: &[u8],
+        grant: u32,
     ) -> PyResult<()> {
-        outlet_stream_grant_credit_impl(&self.inner, handle_id, caller_did, grant)
+        outlet_stream_grant_credit_impl(py, &self.inner, handle_id, caller_did, grant)
     }
 
     /// Signs and applies a stream cancel at the runtime-derived cursor

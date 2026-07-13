@@ -5373,6 +5373,18 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
+            OutletsCommand::ReserveStreamGrantEscrow {
+                context_id, reply, ..
+            } => {
+                // Distinct `Result<Amount, _>` reply shape. A missing actor for a
+                // mid-stream grant reserve means the hosting context was torn
+                // down — the grant cannot be escrowed; reply the typed error so
+                // the bridge surfaces it and does NOT apply the credit grant.
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
             OutletsCommand::ReserveStreamCaveatCounter {
                 context_id, reply, ..
             } => {
@@ -10682,6 +10694,73 @@ impl Supervisor {
             .map(|boxed| *boxed)
     }
 
+    /// §5.4.5 GRANT-time escrow top-up reserve — DEBITS `cost_per_chunk ×
+    /// grant` from the invoker's `MemberBudgetTracker` inside the per-context
+    /// actor, returning the reserved hold `Amount`.
+    ///
+    /// This is the runtime half of the FFI grant path: the bridge signs the
+    /// `OutletStreamCredit` internally, calls THIS to reserve the incremental
+    /// escrow, threads the returned hold into
+    /// [`StreamSessionHandle::apply_credit_grant`](crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant)
+    /// as `reserved_top_up`, and — if that apply rejects — reverses the hold via
+    /// [`Self::outlet_stream_reverse_grant`]. Together they uphold the §5.4.5
+    /// atomicity invariant `billed + refund == reserved` across open + grants,
+    /// closing the budget-cap under-enforcement where a grant used to extend the
+    /// billable window with no debit.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ContextNotRegistered`] when no actor is registered;
+    /// [`ContextError::TransportFailed`] if the actor reply channel closes;
+    /// `EscrowOverflow` / `InsufficientFunds` from the reserve handler.
+    pub async fn outlet_stream_reserve_grant(
+        &self,
+        context_id: &str,
+        invoker_did: &DID,
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        grant: u32,
+    ) -> Result<scp_protocol::economy::types::Amount, ContextError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = OutletsCommand::ReserveStreamGrantEscrow {
+            context_id: context_id.to_owned(),
+            member_did: invoker_did.clone(),
+            cost_per_chunk,
+            grant,
+            reply: reply_tx,
+        };
+        self.dispatch_outlets_command(cmd).await?;
+        reply_rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::outlet_stream_reserve_grant — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Reverse a GRANT-time escrow hold reserved by
+    /// [`Self::outlet_stream_reserve_grant`] when the subsequent credit-grant
+    /// apply rejects (signature / replay / stream-closed).
+    ///
+    /// Thin `pub` wrapper over [`Self::reverse_stream_escrow_via_actor`] (the
+    /// same `MemberBudgetTracker::reverse_spend` refund the open-path escrow
+    /// ticket uses) so the FFI bridge — which cannot reach the
+    /// `pub(in crate::context)` inner method — has a clean reserve/reverse pair.
+    /// `reverse_spend` is infallible / saturating, so a reverse after a race
+    /// that already refunded is a safe no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ContextNotRegistered`] when no actor is registered;
+    /// [`ContextError::TransportFailed`] if the actor reply channel closes.
+    pub async fn outlet_stream_reverse_grant(
+        &self,
+        context_id: &str,
+        invoker_did: &DID,
+        amount: scp_protocol::economy::types::Amount,
+    ) -> Result<(), ContextError> {
+        self.reverse_stream_escrow_via_actor(context_id, invoker_did, amount)
+            .await
+    }
+
     /// Dispatch the Phase-3 [`OutletsCommand::SettleOutletEconomy`] to the
     /// target context's actor and await the settle outcome.
     ///
@@ -13602,6 +13681,7 @@ impl Supervisor {
             | OutletsCommand::RefundHardRateLimit { context_id, .. }
             | OutletsCommand::ReserveOutletEconomy { context_id, .. }
             | OutletsCommand::ReserveOutletStreamEconomy { context_id, .. }
+            | OutletsCommand::ReserveStreamGrantEscrow { context_id, .. }
             | OutletsCommand::ReserveStreamCaveatCounter { context_id, .. }
             | OutletsCommand::ReleaseStreamCaveatCounter { context_id, .. }
             | OutletsCommand::ReverseStreamEscrow { context_id, .. }

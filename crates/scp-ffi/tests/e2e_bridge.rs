@@ -2192,16 +2192,11 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         // live CRITICAL #1 caller==invoker gate fires only against a live entry;
         // its discrimination is exercised at the runtime handle level.)
         let bogus = "0".repeat(32);
-        let dummy_grant =
-            serde_json::to_vec(&scp_core::context::outlets::stream::OutletStreamCredit {
-                request_id: [0u8; 16],
-                grant: 1,
-                monotonic_seq: 1,
-                sig: [0u8; 64],
-            })
-            .unwrap();
+        // The bridge now signs the grant internally + auto-assigns monotonic_seq,
+        // so the caller supplies only a chunk count. An unknown handle rejects at
+        // the CRITICAL #1 lookup before any signing / reserve.
         assert!(
-            scp.outlet_stream_grant_credit(&bogus, &invoker, &dummy_grant)
+            scp.outlet_stream_grant_credit(py, &bogus, &invoker, 1)
                 .unwrap_err()
                 .to_string()
                 .contains("no active outlet stream"),
@@ -2279,6 +2274,7 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
 /// fixture is needed — the reserve is `Amount(0)`.
 #[cfg(feature = "testing")]
 #[test]
+#[allow(clippy::too_many_lines)] // single linear §5.4.5 live-stream flow — readability favors one test
 fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
     use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk};
 
@@ -2289,6 +2285,9 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
 
         let creator = published_identity_did(py, &scp);
         let invoker = published_identity_did(py, &scp);
+        // A non-invoker principal, to prove the grant control-plane rejects a
+        // caller that is not the pinned invoker (CRITICAL #1).
+        let stranger = published_identity_did(py, &scp);
 
         runtime::init_context_manager_for_test(bi);
         let ctx = {
@@ -2362,6 +2361,32 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
                 Some(1),
             )
             .expect("member invoker opens a live stream");
+
+        // CRITICAL #1: a non-invoker caller cannot steer the stream. The
+        // caller==invoker gate fires on the registry lookup BEFORE any signing /
+        // reserve, so this is deterministic regardless of pump progress.
+        assert!(
+            scp.outlet_stream_grant_credit(py, &handle_id, &stranger, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("SCP-PERM-3001"),
+            "a caller that is not the pinned invoker is rejected with SCP-PERM-3001"
+        );
+
+        // A self-grant exercises the bridge's INTERNAL credit signing + escrow
+        // reserve + apply path end-to-end. The single-shot stream may already
+        // have closed (a benign SCP-OUTLET-6101 lifecycle race), but a
+        // bridge-signed grant must NEVER be rejected as a signature/authorization
+        // failure (SCP-OUTLET-6110) — that would mean the bridge built a bad
+        // credit preimage or signed under the wrong custody key.
+        if let Err(e) = scp.outlet_stream_grant_credit(py, &handle_id, &invoker, 1) {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("SCP-OUTLET-6110"),
+                "a correctly bridge-signed grant must not be rejected as a signature/auth \
+                 failure: {msg}"
+            );
+        }
 
         // Drive poll_next to the terminal. Each poll PARKS on the runtime while
         // the Python handler runs (reacquiring the GIL) — reaching the terminal
