@@ -28,6 +28,7 @@ use scp_protocol::context::broadcast::{
     BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision, SubscriptionResult,
     UnsubscribeResult,
 };
+use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::roles::Capability;
 use scp_protocol::crypto::sender_keys::BroadcastEnvelope;
@@ -877,7 +878,18 @@ fn persist_state_best_effort<'d, 'c>(
     let mut snapshot = build_snapshot_from_state(state);
 
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    match deps.crypto.export_crypto_state(&ctx_id_bytes) {
+    // ADR-049 PR-6: floors threaded as parameters, still provider-sourced from
+    // the `export_*` twins (byte-identical to the prior internal read). The
+    // atomic read-authority core swaps these to the supervisor registry.
+    match deps.crypto.export_crypto_state(
+        &ctx_id_bytes,
+        deps.crypto.export_sender_key_epochs(&ctx_id_bytes),
+        deps.crypto
+            .export_recv_sequence_floors(&ctx_id_bytes)
+            .into_iter()
+            .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+            .collect(),
+    ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
             snapshot.needs_reconnect = true;

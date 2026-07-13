@@ -1220,14 +1220,30 @@ mod tests {
         // returns the serialized state for a keyed context and an EMPTY vec for
         // an unkeyed one (no entry under that key).
         let under_digest = crypto
-            .export_crypto_state(&digest)
+            .export_crypto_state(
+                &digest,
+                crypto.export_sender_key_epochs(&digest),
+                crypto
+                    .export_recv_sequence_floors(&digest)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
             .expect("export under the decoded digest must not error");
         assert!(
             !under_digest.is_empty(),
             "crypto state MUST be keyed under the decoded digest"
         );
         let under_sha256 = crypto
-            .export_crypto_state(&sha256_of_id)
+            .export_crypto_state(
+                &sha256_of_id,
+                crypto.export_sender_key_epochs(&sha256_of_id),
+                crypto
+                    .export_recv_sequence_floors(&sha256_of_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
             .expect("export under SHA-256(id) must not error");
         assert!(
             under_sha256.is_empty(),
