@@ -1,15 +1,22 @@
-//! Supervisor-owned Class-M floor registry (ADR-049 PR-4, epoch side).
+//! Supervisor-owned Class-M floor registry (ADR-049 PR-6, epoch + recv side).
 //!
-//! This module adds the [`ContextFloors`] registry to the [`Supervisor`] and
-//! the TOCTOU-safe advance primitives that mutate it. In PR-4 the registry is a
-//! **NON-AUTHORITATIVE FOLLOWER**: the authoritative homes for the per-sender
-//! epoch high-water and the receive-side `(epoch, sequence)` anti-replay floor
-//! remain the supervisor-owned `MlsCryptoProvider` (`crypto/mls/provider.rs` —
-//! `SenderKeyStore.epochs` and `recv_sequence_tracker`). Enforcement, capture,
-//! and merge all still run there. Nothing in PR-4 READS `Supervisor.floors` for
-//! any enforcement, capture, or merge decision; the registry is **write-only**
-//! until PR-6 flips read-authority onto it (see `.claude/plans` PR-6 scope /
-//! `actor/deps.rs` §"`MlsCryptoProvider` dissolution", ADR-049 Decision 9).
+//! This module holds the [`ContextFloors`] registry on the [`Supervisor`] plus
+//! the TOCTOU-safe advance primitives and the §23.17.2 validating merge that
+//! mutate it. The merge/validation path (`validate_and_merge_*`) is now
+//! **authoritative-CAPABLE**: it implements the full §23.17.2 fail-closed
+//! Inv-2/Inv-3/Inv-4 + epoch-poisoning-overshoot validating merge (no longer the
+//! unconditional monotone-max PR-4 follower). It is implemented and unit-tested
+//! in isolation.
+//!
+//! The **LIVE receive/enforcement gate still reads the provider's authoritative
+//! homes** — the supervisor-owned `MlsCryptoProvider` (`crypto/mls/provider.rs` —
+//! `SenderKeyStore.epochs` and `recv_sequence_tracker`). Read-authority is NOT
+//! flipped onto this registry yet: production still routes the authoritative
+//! restore / import result through the provider (the follower seed's `Result` is
+//! non-fatal, log-and-dropped), and no production code READS `Supervisor.floors`
+//! for any enforcement, capture, or merge decision. The atomic read-authority
+//! switch (a later ADR-049 PR-6 slice) flips the gate onto the registry; see
+//! `actor/deps.rs` §"`MlsCryptoProvider` dissolution", ADR-049 Decision 9.
 //!
 //! Why it must live on the `Supervisor` (an `Arc<Supervisor>`, not on the actor
 //! `PerContextState`): these are **Class-M** floors that MUST survive an actor
@@ -25,6 +32,7 @@ use std::collections::HashMap;
 
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ReceiveFloor;
+use scp_protocol::crypto::sender_keys::{MAX_EPOCH_ADVANCE, MergePolicy};
 
 use super::supervisor::Supervisor;
 
@@ -382,99 +390,206 @@ impl Supervisor {
         })
     }
 
-    /// Merge `incoming` per-sender epoch floors into the registry for `ctx`.
+    /// Merge `incoming` per-sender epoch floors into the registry for `ctx`
+    /// under the spec §23.17.2 fail-closed validating-merge semantics.
     ///
-    /// PR-4 **follower** semantics: a monotone max-merge — for each incoming
-    /// `(did, floor)`, the registry keeps `max(existing, floor)` (insert-if-
-    /// absent). It never regresses a registry floor and never rejects, because
-    /// the AUTHORITATIVE regression / overshoot validation runs on the provider
-    /// in PR-4 (this seed only mirrors the provider's already-validated result).
-    /// `max_advance` and `trusted_local` are plumbed through for the PR-6
-    /// read-authority switch, which makes this the authoritative, fail-closed
-    /// merge (see PR-6 scope note); they are intentionally unused in the PR-4
-    /// follower body. The whole merge runs under one `entry()` guard.
+    /// This path is **authoritative-CAPABLE** — it implements the full §23.17.2
+    /// merge, NOT the PR-4 unconditional monotone-max follower. `policy` selects
+    /// the lower-bound rule:
+    ///
+    /// - [`MergePolicy::RejectRegression`] (**Inv-3**, UNTRUSTED import): reject
+    ///   the WHOLE merge if ANY incoming floor is strictly below its local floor
+    ///   (a snapshot-mediated downgrade is a replay vector).
+    /// - [`MergePolicy::MaxMergeTrustedLocal`] (**Inv-2**, TRUSTED-LOCAL restore):
+    ///   NEVER reject a regression — a snapshot floor lagging the live floor is
+    ///   the expected ≤50ms coalesce-lag case (ADR-049 §9), silently dominated by
+    ///   the live floor in the max-merge apply.
+    ///
+    /// BOTH policies enforce the epoch-poisoning overshoot ceiling
+    /// (`local + max_advance`, saturating; the ADR-049 guard keyed off
+    /// `MAX_EPOCH_ADVANCE = 1000`) and the **Inv-4** append-only max-merge apply.
+    /// The validation pass returns on the FIRST failure BEFORE any mutation, so a
+    /// rejected merge leaves the registry UNTOUCHED (atomic — no partial apply).
+    /// The whole two-pass merge runs under one `entry()` guard.
     ///
     /// # Errors
     ///
-    /// Infallible in PR-4 (returns `Ok`); the `Result` matches the provider twin
-    /// so PR-6 can retarget callers without a PARAM-LIST change. Parity is only
-    /// PARTIAL, though: the provider twin returns `Result<(), ContextError>`
-    /// while this returns `Result<(), FloorAdvanceError>`, so the PR-6 retarget
-    /// is param-list-churn-free but MUST still reconcile the error type (unify
-    /// `FloorAdvanceError` / `ContextError`).
+    /// Returns the single-sender [`FloorAdvanceError`] for the FIRST failing
+    /// sender in `incoming` order:
+    /// [`FloorAdvanceError::SenderEpochNotMonotonic`] on an Inv-3 regression, or
+    /// [`FloorAdvanceError::SenderEpochOvershoot`] on an overshoot. (The provider
+    /// twin aggregates every failure into `ContextError::SnapshotFloorRegression`;
+    /// the `From<FloorAdvanceError>` impl reconciles this single-sender registry
+    /// error to `ContextError` at the atomic-core seam. Atomicity holds
+    /// regardless of single-vs-batch reporting.)
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "the single DashMap entry guard MUST span the whole monotone max-merge (ADR-049 PR-4); early-dropping it breaks the single-guard invariant"
-    )]
-    #[allow(
-        clippy::unnecessary_wraps,
-        unused_variables,
-        reason = "signature parity with provider::validate_and_merge_epoch_floors — max_advance/trusted_local + the fallible Result are exercised by the PR-6 fail-closed validating merge; the PR-4 follower is infallible monotone-max"
+        reason = "the single DashMap entry guard MUST span the whole validating two-pass merge (ADR-049 §23.17.2); early-dropping it breaks the TOCTOU-atomic single-guard invariant"
     )]
     pub(in crate::context) fn validate_and_merge_epoch_floors(
         &self,
         ctx: &[u8; 32],
         incoming: Vec<(String, u64)>,
         max_advance: u64,
-        trusted_local: bool,
+        policy: MergePolicy,
     ) -> Result<(), FloorAdvanceError> {
-        // PR-4 follower: `max_advance` / `trusted_local` are reserved for the
-        // PR-6 fail-closed switch.
+        // Cold-restart no-op (§23.17.2 / ADR-049 §9): nothing to merge or regress
+        // against.
         if incoming.is_empty() {
             return Ok(());
         }
+        // THE single guard. Both passes run under it — no second acquire.
         let mut entry = self.floors.entry(*ctx).or_default();
         let floors = entry.value_mut();
-        for (did, floor) in incoming {
+
+        // Validation pass (NO mutation): returning on the FIRST failure — BEFORE
+        // any apply below — IS the "reject the whole merge, no partial apply"
+        // atomicity guarantee.
+        for (did, incoming_epoch) in &incoming {
+            let local = floors.sender_epochs.get(did).copied().unwrap_or(0);
+            // Inv-3 lower-bound (RejectRegression only): a strictly-lower incoming
+            // floor is a replay/downgrade. MaxMergeTrustedLocal (Inv-2) tolerates
+            // it — the live floor dominates in the apply pass.
+            if policy == MergePolicy::RejectRegression && *incoming_epoch < local {
+                return Err(FloorAdvanceError::SenderEpochNotMonotonic {
+                    did: did.clone(),
+                    current: local,
+                    proposed: *incoming_epoch,
+                });
+            }
+            // Epoch-poisoning overshoot ceiling (BOTH policies): reject a floor
+            // beyond `local + max_advance` so a corrupt snapshot cannot wedge the
+            // sender's monotonicity guard at `epoch = u64::MAX`.
+            let ceiling = local.saturating_add(max_advance);
+            if *incoming_epoch > ceiling {
+                return Err(FloorAdvanceError::SenderEpochOvershoot {
+                    did: did.clone(),
+                    ceiling,
+                    proposed: *incoming_epoch,
+                });
+            }
+        }
+
+        // Apply pass (Inv-4 append-only max-merge): only reached when validation
+        // found no failure. Senders present locally but absent from `incoming`
+        // are untouched (local-only retention).
+        for (did, incoming_epoch) in incoming {
             floors
                 .sender_epochs
                 .entry(did)
-                .and_modify(|cur| *cur = (*cur).max(floor))
-                .or_insert(floor);
+                .and_modify(|cur| *cur = (*cur).max(incoming_epoch))
+                .or_insert(incoming_epoch);
         }
         Ok(())
     }
 
     /// Merge `incoming` per-sender receive-sequence floors into the registry for
-    /// `ctx`. Receive-side twin of [`Self::validate_and_merge_epoch_floors`] with
-    /// the same PR-4 follower (monotone max-merge, lexicographic on
-    /// `(epoch, sequence)`) semantics and the same PR-6 deferral.
+    /// `ctx` under the spec §23.17.2 / §23.17.3 fail-closed validating-merge
+    /// semantics. Receive-side twin of
+    /// [`Self::validate_and_merge_epoch_floors`].
+    ///
+    /// `policy` selects the lower-bound rule exactly as the epoch twin:
+    /// [`MergePolicy::RejectRegression`] (**Inv-3**) rejects the WHOLE merge if
+    /// ANY incoming [`ReceiveFloor`] is lexicographically (epoch-major) below its
+    /// local floor; [`MergePolicy::MaxMergeTrustedLocal`] (**Inv-2**) tolerates a
+    /// lagging floor. The **Inv-4** apply pass max-merges lexicographically. An
+    /// absent local floor accepts the first observation.
+    ///
+    /// The epoch-poisoning overshoot ceiling bounds ONLY the EPOCH axis: an
+    /// incoming floor whose `epoch` exceeds the sender's epoch floor
+    /// (`sender_epochs[did] + MAX_EPOCH_ADVANCE`, saturating, read from the SAME
+    /// entry) is rejected under BOTH policies. The SEQUENCE axis is DELIBERATELY
+    /// UNBOUNDED: there is no sound `MAX_SEQUENCE_ADVANCE` oracle (no per-`(sender,
+    /// epoch)` sequence high-water to bound against, unlike `sender_epochs` for
+    /// the epoch axis), and §23.17.2 Inv-3 mandates accepting a floor `>= local`
+    /// via max-merge. The residual is reachable by ANY untrusted peer whose
+    /// imported snapshot passes validation — not only a signed/trusted exporter:
+    /// under `RejectRegression` an incoming `(current_epoch, u64::MAX)` is
+    /// `>= local` AND within the epoch ceiling, so it is accepted and silences
+    /// that sender for the current epoch. It stays LOW-severity because it is
+    /// (a) fail-SAFE — it can only OVER-reject that sender's legitimate messages
+    /// (a self-inflicted liveness dent), NEVER admit a replay or a floor below the
+    /// live one; and (b) self-healing — the next sender-key rotation advances the
+    /// sender to `epoch + 1`, and `(epoch + 1, 0) > (epoch, u64::MAX)` epoch-major,
+    /// so a legitimate `(epoch + 1, *)` floor immediately clears the poisoned mark.
+    /// It is a bounded `DoS`, NOT a replay hole.
+    ///
+    /// # Precondition (F-2 / same-entry epoch read)
+    ///
+    /// The epoch-axis ceiling reads `sender_epochs[did]` from the SAME entry, so
+    /// the caller MUST run [`Self::validate_and_merge_epoch_floors`] BEFORE this
+    /// recv merge (the existing follower-seed caller order already does). This is
+    /// the F-3 co-mingling invariant: the ceiling reads
+    /// `sender_epochs[remote_did]`, and `local_did` never appears as a remote
+    /// sender on its own recv path, so the ceiling never reads the local scalar.
     ///
     /// # Errors
     ///
-    /// Infallible in PR-4 (returns `Ok`); the `Result` matches the provider twin
-    /// in PARAM-LIST only — same PARTIAL parity as
-    /// [`Self::validate_and_merge_epoch_floors`]: the provider twin returns
-    /// `Result<(), ContextError>` while this returns `Result<(), FloorAdvanceError>`,
-    /// so PR-6's retarget must still reconcile the error type.
+    /// Returns the single-sender [`FloorAdvanceError`] for the FIRST failing
+    /// sender in `incoming` order:
+    /// [`FloorAdvanceError::RecvSequenceNotMonotonic`] on an Inv-3 regression, or
+    /// [`FloorAdvanceError::RecvSequenceOvershoot`] on an epoch overshoot.
+    /// Reconciled to `ContextError::SnapshotFloorRegression` via the
+    /// `From<FloorAdvanceError>` impl at the atomic-core seam; atomicity holds
+    /// regardless of single-vs-batch reporting.
     #[allow(
         clippy::significant_drop_tightening,
-        reason = "the single DashMap entry guard MUST span the whole monotone max-merge (ADR-049 PR-4); early-dropping it breaks the single-guard invariant"
-    )]
-    #[allow(
-        clippy::unnecessary_wraps,
-        unused_variables,
-        reason = "signature parity with provider::validate_and_merge_recv_sequence_floors — trusted_local + the fallible Result are exercised by the PR-6 fail-closed validating merge; the PR-4 follower is infallible monotone-max"
+        reason = "the single DashMap entry guard MUST span the whole validating two-pass merge (ADR-049 §23.17.2); early-dropping it breaks the TOCTOU-atomic single-guard invariant"
     )]
     pub(in crate::context) fn validate_and_merge_recv_sequence_floors(
         &self,
         ctx: &[u8; 32],
         incoming: Vec<(String, ReceiveFloor)>,
-        trusted_local: bool,
+        policy: MergePolicy,
     ) -> Result<(), FloorAdvanceError> {
-        // PR-4 follower: `trusted_local` is reserved for the PR-6 fail-closed
-        // switch.
+        // Cold-restart no-op (§23.17.2 / ADR-049 §9): nothing to merge or regress
+        // against.
         if incoming.is_empty() {
             return Ok(());
         }
+        // THE single guard. Both passes run under it — no second acquire.
         let mut entry = self.floors.entry(*ctx).or_default();
         let floors = entry.value_mut();
-        for (did, floor) in incoming {
+
+        // Validation pass (NO mutation): returning on the FIRST failure BEFORE any
+        // apply IS the "reject the whole merge, no partial apply" atomicity
+        // guarantee.
+        for (did, incoming_floor) in &incoming {
+            // Inv-3 lower-bound (RejectRegression only), lexicographic epoch-major
+            // via ReceiveFloor's derived Ord. An absent local floor accepts the
+            // first observation (matching the live gate's Some-guarded check).
+            if policy == MergePolicy::RejectRegression
+                && let Some(current) = floors.recv_sequence.get(did).copied()
+                && *incoming_floor < current
+            {
+                return Err(FloorAdvanceError::RecvSequenceNotMonotonic {
+                    did: did.clone(),
+                    current,
+                    proposed: *incoming_floor,
+                });
+            }
+            // Epoch-poisoning overshoot ceiling (BOTH policies), EPOCH axis only.
+            // Reads the sender epoch floor from THIS SAME entry (absent read as
+            // 0). The sequence axis is intentionally unbounded (see fn docs).
+            let epoch_floor = floors.sender_epochs.get(did).copied().unwrap_or(0);
+            let ceiling = epoch_floor.saturating_add(MAX_EPOCH_ADVANCE);
+            if incoming_floor.epoch > ceiling {
+                return Err(FloorAdvanceError::RecvSequenceOvershoot {
+                    did: did.clone(),
+                    ceiling,
+                    proposed: incoming_floor.epoch,
+                });
+            }
+        }
+
+        // Apply pass (Inv-4 append-only max-merge), lexicographic. Senders present
+        // locally but absent from `incoming` are untouched (local-only retention).
+        for (did, incoming_floor) in incoming {
             floors
                 .recv_sequence
                 .entry(did)
-                .and_modify(|cur| *cur = (*cur).max(floor))
-                .or_insert(floor);
+                .and_modify(|cur| *cur = (*cur).max(incoming_floor))
+                .or_insert(incoming_floor);
         }
         Ok(())
     }
@@ -522,6 +637,34 @@ impl Supervisor {
     pub(in crate::context) fn remove_context_floors(&self, ctx: &[u8; 32]) {
         self.floors.remove(ctx);
     }
+
+    /// Member-granular floor prune: remove `did` from BOTH the `sender_epochs`
+    /// and `recv_sequence` maps of `ctx`'s [`ContextFloors`] entry, WITHOUT
+    /// dropping the whole entry (sibling senders and the local `sender_key_epoch`
+    /// scalar remain).
+    ///
+    /// The member-granular twin of [`Self::remove_context_floors`]: that prunes
+    /// the entire per-context bundle on permanent teardown; this prunes a single
+    /// departed member's floors while the context lives on. Both maps are cleared
+    /// under ONE `get_mut` guard so a member is never left half-removed.
+    ///
+    /// Idempotent: an absent member — or an absent `ctx` — is a no-op.
+    ///
+    /// No membership-set sweep here: the registry carries no membership set at
+    /// this layer (that is an atomic-core caller concern). Production callers
+    /// (a member leaving / being removed pruning its floors) arrive with the
+    /// atomic read-authority switch; definition-only in this slice.
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-6 forward-declared member-granular floor prune; production callers land in the atomic read-authority switch. Test-exercised today."
+    )]
+    pub(in crate::context) fn remove_member_floors(&self, ctx: &[u8; 32], did: &str) {
+        if let Some(mut entry) = self.floors.get_mut(ctx) {
+            let floors = entry.value_mut();
+            floors.sender_epochs.remove(did);
+            floors.recv_sequence.remove(did);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -530,7 +673,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
+    use scp_protocol::crypto::sender_keys::{MAX_EPOCH_ADVANCE, MergePolicy};
 
     use super::{ContextError, FloorAdvanceError, ReceiveFloor, Supervisor};
     use crate::context::supervisor::handle::SupervisorHandle;
@@ -778,7 +921,7 @@ mod tests {
                 ("did:dht:zOther".to_owned(), 7), // new sender
             ],
             MAX_EPOCH_ADVANCE,
-            true,
+            MergePolicy::MaxMergeTrustedLocal,
         )
         .unwrap();
         let mut got = s.export_sender_key_epochs(&CTX);
@@ -798,7 +941,7 @@ mod tests {
         s.validate_and_merge_recv_sequence_floors(
             &CTX,
             vec![(DID.to_owned(), rf(2, 9)), (DID.to_owned(), rf(1, 0))],
-            true,
+            MergePolicy::MaxMergeTrustedLocal,
         )
         .unwrap();
         assert_eq!(
@@ -807,9 +950,332 @@ mod tests {
         );
         // empty merge is a no-op that does not error.
         assert!(
-            s.validate_and_merge_epoch_floors(&CTX, vec![], MAX_EPOCH_ADVANCE, false)
-                .is_ok()
+            s.validate_and_merge_epoch_floors(
+                &CTX,
+                vec![],
+                MAX_EPOCH_ADVANCE,
+                MergePolicy::RejectRegression
+            )
+            .is_ok()
         );
+    }
+
+    // -- §23.17.2 validating epoch merge (Inv-2/Inv-3/Inv-4 + overshoot) --------
+
+    #[test]
+    fn epoch_merge_max_merges_accepted_monotonic() {
+        let s = sup();
+        s.check_and_advance_sender_epoch(&CTX, "A", 5, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        s.check_and_advance_sender_epoch(&CTX, "B", 10, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        // Inv-2 (MaxMergeTrustedLocal): B:3 lags — tolerated, live 10 dominates;
+        // A:8 wins via max; C:2 is a new sender (insert-if-absent).
+        s.validate_and_merge_epoch_floors(
+            &CTX,
+            vec![
+                ("A".to_owned(), 8),
+                ("B".to_owned(), 3),
+                ("C".to_owned(), 2),
+            ],
+            MAX_EPOCH_ADVANCE,
+            MergePolicy::MaxMergeTrustedLocal,
+        )
+        .unwrap();
+        let mut got = s.export_sender_key_epochs(&CTX);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("A".to_owned(), 8),
+                ("B".to_owned(), 10),
+                ("C".to_owned(), 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn epoch_merge_rejects_regression_atomically() {
+        let s = sup();
+        s.check_and_advance_sender_epoch(&CTX, "A", 5, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        s.check_and_advance_sender_epoch(&CTX, "B", 10, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        s.check_and_advance_sender_epoch(&CTX, "C", 1, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        let before = {
+            let mut v = s.export_sender_key_epochs(&CTX);
+            v.sort();
+            v
+        };
+        // Inv-3 (RejectRegression): A:9 validates OK first, then B:3 < 10 fails.
+        // The FIRST failure is returned (single-sender FloorAdvanceError).
+        assert_eq!(
+            s.validate_and_merge_epoch_floors(
+                &CTX,
+                vec![("A".to_owned(), 9), ("B".to_owned(), 3)],
+                MAX_EPOCH_ADVANCE,
+                MergePolicy::RejectRegression,
+            ),
+            Err(FloorAdvanceError::SenderEpochNotMonotonic {
+                did: "B".to_owned(),
+                current: 10,
+                proposed: 3,
+            })
+        );
+        // Atomicity: A was NOT advanced despite validating OK — no partial apply.
+        let after = {
+            let mut v = s.export_sender_key_epochs(&CTX);
+            v.sort();
+            v
+        };
+        assert_eq!(after, before, "rejected merge leaves the map unchanged");
+    }
+
+    #[test]
+    fn epoch_merge_rejects_overshoot_atomically_both_policies() {
+        for policy in [
+            MergePolicy::MaxMergeTrustedLocal,
+            MergePolicy::RejectRegression,
+        ] {
+            let s = sup();
+            s.check_and_advance_sender_epoch(&CTX, "A", 5, MAX_EPOCH_ADVANCE)
+                .unwrap();
+            // Overshoot ceiling `local(5) + MAX_EPOCH_ADVANCE` — enforced under
+            // BOTH policies.
+            assert_eq!(
+                s.validate_and_merge_epoch_floors(
+                    &CTX,
+                    vec![("A".to_owned(), 5 + MAX_EPOCH_ADVANCE + 1)],
+                    MAX_EPOCH_ADVANCE,
+                    policy,
+                ),
+                Err(FloorAdvanceError::SenderEpochOvershoot {
+                    did: "A".to_owned(),
+                    ceiling: 5 + MAX_EPOCH_ADVANCE,
+                    proposed: 5 + MAX_EPOCH_ADVANCE + 1,
+                })
+            );
+            // Rejected atomically — floor unchanged at 5.
+            assert_eq!(s.export_sender_key_epochs(&CTX), vec![("A".to_owned(), 5)]);
+            // Exactly at the ceiling is accepted.
+            s.validate_and_merge_epoch_floors(
+                &CTX,
+                vec![("A".to_owned(), 5 + MAX_EPOCH_ADVANCE)],
+                MAX_EPOCH_ADVANCE,
+                policy,
+            )
+            .unwrap();
+            assert_eq!(
+                s.export_sender_key_epochs(&CTX),
+                vec![("A".to_owned(), 5 + MAX_EPOCH_ADVANCE)]
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_merge_trusted_local_tolerates_vs_untrusted_rejects() {
+        let regressing = vec![("A".to_owned(), 3)];
+        // Inv-2 (trusted-local): the lagging floor is tolerated; live 10 dominates.
+        let trusted = sup();
+        trusted
+            .check_and_advance_sender_epoch(&CTX, "A", 10, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        trusted
+            .validate_and_merge_epoch_floors(
+                &CTX,
+                regressing.clone(),
+                MAX_EPOCH_ADVANCE,
+                MergePolicy::MaxMergeTrustedLocal,
+            )
+            .unwrap();
+        assert_eq!(
+            trusted.export_sender_key_epochs(&CTX),
+            vec![("A".to_owned(), 10)]
+        );
+        // Inv-3 (untrusted): the SAME regression is rejected.
+        let untrusted = sup();
+        untrusted
+            .check_and_advance_sender_epoch(&CTX, "A", 10, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        assert!(matches!(
+            untrusted.validate_and_merge_epoch_floors(
+                &CTX,
+                regressing,
+                MAX_EPOCH_ADVANCE,
+                MergePolicy::RejectRegression,
+            ),
+            Err(FloorAdvanceError::SenderEpochNotMonotonic { .. })
+        ));
+        assert_eq!(
+            untrusted.export_sender_key_epochs(&CTX),
+            vec![("A".to_owned(), 10)]
+        );
+    }
+
+    #[test]
+    fn epoch_merge_empty_is_noop() {
+        for policy in [
+            MergePolicy::MaxMergeTrustedLocal,
+            MergePolicy::RejectRegression,
+        ] {
+            let s = sup();
+            s.check_and_advance_sender_epoch(&CTX, "A", 7, MAX_EPOCH_ADVANCE)
+                .unwrap();
+            s.validate_and_merge_epoch_floors(&CTX, vec![], MAX_EPOCH_ADVANCE, policy)
+                .unwrap();
+            assert_eq!(s.export_sender_key_epochs(&CTX), vec![("A".to_owned(), 7)]);
+        }
+    }
+
+    // -- §23.17.2/.3 validating recv-sequence merge -----------------------------
+
+    #[test]
+    fn recv_merge_max_merges_lexicographic() {
+        let s = sup();
+        s.check_and_advance_recv_sequence(&CTX, "A", rf(2, 5), MAX_EPOCH_ADVANCE)
+            .unwrap();
+        // Inv-4 max-merge, epoch-major: rf(2,9) dominates; rf(1,99) is below
+        // (lower epoch beats higher sequence).
+        s.validate_and_merge_recv_sequence_floors(
+            &CTX,
+            vec![("A".to_owned(), rf(2, 9)), ("A".to_owned(), rf(1, 99))],
+            MergePolicy::MaxMergeTrustedLocal,
+        )
+        .unwrap();
+        assert_eq!(
+            s.export_recv_sequence_floors(&CTX),
+            vec![("A".to_owned(), rf(2, 9))]
+        );
+    }
+
+    #[test]
+    fn recv_merge_rejects_regression_atomically() {
+        let s = sup();
+        s.check_and_advance_recv_sequence(&CTX, "A", rf(3, 0), MAX_EPOCH_ADVANCE)
+            .unwrap();
+        s.check_and_advance_recv_sequence(&CTX, "B", rf(1, 4), MAX_EPOCH_ADVANCE)
+            .unwrap();
+        // Inv-3: rf(2,9) < rf(3,0) lexicographically (lower epoch) — rejected.
+        assert_eq!(
+            s.validate_and_merge_recv_sequence_floors(
+                &CTX,
+                vec![("A".to_owned(), rf(2, 9))],
+                MergePolicy::RejectRegression,
+            ),
+            Err(FloorAdvanceError::RecvSequenceNotMonotonic {
+                did: "A".to_owned(),
+                current: rf(3, 0),
+                proposed: rf(2, 9),
+            })
+        );
+        // Atomicity: A keeps rf(3,0); sibling B is untouched.
+        let mut got = s.export_recv_sequence_floors(&CTX);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("A".to_owned(), rf(3, 0)), ("B".to_owned(), rf(1, 4))]
+        );
+    }
+
+    #[test]
+    fn recv_merge_rejects_epoch_overshoot() {
+        let s = sup();
+        // Advance the sender epoch floor to 5 in the SAME entry.
+        s.check_and_advance_sender_epoch(&CTX, "A", 5, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        // The recv overshoot ceiling reads `sender_epochs[A]`(5) + MAX_EPOCH_ADVANCE
+        // from the SAME entry (F-3): a recv epoch beyond it is rejected.
+        assert_eq!(
+            s.validate_and_merge_recv_sequence_floors(
+                &CTX,
+                vec![("A".to_owned(), rf(5 + MAX_EPOCH_ADVANCE + 1, 0))],
+                MergePolicy::RejectRegression,
+            ),
+            Err(FloorAdvanceError::RecvSequenceOvershoot {
+                did: "A".to_owned(),
+                ceiling: 5 + MAX_EPOCH_ADVANCE,
+                proposed: 5 + MAX_EPOCH_ADVANCE + 1,
+            })
+        );
+        // Rejected atomically — no recv floor written for A.
+        assert!(s.export_recv_sequence_floors(&CTX).is_empty());
+    }
+
+    #[test]
+    fn recv_merge_trusted_local_tolerates_regression() {
+        let s = sup();
+        s.check_and_advance_recv_sequence(&CTX, "A", rf(3, 0), MAX_EPOCH_ADVANCE)
+            .unwrap();
+        // Inv-2: a lagging restored recv floor is tolerated; live rf(3,0) dominates.
+        s.validate_and_merge_recv_sequence_floors(
+            &CTX,
+            vec![("A".to_owned(), rf(2, 9))],
+            MergePolicy::MaxMergeTrustedLocal,
+        )
+        .unwrap();
+        assert_eq!(
+            s.export_recv_sequence_floors(&CTX),
+            vec![("A".to_owned(), rf(3, 0))]
+        );
+    }
+
+    #[test]
+    fn recv_merge_empty_is_noop() {
+        for policy in [
+            MergePolicy::MaxMergeTrustedLocal,
+            MergePolicy::RejectRegression,
+        ] {
+            let s = sup();
+            s.check_and_advance_recv_sequence(&CTX, "A", rf(1, 1), MAX_EPOCH_ADVANCE)
+                .unwrap();
+            s.validate_and_merge_recv_sequence_floors(&CTX, vec![], policy)
+                .unwrap();
+            assert_eq!(
+                s.export_recv_sequence_floors(&CTX),
+                vec![("A".to_owned(), rf(1, 1))]
+            );
+        }
+    }
+
+    // -- member-granular floor prune --------------------------------------------
+
+    #[test]
+    fn remove_member_floors_drops_member_keeps_siblings() {
+        const OTHER_CTX: [u8; 32] = [0x11u8; 32];
+        let s = sup();
+        // Populate BOTH maps for two members.
+        s.check_and_advance_sender_epoch(&CTX, "A", 5, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        s.check_and_advance_sender_epoch(&CTX, "B", 7, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        s.check_and_advance_recv_sequence(&CTX, "A", rf(1, 2), MAX_EPOCH_ADVANCE)
+            .unwrap();
+        s.check_and_advance_recv_sequence(&CTX, "B", rf(3, 4), MAX_EPOCH_ADVANCE)
+            .unwrap();
+
+        s.remove_member_floors(&CTX, "A");
+
+        // A is gone from BOTH maps; B is intact in BOTH; the ctx entry survives.
+        assert_eq!(s.export_sender_key_epochs(&CTX), vec![("B".to_owned(), 7)]);
+        assert_eq!(
+            s.export_recv_sequence_floors(&CTX),
+            vec![("B".to_owned(), rf(3, 4))]
+        );
+        assert_eq!(s.floors.len(), 1, "ctx entry kept — only the member pruned");
+
+        // Idempotent: removing the now-absent member again is a no-op.
+        s.remove_member_floors(&CTX, "A");
+        assert_eq!(s.export_sender_key_epochs(&CTX), vec![("B".to_owned(), 7)]);
+        assert_eq!(
+            s.export_recv_sequence_floors(&CTX),
+            vec![("B".to_owned(), rf(3, 4))]
+        );
+
+        // Absent ctx is a no-op — it does not create an entry.
+        s.remove_member_floors(&OTHER_CTX, "A");
+        assert!(s.export_sender_key_epochs(&OTHER_CTX).is_empty());
+        assert_eq!(s.floors.len(), 1, "absent-ctx prune created no entry");
     }
 
     // -- Decision-13: exactly ONE registry entry per gate (single-guard body) ---
@@ -940,10 +1406,19 @@ mod tests {
             h.check_and_advance_recv_sequence(&CTX, DID, rf(3, 1), MAX_EPOCH_ADVANCE)
                 .is_ok()
         );
-        h.validate_and_merge_epoch_floors(&CTX, vec![(DID.to_owned(), 8)], MAX_EPOCH_ADVANCE, true)
-            .unwrap();
-        h.validate_and_merge_recv_sequence_floors(&CTX, vec![(DID.to_owned(), rf(8, 2))], true)
-            .unwrap();
+        h.validate_and_merge_epoch_floors(
+            &CTX,
+            vec![(DID.to_owned(), 8)],
+            MAX_EPOCH_ADVANCE,
+            MergePolicy::MaxMergeTrustedLocal,
+        )
+        .unwrap();
+        h.validate_and_merge_recv_sequence_floors(
+            &CTX,
+            vec![(DID.to_owned(), rf(8, 2))],
+            MergePolicy::MaxMergeTrustedLocal,
+        )
+        .unwrap();
 
         // The handle reads must agree with the direct Supervisor reads.
         assert_eq!(
@@ -959,5 +1434,11 @@ mod tests {
             h.export_recv_sequence_floors(&CTX),
             vec![(DID.to_owned(), rf(8, 2))]
         );
+
+        // The remove_member_floors fan-out reaches the registry: pruning DID via
+        // the handle drops it from BOTH maps of the direct Supervisor view.
+        h.remove_member_floors(&CTX, DID);
+        assert!(s.export_sender_key_epochs(&CTX).is_empty());
+        assert!(s.export_recv_sequence_floors(&CTX).is_empty());
     }
 }

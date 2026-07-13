@@ -1812,12 +1812,21 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // never regresses). NON-FATAL: the provider remains authoritative in PR-4,
     // so a follower seed failure is logged and dropped (PR-6 makes it
     // fail-closed once the registry becomes authoritative).
+    // Map the restore's `trusted_local` bool to the registry merge's §23.17.2
+    // `MergePolicy` (identical to the provider twin's mapping): a trusted-local
+    // respawn max-merges and tolerates the coalesce-lag regression (Inv-2); an
+    // untrusted import rejects any regression (Inv-3).
+    let follower_seed_policy = if trusted_local {
+        scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal
+    } else {
+        scp_protocol::crypto::sender_keys::MergePolicy::RejectRegression
+    };
     let seeded_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
     if let Err(e) = deps.supervisor.validate_and_merge_epoch_floors(
         ctx_id_bytes,
         seeded_epoch_floors,
         scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-        trusted_local,
+        follower_seed_policy,
     ) {
         tracing::debug!(
             error = %e,
@@ -1839,7 +1848,7 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     if let Err(e) = deps.supervisor.validate_and_merge_recv_sequence_floors(
         ctx_id_bytes,
         seeded_recv_floors,
-        trusted_local,
+        follower_seed_policy,
     ) {
         tracing::debug!(
             error = %e,
