@@ -2124,6 +2124,13 @@ impl MlsCryptoProvider {
                         Box::new(scp_protocol::context::builder::OpenedEnvelope {
                             inner,
                             sender_did,
+                            // ADR-049 PR-4: surface the just-advanced receive
+                            // floor (recorded into `recv_sequence_tracker`
+                            // above) for the supervisor-registry follower
+                            // mirror-forward. Read-only export of a value
+                            // already computed + stored; does not alter
+                            // enforcement.
+                            receive_floor: (epoch, sequence),
                         }),
                     ))
                 }
@@ -2646,6 +2653,54 @@ impl MlsCryptoProvider {
             .value()
             .sender_key_store
             .epochs_for_context(&ctx_id_hex)
+    }
+
+    /// Returns the stored epoch high-water for a SINGLE `(context, sender_did)`
+    /// pair — `0` when absent, matching `SenderKeyStore::epoch`.
+    ///
+    /// ADR-049 PR-4: the remote-sender-epoch follower mirror-forward reads this
+    /// (O(1)) AFTER `process_incoming_sender_key` / `store_member_sender_key`
+    /// have advanced the authoritative floor via `set_checked`, to forward the
+    /// just-recorded value into the supervisor floor registry. It surfaces the
+    /// value already computed inside those paths without an O(senders)
+    /// `export_sender_key_epochs` clone (Decision-14 budget). `pub(crate)` — an
+    /// internal follower read with no FFI surface.
+    #[must_use]
+    pub(crate) fn sender_key_epoch(&self, context_id: &[u8; 32], sender_did: &str) -> u64 {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
+        let Some(entry) = self.contexts.get(context_id) else {
+            return 0;
+        };
+        let ctx_id_hex = hex::encode(context_id);
+        entry
+            .value()
+            .sender_key_store
+            .epoch(&ctx_id_hex, sender_did)
+    }
+
+    /// Returns the LOCAL sender-key epoch scalar (`state.sender_key_epoch`) for
+    /// `context_id` — `0` when the context has no crypto state.
+    ///
+    /// ADR-049 PR-4: the local-sender-epoch follower mirror-forward reads this
+    /// (O(1)) AFTER `rotate_sender_key` increments the local epoch, and forwards
+    /// it (keyed by [`Self::local_did`]) into the supervisor floor registry.
+    /// `rotate_sender_key` stores the local key via `set_unchecked`, which does
+    /// NOT populate the store's per-sender epoch map — so the authoritative
+    /// local floor is this scalar, not `export_sender_key_epochs`. `pub(crate)`.
+    #[must_use]
+    pub(crate) fn local_sender_key_epoch(&self, context_id: &[u8; 32]) -> u64 {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
+        self.contexts
+            .get(context_id)
+            .map_or(0, |entry| entry.value().sender_key_epoch)
+    }
+
+    /// Returns this provider's local member DID — the key under which the local
+    /// sender's epoch is recorded in the floor registry. `pub(crate)` — internal
+    /// follower read with no FFI surface.
+    #[must_use]
+    pub(crate) fn local_did(&self) -> &str {
+        &self.local_did
     }
 
     /// Test-only: seed a per-sender epoch high-water floor directly into the

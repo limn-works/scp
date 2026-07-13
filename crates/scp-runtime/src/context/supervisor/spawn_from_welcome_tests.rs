@@ -2960,6 +2960,19 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
         "the join persisted an initial Class-S snapshot"
     );
 
+    // Populate the supervisor-owned Class-M floor registry with a real
+    // per-sender follower floor for this ctx (as the mirror-forward would on
+    // live traffic) so the teardown has non-empty state to prune (ADR-049
+    // PR-4). `max_advance = u64::MAX` keeps the single +1 advance well within
+    // the overshoot ceiling without importing the const.
+    j.sup
+        .check_and_advance_sender_epoch(&j.ctx_bytes, BOB_DID, 1, u64::MAX)
+        .expect("first sender-epoch advance is accepted");
+    assert!(
+        j.sup.floors.contains_key(&j.ctx_bytes),
+        "a follower floor entry exists for the joined context before teardown"
+    );
+
     // --- COMPLETE teardown (the FFI compensating path). ---
     let removed = j.sup.discard_joined_context(&j.ctx_id).await;
     assert!(
@@ -3001,6 +3014,17 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     assert!(
         rec.deletes.contains(&j.ctx_id),
         "the snapshot delete was issued to the persistence backend"
+    );
+
+    // 4. Supervisor-owned Class-M floor registry entry pruned (ADR-049 PR-4) —
+    //    mirrors the provider's per-context floor-map prune inside
+    //    `destroy_mls_group`. Without this the follower registry would leak a
+    //    `ContextFloors` entry (and its per-sender maps) for every torn-down
+    //    context. Safe on permanent teardown: a re-created deterministic id is a
+    //    NEW MLS group with fresh keys, so the discarded floors are moot.
+    assert!(
+        !j.sup.floors.contains_key(&j.ctx_bytes),
+        "the follower floor entry is pruned on permanent teardown — no leak"
     );
 }
 

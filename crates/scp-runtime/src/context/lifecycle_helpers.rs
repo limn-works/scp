@@ -402,6 +402,12 @@ pub async fn leave_context(
                 "rotate_sender_key failed after leave — \
                  remaining members retain old sender key"
             );
+        } else {
+            // ADR-049 PR-4: track the rotated local epoch in the floor registry.
+            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                deps,
+                &context_id_bytes,
+            );
         }
         if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes).await {
             tracing::warn!(
@@ -1513,6 +1519,10 @@ pub async fn create_context(
     // §6.2.4 cross-context outlet saga compares `target_context_id` against on
     // the wire, and the bytes the creation crypto (builder) keys under.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
+    // ADR-049 PR-4 §5: create-seed the supervisor floor registry so a
+    // default-empty entry exists from creation (it then grows via
+    // mirror-forward). Insert-if-absent — never resets an advanced entry.
+    deps.supervisor.seed_context_floors(&context_id_bytes);
     let actor_members: HashSet<DID> = initial_members.clone();
     let create_is_broadcast = broadcast_context.is_some();
     let mode = if create_is_broadcast {
@@ -1791,6 +1801,39 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
         let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
         let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
         return Err(e);
+    }
+
+    // ADR-049 PR-4: additive FOLLOWER seed. The AUTHORITATIVE provider floors
+    // above are restored + merged and STAY authoritative (the `deps.crypto`
+    // export/merge calls are deliberately NOT rewired to `deps.supervisor`).
+    // Here we ADDITIONALLY mirror the post-merge provider floors into the
+    // supervisor-owned registry so the follower tracks the provider across a
+    // restore / import / respawn. Insert-if-absent-then-max (the registry merge
+    // never regresses). NON-FATAL: the provider remains authoritative in PR-4,
+    // so a follower seed failure is logged and dropped (PR-6 makes it
+    // fail-closed once the registry becomes authoritative).
+    let seeded_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
+    if let Err(e) = deps.supervisor.validate_and_merge_epoch_floors(
+        ctx_id_bytes,
+        seeded_epoch_floors,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        trusted_local,
+    ) {
+        tracing::debug!(
+            error = %e,
+            "floor-registry follower epoch seed failed on restore (non-fatal in PR-4; provider authoritative)"
+        );
+    }
+    let seeded_recv_floors = deps.crypto.export_recv_sequence_floors(ctx_id_bytes);
+    if let Err(e) = deps.supervisor.validate_and_merge_recv_sequence_floors(
+        ctx_id_bytes,
+        seeded_recv_floors,
+        trusted_local,
+    ) {
+        tracing::debug!(
+            error = %e,
+            "floor-registry follower recv seed failed on restore (non-fatal in PR-4; provider authoritative)"
+        );
     }
     Ok(())
 }
@@ -3333,6 +3376,14 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // lookup still reports the poison until an operator clears it or the
         // process restarts.
         supervisor.reap_crash_window(ctx_id);
+        // Drop the supervisor-owned Class-M floor registry entry on the same
+        // teardown sweep (ADR-049 PR-4) — the floor-registry twin of the
+        // crash-window reap above. Harmless-but-tidy here (the whole Supervisor
+        // is about to be dropped), but it keeps the follower floors' lifecycle
+        // aligned 1:1 with crash_windows and leaves no per-context registry
+        // entry behind after a shutdown sweep.
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx_id);
+        supervisor.remove_context_floors(&ctx_id_bytes);
     }
 
     // Supervisor-level state clear. Acquired under the write_lock once

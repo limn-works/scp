@@ -132,7 +132,13 @@ impl ContextCryptoProvider for MockCrypto {
             .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
         let sender_did = inner.sender_did.clone();
         Ok(scp_core::context::builder::OpenResult::Application(
-            Box::new(scp_core::context::builder::OpenedEnvelope { inner, sender_did }),
+            Box::new(scp_core::context::builder::OpenedEnvelope {
+                inner,
+                sender_did,
+                // ADR-049 PR-4: mock open() has no live recv tracker; the
+                // follower mirror-forward drop is non-fatal.
+                receive_floor: (0, 0),
+            }),
         ))
     }
 }

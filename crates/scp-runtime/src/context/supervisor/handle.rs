@@ -37,6 +37,7 @@ use std::sync::Arc;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 
+use crate::context::supervisor::floors::FloorAdvanceError;
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
@@ -78,6 +79,152 @@ impl SupervisorHandle {
     #[must_use]
     pub(in crate::context::supervisor) const fn wrap(supervisor: Arc<Supervisor>) -> Self {
         Self { supervisor }
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-049 PR-4 — supervisor-owned floor registry (epoch side) fan-out.
+    //
+    // These eight accessors are PER-CONTEXT (they take `&[u8; 32]`, NOT
+    // `&OwnedIdentityDid` and NOT `&DID`): they are registry fan-out, which the
+    // AXIS comment above explicitly exempts from the per-identity token rule.
+    // They forward to the same-named `Supervisor` primitives on
+    // `Supervisor.floors`. NONE returns (or exposes) a `ContextActorHandle`, so
+    // Invariant 3 (actors cannot reach sibling actors) is preserved.
+    //
+    // Single-writer / security separation (inquisitor-sharpened, verbatim — it
+    // SEPARATES structural security from liveness): SECURITY — "never accept a
+    // key below the floor" — is STRUCTURAL and caller-topology-independent: the
+    // single-`entry()`-guard body (atomic read → reject-`<=` → reject-overshoot
+    // → write, all under one guard) plus the fail-safe gate-then-key-insert
+    // ordering make key-below-floor impossible no matter who calls. The
+    // per-context single-writer actor (`ContextActor::run()` serializes
+    // gate-then-insert) preserves only LIVENESS (avoids spurious rejects). If
+    // `check_and_advance` were ever called for a LIVE context from OUTSIDE its
+    // owning actor, the gate→insert window would open but stays FAIL-SAFE — it
+    // degrades liveness (a spurious reject / retry), NEVER fail-open. Do NOT
+    // read this as "security depends on single-writer"; security is the
+    // structural gate, single-writer is a liveness convention. (PR-6
+    // re-evaluates whether a structural guard is warranted once the gate RESULT
+    // becomes security-enforced.)
+
+    /// Follower mirror-forward of a per-sender epoch advance into the
+    /// supervisor-owned floor registry. See
+    /// [`Supervisor::check_and_advance_sender_epoch`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting
+    /// epoch; NON-FATAL in PR-4 (callers log-and-drop — the provider remains
+    /// authoritative).
+    pub(in crate::context) fn check_and_advance_sender_epoch(
+        &self,
+        ctx: &[u8; 32],
+        did: &str,
+        epoch: u64,
+        max_advance: u64,
+    ) -> Result<(), FloorAdvanceError> {
+        self.supervisor
+            .check_and_advance_sender_epoch(ctx, did, epoch, max_advance)
+    }
+
+    /// Follower mirror-forward of a per-sender receive-sequence advance. See
+    /// [`Supervisor::check_and_advance_recv_sequence`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting
+    /// `(epoch, sequence)`; NON-FATAL in PR-4.
+    pub(in crate::context) fn check_and_advance_recv_sequence(
+        &self,
+        ctx: &[u8; 32],
+        did: &str,
+        next: (u64, u64),
+        max_advance: u64,
+    ) -> Result<(), FloorAdvanceError> {
+        self.supervisor
+            .check_and_advance_recv_sequence(ctx, did, next, max_advance)
+    }
+
+    /// Read the registry's per-sender epoch floors for `ctx`. See
+    /// [`Supervisor::export_sender_key_epochs`].
+    ///
+    /// PR-4 forward-declared read surface (no production caller until PR-6);
+    /// exercised by the registry unit tests.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-4 forward-declared registry read API; production callers land in PR-6 (read-authority switch). Test-exercised today."
+    )]
+    pub(in crate::context) fn export_sender_key_epochs(
+        &self,
+        ctx: &[u8; 32],
+    ) -> Vec<(String, u64)> {
+        self.supervisor.export_sender_key_epochs(ctx)
+    }
+
+    /// Read the registry's per-sender receive-sequence floors for `ctx`. See
+    /// [`Supervisor::export_recv_sequence_floors`].
+    ///
+    /// PR-4 forward-declared read surface (no production caller until PR-6);
+    /// exercised by the registry unit tests.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-4 forward-declared registry read API; production callers land in PR-6 (read-authority switch). Test-exercised today."
+    )]
+    pub(in crate::context) fn export_recv_sequence_floors(
+        &self,
+        ctx: &[u8; 32],
+    ) -> Vec<(String, (u64, u64))> {
+        self.supervisor.export_recv_sequence_floors(ctx)
+    }
+
+    /// Seed/merge per-sender epoch floors into the registry (follower). See
+    /// [`Supervisor::validate_and_merge_epoch_floors`].
+    ///
+    /// # Errors
+    ///
+    /// Infallible in PR-4 (matches the provider twin's signature for the PR-6
+    /// retarget).
+    pub(in crate::context) fn validate_and_merge_epoch_floors(
+        &self,
+        ctx: &[u8; 32],
+        incoming: Vec<(String, u64)>,
+        max_advance: u64,
+        trusted_local: bool,
+    ) -> Result<(), FloorAdvanceError> {
+        self.supervisor
+            .validate_and_merge_epoch_floors(ctx, incoming, max_advance, trusted_local)
+    }
+
+    /// Seed/merge per-sender receive-sequence floors into the registry
+    /// (follower). See [`Supervisor::validate_and_merge_recv_sequence_floors`].
+    ///
+    /// # Errors
+    ///
+    /// Infallible in PR-4 (matches the provider twin's signature).
+    pub(in crate::context) fn validate_and_merge_recv_sequence_floors(
+        &self,
+        ctx: &[u8; 32],
+        incoming: Vec<(String, (u64, u64))>,
+        trusted_local: bool,
+    ) -> Result<(), FloorAdvanceError> {
+        self.supervisor
+            .validate_and_merge_recv_sequence_floors(ctx, incoming, trusted_local)
+    }
+
+    /// Create-seed the floor registry for `ctx` (insert-if-absent). See
+    /// [`Supervisor::seed_context_floors`].
+    pub(in crate::context) fn seed_context_floors(&self, ctx: &[u8; 32]) {
+        self.supervisor.seed_context_floors(ctx);
+    }
+
+    /// Permanent-teardown prune of the floor registry entry for `ctx`. See
+    /// [`Supervisor::remove_context_floors`] — including the permanent-vs-
+    /// transient safety argument. Callers (the terminal close / TTL-expiry /
+    /// shutdown paths) invoke this only when the context is permanently gone.
+    pub(in crate::context) fn remove_context_floors(&self, ctx: &[u8; 32]) {
+        self.supervisor.remove_context_floors(ctx);
     }
 
     /// Start a cross-context saga. The ONLY way for an actor to affect

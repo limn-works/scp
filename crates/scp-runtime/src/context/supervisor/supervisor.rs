@@ -1238,6 +1238,19 @@ pub struct Supervisor {
     /// first time an actor for that context crashes. Lock-free reads via
     /// `DashMap` per ADR-049 §Decision 12.
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
+    /// ADR-049 PR-4 — supervisor-owned Class-M **floor registry** (epoch side).
+    /// Keyed by the 32-byte context id. Each [`ContextFloors`] bundles the
+    /// per-sender epoch high-water and the receive-side `(epoch, sequence)`
+    /// anti-replay floor. In PR-4 this is a NON-AUTHORITATIVE FOLLOWER: the
+    /// `MlsCryptoProvider` remains the authoritative floor store and nothing
+    /// reads this map for enforcement/capture/merge (write-only until PR-6).
+    /// Lives on `Arc<Supervisor>` so it survives an actor task unwind — the
+    /// Class-M requirement the floors exist to satisfy. Lock-free entry-scoped
+    /// reads/writes via `DashMap` (ADR-049 Decision 12); an entry mutation does
+    /// NOT take [`Self::write_lock`] (that guards the multi-field ArcSwap write
+    /// path per Decision 2). Precedent: `crash_windows` above.
+    pub(in crate::context::supervisor) floors:
+        DashMap<[u8; 32], crate::context::supervisor::floors::ContextFloors>,
     /// Test-only completion signal for the KeyPackage-actor watchdog.
     ///
     /// A monotonically-incrementing counter bumped by [`Self::kp_actor_watchdog`]
@@ -1614,6 +1627,8 @@ impl Supervisor {
             key_package_stores: DashMap::new(),
             health_config,
             crash_windows: DashMap::new(),
+            // ADR-049 PR-4: supervisor-owned Class-M floor registry (follower).
+            floors: DashMap::new(),
             // Test-only KP-watchdog completion signal (see field docs). The
             // paired receiver is created on demand via `kp_watchdog_processed_tx.subscribe()`;
             // dropping the initial one here is fine — `watch::Sender::send_modify`
@@ -4814,6 +4829,14 @@ impl Supervisor {
         if let Some(persistence) = self.persistence_ref() {
             let _ = persistence.delete_context(context_id).await;
         }
+        // 4. Drop the supervisor-owned Class-M floor registry entry (ADR-049
+        //    PR-4) — the follower twin of the provider's per-context floor-map
+        //    prune inside `destroy_mls_group` (step 2). A discarded welcome-join
+        //    is permanently gone (its crypto group + durable snapshot were just
+        //    destroyed), so the floors are moot and pruning is sound; see
+        //    `Supervisor::remove_context_floors` for the full permanent-vs-
+        //    transient safety argument.
+        self.remove_context_floors(&context_id_bytes);
         removed
     }
 
@@ -15247,6 +15270,14 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
+        // ADR-049 PR-4 floor-registry SAFETY gate (F-1): seed a real follower
+        // floor. An ABORTED expiry (params.ttl == None, A3) leaves the context
+        // LIVE (`Active`), so its floors MUST survive — pruning here would drop a
+        // live context's anti-replay floors. This guards the `state_transitioned()`
+        // gate on the prune.
+        sup.check_and_advance_sender_epoch(&ctx_id_bytes, "did:example:floor-sender", 1, u64::MAX)
+            .expect("first sender-epoch advance is accepted");
+
         let outcome =
             crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
                 .await;
@@ -15254,6 +15285,11 @@ mod tests {
         assert!(
             !outcome.result.is_complete(),
             "an aborted expiry is NOT a completed expiry"
+        );
+        assert!(
+            sup.floors.contains_key(&ctx_id_bytes),
+            "an ABORTED expiry leaves the context Active, so its follower floors MUST \
+             survive — the prune is gated on a genuine terminal transition"
         );
         assert_eq!(
             cell.handle.state(),
@@ -15337,9 +15373,26 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
+        // ADR-049 PR-4 floor-registry prune (F-1): seed a real follower floor for
+        // this ctx (Full scope, so finalize destroys NO crypto — this proves the
+        // prune is driven by the terminal close, not by key destruction), assert
+        // it is present, then confirm the explicit close prunes it.
+        sup.check_and_advance_sender_epoch(&ctx_id_bytes, "did:example:floor-sender", 1, u64::MAX)
+            .expect("first sender-epoch advance is accepted");
+        assert!(
+            sup.floors.contains_key(&ctx_id_bytes),
+            "a follower floor entry exists before the explicit close"
+        );
+
         crate::context::ttl_close_helpers::finalize_close(&mut cell, &deps, &handle)
             .await
             .expect("finalize_close on a Closing context succeeds");
+
+        assert!(
+            !sup.floors.contains_key(&ctx_id_bytes),
+            "the explicit close (Closed) prunes the follower floor entry — no leak on \
+             the dominant teardown path, even for Full scope where crypto is retained"
+        );
 
         let closed_ts = entries_handle
             .lock()
@@ -15443,6 +15496,10 @@ mod tests {
     /// the convergent deadline from `creation + ttl` (+ recorded extensions) on
     /// the retry, independent of the cleared field.
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear TTL-expiry retry fixture (setup + two-attempt drive + convergent-timestamp asserts + ADR-049 PR-4 floor-prune asserts); reads clearer unsplit"
+    )]
     async fn retry_stamps_convergent_leaf_timestamp() {
         const T0: u64 = 1_700_000_000;
         const TTL_SECS: u64 = 3_600;
@@ -15515,6 +15572,18 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
+        // ADR-049 PR-4 floor-registry prune (F-1): seed a real follower floor and
+        // assert the TERMINAL TTL expiry drops it. The Phase-1 terminal transition
+        // (`state_transitioned()`) runs on the FIRST attempt even though the leaf
+        // append fails, so the prune lands on `out1` — and the RETRY (`out2`) is a
+        // harmless idempotent no-op (remove-on-absent).
+        sup.check_and_advance_sender_epoch(&ctx_id_bytes, "did:example:floor-sender", 1, u64::MAX)
+            .expect("first sender-epoch advance is accepted");
+        assert!(
+            sup.floors.contains_key(&ctx_id_bytes),
+            "a follower floor entry exists before the terminal TTL expiry"
+        );
+
         // First attempt: append FAILS ⇒ incomplete. Phase 1 clears the recorded
         // deadline.
         let out1 =
@@ -15524,6 +15593,11 @@ mod tests {
             !out1.result.is_complete(),
             "first attempt's append must fail (forcing a retry): {}",
             out1.result
+        );
+        assert!(
+            !sup.floors.contains_key(&ctx_id_bytes),
+            "the terminal TTL transition (Expired) prunes the follower floor entry — no \
+             leak on the TTL-expiry teardown path"
         );
         assert_eq!(
             cell.ttl.timer.deadline_unix_secs, None,
@@ -18180,6 +18254,16 @@ mod tests {
         // The PERSISTED snapshot captures the floor at epoch 5 (the coalesced
         // state at snapshot time).
         crypto.seed_sender_key_epoch_for_test(&ctx_id_bytes, sender_did, 5);
+        // ADR-049 PR-4: the supervisor floor registry is a FOLLOWER. Seed it in
+        // parallel to epoch 5 (as the mirror-forward seams would have) so we can
+        // assert after respawn that the follower tracks the provider.
+        sup.check_and_advance_sender_epoch(
+            &ctx_id_bytes,
+            sender_did,
+            5,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        )
+        .expect("seed follower registry to epoch 5");
 
         let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
@@ -18211,6 +18295,14 @@ mod tests {
         // survives the crash (it lives in the supervisor-owned crypto provider,
         // which a mailbox/handle despawn does not tear down).
         crypto.seed_sender_key_epoch_for_test(&ctx_id_bytes, sender_did, 12);
+        // Advance the follower registry in parallel to the live floor (12).
+        sup.check_and_advance_sender_epoch(
+            &ctx_id_bytes,
+            sender_did,
+            12,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        )
+        .expect("advance follower registry to epoch 12");
 
         // Crash before any re-persist of the advanced floor.
         induce_panic(&handle, "SECRET_SENTINEL_lagged").await;
@@ -18238,6 +18330,17 @@ mod tests {
         assert!(
             merged.iter().any(|(d, e)| d == sender_did && *e == 12),
             "merged floor must be the higher live value (12), got {merged:?}"
+        );
+
+        // ADR-049 PR-4: the FOLLOWER registry tracks the provider after respawn.
+        // The additive post-merge restore seed in
+        // `restore_crypto_state_with_floor_guard` mirrors the provider's
+        // post-merge floor (12) into the supervisor registry, so the follower
+        // reports 12 too — never the stale snapshot's 5.
+        let follower = sup.export_sender_key_epochs(&ctx_id_bytes);
+        assert!(
+            follower.iter().any(|(d, e)| d == sender_did && *e == 12),
+            "follower registry must track the provider's merged floor (12) after respawn, got {follower:?}"
         );
     }
 
