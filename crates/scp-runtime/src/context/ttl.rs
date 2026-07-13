@@ -1122,7 +1122,6 @@ pub const fn expiry_notification() -> ContextEvent {
 mod tests {
     use super::*;
     use scp_clock::TestClock;
-    use scp_protocol::context::builder::ReceiveFloor;
     use scp_protocol::context::params::ContextParams;
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
     use std::time::Duration;
@@ -1632,15 +1631,7 @@ mod tests {
         // The group MUST be present under the digest before expiry — proves this
         // is a real destroy, not a phantom no-op against an empty slot.
         let before = crypto
-            .export_crypto_state(
-                &digest,
-                crypto.export_sender_key_epochs(&digest),
-                crypto
-                    .export_recv_sequence_floors(&digest)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&digest, Vec::new(), Vec::new())
             .expect("export under the decoded digest must not error");
         assert!(
             !before.is_empty(),
@@ -1683,15 +1674,7 @@ mod tests {
         // would have addressed an unkeyed slot (a silent no-op) and the digest
         // slot would still be populated — this assertion FAILS in that case.
         let after_digest = crypto
-            .export_crypto_state(
-                &digest,
-                crypto.export_sender_key_epochs(&digest),
-                crypto
-                    .export_recv_sequence_floors(&digest)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
-            )
+            .export_crypto_state(&digest, Vec::new(), Vec::new())
             .expect("export under the decoded digest must not error");
         assert!(
             after_digest.is_empty(),

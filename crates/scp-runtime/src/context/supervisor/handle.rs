@@ -84,9 +84,9 @@ impl SupervisorHandle {
     }
 
     // -----------------------------------------------------------------------
-    // ADR-049 PR-4 — supervisor-owned floor registry (epoch side) fan-out.
+    // ADR-049 (read-authority switch) — supervisor-owned floor registry fan-out.
     //
-    // These eight accessors are PER-CONTEXT (they take `&[u8; 32]`, NOT
+    // These accessors are PER-CONTEXT (they take `&[u8; 32]`, NOT
     // `&OwnedIdentityDid` and NOT `&DID`): they are registry fan-out, which the
     // AXIS comment above explicitly exempts from the per-identity token rule.
     // They forward to the same-named `Supervisor` primitives on
@@ -105,19 +105,20 @@ impl SupervisorHandle {
     // owning actor, the gate→insert window would open but stays FAIL-SAFE — it
     // degrades liveness (a spurious reject / retry), NEVER fail-open. Do NOT
     // read this as "security depends on single-writer"; security is the
-    // structural gate, single-writer is a liveness convention. (PR-6
-    // re-evaluates whether a structural guard is warranted once the gate RESULT
-    // becomes security-enforced.)
+    // structural gate, single-writer is a liveness convention. PR-6 made the
+    // call: NO separate structural guard is warranted — the single-`entry()`
+    // gate + fail-safe ordering is sufficient now that the gate RESULT is
+    // security-enforced (fail-closed at the seams); co-locating the gate with the
+    // key insert is deferred to PR-7's key-move, which co-serializes it for free.
 
-    /// Follower mirror-forward of a per-sender epoch advance into the
-    /// supervisor-owned floor registry. See
-    /// [`Supervisor::check_and_advance_sender_epoch`].
+    /// Advance a per-sender epoch floor in the authoritative registry, FAIL-CLOSED.
+    /// See [`Supervisor::check_and_advance_sender_epoch`].
     ///
     /// # Errors
     ///
-    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting
-    /// epoch; NON-FATAL in PR-4 (callers log-and-drop — the provider remains
-    /// authoritative).
+    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting epoch;
+    /// the live receive seams surface it via `?` and abort the operation (it is
+    /// NEVER log-and-dropped).
     pub(in crate::context) fn check_and_advance_sender_epoch(
         &self,
         ctx: &[u8; 32],
@@ -129,13 +130,13 @@ impl SupervisorHandle {
             .check_and_advance_sender_epoch(ctx, did, epoch, max_advance)
     }
 
-    /// Follower mirror-forward of a per-sender receive-sequence advance. See
-    /// [`Supervisor::check_and_advance_recv_sequence`].
+    /// Advance a per-sender receive-sequence floor in the authoritative registry,
+    /// FAIL-CLOSED. See [`Supervisor::check_and_advance_recv_sequence`].
     ///
     /// # Errors
     ///
     /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting
-    /// `(epoch, sequence)`; NON-FATAL in PR-4.
+    /// `(epoch, sequence)`; the recv seam surfaces it via `?` (never dropped).
     pub(in crate::context) fn check_and_advance_recv_sequence(
         &self,
         ctx: &[u8; 32],
@@ -150,13 +151,9 @@ impl SupervisorHandle {
     /// Read the registry's per-sender epoch floors for `ctx`. See
     /// [`Supervisor::export_sender_key_epochs`].
     ///
-    /// PR-4 forward-declared read surface (no production caller until PR-6);
-    /// exercised by the registry unit tests.
+    /// ADR-049 PR-6: the authoritative durable-blob export source (the 6
+    /// production `export_crypto_state` callers).
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "ADR-049 PR-4 forward-declared registry read API; production callers land in PR-6 (read-authority switch). Test-exercised today."
-    )]
     pub(in crate::context) fn export_sender_key_epochs(
         &self,
         ctx: &[u8; 32],
@@ -167,13 +164,9 @@ impl SupervisorHandle {
     /// Read the registry's per-sender receive-sequence floors for `ctx`. See
     /// [`Supervisor::export_recv_sequence_floors`].
     ///
-    /// PR-4 forward-declared read surface (no production caller until PR-6);
-    /// exercised by the registry unit tests.
+    /// ADR-049 PR-6: the authoritative durable-blob export source (the 6
+    /// production `export_crypto_state` callers).
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "ADR-049 PR-4 forward-declared registry read API; production callers land in PR-6 (read-authority switch). Test-exercised today."
-    )]
     pub(in crate::context) fn export_recv_sequence_floors(
         &self,
         ctx: &[u8; 32],
@@ -181,41 +174,24 @@ impl SupervisorHandle {
         self.supervisor.export_recv_sequence_floors(ctx)
     }
 
-    /// Merge per-sender epoch floors into the registry under the §23.17.2
-    /// fail-closed validating-merge `policy`. See
-    /// [`Supervisor::validate_and_merge_epoch_floors`].
+    /// Atomically merge BOTH the per-sender epoch floors AND the receive-sequence
+    /// floors into the registry under one guard (the restore/import sink). See
+    /// [`Supervisor::validate_and_merge_all_floors`].
     ///
     /// # Errors
     ///
     /// Propagates [`FloorAdvanceError`] on an Inv-3 regression
-    /// ([`MergePolicy::RejectRegression`]) or an overshoot (both policies).
-    pub(in crate::context) fn validate_and_merge_epoch_floors(
+    /// ([`MergePolicy::RejectRegression`]) or an overshoot (RejectRegression only).
+    pub(in crate::context) fn validate_and_merge_all_floors(
         &self,
         ctx: &[u8; 32],
-        incoming: Vec<(String, u64)>,
+        epochs: Vec<(String, u64)>,
+        recv: Vec<(String, ReceiveFloor)>,
         max_advance: u64,
         policy: MergePolicy,
     ) -> Result<(), FloorAdvanceError> {
         self.supervisor
-            .validate_and_merge_epoch_floors(ctx, incoming, max_advance, policy)
-    }
-
-    /// Merge per-sender receive-sequence floors into the registry under the
-    /// §23.17.2/.3 fail-closed validating-merge `policy`. See
-    /// [`Supervisor::validate_and_merge_recv_sequence_floors`].
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`FloorAdvanceError`] on an Inv-3 regression
-    /// ([`MergePolicy::RejectRegression`]) or an epoch overshoot (both policies).
-    pub(in crate::context) fn validate_and_merge_recv_sequence_floors(
-        &self,
-        ctx: &[u8; 32],
-        incoming: Vec<(String, ReceiveFloor)>,
-        policy: MergePolicy,
-    ) -> Result<(), FloorAdvanceError> {
-        self.supervisor
-            .validate_and_merge_recv_sequence_floors(ctx, incoming, policy)
+            .validate_and_merge_all_floors(ctx, epochs, recv, max_advance, policy)
     }
 
     /// Create-seed the floor registry for `ctx` (insert-if-absent). See
@@ -235,11 +211,8 @@ impl SupervisorHandle {
     /// Member-granular floor prune of `did` from `ctx`'s registry entry. See
     /// [`Supervisor::remove_member_floors`] — the member-granular twin of
     /// `remove_context_floors` (keeps siblings + the local scalar; drops only the
-    /// departed member's floors under one guard).
-    #[allow(
-        dead_code,
-        reason = "ADR-049 PR-6 forward-declared member-granular floor prune; production callers land in the atomic read-authority switch. Test-exercised today."
-    )]
+    /// departed member's floors under one guard). ADR-049 PR-6: called from every
+    /// member-removal seam.
     pub(in crate::context) fn remove_member_floors(&self, ctx: &[u8; 32], did: &str) {
         self.supervisor.remove_member_floors(ctx, did);
     }

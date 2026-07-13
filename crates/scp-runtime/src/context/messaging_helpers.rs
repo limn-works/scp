@@ -57,7 +57,6 @@ use subtle::ConstantTimeEq;
 use scp_clock::Clock;
 use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::roles::Capability;
@@ -2464,17 +2463,14 @@ pub fn build_snapshot_for_persist(
     let mut snapshot = build_snapshot_from_state(state);
     // ADR-056: canonical digest, not a re-hash of the hex id.
     let ctx_id_bytes = state::context_id_to_bytes(context_id);
-    // ADR-049 PR-6: floors threaded as parameters, still provider-sourced from
-    // the `export_*` twins (byte-identical to the prior internal read). The
-    // atomic read-authority core swaps these to the supervisor registry.
+    // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
+    // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
+    // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
+    // durable-blob params. The provider floor mirrors are deleted.
     match deps.crypto.export_crypto_state(
         &ctx_id_bytes,
-        deps.crypto.export_sender_key_epochs(&ctx_id_bytes),
-        deps.crypto
-            .export_recv_sequence_floors(&ctx_id_bytes)
-            .into_iter()
-            .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-            .collect(),
+        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
+        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
@@ -2938,33 +2934,31 @@ pub fn decrypt_and_dispatch(
 
     match open_result {
         scp_protocol::context::builder::OpenResult::Application(env) => {
-            // ADR-049 PR-4 follower mirror-forward (recv-seq). `open()` already
-            // advanced + enforced the authoritative `recv_sequence_tracker`; we
-            // only TRACK the just-advanced `(epoch, sequence)` — surfaced O(1)
-            // on `env.receive_floor` — into the supervisor floor registry.
-            // NON-FATAL: the provider remains authoritative in PR-4, so a
-            // rejected/failed follow-on advance is logged and dropped.
+            // ADR-049 PR-6 (read-authority switch): the Supervisor-owned Class-M
+            // floor registry is now AUTHORITATIVE for the receive-side
+            // `(epoch, sequence)` anti-replay floor. `open()` performed pure
+            // decrypt + surfaced `env.receive_floor`; the enforcement is HERE,
+            // FAIL-CLOSED. The `?` fires BEFORE any `OpenedEnvelope` is
+            // dispatched, so a replayed/reordered envelope decrypts harmlessly
+            // and is then rejected — no envelope surfaces (D1 close).
             //
-            // Single-writer / security separation (verbatim, mirror-forward
-            // seam): SECURITY — "never accept a key below the floor" — is
-            // STRUCTURAL and caller-topology-independent (the single-`entry()`
-            // gate); the per-context single-writer actor preserves only
-            // LIVENESS. A cross-actor call would stay FAIL-SAFE (spurious
-            // reject), never fail-open. Security is the structural gate;
-            // single-writer is a liveness convention.
-            if let Err(e) = deps.supervisor.check_and_advance_recv_sequence(
+            // F-3 (black-hat): the receive-side overshoot ceiling reads
+            // `sender_epochs[sender_did]`, which co-mingles remote per-sender
+            // epochs with the LOCAL scalar keyed by `local_did`. This is safe
+            // only while `local_did` never appears as a remote sender on its own
+            // recv path — assert it rather than split the map (splitting ripples
+            // through merge/export/blob format; a violation here is fail-safe).
+            debug_assert_ne!(
+                env.sender_did.as_str(),
+                deps.crypto.local_did(),
+                "F-3: local_did must never appear as a remote sender on its own recv path"
+            );
+            deps.supervisor.check_and_advance_recv_sequence(
                 context_id_bytes,
                 &env.sender_did,
                 env.receive_floor,
                 scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-            ) {
-                tracing::debug!(
-                    sender_did = %env.sender_did,
-                    context_id = %context_id,
-                    error = %e,
-                    "floor-registry follower recv-sequence mirror-forward rejected (non-fatal in PR-4; provider authoritative)"
-                );
-            }
+            )?;
             Ok(Some(*env))
         }
         scp_protocol::context::builder::OpenResult::Control => Ok(None),
@@ -2973,63 +2967,60 @@ pub fn decrypt_and_dispatch(
             payload,
         } => {
             tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
-            deps.crypto
-                .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
-            // ADR-049 PR-4 follower mirror-forward (remote sender-epoch). The
-            // `set_checked` inside `process_incoming_sender_key` has advanced
-            // the authoritative floor; read the just-recorded epoch O(1) and
-            // TRACK it in the supervisor registry. NON-FATAL (see recv seam).
-            let epoch = deps.crypto.sender_key_epoch(context_id_bytes, &sender_did);
-            if let Err(e) = deps.supervisor.check_and_advance_sender_epoch(
+            // ADR-049 PR-6 (read-authority switch): GATE-BEFORE-INSTALL. The
+            // provider only HPKE-opens + DID-authenticates the key; the
+            // authoritative Class-M registry enforces epoch monotonicity + the
+            // poisoning ceiling, FAIL-CLOSED, BEFORE the key is installed. A
+            // regressing/poisoned remote epoch is rejected with the key NEVER
+            // reaching the sender-key store (D1 close, fail-safe ordering).
+            let (sender_key, epoch) =
+                deps.crypto
+                    .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
+            deps.supervisor.check_and_advance_sender_epoch(
                 context_id_bytes,
                 &sender_did,
                 epoch,
                 scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-            ) {
-                tracing::debug!(
-                    sender_did = %sender_did,
-                    context_id = %context_id,
-                    error = %e,
-                    "floor-registry follower remote sender-epoch mirror-forward rejected (non-fatal in PR-4; provider authoritative)"
-                );
-            }
+            )?;
+            deps.crypto
+                .set_sender_key_unchecked(context_id_bytes, &sender_did, sender_key);
             Ok(None)
         }
     }
 }
 
-/// ADR-049 PR-4 follower mirror-forward for a LOCAL sender-key rotation.
+/// ADR-049 PR-6 (read-authority switch): advance the LOCAL sender-key epoch
+/// floor in the authoritative Class-M registry after a local rotation.
 ///
 /// Call AFTER `deps.crypto.rotate_sender_key(ctx)` succeeds. `rotate_sender_key`
 /// increments the local epoch scalar (`state.sender_key_epoch`, which
 /// `set_unchecked` does NOT record in the store's per-sender epoch map), so the
-/// authoritative local floor is read via
+/// local floor is read via
 /// [`MlsCryptoProvider::local_sender_key_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::local_sender_key_epoch)
-/// and TRACKED in the supervisor floor registry keyed by the provider's local
-/// DID. NON-FATAL in PR-4: the provider remains authoritative, so a rejected
-/// follow-on advance is logged and dropped.
+/// and advanced in the supervisor floor registry keyed by the provider's local
+/// DID. FAIL-CLOSED: a non-monotonic / overshooting local advance surfaces as a
+/// [`ContextError`] (via `From<FloorAdvanceError>`) that the caller `?`-propagates,
+/// aborting the enclosing operation. In practice a local rotation advances the
+/// scalar monotonically by +1, so this never fires; propagating it is the
+/// fail-closed default rather than a rollback the caller must orchestrate.
 ///
-/// Single-writer / security separation (verbatim, mirror-forward seam):
-/// SECURITY — "never accept a key below the floor" — is STRUCTURAL and
-/// caller-topology-independent (the single-`entry()` gate); the per-context
-/// single-writer actor preserves only LIVENESS. A cross-actor call would stay
-/// FAIL-SAFE (spurious reject), never fail-open. Security is the structural
-/// gate; single-writer is a liveness convention.
-pub(in crate::context) fn mirror_forward_local_sender_epoch(deps: &ActorDeps, ctx: &[u8; 32]) {
+/// # Errors
+///
+/// Returns [`ContextError::CryptoFailed`] if the registry rejects the local
+/// epoch advance (non-monotonic or overshoot).
+pub(in crate::context) fn mirror_forward_local_sender_epoch(
+    deps: &ActorDeps,
+    ctx: &[u8; 32],
+) -> Result<(), ContextError> {
     let epoch = deps.crypto.local_sender_key_epoch(ctx);
     let local_did = deps.crypto.local_did();
-    if let Err(e) = deps.supervisor.check_and_advance_sender_epoch(
+    deps.supervisor.check_and_advance_sender_epoch(
         ctx,
         local_did,
         epoch,
         scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-    ) {
-        tracing::debug!(
-            local_did = %local_did,
-            error = %e,
-            "floor-registry follower local sender-epoch mirror-forward rejected (non-fatal in PR-4; provider authoritative)"
-        );
-    }
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

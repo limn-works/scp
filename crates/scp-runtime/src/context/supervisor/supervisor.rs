@@ -38,7 +38,6 @@ use dashmap::DashMap;
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 
@@ -1239,12 +1238,13 @@ pub struct Supervisor {
     /// first time an actor for that context crashes. Lock-free reads via
     /// `DashMap` per ADR-049 §Decision 12.
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
-    /// ADR-049 PR-4 — supervisor-owned Class-M **floor registry** (epoch side).
-    /// Keyed by the 32-byte context id. Each [`ContextFloors`] bundles the
-    /// per-sender epoch high-water and the receive-side `(epoch, sequence)`
-    /// anti-replay floor. In PR-4 this is a NON-AUTHORITATIVE FOLLOWER: the
-    /// `MlsCryptoProvider` remains the authoritative floor store and nothing
-    /// reads this map for enforcement/capture/merge (write-only until PR-6).
+    /// ADR-049 (read-authority switch) — supervisor-owned Class-M **floor
+    /// registry**. Keyed by the 32-byte context id. Each [`ContextFloors`]
+    /// bundles the per-sender epoch high-water and the receive-side
+    /// `(epoch, sequence)` anti-replay floor. This is the AUTHORITATIVE Class-M
+    /// home: the live receive seams gate on it fail-closed, the durable-blob
+    /// export sources from it, and the restore/import guard merges into it. The
+    /// provider's former floor mirrors are deleted.
     /// Lives on `Arc<Supervisor>` so it survives an actor task unwind — the
     /// Class-M requirement the floors exist to satisfy. Lock-free entry-scoped
     /// reads/writes via `DashMap` (ADR-049 Decision 12); an entry mutation does
@@ -1628,7 +1628,7 @@ impl Supervisor {
             key_package_stores: DashMap::new(),
             health_config,
             crash_windows: DashMap::new(),
-            // ADR-049 PR-4: supervisor-owned Class-M floor registry (follower).
+            // ADR-049 (read-authority switch): supervisor-owned authoritative Class-M floor registry.
             floors: DashMap::new(),
             // Test-only KP-watchdog completion signal (see field docs). The
             // paired receiver is created on demand via `kp_watchdog_processed_tx.subscribe()`;
@@ -4830,9 +4830,9 @@ impl Supervisor {
         if let Some(persistence) = self.persistence_ref() {
             let _ = persistence.delete_context(context_id).await;
         }
-        // 4. Drop the supervisor-owned Class-M floor registry entry (ADR-049
-        //    PR-4) — the follower twin of the provider's per-context floor-map
-        //    prune inside `destroy_mls_group` (step 2). A discarded welcome-join
+        // 4. Drop the authoritative Class-M floor registry entry (ADR-049) —
+        //    the registry twin of the provider's per-context crypto teardown
+        //    inside `destroy_mls_group` (step 2). A discarded welcome-join
         //    is permanently gone (its crypto group + durable snapshot were just
         //    destroyed), so the floors are moot and pruning is sound; see
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
@@ -11569,21 +11569,17 @@ impl Supervisor {
                     //     `Err` — nothing has been persisted yet, so there is no durable
                     //     snapshot to delete (strictly cleaner than persist-then-delete, same
                     //     fail-closed guarantee).
-                    // ADR-049 PR-6: floors threaded as parameters, still
-                    // provider-sourced from the `export_*` twins (byte-identical
-                    // to the prior internal read). The atomic read-authority core
-                    // swaps these to the supervisor registry.
+                    // ADR-049 PR-6 (read-authority switch): floors sourced from
+                    // the AUTHORITATIVE Supervisor-owned Class-M registry
+                    // (`deps.supervisor.export_*`) and threaded into
+                    // `export_crypto_state` as the durable-blob params; the
+                    // provider floor mirrors are deleted.
                     if !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
                         &deps.crypto.export_crypto_state(
                             &context_id_bytes,
-                            deps.crypto.export_sender_key_epochs(&context_id_bytes),
-                            deps.crypto
-                                .export_recv_sequence_floors(&context_id_bytes)
-                                .into_iter()
-                                .map(|(did, (epoch, sequence))| {
-                                    (did, ReceiveFloor { epoch, sequence })
-                                })
-                                .collect(),
+                            deps.supervisor.export_sender_key_epochs(&context_id_bytes),
+                            deps.supervisor
+                                .export_recv_sequence_floors(&context_id_bytes),
                         ),
                     ) {
                         let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
@@ -13773,6 +13769,37 @@ mod tests {
         )
     }
 
+    /// Build a `Supervisor` around an EXISTING crypto provider `Arc` — used by the
+    /// two-party seam-level e2e tests to wrap Bob's post-join `bob_crypto` (which
+    /// holds the joined group) in a fresh supervisor so `build_actor_deps` yields
+    /// an `ActorDeps` whose `crypto` opens Alice's real ciphertext and whose
+    /// `supervisor` floor registry starts empty. A no-op resolver suffices —
+    /// `decrypt_and_dispatch` defers signature verification to `ContextManager`.
+    fn supervisor_with_crypto(
+        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+    ) -> Arc<Supervisor> {
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        Supervisor::with_providers(
+            crypto,
+            transport,
+            Box::new(TestEventLog),
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+            mls_storage,
+        )
+    }
+
     /// Block until the KP-actor watchdog has FULLY processed one more crash than
     /// `baseline` — the [`Supervisor::kp_watchdog_processed_tx`] counter value
     /// captured *before* the panic was induced.
@@ -15285,7 +15312,7 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
-        // ADR-049 PR-4 floor-registry SAFETY gate (F-1): seed a real follower
+        // ADR-049 floor-registry SAFETY gate (F-1): seed a real registry
         // floor. An ABORTED expiry (params.ttl == None, A3) leaves the context
         // LIVE (`Active`), so its floors MUST survive — pruning here would drop a
         // live context's anti-replay floors. This guards the `state_transitioned()`
@@ -15303,7 +15330,7 @@ mod tests {
         );
         assert!(
             sup.floors.contains_key(&ctx_id_bytes),
-            "an ABORTED expiry leaves the context Active, so its follower floors MUST \
+            "an ABORTED expiry leaves the context Active, so its registry floors MUST \
              survive — the prune is gated on a genuine terminal transition"
         );
         assert_eq!(
@@ -15388,7 +15415,7 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
-        // ADR-049 PR-4 floor-registry prune (F-1): seed a real follower floor for
+        // ADR-049 floor-registry prune (F-1): seed a real registry floor for
         // this ctx (Full scope, so finalize destroys NO crypto — this proves the
         // prune is driven by the terminal close, not by key destruction), assert
         // it is present, then confirm the explicit close prunes it.
@@ -15396,7 +15423,7 @@ mod tests {
             .expect("first sender-epoch advance is accepted");
         assert!(
             sup.floors.contains_key(&ctx_id_bytes),
-            "a follower floor entry exists before the explicit close"
+            "a registry floor entry exists before the explicit close"
         );
 
         crate::context::ttl_close_helpers::finalize_close(&mut cell, &deps, &handle)
@@ -15405,7 +15432,7 @@ mod tests {
 
         assert!(
             !sup.floors.contains_key(&ctx_id_bytes),
-            "the explicit close (Closed) prunes the follower floor entry — no leak on \
+            "the explicit close (Closed) prunes the registry floor entry — no leak on \
              the dominant teardown path, even for Full scope where crypto is retained"
         );
 
@@ -15587,7 +15614,7 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
-        // ADR-049 PR-4 floor-registry prune (F-1): seed a real follower floor and
+        // ADR-049 floor-registry prune (F-1): seed a real registry floor and
         // assert the TERMINAL TTL expiry drops it. The Phase-1 terminal transition
         // (`state_transitioned()`) runs on the FIRST attempt even though the leaf
         // append fails, so the prune lands on `out1` — and the RETRY (`out2`) is a
@@ -15596,7 +15623,7 @@ mod tests {
             .expect("first sender-epoch advance is accepted");
         assert!(
             sup.floors.contains_key(&ctx_id_bytes),
-            "a follower floor entry exists before the terminal TTL expiry"
+            "a registry floor entry exists before the terminal TTL expiry"
         );
 
         // First attempt: append FAILS ⇒ incomplete. Phase 1 clears the recorded
@@ -15611,7 +15638,7 @@ mod tests {
         );
         assert!(
             !sup.floors.contains_key(&ctx_id_bytes),
-            "the terminal TTL transition (Expired) prunes the follower floor entry — no \
+            "the terminal TTL transition (Expired) prunes the registry floor entry — no \
              leak on the TTL-expiry teardown path"
         );
         assert_eq!(
@@ -18266,19 +18293,16 @@ mod tests {
             .unwrap();
         crypto.generate_sender_key(&ctx_id_bytes).unwrap();
 
-        // The PERSISTED snapshot captures the floor at epoch 5 (the coalesced
-        // state at snapshot time).
-        crypto.seed_sender_key_epoch_for_test(&ctx_id_bytes, sender_did, 5);
-        // ADR-049 PR-4: the supervisor floor registry is a FOLLOWER. Seed it in
-        // parallel to epoch 5 (as the mirror-forward seams would have) so we can
-        // assert after respawn that the follower tracks the provider.
+        // ADR-049 PR-6: the AUTHORITATIVE per-sender floor lives in the
+        // Supervisor-owned Class-M registry. Advance it to epoch 5 — the
+        // coalesced state captured into the snapshot below.
         sup.check_and_advance_sender_epoch(
             &ctx_id_bytes,
             sender_did,
             5,
             scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
         )
-        .expect("seed follower registry to epoch 5");
+        .expect("seed registry floor to epoch 5");
 
         let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
@@ -18290,17 +18314,14 @@ mod tests {
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
         let mut snap = crate::context::manager_methods::snapshot_context(&state);
-        // Capture the live crypto state (floor=5) into the persisted snapshot,
-        // exactly as `persist_state_best_effort` does.
+        // Capture the live crypto state INCLUDING the registry floor (=5) into
+        // the persisted snapshot, exactly as `build_snapshot_for_persist` does
+        // (floors sourced from the authoritative registry).
         snap.mls_crypto_state = crypto
             .export_crypto_state(
                 &ctx_id_bytes,
-                crypto.export_sender_key_epochs(&ctx_id_bytes),
-                crypto
-                    .export_recv_sequence_floors(&ctx_id_bytes)
-                    .into_iter()
-                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-                    .collect(),
+                sup.export_sender_key_epochs(&ctx_id_bytes),
+                sup.export_recv_sequence_floors(&ctx_id_bytes),
             )
             .unwrap();
         assert!(
@@ -18317,17 +18338,15 @@ mod tests {
 
         // The LIVE floor advances to epoch 12 AFTER the snapshot was persisted
         // — the snapshot now lags the live floor by 7 epochs. This live floor
-        // survives the crash (it lives in the supervisor-owned crypto provider,
+        // survives the crash (it lives in the supervisor-owned Class-M registry,
         // which a mailbox/handle despawn does not tear down).
-        crypto.seed_sender_key_epoch_for_test(&ctx_id_bytes, sender_did, 12);
-        // Advance the follower registry in parallel to the live floor (12).
         sup.check_and_advance_sender_epoch(
             &ctx_id_bytes,
             sender_did,
             12,
             scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
         )
-        .expect("advance follower registry to epoch 12");
+        .expect("advance registry floor to epoch 12");
 
         // Crash before any re-persist of the advanced floor.
         induce_panic(&handle, "SECRET_SENTINEL_lagged").await;
@@ -18349,23 +18368,599 @@ mod tests {
             "a healthy context must not be poisoned by a benign coalesce-lag floor regression"
         );
 
-        // The merged floor is the higher LIVE value (12), never lowered to the
-        // stale snapshot's 5.
-        let merged = crypto.export_sender_key_epochs(&ctx_id_bytes);
+        // ADR-049 PR-6: the AUTHORITATIVE registry floor is the higher LIVE
+        // value (12) after the respawn max-merges the snapshot's stale 5 — never
+        // lowered to 5. `restore_crypto_state_with_floor_guard` merges the
+        // snapshot floors (incoming=5) INTO the live registry (12) under
+        // MaxMergeTrustedLocal, so 12 dominates.
+        let merged = sup.export_sender_key_epochs(&ctx_id_bytes);
         assert!(
             merged.iter().any(|(d, e)| d == sender_did && *e == 12),
-            "merged floor must be the higher live value (12), got {merged:?}"
+            "authoritative registry floor must be the higher live value (12), got {merged:?}"
+        );
+    }
+
+    /// ADR-049 PR-6 §0.1 — COLD-RESTART DURABILITY (the D2 regression guard).
+    ///
+    /// Advances the authoritative Class-M registry floors non-trivially, persists
+    /// the durable blob FROM the registry, then restores that blob into a FRESH
+    /// Supervisor whose registry starts EMPTY (the cold restart — the origin
+    /// registry is not shared). Asserts the fresh registry is EMPTY-then-POPULATED
+    /// from the blob (this is the exact line the deleted provider
+    /// `local_floors.is_empty()` short-circuit would have broken — it skips the
+    /// merge on an empty live registry, silently losing the blob floors) and that
+    /// a replay AT or BELOW the restored recv floor is REJECTED by the same gate
+    /// primitive the `decrypt_and_dispatch` recv seam calls fail-closed
+    /// (`check_and_advance_recv_sequence`; the seam→gate wiring is enforced
+    /// structurally in `pipeline_wiring.rs`).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single cohesive cold-restart D2 scenario: advance floors, persist, fresh-restore, assert empty-then-populated + replay-rejected — splitting it would obscure the one flow"
+    )]
+    async fn cold_restart_restores_floors_into_fresh_registry_and_rejects_replay() {
+        use scp_protocol::context::builder::ReceiveFloor;
+        use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
+
+        let ctx = [0xD2u8; 32];
+        let sender = "did:dht:z6MkColdRestartSenderColdRestartSenderXX";
+
+        // Origin node: keyed context + non-trivially advanced registry floors.
+        let origin = supervisor_with_providers();
+        let origin_crypto = origin.crypto_ref().expect("origin crypto").clone();
+        origin_crypto.create_mls_group(&ctx).unwrap();
+        origin_crypto.generate_sender_key(&ctx).unwrap();
+        origin
+            .check_and_advance_sender_epoch(&ctx, sender, 4, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        origin
+            .check_and_advance_recv_sequence(
+                &ctx,
+                sender,
+                ReceiveFloor {
+                    epoch: 3,
+                    sequence: 5,
+                },
+                MAX_EPOCH_ADVANCE,
+            )
+            .unwrap();
+
+        // Persist the durable blob, floors sourced FROM the registry (the G2 path).
+        let blob = origin_crypto
+            .export_crypto_state(
+                &ctx,
+                origin.export_sender_key_epochs(&ctx),
+                origin.export_recv_sequence_floors(&ctx),
+            )
+            .unwrap();
+        assert!(
+            !blob.is_empty(),
+            "keyed context must export a non-empty blob"
         );
 
-        // ADR-049 PR-4: the FOLLOWER registry tracks the provider after respawn.
-        // The additive post-merge restore seed in
-        // `restore_crypto_state_with_floor_guard` mirrors the provider's
-        // post-merge floor (12) into the supervisor registry, so the follower
-        // reports 12 too — never the stale snapshot's 5.
-        let follower = sup.export_sender_key_epochs(&ctx_id_bytes);
+        // FRESH node: a NEW Supervisor (EMPTY registry) + a new provider. The
+        // origin registry is NOT shared — this is the cold restart.
+        let fresh = supervisor_with_providers();
+        let fresh_deps = test_actor_deps(&fresh).await;
         assert!(
-            follower.iter().any(|(d, e)| d == sender_did && *e == 12),
-            "follower registry must track the provider's merged floor (12) after respawn, got {follower:?}"
+            fresh.export_sender_key_epochs(&ctx).is_empty(),
+            "fresh registry must start EMPTY (the cold-restart precondition)"
+        );
+        assert!(fresh.export_recv_sequence_floors(&ctx).is_empty());
+
+        crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+            &fresh_deps,
+            &ctx,
+            &blob,
+            true,
+        )
+        .expect("cold restore must SUCCEED and populate the empty registry");
+
+        // D2 CORE: the empty registry was POPULATED from the blob. This is the
+        // empty-short-circuit catcher.
+        assert_eq!(
+            fresh.export_sender_key_epochs(&ctx),
+            vec![(sender.to_owned(), 4)],
+            "epoch floor must be populated from the blob on cold restart"
+        );
+        assert_eq!(
+            fresh.export_recv_sequence_floors(&ctx),
+            vec![(
+                sender.to_owned(),
+                ReceiveFloor {
+                    epoch: 3,
+                    sequence: 5
+                }
+            )],
+            "recv floor must be populated from the blob on cold restart"
+        );
+
+        // D2 CLOSE: a replay AT the restored floor is rejected …
+        assert!(
+            fresh
+                .check_and_advance_recv_sequence(
+                    &ctx,
+                    sender,
+                    ReceiveFloor {
+                        epoch: 3,
+                        sequence: 5
+                    },
+                    MAX_EPOCH_ADVANCE
+                )
+                .is_err(),
+            "a replay AT the restored recv floor must be rejected after cold restart"
+        );
+        // … and BELOW it …
+        assert!(
+            fresh
+                .check_and_advance_recv_sequence(
+                    &ctx,
+                    sender,
+                    ReceiveFloor {
+                        epoch: 2,
+                        sequence: 9
+                    },
+                    MAX_EPOCH_ADVANCE
+                )
+                .is_err(),
+            "a replay BELOW the restored recv floor must be rejected after cold restart"
+        );
+        // … while a strictly-higher floor still advances (liveness preserved).
+        assert!(
+            fresh
+                .check_and_advance_recv_sequence(
+                    &ctx,
+                    sender,
+                    ReceiveFloor {
+                        epoch: 3,
+                        sequence: 6
+                    },
+                    MAX_EPOCH_ADVANCE
+                )
+                .is_ok(),
+            "a legitimate higher recv floor must still advance after cold restart"
+        );
+    }
+
+    /// ADR-049 PR-6 BUG-1 — an UNTRUSTED import whose blob floor REGRESSES below
+    /// the live registry floor must be REJECTED (`Err(CryptoFailed)`), roll the
+    /// just-restored crypto back (provider group destroyed), and leave the
+    /// registry UNCHANGED (atomic — the validating merge validates before it
+    /// applies, so a rejected merge touches nothing).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn untrusted_import_regressing_floor_is_rejected_and_atomic() {
+        use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
+
+        let ctx = [0xB1u8; 32];
+        let sender = "did:dht:z6MkBug1SenderBug1SenderBug1SenderBug1XX";
+
+        // Exporter snapshot carries a LOW sender-epoch floor (=2).
+        let exporter = supervisor_with_providers();
+        let exporter_crypto = exporter.crypto_ref().expect("exporter crypto").clone();
+        exporter_crypto.create_mls_group(&ctx).unwrap();
+        exporter_crypto.generate_sender_key(&ctx).unwrap();
+        exporter
+            .check_and_advance_sender_epoch(&ctx, sender, 2, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        let blob = exporter_crypto
+            .export_crypto_state(
+                &ctx,
+                exporter.export_sender_key_epochs(&ctx),
+                exporter.export_recv_sequence_floors(&ctx),
+            )
+            .unwrap();
+
+        // Importer's LIVE registry floor for `sender` is HIGHER (=9).
+        let importer = supervisor_with_providers();
+        let importer_crypto = importer.crypto_ref().expect("importer crypto").clone();
+        let importer_deps = test_actor_deps(&importer).await;
+        importer
+            .check_and_advance_sender_epoch(&ctx, sender, 9, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        let before = importer.export_sender_key_epochs(&ctx);
+
+        // Untrusted import (trusted_local=false): blob floor 2 < live floor 9 →
+        // RejectRegression → Err(CryptoFailed).
+        let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+            &importer_deps,
+            &ctx,
+            &blob,
+            false,
+        )
+        .expect_err("a regressing untrusted import must be rejected");
+        assert!(
+            matches!(err, ContextError::CryptoFailed(_)),
+            "regressing import must map to CryptoFailed, got {err:?}"
+        );
+
+        // Atomic: the registry is UNCHANGED (still 9, never lowered to 2).
+        assert_eq!(
+            importer.export_sender_key_epochs(&ctx),
+            before,
+            "a rejected import must leave the registry unchanged (atomic)"
+        );
+        assert!(
+            importer
+                .export_sender_key_epochs(&ctx)
+                .iter()
+                .any(|(d, e)| d == sender && *e == 9),
+            "the live floor (9) must survive the rejected import"
+        );
+
+        // Provider rolled back: the just-restored group was destroyed on the Err
+        // path, so the importer's provider holds NO crypto state for `ctx`
+        // (`export_crypto_state` returns an empty blob for an absent context).
+        assert!(
+            importer_crypto
+                .export_crypto_state(&ctx, Vec::new(), Vec::new())
+                .unwrap()
+                .is_empty(),
+            "the restored crypto must be rolled back (group destroyed) on rejection"
+        );
+    }
+
+    /// ADR-049 A2 — a cold restart of a context whose per-sender epoch high-water
+    /// EXCEEDS `MAX_EPOCH_ADVANCE` (1000) must SUCCEED under trusted-local and
+    /// reject a replay at or below the restored floor. The pre-A2 code applied the
+    /// overshoot ceiling on the trusted restore path too (`local=0` on a cold
+    /// registry → `ceiling=1000`), which would have made any such context
+    /// PERMANENTLY unrestorable.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_restart_high_epoch_beyond_ceiling_restores_under_trusted_local() {
+        use scp_protocol::context::builder::ReceiveFloor;
+        use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
+
+        let ctx = [0xE5u8; 32];
+        let sender = "did:dht:z6MkHighEpochSenderHighEpochSenderHighXX";
+        let high = 5_000u64; // > MAX_EPOCH_ADVANCE (1000)
+        assert!(high > MAX_EPOCH_ADVANCE);
+
+        let origin = supervisor_with_providers();
+        let origin_crypto = origin.crypto_ref().expect("origin crypto").clone();
+        origin_crypto.create_mls_group(&ctx).unwrap();
+        origin_crypto.generate_sender_key(&ctx).unwrap();
+        origin
+            .check_and_advance_sender_epoch(&ctx, sender, high, high)
+            .unwrap();
+        origin
+            .check_and_advance_recv_sequence(
+                &ctx,
+                sender,
+                ReceiveFloor {
+                    epoch: high,
+                    sequence: 2,
+                },
+                high,
+            )
+            .unwrap();
+        let blob = origin_crypto
+            .export_crypto_state(
+                &ctx,
+                origin.export_sender_key_epochs(&ctx),
+                origin.export_recv_sequence_floors(&ctx),
+            )
+            .unwrap();
+
+        // Cold restart: fresh Supervisor, EMPTY registry (local=0), trusted_local.
+        let fresh = supervisor_with_providers();
+        let fresh_deps = test_actor_deps(&fresh).await;
+        crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+            &fresh_deps,
+            &ctx,
+            &blob,
+            true,
+        )
+        .expect("a high-epoch (>MAX_EPOCH_ADVANCE) context must restore under trusted-local");
+
+        assert_eq!(
+            fresh.export_sender_key_epochs(&ctx),
+            vec![(sender.to_owned(), high)],
+            "the high epoch floor must load VERBATIM on a trusted cold restart"
+        );
+        // A replay at the restored recv floor is still rejected.
+        assert!(
+            fresh
+                .check_and_advance_recv_sequence(
+                    &ctx,
+                    sender,
+                    ReceiveFloor {
+                        epoch: high,
+                        sequence: 2
+                    },
+                    MAX_EPOCH_ADVANCE
+                )
+                .is_err(),
+            "a replay at the restored high recv floor must be rejected"
+        );
+    }
+
+    /// ADR-049 BUG-1b — an untrusted import whose EPOCH floor validates (>= live,
+    /// within ceiling) but whose RECV floor REGRESSES must be rejected AND leave
+    /// the epoch floor UNCHANGED — the cross-axis atomicity guarantee (the epoch
+    /// merge must NOT stick when the recv merge rejects).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn untrusted_import_recv_regression_leaves_epoch_floor_unchanged() {
+        use scp_protocol::context::builder::ReceiveFloor;
+        use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
+
+        let ctx = [0xB2u8; 32];
+        let sender = "did:dht:z6MkBug1bSenderBug1bSenderBug1bSenderXX";
+
+        // Exporter blob: epoch 9 (will be >= importer live), recv rf(2, 0) (will
+        // regress below importer live recv).
+        let exporter = supervisor_with_providers();
+        let exporter_crypto = exporter.crypto_ref().expect("exporter crypto").clone();
+        exporter_crypto.create_mls_group(&ctx).unwrap();
+        exporter_crypto.generate_sender_key(&ctx).unwrap();
+        exporter
+            .check_and_advance_sender_epoch(&ctx, sender, 9, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        exporter
+            .check_and_advance_recv_sequence(
+                &ctx,
+                sender,
+                ReceiveFloor {
+                    epoch: 2,
+                    sequence: 0,
+                },
+                MAX_EPOCH_ADVANCE,
+            )
+            .unwrap();
+        let blob = exporter_crypto
+            .export_crypto_state(
+                &ctx,
+                exporter.export_sender_key_epochs(&ctx),
+                exporter.export_recv_sequence_floors(&ctx),
+            )
+            .unwrap();
+
+        // Importer live: epoch 5 (< blob's 9 → epoch axis PASSES), recv rf(4, 0)
+        // (> blob's rf(2,0) → recv axis REGRESSES under RejectRegression).
+        let importer = supervisor_with_providers();
+        let importer_deps = test_actor_deps(&importer).await;
+        importer
+            .check_and_advance_sender_epoch(&ctx, sender, 5, MAX_EPOCH_ADVANCE)
+            .unwrap();
+        importer
+            .check_and_advance_recv_sequence(
+                &ctx,
+                sender,
+                ReceiveFloor {
+                    epoch: 4,
+                    sequence: 0,
+                },
+                MAX_EPOCH_ADVANCE,
+            )
+            .unwrap();
+        let epoch_before = importer.export_sender_key_epochs(&ctx);
+        let recv_before = importer.export_recv_sequence_floors(&ctx);
+
+        let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+            &importer_deps,
+            &ctx,
+            &blob,
+            false,
+        )
+        .expect_err("a recv-floor regression on an untrusted import must be rejected");
+        assert!(matches!(err, ContextError::CryptoFailed(_)), "got {err:?}");
+
+        // CROSS-AXIS ATOMICITY: the epoch floor did NOT advance to 9 despite the
+        // epoch axis validating — the whole merge was rejected atomically.
+        assert_eq!(
+            importer.export_sender_key_epochs(&ctx),
+            epoch_before,
+            "epoch floor must be UNCHANGED (5) — the epoch merge must not stick when recv rejects"
+        );
+        assert_eq!(importer.export_recv_sequence_floors(&ctx), recv_before);
+    }
+
+    /// ADR-049 §9(1) FAIL-CLOSED-BLOCKS (e2e). Alice seals two REAL application
+    /// envelopes through the joined MLS group; Bob drives the production
+    /// `decrypt_and_dispatch` seam. Proves, POST-`open()`-H9-deletion, that (a)
+    /// the surfaced `env.receive_floor` is correct and the recv seam CONSUMES it
+    /// into the authoritative registry, and (b) an out-of-order / replayed older
+    /// floor is REJECTED fail-closed at that seam with NO `OpenedEnvelope`
+    /// surfacing.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn decrypt_and_dispatch_fail_closed_blocks_reorder_and_replay_e2e() {
+        use crate::envelope::inner::sign::create_inner_envelope_raw;
+        use crate::envelope::inner::{InnerEnvelopeParams, MessageType};
+        use scp_did::SigningKeyId;
+
+        const ALICE: &str = "did:dht:z6MkAliceE2eSenderAliceE2eSenderAlice1";
+        const BOB: &str = "did:dht:z6MkBobE2eReceiverBobE2eReceiverBob123";
+        let ctx_str = "e2e-decrypt-and-dispatch-fail-closed";
+
+        // Real two-party join: Bob holds the group + Alice's sender key at epoch 1.
+        let (alice_crypto, bob_crypto, ctx_bytes) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        // Wrap Bob's post-join provider in a fresh Supervisor (empty registry) and
+        // build his production ActorDeps.
+        let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Bob's ActorDeps from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let bob_deps = rt
+            .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
+            .expect("build bob's actor deps");
+
+        // Alice seals an Application envelope; the sender-layer header carries her
+        // current (epoch, send_sequence). First seal → sequence 0, second → 1.
+        let seal_app = |payload: &[u8]| -> Vec<u8> {
+            let params = InnerEnvelopeParams {
+                version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+                context_id: ctx_str,
+                sender_did: ALICE,
+                epoch: 1,
+                generation: 0,
+                sequence: 0,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
+                payload,
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            };
+            let inner = create_inner_envelope_raw(
+                &params,
+                &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            )
+            .expect("alice signs her inner application envelope");
+            let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+            alice_crypto
+                .seal(&ctx_bytes, &inner, &routing_id, 3600)
+                .expect("alice seals the application message")
+        };
+
+        let msg_a = seal_app(b"first-application-message"); // header sequence 0
+        let msg_b = seal_app(b"second-application-message"); // header sequence 1
+
+        // Deliver the LATER message (b, sequence 1) FIRST. Accepted; the registry
+        // recv floor advances to exactly the surfaced receive_floor.
+        let opened_b = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps, ctx_str, &ctx_bytes, &msg_b,
+        )
+        .expect("first (in-order) delivery must succeed")
+        .expect("an Application envelope must surface");
+        let floor_b = opened_b.receive_floor;
+        assert_eq!(
+            bob_sup.export_recv_sequence_floors(&ctx_bytes),
+            vec![(ALICE.to_owned(), floor_b)],
+            "the recv seam must CONSUME the surfaced receive_floor into the registry"
+        );
+
+        // Now deliver the EARLIER message (a, sequence 0) — a DISTINCT, never-seen
+        // MLS ciphertext (so MLS decrypts it), but an older floor. The authoritative
+        // registry recv gate MUST reject it fail-closed, and NO envelope surfaces.
+        let reorder = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps, ctx_str, &ctx_bytes, &msg_a,
+        );
+        // Pin the REASON: the rejection must be the registry recv-floor gate
+        // (`FloorAdvanceError::RecvSequenceNotMonotonic`, whose Display is
+        // "recv-sequence floor … is non-monotonic …"), NOT an MLS-decrypt failure
+        // — so a future OpenMLS `out_of_order_tolerance` change can't silently
+        // turn this into a pass-for-the-wrong-reason.
+        assert!(
+            matches!(
+                &reorder,
+                Err(ContextError::CryptoFailed(m))
+                    if m.contains("recv-sequence floor") && m.contains("non-monotonic")
+            ),
+            "an out-of-order older floor must be rejected by the registry recv-floor gate, got {reorder:?}"
+        );
+        // The registry floor is unchanged by the rejected reorder.
+        assert_eq!(
+            bob_sup.export_recv_sequence_floors(&ctx_bytes),
+            vec![(ALICE.to_owned(), floor_b)],
+            "a rejected reorder must not move the registry floor"
+        );
+
+        // A replay of the accepted message b is also rejected (no envelope).
+        let replay = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps, ctx_str, &ctx_bytes, &msg_b,
+        );
+        assert!(
+            replay.is_err(),
+            "a replay of an already-accepted message must be rejected, got {replay:?}"
+        );
+    }
+
+    /// ADR-049 §9(2) CATCH-UP-AFTER-LAG (F-2, e2e). After Alice ROTATES her
+    /// sender key (epoch 1 → 2) and the key-distribution seam advances the
+    /// registry `sender_epochs[alice]` to 2, a recv from Alice at the NEW epoch is
+    /// ACCEPTED — proving the recv ceiling reads the just-advanced epoch floor
+    /// from the same registry (no stale-floor over-rejection).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn decrypt_and_dispatch_catch_up_after_epoch_rotation_e2e() {
+        use crate::envelope::inner::sign::create_inner_envelope_raw;
+        use crate::envelope::inner::{InnerEnvelopeParams, MessageType};
+        use scp_did::SigningKeyId;
+        use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
+
+        const ALICE: &str = "did:dht:z6MkAliceCatchUpAliceCatchUpAliceCat1";
+        const BOB: &str = "did:dht:z6MkBobCatchUpBobCatchUpBobCatchUpBob12";
+        let ctx_str = "e2e-decrypt-and-dispatch-catch-up";
+
+        let (alice_crypto, bob_crypto, ctx_bytes) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        // Alice rotates her sender key (epoch 1 → 2) and redistributes it to Bob,
+        // who installs it — exactly what the live key-distribution flow does.
+        alice_crypto.rotate_sender_key(&ctx_bytes).unwrap();
+        alice_crypto.distribute_sender_key(&ctx_bytes, ALICE).ok();
+        for (_t, msg) in alice_crypto
+            .drain_pending_sender_key_messages(&ctx_bytes)
+            .unwrap()
+        {
+            if let Ok((key, _epoch)) =
+                bob_crypto.process_incoming_sender_key(&ctx_bytes, ALICE, &msg)
+            {
+                bob_crypto.set_sender_key_unchecked(&ctx_bytes, ALICE, key);
+            }
+        }
+
+        let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Bob's ActorDeps from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let bob_deps = rt
+            .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
+            .expect("build bob's actor deps");
+
+        // The key-distribution seam advanced the registry epoch floor to 2.
+        bob_sup
+            .check_and_advance_sender_epoch(&ctx_bytes, ALICE, 2, MAX_EPOCH_ADVANCE)
+            .expect("key-dist seam advances the registry epoch floor to 2");
+
+        // Alice seals at the NEW epoch (2); Bob's recv at epoch 2 is ACCEPTED (the
+        // recv ceiling reads the just-advanced sender_epochs[alice]=2, not a stale
+        // lower floor).
+        let params = InnerEnvelopeParams {
+            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+            context_id: ctx_str,
+            sender_did: ALICE,
+            epoch: 2,
+            generation: 0,
+            sequence: 0,
+            timestamp: 1_700_000_000,
+            message_type: MessageType::Content,
+            payload: b"post-rotation-application-message",
+            provenance: None,
+            signing_key_id: SigningKeyId::Active,
+        };
+        let inner = create_inner_envelope_raw(
+            &params,
+            &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+        )
+        .expect("alice signs her inner envelope");
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let sealed = alice_crypto
+            .seal(&ctx_bytes, &inner, &routing_id, 3600)
+            .expect("alice seals at the rotated epoch");
+
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps, ctx_str, &ctx_bytes, &sealed,
+        )
+        .expect("a recv at the just-advanced epoch must be ACCEPTED (no stale over-reject)")
+        .expect("an Application envelope must surface");
+        assert_eq!(
+            opened.receive_floor.epoch, 2,
+            "the surfaced recv floor must be at the rotated epoch 2"
+        );
+        assert!(
+            bob_sup
+                .export_recv_sequence_floors(&ctx_bytes)
+                .iter()
+                .any(|(d, f)| d == ALICE && f.epoch == 2),
+            "the registry recv floor must track the epoch-2 receive"
         );
     }
 

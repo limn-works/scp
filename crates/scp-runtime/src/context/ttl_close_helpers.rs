@@ -36,7 +36,6 @@
 
 use scp_did::DID;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::ContextHandle;
@@ -173,7 +172,7 @@ pub async fn handle_ttl_expiry(
     let terminal_result =
         ttl::apply_ttl_terminal_transition(handle, deps.crypto.as_ref(), prior_completed);
 
-    // Prune the supervisor-owned Class-M floor registry entry (ADR-049 PR-4) on a
+    // Prune the authoritative Class-M floor registry entry (ADR-049) on a
     // GENUINE terminal expiry. Gated on `state_transitioned()` so an aborted /
     // failed transition (A3 `None`-deadline abort already returned above; a wrong-
     // state transition failure sets no step and destroys no keys) NEVER prunes a
@@ -181,7 +180,7 @@ pub async fn handle_ttl_expiry(
     // terminally `Expired` — restore skips non-`Active` snapshots and B8 refuses
     // re-create, so it is permanently gone — and `apply_ttl_terminal_transition`
     // just ran the provider's `destroy_mls_group` floor-map prune (Ephemeral /
-    // Summary scope), so this follower prune mirrors it. Pruned regardless of
+    // Summary scope), so this registry prune mirrors it. Pruned regardless of
     // memory scope (a terminal context accepts no further inbound). Idempotent: a
     // bounded expiry RETRY re-enters here and remove-on-absent is a no-op. See
     // `Supervisor::remove_context_floors` for the permanent-vs-transient safety
@@ -879,10 +878,10 @@ pub async fn finalize_close(
     // ActorDeps so we always issue the delete.
     let _ = deps.persistence.delete_context(&context_id).await;
 
-    // Prune the supervisor-owned Class-M floor registry entry (ADR-049 PR-4):
+    // Prune the authoritative Class-M floor registry entry (ADR-049):
     // an explicit close is a PERMANENT teardown — the FSM is terminally `Closed`
     // (anti-resurrection refuses re-create of a terminal id) and the durable
-    // Class-S snapshot was just deleted — so the follower floors are moot and
+    // Class-S snapshot was just deleted — so the registry floors are moot and
     // must be dropped, mirroring the provider's per-context floor-map prune
     // inside `destroy_mls_group` (which `ttl::finalize_close` ran above for
     // Ephemeral/Summary scope) and co-located with the snapshot delete. Pruned
@@ -939,17 +938,14 @@ fn persist_state_best_effort<'d, 'c>(
     // persist an empty crypto blob so a later restore fires the §23.11
     // reconnection pipeline.
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    // ADR-049 PR-6: floors threaded as parameters, still provider-sourced from
-    // the `export_*` twins (byte-identical to the prior internal read). The
-    // atomic read-authority core swaps these to the supervisor registry.
+    // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
+    // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
+    // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
+    // durable-blob params. The provider floor mirrors are deleted.
     match deps.crypto.export_crypto_state(
         &ctx_id_bytes,
-        deps.crypto.export_sender_key_epochs(&ctx_id_bytes),
-        deps.crypto
-            .export_recv_sequence_floors(&ctx_id_bytes)
-            .into_iter()
-            .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
-            .collect(),
+        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
+        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {

@@ -310,10 +310,12 @@ async fn join_time_sender_key_distribution_uses_management_channel() {
         "management payload must round-trip the original HPKE distribution bytes"
     );
 
-    // Bob can now process the distribution.
-    bob_crypto
+    // Bob can now process the distribution. ADR-049 PR-6: process returns
+    // (key, epoch) without installing; install unchecked.
+    let (key, _epoch) = bob_crypto
         .process_incoming_sender_key(&context_id, alice_did, &payload)
         .unwrap();
+    bob_crypto.set_sender_key_unchecked(&context_id, alice_did, key);
 }
 
 // ---------------------------------------------------------------------------

@@ -55,7 +55,10 @@ use crate::context::supervisor::key_package_actor::ReservationId;
 /// Alice's (creator) fixed bundle-signing key. The bootstrap resolver maps
 /// `alice_did` to its verifying key so the joiner can verify the creator-signed
 /// invitation bundle.
-fn alice_signing_key() -> SigningKey {
+// `pub` (crate-internal via the `pub(crate)` module ceiling) so the seam-level
+// e2e tests can sign Alice's inner application envelope with the SAME key the
+// pair resolver maps `alice_did` to.
+pub fn alice_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xA1; 32])
 }
 
@@ -387,9 +390,12 @@ pub fn stand_up_two_party(
                 .drain_pending_sender_key_messages(&ctx_bytes)
                 .expect("drain alice's pending sender-key messages")
             {
-                bob_crypto
+                let (key, _epoch) = bob_crypto
                     .process_incoming_sender_key(&ctx_bytes, alice_did, &msg)
                     .expect("bob processes alice's distributed sender key");
+                // ADR-049 PR-6: install the authenticated key (decomposed
+                // process_incoming no longer installs).
+                bob_crypto.set_sender_key_unchecked(&ctx_bytes, alice_did, key);
             }
 
             // Drop the joiner supervisor; the installed group persists in
