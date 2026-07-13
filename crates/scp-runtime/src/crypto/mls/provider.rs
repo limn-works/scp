@@ -2130,7 +2130,10 @@ impl MlsCryptoProvider {
                             // mirror-forward. Read-only export of a value
                             // already computed + stored; does not alter
                             // enforcement.
-                            receive_floor: (epoch, sequence),
+                            receive_floor: scp_protocol::context::builder::ReceiveFloor {
+                                epoch,
+                                sequence,
+                            },
                         }),
                     ))
                 }
