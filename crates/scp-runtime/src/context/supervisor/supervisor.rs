@@ -12510,6 +12510,8 @@ impl Supervisor {
                 ),
                 // §7.3.8 value-caveat counters: a fresh joiner carries none.
                 caveat_counters: HashMap::new(),
+                // Fix-D streaming reservation recovery: a fresh joiner carries none.
+                stream_reservations: HashMap::new(),
             },
             pending_broadcast_publishes: HashMap::new(),
             // Transient join-handshake state; the fused join already consumed
@@ -17073,6 +17075,7 @@ mod tests {
             xctx_caller_reservations: HashMap::new(),
             xctx_nonce_dedup: HashMap::new(),
             caveat_counters: HashMap::new(),
+            stream_reservations: HashMap::new(),
             broadcast: None,
         }
     }

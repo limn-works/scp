@@ -1635,6 +1635,8 @@ pub async fn create_context(
             ),
             // §7.3.8 value-caveat counters: fresh on create.
             caveat_counters: HashMap::new(),
+            // Fix-D streaming reservation recovery records: fresh on create.
+            stream_reservations: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2516,6 +2518,8 @@ pub async fn import_context(
             ),
             // §7.3.8 value-caveat counters: fresh on create.
             caveat_counters: HashMap::new(),
+            // Fix-D streaming reservation recovery records: fresh on create.
+            stream_reservations: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -3115,6 +3119,13 @@ pub async fn restore_context(
             // wall clock, so a restart can only ever DROP stale timestamps —
             // never widen a window. Cross-node public export strips this map.
             caveat_counters: ctx_snapshot.caveat_counters,
+            // Fix-D Class S: same-node restore REHYDRATES the streaming
+            // reservation recovery records so the post-restore reconcile sweep
+            // can RELEASE the escrow hold + cumulative counter reserve of any
+            // stream whose off-mailbox pump survived the crash (its close-time
+            // settle lands on the respawned generation and is dropped). Cross-
+            // node public export strips this map (invoker economy is local).
+            stream_reservations: ctx_snapshot.stream_reservations,
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,

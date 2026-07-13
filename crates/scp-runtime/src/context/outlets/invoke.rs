@@ -1627,6 +1627,68 @@ pub struct StreamSettlement {
     pub cost_per_chunk: scp_protocol::economy::types::Amount,
 }
 
+/// Durable crash-recovery record for an in-flight streaming reservation
+/// (Fix-D — the streaming analogue of §6.2.4
+/// [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)).
+///
+/// **Why this exists.** A streaming open makes TWO durable reservations that
+/// the close-time settlement is responsible for releasing: (1) the §5.4.5
+/// open-time escrow HOLD debited against the invoker's `MemberBudgetTracker`,
+/// and (2) the §7.3.8 `AmountCumulative` counter reserve committed at the
+/// pump's open-time final gate. The pump runs as a SEPARATE `tokio` task that
+/// SURVIVES an actor crash + respawn (generation `G → G+1`). On crash-restore
+/// the pump's close-time settlement lands with the pre-crash generation `G`,
+/// mismatches the respawned `G+1`, and the confused-deputy guard DROPS it — so
+/// without this record the durable escrow debit and cumulative counter reserve
+/// (both restored in the ADR-049 §9 snapshot) would NEVER be released: a
+/// permanent over-charge + a cumulative-cap capacity leak. The generation guard
+/// alone cannot distinguish an import-REPLACE (where the whole state was
+/// swapped, so a drop is correct) from a crash-RESTORE (where the reserves are
+/// this same context's own restored state and MUST be released).
+///
+/// **Lifetime — persisted once, cleared once.** The record is persisted
+/// atomically at pump open (after BOTH reservations are durable — the counter
+/// reserve is the later of the two), keyed by the stream `request_id`. It is
+/// cleared on the clean close-time settlement (generation match → release /
+/// refund / clear in one Class-S commit). Its ONLY surviving path is a crash
+/// while the pump is mid-flight — exactly the leak above — which the restore-
+/// time [`ReconcileStreamReservations`](crate::context::actor::commands::OutletsCommand::ReconcileStreamReservations)
+/// sweep drains: refund the full `reserved_escrow` + release the full
+/// `amount_cumulative_reserved`, then clear.
+///
+/// **Class S** — synchronously persisted fail-closed (ADR-049 §9) so a crash in
+/// the coalesce window cannot lose the only durable handle for reserves that DID
+/// persist. Survives same-node restore; dropped on cross-node export/import
+/// (the invoker economy + counters are local — a foreign node must never drive
+/// a local release), exactly like `xctx_caller_reservations` / `caveat_counters`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamReservationRecord {
+    /// The invoker whose budget hold (`reserved_escrow`) the crash-recovery
+    /// sweep refunds via `MemberBudgetTracker::reverse_spend`.
+    pub invoker_did: DID,
+    /// The opening UCAN CID — the key of the §7.3.8 `AmountCumulative` counter
+    /// the sweep releases `amount_cumulative_reserved` back to. Empty when no
+    /// counter-bearing cap was reserved (escrow-only stream).
+    pub ucan_cid: String,
+    /// The per-billable-chunk cost at open (diagnostics / provenance — the
+    /// sweep releases the FULL reserved amounts since the billed count is
+    /// unknown once the pump is gone).
+    pub cost_per_chunk: scp_protocol::economy::types::Amount,
+    /// The worst-case cumulative amount reserved against the `AmountCumulative`
+    /// counter at open (`0` when no cap / no store / zero-cost). Released in
+    /// full by the crash-recovery sweep.
+    pub amount_cumulative_reserved: u64,
+    /// The §5.4.5 open-time escrow hold debited against the invoker's budget
+    /// tracker (`0` for zero-cost / Query streams). Refunded in full by the
+    /// crash-recovery sweep.
+    pub reserved_escrow: scp_protocol::economy::types::Amount,
+    /// The actor spawn-`generation` the reservation was made against
+    /// (diagnostics only — the crash-recovery sweep reconciles the restored
+    /// context's OWN reserves regardless of generation, since a restore
+    /// overwrites `PerContextState::generation` with a fresh spawn generation).
+    pub generation: u64,
+}
+
 /// §5.4.5 MED-HIGH — economic state snapshotted at `OutletStreamOpen`
 /// acceptance so close-time settlement survives a mid-stream context
 /// teardown.

@@ -812,6 +812,11 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // snapshot is never imported back into a live encrypted context, so no
         // spend/rate window is re-opened by stripping them here.
         caveat_counters: HashMap::new(),
+        // Fix-D: streaming reservation recovery records are local invoker-economy
+        // state with no authority on a foreign node — ALWAYS dropped from the
+        // public export (like the budget tracker and the caveat counters). A
+        // foreign node must never drive a local escrow refund / counter release.
+        stream_reservations: HashMap::new(),
         // Broadcast per-author keys and block lists are sensitive access-control
         // state; a public-scope export is for pre-join observers, so it is
         // redacted here (mirrors the empty `read_exclusion_list` / `membership`).
@@ -1013,6 +1018,8 @@ mod tests {
             // a fresh node starts its own replay window — dropped from export.
             xctx_nonce_dedup: HashMap::new(),
             caveat_counters: HashMap::new(),
+            // Fix-D: local invoker-economy recovery records — dropped from export.
+            stream_reservations: HashMap::new(),
             broadcast: None,
         }
     }
