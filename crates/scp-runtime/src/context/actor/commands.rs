@@ -2341,6 +2341,67 @@ pub enum OutletsCommand {
         /// Oneshot reply carrying the persist / transport infra outcome.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+
+    /// Off-mailbox streaming §5.4.5 open-time escrow REVERSAL on actor-owned
+    /// state — the actor-mailbox port of the reference
+    /// `ContextManager::outlet_stream_reverse_spend`. Fired by
+    /// [`crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink`]
+    /// from the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+    /// Drop-guard when an open-time escrow HOLD was debited against the
+    /// invoker's `MemberBudgetTracker` but the pump never spawned (an
+    /// early-return between the reserve debit and the spawn).
+    ///
+    /// The handler runs
+    /// [`MemberBudgetTracker::reverse_spend`](scp_protocol::economy::budget::MemberBudgetTracker::reverse_spend)
+    /// (infallible / saturating at `0`, so a double-refund — a Drop after an
+    /// explicit settlement — is a safe no-op) against the owned budget tracker
+    /// under a fail-closed `commit_class_s_keep`. The reply carries only the
+    /// persist / transport infrastructure outcome; the refund itself never
+    /// rejects.
+    ReverseStreamEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker whose budget hold is being refunded.
+        member_did: scp_did::DID,
+        /// The debited hold amount to return (saturating at `0`).
+        amount: scp_protocol::economy::types::Amount,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Off-mailbox streaming §5.4.5 close-time economic SETTLEMENT on
+    /// actor-owned state — the actor-mailbox port of the reference
+    /// `ContextManager::outlet_stream_settle`. Fired by
+    /// [`crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink`]
+    /// at stream close (terminal chunk delivered).
+    ///
+    /// The handler is generation-guarded (confused-deputy protection): if the
+    /// reservation's `generation` no longer matches the live actor's
+    /// `PerContextState::generation` — the original instance was despawned and a
+    /// new one respawned for the same `context_id` between reserve and settle —
+    /// it DROPS the settlement silently (touching no state; there is no external
+    /// payment escrow to void, unlike the unary settle). On a match it (1)
+    /// RELEASES the unspent R4 HIGH-1 cumulative-counter reserve, (2) REFUNDS
+    /// the unspent escrow to the invoker's budget tracker, both under one
+    /// fail-closed `commit_class_s_keep`, then (3) captures the §19.15.5
+    /// `PaymentReceipt` for the exact billed amount off-persist. The no-actor
+    /// fallback (context torn down mid-stream) is handled supervisor-side in
+    /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)
+    /// BEFORE this command is dispatched.
+    SettleOutletStream {
+        /// The close-time settlement inputs (boxed — the largest
+        /// [`OutletsCommand`] payload).
+        settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+        /// Spawn-generation the reservation was made against. Compared to the
+        /// live actor's `PerContextState::generation`; a mismatch DROPS.
+        generation: u64,
+        /// Oneshot reply carrying the captured receipt (`None` when nothing was
+        /// billed / no adapter / capture failed / dropped on generation
+        /// mismatch), or the dispatch / transport infra error.
+        reply: oneshot::Sender<
+            Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>,
+        >,
+    },
 }
 
 /// See [`ContextCommand::Queries`]. Pure-read variants — handlers MUST

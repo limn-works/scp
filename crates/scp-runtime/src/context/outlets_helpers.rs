@@ -1300,6 +1300,253 @@ pub async fn reserve_outlet_stream_economy(
 }
 
 // ---------------------------------------------------------------------------
+// Streaming close-time settlement (chunk 3c) — the actor-mailbox port of the
+// reference `ContextManager::outlet_stream_settle`.
+// ---------------------------------------------------------------------------
+
+/// §5.4.5 close-time economic settlement of a streaming-native invocation, run
+/// inside the per-context actor on owned state. The generation guard is applied
+/// by the [`SettleOutletStream`](crate::context::actor::commands::OutletsCommand::SettleOutletStream)
+/// handler BEFORE this call (a mismatch drops the settlement without reaching
+/// here).
+///
+/// Order (matches the reference "release FIRST"): (1) RELEASE the unspent R4
+/// HIGH-1 cumulative-counter reserve back to the owned §7.3.8 `AmountCumulative`
+/// counter, and (2) REFUND the unspent escrow to the invoker's budget tracker —
+/// both under ONE fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// so the two durable bookkeeping mutations land atomically; then (3) capture
+/// the §19.15.5 `PaymentReceipt` for the EXACT billed amount off-persist,
+/// against the LIVE per-context economic policy (falling back to the open-time
+/// [`EconomicPolicySnapshot`](crate::context::outlets::invoke::EconomicPolicySnapshot)
+/// only when the live policy is absent — H8 "service rendered is billed").
+///
+/// Capture runs INDEPENDENTLY of the release/refund persist: a persist failure
+/// is KEEP'd in memory (the actor run loop retries the durable write) and logged,
+/// and capture still proceeds. Returns the captured receipt, or `None` when
+/// nothing was billed, no payment adapter / policy is configured, or capture
+/// failed (a `PaymentCaptureFailed` local event records the failure — the billed
+/// budget is NOT reversed).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear close-time settlement: unspent math + live-policy read + \
+              combined release/refund persist + off-persist capture with capture-failure \
+              recording — splitting it would scatter the fixed ordering the doc-comment pins"
+)]
+pub async fn settle_outlet_stream(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    settlement: crate::context::outlets::invoke::StreamSettlement,
+) -> Option<PaymentReceipt> {
+    let crate::context::outlets::invoke::StreamSettlement {
+        context_id,
+        invoker_did,
+        billed_amount,
+        refund_amount,
+        billed_count,
+        request_id,
+        economic_policy_snapshot,
+        amount_cumulative_reserved,
+        ucan_cid,
+        cost_per_chunk,
+        ..
+    } = settlement;
+
+    // The UNSPENT cumulative reserve to release: `reserved − billed_count ×
+    // cost_per_chunk` (saturating). A degenerate `billed × cost` overflow FAILS
+    // CLOSED — releases nothing, leaving the counter conservatively over-charged
+    // (never under-charged). Mirrors
+    // [`CounterReserveSettlement::unspent_release_amount`](crate::context::outlets::dispatch::CounterReserveSettlement::unspent_release_amount).
+    let unspent_release = u64::from(billed_count)
+        .checked_mul(cost_per_chunk.value())
+        .map_or(0, |billed| amount_cumulative_reserved.saturating_sub(billed));
+    // An empty `ucan_cid` (legacy / test caller with no durable counter
+    // reservation) has no counter to release to.
+    let should_release = unspent_release > 0 && !ucan_cid.is_empty();
+
+    // Read the LIVE per-context economic policy for capture BEFORE the commit
+    // borrows the cell. Prefer live (it may have changed via governance since
+    // open); fall back to the open-time snapshot (H8) when the live policy is
+    // absent. Routed through the non-persisting `class_c_view()`.
+    let capture_policy = cell
+        .class_c_view()
+        .governance_class_c_mut()
+        .economic_policy_mut()
+        .clone()
+        .or_else(|| economic_policy_snapshot.map(|snap| snap.policy));
+
+    // Release the cumulative reserve + refund the escrow under ONE fail-closed
+    // persist. Both are owned-state writes; combining them means either both
+    // survive a coalesce-window crash or the KEEP'd in-memory mutation is
+    // retried by the run loop.
+    if should_release || refund_amount.value() > 0 {
+        let invoker_for_commit = invoker_did.clone();
+        let ucan_for_commit = ucan_cid.clone();
+        let commit_result = cell
+            .commit_class_s_keep(deps, &context_id, move |mut view| {
+                let state = view.rest_mut();
+                if should_release {
+                    state
+                        .class_s
+                        .caveat_counters
+                        .entry(ucan_for_commit)
+                        .or_default()
+                        .release(CaveatKind::AmountCumulative, unspent_release);
+                }
+                if refund_amount.value() > 0 {
+                    state
+                        .governance
+                        .budget_tracker
+                        .reverse_spend(&invoker_for_commit, refund_amount);
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(err) = commit_result {
+            // KEEP semantics: the in-memory release/refund IS applied; the run
+            // loop retries the durable write. Capture runs regardless (H8).
+            tracing::warn!(
+                context_id = %context_id,
+                request_id = %hex::encode(request_id),
+                "outlet stream settlement: release/refund persist failed (kept in memory): {err}"
+            );
+        }
+    }
+
+    // Capture the §19.15.5 PaymentReceipt for the EXACT billed amount. Skip when
+    // nothing was billed or no adapter/policy is configured (the legitimate
+    // zero-cost / no-payment-rail default).
+    let (Some(adapter), Some(policy)) = (deps.payment_adapter.as_ref(), capture_policy.as_ref())
+    else {
+        return None;
+    };
+    if billed_amount.value() == 0 {
+        return None;
+    }
+    match authorize_and_capture_stream_billed(
+        adapter.as_ref(),
+        policy,
+        &invoker_did,
+        billed_amount,
+        request_id,
+        &context_id,
+    )
+    .await
+    {
+        Ok(receipt) => {
+            tracing::debug!(
+                request_id = %hex::encode(request_id),
+                billed = billed_amount.value(),
+                billed_count,
+                receipt_id = %hex::encode(receipt.receipt_id),
+                "outlet stream settlement captured PaymentReceipt"
+            );
+            Some(receipt)
+        }
+        Err(err) => {
+            // Capture failed AFTER service was rendered (H8): the billed budget
+            // is NOT reversed — only the unspent refund (already applied above)
+            // is returned. Surface a `PaymentCaptureFailed` LOCAL event for the
+            // reconciliation audit trail (ADR-051 §6 — per-payee, non-durable).
+            tracing::warn!(
+                context_id = %context_id,
+                "outlet stream settlement: payment capture failed: {err}"
+            );
+            let event = scp_protocol::context::membership::ContextEvent::PaymentCaptureFailed {
+                action: "outlet_stream".to_owned(),
+                actor_did: invoker_did.clone(),
+                error: err.to_string(),
+                cost: Some(billed_amount.value()),
+            };
+            crate::context::state::emit_event_into(
+                cell.class_c_view().receive_buffer_mut(),
+                event,
+                &context_id,
+                deps.event_tx.as_ref(),
+            );
+            None
+        }
+    }
+}
+
+/// §5.4.5 open-time escrow REVERSAL on actor-owned state — the actor-mailbox
+/// port of the reference `ContextManager::outlet_stream_reverse_spend`.
+///
+/// Credits `amount` back to `member_did`'s
+/// [`MemberBudgetTracker`](scp_protocol::economy::budget::MemberBudgetTracker)
+/// via [`reverse_spend`](scp_protocol::economy::budget::MemberBudgetTracker::reverse_spend)
+/// — infallible / SATURATING at `0`, so a double-refund (a Drop-guard reversal
+/// after an explicit settlement already returned the hold) is a safe no-op —
+/// under a fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep),
+/// so the returned budget survives a coalesce-window crash the same way the
+/// original debit does.
+///
+/// # Errors
+///
+/// [`ContextError::PersistenceFailed`] when the fail-closed persist does not land
+/// (the credit is KEEP'd in memory — the run loop retries the durable write).
+pub async fn reverse_stream_escrow(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    member_did: &DID,
+    amount: Amount,
+) -> Result<(), ContextError> {
+    let member_did_owned = member_did.clone();
+    cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        view.rest_mut()
+            .governance
+            .budget_tracker
+            .reverse_spend(&member_did_owned, amount);
+        Ok(())
+    })
+    .await
+}
+
+/// Authorize + capture the exact `billed_amount` for a closed §5.4.5 stream —
+/// the actor-mailbox port of the `authorize_dyn → capture_dyn` sequence in the
+/// reference `ContextManager::outlet_stream_settle`.
+///
+/// The streaming billed amount (`cost_per_chunk × billed_count`) is the
+/// AUTHORITATIVE figure — NOT a fresh policy evaluation — so it is authorized and
+/// captured verbatim; the receipt reflects exactly what the invoker consumed.
+/// The `request_id` is the idempotency key (a settlement is captured at most
+/// once per stream). Shared by the on-actor
+/// [`settle_outlet_stream`] and the supervisor-side no-actor fallback
+/// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor).
+///
+/// # Errors
+///
+/// Propagates the adapter's [`PaymentError`](crate::economy::adapter::PaymentError)
+/// from either the authorize or the capture leg (service was rendered — the
+/// caller records a `PaymentCaptureFailed` and does NOT reverse the budget).
+pub async fn authorize_and_capture_stream_billed(
+    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
+    policy: &scp_protocol::economy::types::EconomicPolicy,
+    invoker_did: &DID,
+    billed_amount: Amount,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
+    context_id: &str,
+) -> Result<PaymentReceipt, crate::economy::adapter::PaymentError> {
+    let metadata = crate::economy::adapter::PaymentMetadata {
+        action_type: scp_protocol::economy::types::PaidActionType::OutletCall,
+        context_id: Some(context_id.to_owned()),
+        idempotency_key: request_id,
+    };
+    let auth = adapter
+        .authorize_dyn(
+            invoker_did,
+            &policy.payee,
+            billed_amount,
+            policy.cost_schedule.currency,
+            metadata,
+        )
+        .await?;
+    adapter.capture_dyn(&auth).await
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3a: settle_outlet_economy_capture (actor handler entry point)
 // ---------------------------------------------------------------------------
 

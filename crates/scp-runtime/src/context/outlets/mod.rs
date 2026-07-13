@@ -9,3 +9,4 @@ pub mod session;
 pub mod signer;
 pub mod stream;
 pub mod stream_counter_adapter;
+pub mod stream_settlement_adapter;

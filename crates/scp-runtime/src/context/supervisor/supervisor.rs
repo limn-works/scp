@@ -5102,18 +5102,39 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
-            // `RefundHardRateLimit` and `ReleaseStreamCaveatCounter` share the
+            // `RefundHardRateLimit`, `ReleaseStreamCaveatCounter`, and
+            // `ReverseStreamEscrow` share the
             // `oneshot::Sender<Result<(), ContextError>>` reply shape and the
             // identical not-registered response, so they collapse into one arm
             // (the reserve variants below each carry a distinct reply type and
-            // stay separate).
+            // stay separate). `ReverseStreamEscrow` carries no external escrow —
+            // the §5.4.5 open-time hold is a budget-tracker debit only — so a
+            // missing actor simply drops the (best-effort) refund: the torn-down
+            // context's budget tracker is gone, so there is nothing to credit.
             OutletsCommand::RefundHardRateLimit {
                 context_id, reply, ..
             }
             | OutletsCommand::ReleaseStreamCaveatCounter {
                 context_id, reply, ..
+            }
+            | OutletsCommand::ReverseStreamEscrow {
+                context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            OutletsCommand::SettleOutletStream {
+                settlement, reply, ..
+            } => {
+                // The common no-actor case is handled supervisor-side in
+                // `settle_outlet_stream_via_actor` (which captures against the
+                // open-time snapshot) BEFORE dispatch. Reaching here is the
+                // residual TOCTOU where the actor was despawned between that
+                // pre-check and here — reply with the typed error (no external
+                // escrow to void, unlike the unary settle backstop).
+                let err = ContextError::ContextNotRegistered(settlement.context_id);
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
@@ -10511,6 +10532,147 @@ impl Supervisor {
         })?
     }
 
+    /// Dispatch the streaming close-time [`OutletsCommand::SettleOutletStream`]
+    /// to the target context's actor, with the supervisor-side no-actor fallback.
+    ///
+    /// The actor-mailbox analog of the reference `ContextManager::outlet_stream_settle`.
+    /// Called from
+    /// [`ActorStreamSettlementSink`](crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink)
+    /// via a spawned task (the sink's `settle` is a sync fire-and-forget).
+    ///
+    /// # No-actor fallback (mirrors [`Self::settle_outlet_economy_via_actor`])
+    ///
+    /// The reserve→pump→settle split runs the pump OFF the actor mailbox, so the
+    /// owning actor can be despawned (shutdown / node teardown / import replace)
+    /// mid-stream. If no actor is registered now, the counter release and escrow
+    /// refund are MOOT — the actor-owned Class-S counter and the budget tracker
+    /// were torn down with the context — but service WAS rendered (H8), so the
+    /// billed `PaymentReceipt` is STILL captured here, supervisor-side, against
+    /// the open-time
+    /// [`EconomicPolicySnapshot`](crate::context::outlets::invoke::EconomicPolicySnapshot)
+    /// (the payment adapter lives on the supervisor, not per-context, so it is
+    /// reachable regardless of context liveness). A capture failure is logged
+    /// (the non-durable `PaymentCaptureFailed` local event has no live receive
+    /// buffer to land in once the context is gone).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::TransportFailed`] if the actor reply channel closes;
+    /// otherwise the dispatch error. The no-actor fallback never errors (a
+    /// capture failure resolves to `Ok(None)`).
+    pub async fn settle_outlet_stream_via_actor(
+        &self,
+        settlement: crate::context::outlets::invoke::StreamSettlement,
+        generation: u64,
+    ) -> Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError> {
+        // No-actor pre-check. When the context is gone, capture against the
+        // open-time snapshot supervisor-side (release + refund are moot — the
+        // owned state that held them was torn down with the actor).
+        if self.lookup(&settlement.context_id).is_none() {
+            let crate::context::outlets::invoke::StreamSettlement {
+                context_id,
+                invoker_did,
+                billed_amount,
+                request_id,
+                economic_policy_snapshot,
+                ..
+            } = settlement;
+            let (Some(adapter), Some(policy)) = (
+                self.payment_adapter_ref(),
+                economic_policy_snapshot.map(|snap| snap.policy),
+            ) else {
+                return Ok(None);
+            };
+            if billed_amount.value() == 0 {
+                return Ok(None);
+            }
+            return Ok(
+                match crate::context::outlets_helpers::authorize_and_capture_stream_billed(
+                    adapter.as_ref(),
+                    &policy,
+                    &invoker_did,
+                    billed_amount,
+                    request_id,
+                    &context_id,
+                )
+                .await
+                {
+                    Ok(receipt) => {
+                        tracing::debug!(
+                            context_id = %context_id,
+                            request_id = %hex::encode(request_id),
+                            "outlet stream settlement: context gone mid-stream — captured \
+                             PaymentReceipt against open-time economic snapshot"
+                        );
+                        Some(receipt)
+                    }
+                    Err(e) => {
+                        // No live receive buffer to record the non-durable
+                        // `PaymentCaptureFailed` into — surface the failure to the
+                        // operator log only (matches the reference no-actor path).
+                        tracing::warn!(
+                            context_id = %context_id,
+                            "outlet stream settlement (no-actor): payment capture failed: {e}"
+                        );
+                        None
+                    }
+                },
+            );
+        }
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = OutletsCommand::SettleOutletStream {
+            settlement: Box::new(settlement),
+            generation,
+            reply: reply_tx,
+        };
+        self.dispatch_outlets_command(cmd).await?;
+        reply_rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::settle_outlet_stream_via_actor — actor reply channel closed"
+                    .to_owned(),
+            )
+        })?
+    }
+
+    /// Dispatch the streaming open-time [`OutletsCommand::ReverseStreamEscrow`]
+    /// to the target context's actor and await the persist outcome.
+    ///
+    /// The actor-mailbox analog of the reference
+    /// `ContextManager::outlet_stream_reverse_spend`. Called from
+    /// [`ActorEscrowRefundSink`](crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink)
+    /// via a spawned task (the sink's `refund` is a sync fire-and-forget fired
+    /// from the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+    /// Drop-guard). A missing actor drops the best-effort refund (the torn-down
+    /// context's budget tracker is gone).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::TransportFailed`] if the actor reply channel closes;
+    /// [`ContextError::ContextNotRegistered`] when no actor is registered;
+    /// otherwise the persist error.
+    pub async fn reverse_stream_escrow_via_actor(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        amount: scp_protocol::economy::types::Amount,
+    ) -> Result<(), ContextError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = OutletsCommand::ReverseStreamEscrow {
+            context_id: context_id.to_owned(),
+            member_did: member_did.clone(),
+            amount,
+            reply: reply_tx,
+        };
+        self.dispatch_outlets_command(cmd).await?;
+        reply_rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::reverse_stream_escrow_via_actor — actor reply channel closed"
+                    .to_owned(),
+            )
+        })?
+    }
+
     /// Invoke a outlet under the full economy pipeline (actor model).
     ///
     /// Orchestrates the three-phase split through
@@ -12859,7 +13021,11 @@ impl Supervisor {
     }
 
     /// Extract the target context_id from a [`OutletsCommand`].
-    const fn outlets_command_context_id(cmd: &OutletsCommand) -> &str {
+    ///
+    /// Not `const`: [`OutletsCommand::SettleOutletStream`] carries its
+    /// `context_id` inside a boxed `StreamSettlement`, and `Box` deref is not
+    /// available in a `const fn`.
+    fn outlets_command_context_id(cmd: &OutletsCommand) -> &str {
         match cmd {
             OutletsCommand::TryConsumeHardRateLimit { context_id, .. }
             | OutletsCommand::RefundHardRateLimit { context_id, .. }
@@ -12867,7 +13033,11 @@ impl Supervisor {
             | OutletsCommand::ReserveOutletStreamEconomy { context_id, .. }
             | OutletsCommand::ReserveStreamCaveatCounter { context_id, .. }
             | OutletsCommand::ReleaseStreamCaveatCounter { context_id, .. }
+            | OutletsCommand::ReverseStreamEscrow { context_id, .. }
             | OutletsCommand::SettleOutletEconomy { context_id, .. } => context_id.as_str(),
+            OutletsCommand::SettleOutletStream { settlement, .. } => {
+                settlement.context_id.as_str()
+            }
         }
     }
 

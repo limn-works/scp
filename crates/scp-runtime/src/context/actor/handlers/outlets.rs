@@ -161,6 +161,17 @@ pub(crate) async fn dispatch(
             )
             .await
         }
+        OutletsCommand::ReverseStreamEscrow {
+            context_id,
+            member_did,
+            amount,
+            reply,
+        } => handle_reverse_stream_escrow(cell, deps, &context_id, &member_did, amount, reply).await,
+        OutletsCommand::SettleOutletStream {
+            settlement,
+            generation,
+            reply,
+        } => handle_settle_outlet_stream(cell, deps, settlement, generation, reply).await,
     }
 }
 
@@ -242,6 +253,112 @@ async fn handle_refund_hard_rate_limit(
 
     let _ = reply.send(reply_result);
     outcome
+}
+
+/// Handle [`OutletsCommand::ReverseStreamEscrow`] — the off-mailbox streaming
+/// §5.4.5 open-time escrow REVERSAL.
+///
+/// The actor-mailbox port of the reference
+/// `ContextManager::outlet_stream_reverse_spend`: the
+/// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+/// Drop-guard runs supervisor-side (it cannot take `&mut` to actor-owned
+/// state), so its refund of a debited-but-never-settled hold routes here.
+/// Runs
+/// [`MemberBudgetTracker::reverse_spend`](scp_protocol::economy::budget::MemberBudgetTracker::reverse_spend)
+/// — infallible / SATURATING at `0`, so a double-refund (a Drop after an
+/// explicit settlement already returned the hold) is a safe no-op — against the
+/// owned budget tracker under a fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep),
+/// so the returned budget survives a coalesce-window crash the same way the
+/// original debit does. Reverse never rejects; the reply carries only the
+/// persist / transport infrastructure outcome.
+async fn handle_reverse_stream_escrow(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    member_did: &scp_did::DID,
+    amount: scp_protocol::economy::types::Amount,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    // A zero-amount refund (Query / zero-cost stream) touches nothing and
+    // needs no persist — reply success without a spurious durable write.
+    if amount.value() == 0 {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+
+    let commit_fut = crate::context::outlets_helpers::reverse_stream_escrow(
+        cell, deps, context_id, member_did, amount,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, commit_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            // KEEP semantics: the in-memory budget IS credited even though the
+            // persist failed — flag mutated so the actor's coalesced persist
+            // retries the durable write.
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reverse_stream_escrow exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`OutletsCommand::SettleOutletStream`] — the off-mailbox streaming
+/// §5.4.5 close-time economic settlement.
+///
+/// The actor-mailbox port of the reference `ContextManager::outlet_stream_settle`.
+///
+/// # Confused-deputy guard
+///
+/// The reservation was made against a specific actor-instance
+/// `generation`. If this actor's generation differs, the original instance was
+/// despawned and a NEW instance respawned for the same `context_id` between
+/// reserve and settle (an import replace / node teardown+respawn). Releasing the
+/// cumulative counter or refunding budget against THIS instance's owned state
+/// would corrupt the WRONG context's economy. Unlike the unary settle there is
+/// NO external payment escrow to void (the §5.4.5 open-time hold is a
+/// budget-tracker debit only, not a payment-rail authorization), so the correct
+/// action on mismatch is to DROP the settlement silently — reply `Ok(None)` and
+/// touch nothing. `generation` is a Class-C structural field read through the
+/// cell `Deref`.
+async fn handle_settle_outlet_stream(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+    generation: u64,
+    reply: oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
+) -> Outcome<()> {
+    if generation != cell.generation {
+        tracing::debug!(
+            context_id = %settlement.context_id,
+            reserved_generation = generation,
+            live_generation = cell.generation,
+            "outlet stream settlement landed on a replaced actor instance — dropping \
+             (no external escrow to void)"
+        );
+        let _ = reply.send(Ok(None));
+        return Outcome::ok(());
+    }
+
+    // Generations match: release the unspent cumulative reserve → refund the
+    // unspent escrow → capture the billed receipt. `settle_outlet_stream`
+    // performs the owned-state mutations under a fail-closed persist and the
+    // off-persist receipt capture; it never returns `Err` (a persist failure is
+    // KEEP'd + logged, service-rendered capture runs regardless), so the reply
+    // always carries the billing outcome.
+    let receipt = crate::context::outlets_helpers::settle_outlet_stream(cell, deps, *settlement).await;
+    let _ = reply.send(Ok(receipt));
+    Outcome::ok_mutated(())
 }
 
 /// Handle [`OutletsCommand::ReserveOutletEconomy`] — Phase 1 of the outlet
