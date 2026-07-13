@@ -5118,6 +5118,14 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
+            OutletsCommand::ReserveOutletStreamEconomy {
+                context_id, reply, ..
+            } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
             OutletsCommand::SettleOutletEconomy {
                 context_id,
                 request,
@@ -10368,6 +10376,61 @@ impl Supervisor {
             .map(|boxed| *boxed)
     }
 
+    /// Dispatch the streaming open-time [`OutletsCommand::ReserveOutletStreamEconomy`]
+    /// to the target context's actor and await the `Send`
+    /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation).
+    ///
+    /// Mirrors [`Self::reserve_outlet_economy_via_actor`] for the
+    /// streaming-native open path: the reserve runs inside the per-context
+    /// actor on owned Class-S state (hard-rate + velocity + escrow debit +
+    /// seq-authority-B allocation); the supervisor carries the returned
+    /// reservation across the off-mailbox stream pump.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::ContextNotRegistered`] when no actor is registered for
+    /// `context_id`; [`ContextError::TransportFailed`] if the actor reply
+    /// channel closes; otherwise any error the reserve handler emits
+    /// (rate-limit, not-a-member, escrow overflow / insufficient funds,
+    /// persist failure).
+    #[allow(
+        dead_code,
+        reason = "streaming open reserve seam (sub-chunk 3a): the caller is \
+                  `Supervisor::open_outlet_stream<E>`, landed in a later sub-chunk of the \
+                  outlet-streaming runtime port. Exercised by unit tests now."
+    )]
+    async fn reserve_outlet_stream_economy_via_actor(
+        &self,
+        context_id: &str,
+        invoker_did: &DID,
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        estimated_chunk_count: u32,
+        max_per_action: Option<scp_protocol::economy::types::Amount>,
+        now_secs: u64,
+    ) -> Result<crate::context::outlets_helpers::StreamEconomyReservation, ContextError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = OutletsCommand::ReserveOutletStreamEconomy {
+            context_id: context_id.to_owned(),
+            invoker_did: invoker_did.clone(),
+            cost_per_chunk,
+            estimated_chunk_count,
+            max_per_action,
+            now_secs,
+            reply: reply_tx,
+        };
+        self.dispatch_outlets_command(cmd).await?;
+        reply_rx
+            .await
+            .map_err(|_| {
+                ContextError::TransportFailed(
+                    "Supervisor::reserve_outlet_stream_economy_via_actor — actor reply channel \
+                     closed"
+                        .to_owned(),
+                )
+            })?
+            .map(|boxed| *boxed)
+    }
+
     /// Dispatch the Phase-3 [`OutletsCommand::SettleOutletEconomy`] to the
     /// target context's actor and await the settle outcome.
     ///
@@ -12783,6 +12846,7 @@ impl Supervisor {
             OutletsCommand::TryConsumeHardRateLimit { context_id, .. }
             | OutletsCommand::RefundHardRateLimit { context_id, .. }
             | OutletsCommand::ReserveOutletEconomy { context_id, .. }
+            | OutletsCommand::ReserveOutletStreamEconomy { context_id, .. }
             | OutletsCommand::SettleOutletEconomy { context_id, .. } => context_id.as_str(),
         }
     }

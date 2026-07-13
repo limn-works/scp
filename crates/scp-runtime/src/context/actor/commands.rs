@@ -2249,6 +2249,39 @@ pub enum OutletsCommand {
             Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>,
         >,
     },
+
+    /// Streaming open-time economy reserve on actor-owned state — the
+    /// streaming-native counterpart of [`Self::ReserveOutletEconomy`].
+    /// Consumes the hard rate limit, records the velocity entry, snapshots the
+    /// economic policy, allocates the per-sender `base_sequence` (seq-authority
+    /// B), and DEBITS the §5.4.5 open-time escrow hold
+    /// (`cost_per_chunk × estimated_chunk_count`) under a fail-closed persist.
+    /// Replies with a `Send`
+    /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
+    /// the supervisor carries across the off-mailbox stream pump.
+    ///
+    /// See [`crate::context::outlets_helpers::reserve_outlet_stream_economy`].
+    ReserveOutletStreamEconomy {
+        /// Context identifier string.
+        context_id: String,
+        /// Invoker DID.
+        invoker_did: scp_did::DID,
+        /// Per-Data-chunk cost. `Amount::new(0)` for Query / zero-cost outlets
+        /// (short-circuits the escrow debit to a zero hold).
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        /// Declared estimated Data-chunk count — the escrow hold multiplier.
+        estimated_chunk_count: u32,
+        /// Optional §19.5 per-action ceiling AND-folded into the effective
+        /// spendable balance when a spending UCAN caps per-action spend.
+        max_per_action: Option<scp_protocol::economy::types::Amount>,
+        /// Current Unix time in seconds — caller supplies to keep the handler
+        /// deterministic.
+        now_secs: u64,
+        /// Oneshot reply channel carrying the streaming open reservation.
+        reply: oneshot::Sender<
+            Result<Box<crate::context::outlets_helpers::StreamEconomyReservation>, ContextError>,
+        >,
+    },
 }
 
 /// See [`ContextCommand::Queries`]. Pure-read variants — handlers MUST

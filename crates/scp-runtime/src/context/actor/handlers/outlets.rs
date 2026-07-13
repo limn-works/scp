@@ -92,6 +92,28 @@ pub(crate) async fn dispatch(
             handle_settle_outlet_economy(cell, deps, &context_id, &invoker_did, *request, reply)
                 .await
         }
+        OutletsCommand::ReserveOutletStreamEconomy {
+            context_id,
+            invoker_did,
+            cost_per_chunk,
+            estimated_chunk_count,
+            max_per_action,
+            now_secs,
+            reply,
+        } => {
+            handle_reserve_outlet_stream_economy(
+                cell,
+                deps,
+                &context_id,
+                &invoker_did,
+                cost_per_chunk,
+                estimated_chunk_count,
+                max_per_action,
+                now_secs,
+                reply,
+            )
+            .await
+        }
     }
 }
 
@@ -218,6 +240,60 @@ async fn handle_reserve_outlet_economy(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "reserve_outlet_economy exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`OutletsCommand::ReserveOutletStreamEconomy`] — the streaming
+/// open-time economy reserve. Delegates to
+/// [`outlets_helpers::reserve_outlet_stream_economy`](crate::context::outlets_helpers::reserve_outlet_stream_economy)
+/// on owned state under a 30s timeout. On success replies with the `Send`
+/// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
+/// the supervisor carries across the off-mailbox pump.
+#[allow(clippy::too_many_arguments)]
+async fn handle_reserve_outlet_stream_economy(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    invoker_did: &scp_did::DID,
+    cost_per_chunk: scp_protocol::economy::types::Amount,
+    estimated_chunk_count: u32,
+    max_per_action: Option<scp_protocol::economy::types::Amount>,
+    now_secs: u64,
+    reply: oneshot::Sender<
+        Result<Box<crate::context::outlets_helpers::StreamEconomyReservation>, ContextError>,
+    >,
+) -> Outcome<()> {
+    let reserve_fut = crate::context::outlets_helpers::reserve_outlet_stream_economy(
+        cell,
+        deps,
+        context_id,
+        invoker_did,
+        cost_per_chunk,
+        estimated_chunk_count,
+        max_per_action,
+        now_secs,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reserve_fut).await {
+        Ok(Ok(reservation)) => (Outcome::ok_mutated(()), Ok(Box::new(reservation))),
+        Ok(Err(err)) => {
+            // A rejected reservation refunds/rolls back inline, but the
+            // observable state (rate-limit bucket touched then refunded,
+            // sequence bumped then reversed) is mutated during the attempt —
+            // flag mutated so the actor persists if persistence is wired.
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reserve_outlet_stream_economy exceeded {HANDLER_TIMEOUT:?} budget"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
