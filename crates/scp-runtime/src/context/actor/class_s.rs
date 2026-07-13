@@ -2909,9 +2909,6 @@ impl ClassSCell {
     ///
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after the
     /// in-state restore + async compensation).
-    ///
-    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
-    #[allow(dead_code)]
     pub(crate) async fn commit_class_s_compensating<T, X>(
         &mut self,
         deps: &ActorDeps,

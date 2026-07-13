@@ -853,14 +853,20 @@ fn outlet_stream_grant_credit_impl(
             //    REVERSE the reserve (CREDIT budget + un-bump the durable record,
             //    atomically) so the debit is not stranded (money-conservation).
             //    A `reverse_err` is logged-and-swallowed (the original grant
-            //    error is the caller-facing outcome) and is safe because the
-            //    reverse runs under `commit_class_s_keep`: its budget-credit and
-            //    record-un-bump are applied IN MEMORY regardless of the persist
-            //    outcome (the actor run loop retries the durable write), and
-            //    `outlet_stream_reverse_grant` only returns `Err` when the
-            //    context has no live actor — i.e. it is being torn down, so its
-            //    owned budget + record state are moot anyway. There is NO sweep
-            //    that would otherwise reconcile a stranded grant top-up.
+            //    error is the caller-facing outcome). It is safe in BOTH of its
+            //    two forms, because the reverse runs under `commit_class_s_keep`
+            //    which applies the budget-credit + record-un-bump IN MEMORY
+            //    regardless of the persist outcome:
+            //    - `PersistenceFailed` on a LIVE actor: the reverse HAS been
+            //      applied in memory; only the durable write failed, and the
+            //      actor run loop retries it (KEEP semantics). The credit is not
+            //      lost.
+            //    - `ContextNotRegistered`: the context has no live actor (being
+            //      torn down), so its owned budget + crash-recovery record are
+            //      moot anyway.
+            //    There is NO sweep that would otherwise reconcile a stranded
+            //    grant top-up, so the in-memory KEEP is the load-bearing
+            //    safety mechanism, not any later reconcile.
             let apply = handle.lock().await.apply_credit_grant(&credit, reserved);
             match apply {
                 Ok(_new_total) => Ok(()),

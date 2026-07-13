@@ -1575,9 +1575,14 @@ pub async fn settle_outlet_stream(
 ) -> StreamSettleOutcome {
     // Destructure up front so the Fix-D generation-mismatch branch below can
     // read the settlement for its snapshot-policy capture. `reserved`
-    // (= billed + refund) is the open-time escrow HOLD — it tells the clean
-    // path whether a crash-recovery record was persisted at open (only streams
-    // that held an escrow or a cumulative counter reserve persist one).
+    // (= billed + refund) is the TOTAL escrow hold the pump accrued over the
+    // stream's life — the open-time hold PLUS every accepted credit-grant
+    // top-up (`apply_reserved_top_up` extends the same ledger `reserved` is read
+    // from at close), NOT the open-time hold alone. The clean path operates on
+    // `billed_amount` / `refund_amount` (not `reserved`); `reserved` is the
+    // audit/receipt-provenance figure, kept here only to assert the money-
+    // conservation invariant below. (Record detection uses `has_record` —
+    // whether an entry actually exists — NOT `reserved > 0`.)
     let crate::context::outlets::invoke::StreamSettlement {
         context_id,
         invoker_did,
@@ -1592,6 +1597,16 @@ pub async fn settle_outlet_stream(
         cost_per_chunk,
         ..
     } = settlement;
+
+    // Money-conservation invariant: the total hold is exactly billed + refund
+    // (open + Σgrants). The settlement is CONSTRUCTED this way at pump close, so
+    // a violation is a runtime-internal bug, not attacker input — a debug assert
+    // documents + guards it without a release-build cost.
+    debug_assert_eq!(
+        reserved.value(),
+        billed_amount.value().saturating_add(refund_amount.value()),
+        "StreamSettlement.reserved must equal billed + refund"
+    );
 
     // Money-conservation fail-closed (crypto): `billed_amount` and the
     // (`billed_count`, `cost_per_chunk`) pair are INDEPENDENT settlement fields,
@@ -1710,14 +1725,24 @@ pub async fn settle_outlet_stream(
     // persist. Both are owned-state writes; combining them means either both
     // survive a coalesce-window crash or the KEEP'd in-memory mutation is
     // retried by the run loop.
-    // Fix-D: a crash-recovery record was persisted at open IFF the stream held a
-    // durable escrow hold (`reserved > 0`) or a cumulative counter reserve. On
-    // this clean terminal the reserves are being released here, so the record
-    // must be CLEARED in the SAME persist — otherwise a later restart's
-    // reconcile sweep would see a stale record and double-release.
-    let record_persisted = reserved.value() > 0 || amount_cumulative_reserved > 0;
+    // Fix-D: the crash-recovery record's WHOLE purpose is refunding UNSPENT
+    // escrow on a crash where this clean settle never runs. This clean terminal
+    // has fully accounted the escrow (release + refund above), so the record is
+    // now stale and MUST be removed in the SAME persist — otherwise a later
+    // restart's reconcile sweep would see it and double-release. Remove it
+    // UNCONDITIONALLY (not gated on `reserved`/`cum`): a record can exist even
+    // when the ledger-derived `reserved` settled to `0` — e.g. a zero-escrow-
+    // open stream whose first grant CREATED a record and then had its apply
+    // REJECTED (the reverse un-bumped `reserved_escrow` to 0 but left the entry)
+    // — and that 0-record must not linger in durable state. `has_record` (read
+    // before the commit borrows the cell) keeps a truly recordless stream
+    // (zero-cost, no grant) skipping the persist entirely; the removal inside is
+    // a no-op if somehow absent. Removing a record NEVER changes budget: the
+    // refund is the independent `refund_amount` reverse above; the record is
+    // only the crash-recovery figure a clean settle supersedes.
     let request_key = hex::encode(request_id);
-    if should_release || refund_amount.value() > 0 || record_persisted {
+    let has_record = cell.class_s.stream_reservations.contains_key(&request_key);
+    if should_release || refund_amount.value() > 0 || has_record {
         let invoker_for_commit = invoker_did.clone();
         let ucan_for_commit = ucan_cid.clone();
         let commit_result = cell
@@ -1737,12 +1762,9 @@ pub async fn settle_outlet_stream(
                         .budget_tracker
                         .reverse_spend(&invoker_for_commit, refund_amount);
                 }
-                if record_persisted {
-                    // Consumed on the clean terminal — the reserves this record
-                    // tracked were just released above, so the crash-recovery
-                    // sweep must never see it (double-release guard).
-                    state.class_s.stream_reservations.remove(&request_key);
-                }
+                // Unconditionally drop the crash-recovery record on the clean
+                // terminal (no-op if absent) — the double-release guard.
+                state.class_s.stream_reservations.remove(&request_key);
                 Ok(())
             })
             .await;
