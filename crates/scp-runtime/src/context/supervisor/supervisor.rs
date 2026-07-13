@@ -5193,7 +5193,7 @@ impl Supervisor {
     /// - [`ContextError::NotInitialized`] if no
     ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
-    pub async fn dispatch_outlets_command(
+    pub(in crate::context) async fn dispatch_outlets_command(
         &self,
         cmd: OutletsCommand,
     ) -> Result<Outcome<()>, ContextError> {
@@ -10714,7 +10714,7 @@ impl Supervisor {
     /// [`ContextError::TransportFailed`] if the actor reply channel closes;
     /// otherwise the dispatch error. The no-actor fallback never errors (a
     /// capture failure resolves to `Ok(None)`).
-    pub async fn settle_outlet_stream_via_actor(
+    pub(in crate::context) async fn settle_outlet_stream_via_actor(
         &self,
         settlement: crate::context::outlets::invoke::StreamSettlement,
         generation: u64,
@@ -10805,7 +10805,7 @@ impl Supervisor {
     /// [`ContextError::TransportFailed`] if the actor reply channel closes;
     /// [`ContextError::ContextNotRegistered`] when no actor is registered;
     /// otherwise the persist error.
-    pub async fn reverse_stream_escrow_via_actor(
+    pub(in crate::context) async fn reverse_stream_escrow_via_actor(
         &self,
         context_id: &str,
         member_did: &DID,
@@ -10952,13 +10952,15 @@ impl Supervisor {
     ///
     /// # Sequence allocation (`base_sequence`)
     ///
-    /// The reserve allocates the per-sender MLS send-sequence
-    /// (`reservation.base_sequence`, seq-authority-B). It is NOT consumed here:
-    /// per §5.4.5 the pump's per-chunk cursor starts at `0` per `request_id`
-    /// (`invoke.rs` "sequence starts at 0"), a DISTINCT counter from the message
-    /// send-sequence. `base_sequence` is surfaced to / released by the transport
-    /// send path (the later FFI/transport wiring chunk) — no `open_stream_session`
-    /// / `StreamSessionHandle` slot exists for it in this chunk.
+    /// The reserve allocates NO per-sender MLS send-sequence. Per §5.4.5 the
+    /// pump's per-chunk cursor starts at `0` per `request_id` (`invoke.rs`
+    /// "sequence starts at 0"), a DISTINCT counter from the message
+    /// send-sequence, so nothing here reads a `base_sequence`. The per-sender
+    /// send-sequence is allocated at the point of consumption by the
+    /// transport/FFI send path (the later FFI/transport wiring chunk) —
+    /// allocate-at-consumption — never pre-reserved at open, because a
+    /// rollback-in-place across the off-mailbox pump window would corrupt a
+    /// DIFFERENT message's sequence.
     ///
     /// # Errors
     ///
@@ -11054,6 +11056,25 @@ impl Supervisor {
                 .map(|policy| crate::context::outlets::invoke::EconomicPolicySnapshot { policy });
         }
 
+        // Open-failure escrow guard (see the method doc). The reserve just
+        // DEBITED `reserved_escrow`; arm the guard IMMEDIATELY — before any
+        // fallible step between here and the pump spawn (the `?` on
+        // `build_stream_post_input_hook` below, any early return) — so an early
+        // exit drops the ticket and its `Drop` reverses the hold. Consumed on
+        // success — the pump's close-time settlement then owns the
+        // unspent-portion refund.
+        let escrow_refund_sink: Arc<dyn dispatch::StreamEscrowRefundSink> = Arc::new(
+            crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
+                Arc::clone(self),
+            ),
+        );
+        let escrow_ticket = dispatch::StreamEscrowTicket::new(
+            escrow_refund_sink,
+            context_id.to_owned(),
+            invoker_did.clone(),
+            reservation.reserved_escrow,
+        );
+
         // The actor-owned durable caveat-counter store: routes the §7.3.8
         // counter CAS onto the target context's Class-S `caveat_counters` via
         // the mailbox. Always constructible in the actor architecture, so the
@@ -11090,22 +11111,6 @@ impl Supervisor {
                     reservation.generation,
                 ),
             );
-
-        // Open-failure escrow guard (see the method doc). The reserve already
-        // debited `reserved_escrow`; if `open_stream_session` rejects, this
-        // ticket's `Drop` reverses the hold. Consumed on success — the pump's
-        // settlement then owns the unspent-portion refund.
-        let escrow_refund_sink: Arc<dyn dispatch::StreamEscrowRefundSink> = Arc::new(
-            crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink::new(
-                Arc::clone(self),
-            ),
-        );
-        let escrow_ticket = dispatch::StreamEscrowTicket::new(
-            escrow_refund_sink,
-            context_id.to_owned(),
-            invoker_did.clone(),
-            reservation.reserved_escrow,
-        );
 
         // Per-context admission tracker + node-level pump semaphore (chunk 3d).
         let admission = self.outlet_stream_admission_for(context_id);
@@ -28164,6 +28169,179 @@ mod open_outlet_stream_tests {
             captured.load(Ordering::SeqCst),
             1,
             "exactly one §19.15.5 receipt captured for the billed count"
+        );
+    }
+
+    /// F5 regression — an open that FAILS AFTER the reserve has debited the
+    /// open-time escrow hold must REFUND that hold via the
+    /// [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+    /// `Drop` guard. The orchestrator arms the ticket IMMEDIATELY after the
+    /// reserve returns `Ok` (before the fallible post-input-hook build), so any
+    /// post-reserve early return — here a Phase-2 admission rejection forced by
+    /// zero-capacity caps — drops the ticket and reverses the debit.
+    ///
+    /// The refund is proven by MONEY: the invoker is funded with EXACTLY one
+    /// reservation's worth of budget (`cost_per_chunk × estimate == 50`). The
+    /// failed open reserves (debits) the full 50; only if the ticket refunds it
+    /// can a follow-up reserve of the same 50 succeed. Without the refund the
+    /// follow-up would stay `InsufficientFunds` forever and the poll times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_outlet_stream_post_reserve_failure_refunds_escrow() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let supervisor = build_supervisor(&captured);
+
+        let role_state = authorizing_role_state();
+        let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        state.role_state = role_state.clone();
+        state
+            .membership
+            .add_member(invoker(), "owner".to_owned(), Vec::new());
+        // Budget = EXACTLY one reservation (cost 10 × estimate 5 == 50). The
+        // follow-up reserve can only succeed once the FIRST (failed) open has
+        // refunded its debit.
+        let one_reservation = COST_PER_CHUNK * u64::from(DECLARED_ESTIMATE);
+        state
+            .governance
+            .budget_tracker
+            .grant(&invoker(), Amount::new(one_reservation));
+        state.governance.economic_policy = Some(policy());
+        let deps = supervisor
+            .build_actor_deps(&invoker())
+            .await
+            .expect("build_actor_deps");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn_actor_with_state");
+
+        let mut registry = OutletRegistry::new();
+        register_outlet(&mut registry, &role_state, registration(), &invoker().0)
+            .expect("register streaming outlet");
+
+        // A counter-bearing caveat (mirrors the happy-path fixture) so Step 0's
+        // binding recompute matches byte-for-byte and the FIRST rejection is
+        // the admission gate — not a binding mismatch.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        let request_id: RequestId = [CTX_BYTE; 16];
+        let caveats_jcs = caveats.to_canonical_json_bytes().expect("jcs");
+        let caveats_binding = compute_caveats_binding(
+            UCAN_CID.as_bytes(),
+            &request_id,
+            &invoker().0,
+            DECLARED_ESTIMATE,
+            &caveats_jcs,
+        );
+        let identity = StreamIdentity {
+            context_id: ctx_key(),
+            outlet_id: "calculator".to_owned(),
+            stream_epoch: 1,
+            caveats_binding,
+        };
+        let invoker_key = SigningKey::from_bytes(&[0x24; 32]);
+        let invoker_pk = invoker_key.verifying_key();
+        let operator_signer: Arc<dyn StreamSigner> =
+            Arc::new(InProcessStreamSigner::new(invoker_key));
+
+        let params = OpenStreamParams {
+            identity,
+            // Zero admission capacity forces a Phase-2 rejection AFTER the
+            // reserve has debited the hold.
+            caps: AdmissionCaps {
+                per_invoker: 0,
+                per_origin_invoker: 0,
+                per_outlet: 0,
+            },
+            invoker_did: invoker().0,
+            origin_invoker_did: invoker().0,
+            cost_per_chunk: Amount::new(COST_PER_CHUNK),
+            available_balance: Amount::new(one_reservation),
+            reserved_escrow: Amount::new(0),
+            declared_estimated_chunk_count: Some(DECLARED_ESTIMATE),
+            credit_window: 32,
+            caveats: caveats.clone(),
+            invoker_pk,
+            operator_signer,
+            stream_credit_stall_secs: 30,
+            stream_cancel_ack_secs: 1,
+            stream_ucan_recheck_secs: 3_600,
+            ucan_cid: UCAN_CID.to_owned(),
+            request_id,
+            revocation_checker: Arc::new(
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+            ),
+            economic_policy_snapshot: None,
+        };
+        let invocation_binding = Some(InvocationCaveatBinding {
+            caveats,
+            ucan_cid: UCAN_CID.to_owned(),
+        });
+
+        let executor: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
+        let outlet_id: OutletId = "calculator".to_owned();
+        let open_result = supervisor
+            .open_outlet_stream(
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                executor,
+                None,
+                None,
+                None,
+                invocation_binding,
+                params,
+            )
+            .await;
+        // `StreamSessionHandle` is not `Debug`, so match rather than `expect_err`.
+        match open_result {
+            Ok(_) => panic!("a zero-capacity admission cap must reject the open after the reserve"),
+            Err(rejection) => assert!(
+                matches!(
+                    rejection,
+                    crate::context::outlets::dispatch::OpenStreamRejection::AdmissionRateLimited { .. }
+                ),
+                "the open is rejected at the Phase-2 admission gate: {rejection:?}"
+            ),
+        }
+
+        // The reserve debited the full hold; the ticket `Drop` spawns a mailbox
+        // reversal. Prove the refund landed by observing that a follow-up
+        // reserve of the SAME entire budget succeeds — impossible unless the
+        // debit was returned. Retrying on rejection is token-neutral: the
+        // reserve refunds its own hard-rate token on an insufficient-funds
+        // reject.
+        let restored = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if supervisor
+                    .reserve_outlet_stream_economy_via_actor(
+                        &ctx_key(),
+                        &invoker(),
+                        Amount::new(COST_PER_CHUNK),
+                        DECLARED_ESTIMATE,
+                        None,
+                        NOW,
+                    )
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            restored.is_ok(),
+            "the StreamEscrowTicket Drop must refund the debited hold — a \
+             follow-up reserve of the full budget succeeds only once the \
+             refund lands"
         );
     }
 }

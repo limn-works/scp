@@ -486,11 +486,18 @@ impl std::fmt::Debug for OutletEconomyReservation {
 /// Unlike the unary reservation this carries NO in-flight
 /// [`OutletEconomyTicket`]: the streaming path holds its economic reservation
 /// as a debited `reserved_escrow` against the invoker's budget (refunded, net
-/// of billed chunks, at stream close) plus the open-time `base_sequence`
-/// allocated for the pump's per-chunk sequence numbering. The
-/// `economic_policy` is snapshotted at acceptance so close-time settlement can
-/// capture the §19.15.5 `PaymentReceipt` for rendered service even if the
-/// context is torn down mid-stream.
+/// of billed chunks, at stream close). The `economic_policy` is snapshotted at
+/// acceptance so close-time settlement can capture the §19.15.5
+/// `PaymentReceipt` for rendered service even if the context is torn down
+/// mid-stream.
+///
+/// The per-sender MLS send-sequence (`base_sequence`) is deliberately NOT
+/// carried here: it is allocated at the point of consumption by the
+/// transport/FFI send path (allocate-at-consumption), never at open. A
+/// rollback-in-place of a pre-allocated sequence across the off-mailbox pump
+/// window would corrupt a DIFFERENT message's sequence — the LIFO
+/// [`rollback_sequence_number`](scp_protocol::context::membership::MembershipState::rollback_sequence_number)
+/// `saturating_sub` is not request-scoped — so the allocation is deferred.
 #[must_use = "a StreamEconomyReservation debits open-time escrow and must be settled or reversed at stream close — dropping leaks the held reservation"]
 pub struct StreamEconomyReservation {
     /// Context handle snapshot — the off-mailbox pump reads lifecycle state
@@ -516,12 +523,6 @@ pub struct StreamEconomyReservation {
     /// if the context is torn down mid-stream. `None` when the context has no
     /// economic policy.
     pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
-    /// The §9.8.5 per-sender sequence number allocated in-actor at open
-    /// (seq-authority-B): [`MembershipState::next_sequence_number`] on the
-    /// owned membership roster. The pump numbers its emitted chunks from this
-    /// base; on ANY open-time failure after allocation it is rolled back via
-    /// [`MembershipState::rollback_sequence_number`].
-    pub base_sequence: u64,
 }
 
 impl std::fmt::Debug for StreamEconomyReservation {
@@ -529,7 +530,6 @@ impl std::fmt::Debug for StreamEconomyReservation {
         f.debug_struct("StreamEconomyReservation")
             .field("generation", &self.generation)
             .field("reserved_escrow", &self.reserved_escrow)
-            .field("base_sequence", &self.base_sequence)
             .finish_non_exhaustive()
     }
 }
@@ -1067,11 +1067,14 @@ pub async fn reserve_outlet_economy(
 /// hard-rate-limit consume, velocity record, economic-policy snapshot) and
 /// then runs the streaming-specific open-time gates:
 ///
-/// 1. **Seq-authority-B** — allocate the per-sender `base_sequence` in-actor
-///    via [`MembershipState::next_sequence_number`](scp_protocol::context::membership::MembershipState::next_sequence_number)
-///    (NOT the send-tracker). Rolled back via
-///    [`rollback_sequence_number`](scp_protocol::context::membership::MembershipState::rollback_sequence_number)
-///    on any failure after allocation.
+/// 1. **Membership gate** — the invoker must be on the §9.8.5 membership
+///    roster ([`MembershipState::contains`](scp_protocol::context::membership::MembershipState::contains));
+///    a non-member has no per-sender stream state and is rejected. The
+///    per-sender `base_sequence` is NOT allocated here — the transport/FFI
+///    send path allocates it at the point of consumption
+///    (allocate-at-consumption), because a rollback-in-place across the
+///    off-mailbox pump window would corrupt a DIFFERENT message's sequence
+///    (the LIFO `saturating_sub` is not request-scoped).
 /// 2. **Open-time escrow** — a faithful port of the reference
 ///    `outlet_stream_reserve_escrow`: `reserved = cost_per_chunk ×
 ///    estimated_chunk_count` (checked; overflow → `EscrowOverflow`), gated
@@ -1087,16 +1090,16 @@ pub async fn reserve_outlet_economy(
 /// On ANY failure branch after a consume the token is refunded / the mutation
 /// rolled back inline: the hard-rate token is refunded exactly once (on the
 /// early-return branches and in the single outer error arm around the
-/// combinator), the velocity tick + sequence increment are rolled back on
-/// whichever branch consumed them, and the budget debit is reversed by the
-/// persist-failure compensation — so a rejected reservation leaves observable
-/// state unchanged.
+/// combinator), the velocity tick is rolled back on whichever branch consumed
+/// it, and the budget debit is reversed by the persist-failure compensation —
+/// so a rejected reservation leaves observable state unchanged. No sequence is
+/// allocated here, so there is none to roll back.
 ///
 /// # Errors
 ///
 /// - [`ContextError::RateLimited`] — hard rate limit exceeded for the invoker.
 /// - [`ContextError::PermissionDenied`] — the invoker is not a member of the
-///   context (no per-sender sequence counter to allocate against).
+///   context (no per-sender stream state).
 /// - An escrow-overflow / insufficient-funds [`ContextError`] — reusing the
 ///   [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
 ///   `EscrowOverflow` / `InsufficientFunds` variants routed through
@@ -1149,17 +1152,21 @@ pub async fn reserve_outlet_stream_economy(
         // `view` dropped here.
     }
 
-    // --- Seq-authority-B: allocate `base_sequence` in-actor (Class-C
-    // membership roster, §9.8.5). `None` ⇒ the invoker has no membership
-    // record, so there is no per-sender counter to allocate against — reject
-    // (rolling back the velocity tick + hard-rate token consumed above; no
-    // sequence was allocated to roll back).
+    // --- Membership gate (Class-C membership roster, §9.8.5). A non-member has
+    // no per-sender stream state — reject (rolling back the velocity tick +
+    // hard-rate token consumed above). The per-sender `base_sequence` is NOT
+    // allocated here: the transport/FFI send path allocates it at the point of
+    // consumption (allocate-at-consumption). Holding a pre-allocated sequence
+    // across the off-mailbox pump window and rolling it back in place would
+    // corrupt a DIFFERENT message's sequence — the LIFO `saturating_sub` in
+    // `rollback_sequence_number` is not request-scoped — so the allocation is
+    // deferred rather than reserved-and-rolled-back.
     let invoker_did_str = invoker_did.to_string();
-    let allocated_sequence = cell
+    if !cell
         .class_c_view()
         .membership_class_c_mut()
-        .next_sequence_number(&invoker_did_str);
-    let Some(base_sequence) = allocated_sequence else {
+        .contains(&invoker_did_str)
+    {
         let mut view = cell.class_c_view();
         let gov = view.governance_class_c_mut();
         gov.velocity_tracker_mut()
@@ -1167,9 +1174,9 @@ pub async fn reserve_outlet_stream_economy(
         gov.hard_rate_limit_mut().refund(invoker_did);
         return Err(ContextError::PermissionDenied(format!(
             "SCP-OUTLET-6089: invoker {invoker_did} is not a member of context \
-             '{context_id}' — no sequence counter to allocate for stream open"
+             '{context_id}' — cannot open a stream"
         )));
-    };
+    }
 
     // --- Open-time escrow reserve (port of `outlet_stream_reserve_escrow`).
     let reserved_escrow = if cost_per_chunk.value() == 0 {
@@ -1178,18 +1185,14 @@ pub async fn reserve_outlet_stream_economy(
     } else {
         // Overflow is a PURE check on `cost × count` — done BEFORE any debit so
         // an overflow rejects without consulting or debiting the budget. On
-        // overflow the sequence + velocity + hard-rate consumed above are all
-        // rolled back (the sequence WAS allocated, unlike the not-a-member arm).
+        // overflow the velocity tick + hard-rate token consumed above are
+        // rolled back (no sequence was allocated — see the membership gate).
         let Some(reserved) = cost_per_chunk.checked_mul(u64::from(estimated_chunk_count)) else {
             let mut view = cell.class_c_view();
-            {
-                let gov = view.governance_class_c_mut();
-                gov.velocity_tracker_mut()
-                    .rollback(invoker_did, velocity_token);
-                gov.hard_rate_limit_mut().refund(invoker_did);
-            }
-            view.membership_class_c_mut()
-                .rollback_sequence_number(&invoker_did_str);
+            let gov = view.governance_class_c_mut();
+            gov.velocity_tracker_mut()
+                .rollback(invoker_did, velocity_token);
+            gov.hard_rate_limit_mut().refund(invoker_did);
             return Err(invocation_error_to_context(
                 OpenStreamRejection::EscrowOverflow.to_invocation_error(),
             ));
@@ -1215,14 +1218,13 @@ pub async fn reserve_outlet_stream_economy(
                     });
                     if reserved.value() > effective_remaining.value() {
                         // Insufficient funds: reject BEFORE the debit. Roll the
-                        // velocity tick + sequence increment back inline (both
-                        // reachable through the owned state); the hard-rate token
-                        // is refunded once in the outer arm.
+                        // velocity tick back inline (reachable through the owned
+                        // state); the hard-rate token is refunded once in the
+                        // outer arm. No sequence was allocated to roll back.
                         state
                             .governance
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
-                        state.membership.rollback_sequence_number(&invoker_did_str);
                         return Err(invocation_error_to_context(
                             OpenStreamRejection::InsufficientFunds.to_invocation_error(),
                         ));
@@ -1235,12 +1237,12 @@ pub async fn reserve_outlet_stream_economy(
                     {
                         // Defensive: a `record_spend` reject (budget drained after
                         // the local comparison). The serial actor makes this
-                        // unreachable, but fail closed — roll back inline.
+                        // unreachable, but fail closed — roll back the velocity
+                        // tick inline (no sequence was allocated).
                         state
                             .governance
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
-                        state.membership.rollback_sequence_number(&invoker_did_str);
                         return Err(invocation_error_to_context(
                             OpenStreamRejection::InsufficientFunds.to_invocation_error(),
                         ));
@@ -1251,20 +1253,16 @@ pub async fn reserve_outlet_stream_economy(
                     Ok((reserved, reserved))
                 },
                 // KEEP-direction (no Class-S mutation to restore). On persist
-                // failure reverse the Class-C budget debit + velocity tick +
-                // sequence increment the failed persist did not make durable.
-                // `view` is a `ClassCMut` — it cannot reach `hard_rate_limit`,
-                // which is refunded in the outer arm below.
+                // failure reverse the Class-C budget debit + velocity tick the
+                // failed persist did not make durable (no sequence was
+                // allocated). `view` is a `ClassCMut` — it cannot reach
+                // `hard_rate_limit`, which is refunded in the outer arm below.
                 async |reserved: Amount, mut view, _deps| {
-                    {
-                        let gov = view.governance_class_c_mut();
-                        gov.budget_tracker_mut()
-                            .reverse_spend(invoker_did, reserved);
-                        gov.velocity_tracker_mut()
-                            .rollback(invoker_did, velocity_token);
-                    }
-                    view.membership_class_c_mut()
-                        .rollback_sequence_number(&invoker_did_str);
+                    let gov = view.governance_class_c_mut();
+                    gov.budget_tracker_mut()
+                        .reverse_spend(invoker_did, reserved);
+                    gov.velocity_tracker_mut()
+                        .rollback(invoker_did, velocity_token);
                 },
             )
             .await;
@@ -1274,8 +1272,8 @@ pub async fn reserve_outlet_stream_economy(
             Err(err) => {
                 // Single hard-rate-limit refund site for every combinator error
                 // path (`f`-reject and persist-failure alike): `f` and the
-                // compensation reverse the velocity + sequence + budget they can
-                // reach; the hard-rate token is refunded here exactly once (it is
+                // compensation reverse the velocity + budget they can reach; the
+                // hard-rate token is refunded here exactly once (it is
                 // not reachable through the compensation `ClassCMut` view). Routed
                 // through the non-persisting `class_c_view()` — the reserve's
                 // persist already ran in the combinator; this arm injects none.
@@ -1295,7 +1293,6 @@ pub async fn reserve_outlet_stream_economy(
         generation: cell.generation,
         reserved_escrow,
         economic_policy,
-        base_sequence,
     })
 }
 
@@ -1386,6 +1383,23 @@ pub async fn settle_outlet_stream(
         cost_per_chunk,
         ..
     } = settlement;
+
+    // Money-conservation fail-closed (crypto): `billed_amount` and the
+    // (`billed_count`, `cost_per_chunk`) pair are INDEPENDENT settlement fields,
+    // but the captured `PaymentReceipt` (a money artifact) must never bill MORE
+    // than `cost_per_chunk × billed_count`. Cap the captured amount at that
+    // per-chunk-derived figure so a settlement constructed with an inflated
+    // `billed_amount` can never OVER-charge the invoker (a `cost × count`
+    // overflow derives `0` — capture nothing rather than a bogus amount). `min`
+    // only ever REDUCES the captured amount; an under-stated `billed_amount`
+    // (e.g. a zero-cost / release-only settlement) is left as-is. The refund
+    // leg (`refund_amount`, computed independently as `reserved − billed`) is
+    // unaffected.
+    let derived_billed = cost_per_chunk
+        .value()
+        .checked_mul(u64::from(billed_count))
+        .unwrap_or(0);
+    let billed_amount = Amount::new(billed_amount.value().min(derived_billed));
 
     // The UNSPENT cumulative reserve to release: `reserved − billed_count ×
     // cost_per_chunk` (saturating). A degenerate `billed × cost` overflow FAILS
@@ -3857,9 +3871,10 @@ mod tests {
     /// ([`reserve_outlet_stream_economy`]).
     ///
     /// Covers the escrow-debit math (`cost × count`, `cost == 0 → 0`, checked
-    /// overflow), the seq-authority-B `base_sequence` allocation + rollback,
-    /// the generation/economic-policy capture, the not-a-member reject, and the
-    /// budget+sequence DUAL reversal on persist failure.
+    /// overflow), the generation/economic-policy capture, the not-a-member
+    /// reject, and the budget reversal on persist failure. No per-sender
+    /// sequence is allocated at reserve (allocate-at-consumption), so the tests
+    /// assert the membership sequence counter is left UNTOUCHED.
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     mod stream_reserve {
         use std::sync::Arc;
@@ -4050,7 +4065,8 @@ mod tests {
         }
 
         /// Success: `reserved = cost × count` is DEBITED, and the reservation
-        /// captures the sequence, generation, and economic-policy snapshot.
+        /// captures the generation and economic-policy snapshot. No per-sender
+        /// sequence is allocated (allocate-at-consumption).
         #[tokio::test]
         async fn debits_escrow_and_captures_fields() {
             let deps = build_deps(Box::new(OkPersistence)).await;
@@ -4069,10 +4085,6 @@ mod tests {
                 "reserved_escrow = cost 10 × count 4"
             );
             assert_eq!(
-                reservation.base_sequence, 1,
-                "first open allocates sequence 1"
-            );
-            assert_eq!(
                 reservation.generation, generation,
                 "the reservation captures the actor generation"
             );
@@ -4088,39 +4100,41 @@ mod tests {
             );
             assert_eq!(
                 cell.membership.get(INVOKER).unwrap().sequence_number,
-                1,
-                "the per-sender sequence counter advanced to 1"
+                0,
+                "the reserve does NOT allocate a per-sender sequence \
+                 (allocate-at-consumption) — the counter is left at 0"
             );
         }
 
-        /// A second open allocates the next sequence and debits again.
+        /// Successive opens each debit their own hold and NEVER touch the
+        /// per-sender sequence counter (allocate-at-consumption).
         #[tokio::test]
-        async fn sequence_advances_across_opens() {
+        async fn escrow_debits_across_opens_without_touching_sequence() {
             let deps = build_deps(Box::new(OkPersistence)).await;
             let mut cell = ClassSCell::new(member_state(1000));
 
-            let first = reserve(&mut cell, &deps, 10, 2, None)
+            let _first = reserve(&mut cell, &deps, 10, 2, None)
                 .await
                 .expect("first open");
-            let second = reserve(&mut cell, &deps, 10, 3, None)
+            let _second = reserve(&mut cell, &deps, 10, 3, None)
                 .await
                 .expect("second open");
 
-            assert_eq!(first.base_sequence, 1);
-            assert_eq!(
-                second.base_sequence, 2,
-                "the second open allocates the next sequence"
-            );
             assert_eq!(
                 cell.governance.budget_tracker.total_spent(&invoker()),
                 Amount::new(50),
                 "both holds (20 + 30) are debited"
             );
+            assert_eq!(
+                cell.membership.get(INVOKER).unwrap().sequence_number,
+                0,
+                "neither open advanced the per-sender sequence counter"
+            );
         }
 
         /// `cost_per_chunk == 0` (Query / zero-cost) short-circuits to a zero
-        /// hold with no debit and no balance consultation — while still
-        /// allocating the sequence.
+        /// hold with no debit and no balance consultation — and, like every
+        /// open, allocates no per-sender sequence.
         #[tokio::test]
         async fn zero_cost_reserves_nothing() {
             let deps = build_deps(Box::new(OkPersistence)).await;
@@ -4137,18 +4151,19 @@ mod tests {
                 "zero cost → zero hold"
             );
             assert_eq!(
-                reservation.base_sequence, 1,
-                "sequence still allocated for a Query stream"
-            );
-            assert_eq!(
                 cell.governance.budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "no debit for a zero-cost stream"
             );
+            assert_eq!(
+                cell.membership.get(INVOKER).unwrap().sequence_number,
+                0,
+                "a zero-cost open allocates no per-sender sequence either"
+            );
         }
 
-        /// `cost × count` overflow → an escrow-overflow error, with the
-        /// sequence increment rolled back and no budget debited.
+        /// `cost × count` overflow → an escrow-overflow error, with no budget
+        /// debited and the per-sender sequence counter left untouched.
         #[tokio::test]
         async fn overflow_rejects_and_rolls_back() {
             let deps = build_deps(Box::new(OkPersistence)).await;
@@ -4170,12 +4185,12 @@ mod tests {
             assert_eq!(
                 cell.membership.get(INVOKER).unwrap().sequence_number,
                 0,
-                "the sequence increment is rolled back on overflow"
+                "the per-sender sequence counter is never allocated at reserve"
             );
         }
 
         /// `reserved > effective_remaining` → an insufficient-funds error, with
-        /// the sequence increment rolled back and no budget debited.
+        /// no budget debited and the per-sender sequence counter left untouched.
         #[tokio::test]
         async fn insufficient_funds_rejects_and_rolls_back() {
             let deps = build_deps(Box::new(OkPersistence)).await;
@@ -4198,7 +4213,7 @@ mod tests {
             assert_eq!(
                 cell.membership.get(INVOKER).unwrap().sequence_number,
                 0,
-                "the sequence increment is rolled back on insufficient funds"
+                "the per-sender sequence counter is never allocated at reserve"
             );
         }
 
@@ -4258,8 +4273,9 @@ mod tests {
             );
         }
 
-        /// A fail-closed escrow-debit persist failure reverses BOTH the budget
-        /// debit AND the sequence increment (the compensation path).
+        /// A fail-closed escrow-debit persist failure reverses the budget debit
+        /// (the compensation path); the per-sender sequence counter is never
+        /// allocated at reserve, so it stays untouched throughout.
         #[tokio::test]
         async fn persist_failure_reverses_budget_and_sequence() {
             let deps = build_deps(Box::new(FailPersistence)).await;
@@ -4281,7 +4297,7 @@ mod tests {
             assert_eq!(
                 cell.membership.get(INVOKER).unwrap().sequence_number,
                 0,
-                "the sequence increment is REVERSED when the persist does not land"
+                "the per-sender sequence counter is never allocated at reserve"
             );
         }
     }

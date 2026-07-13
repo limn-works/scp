@@ -2253,9 +2253,10 @@ pub enum OutletsCommand {
     /// Streaming open-time economy reserve on actor-owned state — the
     /// streaming-native counterpart of [`Self::ReserveOutletEconomy`].
     /// Consumes the hard rate limit, records the velocity entry, snapshots the
-    /// economic policy, allocates the per-sender `base_sequence` (seq-authority
-    /// B), and DEBITS the §5.4.5 open-time escrow hold
-    /// (`cost_per_chunk × estimated_chunk_count`) under a fail-closed persist.
+    /// economic policy, gates on membership, and DEBITS the §5.4.5 open-time
+    /// escrow hold (`cost_per_chunk × estimated_chunk_count`) under a
+    /// fail-closed persist. The per-sender `base_sequence` is NOT allocated here
+    /// — the transport/FFI send path allocates it at consumption.
     /// Replies with a `Send`
     /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
     /// the supervisor carries across the off-mailbox stream pump.
