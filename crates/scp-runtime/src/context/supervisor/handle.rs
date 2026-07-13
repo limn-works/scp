@@ -37,6 +37,7 @@ use std::sync::Arc;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ReceiveFloor;
+use scp_protocol::crypto::sender_keys::MergePolicy;
 
 use crate::context::supervisor::floors::FloorAdvanceError;
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
@@ -180,38 +181,41 @@ impl SupervisorHandle {
         self.supervisor.export_recv_sequence_floors(ctx)
     }
 
-    /// Seed/merge per-sender epoch floors into the registry (follower). See
+    /// Merge per-sender epoch floors into the registry under the §23.17.2
+    /// fail-closed validating-merge `policy`. See
     /// [`Supervisor::validate_and_merge_epoch_floors`].
     ///
     /// # Errors
     ///
-    /// Infallible in PR-4 (matches the provider twin's signature for the PR-6
-    /// retarget).
+    /// Propagates [`FloorAdvanceError`] on an Inv-3 regression
+    /// ([`MergePolicy::RejectRegression`]) or an overshoot (both policies).
     pub(in crate::context) fn validate_and_merge_epoch_floors(
         &self,
         ctx: &[u8; 32],
         incoming: Vec<(String, u64)>,
         max_advance: u64,
-        trusted_local: bool,
+        policy: MergePolicy,
     ) -> Result<(), FloorAdvanceError> {
         self.supervisor
-            .validate_and_merge_epoch_floors(ctx, incoming, max_advance, trusted_local)
+            .validate_and_merge_epoch_floors(ctx, incoming, max_advance, policy)
     }
 
-    /// Seed/merge per-sender receive-sequence floors into the registry
-    /// (follower). See [`Supervisor::validate_and_merge_recv_sequence_floors`].
+    /// Merge per-sender receive-sequence floors into the registry under the
+    /// §23.17.2/.3 fail-closed validating-merge `policy`. See
+    /// [`Supervisor::validate_and_merge_recv_sequence_floors`].
     ///
     /// # Errors
     ///
-    /// Infallible in PR-4 (matches the provider twin's signature).
+    /// Propagates [`FloorAdvanceError`] on an Inv-3 regression
+    /// ([`MergePolicy::RejectRegression`]) or an epoch overshoot (both policies).
     pub(in crate::context) fn validate_and_merge_recv_sequence_floors(
         &self,
         ctx: &[u8; 32],
         incoming: Vec<(String, ReceiveFloor)>,
-        trusted_local: bool,
+        policy: MergePolicy,
     ) -> Result<(), FloorAdvanceError> {
         self.supervisor
-            .validate_and_merge_recv_sequence_floors(ctx, incoming, trusted_local)
+            .validate_and_merge_recv_sequence_floors(ctx, incoming, policy)
     }
 
     /// Create-seed the floor registry for `ctx` (insert-if-absent). See
@@ -226,6 +230,18 @@ impl SupervisorHandle {
     /// shutdown paths) invoke this only when the context is permanently gone.
     pub(in crate::context) fn remove_context_floors(&self, ctx: &[u8; 32]) {
         self.supervisor.remove_context_floors(ctx);
+    }
+
+    /// Member-granular floor prune of `did` from `ctx`'s registry entry. See
+    /// [`Supervisor::remove_member_floors`] — the member-granular twin of
+    /// `remove_context_floors` (keeps siblings + the local scalar; drops only the
+    /// departed member's floors under one guard).
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-6 forward-declared member-granular floor prune; production callers land in the atomic read-authority switch. Test-exercised today."
+    )]
+    pub(in crate::context) fn remove_member_floors(&self, ctx: &[u8; 32], did: &str) {
+        self.supervisor.remove_member_floors(ctx, did);
     }
 
     /// Start a cross-context saga. The ONLY way for an actor to affect
