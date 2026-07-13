@@ -50,6 +50,7 @@ use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use crate::context::outlets::stream::StreamAdmissionTracker;
 use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
@@ -728,17 +729,58 @@ fn decode_repair_records_evidence(bytes: &[u8]) -> Result<Vec<SagaDivergenceRepa
 // Supervisor configuration + crash tracking
 // ---------------------------------------------------------------------------
 
-/// Supervisor configuration. Currently a reserved placeholder with no
-/// tunables wired; saga phase timeouts and respawn-budget windows are
-/// derived from code constants (`Supervisor::LIFECYCLE_TIMEOUT`, the
-/// function-local `PHASE_TIMEOUT`, and the module-level
-/// [`CRASH_WINDOW_MS`]) rather than this struct.
-#[derive(Clone, Debug, Default)]
+/// Default node-level concurrent outlet-stream-pump ceiling
+/// (`max_concurrent_outlet_stream_pumps`), spec §5.4.5 round-8. Mirrors the
+/// reference `ContextManager` default (feat/outlet-redesign). Bounds the
+/// runtime's aggregate streaming task/memory footprint independent of any
+/// per-context admission cap.
+pub const DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS: u32 = 4096;
+
+/// Minimum configurable node-level concurrent-pump ceiling. A value of 0
+/// would deadlock all streaming, so the floor is 1.
+pub const MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS: u32 = 1;
+
+/// Maximum configurable node-level concurrent-pump ceiling.
+///
+/// `tokio::sync::Semaphore` caps permits at `Semaphore::MAX_PERMITS`
+/// (`usize::MAX >> 3`); 65536 is a generous practical upper bound well
+/// under that limit.
+pub const MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS: u32 = 65_536;
+
+/// Clamps a requested `max_concurrent_outlet_stream_pumps` into the
+/// `[MIN, MAX]` range and constructs the backing node-wide pump semaphore.
+fn build_outlet_stream_pump_semaphore(requested: u32) -> Arc<tokio::sync::Semaphore> {
+    let clamped = requested.clamp(
+        MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
+        MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
+    );
+    Arc::new(tokio::sync::Semaphore::new(clamped as usize))
+}
+
+/// Supervisor configuration (per-node tunables). Saga phase timeouts and
+/// respawn-budget windows are still derived from code constants
+/// (`Supervisor::LIFECYCLE_TIMEOUT`, the function-local `PHASE_TIMEOUT`, and
+/// the module-level [`CRASH_WINDOW_MS`]) rather than this struct.
+#[derive(Clone, Debug)]
 pub struct SupervisorConfig {
-    /// Reserved for future configuration; placeholder field so the
-    /// struct has stable layout.
-    #[allow(dead_code)]
-    reserved: (),
+    /// Node-level ceiling on the number of outlet stream pumps that may run
+    /// concurrently across ALL contexts on this supervisor (spec §5.4.5
+    /// round-8). Sizes the shared
+    /// [`Supervisor::outlet_stream_pump_semaphore`] at construction, clamped
+    /// into [`MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`] ..=
+    /// [`MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`]. Bounds the runtime's
+    /// aggregate streaming task/memory footprint regardless of per-context
+    /// admission caps. Defaults to
+    /// [`DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`].
+    pub max_concurrent_outlet_stream_pumps: u32,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_outlet_stream_pumps: DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
+        }
+    }
 }
 
 /// Sliding-window length for the actor respawn budget (ADR-049 §10).
@@ -1422,6 +1464,40 @@ pub struct Supervisor {
     /// supervisor-side (non-`Send`) outside the actor's serialized mailbox,
     /// so the actor instance identity must be re-verified at settle time.
     spawn_generation: std::sync::atomic::AtomicU64,
+
+    // -----------------------------------------------------------------
+    // Outlet streaming (spec §5.4.5) — supervisor-owned pump resources.
+    // -----------------------------------------------------------------
+    /// Node-wide ceiling on concurrently-running outlet stream pumps
+    /// (spec §5.4.5 round-8). A pump permit is acquired AFTER all
+    /// per-context admission / escrow gates pass in `open_outlet_stream`
+    /// and held for the exact lifetime of the pump task (released on
+    /// normal close, terminal, cancel-ack, or panic); saturation
+    /// hard-rejects the open. Per-INSTANCE (ADR-048): owned by this
+    /// supervisor, never a process-global static (a global would be caught
+    /// by `check-no-mutable-globals`). Sized at construction from
+    /// [`SupervisorConfig::max_concurrent_outlet_stream_pumps`] via
+    /// [`build_outlet_stream_pump_semaphore`]. Read via
+    /// [`Self::outlet_stream_pump_semaphore`].
+    outlet_stream_pump_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Per-context §5.4.5 round-5 stream admission trackers, keyed by
+    /// `context_id`. Get-or-created on stream open via
+    /// [`Self::outlet_stream_admission_for`] and dropped on permanent
+    /// context teardown via [`Self::reap_stream_admission`] (the twin of
+    /// the [`Self::floors`] / [`Self::crash_windows`] teardown reap; NOT
+    /// reaped on a respawn's transient despawn, so the per-context caps
+    /// survive crash-recovery). The inner
+    /// `Arc<std::sync::RwLock<StreamAdmissionTracker>>` is the exact type
+    /// the off-mailbox pump (`dispatch::open_stream_session`) consumes; the
+    /// outer `RwLock` guards the registry map. `std::sync::RwLock` is the
+    /// sanctioned off-mailbox primitive here (clippy.toml bans only the
+    /// tokio RwLock / Mutex read-path variants), and its guard is only ever
+    /// taken in synchronous critical sections — never held across an
+    /// `.await`. Removing a map entry drops only the registry's `Arc`
+    /// reference: an in-flight pump holding its own `Arc` clone keeps the
+    /// tracker alive until the pump ends.
+    outlet_stream_admission:
+        Arc<std::sync::RwLock<HashMap<String, Arc<std::sync::RwLock<StreamAdmissionTracker>>>>>,
 }
 
 /// The two durable providers — the saga journal and the `OpenMLS` `mls_storage`
@@ -1616,6 +1692,11 @@ impl Supervisor {
             reason = "ADR-049 §Decision 12 allow-list: same-id bootstrap-spawn serialization guard; cold bootstrap path, not a per-command read."
         )]
         let bootstrap_spawn_lock = tokio::sync::Mutex::new(());
+        // Size the node-wide pump ceiling from the config knob (clamped into
+        // range). Read `health_config` BEFORE it is moved into the struct
+        // literal below. §5.4.5 round-8.
+        let outlet_stream_pump_semaphore =
+            build_outlet_stream_pump_semaphore(health_config.max_concurrent_outlet_stream_pumps);
         Self {
             actors: DashMap::new(),
             standing_contexts: ArcSwap::new(Arc::new(HashMap::new())),
@@ -1655,6 +1736,11 @@ impl Supervisor {
             // `PerContextState::generation == 0` can never collide with a
             // real spawn generation.
             spawn_generation: std::sync::atomic::AtomicU64::new(0),
+            // Outlet streaming (spec §5.4.5) — pump ceiling sized above; the
+            // admission registry starts empty (populated lazily per context
+            // on the first stream open).
+            outlet_stream_pump_semaphore,
+            outlet_stream_admission: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -1875,6 +1961,75 @@ impl Supervisor {
         let _ = supervisor.mls_storage.set(mls_storage);
 
         supervisor
+    }
+
+    // -------------------------------------------------------------------
+    // Outlet streaming (spec §5.4.5) — pump-resource accessors.
+    // -------------------------------------------------------------------
+
+    /// Node-wide outlet-stream-pump semaphore (spec §5.4.5 round-8).
+    ///
+    /// Returns an `Arc` clone of the shared per-instance semaphore.
+    /// `open_outlet_stream` acquires a permit from it as the LAST gate
+    /// (after all per-context admission / escrow checks pass) and holds it
+    /// for the exact lifetime of the pump task.
+    #[must_use]
+    pub fn outlet_stream_pump_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.outlet_stream_pump_semaphore)
+    }
+
+    /// Get-or-create the §5.4.5 round-5 [`StreamAdmissionTracker`] for
+    /// `context_id`.
+    ///
+    /// Returns an `Arc` clone of the per-context tracker, inserting a fresh
+    /// one on first use. Repeated calls for the SAME `context_id` return
+    /// clones of the SAME `Arc` (so every open for a context shares one
+    /// admission state); distinct `context_id`s get distinct trackers. The
+    /// returned `Arc<std::sync::RwLock<StreamAdmissionTracker>>` is exactly
+    /// what the off-mailbox pump (`dispatch::open_stream_session`) consumes.
+    ///
+    /// Synchronous: the registry write guard is taken and dropped within
+    /// this call and is never held across an `.await`. Stream opens are
+    /// infrequent, so the single write-lock get-or-insert is cheap enough
+    /// that no read-fast-path is warranted.
+    // Wired by the `open_outlet_stream` orchestrator (chunk 3e), which hands
+    // the returned tracker to `dispatch::open_stream_session`. Tested here in
+    // chunk 3d (`outlet_stream_admission_for_is_get_or_create`).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(in crate::context) fn outlet_stream_admission_for(
+        &self,
+        context_id: &str,
+    ) -> Arc<std::sync::RwLock<StreamAdmissionTracker>> {
+        let mut guard = self
+            .outlet_stream_admission
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            guard
+                .entry(context_id.to_owned())
+                .or_insert_with(|| Arc::new(std::sync::RwLock::new(StreamAdmissionTracker::new()))),
+        )
+    }
+
+    /// Drop the stream admission-tracker registry entry for `context_id` on
+    /// PERMANENT context teardown (close / TTL-expiry / discard-join /
+    /// shutdown sweep) — the twin of the [`Self::reap_crash_window`] /
+    /// [`Self::remove_context_floors`] teardown reap, keeping the admission
+    /// registry's lifecycle aligned 1:1 with them.
+    ///
+    /// Deliberately NOT called on a respawn's transient despawn (unlike the
+    /// unconditional [`Self::despawn_actor`]): a respawned actor is the same
+    /// logical context, and preserving its tracker keeps the §5.4.5 caps
+    /// exact across crash-recovery. Removing the map entry drops ONLY the
+    /// registry's `Arc` reference; an in-flight pump holding its own `Arc`
+    /// clone of the tracker keeps it alive until the pump ends — this does
+    /// not force-drop or invalidate any live tracker.
+    pub(in crate::context) fn reap_stream_admission(&self, context_id: &str) {
+        self.outlet_stream_admission
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(context_id);
     }
 
     // -------------------------------------------------------------------
@@ -4838,6 +4993,12 @@ impl Supervisor {
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
         //    transient safety argument.
         self.remove_context_floors(&context_id_bytes);
+        // 5. Drop the per-context stream admission-tracker registry entry on
+        //    the same permanent-teardown sweep (spec §5.4.5) — the streaming
+        //    twin of the floor-registry reap above. An in-flight pump holding
+        //    its own Arc keeps the tracker alive; this only drops the
+        //    registry's reference.
+        self.reap_stream_admission(context_id);
         removed
     }
 
@@ -13681,6 +13842,115 @@ mod tests {
         assert!(s.lookup("any-ctx").is_none());
         assert!(s.local_dids.load().is_empty());
         assert!(s.standing_contexts.load().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Outlet streaming (spec §5.4.5) — pump semaphore + per-context
+    // admission-tracker registry (chunk 3d).
+    // ---------------------------------------------------------------
+
+    /// The node-wide pump semaphore is sized from
+    /// `SupervisorConfig::max_concurrent_outlet_stream_pumps` (default
+    /// `DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`) and the getter hands
+    /// back a clone of the SAME shared semaphore.
+    #[tokio::test]
+    async fn outlet_stream_pump_semaphore_sized_from_config_default() {
+        let s = test_supervisor();
+        let sem = s.outlet_stream_pump_semaphore();
+        assert_eq!(
+            sem.available_permits(),
+            DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS as usize,
+            "default config sizes the semaphore at the default cap",
+        );
+        // The getter returns a clone of the same underlying semaphore:
+        // acquiring a permit from one view is observed by another.
+        let permit = sem.try_acquire().expect("a permit is available");
+        assert_eq!(
+            s.outlet_stream_pump_semaphore().available_permits(),
+            DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS as usize - 1,
+            "getter clones share one semaphore, not independent copies",
+        );
+        drop(permit);
+    }
+
+    /// A non-default (and out-of-range) config value is clamped into
+    /// `[MIN, MAX]` when sizing the semaphore.
+    #[tokio::test]
+    async fn outlet_stream_pump_semaphore_clamps_config_value() {
+        let persistence: Arc<dyn ContextPersistence> = Arc::new(TestPersistence);
+        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
+            InMemoryStorage::new(),
+        )));
+        // 0 requested → clamped up to the floor (MIN).
+        let cfg_zero = SupervisorConfig {
+            max_concurrent_outlet_stream_pumps: 0,
+        };
+        let s_zero = Supervisor::new(Arc::clone(&persistence), Arc::clone(&journal), cfg_zero);
+        assert_eq!(
+            s_zero.outlet_stream_pump_semaphore().available_permits(),
+            MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS as usize,
+            "a 0 config clamps up to MIN (streaming must not deadlock)",
+        );
+        // Above MAX → clamped down to the ceiling (MAX).
+        let cfg_huge = SupervisorConfig {
+            max_concurrent_outlet_stream_pumps: MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS + 1,
+        };
+        let s_huge = Supervisor::new(persistence, journal, cfg_huge);
+        assert_eq!(
+            s_huge.outlet_stream_pump_semaphore().available_permits(),
+            MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS as usize,
+            "an over-MAX config clamps down to MAX",
+        );
+    }
+
+    /// `outlet_stream_admission_for` is get-or-create: repeated calls for
+    /// one `context_id` return clones of the SAME `Arc`; distinct
+    /// `context_id`s get distinct trackers.
+    #[tokio::test]
+    async fn outlet_stream_admission_for_is_get_or_create() {
+        let s = test_supervisor();
+        let a1 = s.outlet_stream_admission_for("ctx-a");
+        let a2 = s.outlet_stream_admission_for("ctx-a");
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "repeated calls for one context_id share the SAME tracker Arc",
+        );
+        let b1 = s.outlet_stream_admission_for("ctx-b");
+        assert!(
+            !Arc::ptr_eq(&a1, &b1),
+            "distinct context_ids get distinct trackers",
+        );
+    }
+
+    /// `reap_stream_admission` removes the registry entry so it does not
+    /// leak. A subsequent get-or-create yields a FRESH tracker (distinct
+    /// `Arc`), and a live `Arc` held across the reap stays valid (only the
+    /// registry's reference is dropped, never a live tracker).
+    #[tokio::test]
+    async fn reap_stream_admission_removes_entry_without_invalidating_live_arc() {
+        let s = test_supervisor();
+        let before = s.outlet_stream_admission_for("ctx-reap");
+        // Hold a live clone across the reap — mirrors an in-flight pump.
+        let live = Arc::clone(&before);
+
+        s.reap_stream_admission("ctx-reap");
+
+        // The live Arc is still usable after the registry entry is dropped.
+        {
+            let _guard = live
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // (tracker is accessible; no panic / poisoning)
+        }
+
+        // A fresh get-or-create after the reap allocates a NEW tracker.
+        let after = s.outlet_stream_admission_for("ctx-reap");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "after reap, get-or-create allocates a fresh tracker",
+        );
+        // Reaping an absent context is a harmless no-op.
+        s.reap_stream_admission("never-existed");
     }
 
     /// ADR-049 commit 12c.9f: per-identity wrapping-key accessors lift

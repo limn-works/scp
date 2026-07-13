@@ -3386,6 +3386,11 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // shutdown sweep.
         let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx_id);
         supervisor.remove_context_floors(&ctx_id_bytes);
+        // Drop the per-context stream admission-tracker registry entry on the
+        // same teardown sweep (spec §5.4.5) — the streaming twin of the
+        // crash-window / floor-registry reaps above, keeping the admission
+        // registry from leaking past a shutdown.
+        supervisor.reap_stream_admission(ctx_id);
     }
 
     // Supervisor-level state clear. Acquired under the write_lock once

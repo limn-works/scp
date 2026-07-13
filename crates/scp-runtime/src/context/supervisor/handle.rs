@@ -217,6 +217,16 @@ impl SupervisorHandle {
         self.supervisor.remove_member_floors(ctx, did);
     }
 
+    /// Permanent-teardown drop of the per-context outlet-stream admission
+    /// registry entry for `context_id` (spec §5.4.5) — the streaming twin of
+    /// [`Self::remove_context_floors`]. See
+    /// [`Supervisor::reap_stream_admission`] for the live-Arc safety
+    /// argument. Callers (the terminal close / TTL-expiry paths) invoke this
+    /// only when the context is permanently gone.
+    pub(in crate::context) fn reap_stream_admission(&self, context_id: &str) {
+        self.supervisor.reap_stream_admission(context_id);
+    }
+
     /// Start a cross-context saga. The ONLY way for an actor to affect
     /// state in another context.
     ///

@@ -187,6 +187,11 @@ pub async fn handle_ttl_expiry(
     // argument.
     if terminal_result.state_transitioned() {
         deps.supervisor.remove_context_floors(&context_id_bytes);
+        // Streaming twin of the floor-registry prune (spec §5.4.5): a
+        // terminally `Expired` context accepts no further stream opens, so
+        // drop its per-context admission-tracker registry entry. An in-flight
+        // pump holding its own Arc keeps the tracker alive.
+        deps.supervisor.reap_stream_admission(&context_id);
     }
 
     // Fold the Class-C participation decay + convergent-deadline clear into the
@@ -891,6 +896,11 @@ pub async fn finalize_close(
     // safety argument.
     let ctx_id_bytes = context_id_to_bytes(&context_id);
     deps.supervisor.remove_context_floors(&ctx_id_bytes);
+    // Streaming twin of the floor-registry prune (spec §5.4.5): an explicit
+    // close is a permanent teardown (`Closed` context accepts no further
+    // stream opens), so drop its per-context admission-tracker registry
+    // entry. An in-flight pump holding its own Arc keeps the tracker alive.
+    deps.supervisor.reap_stream_admission(&context_id);
 
     Ok(())
 }
