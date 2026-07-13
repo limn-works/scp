@@ -39,6 +39,16 @@ pub(in crate::context::supervisor) struct ContextFloors {
     /// `sender_did` → highest sender-key epoch observed for that sender.
     /// Mirrors `SenderKeyStore.epochs` for this context (the authoritative
     /// copy in PR-4).
+    ///
+    /// INVARIANT (black-hat F-3): this one map holds BOTH the REMOTE per-sender
+    /// distributed-epoch high-water (keyed by each remote sender DID) AND — via
+    /// the local-rotation mirror-forward — the LOCAL `sender_key_epoch` scalar
+    /// keyed by `local_did`. This coexistence is safe today ONLY because
+    /// `local_did` never appears as a remote sender in its own recv path, so the
+    /// receive-side overshoot ceiling (which reads `sender_epochs[remote_did]`)
+    /// never reads the local scalar. This coincidence is LOAD-BEARING: PR-6 / PR-7
+    /// must preserve it (or split the two counters into separate maps) before the
+    /// gate becomes read-authoritative.
     pub(in crate::context::supervisor) sender_epochs: HashMap<String, u64>,
     /// `sender_did` → highest `(epoch, sequence)` accepted from that sender —
     /// the intra-epoch anti-replay floor (spec §23.17.3). LEXICOGRAPHIC order.
@@ -88,7 +98,11 @@ pub enum FloorAdvanceError {
         proposed: (u64, u64),
     },
     /// A receive-side epoch beyond the sender's epoch floor `+ max_advance`
-    /// (mirrors the provider's H9 receive-side epoch ceiling in `open()`).
+    /// (the follower's analogue of the provider's H9 receive-side epoch ceiling
+    /// in `open()` — but the ceiling reads THIS follower's own, possibly-lagging
+    /// `sender_epochs` mirror, not the provider's authoritative epoch, so it is
+    /// NOT exact provider-parity; exact parity is a PR-6 concern once the gate
+    /// is fail-closed and read-authoritative).
     RecvSequenceOvershoot {
         /// The sender whose floor was consulted.
         did: String,
@@ -213,9 +227,14 @@ impl Supervisor {
     /// `ctx`. Receive-side twin of [`Self::check_and_advance_sender_epoch`].
     ///
     /// `next` is compared LEXICOGRAPHICALLY on `(epoch, sequence)`. The overshoot
-    /// ceiling reads the sender epoch floor from the SAME entry (matching the
-    /// provider's H9 receive-side epoch ceiling in `open()`), so both live under
-    /// one `entry()` guard (ADR-049 Decision 13). Same TOCTOU-safety and the same
+    /// ceiling reads the sender epoch floor from the SAME entry — the follower's
+    /// analogue of the provider's H9 receive-side epoch ceiling in `open()`, but
+    /// against THIS follower's own, possibly-lagging `sender_epochs` mirror (which
+    /// only catches up when the Management-arm mirror-forward runs), NOT the
+    /// provider's authoritative epoch. It is therefore NOT exact provider-parity;
+    /// exact parity is a PR-6 concern once the gate becomes fail-closed and
+    /// read-authoritative. Both floors live under one `entry()` guard (ADR-049
+    /// Decision 13). Same TOCTOU-safety and the same
     /// single-writer / security separation as the epoch twin above apply here
     /// verbatim: security is the structural single-guard gate; single-writer is
     /// only a liveness convention.
@@ -336,7 +355,11 @@ impl Supervisor {
     /// # Errors
     ///
     /// Infallible in PR-4 (returns `Ok`); the `Result` matches the provider twin
-    /// so PR-6 can retarget callers without a signature change.
+    /// so PR-6 can retarget callers without a PARAM-LIST change. Parity is only
+    /// PARTIAL, though: the provider twin returns `Result<(), ContextError>`
+    /// while this returns `Result<(), FloorAdvanceError>`, so the PR-6 retarget
+    /// is param-list-churn-free but MUST still reconcile the error type (unify
+    /// `FloorAdvanceError` / `ContextError`).
     #[allow(
         clippy::significant_drop_tightening,
         reason = "the single DashMap entry guard MUST span the whole monotone max-merge (ADR-049 PR-4); early-dropping it breaks the single-guard invariant"
@@ -377,7 +400,11 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Infallible in PR-4 (returns `Ok`); the `Result` matches the provider twin.
+    /// Infallible in PR-4 (returns `Ok`); the `Result` matches the provider twin
+    /// in PARAM-LIST only — same PARTIAL parity as
+    /// [`Self::validate_and_merge_epoch_floors`]: the provider twin returns
+    /// `Result<(), ContextError>` while this returns `Result<(), FloorAdvanceError>`,
+    /// so PR-6's retarget must still reconcile the error type.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "the single DashMap entry guard MUST span the whole monotone max-merge (ADR-049 PR-4); early-dropping it breaks the single-guard invariant"
@@ -424,15 +451,39 @@ impl Supervisor {
         // overwrite an existing (possibly already-advanced) entry.
         self.floors.entry(*ctx).or_default();
     }
+
+    /// Permanent-teardown prune: drop the whole [`ContextFloors`] entry for
+    /// `ctx` (ADR-049 PR-4).
+    ///
+    /// The provider prunes its AUTHORITATIVE per-context floor maps inside
+    /// `destroy_mls_group` (`self.contexts.remove` in `crypto/mls/provider.rs`);
+    /// the follower registry has no such prune, so without this every
+    /// permanently-torn-down context would leak a `ContextFloors` entry (and its
+    /// unbounded per-sender maps). This is the follower twin of that prune,
+    /// called from EVERY genuine permanent-teardown site (explicit
+    /// close → `Closed`, TTL expiry → `Expired`, welcome-join rollback, process
+    /// shutdown) — mirroring exactly where the provider drops its crypto state
+    /// and where `crash_windows` is reaped.
+    ///
+    /// # Safety (why pruning is sound only on PERMANENT teardown)
+    ///
+    /// A later re-create of the SAME deterministic id is a NEW MLS group with
+    /// fresh keys, so the discarded `(epoch, sequence)` / epoch floors are
+    /// cryptographically moot — an old floor cannot gate (or be replayed
+    /// against) the new group's keys. It is therefore CORRECT here but WOULD BE
+    /// UNSOUND on a TRANSIENT destroy where the SAME keys resume (a warm
+    /// respawn / restore, where `restore_crypto_state_with_floor_guard`
+    /// deliberately captures + re-merges the live floors instead of dropping
+    /// them). Callers must only invoke this when the context is permanently gone
+    /// or is being replaced by a fresh group. Idempotent: remove-on-absent is a
+    /// no-op, so a bounded TTL-expiry retry re-entering here is harmless.
+    pub(in crate::context) fn remove_context_floors(&self, ctx: &[u8; 32]) {
+        self.floors.remove(ctx);
+    }
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::significant_drop_tightening
-)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use std::sync::Arc;
     use std::thread;

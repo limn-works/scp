@@ -172,6 +172,23 @@ pub async fn handle_ttl_expiry(
     let terminal_result =
         ttl::apply_ttl_terminal_transition(handle, deps.crypto.as_ref(), prior_completed);
 
+    // Prune the supervisor-owned Class-M floor registry entry (ADR-049 PR-4) on a
+    // GENUINE terminal expiry. Gated on `state_transitioned()` so an aborted /
+    // failed transition (A3 `None`-deadline abort already returned above; a wrong-
+    // state transition failure sets no step and destroys no keys) NEVER prunes a
+    // still-live context's floors. When the transition landed, the context is
+    // terminally `Expired` — restore skips non-`Active` snapshots and B8 refuses
+    // re-create, so it is permanently gone — and `apply_ttl_terminal_transition`
+    // just ran the provider's `destroy_mls_group` floor-map prune (Ephemeral /
+    // Summary scope), so this follower prune mirrors it. Pruned regardless of
+    // memory scope (a terminal context accepts no further inbound). Idempotent: a
+    // bounded expiry RETRY re-enters here and remove-on-absent is a no-op. See
+    // `Supervisor::remove_context_floors` for the permanent-vs-transient safety
+    // argument.
+    if terminal_result.state_transitioned() {
+        deps.supervisor.remove_context_floors(&context_id_bytes);
+    }
+
     // Fold the Class-C participation decay + convergent-deadline clear into the
     // SAME fail-closed snapshot (mirrors `close_context_with_key`). KEEP-
     // direction: a persist failure is surfaced but the FSM is NOT rolled back —
@@ -860,6 +877,20 @@ pub async fn finalize_close(
     // provider was attached; ContextPersistence is always present on
     // ActorDeps so we always issue the delete.
     let _ = deps.persistence.delete_context(&context_id).await;
+
+    // Prune the supervisor-owned Class-M floor registry entry (ADR-049 PR-4):
+    // an explicit close is a PERMANENT teardown — the FSM is terminally `Closed`
+    // (anti-resurrection refuses re-create of a terminal id) and the durable
+    // Class-S snapshot was just deleted — so the follower floors are moot and
+    // must be dropped, mirroring the provider's per-context floor-map prune
+    // inside `destroy_mls_group` (which `ttl::finalize_close` ran above for
+    // Ephemeral/Summary scope) and co-located with the snapshot delete. Pruned
+    // regardless of memory scope: a `Closed` context accepts no further inbound,
+    // so the floors serve no purpose even when Full-scope crypto is retained.
+    // See `Supervisor::remove_context_floors` for the permanent-vs-transient
+    // safety argument.
+    let ctx_id_bytes = context_id_to_bytes(&context_id);
+    deps.supervisor.remove_context_floors(&ctx_id_bytes);
 
     Ok(())
 }

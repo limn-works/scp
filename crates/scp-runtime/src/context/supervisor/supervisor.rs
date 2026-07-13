@@ -4829,6 +4829,14 @@ impl Supervisor {
         if let Some(persistence) = self.persistence_ref() {
             let _ = persistence.delete_context(context_id).await;
         }
+        // 4. Drop the supervisor-owned Class-M floor registry entry (ADR-049
+        //    PR-4) — the follower twin of the provider's per-context floor-map
+        //    prune inside `destroy_mls_group` (step 2). A discarded welcome-join
+        //    is permanently gone (its crypto group + durable snapshot were just
+        //    destroyed), so the floors are moot and pruning is sound; see
+        //    `Supervisor::remove_context_floors` for the full permanent-vs-
+        //    transient safety argument.
+        self.remove_context_floors(&context_id_bytes);
         removed
     }
 
@@ -15232,6 +15240,14 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
+        // ADR-049 PR-4 floor-registry SAFETY gate (F-1): seed a real follower
+        // floor. An ABORTED expiry (params.ttl == None, A3) leaves the context
+        // LIVE (`Active`), so its floors MUST survive — pruning here would drop a
+        // live context's anti-replay floors. This guards the `state_transitioned()`
+        // gate on the prune.
+        sup.check_and_advance_sender_epoch(&ctx_id_bytes, "did:example:floor-sender", 1, u64::MAX)
+            .expect("first sender-epoch advance is accepted");
+
         let outcome =
             crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
                 .await;
@@ -15239,6 +15255,11 @@ mod tests {
         assert!(
             !outcome.result.is_complete(),
             "an aborted expiry is NOT a completed expiry"
+        );
+        assert!(
+            sup.floors.contains_key(&ctx_id_bytes),
+            "an ABORTED expiry leaves the context Active, so its follower floors MUST \
+             survive — the prune is gated on a genuine terminal transition"
         );
         assert_eq!(
             cell.handle.state(),
@@ -15322,9 +15343,26 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
+        // ADR-049 PR-4 floor-registry prune (F-1): seed a real follower floor for
+        // this ctx (Full scope, so finalize destroys NO crypto — this proves the
+        // prune is driven by the terminal close, not by key destruction), assert
+        // it is present, then confirm the explicit close prunes it.
+        sup.check_and_advance_sender_epoch(&ctx_id_bytes, "did:example:floor-sender", 1, u64::MAX)
+            .expect("first sender-epoch advance is accepted");
+        assert!(
+            sup.floors.contains_key(&ctx_id_bytes),
+            "a follower floor entry exists before the explicit close"
+        );
+
         crate::context::ttl_close_helpers::finalize_close(&mut cell, &deps, &handle)
             .await
             .expect("finalize_close on a Closing context succeeds");
+
+        assert!(
+            !sup.floors.contains_key(&ctx_id_bytes),
+            "the explicit close (Closed) prunes the follower floor entry — no leak on \
+             the dominant teardown path, even for Full scope where crypto is retained"
+        );
 
         let closed_ts = entries_handle
             .lock()
@@ -15428,6 +15466,10 @@ mod tests {
     /// the convergent deadline from `creation + ttl` (+ recorded extensions) on
     /// the retry, independent of the cleared field.
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear TTL-expiry retry fixture (setup + two-attempt drive + convergent-timestamp asserts + ADR-049 PR-4 floor-prune asserts); reads clearer unsplit"
+    )]
     async fn retry_stamps_convergent_leaf_timestamp() {
         const T0: u64 = 1_700_000_000;
         const TTL_SECS: u64 = 3_600;
@@ -15500,6 +15542,18 @@ mod tests {
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let handle = cell.handle.clone();
 
+        // ADR-049 PR-4 floor-registry prune (F-1): seed a real follower floor and
+        // assert the TERMINAL TTL expiry drops it. The Phase-1 terminal transition
+        // (`state_transitioned()`) runs on the FIRST attempt even though the leaf
+        // append fails, so the prune lands on `out1` — and the RETRY (`out2`) is a
+        // harmless idempotent no-op (remove-on-absent).
+        sup.check_and_advance_sender_epoch(&ctx_id_bytes, "did:example:floor-sender", 1, u64::MAX)
+            .expect("first sender-epoch advance is accepted");
+        assert!(
+            sup.floors.contains_key(&ctx_id_bytes),
+            "a follower floor entry exists before the terminal TTL expiry"
+        );
+
         // First attempt: append FAILS ⇒ incomplete. Phase 1 clears the recorded
         // deadline.
         let out1 =
@@ -15509,6 +15563,11 @@ mod tests {
             !out1.result.is_complete(),
             "first attempt's append must fail (forcing a retry): {}",
             out1.result
+        );
+        assert!(
+            !sup.floors.contains_key(&ctx_id_bytes),
+            "the terminal TTL transition (Expired) prunes the follower floor entry — no \
+             leak on the TTL-expiry teardown path"
         );
         assert_eq!(
             cell.ttl.timer.deadline_unix_secs, None,

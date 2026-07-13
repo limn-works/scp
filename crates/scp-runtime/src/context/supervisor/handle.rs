@@ -84,7 +84,7 @@ impl SupervisorHandle {
     // -----------------------------------------------------------------------
     // ADR-049 PR-4 — supervisor-owned floor registry (epoch side) fan-out.
     //
-    // These six accessors are PER-CONTEXT (they take `&[u8; 32]`, NOT
+    // These eight accessors are PER-CONTEXT (they take `&[u8; 32]`, NOT
     // `&OwnedIdentityDid` and NOT `&DID`): they are registry fan-out, which the
     // AXIS comment above explicitly exempts from the per-identity token rule.
     // They forward to the same-named `Supervisor` primitives on
@@ -217,6 +217,14 @@ impl SupervisorHandle {
     /// [`Supervisor::seed_context_floors`].
     pub(in crate::context) fn seed_context_floors(&self, ctx: &[u8; 32]) {
         self.supervisor.seed_context_floors(ctx);
+    }
+
+    /// Permanent-teardown prune of the floor registry entry for `ctx`. See
+    /// [`Supervisor::remove_context_floors`] — including the permanent-vs-
+    /// transient safety argument. Callers (the terminal close / TTL-expiry /
+    /// shutdown paths) invoke this only when the context is permanently gone.
+    pub(in crate::context) fn remove_context_floors(&self, ctx: &[u8; 32]) {
+        self.supervisor.remove_context_floors(ctx);
     }
 
     /// Start a cross-context saga. The ONLY way for an actor to affect
