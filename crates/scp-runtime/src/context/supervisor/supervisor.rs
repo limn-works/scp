@@ -5102,7 +5102,15 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
+            // `RefundHardRateLimit` and `ReleaseStreamCaveatCounter` share the
+            // `oneshot::Sender<Result<(), ContextError>>` reply shape and the
+            // identical not-registered response, so they collapse into one arm
+            // (the reserve variants below each carry a distinct reply type and
+            // stay separate).
             OutletsCommand::RefundHardRateLimit {
+                context_id, reply, ..
+            }
+            | OutletsCommand::ReleaseStreamCaveatCounter {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
@@ -5121,6 +5129,16 @@ impl Supervisor {
             OutletsCommand::ReserveOutletStreamEconomy {
                 context_id, reply, ..
             } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            OutletsCommand::ReserveStreamCaveatCounter {
+                context_id, reply, ..
+            } => {
+                // Outer `Result` = infra outcome — a missing actor is an
+                // infrastructure failure, not an admission decision.
                 let err = ContextError::ContextNotRegistered(context_id);
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
@@ -12847,6 +12865,8 @@ impl Supervisor {
             | OutletsCommand::RefundHardRateLimit { context_id, .. }
             | OutletsCommand::ReserveOutletEconomy { context_id, .. }
             | OutletsCommand::ReserveOutletStreamEconomy { context_id, .. }
+            | OutletsCommand::ReserveStreamCaveatCounter { context_id, .. }
+            | OutletsCommand::ReleaseStreamCaveatCounter { context_id, .. }
             | OutletsCommand::SettleOutletEconomy { context_id, .. } => context_id.as_str(),
         }
     }

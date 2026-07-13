@@ -2282,6 +2282,65 @@ pub enum OutletsCommand {
             Result<Box<crate::context::outlets_helpers::StreamEconomyReservation>, ContextError>,
         >,
     },
+
+    /// Off-mailbox streaming §7.3.8 value-caveat counter reservation on
+    /// actor-owned Class-S state — the streaming-pump counterpart of the
+    /// unary `consume_caveat_counters` gate. The stream pump runs
+    /// supervisor-side (it holds no `&mut` to actor-owned state) and routes
+    /// its open-time per-kind `check_and_increment` back through this command
+    /// via [`crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter`].
+    ///
+    /// The handler runs [`crate::trust::CaveatCounters::try_consume`] against
+    /// the owned `ClassSState.caveat_counters` record keyed by `ucan_cid`. An
+    /// ADMITTED consume rides a fail-closed `commit_class_s_keep` (durable via
+    /// the ADR-049 §9 snapshot); an EXHAUSTED consume mutates nothing and does
+    /// NOT persist. The reply's outer `Result` carries the persist / transport
+    /// infrastructure outcome; the inner `Result` carries the structured
+    /// [`crate::trust::CounterExhausted`] so the pump maps the precise §7.3.8
+    /// slug (`maxCalls` / `amountMaxCumulative` / `rateWindow`).
+    ReserveStreamCaveatCounter {
+        /// Context identifier string.
+        context_id: String,
+        /// The delegation CID keying the per-UCAN counter record.
+        ucan_cid: String,
+        /// Which §7.3.8 counter kind to consume.
+        kind: scp_protocol::trust::CaveatKind,
+        /// Amount to consume (per-kind semantics — ignored for `MaxCalls` /
+        /// `RateWindow`, added to the cumulative used for `AmountCumulative`).
+        amount: u64,
+        /// The counter's cap.
+        cap: u64,
+        /// Sliding-window length in seconds (`RateWindow` only; `0` otherwise).
+        window_secs: u32,
+        /// Current Unix time in seconds — the supervisor-side adapter sources
+        /// this from the injected clock, keeping the handler deterministic.
+        now_secs: u64,
+        /// Oneshot reply: outer `Result` = persist/transport infra outcome;
+        /// inner `Result` = the structured admission decision.
+        reply: oneshot::Sender<Result<Result<(), crate::trust::CounterExhausted>, ContextError>>,
+    },
+
+    /// Off-mailbox streaming §7.3.8 value-caveat counter RELEASE on actor-owned
+    /// Class-S state — returns the unspent portion of a stream's open-time
+    /// reservation to the counter at close-time settlement (SCP R4 HIGH-1), or
+    /// rolls back an earlier-kind increment when a later kind rejects the open.
+    ///
+    /// The handler runs [`crate::trust::CaveatCounters::release`] (infallible /
+    /// saturating at `0`) against the owned record keyed by `ucan_cid` under a
+    /// fail-closed `commit_class_s_keep`. The reply carries only the persist /
+    /// transport infrastructure outcome — release itself never rejects.
+    ReleaseStreamCaveatCounter {
+        /// Context identifier string.
+        context_id: String,
+        /// The delegation CID keying the per-UCAN counter record.
+        ucan_cid: String,
+        /// Which §7.3.8 counter kind to release.
+        kind: scp_protocol::trust::CaveatKind,
+        /// Amount to return to the counter (saturating at `0`).
+        amount: u64,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 /// See [`ContextCommand::Queries`]. Pure-read variants — handlers MUST

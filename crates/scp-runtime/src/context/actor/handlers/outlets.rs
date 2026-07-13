@@ -46,6 +46,11 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch a [`OutletsCommand`] against actor-owned state and
 /// capability-reduced dependencies.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat command-dispatch match — one arm per OutletsCommand variant; \
+              splitting it would obscure the 1:1 variant→handler routing"
+)]
 pub(crate) async fn dispatch(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -110,6 +115,48 @@ pub(crate) async fn dispatch(
                 estimated_chunk_count,
                 max_per_action,
                 now_secs,
+                reply,
+            )
+            .await
+        }
+        OutletsCommand::ReserveStreamCaveatCounter {
+            context_id,
+            ucan_cid,
+            kind,
+            amount,
+            cap,
+            window_secs,
+            now_secs,
+            reply,
+        } => {
+            handle_reserve_stream_caveat_counter(
+                cell,
+                deps,
+                &context_id,
+                &ucan_cid,
+                kind,
+                amount,
+                cap,
+                window_secs,
+                now_secs,
+                reply,
+            )
+            .await
+        }
+        OutletsCommand::ReleaseStreamCaveatCounter {
+            context_id,
+            ucan_cid,
+            kind,
+            amount,
+            reply,
+        } => {
+            handle_release_stream_caveat_counter(
+                cell,
+                deps,
+                &context_id,
+                &ucan_cid,
+                kind,
+                amount,
                 reply,
             )
             .await
@@ -294,6 +341,140 @@ async fn handle_reserve_outlet_stream_economy(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "reserve_outlet_stream_economy exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`OutletsCommand::ReserveStreamCaveatCounter`] — the off-mailbox
+/// streaming §7.3.8 value-caveat counter reservation.
+///
+/// Mirrors the unary `consume_caveat_counters` gate for ONE counter kind, but
+/// split across the mailbox: the supervisor-side stream pump cannot take `&mut`
+/// to actor-owned Class-S state, so its per-kind
+/// [`CaveatCounters::try_consume`](crate::trust::CaveatCounters::try_consume)
+/// runs here on the owned record keyed by `ucan_cid`.
+///
+/// The admission check runs on a CLONE first, so a rejection mutates nothing
+/// and performs NO persist (mirroring the unary "reject before persist"
+/// semantics — and avoiding a spurious durable write on a rate-limited open).
+/// Only an ADMITTED consume writes the mutated record back under a fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// (durable via the ADR-049 §9 snapshot). The structured
+/// [`CounterExhausted`](crate::trust::CounterExhausted) is threaded through the
+/// reply's inner `Result` so the pump can map the precise §7.3.8 slug; the
+/// outer `Result` carries only persist / transport infrastructure failures.
+#[allow(clippy::too_many_arguments)]
+async fn handle_reserve_stream_caveat_counter(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    ucan_cid: &str,
+    kind: scp_protocol::trust::CaveatKind,
+    amount: u64,
+    cap: u64,
+    window_secs: u32,
+    now_secs: u64,
+    reply: oneshot::Sender<Result<Result<(), crate::trust::CounterExhausted>, ContextError>>,
+) -> Outcome<()> {
+    // Phase 1 — pure admission on a clone. `try_consume` leaves the record
+    // unchanged on exhaustion; consuming a clone means a rejection touches no
+    // owned state and triggers no persist.
+    let mut record = cell
+        .class_s
+        .caveat_counters
+        .get(ucan_cid)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Err(exhausted) = record.try_consume(kind, amount, cap, window_secs, now_secs) {
+        // Rejected: owned state untouched, nothing to persist.
+        let _ = reply.send(Ok(Err(exhausted)));
+        return Outcome::ok(());
+    }
+
+    // Phase 2 — ADMITTED: write the mutated record back under a fail-closed
+    // persist. A consumed cap must never un-consume, so `commit_class_s_keep`
+    // (KEEP-on-persist-failure) is the correct combinator: the reservation is
+    // kept in memory even if the durable write fails, and the persist error is
+    // surfaced to the caller.
+    let ucan_cid_owned = ucan_cid.to_owned();
+    let commit_fut = cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        view.rest_mut()
+            .class_s
+            .caveat_counters
+            .insert(ucan_cid_owned, record);
+        Ok(())
+    });
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, commit_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(Ok(()))),
+        Ok(Err(err)) => {
+            // The in-memory record IS mutated (KEEP semantics) even though the
+            // persist failed — flag mutated so the actor's coalesced persist
+            // retries the write.
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reserve_stream_caveat_counter exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`OutletsCommand::ReleaseStreamCaveatCounter`] — the off-mailbox
+/// streaming §7.3.8 counter RELEASE.
+///
+/// Returns the unspent portion of a stream's open-time reservation (SCP R4
+/// HIGH-1), or rolls back an earlier-kind increment when a later kind rejects
+/// the open. Runs [`CaveatCounters::release`](crate::trust::CaveatCounters::release)
+/// — infallible / saturating at `0` — on the owned record keyed by `ucan_cid`
+/// under a fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep),
+/// so the returned capacity survives a coalesce-window crash the same way the
+/// original consume does. Release itself never rejects; the reply carries only
+/// the persist / transport infrastructure outcome.
+async fn handle_release_stream_caveat_counter(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    ucan_cid: &str,
+    kind: scp_protocol::trust::CaveatKind,
+    amount: u64,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let ucan_cid_owned = ucan_cid.to_owned();
+    let commit_fut = cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        view.rest_mut()
+            .class_s
+            .caveat_counters
+            .entry(ucan_cid_owned)
+            .or_default()
+            .release(kind, amount);
+        Ok(())
+    });
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, commit_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "release_stream_caveat_counter exceeded {HANDLER_TIMEOUT:?} budget"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
