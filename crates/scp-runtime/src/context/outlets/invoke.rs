@@ -3215,7 +3215,8 @@ impl InnerPumpSigningContext {
 /// caveat violation, output schema) surfaces as a terminal
 /// `ChunkPayload::Error` chunk on the receiver — never as a `Result`
 /// error.
-#[allow(clippy::too_many_arguments)] // mirrors invoke_outlet_aggregating's parameter set so the streaming/aggregating split is interchangeable for callers that hold the same surrounding state.
+#[allow(clippy::too_many_arguments)]
+// mirrors invoke_outlet_aggregating's parameter set so the streaming/aggregating split is interchangeable for callers that hold the same surrounding state.
 #[allow(clippy::unused_async)] // public streaming entry point: async for API parity with invoke_outlet_aggregating and the manager wrapper; the body only awaits on this branch when `context.state()` is async (it is sync here, so no await is emitted).
 pub async fn invoke_outlet<E>(
     context: &ContextHandle,
@@ -5120,6 +5121,277 @@ mod tests {
         assert!(
             matches!(result, Err(super::InvocationError::BudgetExceeded { .. })),
             "should return BudgetExceeded when budget is insufficient, got: {result:?}"
+        );
+    }
+
+    // =======================================================================
+    // Streaming entry point (SCP-OUT-033 / §5.4.5): the executor-based
+    // `invoke_outlet<E>` machinery ported in chunk 2a.
+    // =======================================================================
+
+    /// Drains a `mpsc::Receiver<OutletStreamChunk>` into a `Vec` until
+    /// EOS, asserting that sequence numbers are strictly monotonic
+    /// starting at `0` (PRD AC4).
+    async fn drain_stream_with_sequence_invariant(
+        mut rx: tokio::sync::mpsc::Receiver<OutletStreamChunk>,
+    ) -> Vec<OutletStreamChunk> {
+        let mut chunks = Vec::new();
+        let mut expected_seq: u64 = 0;
+        while let Some(chunk) = rx.recv().await {
+            assert_eq!(
+                chunk.sequence, expected_seq,
+                "sequence must be strictly monotonic per request_id (PRD AC4)"
+            );
+            expected_seq = expected_seq.saturating_add(1);
+            chunks.push(chunk);
+        }
+        chunks
+    }
+
+    /// A [`HandlerPanicSink`] that forwards each event over an unbounded
+    /// channel — a Mutex-free capture surface for tests (the reference's
+    /// `InMemoryHandlerPanicSink` is intentionally not on this branch; it
+    /// backs its Vec with `std::sync::Mutex`, banned in scp-runtime).
+    struct ChannelPanicSink {
+        tx: tokio::sync::mpsc::UnboundedSender<scp_protocol::context::outlets::OutletVerifiedEvent>,
+    }
+
+    impl super::HandlerPanicSink for ChannelPanicSink {
+        fn record(&self, event: scp_protocol::context::outlets::OutletVerifiedEvent) {
+            let _ = self.tx.send(event);
+        }
+    }
+
+    /// AC8 — a single-value executor produces a two-chunk stream ending in
+    /// `End`. The default `OutletExecutor::exec_action_stream` impl
+    /// delegates to `exec_action`, pushes the returned `Value` as one
+    /// `Data` chunk, and the framework appends `End`.
+    #[tokio::test]
+    async fn invoke_outlet_single_value_executor_produces_two_chunk_stream_ending_in_end() {
+        struct AddExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for AddExecutor {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                let a = input["a"].as_f64().unwrap_or(0.0);
+                let b = input["b"].as_f64().unwrap_or(0.0);
+                Ok(serde_json::json!({ "result": a + b }))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> = std::sync::Arc::new(AddExecutor);
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 3, "b": 4}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            None,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        assert_eq!(
+            chunks.len(),
+            2,
+            "single-value executor must produce exactly 2 chunks (Data + End); got {chunks:?}"
+        );
+        match &chunks[0].payload {
+            ChunkPayload::Data { value } => {
+                assert_eq!(*value, serde_json::json!({"result": 7.0}));
+            }
+            other => panic!("expected first chunk = Data, got {other:?}"),
+        }
+        assert!(
+            matches!(chunks[1].payload, ChunkPayload::End { .. }),
+            "expected second chunk = End, got {:?}",
+            chunks[1].payload
+        );
+        // PRD AC4: both chunks share the same request_id.
+        assert_eq!(chunks[0].request_id, chunks[1].request_id);
+    }
+
+    /// AC9 — a streaming executor produces multiple `Data` chunks followed
+    /// by a single terminal `End`. The executor overrides
+    /// `exec_action_stream` directly and writes three `Data` chunks into
+    /// the framework-provided `tx` before returning.
+    #[tokio::test]
+    async fn invoke_outlet_streaming_executor_produces_data_chunks_then_end() {
+        struct StreamingExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for StreamingExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..3u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(StreamingExecutor);
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            None,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        assert_eq!(
+            chunks.len(),
+            4,
+            "streaming executor must produce 3 Data + 1 End = 4 chunks; got {chunks:?}"
+        );
+        for (i, chunk) in chunks.iter().enumerate().take(3) {
+            match &chunk.payload {
+                ChunkPayload::Data { value } => {
+                    let expected = u32::try_from(i).expect("3 chunks fit in u32");
+                    assert_eq!(value["tick"], serde_json::json!(expected));
+                }
+                other => panic!("chunk[{i}] expected Data, got {other:?}"),
+            }
+        }
+        assert!(
+            matches!(chunks[3].payload, ChunkPayload::End { .. }),
+            "chunk[3] must be End, got {:?}",
+            chunks[3].payload
+        );
+    }
+
+    /// AC10 — a panicking executor produces a single terminal `Error` chunk
+    /// with code `SCP-TOOL-6130` (`CODE_EXECUTION_FAULT`), `terminal: true`,
+    /// and emits the §5.4.2 `OutletVerified` `HandlerPanicked` signal through
+    /// the panic sink.
+    #[tokio::test]
+    async fn invoke_outlet_panicking_executor_produces_terminal_error_chunk() {
+        struct PanickingExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for PanickingExecutor {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                panic!("operator-side defect");
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(PanickingExecutor);
+        let (tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let panic_sink_dyn: std::sync::Arc<dyn super::HandlerPanicSink> =
+            std::sync::Arc::new(ChannelPanicSink { tx });
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            Some(panic_sink_dyn),
+            None,
+            None,
+            [0u8; 32],
+        )
+        .await
+        .expect("synchronous validation must pass before the panic fires");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "panicking executor produces exactly one terminal Error chunk; got {chunks:?}"
+        );
+        match &chunks[0].payload {
+            ChunkPayload::Error {
+                code,
+                terminal,
+                message,
+            } => {
+                assert_eq!(
+                    code, CODE_EXECUTION_FAULT,
+                    "code must be SCP-TOOL-6130 (CODE_EXECUTION_FAULT)"
+                );
+                assert!(*terminal, "terminal must be true (PRD AC6)");
+                assert!(
+                    message.contains("operator-side defect"),
+                    "panic payload must surface in the chunk message; got {message}"
+                );
+            }
+            other => panic!("expected terminal Error chunk, got {other:?}"),
+        }
+
+        // SCP-OUT-028 parallel-signal observability: exactly one
+        // HandlerPanicked OutletVerified event emitted.
+        let mut events = Vec::new();
+        while let Ok(ev) = sink_rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one HandlerPanicked OutletVerified event emitted"
+        );
+        assert!(!events[0].integrity_ok);
+        assert_eq!(
+            events[0].reason,
+            Some(scp_protocol::context::outlets::OutletVerifiedReason::HandlerPanicked)
         );
     }
 }
