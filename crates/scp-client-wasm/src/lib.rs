@@ -617,6 +617,133 @@ impl WasmScpClient {
     // live state simply by being built over the same storage.
 }
 
+// ---------------------------------------------------------------------------
+// §5.4.5 outlet-streaming pure wrappers (browser invoker "signs/verifies its
+// own steps" — ADR-057 scope fence)
+// ---------------------------------------------------------------------------
+//
+// These two are the ONLY outlet-streaming operations the browser can host. They
+// are stateless `scp-protocol` predicates — no client state, no `scp-runtime`,
+// no stream pump — so they live here as free `#[wasm_bindgen]` functions (like
+// [`scp_version`]), mirroring the canonical `outlet_stream_verify_chunk_signature`
+// / `outlet_stream_compute_caveats_binding` ops the native bridges expose.
+//
+// # Why only these two (and not open / poll / grant / cancel / terminate)
+//
+// The runtime-backed control plane (`Supervisor::open_outlet_stream`, the
+// `StreamSessionHandle` pump, escrow, and credit accounting) is `scp-runtime`
+// machinery — tokio-multi-thread, and NOT wasm-hostable (ADR-034). The ADR-057
+// scope fence (§"Scope fence (mandatory)") puts economy COORDINATION node-side
+// by construction and enforces it MECHANICALLY: `scp-client` / this crate must
+// not depend on `scp-runtime`, so the pump is unreachable here by the dependency
+// graph, not by prose. The browser is a *participant* that "signs its own steps"
+// but does not *coordinate*. A browser INVOKER of a node-hosted stream therefore
+// (a) computes the `caveats_binding` it commits into its open-request UCAN
+// ([`outlet_stream_compute_caveats_binding`]) and (b) verifies each chunk it
+// receives was signed by the outlet operator ([`outlet_stream_verify_chunk_signature`])
+// — both pure. The transport that carries the open-request to the hosting node
+// and the operator's chunks back is out of this crate's scope today (it is the
+// remote-invoker / cross-context transport slice; `scp-client` has no outlet
+// invocation surface yet), the same out-of-band-seam shape the sender-key
+// hand-off above already uses.
+
+/// Computes the §5.4.5 `caveats_binding` (pure; mirrors
+/// `outlet_stream_compute_caveats_binding`). Returns the 32-byte binding as a
+/// `Uint8Array`.
+///
+/// A browser invoker binds this value into its outlet-stream open request so the
+/// hosting node can pin the exact UCAN caveats the stream was authorized under.
+/// It is a deterministic SHA-256 over `(ucan_cid, request_id, invoker_did,
+/// estimated_chunk_count, effective_caveats_jcs)` — see
+/// [`scp_protocol::context::outlets::stream::compute_caveats_binding`].
+///
+/// `effectiveCaveatsJcs` MUST be the RFC 8785 JCS canonical encoding of the
+/// post-narrowing `InvocationCaveats` (§7.3.8), with `None` fields OMITTED (not
+/// serialized as `null`) per the §5.4.5 JCS Option rule. This function consumes
+/// those bytes as produced; it does not canonicalize.
+///
+/// # Errors
+///
+/// Throws `[SCP-VALID-7010]` if `requestId` is not exactly 16 bytes.
+#[wasm_bindgen(js_name = "outletStreamComputeCaveatsBinding")]
+pub fn outlet_stream_compute_caveats_binding(
+    ucan_cid: Vec<u8>,
+    request_id: Vec<u8>,
+    invoker_did: String,
+    estimated_chunk_count: u32,
+    effective_caveats_jcs: Vec<u8>,
+) -> Result<Vec<u8>, JsValue> {
+    use scp_protocol::context::outlets::stream::compute_caveats_binding;
+    let request_id = <[u8; 16]>::try_from(request_id.as_slice())
+        .map_err(|_| JsValue::from_str("[SCP-VALID-7010] request_id must be 16 bytes"))?;
+    let binding = compute_caveats_binding(
+        &ucan_cid,
+        &request_id,
+        &invoker_did,
+        estimated_chunk_count,
+        &effective_caveats_jcs,
+    );
+    Ok(binding.to_vec())
+}
+
+/// Verifies an outlet-stream chunk's operator signature (pure; mirrors
+/// `outlet_stream_verify_chunk_signature`).
+///
+/// This is a browser invoker's chunk-acceptance step: a remote invoker that
+/// receives §5.4.5 stream chunks over transport verifies each was signed by the
+/// outlet OPERATOR for this stream before acting on it. Delegates to
+/// [`scp_protocol::context::outlets::stream::verify_chunk_signature`], whose
+/// preimage binds `(context_id, outlet_id, chunk.request_id, chunk.sequence,
+/// caveats_binding, chunk.payload)`.
+///
+/// `chunk` is the JSON-serialized [`OutletStreamChunk`] (the same wire encoding
+/// the NAPI bridge accepts, so the TS SDK produces/consumes ONE chunk form
+/// across bindings). `operatorPk` and `caveatsBinding` are 32-byte values.
+///
+/// Returns `true` iff the signature is valid; a valid chunk that fails
+/// verification (wrong key, tampered payload) returns `false` — that is a
+/// verification RESULT, not an error.
+///
+/// # Errors
+///
+/// Throws `[SCP-VALID-7010]` on malformed INPUT — a chunk that will not
+/// deserialize, an `operatorPk` that is not 32 bytes or not a valid Ed25519
+/// point, or a `caveatsBinding` that is not 32 bytes. These are distinct from a
+/// `false` return so a caller can tell "I was handed garbage" from "this chunk
+/// is not from the operator".
+#[wasm_bindgen(js_name = "outletStreamVerifyChunkSignature")]
+pub fn outlet_stream_verify_chunk_signature(
+    chunk: Vec<u8>,
+    operator_pk: Vec<u8>,
+    context_id: String,
+    outlet_id: String,
+    caveats_binding: Vec<u8>,
+) -> Result<bool, JsValue> {
+    use scp_protocol::context::outlets::stream::{OutletStreamChunk, verify_chunk_signature};
+    let chunk: OutletStreamChunk = serde_json::from_slice(&chunk).map_err(|e| {
+        JsValue::from_str(&format!(
+            "[SCP-VALID-7010] invalid OutletStreamChunk bytes: {e}"
+        ))
+    })?;
+    let pk_bytes = <[u8; 32]>::try_from(operator_pk.as_slice())
+        .map_err(|_| JsValue::from_str("[SCP-VALID-7010] operator_pk must be 32 bytes"))?;
+    let operator_verifying_key =
+        ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).map_err(|e| {
+            JsValue::from_str(&format!(
+                "[SCP-VALID-7010] operator_pk is not a valid key: {e}"
+            ))
+        })?;
+    let binding = <[u8; 32]>::try_from(caveats_binding.as_slice())
+        .map_err(|_| JsValue::from_str("[SCP-VALID-7010] caveats_binding must be 32 bytes"))?;
+    Ok(verify_chunk_signature(
+        &chunk,
+        &operator_verifying_key,
+        &context_id,
+        &outlet_id,
+        &binding,
+    ))
+}
+
 /// Serializes the adder's event-log stream for transport to the joiner.
 ///
 /// `scp_event_log::Event` is `serde`; the joiner deserializes the identical
@@ -648,5 +775,229 @@ fn event_kind(event: &scp_protocol::context::membership::ContextEvent) -> &'stat
         ContextEvent::MemberJoined { .. } => "MemberJoined",
         ContextEvent::MemberLeft { .. } => "MemberLeft",
         _ => "Other",
+    }
+}
+
+// Native-host tests: the HAPPY path of the two §5.4.5 pure wrappers. These
+// exercise only the `Ok(...)` arms, which never construct a `JsValue` — so they
+// run on the native host, where wasm-bindgen imported calls (`JsValue::from_str`)
+// abort. The `Err(JsValue)` (bad-input) arms cannot run natively and are covered
+// by the wasm-target tests below. This mirrors the split in `crate::error`.
+#[cfg(test)]
+mod pure_wrapper_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use scp_protocol::context::outlets::stream::{
+        ChunkPayload, OutletStreamChunk, compute_caveats_binding, sign_chunk,
+    };
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    use super::*;
+
+    /// `outletStreamComputeCaveatsBinding` produces the 32-byte binding that the
+    /// core `compute_caveats_binding` helper produces for the same inputs — the
+    /// wasm wrapper adds nothing but the byte translation.
+    #[test]
+    fn compute_caveats_binding_matches_core_helper() {
+        let caveats_jcs = InvocationCaveats::empty()
+            .to_canonical_json_bytes()
+            .unwrap();
+        let request_id = [7u8; 16];
+
+        let got = outlet_stream_compute_caveats_binding(
+            b"cid-abc".to_vec(),
+            request_id.to_vec(),
+            "did:dht:zInvoker".to_owned(),
+            3,
+            caveats_jcs.clone(),
+        )
+        .expect("valid inputs produce a binding");
+        assert_eq!(got.len(), 32, "caveats binding is 32 bytes");
+
+        let expected =
+            compute_caveats_binding(b"cid-abc", &request_id, "did:dht:zInvoker", 3, &caveats_jcs);
+        assert_eq!(
+            got.as_slice(),
+            expected.as_slice(),
+            "the wrapper matches the core helper byte-for-byte"
+        );
+    }
+
+    /// `outletStreamVerifyChunkSignature` accepts a chunk signed under the
+    /// matching operator key (`true`) and rejects one checked against a different
+    /// key (`false`) — fail-closed. Both are `Ok(...)` results (no `JsValue`), so
+    /// this runs natively.
+    #[test]
+    fn verify_chunk_signature_accepts_matching_key_rejects_other() {
+        let caveats_jcs = InvocationCaveats::empty()
+            .to_canonical_json_bytes()
+            .unwrap();
+        let request_id = [7u8; 16];
+        let binding =
+            compute_caveats_binding(b"cid-abc", &request_id, "did:dht:zInvoker", 3, &caveats_jcs);
+
+        let operator = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let payload = ChunkPayload::Data {
+            value: serde_json::json!({ "sum": 3 }),
+        };
+        let sig = sign_chunk(
+            &operator,
+            "ctx-1",
+            "outlet-1",
+            &request_id,
+            0,
+            &binding,
+            &payload,
+        )
+        .unwrap();
+        let chunk = OutletStreamChunk {
+            request_id,
+            sequence: 0,
+            payload,
+            sig,
+        };
+        let chunk_bytes = serde_json::to_vec(&chunk).unwrap();
+
+        assert!(
+            outlet_stream_verify_chunk_signature(
+                chunk_bytes.clone(),
+                operator.verifying_key().as_bytes().to_vec(),
+                "ctx-1".to_owned(),
+                "outlet-1".to_owned(),
+                binding.to_vec(),
+            )
+            .expect("well-formed inputs verify without error"),
+            "accepts a chunk signed under the matching operator key"
+        );
+
+        let other = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        assert!(
+            !outlet_stream_verify_chunk_signature(
+                chunk_bytes,
+                other.verifying_key().as_bytes().to_vec(),
+                "ctx-1".to_owned(),
+                "outlet-1".to_owned(),
+                binding.to_vec(),
+            )
+            .expect("a wrong-key check is a `false` RESULT, not an error"),
+            "rejects a chunk checked against a different operator key"
+        );
+    }
+}
+
+// wasm-target tests: the `Err(JsValue)` (malformed-input) arms of the two pure
+// wrappers, which construct a `JsValue` and so cannot run on the native host.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod pure_wrapper_wasm_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    fn err_message(err: JsValue) -> String {
+        err.as_string().unwrap_or_default()
+    }
+
+    /// A `request_id` that is not 16 bytes fails closed as `[SCP-VALID-7010]`.
+    #[wasm_bindgen_test]
+    fn compute_caveats_binding_rejects_wrong_request_id_len() {
+        let err = outlet_stream_compute_caveats_binding(
+            b"cid".to_vec(),
+            vec![0u8; 8],
+            "did:dht:zX".to_owned(),
+            1,
+            b"{}".to_vec(),
+        )
+        .expect_err("an 8-byte request_id must be rejected");
+        let msg = err_message(err);
+        assert!(
+            msg.contains("[SCP-VALID-7010]") && msg.contains("request_id must be 16 bytes"),
+            "wrong-length request_id fails closed: {msg}"
+        );
+    }
+
+    /// Malformed chunk bytes, a wrong-length operator key, and a wrong-length
+    /// caveats binding each fail closed as `[SCP-VALID-7010]` — distinct from the
+    /// `false` a well-formed-but-unauthentic chunk returns.
+    #[wasm_bindgen_test]
+    fn verify_chunk_signature_rejects_malformed_inputs() {
+        use scp_protocol::context::outlets::stream::{
+            ChunkPayload, OutletStreamChunk, compute_caveats_binding, sign_chunk,
+        };
+        use scp_protocol::trust::caveats::InvocationCaveats;
+
+        // Unparseable chunk JSON.
+        let err = outlet_stream_verify_chunk_signature(
+            b"not json".to_vec(),
+            vec![0u8; 32],
+            "ctx-1".to_owned(),
+            "outlet-1".to_owned(),
+            vec![0u8; 32],
+        )
+        .expect_err("garbage chunk bytes are rejected");
+        assert!(
+            err_message(err).contains("[SCP-VALID-7010]"),
+            "unparseable chunk fails closed"
+        );
+
+        // A REAL, round-trippable chunk (built via `sign_chunk`, not hand-authored
+        // JSON) so parsing succeeds and the code reaches the key/binding length
+        // guards under test.
+        let caveats_jcs = InvocationCaveats::empty()
+            .to_canonical_json_bytes()
+            .unwrap_or_default();
+        let request_id = [7u8; 16];
+        let binding = compute_caveats_binding(b"cid", &request_id, "did:dht:zX", 1, &caveats_jcs);
+        let operator = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let payload = ChunkPayload::Data {
+            value: serde_json::json!({ "sum": 3 }),
+        };
+        let sig = sign_chunk(
+            &operator,
+            "ctx-1",
+            "outlet-1",
+            &request_id,
+            0,
+            &binding,
+            &payload,
+        )
+        .expect("sign a well-formed chunk");
+        let chunk_bytes = serde_json::to_vec(&OutletStreamChunk {
+            request_id,
+            sequence: 0,
+            payload,
+            sig,
+        })
+        .expect("serialize the chunk");
+
+        // Wrong-length operator key.
+        let err = outlet_stream_verify_chunk_signature(
+            chunk_bytes.clone(),
+            vec![0u8; 31],
+            "ctx-1".to_owned(),
+            "outlet-1".to_owned(),
+            binding.to_vec(),
+        )
+        .expect_err("a 31-byte operator key is rejected");
+        assert!(
+            err_message(err).contains("operator_pk must be 32 bytes"),
+            "wrong-length operator key fails closed"
+        );
+
+        // Wrong-length caveats binding.
+        let err = outlet_stream_verify_chunk_signature(
+            chunk_bytes,
+            operator.verifying_key().as_bytes().to_vec(),
+            "ctx-1".to_owned(),
+            "outlet-1".to_owned(),
+            vec![0u8; 31],
+        )
+        .expect_err("a 31-byte caveats binding is rejected");
+        assert!(
+            err_message(err).contains("caveats_binding must be 32 bytes"),
+            "wrong-length caveats binding fails closed"
+        );
     }
 }
