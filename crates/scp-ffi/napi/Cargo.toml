@@ -18,6 +18,13 @@ server = ["scp-ffi-common/server", "dep:scp-node"]
 # Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
 # be enabled in production builds; the parity harness (ADR-046) enables it.
 testing = ["scp-core/testing"]
+# §5.4.5 live-stream outlet test authorization seam
+# (`Supervisor::test_grant_member_capability`). An AUTHORITY-ESCALATION
+# primitive, so it is a DEDICATED leaf feature — deliberately NOT implied by
+# `testing` (which leaks into every `allow_in_memory_custody` build) — mirroring
+# scp-ffi's `outlet-capability-test-grant`. Enabled ONLY by the outlet-stream
+# live-flow test lane. See scp-runtime/Cargo.toml and SCP-OUT-037 (C8a).
+outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
 napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt", "async", "error_anyhow"] }

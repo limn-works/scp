@@ -69,7 +69,14 @@ export { Context } from "./context";
 // Outlets
 // ---------------------------------------------------------------------------
 
-export { defineOutletDefinition } from "./outlets";
+export type { Aggregate, InvokeOptions } from "./outlets";
+export {
+  Credit,
+  defineOutletDefinition,
+  InvocationHandle,
+  OutletStreamChunk,
+  Outlets,
+} from "./outlets";
 
 // ---------------------------------------------------------------------------
 // Trust — types only (entry points moved to SCP)
@@ -216,16 +223,20 @@ export {
   EconomyError,
   GovernanceError,
   IdentityError,
+  InvalidGrant,
   McpError,
   mapBridgeError,
   mapSagaError,
   OutletError,
   PermissionError,
+  ProtocolError,
   SagaAbortedError,
   SagaBusyError,
   SagaNeedsRepairError,
   ScpError,
   StorageError,
+  StreamAlreadyClosed,
+  StreamGap,
   TransportError,
   UcanPermissionError,
   ValidationError,

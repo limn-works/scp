@@ -43,6 +43,19 @@ scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 # the joiner can replay an identical sequence across the JS boundary.
 rmp-serde = { workspace = true }
 
+# JSON is the §5.4.5 outlet-stream chunk wire form the native bridges already
+# use for the `OutletStreamChunk` FFI parameter; the pure `verify_chunk_signature`
+# wrapper deserializes the same JSON bytes so the TS SDK sees ONE cross-binding
+# chunk encoding (NAPI + WASM identical). Pure Rust, wasm-safe.
+serde_json = { workspace = true }
+
+# The pure `verify_chunk_signature` wrapper reconstructs the outlet OPERATOR's
+# `VerifyingKey` from its 32 raw bytes before delegating to `scp-protocol`. A
+# leaf crypto crate already present transitively (via scp-protocol / scp-mls);
+# a direct edge here is inside the ADR-057 wasm fence (it is not scp-runtime /
+# scp-identity / tokio) and compiles for wasm32.
+ed25519-dalek = { workspace = true }
+
 # wasm-bindgen is needed on BOTH targets: on wasm32 it generates the real JS
 # glue; on native it provides an inert `JsValue` / `#[wasm_bindgen]` so the
 # exposed surface still compiles and the host test can link it. The JS-extern

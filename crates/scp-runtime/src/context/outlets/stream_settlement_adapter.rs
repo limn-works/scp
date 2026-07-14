@@ -471,6 +471,61 @@ mod tests {
         );
     }
 
+    /// A zero-escrow-open stream whose only credit grant was REJECTED (apply
+    /// error) creates a crash-recovery record and then un-bumps its
+    /// `reserved_escrow` back to `0`. A clean settle — `reserved == 0`, no
+    /// refund, no counter release — must STILL remove that lingering `0`-record
+    /// from durable `stream_reservations`, so it never survives to the next
+    /// restart's reconcile sweep. Removing an already-zero, fully-settled record
+    /// changes no budget.
+    #[tokio::test]
+    async fn clean_settle_removes_lingering_zero_record() {
+        let supervisor = build_supervisor(None);
+        let deps = deps_for(&supervisor).await;
+
+        let mut state = member_state(0, 0);
+        // Model the grant-created-then-reverse-zeroed crash-recovery record for
+        // the settlement's `request_id` ([3u8; 16]).
+        state.class_s.stream_reservations.insert(
+            hex::encode([3u8; 16]),
+            crate::context::outlets::invoke::StreamReservationRecord {
+                invoker_did: invoker(),
+                ucan_cid: String::new(),
+                cost_per_chunk: Amount::new(10),
+                amount_cumulative_reserved: 0,
+                reserved_escrow: Amount::new(0),
+                generation: 0,
+            },
+        );
+        let mut cell = ClassSCell::new(state);
+        let live_gen = cell.generation;
+        assert!(
+            cell.class_s
+                .stream_reservations
+                .contains_key(&hex::encode([3u8; 16])),
+            "precondition: the lingering 0-record exists before settle"
+        );
+
+        // reserved = 0 (open reserved nothing; the grant's apply rejected so the
+        // ledger never extended), billed = 0, refund = 0, cumulative = 0.
+        let outcome =
+            settle_outlet_stream(&mut cell, &deps, settlement(0, 0, 0, 0, 0, None), live_gen).await;
+
+        assert!(
+            matches!(outcome, StreamSettleOutcome::Settled(None)),
+            "a zero-cost clean settle settles with no receipt: {outcome:?}"
+        );
+        assert!(
+            cell.class_s.stream_reservations.is_empty(),
+            "the lingering 0-record is REMOVED on clean settle (no leak to the reconcile sweep)"
+        );
+        assert_eq!(
+            cell.governance.budget_tracker.total_spent(&invoker()),
+            Amount::new(0),
+            "removing the fully-settled 0-record changes no budget"
+        );
+    }
+
     /// Fix-D confused-deputy guard: a generation MISMATCH touches NO owned state
     /// (no release, no refund). With no open-time policy SNAPSHOT there is
     /// nothing to capture either, so the outcome is

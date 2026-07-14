@@ -311,6 +311,20 @@ pub struct NapiBridgeInstance {
     /// explicit clear step in `bridge_specific_shutdown`, so the store lives
     /// exactly as long as its last `Arc` reference.
     pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
+
+    /// Per-instance §5.4.5 streaming-outlet registry (SCP-OUT-037, C8a).
+    ///
+    /// Keyed by `StreamHandleId` (the stream's `request_id` hex). Each
+    /// [`StreamEntry`](crate::outlet_stream::StreamEntry) pins the invoker DID,
+    /// hosting context/outlet ids, `caveats_binding`, `request_id`,
+    /// `stream_epoch`, and `cost_per_chunk` at open, plus the split
+    /// control-plane handle + detached chunk receiver. Per-instance (never a
+    /// `static` — `check-no-bridge-globals.sh` / `check-handle-affinity.sh`): a
+    /// stream opened on one instance is invisible to another, and instance
+    /// shutdown drops every live stream with the `Arc`. Cleared by
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
+    /// reference bridge's `PyBridgeInstance::outlet_stream_registry`.
+    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
 }
 
 /// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
@@ -366,6 +380,7 @@ impl NapiBridgeInstance {
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -396,6 +411,7 @@ impl NapiBridgeInstance {
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -521,6 +537,7 @@ impl NapiBridgeInstance {
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -649,6 +666,10 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Drop every live §5.4.5 stream on this instance — dropping the
+        // `StreamEntry` `Arc`s releases the control handle + chunk receiver, so
+        // any parked pump task winds down (SCP-OUT-037, C8a).
+        self.outlet_stream_registry.clear();
         // Reset the full-stack test network slot. Best-effort: on lock
         // poisoning we leave the slot alone — a poisoned mutex means
         // another thread panicked while holding it, which is a larger

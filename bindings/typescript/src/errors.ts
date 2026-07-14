@@ -115,6 +115,84 @@ export class OutletError extends ScpError {
   }
 }
 
+/**
+ * Protocol-class outlet failure (`OutletErrorClass::Protocol`, §5.4.4).
+ *
+ * The common parent for every protocol-class condition — stream-lifecycle
+ * violations, stream-already-open, unknown-session — so a single `catch`
+ * branch can handle all protocol-class errors. A DIRECT subclass of
+ * {@link OutletError}; its protocol-class siblings ({@link InvalidGrant},
+ * {@link StreamAlreadyClosed}) sit at this same inheritance depth (the
+ * round-5 cross-SDK symmetry rule of SCP-OUT-038: lifecycle errors sit at
+ * the same depth as their semantic-class siblings).
+ *
+ * On the wire the class renders as the lowercase variant `"protocol"` and
+ * carries a code in the `SCP-OUTLET-6100..6101` Protocol sub-range.
+ */
+export class ProtocolError extends OutletError {
+  constructor(message: string, code = "SCP-OUTLET-6100") {
+    super(message, code);
+    this.name = "ProtocolError";
+  }
+}
+
+/**
+ * A stream-credit grant value outside the valid `u32` range (§5.4.5).
+ *
+ * Thrown at {@link Credit} construction — `new Credit(0)`, `new Credit(-1)`,
+ * `new Credit(2 ** 32)`, and non-integer / non-number values all throw this
+ * UNIFORMLY (never a bare `RangeError` / `TypeError`), matching the
+ * SCP-OUT-031 round-6 uniform `InvalidGrant` rule across all four SDKs. The
+ * valid range is the non-zero `u32` interval `[1, 2**32)`.
+ */
+export class InvalidGrant extends ProtocolError {
+  constructor(message: string, code = "SCP-OUTLET-6100") {
+    super(message, code);
+    this.name = "InvalidGrant";
+  }
+}
+
+/**
+ * A control-plane call on a handle whose stream already reached a terminal.
+ *
+ * Thrown by `InvocationHandle.grantCredit` and `InvocationHandle.cancel`
+ * when the handle's stream has already delivered a terminal chunk (an `End`
+ * or a terminal `Error`) — the §5.4.5 InvocationHandle lifecycle guard
+ * (SCP-OUT-038, API MAJOR 24). Sits at the same inheritance depth as its
+ * protocol-class siblings under {@link ProtocolError}.
+ */
+export class StreamAlreadyClosed extends ProtocolError {
+  constructor(message: string, code = "SCP-OUTLET-6100") {
+    super(message, code);
+    this.name = "StreamAlreadyClosed";
+  }
+}
+
+/**
+ * A gap (missing sequence) in an outlet stream's chunk sequence (§5.4.5).
+ *
+ * Sequence values are strictly monotonic per `request_id`; a receiver that
+ * observes a gap (a missing or regressed sequence) MUST cancel the stream and
+ * surface this error (spec §5.4.5 "Ordering and gaps",
+ * `OutletErrorClass::Execution::StreamGap`). The SDK {@link InvocationHandle}
+ * drain is that receiver: it tracks the expected next sequence and, on any
+ * non-contiguous chunk, signs an `OutletCancel` through the bridge and throws
+ * this error. A same-context stream flows over a lossless ordered channel so a
+ * gap never occurs in production — this is a defense-in-depth monotonicity
+ * check mirroring the §5.4.5 receiver-side recheck posture.
+ *
+ * Sits at the same inheritance depth as its protocol-class siblings
+ * ({@link InvalidGrant}, {@link StreamAlreadyClosed}) under
+ * {@link ProtocolError}. Carries the execution-class code `SCP-OUTLET-6131`
+ * (`execution.stream-gap`).
+ */
+export class StreamGap extends ProtocolError {
+  constructor(message: string, code = "SCP-OUTLET-6131") {
+    super(message, code);
+    this.name = "StreamGap";
+  }
+}
+
 /** Input validation, schema, parameter failures. */
 export class ValidationError extends ScpError {
   constructor(message: string, code: string) {

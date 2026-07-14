@@ -715,6 +715,40 @@ class SCP:
         ucan_proof_id: Any = ...,
     ) -> SagaResult: ...
     def outlet_register(self, context_id: Any, registration: Any) -> Any: ...
+    def outlet_stream_open(
+        self,
+        context_id: Any,
+        outlet_id: Any,
+        input: Any,
+        caller_did: Any,
+        ucan_token: Any,
+        proof_tokens: Any = ...,
+        spending_ucan: Any = ...,
+        timeout_ms: Any = ...,
+        estimated_chunk_count: Any = ...,
+    ) -> str: ...
+    def outlet_stream_poll_next(self, handle_id: Any) -> bytes | None: ...
+    def outlet_stream_grant_credit(self, handle_id: Any, caller_did: Any, grant: Any) -> None: ...
+    def outlet_stream_cancel(self, handle_id: Any, caller_did: Any) -> None: ...
+    def outlet_stream_terminate(
+        self, handle_id: Any, caller_did: Any, slug: Any, message: Any
+    ) -> None: ...
+    def outlet_stream_verify_chunk_signature(
+        self,
+        chunk_bytes: Any,
+        operator_pk: Any,
+        context_id: Any,
+        outlet_id: Any,
+        caveats_binding: Any,
+    ) -> bool: ...
+    def outlet_stream_compute_caveats_binding(
+        self,
+        ucan_cid: Any,
+        request_id: Any,
+        invoker_did: Any,
+        estimated_chunk_count: Any,
+        effective_caveats_jcs: Any,
+    ) -> bytes: ...
     def outlet_session_close(self, context_id: Any, session_id: Any) -> Any: ...
     def outlet_session_create(
         self, context_id: Any, outlet_id: Any, source_context_id: Any, ttl_seconds: Any = ...

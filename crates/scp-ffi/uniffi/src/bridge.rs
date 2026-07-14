@@ -3989,7 +3989,7 @@ pub fn identity_verify_link_attestation(
 ///
 /// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
 /// or `outlet_call:*` capability. Extracted to keep `outlet_invoke` focused.
-fn validate_outlet_ucan_uniffi(
+pub(crate) fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: &ContextHandle,
     outlet_id: &str,

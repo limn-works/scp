@@ -32,9 +32,10 @@ import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ValidationError
+from scp_sdk.errors import ContextError, ValidationError
 
 if TYPE_CHECKING:
+    from scp_sdk.outlets import Outlets
     from scp_sdk.scp import SCP
 
 
@@ -495,22 +496,28 @@ class Context:
             :meth:`_from_handle` to track a different actor.
     """
 
-    __slots__ = ("_raw_handle", "identity_did")
+    __slots__ = ("_raw_handle", "_scp", "identity_did")
 
-    def __init__(self, handle: Any, identity_did: str = "") -> None:
+    def __init__(self, handle: Any, identity_did: str = "", scp: SCP | None = None) -> None:
         """Wrap a ``PyContextHandle`` bridge handle.
 
         Users should not call this directly. Use
         :meth:`scp_sdk.SCP.context_create`,
         :meth:`scp_sdk.SCP.context_import`, or related factories.
+
+        ``scp`` is the owning :class:`scp_sdk.SCP` instance; it backs the
+        :attr:`outlets` accessor (whose control plane dispatches to the SCP
+        native bridge). Factory methods pass it; a bare ``Context(handle)`` for
+        pure handle inspection may omit it.
         """
         self._raw_handle = handle
         self.identity_did = identity_did
+        self._scp = scp
 
     @classmethod
     def _from_handle(cls, _scp: SCP | None, raw: Any, identity_did: str = "") -> Context:
         """Internal constructor used by :class:`scp_sdk.SCP` methods."""
-        return cls(raw, identity_did=identity_did)
+        return cls(raw, identity_did=identity_did, scp=_scp)
 
     @property
     def context_id(self) -> str:
@@ -521,6 +528,33 @@ class Context:
     def state(self) -> str:
         """Current lifecycle state of the context."""
         return self._raw_handle.state
+
+    @property
+    def outlets(self) -> Outlets:
+        """The outlet accessor for this context (§5.4.5, SCP-OUT-038).
+
+        Exposes the single public invocation verb —
+        ``ctx.outlets.invoke(outlet_id, input, ucan_token=...)`` — returning an
+        :class:`~scp_sdk.outlets.InvocationHandle` that is both awaitable (the
+        aggregated result) and async-iterable (per-chunk streaming).
+
+        Raises :class:`~scp_sdk.errors.ContextError` if this ``Context`` was
+        created without an owning :class:`scp_sdk.SCP` instance (a bare
+        ``Context(handle)`` used only for handle inspection).
+        """
+        from scp_sdk.outlets import Outlets
+
+        if self._scp is None:
+            raise ContextError(
+                "Context has no bound SCP instance; obtain the context from an "
+                "SCP factory method (e.g. scp.context_create) to use ctx.outlets",
+                code="SCP-CTX-2000",
+            )
+        return Outlets(
+            native=self._scp._native,
+            context_id=self.context_id,
+            default_caller_did=self.identity_did,
+        )
 
     def __repr__(self) -> str:
         return f"Context(context_id={self.context_id!r}, state={self.state!r})"

@@ -46,6 +46,15 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core", features = ["testing"] }
+# SCP-OUT-039 (C12) — the outlet-streaming conformance tests drive the RAW
+# runtime `open_stream_session` dispatch + `Supervisor::open_outlet_stream`
+# directly (the streaming trackers, `InProcessStreamSigner`, and the dispatch
+# entry are NOT re-exported through the `scp-core` facade — only the bridge
+# control surface is). scp-testing is a publish=false test crate, so a direct
+# dev-dep on the runtime is layering-clean.
+scp-runtime = { path = "../scp-runtime", features = ["testing"] }
+scp-protocol = { path = "../scp-protocol" }
+scp-clock = { path = "../scp-clock" }
 scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }
@@ -87,6 +96,18 @@ axum = { workspace = true, features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1"
+
+[[test]]
+name = "outlet_stream_conformance"
+path = "tests/integration/outlet_stream_conformance.rs"
+
+[[test]]
+name = "outlet_stream_vectors_through_open_path"
+path = "tests/integration/outlet_stream_vectors_through_open_path.rs"
+
+[[test]]
+name = "outlet_caveats_binding_conformance"
+path = "tests/integration/outlet_caveats_binding_conformance.rs"
 
 [[test]]
 name = "harness_meta"

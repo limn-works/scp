@@ -367,6 +367,45 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Grant a §7.2.2 Tier-2 capability directly into a member's
+    /// `role_state.member_capabilities` cache, bypassing the governance
+    /// role-assignment round-trip — test-only.
+    ///
+    /// The runtime's outlet-invocation gate
+    /// ([`has_outlet_invocation_capability`](crate::context::outlets::invoke::has_outlet_invocation_capability))
+    /// requires the invoker to hold `OutletCall(outlet_id)` / `OutletCallAll`
+    /// (or the Query stem) in role state as defense-in-depth alongside the
+    /// primary UCAN gate. The default `admin` / `member` roles grant only
+    /// `messages:*`, so a single-node test cannot drive a real outlet
+    /// invocation without granting the capability — and the genuine grant path
+    /// is a governance role-definition change requiring DID-document-published
+    /// identities (which in-memory test identities are not). This seam inserts
+    /// the capability the same way an executed role assignment would populate
+    /// the Tier-2 cache.
+    ///
+    /// Gated behind the dedicated `outlet-capability-test-grant` feature —
+    /// NOT `testing`. `testing` leaks into every `allow_in_memory_custody`
+    /// bridge build (`scp-ffi → dep:scp-testing → scp-core{testing} →
+    /// scp-runtime/testing`), which would compile this authority-escalation
+    /// primitive into a custody-escape-hatch build; the dedicated feature is
+    /// enabled ONLY by the outlet-stream live-flow test. It has ZERO FFI/SDK
+    /// exports (only that test calls it), but the dedicated gate keeps the
+    /// primitive out of every non-test binary.
+    #[cfg(feature = "outlet-capability-test-grant")]
+    TestGrantMemberCapability {
+        /// Context identifier.
+        context_id: String,
+        /// The member DID to grant the capability to.
+        member_did: scp_did::DID,
+        /// The capability stem (e.g. `"outlet_call:*"`), parsed via
+        /// [`Capability::new`](scp_protocol::context::roles::Capability::new).
+        capability: String,
+        /// Oneshot reply channel. Replies `Ok(())` once the capability is
+        /// cached, or `Err` if the context is unknown / inactive / the stem is
+        /// unrecognized.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
     /// Install a specific member's access key directly into the context's
     /// access key store (§9.17), bypassing the pull-based distribution protocol.
     ///
@@ -2282,6 +2321,67 @@ pub enum OutletsCommand {
         reply: oneshot::Sender<
             Result<Box<crate::context::outlets_helpers::StreamEconomyReservation>, ContextError>,
         >,
+    },
+
+    /// Streaming GRANT-time escrow top-up reserve on actor-owned state — the
+    /// mid-stream counterpart of [`Self::ReserveOutletStreamEconomy`] for a
+    /// §5.4.5 credit grant. DEBITS `cost_per_chunk × grant` from the invoker's
+    /// `MemberBudgetTracker` under a fail-closed persist so the operator can
+    /// bill the newly-granted billable chunks against a real held escrow —
+    /// closing the budget-cap under-enforcement where a grant extended the
+    /// credit window with NO corresponding debit (§5.4.5 "Credit-grant escrow
+    /// top-up"). Unlike the open reserve it runs NO hard-rate / velocity /
+    /// membership gate (those are admission-time concerns already paid at open);
+    /// it is purely the incremental escrow debit, paired ATOMICALLY with a bump
+    /// of the durable crash-recovery record (keyed by `request_id`) so a hard
+    /// crash after a grant refunds `open + Σgrants`, not just the open hold.
+    /// Replies with the reserved `Amount` the FFI bridge threads into
+    /// [`StreamSessionHandle::apply_credit_grant`](crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant)
+    /// as `reserved_top_up`, and reverses via [`Self::ReverseStreamGrantEscrow`]
+    /// if the grant apply then rejects (signature / replay / stream-closed).
+    ///
+    /// See [`crate::context::outlets_helpers::reserve_stream_grant_escrow`].
+    ReserveStreamGrantEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker (== the pinned stream invoker) whose budget is debited.
+        member_did: scp_did::DID,
+        /// The stream's `request_id` — keys the durable crash-recovery record
+        /// whose `reserved_escrow` is bumped atomically with the debit.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        /// Per-Data-chunk cost. `Amount::new(0)` (Query / zero-cost) short-
+        /// circuits to a zero hold with no balance consultation (spec: "For
+        /// Query outlets and zero-cost outlets no top-up is performed").
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        /// Number of additional billable chunks the grant authorizes — the
+        /// escrow-hold multiplier.
+        grant: u32,
+        /// Oneshot reply carrying the reserved (DEBITED) hold amount, or a
+        /// `SCP-OUTLET-6120`/`6089`-class escrow rejection
+        /// (`EscrowOverflow` / `InsufficientFunds`).
+        reply: oneshot::Sender<Result<scp_protocol::economy::types::Amount, ContextError>>,
+    },
+
+    /// Reverse of [`Self::ReserveStreamGrantEscrow`] — CREDIT the grant hold back
+    /// AND un-bump the durable crash-recovery record, atomically, when a grant
+    /// apply is rejected after the reserve debited. Both legs move together so a
+    /// crash between them cannot make [`crate::context::outlets_helpers::reconcile_stream_reservations`]
+    /// double-refund the reversed hold. Both operations are saturating, so a
+    /// double-reverse is a safe no-op.
+    ///
+    /// See [`crate::context::outlets_helpers::reverse_stream_grant_escrow`].
+    ReverseStreamGrantEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker whose budget hold is being credited back.
+        member_did: scp_did::DID,
+        /// The stream's `request_id` — keys the durable crash-recovery record
+        /// whose `reserved_escrow` is un-bumped atomically with the credit.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        /// The grant hold amount to return (saturating at `0`).
+        amount: scp_protocol::economy::types::Amount,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
     /// Off-mailbox streaming §7.3.8 value-caveat counter reservation on

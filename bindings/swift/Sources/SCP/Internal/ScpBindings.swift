@@ -2355,8 +2355,19 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextReconnect(identity: Identity, contextIds: [String], lastRelayContacts: [String: UInt64]) async throws  -> ReconnectReport
     
     /**
-     * Per-instance equivalent of the free-function
-     * `context_reset_ttl_timer`.
+     * Resets the TTL timer after a successful unanimous extension.
+     *
+     * EXTENDS the existing convergent TTL deadline by `new_seconds`
+     * (`old_deadline + new_seconds`), NOT a local `now + new_seconds` — every
+     * member adds the same duration to the same recorded deadline, so the
+     * re-armed `ContextExpired`/`ContextClosed` leaf timestamp stays convergent
+     * across members (§7.3.1). It does NOT cancel/respawn a task: the TTL timer
+     * is an actor-owned arm and `reconcile_timers` re-derives the one-shot sleep
+     * from the new recorded deadline (ADR-049 finding A3).
+     *
+     * NO-OP on a context with no armed TTL (`deadline_unix_secs == None`): with
+     * no recorded deadline there is no TTL to extend, so the disarmed timer
+     * stays disarmed rather than arming a long-past deadline (H2).
      *
      * Routes through `&*self.inner`. Silently returns when the handle's
      * `instance_id` does not match this `SCP`'s (matches the free-function
@@ -3048,6 +3059,101 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `Identity` whose `instance_id` does not match this `SCP`'s.
      */
     func outletSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws  -> String
+    
+    /**
+     * Signs and applies a stream cancel at the runtime-derived cursor (CRITICAL
+     * #3 — the bridge never supplies a `next_seq`).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Permission` with `SCP-PERM-3001` if `caller_did` is not
+     * the pinned invoker; `SCP-OUTLET-6110` on a signature/identity mismatch;
+     * `SCP-OUTLET-6160` (retryable) if the cursor advanced past the bounded retry
+     * budget.
+     */
+    func outletStreamCancel(handleId: String, callerDid: String) async throws 
+    
+    /**
+     * Pure wrapper: computes the §5.4.5 `caveats_binding` (32 bytes).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if `request_id` is not 16 bytes.
+     */
+    func outletStreamComputeCaveatsBinding(ucanCid: Data, requestId: Data, invokerDid: String, estimatedChunkCount: UInt32, effectiveCaveatsJcs: Data) async throws  -> Data
+    
+    /**
+     * Grants `grant` additional billable chunks of credit to a live stream. The
+     * bridge signs the `OutletStreamCredit` internally under the pinned invoker's
+     * custody key and auto-assigns the monotonic sequence, so the caller supplies
+     * only a `u32` — no key access, no replay-counter tracking. The grant debits
+     * `cost_per_chunk × grant` of escrow first (money-conservation), reversing it
+     * if the grant apply then rejects.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Permission` with `SCP-PERM-3001` if `caller_did` is not
+     * the pinned invoker; an escrow rejection (`InsufficientFunds` /
+     * `EscrowOverflow`) if the top-up debit fails; `SCP-OUTLET-NNNN` if the grant
+     * apply is rejected (bad signature, replay, or the stream already closed).
+     */
+    func outletStreamGrantCredit(handleId: String, callerDid: String, grant: UInt32) async throws 
+    
+    /**
+     * Opens a §5.4.5 streaming outlet invocation, returning a `StreamHandleId`
+     * PROMPTLY (Commit transition — never block-until-terminal).
+     *
+     * The UCAN is validated ONCE at open via the full 11-step ADR-016 pipeline;
+     * the invoker (`caller_did`) is pinned for the stream's lifetime. Drive the
+     * stream via `outletStreamPollNext` / `_grantCredit` / `_cancel` /
+     * `_terminate` with the SAME `caller_did`.
+     *
+     * Named `outlet_stream_open` (not `outlet_invoke_stream`) so the whole
+     * streaming surface groups under the `outlet_stream_*` prefix (agent-first
+     * API design).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Permission` if authorization fails. Returns
+     * `ScpError::Outlet` carrying a `SCP-OUTLET-NNNN` code if the open is
+     * rejected (admission caps, escrow, caveats binding, node pump ceiling, or a
+     * §7.3.8 caveat).
+     */
+    func outletStreamOpen(handle: ContextHandle, outletId: String, inputJson: String, callerDid: String, ucanToken: String, proofTokens: [String]?, spendingUcan: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?) async throws  -> String
+    
+    /**
+     * Drains one chunk from a live stream, awaiting until a chunk arrives or the
+     * stream closes. Returns the JSON-serialized `OutletStreamChunk` bytes, or
+     * `None` at the terminal (which evicts the stream).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` for an unknown/evicted `handle_id` (a DISTINCT
+     * error, NEVER `None`) or if chunk serialization fails.
+     */
+    func outletStreamPollNext(handleId: String) async throws  -> Data?
+    
+    /**
+     * Forces a framework terminal chunk. `slug` selects a closed-set terminal
+     * reason; the canonical `code` is derived internally from the reason;
+     * `message` is a human suffix.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Permission` with `SCP-PERM-3001` if `caller_did` is not
+     * the pinned invoker; `ScpError::Validation` if `slug` is not a
+     * stream-terminal slug.
+     */
+    func outletStreamTerminate(handleId: String, callerDid: String, slug: String, message: String) async throws 
+    
+    /**
+     * Pure wrapper: verifies a chunk's operator signature (§5.4.5).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if a byte argument is malformed.
+     */
+    func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, contextId: String, outletId: String, caveatsBinding: Data) async throws  -> Bool
     
     /**
      * Per-instance equivalent of the free-function `outlet_verify`.
@@ -4552,8 +4658,19 @@ open func contextReconnect(identity: Identity, contextIds: [String], lastRelayCo
 }
     
     /**
-     * Per-instance equivalent of the free-function
-     * `context_reset_ttl_timer`.
+     * Resets the TTL timer after a successful unanimous extension.
+     *
+     * EXTENDS the existing convergent TTL deadline by `new_seconds`
+     * (`old_deadline + new_seconds`), NOT a local `now + new_seconds` — every
+     * member adds the same duration to the same recorded deadline, so the
+     * re-armed `ContextExpired`/`ContextClosed` leaf timestamp stays convergent
+     * across members (§7.3.1). It does NOT cancel/respawn a task: the TTL timer
+     * is an actor-owned arm and `reconcile_timers` re-derives the one-shot sleep
+     * from the new recorded deadline (ADR-049 finding A3).
+     *
+     * NO-OP on a context with no armed TTL (`deadline_unix_secs == None`): with
+     * no recorded deadline there is no TTL to extend, so the disarmed timer
+     * stays disarmed rather than arming a long-past deadline (H2).
      *
      * Routes through `&*self.inner`. Silently returns when the handle's
      * `instance_id` does not match this `SCP`'s (matches the free-function
@@ -6088,6 +6205,206 @@ open func outletSessionInvoke(handle: ContextHandle, sessionId: String, inputJso
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Signs and applies a stream cancel at the runtime-derived cursor (CRITICAL
+     * #3 — the bridge never supplies a `next_seq`).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Permission` with `SCP-PERM-3001` if `caller_did` is not
+     * the pinned invoker; `SCP-OUTLET-6110` on a signature/identity mismatch;
+     * `SCP-OUTLET-6160` (retryable) if the cursor advanced past the bounded retry
+     * budget.
+     */
+open func outletStreamCancel(handleId: String, callerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_stream_cancel(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(handleId),FfiConverterString.lower(callerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Pure wrapper: computes the §5.4.5 `caveats_binding` (32 bytes).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if `request_id` is not 16 bytes.
+     */
+open func outletStreamComputeCaveatsBinding(ucanCid: Data, requestId: Data, invokerDid: String, estimatedChunkCount: UInt32, effectiveCaveatsJcs: Data)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_stream_compute_caveats_binding(
+                    self.uniffiClonePointer(),
+                    FfiConverterData.lower(ucanCid),FfiConverterData.lower(requestId),FfiConverterString.lower(invokerDid),FfiConverterUInt32.lower(estimatedChunkCount),FfiConverterData.lower(effectiveCaveatsJcs)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Grants `grant` additional billable chunks of credit to a live stream. The
+     * bridge signs the `OutletStreamCredit` internally under the pinned invoker's
+     * custody key and auto-assigns the monotonic sequence, so the caller supplies
+     * only a `u32` — no key access, no replay-counter tracking. The grant debits
+     * `cost_per_chunk × grant` of escrow first (money-conservation), reversing it
+     * if the grant apply then rejects.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Permission` with `SCP-PERM-3001` if `caller_did` is not
+     * the pinned invoker; an escrow rejection (`InsufficientFunds` /
+     * `EscrowOverflow`) if the top-up debit fails; `SCP-OUTLET-NNNN` if the grant
+     * apply is rejected (bad signature, replay, or the stream already closed).
+     */
+open func outletStreamGrantCredit(handleId: String, callerDid: String, grant: UInt32)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_stream_grant_credit(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(handleId),FfiConverterString.lower(callerDid),FfiConverterUInt32.lower(grant)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Opens a §5.4.5 streaming outlet invocation, returning a `StreamHandleId`
+     * PROMPTLY (Commit transition — never block-until-terminal).
+     *
+     * The UCAN is validated ONCE at open via the full 11-step ADR-016 pipeline;
+     * the invoker (`caller_did`) is pinned for the stream's lifetime. Drive the
+     * stream via `outletStreamPollNext` / `_grantCredit` / `_cancel` /
+     * `_terminate` with the SAME `caller_did`.
+     *
+     * Named `outlet_stream_open` (not `outlet_invoke_stream`) so the whole
+     * streaming surface groups under the `outlet_stream_*` prefix (agent-first
+     * API design).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Permission` if authorization fails. Returns
+     * `ScpError::Outlet` carrying a `SCP-OUTLET-NNNN` code if the open is
+     * rejected (admission caps, escrow, caveats binding, node pump ceiling, or a
+     * §7.3.8 caveat).
+     */
+open func outletStreamOpen(handle: ContextHandle, outletId: String, inputJson: String, callerDid: String, ucanToken: String, proofTokens: [String]?, spendingUcan: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_stream_open(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterString.lower(inputJson),FfiConverterString.lower(callerDid),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(spendingUcan),FfiConverterOptionUInt32.lower(timeoutMs),FfiConverterOptionUInt32.lower(estimatedChunkCount)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Drains one chunk from a live stream, awaiting until a chunk arrives or the
+     * stream closes. Returns the JSON-serialized `OutletStreamChunk` bytes, or
+     * `None` at the terminal (which evicts the stream).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` for an unknown/evicted `handle_id` (a DISTINCT
+     * error, NEVER `None`) or if chunk serialization fails.
+     */
+open func outletStreamPollNext(handleId: String)async throws  -> Data?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_stream_poll_next(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(handleId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Forces a framework terminal chunk. `slug` selects a closed-set terminal
+     * reason; the canonical `code` is derived internally from the reason;
+     * `message` is a human suffix.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Permission` with `SCP-PERM-3001` if `caller_did` is not
+     * the pinned invoker; `ScpError::Validation` if `slug` is not a
+     * stream-terminal slug.
+     */
+open func outletStreamTerminate(handleId: String, callerDid: String, slug: String, message: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_stream_terminate(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(handleId),FfiConverterString.lower(callerDid),FfiConverterString.lower(slug),FfiConverterString.lower(message)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Pure wrapper: verifies a chunk's operator signature (§5.4.5).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if a byte argument is malformed.
+     */
+open func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, contextId: String, outletId: String, caveatsBinding: Data)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_stream_verify_chunk_signature(
+                    self.uniffiClonePointer(),
+                    FfiConverterData.lower(chunkBytes),FfiConverterData.lower(operatorPk),FfiConverterString.lower(contextId),FfiConverterString.lower(outletId),FfiConverterData.lower(caveatsBinding)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -17210,7 +17527,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reconnect() != 23606) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 12217) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 21393) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_send() != 57249) {
@@ -17412,6 +17729,27 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_invoke() != 37173) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_cancel() != 50575) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_compute_caveats_binding() != 12305) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_grant_credit() != 26528) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_open() != 55648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_poll_next() != 8438) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_terminate() != 63929) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_verify_chunk_signature() != 15888) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_verify() != 31142) {

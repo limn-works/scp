@@ -626,9 +626,17 @@ mod tests {
         // Regenerated again by the ADR-049 outlet rename: the `ContextParams`
         // outlet-registration field's JCS key changed `tools` -> `outlets`,
         // which is folded into the genesis params hash.
+        // Regenerated again when `ContextParams` gained the §5.4.5 progressive-
+        // output streaming config fields (SCP-OUT-034, spec §9.18.B):
+        // `stream_window_default`, `stream_credit_stall_secs`,
+        // `stream_cancel_ack_secs`, `stream_ucan_recheck_secs`, and the three
+        // `max_concurrent_inbound_streams_per_*` caps. These (default-valued)
+        // fields are folded into the genesis `ContextParams` JCS canonical form
+        // and thus into this digest — an intended encoding change, not a
+        // regression.
         assert_eq!(
             hex::encode(hash),
-            "a6b5207312e3e26b9c9e91a99bde4b24d5e801619dc28f793049c0c0f1217120",
+            "c103dc6aa1efd28c3c592acdc6e237c453887d0014763516b48d4df72af8cdac",
             "invitation bundle signing-hash KAT"
         );
     }

@@ -119,6 +119,44 @@ pub(crate) async fn dispatch(
             )
             .await
         }
+        OutletsCommand::ReserveStreamGrantEscrow {
+            context_id,
+            member_did,
+            request_id,
+            cost_per_chunk,
+            grant,
+            reply,
+        } => {
+            handle_reserve_stream_grant_escrow(
+                cell,
+                deps,
+                &context_id,
+                &member_did,
+                request_id,
+                cost_per_chunk,
+                grant,
+                reply,
+            )
+            .await
+        }
+        OutletsCommand::ReverseStreamGrantEscrow {
+            context_id,
+            member_did,
+            request_id,
+            amount,
+            reply,
+        } => {
+            handle_reverse_stream_grant_escrow(
+                cell,
+                deps,
+                &context_id,
+                &member_did,
+                request_id,
+                amount,
+                reply,
+            )
+            .await
+        }
         OutletsCommand::ReserveStreamCaveatCounter {
             context_id,
             ucan_cid,
@@ -468,6 +506,94 @@ async fn handle_reserve_outlet_stream_economy(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "reserve_outlet_stream_economy exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`OutletsCommand::ReserveStreamGrantEscrow`] — the mid-stream
+/// §5.4.5 GRANT-time escrow top-up. Delegates to
+/// [`outlets_helpers::reserve_stream_grant_escrow`](crate::context::outlets_helpers::reserve_stream_grant_escrow)
+/// on owned state under a 30s timeout, replying with the reserved (DEBITED)
+/// hold `Amount` the FFI bridge threads into `apply_credit_grant`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_reserve_stream_grant_escrow(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    member_did: &scp_did::DID,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
+    cost_per_chunk: scp_protocol::economy::types::Amount,
+    grant: u32,
+    reply: oneshot::Sender<Result<scp_protocol::economy::types::Amount, ContextError>>,
+) -> Outcome<()> {
+    let reserve_fut = crate::context::outlets_helpers::reserve_stream_grant_escrow(
+        cell,
+        deps,
+        context_id,
+        member_did,
+        request_id,
+        cost_per_chunk,
+        grant,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reserve_fut).await {
+        Ok(Ok(reserved)) => (Outcome::ok_mutated(()), Ok(reserved)),
+        Ok(Err(err)) => {
+            // A rejected reserve rolls back its own debit + record bump inline
+            // (the `commit_class_s_compensating` snapshot-restore + Class-C
+            // compensation on persist-failure; a pure balance/overflow reject
+            // never debited), but the attempt may have touched owned state —
+            // flag mutated so the actor persists if persistence is wired.
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reserve_stream_grant_escrow exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`OutletsCommand::ReverseStreamGrantEscrow`] — the grant reverse-on-
+/// reject. Delegates to
+/// [`outlets_helpers::reverse_stream_grant_escrow`](crate::context::outlets_helpers::reverse_stream_grant_escrow)
+/// (CREDIT budget + un-bump the durable record atomically) under a 30s timeout.
+async fn handle_reverse_stream_grant_escrow(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    member_did: &scp_did::DID,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
+    amount: scp_protocol::economy::types::Amount,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let reverse_fut = crate::context::outlets_helpers::reverse_stream_grant_escrow(
+        cell, deps, context_id, member_did, request_id, amount,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reverse_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            // KEEP semantics: the in-memory credit + un-bump ARE applied even on
+            // persist failure — flag mutated so the run loop retries the write.
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reverse_stream_grant_escrow exceeded {HANDLER_TIMEOUT:?} budget"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))

@@ -68,6 +68,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub mod bridge;
+pub mod outlet_stream;
 pub mod runtime;
 pub mod scp;
 

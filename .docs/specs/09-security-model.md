@@ -1859,6 +1859,13 @@ The following constants have protocol-defined mechanisms and acceptable ranges, 
 | Nesting depth | Unbounded (no protocol ceiling) | [1, u32 max] | `ContextParams::max_nesting_depth`. `None` = unbounded; contexts MAY set a limit. | §5.13.8 |
 | Chain depth | 8 hops | [1, 255] (u8) | `ContextParams::max_chain_depth`. `None` = use default. No protocol hard max. | §24.4 |
 | Session cap per caller | 1000 | [1, u32 max] | `ContextParams::session_cap`. `None` = use default. | §6.2.1 |
+| Stream credit window | 32 chunks | [1, u32 max] | `ContextParams::stream_window_default`. Default per-stream credit headroom when `OutletStreamOpen` declares none. | §5.4.5 |
+| Stream credit-stall timeout | 30s | [1, u32 max] | `ContextParams::stream_credit_stall_secs`. Seconds at zero credit before `SCP-OUTLET-6133` credit-stall cancel. | §5.4.5 |
+| Stream cancel-ack timeout | 5s | [1, u32 max] | `ContextParams::stream_cancel_ack_secs`. Seconds after `OutletCancel` for the terminal chunk before `SCP-OUTLET-6135` forced closure. | §5.4.5 |
+| Stream UCAN re-check cadence | 10s | [1, 60] | `ContextParams::stream_ucan_recheck_secs`. Receiver-side authoritative revocation re-check period for an active stream. | §5.4.5 |
+| Concurrent inbound streams per invoker | 8 | [1, u32 max] | `ContextParams::max_concurrent_inbound_streams_per_invoker`. Per immediate-invoker admission ceiling. | §5.4.5 |
+| Concurrent inbound streams per origin invoker | 16 | [1, u32 max] | `ContextParams::max_concurrent_inbound_streams_per_origin_invoker`. Operator-scoped per-origin-`iss` admission ceiling. | §5.4.5 |
+| Concurrent inbound streams per outlet | 128 | [1, u32 max] | `ContextParams::max_concurrent_inbound_streams_per_outlet`. Per-outlet total fan-in admission ceiling. | §5.4.5 |
 | Relay blob TTL | 604,800s (7d) | [1, infinity] | Relay operator configuration. | §10.5 |
 | Relay republish interval | Derived: `max(ttl - 86400, ttl / 2, 60)` | Derived from TTL | Computed from relay blob TTL. Floor of 60s prevents spin loop at very small TTLs. | §10.5 |
 

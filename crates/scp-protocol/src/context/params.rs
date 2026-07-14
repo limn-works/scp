@@ -871,6 +871,94 @@ pub struct ContextParams {
     /// check is performed — any valid DID can join.
     #[serde(default)]
     pub sybil_policy: Option<crate::trust::sybil::ContextSybilPolicy>,
+
+    /// Default per-stream credit window, in chunks, applied when an
+    /// `OutletStreamOpen` does not declare an explicit `credit_window`
+    /// (spec §5.4.5, §9.18.B). A stream opens with this many chunks of
+    /// headroom; each Data/Progress chunk decrements credit, and a signed
+    /// `OutletStreamCredit` grant tops it back up. Default `32`.
+    #[serde(default = "default_stream_window_default")]
+    pub stream_window_default: u32,
+
+    /// Seconds the streaming framework waits, after credit reaches `0` and
+    /// no valid grant arrives, before cancelling the stream with the
+    /// `SCP-OUTLET-6133` `execution.credit-stall` terminal error
+    /// (spec §5.4.5, §9.18.B). Default `30`.
+    #[serde(default = "default_stream_credit_stall_secs")]
+    pub stream_credit_stall_secs: u32,
+
+    /// Seconds the framework allows an executor to emit the terminal chunk
+    /// after an `OutletCancel` is received before forcing closure with the
+    /// `SCP-OUTLET-6135` `execution.cancel-ack-timeout` error
+    /// (spec §5.4.5, §9.18.B). Default `5`.
+    #[serde(default = "default_stream_cancel_ack_secs")]
+    pub stream_cancel_ack_secs: u32,
+
+    /// Period, in seconds, of the receiver-side authoritative UCAN
+    /// revocation re-check timer that runs for a stream's entire active
+    /// lifetime (spec §5.4.5 "Revocation re-check cadence", §9.18.B).
+    /// Range `[1, 60]`. Default `10`.
+    #[serde(default = "default_stream_ucan_recheck_secs")]
+    pub stream_ucan_recheck_secs: u32,
+
+    /// Maximum concurrent inbound streams a single immediate-previous-hop
+    /// invoker DID may hold open against this context (spec §5.4.5 round-5
+    /// per-invoker admission tier, §9.18.B). Bounds the `DoS` surface a single
+    /// neighbour can mount. Default `8`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_invoker")]
+    pub max_concurrent_inbound_streams_per_invoker: u32,
+
+    /// Maximum concurrent inbound streams a single origin invoker (the
+    /// outermost UCAN `iss`) may hold open, tracked by the operator across
+    /// every interface it hosts (spec §5.4.5 round-5 per-origin-invoker
+    /// admission tier, §9.18.B). Bounds fan-out from one origin regardless
+    /// of delegation-chain rewriting. Default `16`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_origin_invoker")]
+    pub max_concurrent_inbound_streams_per_origin_invoker: u32,
+
+    /// Maximum concurrent inbound streams against any one outlet across all
+    /// invokers (spec §5.4.5 round-5 per-outlet admission tier, §9.18.B).
+    /// Bounds total fan-in to a single outlet. Default `128`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_outlet")]
+    pub max_concurrent_inbound_streams_per_outlet: u32,
+}
+
+/// §9.18.B default for [`ContextParams::stream_window_default`] (chunks).
+const fn default_stream_window_default() -> u32 {
+    32
+}
+
+/// §9.18.B default for [`ContextParams::stream_credit_stall_secs`] (seconds).
+const fn default_stream_credit_stall_secs() -> u32 {
+    30
+}
+
+/// §9.18.B default for [`ContextParams::stream_cancel_ack_secs`] (seconds).
+const fn default_stream_cancel_ack_secs() -> u32 {
+    5
+}
+
+/// §9.18.B default for [`ContextParams::stream_ucan_recheck_secs`] (seconds).
+const fn default_stream_ucan_recheck_secs() -> u32 {
+    10
+}
+
+/// §9.18.B default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_invoker`].
+const fn default_max_concurrent_inbound_streams_per_invoker() -> u32 {
+    8
+}
+
+/// §9.18.B default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_origin_invoker`].
+const fn default_max_concurrent_inbound_streams_per_origin_invoker() -> u32 {
+    16
+}
+
+/// §9.18.B default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_outlet`].
+const fn default_max_concurrent_inbound_streams_per_outlet() -> u32 {
+    128
 }
 
 impl Default for ContextParams {
@@ -902,6 +990,16 @@ impl Default for ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            stream_window_default: default_stream_window_default(),
+            stream_credit_stall_secs: default_stream_credit_stall_secs(),
+            stream_cancel_ack_secs: default_stream_cancel_ack_secs(),
+            stream_ucan_recheck_secs: default_stream_ucan_recheck_secs(),
+            max_concurrent_inbound_streams_per_invoker:
+                default_max_concurrent_inbound_streams_per_invoker(),
+            max_concurrent_inbound_streams_per_origin_invoker:
+                default_max_concurrent_inbound_streams_per_origin_invoker(),
+            max_concurrent_inbound_streams_per_outlet:
+                default_max_concurrent_inbound_streams_per_outlet(),
         }
     }
 }
@@ -1064,6 +1162,14 @@ mod tests {
         assert!(params.projection_policy.is_none());
         assert!(params.participation_requirements.is_empty());
         assert!(params.capability_requirements.is_empty());
+        // §9.18.B streaming defaults (SCP-OUT-034 AC1).
+        assert_eq!(params.stream_window_default, 32);
+        assert_eq!(params.stream_credit_stall_secs, 30);
+        assert_eq!(params.stream_cancel_ack_secs, 5);
+        assert_eq!(params.stream_ucan_recheck_secs, 10);
+        assert_eq!(params.max_concurrent_inbound_streams_per_invoker, 8);
+        assert_eq!(params.max_concurrent_inbound_streams_per_origin_invoker, 16);
+        assert_eq!(params.max_concurrent_inbound_streams_per_outlet, 128);
     }
 
     #[test]
@@ -1127,6 +1233,13 @@ mod tests {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            stream_window_default: 32,
+            stream_credit_stall_secs: 30,
+            stream_cancel_ack_secs: 5,
+            stream_ucan_recheck_secs: 10,
+            max_concurrent_inbound_streams_per_invoker: 8,
+            max_concurrent_inbound_streams_per_origin_invoker: 16,
+            max_concurrent_inbound_streams_per_outlet: 128,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1274,6 +1387,7 @@ mod tests {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            ..ContextParams::default()
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1338,6 +1452,7 @@ mod tests {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            ..ContextParams::default()
         };
 
         let json = serde_json::to_string(&params).unwrap();

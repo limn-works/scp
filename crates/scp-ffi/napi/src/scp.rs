@@ -25,10 +25,11 @@ use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
 
-// `Buffer` is referenced only by the in-memory-custody-gated full-stack test
-// methods (`fullstackSendMessage` / `fullstackDecryptMessage`); production
-// `identity_create` uses the fully-qualified path for its `testing_seed` arg.
-#[cfg(feature = "allow_in_memory_custody")]
+// `Buffer` is used unconditionally by the §5.4.5 streaming-outlet pure-wrapper
+// methods (`outletStreamVerifyChunkSignature` /
+// `outletStreamComputeCaveatsBinding` / `outletStreamPollNext`) as well as the
+// in-memory-custody-gated full-stack test methods; production `identity_create`
+// uses the fully-qualified path for its `testing_seed` arg.
 use napi::bindgen_prelude::Buffer;
 
 use crate::context::{
@@ -2909,6 +2910,149 @@ impl Scp {
     ) -> napi::Result<NapiOutletVerificationResult> {
         crate::napi_check_handle!(&self.inner.core, handle);
         crate::outlets::outlet_verify_on(&self.inner, handle, outlet_id).await
+    }
+
+    // ===== §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8a) =====
+
+    /// Opens a §5.4.5 streaming outlet invocation, returning a `StreamHandleId`
+    /// PROMPTLY (Commit transition — never block-until-terminal).
+    ///
+    /// The UCAN is validated ONCE at open via the full 11-step ADR-016 pipeline;
+    /// the invoker is pinned for the stream's lifetime. Drive the stream via
+    /// `outletStreamPollNext` / `_grantCredit` / `_cancel` / `_terminate` with
+    /// the SAME `caller_did`.
+    #[napi(js_name = "outletStreamOpen")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn outlet_stream_open(
+        &self,
+        handle: &NapiContextHandle,
+        outlet_id: String,
+        input_json: String,
+        caller_did: String,
+        ucan_token: String,
+        proof_tokens: Option<Vec<String>>,
+        spending_ucan: Option<String>,
+        timeout_ms: Option<u32>,
+        estimated_chunk_count: Option<u32>,
+    ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
+        crate::outlet_stream::outlet_stream_open_on(
+            &self.inner,
+            handle,
+            outlet_id,
+            input_json,
+            caller_did,
+            ucan_token,
+            proof_tokens,
+            spending_ucan,
+            timeout_ms,
+            estimated_chunk_count,
+        )
+        .await
+    }
+
+    /// Drains one chunk from a live stream, awaiting the pump until a chunk
+    /// arrives or the stream closes. Returns the JSON-serialized
+    /// `OutletStreamChunk` bytes, or `None` at the terminal (which evicts the
+    /// stream). An unknown/evicted handle is a DISTINCT error, never `None`.
+    #[napi(js_name = "outletStreamPollNext")]
+    pub async fn outlet_stream_poll_next(&self, handle_id: String) -> napi::Result<Option<Buffer>> {
+        crate::outlet_stream::outlet_stream_poll_next_on(&self.inner, &handle_id)
+            .await
+            .map(|opt| opt.map(Buffer::from))
+    }
+
+    /// Grants `grant` additional billable chunks of credit to a live stream. The
+    /// bridge signs the `OutletStreamCredit` internally under the pinned
+    /// invoker's custody key and auto-assigns the monotonic sequence, so the
+    /// caller supplies only a `u32` — no key access, no replay-counter tracking.
+    #[napi(js_name = "outletStreamGrantCredit")]
+    pub async fn outlet_stream_grant_credit(
+        &self,
+        handle_id: String,
+        caller_did: String,
+        grant: u32,
+    ) -> napi::Result<()> {
+        crate::outlet_stream::outlet_stream_grant_credit_on(
+            &self.inner,
+            &handle_id,
+            &caller_did,
+            grant,
+        )
+        .await
+    }
+
+    /// Signs and applies a stream cancel at the runtime-derived cursor
+    /// (CRITICAL #3 — the bridge never supplies a `next_seq`).
+    #[napi(js_name = "outletStreamCancel")]
+    pub async fn outlet_stream_cancel(
+        &self,
+        handle_id: String,
+        caller_did: String,
+    ) -> napi::Result<()> {
+        crate::outlet_stream::outlet_stream_cancel_on(&self.inner, &handle_id, &caller_did).await
+    }
+
+    /// Forces a framework terminal chunk. `slug` selects a closed-set terminal
+    /// reason; the canonical code is derived internally from the reason;
+    /// `message` is a human suffix.
+    #[napi(js_name = "outletStreamTerminate")]
+    pub async fn outlet_stream_terminate(
+        &self,
+        handle_id: String,
+        caller_did: String,
+        slug: String,
+        message: String,
+    ) -> napi::Result<()> {
+        crate::outlet_stream::outlet_stream_terminate_on(
+            &self.inner,
+            &handle_id,
+            &caller_did,
+            &slug,
+            &message,
+        )
+        .await
+    }
+
+    /// Pure wrapper: verifies a chunk's operator signature (§5.4.5).
+    #[napi(js_name = "outletStreamVerifyChunkSignature")]
+    pub fn outlet_stream_verify_chunk_signature(
+        &self,
+        chunk_bytes: Buffer,
+        operator_pk: Buffer,
+        context_id: String,
+        outlet_id: String,
+        caveats_binding: Buffer,
+    ) -> napi::Result<bool> {
+        crate::outlet_stream::outlet_stream_verify_chunk_signature_impl(
+            chunk_bytes.as_ref(),
+            operator_pk.as_ref(),
+            &context_id,
+            &outlet_id,
+            caveats_binding.as_ref(),
+        )
+        .map_err(napi::Error::from)
+    }
+
+    /// Pure wrapper: computes the §5.4.5 `caveats_binding` (32 bytes).
+    #[napi(js_name = "outletStreamComputeCaveatsBinding")]
+    pub fn outlet_stream_compute_caveats_binding(
+        &self,
+        ucan_cid: Buffer,
+        request_id: Buffer,
+        invoker_did: String,
+        estimated_chunk_count: u32,
+        effective_caveats_jcs: Buffer,
+    ) -> napi::Result<Buffer> {
+        crate::outlet_stream::outlet_stream_compute_caveats_binding_impl(
+            ucan_cid.as_ref(),
+            request_id.as_ref(),
+            &invoker_did,
+            estimated_chunk_count,
+            effective_caveats_jcs.as_ref(),
+        )
+        .map(Buffer::from)
+        .map_err(napi::Error::from)
     }
 
     /// Per-instance equivalent of the free-function `outlet_invoke_cross_context`.

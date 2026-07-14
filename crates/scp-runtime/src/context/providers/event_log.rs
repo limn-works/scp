@@ -691,6 +691,38 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         payload: EventPayload,
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
+        // §5.4.5 `chunks_billed` wire-invariant (C1) — enforced at the
+        // event-log APPEND boundary so ANY malformed streaming
+        // `OutletInvokedEvent`, from any source, is durably wire-rejected
+        // ("refused at log-insert time, not accepted-and-flagged"). The
+        // appender holds only the event (opaque `payload` bytes), NOT the
+        // chunk sequence or `cancel_ack_seq`, so it enforces the
+        // event-LOCAL bound `chunks_billed <= stream_chunk_count`
+        // (`verify_outlet_invoked_event_local`); the tighter
+        // manifest-derived equality is enforced upstream at chunk-emission
+        // time by the dispatch pump's gate. Only payloads that DECODE as an
+        // `OutletInvokedEvent` are checked: the `OutletInvoked`
+        // discriminator is also carried by the unary saga's join-record
+        // payload (a distinct JSON shape lacking the required event fields),
+        // which does not decode here and is passed through untouched. This
+        // keeps the `scp-event-log` crate runtime-independent — the invariant
+        // lives in `scp-runtime`, the crate only owns the error variant.
+        if event_type == EventType::OutletInvoked
+            && let Ok(invoked) = serde_json::from_slice::<
+                scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+            >(&payload.data)
+        {
+            crate::context::outlets::stream::verify_outlet_invoked_event_local(&invoked).map_err(
+                |err| {
+                    let log_err =
+                        crate::context::outlets::stream::chunks_billed_error_to_event_log_error(
+                            err,
+                        );
+                    ContextCreationError::EventLogFailed(log_err.to_string())
+                },
+            )?;
+        }
+
         let (seq, event) = {
             let mut logs = self
                 .logs
@@ -861,6 +893,134 @@ mod tests {
 
         let entries = provider.entries(&ctx_id).unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// Builds a JSON-encoded `OutletInvokedEvent` payload with the given
+    /// chunk/billed counts (the encoding the saga append path uses:
+    /// `serde_json::to_vec`), so the provider's append-boundary check can
+    /// decode and enforce the §5.4.5 wire-invariant.
+    fn outlet_invoked_payload(stream_chunk_count: u32, chunks_billed: u32) -> EventPayload {
+        use scp_protocol::context::outlets::OutletStatus;
+        use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
+        use scp_protocol::context::outlets::stream::StreamTerminalStatus;
+        let event = OutletInvokedEvent {
+            request_id: "00000000000000000000000000000001".to_owned(),
+            outlet_id: "outlet-x".to_owned(),
+            invoker_did: scp_did::DID("did:dht:z6MkInvoker".to_owned()),
+            status: OutletStatus::Success,
+            execution_time_ms: 5,
+            input_hash: "0".repeat(64),
+            output_hash: None,
+            cost: None,
+            stream_chunk_count,
+            chunks_billed,
+            stream_manifest_hash: [0x11; 32],
+            stream_terminal_status: StreamTerminalStatus::Ok,
+            audit_anomaly: None,
+        };
+        EventPayload {
+            data: serde_json::to_vec(&event).unwrap(),
+        }
+    }
+
+    /// §5.4.5 C1: a well-formed streaming `OutletInvokedEvent`
+    /// (`chunks_billed <= stream_chunk_count`) appends; a tampered one
+    /// (`chunks_billed > stream_chunk_count`) is wire-rejected at
+    /// `append_event` with the `ChunksBilledMismatch` error surfaced.
+    #[tokio::test]
+    async fn append_rejects_outlet_invoked_chunks_billed_over_count() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [7u8; 32];
+        provider.init_event_log(&ctx_id).await.unwrap();
+
+        // Well-formed: 3 billed of 5 total chunks — appends.
+        provider
+            .append_event(
+                &ctx_id,
+                EventType::OutletInvoked,
+                "did:dht:z6MkInvoker",
+                outlet_invoked_payload(5, 3),
+                1_700_000_000,
+            )
+            .await
+            .expect("well-formed OutletInvokedEvent must append");
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 1);
+
+        // Tampered: 6 billed of 5 total — impossible; must be rejected and
+        // NOT appended.
+        let err = provider
+            .append_event(
+                &ctx_id,
+                EventType::OutletInvoked,
+                "did:dht:z6MkInvoker",
+                outlet_invoked_payload(5, 6),
+                1_700_000_000,
+            )
+            .await
+            .expect_err("chunks_billed > stream_chunk_count must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunks_billed mismatch"),
+            "error must surface the §5.4.5 ChunksBilledMismatch: {msg}"
+        );
+        assert!(
+            msg.contains("recorded=6") && msg.contains("reference=5"),
+            "error must carry recorded/reference counts: {msg}"
+        );
+        // The rejected event did NOT land — the log still has exactly one.
+        assert_eq!(
+            provider.entries(&ctx_id).unwrap().len(),
+            1,
+            "wire-rejected event must not be appended"
+        );
+
+        // Boundary: chunks_billed == stream_chunk_count is admissible.
+        provider
+            .append_event(
+                &ctx_id,
+                EventType::OutletInvoked,
+                "did:dht:z6MkInvoker",
+                outlet_invoked_payload(4, 4),
+                1_700_000_000,
+            )
+            .await
+            .expect("chunks_billed == stream_chunk_count must append");
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 2);
+    }
+
+    /// §5.4.5 C1: the unary saga's `OutletInvoked` join-record payload (a
+    /// distinct JSON shape lacking the streaming event fields) is passed
+    /// through untouched — the append-boundary check only fires on payloads
+    /// that decode as an `OutletInvokedEvent`.
+    #[tokio::test]
+    async fn append_passes_through_saga_outlet_invoked_join_payload() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [8u8; 32];
+        provider.init_event_log(&ctx_id).await.unwrap();
+
+        // Mirrors the saga.rs join payload: no request_id/status/etc., so it
+        // does NOT decode as an OutletInvokedEvent and is not checked.
+        let saga_payload = serde_json::json!({
+            "saga_id": "saga-1",
+            "outlet_invoked_event_id": "evt-1",
+            "caller_context_id": "aa",
+            "outlet_registration_id": "reg-1",
+            "chain_depth": 2,
+            "timestamp_ms": 1_700_000_000_000_u64,
+        });
+        provider
+            .append_event(
+                &ctx_id,
+                EventType::OutletInvoked,
+                "did:dht:z6MkCaller",
+                EventPayload {
+                    data: serde_json::to_vec(&saga_payload).unwrap(),
+                },
+                1_700_000_000,
+            )
+            .await
+            .expect("saga join-record payload must pass through untouched");
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 1);
     }
 
     #[tokio::test]

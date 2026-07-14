@@ -47,10 +47,11 @@
 //!      per-context tracker and the per-origin-invoker counter on the
 //!      operator-scoped [`OriginAdmissionTracker`] (§05-contexts.md:448),
 //!      both under the sanctioned lock order,
-//!    - publishes the `chunks_billed` value into the
-//!      `OutletInvokedEvent` field and verifies it via
-//!      [`super::stream::verify_chunks_billed`] before handing the
-//!      event to the event-log appender.
+//!    - publishes the frontier-derived `chunks_billed` value into the
+//!      `OutletInvokedEvent` field; the event-local wire-invariant
+//!      `chunks_billed <= stream_chunk_count` is then enforced at the
+//!      event-log append boundary via
+//!      [`super::stream::verify_outlet_invoked_event_local`].
 //!
 //! See `.docs/specs/05-contexts.md` §5.4.5 for the spec source.
 
@@ -97,15 +98,15 @@ use crate::context::ContextHandle;
 use super::invoke::{
     HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink,
     QueryMisdeclarationSink, StreamGateOutcome, StreamSettlement, StreamSettlementSink,
-    accrue_data_chunk_if_billable, apply_stream_chunk_gate, invoke_outlet,
+    accrue_data_chunk_if_billable, apply_stream_chunk_gate, ingest_stream_chunk, invoke_outlet,
     release_stream_admission,
 };
 use super::stream::{
     AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, GrantError, OpenError,
     OriginAdmissionTracker, StreamAdmissionTracker, StreamEscrow, StreamIdentity,
-    admission_outcome_to_slug, coerce_estimated_chunk_count, compute_chunks_billed_ref,
-    cumulative_reserve_amount, effective_max_billable_chunks, enforce_estimated_chunk_count_bound,
-    open_error_to_slug, verify_chunks_billed,
+    admission_outcome_to_slug, coerce_estimated_chunk_count, cumulative_reserve_amount,
+    effective_max_billable_chunks, enforce_estimated_chunk_count_bound, open_error_to_slug,
+    verify_outlet_invoked_event_local,
 };
 
 use scp_protocol::context::outlets::registry::OutletRegistry;
@@ -828,16 +829,32 @@ pub struct StreamCloseSummary {
     pub billed_amount: Amount,
     /// Refund credited back to the invoker.
     pub refund_amount: Amount,
-    /// `chunks_billed` for the `OutletInvokedEvent` (count of `Data`
-    /// leaves at or below `cancel_ack_seq`).
+    /// `chunks_billed` as counted by the ESCROW LEDGER (`settle_at_close`).
+    /// This is the runtime's economic self-tally; it is cross-checked
+    /// against the manifest-derived [`Self::manifest_billed`] at close and,
+    /// on divergence, the event records the manifest value + an
+    /// `AuditAnomaly` (§5.4.5 round-8 F2). Count of `Data` leaves at or
+    /// below `cancel_ack_seq`.
     pub billed_count: u32,
-    /// Total chunks emitted (Data + Progress + terminal).
+    /// Total chunks emitted (Data + Progress + terminal) — the running
+    /// `MerkleFrontier::leaf_count`.
     pub stream_chunk_count: u32,
     /// `cancel_ack_seq` if cancel arrived, else `None`.
     pub cancel_ack_seq: Option<u64>,
-    /// Manifest of all chunks the runtime emitted on the stream.
-    /// Required by the §5.4.5 wire-rejection rule at log-insert time.
-    pub manifest: Vec<OutletStreamChunk>,
+    /// RFC-6962 manifest Merkle root over the emitted chunk sequence,
+    /// produced incrementally by the [`MerkleFrontier`](scp_protocol::context::outlets::stream::MerkleFrontier).
+    /// Equal to `compute_chunk_manifest_root` over the same sequence
+    /// (ADR-061 seal-phase artifact). Replaces the retained chunk Vec.
+    pub manifest_root: [u8; 32],
+    /// Manifest-derived `chunks_billed` — the frontier's `billed_count`
+    /// (`Data` leaves at/below the cancel-ack ceiling). This is the
+    /// §5.4.5-authoritative billed value the `OutletInvokedEvent` and the
+    /// settlement receipt anchor to; the escrow ledger's
+    /// [`Self::billed_count`] is cross-checked against it.
+    pub manifest_billed: u32,
+    /// Terminal-derived event fields (`output_hash`,
+    /// `stream_terminal_status`, legacy `status`), folded incrementally.
+    pub terminal_summary: super::invoke::StreamTerminalSummary,
 }
 
 impl StreamSessionHandle {
@@ -894,15 +911,15 @@ impl StreamSessionHandle {
     /// `reserved_top_up` is the `cost_per_chunk × grant` amount the caller
     /// (the FFI bridge) has ALREADY reserved (DEBITED) against the
     /// invoker's `MemberBudgetTracker` via
-    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_grant`]
+    /// [`Supervisor::outlet_stream_reserve_grant`](crate::context::supervisor::Supervisor::outlet_stream_reserve_grant)
     /// BEFORE invoking this method (E2 remediation). The
     /// `InsufficientFunds` / `Overflow` decision therefore lives entirely in
-    /// the manager — the only lock holder. If THIS method rejects the
+    /// the actor — the only lock holder. If THIS method rejects the
     /// grant (signature / replay) after the caller already reserved, the
     /// caller MUST reverse the debit via
-    /// [`crate::context::manager::ContextManager::outlet_stream_reverse_spend`]
+    /// [`Supervisor::outlet_stream_reverse_grant`](crate::context::supervisor::Supervisor::outlet_stream_reverse_grant)
     /// — the §5.4.5 atomicity invariant is upheld jointly by the
-    /// (manager debit) → (handle apply) → (manager reverse on apply-reject)
+    /// (actor debit) → (handle apply) → (actor reverse on apply-reject)
     /// sequence.
     ///
     /// Wakes the pump via the grant notifier so a stalled executor can
@@ -1613,7 +1630,7 @@ fn counter_error_to_open_rejection(err: &crate::trust::CounterError) -> OpenStre
 ///
 /// Production FFI bridges always supply a non-empty `ucan_cid`
 /// (derived from the validated UCAN's encoded JWT — see
-/// `crates/scp-ffi/src/outlet_stream.rs::py_outlet_invoke_stream` and
+/// `crates/scp-ffi/src/outlet_stream.rs::outlet_stream_open` and
 /// its NAPI / `UniFFI` mirrors). An empty `ucan_cid` is the sentinel
 /// for legacy unit-test fixtures that hand-construct
 /// `OpenStreamParams` outside the bridge path. Those fixtures
@@ -2213,8 +2230,8 @@ where
     // delivered stream. We therefore (i) pass `None` to the inner
     // `invoke_outlet`'s sink, (ii) snapshot input_hash + identifiers
     // before forwarding the input value, and (iii) emit the event
-    // ourselves in the pump settlement block over the outer
-    // `emitted_chunks` manifest.
+    // ourselves in the pump settlement block from the outer pump's
+    // incremental `MerkleFrontier` (manifest_root + manifest_billed).
     let input_hash = scp_protocol::context::outlets::lifecycle::sha256_json(&input);
     let event_context_id = context.context_id().to_owned();
     let event_outlet_id: OutletId = outlet_id.clone();
@@ -2695,7 +2712,20 @@ async fn run_stream_pump_v2(
     request_id: RequestId,
     event_inputs: PumpEventEmissionInputs,
 ) {
-    let mut emitted_chunks: Vec<OutletStreamChunk> = Vec::new();
+    // §5.4.5 / ADR-061: fold each emitted (renumbered, re-signed) chunk
+    // into the O(log n) RFC-6962 Merkle frontier + O(1) terminal summary
+    // as it is emitted — the pump NEVER retains the full payload set for
+    // the manifest (ADR-061: "never accumulates the full payload set in
+    // memory"). The frontier's billing ceiling is unbounded
+    // (`MerkleFrontier::new`): the pump drops above-cancel-ack `Data`
+    // chunks at the gate BEFORE they reach `ingest_stream_chunk`, so every
+    // pushed `Data` chunk is at/below the eventual cancel-ack sequence and
+    // the unbounded ceiling yields the same billed count as the pinned one
+    // (equivalently, `compute_chunks_billed_ref(emitted_manifest,
+    // cancel_ack_seq)` over the emitted set — none of which exceeds the
+    // ceiling).
+    let mut frontier = scp_protocol::context::outlets::stream::MerkleFrontier::new();
+    let mut terminal_summary = super::invoke::StreamTerminalSummary::default();
     let mut next_seq: u64 = 0;
     let mut parked: Option<OutletStreamChunk> = None;
 
@@ -2807,7 +2837,7 @@ async fn run_stream_pump_v2(
                 // `try_build_signed_chunk` already logged the cause.
                 break;
             };
-            emitted_chunks.push(chunk.clone());
+            ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
             let _ = outer_tx.send(chunk).await;
             break;
         }
@@ -2861,7 +2891,7 @@ async fn run_stream_pump_v2(
                     else {
                         break;
                     };
-                    emitted_chunks.push(chunk.clone());
+                    ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
                     let _ = outer_tx.send(chunk).await;
                     break;
                 }
@@ -2873,7 +2903,7 @@ async fn run_stream_pump_v2(
                     else {
                         break;
                     };
-                    emitted_chunks.push(chunk.clone());
+                    ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
                     let _ = outer_tx.send(chunk).await;
                     break;
                 }
@@ -2923,7 +2953,7 @@ async fn run_stream_pump_v2(
                     else {
                         break;
                     };
-                    emitted_chunks.push(chunk.clone());
+                    ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
                     let _ = outer_tx.send(chunk).await;
                     break;
                 }
@@ -2935,7 +2965,7 @@ async fn run_stream_pump_v2(
                     else {
                         break;
                     };
-                    emitted_chunks.push(chunk.clone());
+                    ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
                     let _ = outer_tx.send(chunk).await;
                     break;
                 }
@@ -3078,7 +3108,7 @@ async fn run_stream_pump_v2(
                     // post-forward cursor), never half-stamped.
                     g.next_emission_seq = next_seq;
                 }
-                emitted_chunks.push(final_chunk.clone());
+                ingest_stream_chunk(&mut frontier, &mut terminal_summary, &final_chunk);
                 let terminal = final_chunk.payload.is_terminal();
                 if outer_tx.send(final_chunk).await.is_err() {
                     break;
@@ -3171,44 +3201,44 @@ async fn run_stream_pump_v2(
             billed_amount,
             refund_amount,
             billed_count,
-            stream_chunk_count: u32::try_from(emitted_chunks.len()).unwrap_or(u32::MAX),
+            stream_chunk_count: u32::try_from(frontier.leaf_count()).unwrap_or(u32::MAX),
             cancel_ack_seq,
-            manifest: emitted_chunks,
+            manifest_root: frontier.root(),
+            manifest_billed: u32::try_from(frontier.billed_count()).unwrap_or(u32::MAX),
+            terminal_summary,
         }
     };
 
     // §5.4.5 manifest-derived reference `chunks_billed` (count of `Data`
-    // leaves at or below `cancel_ack_seq`). Computed ONCE here from the
-    // operator-signed outer manifest so BOTH the audit event AND the
-    // money-moving settlement receipt anchor to the SAME value. The pump's
-    // running `summary.billed_count` is a runtime self-count that agrees
-    // with this reference on the honest path and diverges only on a runtime
+    // leaves at or below `cancel_ack_seq`). Produced by the RFC-6962
+    // Merkle frontier as chunks were emitted (`frontier.billed_count`, now
+    // carried on the summary) — the pump drops above-cancel-ack `Data`
+    // chunks before ingest, so this equals
+    // `compute_chunks_billed_ref(emitted_manifest, cancel_ack_seq)` over
+    // the operator-signed emitted set WITHOUT retaining that set. BOTH the
+    // audit event AND the money-moving settlement receipt anchor to this
+    // SAME value. The pump's running `summary.billed_count` (escrow ledger)
+    // agrees on the honest path and diverges only on a runtime
     // self-mismatch — precisely the case where neither the event nor the
     // receipt may out-run the signed manifest.
-    let manifest_reference = reference_chunks_billed(&summary.manifest, summary.cancel_ack_seq);
+    let manifest_reference = summary.manifest_billed;
 
     // §5.4.5 OutletInvokedEvent emission. The dispatch pump owns the
     // outer manifest (renumbered, cancel-ack-truncated) — the only
     // manifest that matches what SDK consumers actually received. We
-    // (i) verify `chunks_billed` against the manifest before emitting
-    // (matches the §5.4.5 wire-rejection rule the runtime applies at
-    // log-insert time, surfacing drift here rather than in the
-    // event-log appender), and (ii) record exactly one event per
-    // stream via the `OutletInvokedEventSink::record` trait method.
+    // (i) run the event-local wire-invariant before emitting (the same
+    // invariant the event-log appender enforces at log-insert, surfacing
+    // drift here as defense-in-depth), and (ii) record exactly one event
+    // per stream via the `OutletInvokedEventSink::record` trait method.
     if let Some(sink) = event_inputs.sink.as_ref() {
         // §5.4.5 round-8 (F2): on a self-consistency drift between the
-        // pump's running `billed_count` and the manifest-derived
-        // reference, DO NOT drop the event. The previous behaviour
-        // silently discarded the audit record, erasing the divergence.
-        // Instead we emit the event with `chunks_billed` set to the
-        // manifest-derived reference (the appender-accepted value — so
-        // the event passes the §5.4.5 wire-rejection rule at log-insert,
-        // verified by `verify_summary_chunks_billed` below) AND attach an
-        // `AuditAnomaly::ChunksBilledSelfMismatch` so the divergence is
-        // durably attributable. `build_streaming_outlet_event` already
-        // derives `chunks_billed` from the (cancel-ack-truncated) manifest
-        // — that is the reference value; we cross-check it here and only
-        // emit when it matches `reference_chunks_billed`.
+        // pump's running `billed_count` (escrow ledger) and the
+        // frontier-derived reference, DO NOT drop the event. The previous
+        // behaviour silently discarded the audit record, erasing the
+        // divergence. Instead we emit the event with `chunks_billed` set to
+        // the frontier-derived reference (the appender-accepted value) AND
+        // attach an `AuditAnomaly::ChunksBilledSelfMismatch` so the
+        // divergence is durably attributable.
         let pump_recorded = summary.billed_count;
         let audit_anomaly = if pump_recorded == manifest_reference {
             None
@@ -3234,25 +3264,30 @@ async fn run_stream_pump_v2(
             &event_inputs.invoker_did,
             event_inputs.input_hash.clone(),
             u64::try_from(event_inputs.start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            &summary.manifest,
+            summary.stream_chunk_count,
+            manifest_reference,
+            summary.manifest_root,
+            &summary.terminal_summary,
             audit_anomaly,
         );
-        // The emitted event carries the manifest-derived `chunks_billed`,
-        // so it MUST pass the wire-rejection check the appender applies.
-        // If it does not, the manifest itself is malformed (not a
-        // pump-vs-manifest divergence) — drop and log rather than emit a
-        // record the appender will reject.
-        if let Err(verify_err) = verify_chunks_billed(
-            &summary.manifest,
-            event.chunks_billed,
-            summary.cancel_ack_seq,
-        ) {
+        // Defense-in-depth advisory pre-record check: the event carries the
+        // frontier-derived `chunks_billed`, so it MUST satisfy the
+        // event-local wire-invariant the appender enforces at log-insert
+        // (`chunks_billed <= stream_chunk_count`). This can only fail on a
+        // frontier accounting bug (billed out-running the leaf count) — the
+        // appender would reject it, so we drop + log here rather than emit a
+        // record the appender will refuse. The FULL manifest-derivation
+        // (`chunks_billed == compute_chunks_billed_ref(chunks, ...)`) is NOT
+        // re-checkable here without the chunk Vec (deliberately dropped per
+        // ADR-061); it was enforced at emission time by the gate that drops
+        // above-ceiling `Data` chunks before ingest.
+        if let Err(verify_err) = verify_outlet_invoked_event_local(&event) {
             tracing::error!(
                 request_id = %hex::encode(request_id),
                 outlet_id = %event_inputs.outlet_id,
                 error = ?verify_err,
-                "OutletInvokedEvent dropped: manifest-derived chunks_billed still fails \
-                 wire-rejection (malformed manifest, not a pump self-mismatch)"
+                "OutletInvokedEvent dropped: event-local wire-invariant failed \
+                 (chunks_billed exceeds stream_chunk_count — frontier accounting bug)"
             );
         } else {
             sink.record(event);
@@ -3322,48 +3357,6 @@ async fn run_stream_pump_v2(
     escrow_guard.settled = true;
 }
 
-// ---------------------------------------------------------------------------
-// Verification helper — chunks_billed at log-insert time
-// ---------------------------------------------------------------------------
-
-/// Verifies that a [`StreamCloseSummary`] is internally consistent:
-/// `billed_count` matches the §5.4.5 reference count derivable from the
-/// manifest + cancel-ack-seq.
-///
-/// Returns the same [`scp_event_log::EventLogError::ChunksBilledMismatch`]
-/// error variant the runtime would surface from
-/// [`scp_event_log::tree::append`] on a wire-rejection so callers can
-/// short-circuit log insertion without importing the runtime stream
-/// types.
-///
-/// # Errors
-///
-/// Returns [`scp_event_log::EventLogError::ChunksBilledMismatch`] when
-/// the recorded `billed_count` does not equal the reference computed
-/// from the manifest.
-pub fn verify_summary_chunks_billed(
-    summary: &StreamCloseSummary,
-) -> Result<(), scp_event_log::EventLogError> {
-    let recorded = summary.billed_count;
-    let cancel_ack_seq = summary.cancel_ack_seq;
-    match verify_chunks_billed(&summary.manifest, recorded, cancel_ack_seq) {
-        Ok(()) => Ok(()),
-        Err(err) => Err(super::stream::chunks_billed_error_to_event_log_error(err)),
-    }
-}
-
-/// Computes the reference `chunks_billed` count from a stream manifest.
-///
-/// Uses the same §5.4.5 predicate the wire-rejection rule applies (count
-/// of `Data` leaves at or below `cancel_ack_seq`). Used by the
-/// integration tests to assert that the pump's recorded `billed_count`
-/// matches the manifest.
-#[must_use]
-pub fn reference_chunks_billed(manifest: &[OutletStreamChunk], cancel_ack_seq: Option<u64>) -> u32 {
-    let ceiling = cancel_ack_seq.unwrap_or(u64::MAX);
-    compute_chunks_billed_ref(manifest, ceiling)
-}
-
 /// Re-derives the settlement receipt's `(billed_amount, refund_amount)` split
 /// from the operator-signed manifest reference count (§5.4.5 Fix-B).
 ///
@@ -3371,7 +3364,7 @@ pub fn reference_chunks_billed(manifest: &[OutletStreamChunk], cancel_ack_seq: O
 /// artifact — unlike the lower-stakes audit event, it MUST bill only what the
 /// operator-signed chunk manifest supports, never the pump's un-verified
 /// escrow-ledger self-count. The dispatch pump therefore hands this the
-/// manifest-derived `reference_chunks_billed` (the SAME value the event's
+/// frontier-derived `manifest_billed` (the SAME value the event's
 /// [`AuditAnomaly::ChunksBilledSelfMismatch`] check keys off) rather than the
 /// ledger's running `billed_count`, and this re-derives the billed/refund split
 /// from it:
@@ -3964,16 +3957,20 @@ mod tests {
         // Summary published.
         let summary = summary_rx.await.expect("summary published");
         assert_eq!(summary.stream_chunk_count, 1);
-        assert_eq!(summary.manifest.len(), 1);
-        // §test #6 invariant: every chunk in the manifest MUST have a
-        // non-placeholder signature. Closes the [0u8;64] deletion gap.
-        for (i, c) in summary.manifest.iter().enumerate() {
-            assert_ne!(
-                c.sig, [0u8; 64],
-                "manifest chunk[{i}] has all-zero sig — placeholder \
-                 emission path re-introduced"
-            );
-        }
+        // The frontier folded exactly the one emitted chunk, so the
+        // manifest root is a real (non-empty) RFC-6962 root, not the
+        // all-zero empty-stream sentinel.
+        assert_ne!(
+            summary.manifest_root, [0u8; 32],
+            "single-chunk stream must have a non-empty manifest root"
+        );
+        // The terminal chunk was non-Data (Error), so nothing is billed.
+        assert_eq!(summary.manifest_billed, 0, "terminal Error is never billed");
+        // §test #6 invariant: the emitted terminal chunk MUST carry a
+        // non-placeholder signature — asserted above on the chunk received
+        // via `outer_rx` (the exact chunk the frontier folded), which is
+        // the SDK-facing wire form. Closes the [0u8;64] deletion gap
+        // without retaining the manifest Vec.
     }
 
     /// Once the pump has broken its loop and published the close
@@ -4188,12 +4185,18 @@ mod tests {
 
             pump_handle.await.expect("pump settles");
             let summary = summary_rx.await.expect("summary published");
-            for c in &summary.manifest {
-                assert_ne!(
-                    c.sig, [0u8; 64],
-                    "manifest chunk has all-zero sig for reason {reason:?}"
-                );
-            }
+            // The emitted terminal chunk's non-placeholder signature is
+            // asserted above on the chunk received via `outer_rx` (the exact
+            // chunk the frontier folded). The manifest root is non-empty
+            // (one chunk folded), and a terminal Error bills nothing.
+            assert_ne!(
+                summary.manifest_root, [0u8; 32],
+                "single-chunk stream must have a non-empty manifest root for reason {reason:?}"
+            );
+            assert_eq!(
+                summary.manifest_billed, 0,
+                "terminal Error is never billed for reason {reason:?}"
+            );
         }
     }
 

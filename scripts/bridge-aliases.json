@@ -2495,6 +2495,97 @@
       ]
     },
     {
+      "canonical": "outlet_stream_open",
+      "category": "outlets",
+      "pyo3": [
+        "outlet_stream_open"
+      ],
+      "uniffi": [
+        "outlet_stream_open"
+      ],
+      "napi": [
+        "outlet_stream_open"
+      ]
+    },
+    {
+      "canonical": "outlet_stream_poll_next",
+      "category": "outlets",
+      "pyo3": [
+        "outlet_stream_poll_next"
+      ],
+      "uniffi": [
+        "outlet_stream_poll_next"
+      ],
+      "napi": [
+        "outlet_stream_poll_next"
+      ]
+    },
+    {
+      "canonical": "outlet_stream_grant_credit",
+      "category": "outlets",
+      "pyo3": [
+        "outlet_stream_grant_credit"
+      ],
+      "uniffi": [
+        "outlet_stream_grant_credit"
+      ],
+      "napi": [
+        "outlet_stream_grant_credit"
+      ]
+    },
+    {
+      "canonical": "outlet_stream_cancel",
+      "category": "outlets",
+      "pyo3": [
+        "outlet_stream_cancel"
+      ],
+      "uniffi": [
+        "outlet_stream_cancel"
+      ],
+      "napi": [
+        "outlet_stream_cancel"
+      ]
+    },
+    {
+      "canonical": "outlet_stream_terminate",
+      "category": "outlets",
+      "pyo3": [
+        "outlet_stream_terminate"
+      ],
+      "uniffi": [
+        "outlet_stream_terminate"
+      ],
+      "napi": [
+        "outlet_stream_terminate"
+      ]
+    },
+    {
+      "canonical": "outlet_stream_verify_chunk_signature",
+      "category": "outlets",
+      "pyo3": [
+        "outlet_stream_verify_chunk_signature"
+      ],
+      "uniffi": [
+        "outlet_stream_verify_chunk_signature"
+      ],
+      "napi": [
+        "outlet_stream_verify_chunk_signature"
+      ]
+    },
+    {
+      "canonical": "outlet_stream_compute_caveats_binding",
+      "category": "outlets",
+      "pyo3": [
+        "outlet_stream_compute_caveats_binding"
+      ],
+      "uniffi": [
+        "outlet_stream_compute_caveats_binding"
+      ],
+      "napi": [
+        "outlet_stream_compute_caveats_binding"
+      ]
+    },
+    {
       "canonical": "broadcast_subscriber_count",
       "category": "broadcast",
       "pyo3": [

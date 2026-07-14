@@ -643,6 +643,22 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "stream_grant_credit",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "InvocationHandle control-plane method that extends the executor's billable credit window (§5.4.5, SCP-OUT-038). Wrapped BEHIND the single public invoke() verb in all four SDKs, consuming a validated Credit newtype (non-zero u32; Credit(0)/negative/>=2**32 raise InvalidGrant), never a raw int: Python InvocationHandle.grant_credit(Credit) (bindings/python/scp_sdk/outlets.py, C11a reference), TypeScript InvocationHandle.grantCredit(Credit) (bindings/typescript/src/outlets.ts, wraps NAPI outlet_stream_grant_credit), Swift InvocationHandle.grantCredit(Credit) (bindings/swift/Sources/SCP/Outlets+Streaming.swift, wraps UniFFI outlet_stream_grant_credit), Kotlin InvocationHandle.grantCredit(Credit) (bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/OutletsStreaming.kt, wraps UniFFI outlet_stream_grant_credit). All dispatch to the outlet_stream_grant_credit bridge export (crates/scp-ffi/**/outlet_stream.rs)."
+        },
+        {
+          "name": "stream_cancel",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "InvocationHandle control-plane method that requests stream cancellation (§5.4.5, SCP-OUT-038). Wrapped BEHIND the single public invoke() verb in all four SDKs; the bridge signs the OutletCancel internally at the runtime-derived cursor, and cancel() on a never-opened handle is a local no-op close: Python InvocationHandle.cancel() (bindings/python/scp_sdk/outlets.py, C11a reference), TypeScript InvocationHandle.cancel() (bindings/typescript/src/outlets.ts, wraps NAPI outlet_stream_cancel), Swift InvocationHandle.cancel() (bindings/swift/Sources/SCP/Outlets+Streaming.swift, wraps UniFFI outlet_stream_cancel), Kotlin InvocationHandle.cancel() (bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/OutletsStreaming.kt, wraps UniFFI outlet_stream_cancel). All dispatch to the outlet_stream_cancel bridge export (crates/scp-ffi/**/outlet_stream.rs)."
         }
       ]
     },
