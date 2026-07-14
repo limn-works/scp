@@ -448,11 +448,8 @@ mod tests {
 
         // The group MUST be present under the digest before destruction — proves
         // this is a real destroy, not a phantom no-op against an empty slot.
-        let before = crypto
-            .export_crypto_state(&digest, Vec::new(), Vec::new())
-            .expect("export under the decoded digest must not error");
         assert!(
-            !before.is_empty(),
+            crypto.context_crypto_present(&digest),
             "precondition: crypto state must be keyed under the digest before destruction"
         );
 
@@ -476,11 +473,8 @@ mod tests {
         // `destroy_mls_group(SHA-256(id))` would have addressed an unkeyed slot
         // (a silent no-op) and the digest slot would still be populated — this
         // assertion FAILS in that case (the ADR-056 fail-open).
-        let after_digest = crypto
-            .export_crypto_state(&digest, Vec::new(), Vec::new())
-            .expect("export under the decoded digest must not error");
         assert!(
-            after_digest.is_empty(),
+            !crypto.context_crypto_present(&digest),
             "ADR-056 FAIL-OPEN: the MLS group SURVIVED under the digest after \
              ephemeral close — destruction keyed off the wrong slot (raw SHA-256(id) \
              instead of the chokepoint digest)"
@@ -488,11 +482,8 @@ mod tests {
 
         // Belt-and-suspenders: nothing was ever keyed under SHA-256(id), so that
         // slot is (and remains) empty regardless of the resolution path.
-        let after_raw = crypto
-            .export_crypto_state(&raw_bytes, Vec::new(), Vec::new())
-            .expect("export under SHA-256(id) must not error");
         assert!(
-            after_raw.is_empty(),
+            !crypto.context_crypto_present(&raw_bytes),
             "no state should ever exist under SHA-256(id) — the pre-ADR-056 double-hash slot"
         );
     }

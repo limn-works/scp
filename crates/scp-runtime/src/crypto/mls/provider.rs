@@ -814,6 +814,23 @@ impl MlsCryptoProvider {
 
 #[allow(clippy::significant_drop_tightening)]
 impl MlsCryptoProvider {
+    /// Residency probe: returns `true` iff live (non-taken) per-context MLS
+    /// crypto state is currently resident on THIS provider under `context_id`.
+    ///
+    /// The birth/destroy paths that stay provider-resident (creation rollback,
+    /// ephemeral / TTL close key destruction) previously proved residency by
+    /// calling `export_crypto_state` and checking the blob was non-empty (it
+    /// short-circuited to EMPTY when the `contexts` entry was absent). ADR-049
+    /// PR-7 (SCP-CRYPTOMOVE-001) moved `export_crypto_state` onto the actor and
+    /// deleted the provider twin; this is its retained, non-serializing
+    /// equivalent for the provider-resident destroy assertions. A context taken
+    /// by an actor is NOT resident here (its entry was removed by
+    /// `take_crypto_state` and recorded in `taken_context_ids`).
+    #[must_use]
+    pub fn context_crypto_present(&self, context_id: &[u8; 32]) -> bool {
+        !self.taken_context_ids.contains(context_id) && self.contexts.contains_key(context_id)
+    }
+
     /// Validates that the creator's identity is valid and the signing key is
     /// accessible.
     ///

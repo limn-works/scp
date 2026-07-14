@@ -3600,27 +3600,27 @@ mod crypto_ops_golden {
         stand_up_two_party(CTX_STR, ALICE, BOB)
     }
 
-    /// Duplicate a provider-resident context into an actor-owned
-    /// [`PerContextState`] (Encrypted mode) holding BYTE-IDENTICAL crypto state:
-    /// export the source's blob, restore it into a throwaway provider, then
-    /// destructively `take` the owned material and seed the actor state. The
-    /// source provider is left untouched (the round-trip runs on the throwaway),
-    /// so the caller can still drive the provider twin for the comparison.
+    /// Move a provider-birthed context into an actor-owned [`PerContextState`]
+    /// (Encrypted mode) via the real ADR-049 PR-7 one-way seam: destructively
+    /// [`take_crypto_state`](MlsCryptoProvider::take_crypto_state) the owned MLS +
+    /// sender-key material off the provider, then seed the actor with it through
+    /// the production [`seed_encrypted_crypto_from_owned`](PerContextState::seed_encrypted_crypto_from_owned)
+    /// primitive.
+    ///
+    /// Post-PR-7 the provider steady-state twins (seal / open / rotate /
+    /// export / …) are DELETED, so there is no longer a provider "twin" to drive
+    /// for a byte-identity comparison — the actor is the sole crypto authority.
+    /// The take is therefore direct (not the old non-destructive
+    /// export→restore→take round-trip): every caller takes each party's crypto
+    /// exactly once and drives all subsequent ops on the actor.
     fn take_into_actor(src: &MlsCryptoProvider, ctx: [u8; 32], local_did: &str) -> PerContextState {
-        let blob = src
-            .export_crypto_state(&ctx, Vec::new(), Vec::new())
-            .expect("source export");
-        assert!(!blob.is_empty(), "source must have exportable crypto state");
-        let dup = MlsCryptoProvider::new(local_did.to_owned(), Arc::new(SystemClock));
-        dup.restore_crypto_state(&ctx, &blob)
-            .expect("restore into throwaway provider");
-        let owned = dup
+        let owned = src
             .take_crypto_state(&ctx)
-            .expect("take owned crypto material");
+            .expect("take owned crypto material off the provider");
         let mut state =
             PerContextState::new_for_test_encrypted(ctx, 0, DID::from(local_did.to_owned()));
         // Exercise the production seed primitive (ADR-049 PR-7) so its shape is
-        // pinned by the golden byte-identity tests in this module.
+        // pinned by these golden tests.
         state.seed_encrypted_crypto_from_owned(owned);
         state
     }

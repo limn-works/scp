@@ -1219,18 +1219,12 @@ mod tests {
         // `create_context` lives under the DECODED digest. `export_crypto_state`
         // returns the serialized state for a keyed context and an EMPTY vec for
         // an unkeyed one (no entry under that key).
-        let under_digest = crypto
-            .export_crypto_state(&digest, Vec::new(), Vec::new())
-            .expect("export under the decoded digest must not error");
         assert!(
-            !under_digest.is_empty(),
+            crypto.context_crypto_present(&digest),
             "crypto state MUST be keyed under the decoded digest"
         );
-        let under_sha256 = crypto
-            .export_crypto_state(&sha256_of_id, Vec::new(), Vec::new())
-            .expect("export under SHA-256(id) must not error");
         assert!(
-            under_sha256.is_empty(),
+            !crypto.context_crypto_present(&sha256_of_id),
             "crypto state MUST NOT be keyed under SHA-256(id) — that would be the \
              pre-ADR-056 double-hash, diverging from state.context_id and the §6.2.4 wire digest"
         );
