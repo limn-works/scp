@@ -46,6 +46,15 @@ const MANAGER_SRC: &str = concat!(
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
 
+// Actor per-context state source — owns the `ContextCryptoState::{seal,open}`
+// steady-state crypto seam. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) moved the seal /
+// open bodies off the `MlsCryptoProvider` (deleted) onto the actor-owned
+// `PerContextState` here, so the seal-internal envelope-pipeline assertions scan
+// this source (the moved code), not `PROVIDER_SRC`. This is a repoint to the new
+// home of the same seal/open pipeline, not a weakening.
+const STATE_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
+
 // Supervisor dispatch source — owns `dispatch_lifecycle_direct`, whose
 // bootstrap arms (Create / Import / Restore) moved to the actor-shape
 // `lifecycle_helpers::{create,import,restore}_context` in the ADR-049
@@ -732,13 +741,16 @@ fn parser_preserves_call_order_through_noncode() {
 // Baseline assertions — currently wired, must pass today
 // ===========================================================================
 
-// Manager level: send_message path calls crypto.seal (full envelope pipeline)
-// seal is in build_encrypted_envelope helper called from send_message
+// Manager level: send_message path calls crypto.seal (full envelope pipeline).
+// ADR-049 PR-7: the seal is invoked from the `build_encrypted_envelope_actor`
+// helper (which calls `crypto_state.seal(...)` on the actor-owned
+// `ContextCryptoState`), reached from `send_message`. Repointed from the deleted
+// `build_encrypted_envelope` provider-twin to its actor successor.
 #[test]
 fn send_message_calls_seal() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", ".seal(")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", ".seal("),
+            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope_actor", ".seal("),
         "send_message path must call crypto.seal (envelope pipeline)"
     );
 }
@@ -1425,30 +1437,34 @@ fn bridge_resume_path_routes_through_restore_on_startup() {
     }
 }
 
-// Provider level: seal calls create_outer_envelope (envelope construction)
+// Actor-state level: `ContextCryptoState::seal` calls create_outer_envelope
+// (envelope construction). Repointed from the deleted provider `seal` to its
+// actor home in `state.rs` (STATE_SRC) — the moved pipeline, not a weakening.
 #[test]
 fn seal_calls_create_outer_envelope() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "create_outer_envelope"),
-        "seal (provider) must call create_outer_envelope"
+        fn_body_contains(STATE_SRC, "seal", "create_outer_envelope"),
+        "seal (actor ContextCryptoState) must call create_outer_envelope"
     );
 }
 
-// Provider level: seal calls encrypt_sender_layer (sender key encryption)
+// Actor-state level: `ContextCryptoState::seal` calls encrypt_sender_layer
+// (sender key encryption). Repointed from the deleted provider `seal`.
 #[test]
 fn seal_calls_encrypt_sender_layer() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "encrypt_sender_layer"),
-        "seal (provider) must call encrypt_sender_layer"
+        fn_body_contains(STATE_SRC, "seal", "encrypt_sender_layer"),
+        "seal (actor ContextCryptoState) must call encrypt_sender_layer"
     );
 }
 
-// Provider level: open calls decrypt_sender_layer
+// Actor-state level: `ContextCryptoState::open` calls decrypt_sender_layer.
+// Repointed from the deleted provider `open` to its actor home in STATE_SRC.
 #[test]
 fn open_calls_decrypt_sender_layer() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "open", "decrypt_sender_layer"),
-        "open (provider) must call decrypt_sender_layer"
+        fn_body_contains(STATE_SRC, "open", "decrypt_sender_layer"),
+        "open (actor ContextCryptoState) must call decrypt_sender_layer"
     );
 }
 
@@ -1457,7 +1473,7 @@ fn open_calls_decrypt_sender_layer() {
 #[test]
 fn encrypt_path_calls_create_outer_envelope_or_seal() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "create_outer_envelope")
+        fn_body_contains(STATE_SRC, "seal", "create_outer_envelope")
             || fn_body_contains(MANAGER_SRC, "send_message", "create_outer_envelope"),
         "send/encrypt path must call create_outer_envelope"
     );
@@ -1469,11 +1485,7 @@ fn encrypt_path_calls_create_outer_envelope_or_seal() {
 fn encrypt_path_calls_create_inner_envelope() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope_raw")
-            || fn_body_contains(
-                MANAGER_SRC,
-                "build_encrypted_envelope",
-                "create_inner_envelope_raw"
-            ),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "create_inner_envelope_raw"),
         "send path must call create_inner_envelope_raw"
     );
 }
@@ -1493,7 +1505,7 @@ fn decrypt_path_calls_verify_inner_signature() {
 fn encrypt_path_calls_wrap_content() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "wrap_content")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", "wrap_content"),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "wrap_content"),
         "send path must call wrap_content"
     );
 }
@@ -1512,7 +1524,7 @@ fn decrypt_path_calls_unwrap_content() {
 #[test]
 fn decrypt_path_calls_strip_padding() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "open", "strip_padding")
+        fn_body_contains(STATE_SRC, "open", "strip_padding")
             || fn_body_contains(MANAGER_SRC, "deliver_incoming", "strip_padding")
             || fn_body_contains(MANAGER_SRC, "verify_and_unwrap", "strip_padding"),
         "receive/decrypt path must call strip_padding"
@@ -1520,7 +1532,7 @@ fn decrypt_path_calls_strip_padding() {
 }
 
 // --- Provenance (#1536) — WIRED (conditional on cross-context source) ---
-// attach_provenance is called in build_encrypted_envelope when
+// attach_provenance is called in the `build_inner_wire` helper when
 // source_provenance is Some (cross-context data flow). For intra-context
 // direct messages source_provenance is None and attach_provenance is not
 // invoked. The pipeline test verifies the code path exists.
@@ -1529,7 +1541,7 @@ fn decrypt_path_calls_strip_padding() {
 fn encrypt_path_references_attach_provenance() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "attach_provenance")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", "attach_provenance"),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "attach_provenance"),
         "send path must reference attach_provenance"
     );
 }
