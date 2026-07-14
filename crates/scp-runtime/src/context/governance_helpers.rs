@@ -985,34 +985,55 @@ pub async fn execute_revoke(
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
-        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "rotate_sender_key failed after access revocation"
-            );
-        } else {
-            // ADR-049 PR-6: advance the rotated local epoch in the authoritative
-            // floor registry (fail-closed).
-            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
-                deps,
-                &context_id_bytes,
-            )?;
-        }
-        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape
-        // and operates directly on `state` + `deps`.
-        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            context_id,
-            &context_id_bytes,
-        )
-        .await
+        // ADR-049 PR-7: Class-S — the epoch bump is sync-persisted fail-closed via
+        // `commit_class_s_keep`; anti-replay backstop is the never-regressing
+        // registry floor (`mirror_forward`, `?`-propagated). M23: sender-key
+        // rotation + distribution stays best-effort (rotate/persist failure logged,
+        // revocation continues — the write-side capability strip above is the hard
+        // boundary).
+        let local_did = deps.crypto.local_did().to_owned();
+        match cell
+            .commit_class_s_keep(deps, context_id, |mut v| {
+                let s = v.rest_mut();
+                s.rotate_sender_key(&local_did)?;
+                Ok(s.local_sender_key_epoch())
+            })
+            .await
         {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "drain_and_deliver_sender_keys failed after access revocation"
-            );
+            Ok(epoch) => {
+                // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch in the
+                // authoritative floor registry (fail-closed backstop).
+                crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                    deps,
+                    &context_id_bytes,
+                    epoch,
+                )?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "rotate_sender_key failed after access revocation"
+                );
+            }
+        }
+        // Drain through the actor's crypto state (same one the rotation populated).
+        {
+            let mut view = cell.class_c_view();
+            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+                deps,
+                view.mode_mut().crypto_mut(),
+                context_id,
+                &context_id_bytes,
+            )
+            .await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "drain_and_deliver_sender_keys failed after access revocation"
+                );
+            }
         }
     }
 
@@ -1417,10 +1438,16 @@ pub async fn execute_remove_member(
                 .map(|()| (String::new(), None));
             }
             // ADR-049 PR-6: rotate succeeded (the Err arm returns above) — advance
-            // the rotated local epoch in the authoritative floor registry (fail-closed).
+            // the rotated local epoch in the authoritative floor registry
+            // (fail-closed). ADR-049 PR-7: `rotate_sender_key` here is still on the
+            // retained provider (this remove site couples the rotate with the
+            // in-closure provider `remove_member` / `remove_member_sender_key`,
+            // flipped together in a later pass), so the epoch is read from the
+            // provider — read-authority follows write-authority.
             crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
                 deps,
                 &context_id_bytes,
+                deps.crypto.local_sender_key_epoch(&context_id_bytes),
             )?;
 
             state.membership.remove_member(did);
@@ -1492,9 +1519,13 @@ pub async fn execute_remove_member(
             keep_broadcast_failure(cell, deps, context_id, failure).await?;
         }
 
-        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
+        // ADR-049 PR-7: retained-provider drain — this remove site's in-closure
+        // `rotate_sender_key` is still on the provider (coupled with the provider
+        // `remove_member` / `remove_member_sender_key`, flipped together later), so
+        // the producer queue is the provider's → `None`.
         if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
             deps,
+            None,
             context_id,
             &context_id_bytes,
         )
@@ -2544,16 +2575,24 @@ pub async fn execute_reset_member(
         );
     } else {
         // ADR-049 PR-6: advance the rotated local epoch in the authoritative
-        // floor registry (fail-closed).
+        // floor registry (fail-closed). ADR-049 PR-7: `execute_reset_member`
+        // holds only a `ClassCMut` view (no `ClassSCell`), so it cannot drive the
+        // `commit_class_s_keep`→`rest_mut` rotate flip; the rotate stays on the
+        // retained provider here (pending a ruling on threading a cell / routing
+        // this rotation best-effort Class-C), so the epoch is read from the
+        // provider — read-authority follows write-authority.
         crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
             deps,
             &context_id_bytes,
+            deps.crypto.local_sender_key_epoch(&context_id_bytes),
         )?;
     }
 
-    // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
+    // ADR-049 PR-7: retained-provider drain (this reset site's producer
+    // `rotate_sender_key` is still on the provider — see above), so `None`.
     if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
         deps,
+        None,
         context_id,
         &context_id_bytes,
     )

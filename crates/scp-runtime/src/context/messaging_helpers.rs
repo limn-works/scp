@@ -3173,17 +3173,23 @@ pub fn decrypt_and_dispatch(
 /// ADR-049 PR-6 (read-authority switch): advance the LOCAL sender-key epoch
 /// floor in the authoritative Class-M registry after a local rotation.
 ///
-/// Call AFTER `deps.crypto.rotate_sender_key(ctx)` succeeds. `rotate_sender_key`
-/// increments the local epoch scalar (`state.sender_key_epoch`, which
-/// `set_unchecked` does NOT record in the store's per-sender epoch map), so the
-/// local floor is read via
+/// Call AFTER a local `rotate_sender_key` succeeds, passing the post-rotation
+/// local epoch as `epoch`. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the epoch is now a
+/// CALLER-SUPPLIED parameter rather than re-read here, so flipped sites source it
+/// from the actor's `PerContextState::local_sender_key_epoch()` (read inside the
+/// same `commit_class_s_keep` closure that durably persisted the bump) and
+/// not-yet-flipped sites source it from the retained
 /// [`MlsCryptoProvider::local_sender_key_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::local_sender_key_epoch)
-/// and advanced in the supervisor floor registry keyed by the provider's local
-/// DID. FAIL-CLOSED: a non-monotonic / overshooting local advance surfaces as a
-/// [`ContextError`] (via `From<FloorAdvanceError>`) that the caller `?`-propagates,
-/// aborting the enclosing operation. In practice a local rotation advances the
-/// scalar monotonically by +1, so this never fires; propagating it is the
-/// fail-closed default rather than a rollback the caller must orchestrate.
+/// — the read-authority follows the write-authority coherently.
+///
+/// The floor is advanced in the supervisor registry keyed by the local DID.
+/// FAIL-CLOSED: a non-monotonic / overshooting local advance surfaces as a
+/// [`ContextError`] (via `From<FloorAdvanceError>`) that the caller `?`-propagates
+/// — this registry floor raise is the never-regressing anti-replay backstop, so
+/// it is NEVER swallowed even though the sender-key rotation + distribution around
+/// it is best-effort (M23). In practice a local rotation advances the scalar
+/// monotonically by +1, so this never fires; propagating it is the fail-closed
+/// default rather than a rollback the caller must orchestrate.
 ///
 /// # Errors
 ///
@@ -3192,8 +3198,8 @@ pub fn decrypt_and_dispatch(
 pub(in crate::context) fn mirror_forward_local_sender_epoch(
     deps: &ActorDeps,
     ctx: &[u8; 32],
+    epoch: u64,
 ) -> Result<(), ContextError> {
-    let epoch = deps.crypto.local_sender_key_epoch(ctx);
     let local_did = deps.crypto.local_did();
     deps.supervisor.check_and_advance_sender_epoch(
         ctx,

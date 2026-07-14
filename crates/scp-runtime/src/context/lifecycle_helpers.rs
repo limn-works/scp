@@ -397,29 +397,58 @@ pub async fn leave_context(
         }
 
         // Rotate the local sender key and distribute to remaining members
-        // (§9.16.4). M23: Non-fatal — MLS removal above is the hard security
-        // boundary. If rotation fails, log but continue.
-        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "rotate_sender_key failed after leave — \
-                 remaining members retain old sender key"
-            );
-        } else {
-            // ADR-049 PR-6: advance the rotated local epoch in the authoritative
-            // floor registry (fail-closed).
-            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
-                deps,
-                &context_id_bytes,
-            )?;
+        // (§9.16.4). ADR-049 PR-7: Class-S — the epoch bump is sync-persisted
+        // fail-closed via `commit_class_s_keep` (a bumped-then-crash-lost epoch
+        // would let the departed member's old key keep decrypting); anti-replay
+        // backstop is the never-regressing registry floor (`mirror_forward`,
+        // `?`-propagated). M23: sender-key rotation + distribution stays
+        // best-effort — a rotate/persist failure is logged and the leave continues
+        // (MLS removal above is the hard security boundary).
+        let local_did = deps.crypto.local_did().to_owned();
+        match cell
+            .commit_class_s_keep(deps, &context_id, |mut v| {
+                let s = v.rest_mut();
+                s.rotate_sender_key(&local_did)?;
+                Ok(s.local_sender_key_epoch())
+            })
+            .await
+        {
+            Ok(epoch) => {
+                // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch in the
+                // authoritative floor registry (fail-closed backstop).
+                crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                    deps,
+                    &context_id_bytes,
+                    epoch,
+                )?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "rotate_sender_key failed after leave — \
+                     remaining members retain old sender key"
+                );
+            }
         }
-        if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes).await {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to deliver rotated sender keys after leave"
-            );
+        {
+            // Drain through the actor's crypto state (same one the rotation just
+            // populated); `&mut` view scoped so `cell` is free afterward.
+            let mut view = cell.class_c_view();
+            if let Err(e) = drain_and_deliver_sender_keys(
+                deps,
+                view.mode_mut().crypto_mut(),
+                &context_id,
+                &context_id_bytes,
+            )
+            .await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to deliver rotated sender keys after leave"
+                );
+            }
         }
     }
 
@@ -482,12 +511,24 @@ pub async fn leave_context(
 /// propagated (the receiver can recover via `SenderKeyRequest`).
 pub async fn drain_and_deliver_sender_keys(
     deps: &ActorDeps,
+    mut crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
 ) -> Result<(), ContextError> {
-    let pending = deps
-        .crypto
-        .drain_pending_sender_key_messages(context_id_bytes)?;
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): when the caller supplies the actor's
+    // field-granular Class-C `&mut ContextCryptoState` (a rotation site that
+    // flipped `rotate_sender_key` onto the actor, which populated the ACTOR's
+    // `pending_distributions`), drain + MLS-wrap through that SAME crypto state so
+    // producer (rotate) and consumer (drain) stay coherent. The retained-provider
+    // sites — and the join path, whose producer `add_member` is a retained
+    // birth-seam provider op — pass `None` and drain the PROVIDER queue. Both are
+    // byte-identical (same `mls_encrypt_management` shape).
+    let pending = match crypto_state.as_deref_mut() {
+        Some(cs) => std::mem::take(&mut cs.pending_distributions),
+        None => deps
+            .crypto
+            .drain_pending_sender_key_messages(context_id_bytes)?,
+    };
     if !pending.is_empty() {
         let routing_id = scp_protocol::context::context_routing_id(context_id);
         for (target_did, message) in pending {
@@ -497,12 +538,24 @@ pub async fn drain_and_deliver_sender_keys(
                 message_len = message.len(),
                 "MLS-encrypting and sending rotated sender key distribution"
             );
-            match deps.crypto.mls_encrypt_management(
-                context_id_bytes,
-                &message,
-                &routing_id,
-                crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
-            ) {
+            let sealed = crypto_state.as_deref_mut().map_or_else(
+                || {
+                    deps.crypto.mls_encrypt_management(
+                        context_id_bytes,
+                        &message,
+                        &routing_id,
+                        crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
+                    )
+                },
+                |cs| {
+                    cs.mls_encrypt_management(
+                        &message,
+                        &routing_id,
+                        crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
+                    )
+                },
+            );
+            match sealed {
                 Ok(sealed) => {
                     if let Err(e) = deps.transport.send_message(&routing_id, &sealed).await {
                         tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
@@ -991,7 +1044,11 @@ pub async fn join_context(
     // Drain pending HPKE-sealed sender key distribution messages and
     // deliver them via the MLS management channel (§9.16.2). MLS-wrap
     // is mandatory — see comment on `drain_and_deliver_sender_keys`.
-    if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes).await {
+    // ADR-049 PR-7: the producer here is `distribute_sender_key` (a retained
+    // birth-seam provider op, populating the PROVIDER queue), so drain the
+    // provider queue → `None`.
+    if let Err(e) = drain_and_deliver_sender_keys(deps, None, &context_id, &context_id_bytes).await
+    {
         // Drain failed catastrophically — roll back MLS state, sender
         // key, escrow, and economy ticket so the join is fully aborted.
         let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
