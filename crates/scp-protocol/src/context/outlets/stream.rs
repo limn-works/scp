@@ -1202,7 +1202,22 @@ pub fn compute_chunk_manifest_root(chunks: &[OutletStreamChunk]) -> Result<[u8; 
 /// above-ceiling `Data` chunk (those are dropped at the gate before
 /// emission), so the unbounded ceiling yields the identical count over the
 /// emitted manifest.
-#[derive(Debug, Clone)]
+///
+/// # Serialization (ADR-061 durable frontier capture)
+///
+/// The four private fields (`stack`, `leaf_count`, `billed_count`,
+/// `ceiling`) are the frontier's minimal, complete state; the derived
+/// `Serialize`/`Deserialize` capture them losslessly. [`Self::root`] is a
+/// pure fold over `stack`, so a frontier restored from its serialized form
+/// reproduces `root()`, `billed_count()`, and `leaf_count()` bit-identically
+/// — the property ADR-061 crash recovery relies on to seal a durable
+/// stream prefix (the receipt's `stream_manifest_hash` re-derives from the
+/// restored peaks, never re-hashing the payload set). This serialized form
+/// is an **actor-local Class-S restore snapshot** (persisted inside
+/// `ContextSnapshot`, not a cross-node wire artifact — the committed root is
+/// carried separately by the signed streaming receipt), so the derive does
+/// not create a cross-node compatibility surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerkleFrontier {
     /// Perfect-subtree roots, bottom (largest, leftmost) → top (smallest,
     /// rightmost). Each entry is `(level, hash)` where a level-`L` subtree
@@ -3042,6 +3057,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ADR-061 durable frontier-capture KAT: serialize a frontier built from
+    /// N `Data` leaves, deserialize it, and assert `root()`, `billed_count()`,
+    /// and `leaf_count()` are byte-identical before/after — the AC7 root-
+    /// reproducibility witness at the type level (crash recovery seals the
+    /// durable prefix by re-deriving `frontier.root()` from the restored
+    /// peaks). Also asserts full value-equality of the frontier and that the
+    /// restored root still equals the batch oracle.
+    #[test]
+    fn frontier_serde_round_trip_reproduces_root() {
+        // Ceiling truncates billing so the restored `billed_count` is a
+        // non-trivial value the round-trip must preserve.
+        let ceiling = 6u64;
+        let mut original = MerkleFrontier::with_ceiling(ceiling);
+        let chunks: Vec<OutletStreamChunk> = (0..10).map(|i| chunk_of_kind(i, 0)).collect();
+        for c in &chunks {
+            original.push(c).expect("valid chunk hashes");
+        }
+
+        let json = serde_json::to_vec(&original).expect("frontier serializes");
+        let restored: MerkleFrontier =
+            serde_json::from_slice(&json).expect("frontier deserializes");
+
+        // Byte-identical projections after restore (the AC7 witness).
+        assert_eq!(restored.root(), original.root(), "root must reproduce");
+        assert_eq!(
+            restored.billed_count(),
+            original.billed_count(),
+            "billed_count must reproduce"
+        );
+        assert_eq!(
+            restored.leaf_count(),
+            original.leaf_count(),
+            "leaf_count must reproduce"
+        );
+        // Full structural equality (all four private fields survive).
+        assert_eq!(restored, original, "frontier value must round-trip");
+        // The restored root still equals the batch oracle over the same seq.
+        assert_eq!(
+            restored.root(),
+            compute_chunk_manifest_root(&chunks).unwrap(),
+            "restored root must still match the batch oracle"
+        );
+        // Ceiling of 6 over 10 Data leaves at seq 0..10 → seq {0..=6} billable.
+        assert_eq!(restored.billed_count(), 7);
+        assert_eq!(restored.leaf_count(), 10);
     }
 
     // -----------------------------------------------------------------------

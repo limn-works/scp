@@ -48,7 +48,11 @@
 //! the analogous capability-token discipline.
 
 use scp_did::DID;
+use scp_protocol::context::outlets::stream::MerkleFrontier;
+use scp_protocol::economy::types::Amount;
 use serde::{Deserialize, Serialize};
+
+use crate::context::supervisor::saga_journal::SagaId;
 
 // ---------------------------------------------------------------------------
 // Discriminated union over the ADR-049 §3 saga type-space (one variant today; extensible)
@@ -77,6 +81,20 @@ pub enum SagaPreparedState {
     /// here — only the proof's identifier — to keep the prepared-state non-
     /// secret-bearing.
     CrossContextOutletInvocation(CrossContextOutletInvocationPrepared),
+    /// Cross-context **streaming** outlet invocation (ADR-061 seal phase,
+    /// §6.2.5 streaming saga). Carries the same replay-deterministic receipt
+    /// inputs as the unary variant plus the live, `SagaId`-keyed durable
+    /// capture (an O(log n) Merkle frontier + credit ledger) the seal phase
+    /// reads at stream-close to finalize `stream_manifest_hash` and settle
+    /// escrow. Like the unary variant it is non-secret-bearing (frontier
+    /// peaks + counters + public metadata), so it rides the Class-S snapshot
+    /// mirror rather than a `Zeroizing` branch.
+    ///
+    /// The production constructor lands with the streaming seal-phase FSM
+    /// (SCP-OUT-046 PR-B); PR-A stages the type, its Class-S mirror, and the
+    /// compile-forced match barrier, mirroring how the unary variant's
+    /// serializable mirror shipped ahead of its dispatch wiring.
+    CrossContextStreamingOutletInvocation(CrossContextStreamingOutletInvocationPrepared),
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +269,83 @@ impl CrossContextOutletInvocationPrepared {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-context STREAMING outlet invocation (ADR-061 seal phase; §6.2.5)
+// ---------------------------------------------------------------------------
+
+/// Staged state for a cross-context **streaming** outlet-invocation saga
+/// (ADR-061 seal phase; spec §6.2.5 streaming saga).
+///
+/// The streaming saga reuses the §6.2.4 unary envelope but replaces the
+/// single committed `output_jcs` with a `stream_manifest_hash` sealed at
+/// stream-close from an incremental Merkle frontier. This prepared state
+/// therefore carries the SAME eight replay-deterministic receipt inputs as
+/// [`CrossContextOutletInvocationPrepared`] — so the seal can reproduce the
+/// streaming receipt preimage byte-for-byte on a replayed Commit — plus the
+/// live, `SagaId`-keyed **durable capture** the seal reads at close:
+///
+/// - `frontier` — the O(log n) RFC-6962 Merkle frontier over the emitted
+///   chunk manifest. `frontier.root()` is the `stream_manifest_hash`; on a
+///   mid-stream crash the recovery seals THIS (the last durable prefix) and
+///   re-derives the root from the restored peaks without re-hashing the
+///   payload set (ADR-061 write-through capture). No output bytes are staged
+///   — the streaming receipt attests the root, not carried output.
+/// - `reserved` / `billed` / `billed_count` — the Class-S credit ledger.
+///   Settlement at close refunds `reserved − billed`; `billed_count` is the
+///   §5.4.5 billable-`Data`-chunk count the escrow cross-check verifies.
+/// - `cancel_ack_ceiling` — the `CancelAckTracker` ceiling that makes a
+///   truncated close well-defined (the billing boundary a cancel pins).
+///
+/// **Not bearer-bearing.** Every field is public protocol metadata (frontier
+/// peaks, counters, ids), so — like the unary variant — it rides the Class-S
+/// snapshot mirror ([`CrossContextStreamingOutletInvocationSnapshot`]) and
+/// the wrapping [`SagaPreparedState`] enum keeps its §9.4.3 non-derive
+/// barrier.
+///
+/// The production constructor lands with the streaming seal-phase FSM
+/// (SCP-OUT-046 PR-B). PR-A stages the type + its Class-S mirror + the
+/// compile-forced match barrier, and is exercised by the snapshot round-trip
+/// tests below.
+pub struct CrossContextStreamingOutletInvocationPrepared {
+    /// The `SagaId` this durable capture is keyed by (spec §6.2.5 "captured
+    /// durably and incrementally … keyed by `SagaId`"). The `saga_pending`
+    /// map is already `SagaId`-keyed; carrying it on the struct makes the
+    /// key explicit on the replay snapshot.
+    pub saga_id: SagaId,
+    /// Calling context ID — raw 32-byte digest (§6.2.4 id-form rule).
+    pub caller_context_id: [u8; 32],
+    /// Target context ID — B's own context (§6.2.4 "Target-context binding").
+    pub target_context_id: [u8; 32],
+    /// Calling DID.
+    pub caller_did: DID,
+    /// Outlet registration ID (context-local stable identifier).
+    pub outlet_registration_id: String,
+    /// UCAN proof reference (token ID), NOT the proof bytes.
+    pub ucan_proof_id: String,
+    /// B's wall-clock captured ONCE at Prepare-B (§6.2.4 "Recorded
+    /// timestamp"); the receipt signature draws `timestamp_ms` from this.
+    pub recorded_timestamp_ms: u64,
+    /// B's staged copy of the 16-byte wire `nonce` (§6.2.4).
+    pub recorded_nonce: [u8; 16],
+    /// B's re-derived inbound chain depth = `incoming chain_depth + 1`
+    /// (§6.2.4 "Chain-depth enforcement").
+    pub recorded_chain_depth: u8,
+    /// The live incremental Merkle frontier over the emitted chunk manifest.
+    /// `frontier.root()` is the sealed `stream_manifest_hash`.
+    pub frontier: MerkleFrontier,
+    /// Total credit reserved at Prepare (the escrow cap). Refund at close is
+    /// `reserved − billed`.
+    pub reserved: Amount,
+    /// Credit billed so far (advances with the frontier's billable chunks).
+    pub billed: Amount,
+    /// The §5.4.5 billable-`Data`-chunk count captured alongside the ledger;
+    /// the escrow cross-check verifies it against `frontier.billed_count()`.
+    pub billed_count: u32,
+    /// The `CancelAckTracker` ceiling that bounds a truncated close (the
+    /// cancel-ack billing boundary; `u64::MAX` when the stream has no cancel).
+    pub cancel_ack_ceiling: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Class-S snapshot mirror (ADR-049 §9 line 144)
 // ---------------------------------------------------------------------------
 
@@ -290,6 +385,8 @@ impl CrossContextOutletInvocationPrepared {
 pub enum SagaPreparedStateSnapshot {
     /// Mirror of [`SagaPreparedState::CrossContextOutletInvocation`].
     CrossContextOutletInvocation(CrossContextOutletInvocationSnapshot),
+    /// Mirror of [`SagaPreparedState::CrossContextStreamingOutletInvocation`].
+    CrossContextStreamingOutletInvocation(CrossContextStreamingOutletInvocationSnapshot),
 }
 
 /// Public snapshot payload for
@@ -315,6 +412,48 @@ pub struct CrossContextOutletInvocationSnapshot {
     pub recorded_chain_depth: u8,
 }
 
+/// Public snapshot payload for the streaming variant (ADR-061 seal phase;
+/// §6.2.5 streaming saga).
+///
+/// Mirrors [`CrossContextStreamingOutletInvocationPrepared`] with `caller_did`
+/// as its canonical string and the now-`Serialize` [`MerkleFrontier`] embedded
+/// directly — the frontier's four private fields are its minimal complete
+/// state, so the derive captures them losslessly and `root()` reproduces
+/// bit-identically after restore (the AC7 durable-prefix reproducibility
+/// property). Not bearer-bearing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossContextStreamingOutletInvocationSnapshot {
+    /// The `SagaId` the durable capture is keyed by.
+    pub saga_id: String,
+    /// The raw 32-byte caller context id.
+    pub caller_context_id: [u8; 32],
+    /// The raw 32-byte target context id.
+    pub target_context_id: [u8; 32],
+    /// `caller_did.0`.
+    pub caller_did: String,
+    /// Context-local outlet registration id.
+    pub outlet_registration_id: String,
+    /// UCAN proof reference (token id), not the proof bytes.
+    pub ucan_proof_id: String,
+    /// B's Prepare-B captured clock value.
+    pub recorded_timestamp_ms: u64,
+    /// B's staged copy of the 16-byte wire nonce.
+    pub recorded_nonce: [u8; 16],
+    /// B's re-derived inbound depth = `incoming chain_depth + 1`.
+    pub recorded_chain_depth: u8,
+    /// The incremental Merkle frontier, serialized verbatim; `root()`
+    /// reproduces after restore.
+    pub frontier: MerkleFrontier,
+    /// Total credit reserved at Prepare (the escrow cap).
+    pub reserved: Amount,
+    /// Credit billed so far.
+    pub billed: Amount,
+    /// The §5.4.5 billable-`Data`-chunk count.
+    pub billed_count: u32,
+    /// The cancel-ack billing ceiling.
+    pub cancel_ack_ceiling: u64,
+}
+
 impl SagaPreparedStateSnapshot {
     /// Project a live [`SagaPreparedState`] onto its serializable Class-S
     /// snapshot mirror.
@@ -336,6 +475,26 @@ impl SagaPreparedStateSnapshot {
                     recorded_chain_depth: inner.recorded_chain_depth,
                 })
             }
+            SagaPreparedState::CrossContextStreamingOutletInvocation(inner) => {
+                Self::CrossContextStreamingOutletInvocation(
+                    CrossContextStreamingOutletInvocationSnapshot {
+                        saga_id: inner.saga_id.0.clone(),
+                        caller_context_id: inner.caller_context_id,
+                        target_context_id: inner.target_context_id,
+                        caller_did: inner.caller_did.0.clone(),
+                        outlet_registration_id: inner.outlet_registration_id.clone(),
+                        ucan_proof_id: inner.ucan_proof_id.clone(),
+                        recorded_timestamp_ms: inner.recorded_timestamp_ms,
+                        recorded_nonce: inner.recorded_nonce,
+                        recorded_chain_depth: inner.recorded_chain_depth,
+                        frontier: inner.frontier.clone(),
+                        reserved: inner.reserved,
+                        billed: inner.billed,
+                        billed_count: inner.billed_count,
+                        cancel_ack_ceiling: inner.cancel_ack_ceiling,
+                    },
+                )
+            }
         }
     }
 
@@ -356,6 +515,26 @@ impl SagaPreparedStateSnapshot {
                         recorded_timestamp_ms: snap.recorded_timestamp_ms,
                         recorded_nonce: snap.recorded_nonce,
                         recorded_chain_depth: snap.recorded_chain_depth,
+                    },
+                )
+            }
+            Self::CrossContextStreamingOutletInvocation(snap) => {
+                SagaPreparedState::CrossContextStreamingOutletInvocation(
+                    CrossContextStreamingOutletInvocationPrepared {
+                        saga_id: SagaId(snap.saga_id),
+                        caller_context_id: snap.caller_context_id,
+                        target_context_id: snap.target_context_id,
+                        caller_did: DID(snap.caller_did),
+                        outlet_registration_id: snap.outlet_registration_id,
+                        ucan_proof_id: snap.ucan_proof_id,
+                        recorded_timestamp_ms: snap.recorded_timestamp_ms,
+                        recorded_nonce: snap.recorded_nonce,
+                        recorded_chain_depth: snap.recorded_chain_depth,
+                        frontier: snap.frontier,
+                        reserved: snap.reserved,
+                        billed: snap.billed,
+                        billed_count: snap.billed_count,
+                        cancel_ack_ceiling: snap.cancel_ack_ceiling,
                     },
                 )
             }
@@ -528,8 +707,9 @@ mod tests {
                 recorded_nonce: [0xABu8; 16],
                 recorded_chain_depth: 3,
             });
-        // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextOutletInvocation(inner) = state;
+        let SagaPreparedState::CrossContextOutletInvocation(inner) = state else {
+            panic!("expected the unary cross-context outlet-invocation variant");
+        };
         assert_eq!(inner.caller_context_id, [5u8; 32]);
         assert_eq!(inner.target_context_id, [6u8; 32]);
         assert_eq!(inner.caller_did, alice());
@@ -599,6 +779,7 @@ mod tests {
         const fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SagaPreparedState>();
         assert_send_sync::<CrossContextOutletInvocationPrepared>();
+        assert_send_sync::<CrossContextStreamingOutletInvocationPrepared>();
     }
 
     /// The Class-S snapshot mirror (ADR-049 §9 line 144) must serialize, then
@@ -622,8 +803,9 @@ mod tests {
         let bytes = serde_json::to_vec(&mirror).unwrap();
         let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(mirror, back);
-        // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextOutletInvocation(inner) = back.into_prepared();
+        let SagaPreparedState::CrossContextOutletInvocation(inner) = back.into_prepared() else {
+            panic!("expected the unary cross-context outlet-invocation variant");
+        };
         assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
         assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
         assert_eq!(inner.caller_did, alice());
@@ -632,5 +814,85 @@ mod tests {
         assert_eq!(inner.recorded_timestamp_ms, 1_700_111_222_333);
         assert_eq!(inner.recorded_nonce, [0x9Eu8; 16]);
         assert_eq!(inner.recorded_chain_depth, 7);
+    }
+
+    /// The Class-S snapshot mirror must round-trip the **streaming** variant
+    /// (ADR-061 seal phase; §6.2.5) losslessly through
+    /// `from_prepared → serialize → deserialize → into_prepared`, and — the
+    /// AC7 witness — the rehydrated `frontier.root()`/`billed_count()` must
+    /// reproduce the pre-snapshot values (crash recovery seals the durable
+    /// prefix by re-deriving the root from the restored peaks).
+    #[test]
+    fn snapshot_mirror_round_trips_cross_context_streaming_outlet() {
+        use scp_protocol::context::outlets::stream::{
+            ChunkPayload, MerkleFrontier, OutletStreamChunk,
+        };
+        use scp_protocol::economy::types::Amount;
+
+        // Build a non-trivial frontier over 4 Data chunks so root() and
+        // billed_count() are meaningful values the round-trip must preserve.
+        let mut frontier = MerkleFrontier::with_ceiling(2);
+        for seq in 0u64..4 {
+            frontier
+                .push(&OutletStreamChunk {
+                    request_id: [0x7Au8; 16],
+                    sequence: seq,
+                    payload: ChunkPayload::Data {
+                        value: serde_json::json!({ "seq": seq }),
+                    },
+                    sig: [(seq & 0xFF) as u8 ^ 0x5A; 64],
+                })
+                .expect("valid chunk hashes");
+        }
+        let expected_root = frontier.root();
+        let expected_billed = frontier.billed_count(); // ceiling 2 → seq {0,1,2}
+        let expected_leaves = frontier.leaf_count();
+
+        let prepared = SagaPreparedState::CrossContextStreamingOutletInvocation(
+            CrossContextStreamingOutletInvocationPrepared {
+                saga_id: SagaId("saga-stream-1".to_owned()),
+                caller_context_id: [0x3Au8; 32],
+                target_context_id: [0x4Bu8; 32],
+                caller_did: alice(),
+                outlet_registration_id: "llm-stream-v1".to_owned(),
+                ucan_proof_id: "ucan-stream-xyz".to_owned(),
+                recorded_timestamp_ms: 1_700_222_333_444,
+                recorded_nonce: [0x8Fu8; 16],
+                recorded_chain_depth: 5,
+                frontier,
+                reserved: Amount::new(1_000),
+                billed: Amount::new(300),
+                billed_count: 3,
+                cancel_ack_ceiling: 2,
+            },
+        );
+
+        let mirror = SagaPreparedStateSnapshot::from_prepared(&prepared);
+        let bytes = serde_json::to_vec(&mirror).unwrap();
+        let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(mirror, back);
+
+        let SagaPreparedState::CrossContextStreamingOutletInvocation(inner) = back.into_prepared()
+        else {
+            panic!("expected the streaming cross-context outlet-invocation variant");
+        };
+        assert_eq!(inner.saga_id, SagaId("saga-stream-1".to_owned()));
+        assert_eq!(inner.caller_context_id, [0x3Au8; 32]);
+        assert_eq!(inner.target_context_id, [0x4Bu8; 32]);
+        assert_eq!(inner.caller_did, alice());
+        assert_eq!(inner.outlet_registration_id, "llm-stream-v1");
+        assert_eq!(inner.ucan_proof_id, "ucan-stream-xyz");
+        assert_eq!(inner.recorded_timestamp_ms, 1_700_222_333_444);
+        assert_eq!(inner.recorded_nonce, [0x8Fu8; 16]);
+        assert_eq!(inner.recorded_chain_depth, 5);
+        assert_eq!(inner.reserved, Amount::new(1_000));
+        assert_eq!(inner.billed, Amount::new(300));
+        assert_eq!(inner.billed_count, 3);
+        assert_eq!(inner.cancel_ack_ceiling, 2);
+        // The AC7 durable-prefix reproducibility witness: the frontier's
+        // root and counters survive the snapshot byte-for-byte.
+        assert_eq!(inner.frontier.root(), expected_root);
+        assert_eq!(inner.frontier.billed_count(), expected_billed);
+        assert_eq!(inner.frontier.leaf_count(), expected_leaves);
     }
 }
