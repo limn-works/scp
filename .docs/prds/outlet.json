@@ -2117,7 +2117,7 @@
         "Test: a 5-chunk stream emits one event with stream_chunk_count = 5",
         "Test: a cancelled stream emits one event with stream_terminal_status = Cancelled",
         "Test: a failed stream emits one event with stream_terminal_status = Error(code)",
-        "Test: non-streaming (one-shot) invocation emits one event with stream_chunk_count = 2 (Data + End)",
+        "Test: a non-progressive (one-shot) executor run through the streaming runtime emits one event with stream_chunk_count = 2 (Data + End)",
         "Event log replay reconstructs stream_manifest_hash identically",
         "cargo test --workspace succeeds",
         "EventKind::OutletInvoked carries chunks_billed: u32 (separately from stream_chunk_count) per \u00a75.4.5 billing semantics",
