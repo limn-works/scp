@@ -2478,7 +2478,7 @@ pub async fn import_context(
     // not-yet-announced non-FFI bootstrap path (e.g. a test fixture) and maps to
     // the reserved sentinel via `build_routing` (see its doc comment).
     let import_routing = build_routing(false, local_pseudonym);
-    let per_context = PerContextState {
+    let mut per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
         // Convergent creator-assigned creation time, consumed VERBATIM from the
@@ -2649,6 +2649,27 @@ pub async fn import_context(
         event_log: None,
         mode: ContextModeState::Encrypted(Box::<ContextCryptoState>::default()),
     };
+
+    // 6b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2/C3 import seed: the floor-guarded
+    //     restore above (the direct call OR the `PrepareForReplace` handler)
+    //     installed the imported MLS crypto into the PROVIDER (birth). TAKE it out
+    //     one-way (`take_crypto_state` removes the `contexts` entry AND records
+    //     `taken_context_ids` — CM-001 double-owner guard) and SEED it onto the
+    //     imported actor state before spawn, exactly as the CREATE seam does after
+    //     `builder::create_context` births the group. The binding verify above ran
+    //     while the group was still provider-resident. A keyless / needs-reconnect
+    //     snapshot (empty `mls_crypto_state`) installed no group, so there is
+    //     nothing to take and the actor keeps its default-empty encrypted mode
+    //     until a reconnect Welcome arrives. (Import is encrypted-only — a
+    //     broadcast export is rejected at the top of this function.)
+    if !export.snapshot.mls_crypto_state.is_empty() {
+        let owned = deps.crypto.take_crypto_state(&ctx_id_bytes).map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "import: seeding actor crypto from the just-restored group failed: {e}"
+            ))
+        })?;
+        per_context.seed_encrypted_crypto_from_owned(owned);
+    }
 
     // 7. Register the imported context as an owned-state actor.
     //
