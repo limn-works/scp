@@ -2182,6 +2182,20 @@ mod tests {
         state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
     }
 
+    /// Borrow the Encrypted-mode crypto sub-state of an actor `PerContextState`
+    /// (panics on Broadcast) — the actor-seam analogue of the provider's
+    /// `with_context` closure, for tests that inspect the live MLS group / stores.
+    fn actor_crypto(
+        state: &PerContextState,
+    ) -> &crate::context::actor::ContextCryptoState {
+        match &state.mode {
+            crate::context::actor::ContextModeState::Encrypted(crypto) => crypto,
+            crate::context::actor::ContextModeState::Broadcast(_) => {
+                panic!("expected encrypted mode")
+            }
+        }
+    }
+
     /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / hardening H3: the single
     /// `pub(crate)` `wrapping_keypair()` accessor that the atomic core
     /// actor-seeding path (SCP-CRYPTOMOVE-001) reads must return a
@@ -2691,13 +2705,15 @@ mod tests {
             assert_eq!(state.mls_group.epoch().unwrap(), 1);
         }
 
-        provider.remove_member(&ctx_id, bob_did).unwrap();
+        // Removal moved onto the actor seam; drive it there and inspect the
+        // resulting live MLS group on the actor state.
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        actor.remove_member(alice_did, bob_did).unwrap();
 
         {
-            let entry = provider.contexts.get(&ctx_id).unwrap();
-            let state = entry.value();
-            assert_eq!(state.mls_group.epoch().unwrap(), 2);
-            let members = state.mls_group.members().unwrap();
+            let group = actor_crypto(&actor).mls_group.as_ref().expect("group present");
+            assert_eq!(group.epoch().unwrap(), 2);
+            let members = group.members().unwrap();
             assert_eq!(members.len(), 1, "only Alice should remain");
         }
     }
@@ -2745,7 +2761,9 @@ mod tests {
             assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
         }
 
-        assert!(provider.remove_member_sender_key(&ctx_id, TEST_DID).is_ok());
+        // Per-member sender-key removal moved onto the actor seam.
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        assert!(actor.remove_member_sender_key(TEST_DID).is_ok());
     }
 
     #[test]
@@ -2816,13 +2834,16 @@ mod tests {
 
     #[test]
     fn remove_member_sender_key_errors_without_context() {
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        assert!(
-            provider
-                .remove_member_sender_key(&ctx_id, "did:dht:z6MkBob")
-                .is_err()
+        // Relocated onto the actor seam: the provider's "no context registered"
+        // error becomes the actor's mode guard — a context with no MLS group
+        // (Broadcast mode, `encrypted_crypto_mut` → CryptoFailed) rejects a
+        // per-member sender-key removal.
+        let mut actor = PerContextState::new_for_test_broadcast(
+            make_context_id(),
+            0,
+            DID::from(TEST_DID.to_owned()),
         );
+        assert!(actor.remove_member_sender_key("did:dht:z6MkBob").is_err());
     }
 
     #[test]
@@ -2839,8 +2860,10 @@ mod tests {
         provider.create_mls_group(&ctx_id).unwrap();
         // Self-removal is a no-op: the leaving member abandons their local
         // MLS group state; the remaining members handle the actual removal
-        // via a Commit from the group admin (#1294).
-        let result = provider.remove_member(&ctx_id, TEST_DID);
+        // via a Commit from the group admin (#1294). Relocated onto the actor
+        // `remove_member` seam.
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        let result = actor.remove_member(TEST_DID, TEST_DID);
         assert!(result.is_ok());
     }
 
@@ -2900,9 +2923,9 @@ mod tests {
             .distribute_sender_key(&ctx_id, bob_did)
             .unwrap();
 
-        let pending = alice_provider
-            .drain_pending_sender_key_messages(&ctx_id)
-            .unwrap();
+        // Draining the queued distribution moved onto the actor seam.
+        let mut alice_actor = take_into_actor(&alice_provider, &ctx_id);
+        let pending = alice_actor.drain_pending_sender_key_messages().unwrap();
         assert_eq!(pending.len(), 1, "should have 1 pending distribution");
         assert_eq!(pending[0].0, bob_did, "pending message should target Bob");
         assert!(
@@ -2950,7 +2973,10 @@ mod tests {
             assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
         }
 
-        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
+        // Bob had no wrapping key, so nothing was queued — draining (on the actor
+        // seam) yields an empty queue.
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        let pending = actor.drain_pending_sender_key_messages().unwrap();
         assert!(pending.is_empty());
     }
 
@@ -2985,9 +3011,16 @@ mod tests {
         alice_provider
             .distribute_sender_key(&ctx_id, bob_did)
             .unwrap();
-        let pending = alice_provider
-            .drain_pending_sender_key_messages(&ctx_id)
-            .unwrap();
+
+        // Capture Alice's local sender key before moving her context onto an
+        // actor to drain the queued distribution (the drain seam moved to the
+        // actor). The provider loses the context on take, so read it first.
+        let alice_sender_key_bytes = {
+            let entry = alice_provider.contexts.get(&ctx_id).unwrap();
+            *entry.value().sender_key.as_bytes()
+        };
+        let mut alice_actor = take_into_actor(&alice_provider, &ctx_id);
+        let pending = alice_actor.drain_pending_sender_key_messages().unwrap();
         assert_eq!(pending.len(), 1);
 
         // ADR-049 PR-6: process returns the authenticated (key, epoch) WITHOUT
@@ -3008,11 +3041,9 @@ mod tests {
                 "Bob must have Alice's sender key after processing distribution"
             );
 
-            let alice_entry = alice_provider.contexts.get(&ctx_id).unwrap();
-            let alice_state = alice_entry.value();
             assert_eq!(
                 alice_key.unwrap().as_bytes(),
-                alice_state.sender_key.as_bytes(),
+                &alice_sender_key_bytes,
                 "recovered key must match Alice's sender key"
             );
         }
@@ -3024,21 +3055,30 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
-        assert!(pending.is_empty());
-
+        // The target has no wrapping key, so distribution queues nothing.
         provider
             .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
             .unwrap();
-        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
+
+        // Drain moved onto the actor seam; draining yields an empty queue and a
+        // second drain leaves it empty (the take clears it).
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        let pending = actor.drain_pending_sender_key_messages().unwrap();
+        assert!(pending.is_empty());
+        let pending = actor.drain_pending_sender_key_messages().unwrap();
         assert!(pending.is_empty());
     }
 
     #[test]
     fn drain_pending_sender_key_messages_errors_without_context() {
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        assert!(provider.drain_pending_sender_key_messages(&ctx_id).is_err());
+        // Relocated onto the actor seam: a context with no MLS group (Broadcast
+        // mode) rejects the drain via the `encrypted_crypto_mut` mode guard.
+        let mut actor = PerContextState::new_for_test_broadcast(
+            make_context_id(),
+            0,
+            DID::from(TEST_DID.to_owned()),
+        );
+        assert!(actor.drain_pending_sender_key_messages().is_err());
     }
 
     #[test]
