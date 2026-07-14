@@ -1146,8 +1146,9 @@ mod pure_wrapper_tests {
                 total_chunks += 1;
             }
         }
-        // 2 + 11 + 4 + 2 + 5 + 3 + 2 == 29 chunk descriptors across the 7 vectors.
-        assert_eq!(total_chunks, 29, "every chunk descriptor exercised");
+        // 2 + 12 + 4 + 2 + 5 + 3 + 2 == 30 chunk descriptors across the 7 vectors
+        // (multi_chunk carries an interleaved Progress chunk — §5.4.5).
+        assert_eq!(total_chunks, 30, "every chunk descriptor exercised");
     }
 }
 

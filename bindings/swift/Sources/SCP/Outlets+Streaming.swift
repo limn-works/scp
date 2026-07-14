@@ -60,22 +60,29 @@ public extension JSONValue {
 
 // MARK: - OutletError — the SDK-surface protocol-class outlet errors
 
-/// Protocol-class (§5.4.4 `OutletErrorClass::Protocol`) outlet-streaming errors
-/// RAISED BY THE SDK layer itself.
+/// Outlet-streaming errors RAISED BY THE SDK layer itself.
 ///
 /// These are distinct from the bridge-raised ``ScpError`` (UniFFI already throws
 /// typed ``ScpError`` cases for data-plane / control-plane rejections, so the
 /// streaming wrapper lets those propagate untranslated — mirroring the sibling
 /// saga wrapper). ``OutletError`` covers only the conditions the SDK generates
 /// locally: an invalid ``Credit``, a control call on an already-terminal stream,
-/// and generic protocol-class violations (a concurrent second consumer, or a
-/// stream that closed without an `End` chunk).
+/// generic protocol-class violations (a concurrent second consumer, or a stream
+/// that closed without an `End` chunk), and a receiver-detected stream gap.
 ///
-/// Mirrors the Python `ProtocolError` hierarchy: `InvalidGrant` and
-/// `StreamAlreadyClosed` are protocol-class siblings. Swift enums are flat, so
-/// the three conditions are cases at the SAME depth (the SCP-OUT-038 round-5
-/// same-depth rule) — a single `catch OutletError` handles the whole protocol
-/// class, exactly as `except ProtocolError` does in Python.
+/// Three of the four cases are Protocol-class (§5.4.4
+/// `OutletErrorClass::Protocol`, code `SCP-OUTLET-6100`), mirroring the Python
+/// `ProtocolError` hierarchy: `InvalidGrant` and `StreamAlreadyClosed` are
+/// protocol-class siblings. The fourth, ``streamGap(msg:code:)``, is an
+/// Execution-class member (§5.4.4 `OutletErrorClass::Execution::StreamGap`, code
+/// `SCP-OUTLET-6131`) — the SDK-drain receiver gap check (§5.4.5 "Ordering and
+/// gaps"). Swift enums are flat, so all four conditions are cases at the SAME
+/// depth (the SCP-OUT-038 round-5 same-depth rule); the Execution-class
+/// `streamGap` is surfaced at the same enum depth as the protocol-class cases —
+/// mirroring how Python/TS/Kotlin document surfacing this execution code under
+/// the shared outlet-error base — so a single `catch OutletError` handles the
+/// whole family, exactly as `except ProtocolError` (plus its `StreamGap`
+/// sibling) does in Python.
 public enum OutletError: Error, Sendable, Equatable {
     /// A ``Credit`` grant outside the valid `u32` range (§5.4.5). The
     /// ``Credit`` initializer rejects `0`; the `UInt32` type rejects
@@ -99,7 +106,7 @@ public enum OutletError: Error, Sendable, Equatable {
     /// stream through the bridge and throws this — a defense-in-depth
     /// monotonicity check (a same-context stream never gaps over its lossless
     /// ordered channel). Carries the execution-class code `SCP-OUTLET-6131`.
-    case sequenceGap(msg: String, code: String)
+    case streamGap(msg: String, code: String)
 }
 
 // MARK: - Credit — a validated non-zero u32 stream-credit grant (§5.4.5)
@@ -440,12 +447,12 @@ public actor InvocationHandle {
     /// Captured terminal state, read back by ``aggregate()``.
     private var aggregateResult: Aggregate?
     private var terminalError: ScpError?
-    /// Captured ``OutletError/sequenceGap(msg:code:)`` terminal, re-thrown by a
+    /// Captured ``OutletError/streamGap(msg:code:)`` terminal, re-thrown by a
     /// re-``aggregate()`` after a gap closed the drain.
     private var streamGapError: OutletError?
     /// §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk
     /// must carry. Strictly monotonic per `request_id`, starting at 0; a chunk
-    /// whose sequence differs is a ``OutletError/sequenceGap(msg:code:)``
+    /// whose sequence differs is a ``OutletError/streamGap(msg:code:)``
     /// (defense-in-depth — same-context streams never gap over their lossless
     /// ordered channel).
     private var expectedSequence: UInt64 = 0
@@ -524,7 +531,7 @@ public actor InvocationHandle {
             // The check spans all chunk kinds (Data/Progress/End/Error) since
             // sequences are strictly monotonic across them.
             closed = true
-            let gap = OutletError.sequenceGap(
+            let gap = OutletError.streamGap(
                 msg: "outlet stream sequence gap: expected \(expectedSequence), "
                     + "got \(chunk.sequence) (§5.4.5)",
                 code: "SCP-OUTLET-6131"
@@ -641,7 +648,7 @@ public actor InvocationHandle {
 
     /// Signs and sends an `OutletCancel` through the bridge (§5.4.5). The single
     /// bridge cancel round-trip shared by the public ``cancel()`` and the
-    /// drain's ``OutletError/sequenceGap(msg:code:)`` teardown, so both cancel
+    /// drain's ``OutletError/streamGap(msg:code:)`` teardown, so both cancel
     /// through the identical signed path.
     private func sendCancel(_ id: String) async throws {
         try await bridge.cancel(handleId: id, callerDid: params.callerDid)

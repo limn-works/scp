@@ -45,12 +45,13 @@
         { "sequence": 2, "payload": { "@type": "data", "value": { "n": 2 } } },
         { "sequence": 3, "payload": { "@type": "data", "value": { "n": 3 } } },
         { "sequence": 4, "payload": { "@type": "data", "value": { "n": 4 } } },
-        { "sequence": 5, "payload": { "@type": "data", "value": { "n": 5 } } },
-        { "sequence": 6, "payload": { "@type": "data", "value": { "n": 6 } } },
-        { "sequence": 7, "payload": { "@type": "data", "value": { "n": 7 } } },
-        { "sequence": 8, "payload": { "@type": "data", "value": { "n": 8 } } },
-        { "sequence": 9, "payload": { "@type": "data", "value": { "n": 9 } } },
-        { "sequence": 10, "payload": { "@type": "end", "aggregate": { "total": 10 }, "execution_time_ms": 5 } }
+        { "sequence": 5, "payload": { "@type": "progress", "pct": 50, "note": "halfway" } },
+        { "sequence": 6, "payload": { "@type": "data", "value": { "n": 5 } } },
+        { "sequence": 7, "payload": { "@type": "data", "value": { "n": 6 } } },
+        { "sequence": 8, "payload": { "@type": "data", "value": { "n": 7 } } },
+        { "sequence": 9, "payload": { "@type": "data", "value": { "n": 8 } } },
+        { "sequence": 10, "payload": { "@type": "data", "value": { "n": 9 } } },
+        { "sequence": 11, "payload": { "@type": "end", "aggregate": { "total": 10 }, "execution_time_ms": 5 } }
       ],
       "credits": [],
       "expected_end_status": "Ok",
@@ -158,17 +159,17 @@
       "expected_error_code": "SCP-OUTLET-6131"
     },
     {
-      "name": "credit_exhaustion",
+      "name": "credit_stall",
       "outlet_kind": "query",
       "open": {
         "request_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
-        "outlet_id": "outlet-credit-exhaustion",
+        "outlet_id": "outlet-credit-stall",
         "input": {},
         "invoker_did": "did:key:z6MkStreamVectorInvokerReference",
         "credit_window": 1,
         "estimated_chunk_count": 1,
-        "ucan_cid": "cid-credit_exhaustion",
-        "expected_caveats_binding": "d9c4eba55263c4ce93aeeb707ae45ff10eddac71e4a956566e3df9f536336754",
+        "ucan_cid": "cid-credit_stall",
+        "expected_caveats_binding": "9d64021a32f434d7dc8139e71d97587c9ecce62686a150670791f68877ec063d",
         "session_id": null,
         "timeout_ms": 30000
       },

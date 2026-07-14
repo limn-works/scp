@@ -23,18 +23,21 @@
 //! # Why the LIVE control plane is NOT driven here (mechanical block, documented)
 //!
 //! A live open→poll→drain replay (the single-shot-seam vectors: `non_streaming`,
-//! `cancellation`, `error_terminal`, `credit_exhaustion`) requires registering a
-//! Rust-side outlet handler, seeding the invoker as a member, granting
-//! `OutletCall`, and seeding the creator's DID document — every one of those
-//! seams takes the per-bridge `&UniffiBridgeInstance`, reached only through
-//! `Scp.inner`, which is `pub(crate)` (crates/scp-ffi/uniffi/src/scp.rs:61),
-//! unreachable from an external `tests/` file. The UniFFI crate exposes no public
-//! Rust-side handler-registration / member-seeding seam (its own external
-//! `tests/e2e_bridge.rs` likewise never drives a live stream). The live
-//! terminal-status behaviour of these vectors is covered by the runtime tiers
-//! (SCP-OUT-039 deliverables 2/3 in scp-testing). This file adds the UniFFI
-//! bridge's own pure-wrapper wire-integrity tier and does NOT fake a live drive
-//! it cannot mechanically perform.
+//! `cancellation`, `error_terminal`) requires registering a Rust-side outlet
+//! handler, seeding the invoker as a member, granting `OutletCall`, and seeding
+//! the creator's DID document — every one of those seams takes the per-bridge
+//! `&UniffiBridgeInstance`, reached only through `Scp.inner`, which is
+//! `pub(crate)` (crates/scp-ffi/uniffi/src/scp.rs:61), unreachable from an
+//! external `tests/` file. The UniFFI crate exposes no public Rust-side
+//! handler-registration / member-seeding seam (its own external
+//! `tests/e2e_bridge.rs` likewise never drives a live stream). `credit_stall` is
+//! NOT a single-shot-seam vector: like §25.21 and the PyO3 header classify it, it
+//! is runtime-tier-only — it needs a real `stream_credit_stall_secs` timer to
+//! fire the framework credit-stall terminal, which a pure-wrapper/bridge replay
+//! cannot drive. The live terminal-status behaviour of all of these vectors is
+//! covered by the runtime tiers (SCP-OUT-039 deliverables 2/3 in scp-testing).
+//! This file adds the UniFFI bridge's own pure-wrapper wire-integrity tier and
+//! does NOT fake a live drive it cannot mechanically perform.
 
 #![cfg(feature = "allow_in_memory_custody")]
 #![allow(
@@ -128,6 +131,16 @@ fn request_id_from_open(open: &serde_json::Value) -> [u8; 16] {
     id
 }
 
+/// Outcome of observing one chunk against the running sequence expectation.
+/// Uniform `GapOutcome` enum shape shared across the runtime-layer harness
+/// (`outlet_stream_vectors_common.rs`) and the `PyO3` / `NAPI` per-bridge
+/// trackers — a single canonical shape so the receiver rule cannot drift.
+#[derive(Debug, PartialEq, Eq)]
+enum GapOutcome {
+    Continue,
+    Cancelled { code: String },
+}
+
 /// Receiver-side ordering check (§5.4.5 "Ordering and gaps").
 struct ReceiverSequenceTracker {
     expected: u64,
@@ -136,12 +149,14 @@ impl ReceiverSequenceTracker {
     fn new() -> Self {
         Self { expected: 0 }
     }
-    fn observe(&mut self, sequence: u64) -> Option<&'static str> {
+    fn observe(&mut self, sequence: u64) -> GapOutcome {
         if sequence == self.expected {
             self.expected += 1;
-            None
+            GapOutcome::Continue
         } else {
-            Some(CODE_STREAM_GAP)
+            GapOutcome::Cancelled {
+                code: CODE_STREAM_GAP.to_owned(),
+            }
         }
     }
 }
@@ -160,7 +175,7 @@ async fn vectors_load_and_have_the_seven_named_scenarios() {
         names,
         vec![
             "cancellation",
-            "credit_exhaustion",
+            "credit_stall",
             "error_recoverable",
             "error_terminal",
             "multi_chunk",
@@ -298,8 +313,9 @@ async fn all_seven_vectors_wire_integrity_through_uniffi_exports() {
             total_chunks += 1;
         }
     }
-    // 2 + 11 + 4 + 2 + 5 + 3 + 2 == 29 chunk descriptors across the 7 vectors.
-    assert_eq!(total_chunks, 29, "every chunk descriptor exercised");
+    // 2 + 12 + 4 + 2 + 5 + 3 + 2 == 30 chunk descriptors across the 7 vectors
+    // (multi_chunk carries an interleaved Progress chunk — §5.4.5).
+    assert_eq!(total_chunks, 30, "every chunk descriptor exercised");
 }
 
 /// `sequence_gap`: the receiver tracker cancels with `SCP-OUTLET-6131` at the
@@ -351,7 +367,7 @@ async fn sequence_gap_receiver_tracker_cancels_with_6131_through_uniffi() {
     );
 
     let mut tracker = ReceiverSequenceTracker::new();
-    let mut cancelled_at: Option<(u64, &'static str)> = None;
+    let mut cancelled_at: Option<(u64, String)> = None;
     for chunk_desc in vector["chunks"].as_array().expect("chunks array") {
         let sequence = chunk_desc["sequence"].as_u64().expect("sequence");
         let payload = payload_from_vector(&chunk_desc["payload"]);
@@ -385,14 +401,14 @@ async fn sequence_gap_receiver_tracker_cancels_with_6131_through_uniffi() {
             "gap transcript chunk seq {sequence} is authentically signed"
         );
         if cancelled_at.is_none()
-            && let Some(code) = tracker.observe(sequence)
+            && let GapOutcome::Cancelled { code } = tracker.observe(sequence)
         {
             cancelled_at = Some((sequence, code));
         }
     }
     assert_eq!(
         cancelled_at,
-        Some((3, CODE_STREAM_GAP)),
+        Some((3, CODE_STREAM_GAP.to_owned())),
         "receiver tracker cancels with SCP-OUTLET-6131 at gapped sequence 3"
     );
     assert_eq!(vector["expected_end_status"], "Cancelled");

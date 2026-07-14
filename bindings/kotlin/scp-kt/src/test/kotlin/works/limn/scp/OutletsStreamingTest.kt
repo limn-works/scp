@@ -732,9 +732,9 @@ class ChunkParsingTest {
 //
 // IMPORTANT boundary — where the terminal comes from:
 //
-// - credit_exhaustion and cancellation surface a terminal the BRIDGE delivers.
-//   The mock plays a framework terminal (a terminal:true Error for credit
-//   exhaustion; a cancel-ack End after the consumer cancels) and the SDK
+// - credit_stall and cancellation surface a terminal the BRIDGE delivers.
+//   The mock plays a framework terminal (a terminal:true Error for the credit
+//   stall; a cancel-ack End after the consumer cancels) and the SDK
 //   faithfully surfaces outletStreamPollNext's terminal — the SDK cannot itself
 //   stall an executor, so it does not synthesize these terminals.
 // - ONLY sequence_gap requires ACTIVE SDK-side detection: the drain tracks the
@@ -750,7 +750,7 @@ class ConformanceVectorSmokeTest {
         assertEquals(
             setOf(
                 "non_streaming", "multi_chunk", "cancellation", "error_terminal",
-                "error_recoverable", "sequence_gap", "credit_exhaustion",
+                "error_recoverable", "sequence_gap", "credit_stall",
             ),
             VECTORS.keys,
         )
@@ -766,10 +766,17 @@ class ConformanceVectorSmokeTest {
         }
 
     @Test
-    fun `multi_chunk reaches Ok with total aggregate`() =
+    fun `multi_chunk reaches Ok with total aggregate and forwards the Progress chunk`() =
         runTest {
+            // multi_chunk interleaves a non-billable Progress chunk (§5.4.5): the
+            // SDK drain FORWARDS it (surfaced, not filtered), the monotonicity
+            // cursor advances across it, and the stream still closes Ok.
             val v = VECTORS.getValue("multi_chunk")
-            val result = invoke(FakeNative(vectorChunks(v))).aggregate()
+            val handle = invoke(FakeNative(vectorChunks(v)))
+            val collected = handle.asFlow().toList()
+            assertTrue(collected.any { it.kind == "progress" }, "the Progress chunk is yielded")
+            assertEquals("end", collected.last().kind)
+            val result = handle.aggregate()
             assertEquals(buildJsonObject { put("total", 10) }, result.value)
             assertEquals(endAggregate(v), result.value)
         }
@@ -795,9 +802,9 @@ class ConformanceVectorSmokeTest {
         }
 
     @Test
-    fun `credit_exhaustion raises typed ScpException 6133 (bridge terminal)`() =
+    fun `credit_stall raises typed ScpException 6133 (bridge terminal)`() =
         runTest {
-            val v = VECTORS.getValue("credit_exhaustion")
+            val v = VECTORS.getValue("credit_stall")
             assertEquals("SCP-OUTLET-6133", expectedErrorCode(v))
             val ex = assertFailsWith<ScpException.Outlet> { invoke(FakeNative(vectorChunks(v))).aggregate() }
             assertEquals("SCP-OUTLET-6133", ex.code)

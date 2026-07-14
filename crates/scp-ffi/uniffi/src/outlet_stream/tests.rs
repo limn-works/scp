@@ -496,7 +496,7 @@ async fn live_poll_next_drains_to_terminal() {
 // This drives the vectors the single-shot `BridgeStreamExecutor` seam CAN produce
 // — `non_streaming`, `error_terminal`, `cancellation` (the same set the PyO3
 // reference drives live). `multi_chunk` / `error_recoverable` need a multi-chunk
-// executor and `credit_exhaustion`'s stall cannot be produced by a one-shot
+// executor and `credit_stall`'s stall cannot be produced by a one-shot
 // handler; those stay covered at the runtime tiers (deliverables 2/3). Named
 // `streaming_vectors_live` so the `streaming_vectors` test filter selects it.
 // ---------------------------------------------------------------------------

@@ -555,6 +555,16 @@ mod streaming_vectors {
         id
     }
 
+    /// Outcome of observing one chunk against the running sequence expectation.
+    /// Uniform `GapOutcome` enum shape shared across the runtime-layer harness
+    /// (`outlet_stream_vectors_common.rs`) and the `PyO3` / `UniFFI` per-bridge
+    /// trackers — a single canonical shape so the receiver rule cannot drift.
+    #[derive(Debug, PartialEq, Eq)]
+    enum GapOutcome {
+        Continue,
+        Cancelled { code: String },
+    }
+
     /// Receiver-side ordering check (§5.4.5 "Ordering and gaps"): a missing
     /// sequence MUST cancel with `execution.stream-gap` (`SCP-OUTLET-6131`).
     struct ReceiverSequenceTracker {
@@ -564,12 +574,14 @@ mod streaming_vectors {
         fn new() -> Self {
             Self { expected: 0 }
         }
-        fn observe(&mut self, sequence: u64) -> Option<&'static str> {
+        fn observe(&mut self, sequence: u64) -> GapOutcome {
             if sequence == self.expected {
                 self.expected += 1;
-                None
+                GapOutcome::Continue
             } else {
-                Some(CODE_STREAM_GAP)
+                GapOutcome::Cancelled {
+                    code: CODE_STREAM_GAP.to_owned(),
+                }
             }
         }
     }
@@ -701,8 +713,9 @@ mod streaming_vectors {
                 total_chunks += 1;
             }
         }
-        // 2 + 11 + 4 + 2 + 5 + 3 + 2 == 29 chunk descriptors across the 7 vectors.
-        assert_eq!(total_chunks, 29, "every chunk descriptor exercised");
+        // 2 + 12 + 4 + 2 + 5 + 3 + 2 == 30 chunk descriptors across the 7 vectors
+        // (multi_chunk carries an interleaved Progress chunk — §5.4.5).
+        assert_eq!(total_chunks, 30, "every chunk descriptor exercised");
     }
 
     /// `sequence_gap`: the receiver tracker cancels with `SCP-OUTLET-6131` at the
@@ -753,7 +766,7 @@ mod streaming_vectors {
         // live trigger is slice-3 transport). It replays the vector's gapped
         // transcript over a really-signed chunk sequence.
         let mut tracker = ReceiverSequenceTracker::new();
-        let mut cancelled_at: Option<(u64, &'static str)> = None;
+        let mut cancelled_at: Option<(u64, String)> = None;
         for chunk_desc in vector["chunks"].as_array().expect("chunks array") {
             let sequence = chunk_desc["sequence"].as_u64().expect("sequence");
             let payload = payload_from_vector(&chunk_desc["payload"]);
@@ -786,14 +799,14 @@ mod streaming_vectors {
                 "gap transcript chunk seq {sequence} is authentically signed"
             );
             if cancelled_at.is_none()
-                && let Some(code) = tracker.observe(sequence)
+                && let GapOutcome::Cancelled { code } = tracker.observe(sequence)
             {
                 cancelled_at = Some((sequence, code));
             }
         }
         assert_eq!(
             cancelled_at,
-            Some((3, CODE_STREAM_GAP)),
+            Some((3, CODE_STREAM_GAP.to_owned())),
             "receiver tracker cancels with SCP-OUTLET-6131 at gapped sequence 3"
         );
         assert_eq!(vector["expected_end_status"], "Cancelled");
@@ -809,7 +822,7 @@ mod streaming_vectors {
 // produce — `non_streaming`, `error_terminal`, `cancellation` (the same set the
 // PyO3 reference drives live). `multi_chunk` / `error_recoverable` need a
 // multi-chunk executor the single-shot handler seam cannot produce, and
-// `credit_exhaustion`'s stall cannot be produced by a one-shot handler (it emits
+// `credit_stall`'s stall cannot be produced by a one-shot handler (it emits
 // exactly one billable chunk and closes) — those stay covered at the runtime
 // tiers (deliverables 2/3). These live tests reuse the same gated resolver/DID
 // seeding helpers as `live_poll_next_drains_to_terminal`. Named

@@ -647,7 +647,7 @@ _EXPECTED_NAMES = frozenset(
         "error_terminal",
         "error_recoverable",
         "sequence_gap",
-        "credit_exhaustion",
+        "credit_stall",
     }
 )
 
@@ -669,9 +669,9 @@ class TestConformanceVectorSmoke:
 
     IMPORTANT boundary — where the terminal comes from:
 
-    - ``credit_exhaustion`` and ``cancellation`` surface a terminal the BRIDGE
+    - ``credit_stall`` and ``cancellation`` surface a terminal the BRIDGE
       delivers. The mock plays a framework terminal (a ``terminal: true`` Error
-      for credit exhaustion; a cancel-ack ``End`` after the consumer cancels)
+      for the credit stall; a cancel-ack ``End`` after the consumer cancels)
       and the SDK faithfully surfaces ``poll_next``'s terminal — the SDK cannot
       itself stall an executor, so it does not synthesize these terminals.
     - ONLY ``sequence_gap`` requires ACTIVE SDK-side detection: the drain tracks
@@ -691,8 +691,17 @@ class TestConformanceVectorSmoke:
         assert result.value == _end_aggregate(v)
 
     async def test_multi_chunk_ok(self) -> None:
+        # multi_chunk interleaves a non-billable Progress chunk (§5.4.5): the SDK
+        # drain FORWARDS it (surfaced, not filtered), the monotonicity cursor
+        # advances across it, and the stream still closes Ok.
         v = _VECTORS["multi_chunk"]
-        result = await _invoke(_FakeNative(_vector_chunks(v)))
+        handle = _invoke(_FakeNative(_vector_chunks(v)))
+        collected = [chunk async for chunk in handle]
+        assert any(c.kind == "progress" for c in collected), (
+            "the Progress chunk is yielded through the SDK drain"
+        )
+        assert collected[-1].kind == "end", "the stream closes Ok with End"
+        result = await handle
         assert result.value == {"total": 10}
         assert result.value == _end_aggregate(v)
 
@@ -714,10 +723,10 @@ class TestConformanceVectorSmoke:
             await _invoke(_FakeNative(_vector_chunks(v)))
         assert excinfo.value.code == "SCP-OUTLET-6130"
 
-    async def test_credit_exhaustion_raises_typed_error_6133(self) -> None:
+    async def test_credit_stall_raises_typed_error_6133(self) -> None:
         # Bridge-delivered terminal: mock plays data seq0 then a framework
         # Error seq1 {terminal:true, code 6133}. The SDK surfaces it faithfully.
-        v = _VECTORS["credit_exhaustion"]
+        v = _VECTORS["credit_stall"]
         assert v["expected_error_code"] == "SCP-OUTLET-6133"
         with pytest.raises(OutletError) as excinfo:
             await _invoke(_FakeNative(_vector_chunks(v)))

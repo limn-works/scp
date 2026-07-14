@@ -16,7 +16,7 @@
 //! `error_recoverable` (a non-terminal `Error` followed by more `Data`), so
 //! those two are NOT faked here — they are covered at the runtime layer
 //! (`crates/scp-testing/tests/integration/outlet_stream_conformance.rs` and
-//! `..._through_open_path.rs`, i.e. 2 of the 3 runtime tiers). `credit_exhaustion`
+//! `..._through_open_path.rs`, i.e. 2 of the 3 runtime tiers). `credit_stall`
 //! likewise cannot be produced by a single-shot handler (it emits exactly one
 //! billable chunk and closes `Ok`, never stalling), so its `SCP-OUTLET-6133`
 //! terminal is covered at the runtime layer too.
@@ -198,7 +198,7 @@ fn vectors_json_has_the_seven_named_scenarios() {
     names.sort_unstable();
     let mut expected = [
         "cancellation",
-        "credit_exhaustion",
+        "credit_stall",
         "error_recoverable",
         "error_terminal",
         "multi_chunk",

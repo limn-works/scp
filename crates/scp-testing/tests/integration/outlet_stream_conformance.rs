@@ -135,7 +135,7 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
         .transition_to(&ContextState::Active)
         .expect("context active");
 
-    // Timing: short credit-stall for the credit-exhaustion vector so its
+    // Timing: short credit-stall for the credit_stall vector so its
     // framework terminal fires fast; short cancel-ack so the cancellation
     // vector's forced terminal fires fast. Large elsewhere so a well-credited
     // stream never spuriously stalls.
@@ -311,7 +311,7 @@ async fn non_streaming_replays_data_then_framework_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multi_chunk_replays_ten_data_then_end() {
+async fn multi_chunk_replays_data_progress_then_end() {
     run_transcript_vector("multi_chunk").await;
 }
 
@@ -326,8 +326,8 @@ async fn error_recoverable_forwards_nonterminal_error_then_ends_ok() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn credit_exhaustion_stalls_to_6133() {
-    run_transcript_vector("credit_exhaustion").await;
+async fn credit_stall_stalls_to_6133() {
+    run_transcript_vector("credit_stall").await;
 }
 
 /// Cancellation: the transcript is timing-dependent (the forced terminal races

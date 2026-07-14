@@ -618,7 +618,7 @@ const EXPECTED_NAMES = new Set([
   "error_terminal",
   "error_recoverable",
   "sequence_gap",
-  "credit_exhaustion",
+  "credit_stall",
 ]);
 
 function vec(name: string): Vector {
@@ -643,9 +643,9 @@ function endAggregate(v: Vector): unknown {
  *
  * IMPORTANT boundary — where the terminal comes from:
  *
- * - `credit_exhaustion` and `cancellation` surface a terminal the BRIDGE
+ * - `credit_stall` and `cancellation` surface a terminal the BRIDGE
  *   delivers. The fake plays a framework terminal (a `terminal: true` Error for
- *   credit exhaustion; a cancel-ack `End` after the consumer cancels) and the
+ *   the credit stall; a cancel-ack `End` after the consumer cancels) and the
  *   SDK faithfully surfaces `pollNext`'s terminal — the SDK cannot itself stall
  *   an executor, so it does not synthesize these terminals.
  * - ONLY `sequence_gap` requires ACTIVE SDK-side detection: the drain tracks the
@@ -666,9 +666,16 @@ describe("AC6 conformance-vector smoke", () => {
     expect(result.value).toEqual(endAggregate(v));
   });
 
-  it("multi_chunk -> Ok, aggregate {total:10}", async () => {
+  it("multi_chunk -> Ok, aggregate {total:10} (forwards the interleaved Progress chunk)", async () => {
+    // multi_chunk interleaves a non-billable Progress chunk (§5.4.5): the SDK
+    // drain FORWARDS it (surfaced, not filtered), the monotonicity cursor
+    // advances across it, and the stream still closes Ok.
     const v = vec("multi_chunk");
-    const result = await invoke(new FakeNative(vectorChunks(v)));
+    const handle = invoke(new FakeNative(vectorChunks(v)));
+    const collected = await collect(handle);
+    expect(collected.some((c) => c.kind === "progress")).toBe(true);
+    expect((collected.at(-1) as OutletStreamChunk).kind).toBe("end");
+    const result = await handle.aggregate();
     expect(result.value).toEqual({ total: 10 });
     expect(result.value).toEqual(endAggregate(v));
   });
@@ -695,8 +702,8 @@ describe("AC6 conformance-vector smoke", () => {
     }
   });
 
-  it("credit_exhaustion -> raises typed OutletError SCP-OUTLET-6133 (bridge terminal)", async () => {
-    const v = vec("credit_exhaustion");
+  it("credit_stall -> raises typed OutletError SCP-OUTLET-6133 (bridge terminal)", async () => {
+    const v = vec("credit_stall");
     expect(v.expected_error_code).toBe("SCP-OUTLET-6133");
     try {
       await invoke(new FakeNative(vectorChunks(v))).aggregate();

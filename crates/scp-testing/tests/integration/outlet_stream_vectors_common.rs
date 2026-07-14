@@ -340,13 +340,13 @@ impl OutletExecutor for ScriptedExecutor {
 /// Builds the executor's emit list + terminal action from a vector's transcript.
 ///
 /// The emit list is every NON-terminal payload; the terminal is inferred from
-/// `expected_end_status`. `credit_exhaustion` is special-cased: the executor
+/// `expected_end_status`. `credit_stall` is special-cased: the executor
 /// must ATTEMPT more Data chunks than `credit_window` so the pump parks the
 /// excess and the credit-stall timer fires (the vector's terminal `Error` chunk
 /// is framework-emitted, not executor-emitted).
 pub fn build_script(vec: &Vector) -> (Vec<ChunkPayload>, TerminalAction) {
     if vec.expected_error_code.as_deref() == Some("SCP-OUTLET-6133") {
-        // credit_exhaustion: send credit_window + 1 Data chunks so the (window+1)th
+        // credit_stall: send credit_window + 1 Data chunks so the (window+1)th
         // parks with credit at zero; never terminate — the framework drives the
         // credit-stall terminal.
         let extra = (vec.open.credit_window + 1) as usize;
@@ -697,7 +697,7 @@ fn vectors_load_and_have_the_seven_named_scenarios() {
     names.sort_unstable();
     let mut expected = vec![
         "cancellation",
-        "credit_exhaustion",
+        "credit_stall",
         "error_recoverable",
         "error_terminal",
         "multi_chunk",

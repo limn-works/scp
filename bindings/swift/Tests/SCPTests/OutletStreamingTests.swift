@@ -507,14 +507,14 @@ extension OutletStreamingTests {
 ///
 /// IMPORTANT boundary — where the terminal comes from:
 ///
-/// - `credit_exhaustion` and `cancellation` surface a terminal the BRIDGE
+/// - `credit_stall` and `cancellation` surface a terminal the BRIDGE
 ///   delivers. The mock plays a framework terminal (a `terminal: true` Error for
-///   credit exhaustion; a cancel-ack `End` after the consumer cancels) and the
+///   the credit stall; a cancel-ack `End` after the consumer cancels) and the
 ///   SDK faithfully surfaces `pollNext`'s terminal — the SDK cannot itself stall
 ///   an executor, so it does not synthesize these terminals.
 /// - ONLY `sequence_gap` requires ACTIVE SDK-side detection: the drain tracks
 ///   the expected sequence, detects the hole ITSELF, signs the cancel through
-///   the bridge, and throws ``OutletError/sequenceGap(msg:code:)``. The mock
+///   the bridge, and throws ``OutletError/streamGap(msg:code:)``. The mock
 ///   feeds NO pre-baked cancel-ack for that vector (that would be test-gaming) —
 ///   the recorded cancel call proves the SDK generated it.
 extension OutletStreamingTests {
@@ -522,7 +522,7 @@ extension OutletStreamingTests {
         let vectors = try loadStreamVectors()
         XCTAssertEqual(Set(vectors.keys), [
             "non_streaming", "multi_chunk", "cancellation", "error_terminal",
-            "error_recoverable", "sequence_gap", "credit_exhaustion"
+            "error_recoverable", "sequence_gap", "credit_stall"
         ])
     }
 
@@ -533,8 +533,21 @@ extension OutletStreamingTests {
     }
 
     func testVectorMultiChunkOk() async throws {
+        // multi_chunk interleaves a non-billable Progress chunk (§5.4.5). The SDK
+        // drain FORWARDS it (surfaced, not filtered), the monotonicity cursor
+        // advances across it, and the stream still closes Ok.
         let vector = try XCTUnwrap(try loadStreamVectors()["multi_chunk"])
-        let result = try await invoke(FakeNative(chunks: vector.chunkData)).aggregate()
+        let handle = invoke(FakeNative(chunks: vector.chunkData))
+        var collected: [OutletStreamChunk] = []
+        for try await streamChunk in handle {
+            collected.append(streamChunk)
+        }
+        XCTAssertTrue(
+            collected.contains { $0.kind == "progress" },
+            "the Progress chunk is yielded through the SDK drain"
+        )
+        XCTAssertEqual(collected.last?.kind, "end", "the stream closes Ok with End")
+        let result = try await handle.aggregate()
         XCTAssertEqual(result.value, ["total": 10])
     }
 
@@ -563,10 +576,10 @@ extension OutletStreamingTests {
         }
     }
 
-    func testVectorCreditExhaustionRaises6133() async throws {
+    func testVectorCreditStallRaises6133() async throws {
         // Bridge-delivered terminal: mock plays data seq0 then a framework Error
         // seq1 {terminal:true, code 6133}. The SDK surfaces it faithfully.
-        let vector = try XCTUnwrap(try loadStreamVectors()["credit_exhaustion"])
+        let vector = try XCTUnwrap(try loadStreamVectors()["credit_stall"])
         XCTAssertEqual(vector.expectedErrorCode, "SCP-OUTLET-6133")
         do {
             _ = try await invoke(FakeNative(chunks: vector.chunkData)).aggregate()
@@ -598,15 +611,15 @@ extension OutletStreamingTests {
     func testVectorSequenceGapDetectedSignedCancelRaises6131() async throws {
         // ACTIVE SDK detection: mock plays data seq0, seq1, seq3 (seq2 MISSING).
         // The drain detects the gap at seq3, itself signs a cancel through the
-        // bridge, and throws sequenceGap(6131). NO pre-baked cancel-ack is fed.
+        // bridge, and throws streamGap(6131). NO pre-baked cancel-ack is fed.
         let vector = try XCTUnwrap(try loadStreamVectors()["sequence_gap"])
         XCTAssertEqual(vector.expectedErrorCode, "SCP-OUTLET-6131")
         let native = FakeNative(chunks: vector.chunkData)
         let handle = invoke(native)
         do {
             _ = try await handle.aggregate()
-            XCTFail("expected a sequenceGap throw")
-        } catch let OutletError.sequenceGap(_, code) {
+            XCTFail("expected a streamGap throw")
+        } catch let OutletError.streamGap(_, code) {
             XCTAssertEqual(code, "SCP-OUTLET-6131")
         }
         // The SDK ITSELF signed the receiver cancel (not fed by the mock).
@@ -615,8 +628,8 @@ extension OutletStreamingTests {
         // Terminal cache: the gap is sticky and control-plane is now guarded.
         do {
             _ = try await handle.aggregate()
-            XCTFail("expected cached sequenceGap")
-        } catch OutletError.sequenceGap {}
+            XCTFail("expected cached streamGap")
+        } catch OutletError.streamGap {}
         do {
             try await handle.grantCredit(Credit(1))
             XCTFail("expected streamAlreadyClosed")

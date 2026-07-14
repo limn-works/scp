@@ -357,8 +357,8 @@ async fn error_recoverable_through_open_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn credit_exhaustion_through_open_path() {
-    run_transcript_vector("credit_exhaustion").await;
+async fn credit_stall_through_open_path() {
+    run_transcript_vector("credit_stall").await;
 }
 
 /// Cancellation: the transcript is timing-dependent (the forced terminal races
