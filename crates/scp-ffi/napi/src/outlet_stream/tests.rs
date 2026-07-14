@@ -850,7 +850,7 @@ mod streaming_vectors_live {
 
     /// Stands up a live zero-cost Action outlet stream driven by `handler`, mirroring
     /// `live_poll_next_drains_to_terminal`'s setup exactly (per-instance resolver,
-    /// member seeding, OutletCallAll grant, delegated UCAN), and returns the opened
+    /// member seeding, `OutletCallAll` grant, delegated UCAN), and returns the opened
     /// stream fixture. `outlet_name` disambiguates the outlet per test.
     #[cfg(all(
         feature = "allow_in_memory_custody",
