@@ -2196,6 +2196,20 @@ mod tests {
         }
     }
 
+    /// Mutable sibling of [`actor_crypto`] — hands out the `&mut ContextCryptoState`
+    /// that the field-granular Class-C send/receive seams (e.g.
+    /// `ContextCryptoState::seal` / `build_encrypted_envelope_actor`) operate on.
+    fn actor_crypto_mut(
+        state: &mut PerContextState,
+    ) -> &mut crate::context::actor::ContextCryptoState {
+        match &mut state.mode {
+            crate::context::actor::ContextModeState::Encrypted(crypto) => crypto,
+            crate::context::actor::ContextModeState::Broadcast(_) => {
+                panic!("expected encrypted mode")
+            }
+        }
+    }
+
     /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / hardening H3: the single
     /// `pub(crate)` `wrapping_keypair()` accessor that the atomic core
     /// actor-seeding path (SCP-CRYPTOMOVE-001) reads must return a
@@ -4068,6 +4082,12 @@ mod tests {
         let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
         let routing_id = ctx_routing_id(&ctx_id);
 
+        // Seal/open moved onto the actor seam: move each party's provider-resident
+        // crypto onto an actor and drive the relocated
+        // `PerContextState::seal` / `PerContextState::open`.
+        let mut alice_actor = take_into_actor(&alice, &ctx_id);
+        let mut bob_actor = take_into_actor(&bob, &ctx_id);
+
         // Two independently-sealed messages. MLS forward secrecy deletes the
         // per-message decryption secret on the FIRST `open` of a given
         // ciphertext, so the negative and positive cases must each consume
@@ -4075,8 +4095,8 @@ mod tests {
         // at the MLS layer for an unrelated (forward-secrecy) reason.
         let inner1 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let inner2 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
-        let sealed_neg = alice.seal(&ctx_id, &inner1, &routing_id, 300).unwrap();
-        let sealed_pos = alice.seal(&ctx_id, &inner2, &routing_id, 300).unwrap();
+        let sealed_neg = alice_actor.seal(&alice_did, &inner1, &routing_id, 300).unwrap();
+        let sealed_pos = alice_actor.seal(&alice_did, &inner2, &routing_id, 300).unwrap();
 
         // Negative: opening with the hex-of-bytes string supplies a
         // `context_id_str` of `hex(ctx_id)` instead of the raw `TEST_CTX_STR`
@@ -4096,15 +4116,15 @@ mod tests {
         // dedicated guard-rejection path is covered by
         // `open_rejects_context_id_str_that_does_not_resolve_to_context_id`.
         let hex_ctx = hex::encode(ctx_id);
-        bob.open(&ctx_id, &hex_ctx, &sealed_neg).expect_err(
+        bob_actor.open(&SystemClock, &hex_ctx, &sealed_neg).expect_err(
             "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
              under the RAW context_id string, so the rebuilt AAD does not authenticate",
         );
 
         // Positive: opening the second blob with the RAW context_id string
         // (the spec value) succeeds, proving the AAD binds the raw string.
-        let opened = bob
-            .open(&ctx_id, TEST_CTX_STR, &sealed_pos)
+        let opened = bob_actor
+            .open(&SystemClock, TEST_CTX_STR, &sealed_pos)
             .expect("opening with the raw context_id string (spec AAD) must succeed");
         match opened {
             scp_protocol::context::builder::OpenResult::Application(env) => {
@@ -4124,6 +4144,8 @@ mod tests {
         // resolve-consistency error, distinct from an AEAD authentication
         // failure.
         let (_alice, bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+        // Seal/open moved onto the actor seam; drive the relocated open.
+        let mut bob_actor = take_into_actor(&bob, &ctx_id);
 
         // A `context_id_str` whose canonical resolution is NOT `ctx_id`. It is a
         // non-64-hex string, so it resolves via the SHA-256 fallback; `ctx_id`
@@ -4142,8 +4164,8 @@ mod tests {
         // instead surface an "outer envelope deserialization" error — proving
         // by its absence that the fail-fast assert ran ahead of the AEAD layer.
         let bogus_outer = [0xABu8; 64];
-        let err = bob
-            .open(&ctx_id, mismatched_ctx_str, &bogus_outer)
+        let err = bob_actor
+            .open(&SystemClock, mismatched_ctx_str, &bogus_outer)
             .expect_err("open must reject a context_id_str that does not resolve to context_id");
 
         match err {
@@ -4171,9 +4193,12 @@ mod tests {
         // error, not a downstream crypto failure.
         let (alice, _bob, ctx_id, alice_did) = setup_alice_bob_two_party();
         let routing_id = ctx_routing_id(&ctx_id);
+        // Seal moved onto the actor seam; drive the relocated seal on the
+        // actor whose `context_id` is the real `ctx_id` (so the live MLS group +
+        // sender key from setup are present).
+        let mut alice_actor = take_into_actor(&alice, &ctx_id);
 
-        // The keying argument is the REAL `ctx_id` (so `with_context` finds the
-        // live MLS group + sender key from setup), but the inner envelope binds
+        // The keying context is the REAL `ctx_id`, but the inner envelope binds
         // a DIFFERENT context-id string. The string is non-64-hex, so it
         // resolves via the SHA-256 fallback; `ctx_id` is the resolution of
         // TEST_CTX_STR, so any other string resolves elsewhere. The mismatch is
@@ -4186,8 +4211,8 @@ mod tests {
         );
 
         let inner = build_test_inner(mismatched_ctx_str, &alice_did, 0, 0);
-        let err = alice
-            .seal(&ctx_id, &inner, &routing_id, 300)
+        let err = alice_actor
+            .seal(&alice_did, &inner, &routing_id, 300)
             .expect_err("seal must reject an inner context_id that does not resolve to context_id");
 
         match err {
@@ -4276,53 +4301,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn seal_after_take_returns_owned_by_actor() {
-        // After `take_crypto_state`, the legacy `seal` path on the
-        // same context must return `CryptoFailed('context state
-        // owned by actor')` so callers learn to route through the
-        // actor mailbox instead.
-        let (alice, _bob, ctx_id, alice_did) = setup_alice_bob_two_party();
-        let _owned = alice.take_crypto_state(&ctx_id).unwrap();
-
-        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let routing_id = ctx_routing_id(&ctx_id);
-
-        let err = alice
-            .seal(&ctx_id, &inner, &routing_id, 300)
-            .expect_err("seal on a taken context must error");
-        match err {
-            ContextError::CryptoFailed(msg) => {
-                assert_eq!(msg, "context state owned by actor");
-            }
-            other => panic!("expected CryptoFailed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn open_after_take_returns_owned_by_actor() {
-        // Companion to `seal_after_take`: the `open` path also
-        // errors with the same message.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
-
-        // Seal a message via alice BEFORE taking the state so we
-        // have a valid ciphertext to feed into bob's open.
-        let inner = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
-        let routing_id = ctx_routing_id(&ctx_id);
-        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
-
-        // Now take bob's state — open on bob's side should error.
-        let _owned = bob.take_crypto_state(&ctx_id).unwrap();
-        let err = bob
-            .open(&ctx_id, TEST_CTX_STR, &sealed)
-            .expect_err("open on a taken context must error");
-        match err {
-            ContextError::CryptoFailed(msg) => {
-                assert_eq!(msg, "context state owned by actor");
-            }
-            other => panic!("expected CryptoFailed, got {other:?}"),
-        }
-    }
+    // NOTE (ADR-049 PR-7): the former `seal_after_take_returns_owned_by_actor`
+    // and `open_after_take_returns_owned_by_actor` asserted that the provider
+    // `seal` / `open` paths return `CryptoFailed("context state owned by actor")`
+    // once a context's crypto has been moved into the actor. The provider `seal`
+    // and `open` methods are now DELETED, so "no provider seal/open on a taken
+    // context" is enforced by the TYPE SYSTEM (the calls no longer compile) — the
+    // strongest possible form of the invariant. The surviving fail-closed
+    // guarantee on the RETAINED provider write/read paths after a take is pinned
+    // by `with_context_distinguishes_never_created_from_taken` (the read path →
+    // "owned by actor") and `taken_context_write_paths_fail_closed`
+    // (create_mls_group / install_joined_group / generate_sender_key → "owned by
+    // actor"). No provider seal/open path survives to relocate these two onto.
 
     #[test]
     fn with_context_distinguishes_never_created_from_taken() {
@@ -4477,17 +4467,20 @@ mod tests {
     #[test]
     fn app_data_envelope_routing_id_is_zeroed_not_context_rid() {
         let ctx_str = "ctx-app-data-zeroed-rid";
-        let (alice, _bob, _ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
-        let alice = std::sync::Arc::new(alice);
+        let (alice, _bob, ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
         let clock: std::sync::Arc<dyn scp_clock::Clock> =
             std::sync::Arc::new(scp_clock::SystemClock);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
-        let wire = crate::context::messaging_helpers::build_encrypted_envelope(
+        // Send-path seal moved onto the actor: `build_encrypted_envelope_actor` is
+        // the production app-data seal that zeroes the outer routing_id (§9.10.4).
+        let mut alice_actor = take_into_actor(&alice, &ctx_id);
+        let wire = crate::context::messaging_helpers::build_encrypted_envelope_actor(
             &clock,
-            &alice,
+            actor_crypto_mut(&mut alice_actor),
+            &alice_did,
             ctx_str,
             &sender,
             b"hello app data",
@@ -4521,16 +4514,19 @@ mod tests {
     fn app_data_roundtrip_decrypts_with_zeroed_routing_id() {
         let ctx_str = "ctx-app-data-roundtrip";
         let (alice, bob, ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
-        let alice_arc = std::sync::Arc::new(alice);
         let clock: std::sync::Arc<dyn scp_clock::Clock> =
             std::sync::Arc::new(scp_clock::SystemClock);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
-        let wire = crate::context::messaging_helpers::build_encrypted_envelope(
+        // Both seal (Alice) and open (Bob) move onto the actor seam.
+        let mut alice_actor = take_into_actor(&alice, &ctx_id);
+        let mut bob_actor = take_into_actor(&bob, &ctx_id);
+        let wire = crate::context::messaging_helpers::build_encrypted_envelope_actor(
             &clock,
-            &alice_arc,
+            actor_crypto_mut(&mut alice_actor),
+            &alice_did,
             ctx_str,
             &sender,
             b"roundtrip payload",
@@ -4548,7 +4544,7 @@ mod tests {
 
         // Bob opens the same blob and recovers the application plaintext,
         // proving the zeroed routing_id does not break delivery.
-        let opened = bob.open(&ctx_id, ctx_str, &wire).unwrap();
+        let opened = bob_actor.open(&SystemClock, ctx_str, &wire).unwrap();
         match opened {
             scp_protocol::context::builder::OpenResult::Application(env) => {
                 assert_eq!(
@@ -4596,9 +4592,13 @@ mod tests {
         let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap();
 
         // Control path passes `context_routing_id` to `seal` (as in
-        // trust_recovery_helpers / supervisor / lifecycle_helpers).
+        // trust_recovery_helpers / supervisor / lifecycle_helpers). Seal moved
+        // onto the actor seam, which preserves whatever `routing_id` it is given.
         let control_rid = scp_protocol::context::context_routing_id(ctx_str);
-        let wire = alice.seal(&ctx_id, &inner, &control_rid, 300).unwrap();
+        let mut alice_actor = take_into_actor(&alice, &ctx_id);
+        let wire = alice_actor
+            .seal(&alice_did, &inner, &control_rid, 300)
+            .unwrap();
 
         let decoded = scp_protocol::envelope::outer::OuterEnvelope::from_bytes(&wire).unwrap();
         assert_eq!(

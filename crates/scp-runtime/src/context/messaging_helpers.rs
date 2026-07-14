@@ -278,7 +278,14 @@ fn build_inner_wire(
 /// from `deps.crypto.local_did()` so the sealed sender-layer AAD binds the same
 /// local identity the provider used.
 #[allow(clippy::too_many_arguments)]
-fn build_encrypted_envelope_actor(
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): `pub(crate)` (was module-private) so the
+// relocated app-data send-path unit tests (crypto/mls/provider.rs `#[cfg(test)]`)
+// can drive the PRODUCTION actor app-data seal — the one that zeroes the outer
+// `routing_id` (§9.10.4) — after the deleted provider twin
+// `build_encrypted_envelope` is removed. This is the production seal seam that
+// `encrypt_and_send` already calls; widening its visibility adds no new caller
+// on the production path.
+pub(crate) fn build_encrypted_envelope_actor(
     clock: &Arc<dyn Clock>,
     crypto_state: &mut crate::context::actor::state::ContextCryptoState,
     local_did: &str,
