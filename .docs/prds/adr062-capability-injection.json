@@ -1,21 +1,26 @@
 {
   "project": "ADR-062 — Capability Injection: Real Backends and Test-Harness-Only Nullifiers",
-  "description": "Realization of ADR-062 (applying umbrella spec §17.17 unchanged). Every provider capability whose in-memory arm is a security nullifier (key custody, device attestation, pre-rotation custody, DHT resolution) gets a real production backend behind a dispatch seam, and its in-memory arm becomes a test-harness-only double (never runtime-selectable, absent from shipped artifacts via G1); the allow_in_memory_custody runtime switch and the public custody=in_memory config are deleted. In-memory STORAGE/push stay legitimate explicit runtime options (durability-only). Two execution units: UNIT 1 (Slice 0 module structure, Slice 1 DHT E1) is clean and executable now. UNIT 2 (pre-rotation, built on ACCEPTED ADR-054 + spec §9.7.4.1 item 3a: seam Slice 2, server floor Slice 3, interactive floor Slice 4, §5/§6 ceremony Slice 5; nullifier severance Slice 6; native SDK backends Slices 7-8). #1733 folds and closes-as-folded at Slice 6. Credentials (E2), blob (E3), relay-querier (E4) are subsequent slices not yet storied (E5-now/E2-later severity ordering argued in ADR §Decision 5).",
+  "description": "Realization of ADR-062 (applying umbrella spec §17.17 unchanged). Every provider capability whose in-memory arm is a security nullifier (key custody, device attestation, pre-rotation custody, DID/DHT resolution, relay querier) gets a real production backend behind a dispatch seam, and its in-memory arm becomes a test-harness-only double (absent from shipped artifacts via G1's closed subset-allowlist); durability-only arms (storage, push, blob) stay legitimate explicit runtime options, never Default. The allow_in_memory_custody switch, the public custody=in_memory config, and the DidDht<D=InMemoryDhtClient> nullifier-default type parameter are all deleted. Units: UNIT 1 (Slice 0 module, Slice 1 DHT E1 incl. DidDht default removal + node DhtMode reconciliation) is executable now. UNIT 2 (pre-rotation on ACCEPTED ADR-054 + §9.7.4.1 item 3a: seam Slice 2, server floor Slice 3, interactive floor Slice 4, §5/§6 ceremony Slice 5; severance Slice 6; native SDK backends Swift/Kotlin Slices 7/8; Python/TS FIDO2 Slices 12/13). UNIT 3 (live SCP-CAPSEL fixes + completeness: E2 credentials Slice 9, E3 blob Slice 10, E4 relay-querier Slice 11 — the impl-Default removals are live violations, storied now). #1733 folds and closes at Slice 6. Every capability is classified per §17.17.2 in the ADR.",
   "gates": [
     { "id": "gate-capinject-0", "name": "Module structure (Slice 0, Unit 1)", "stories": ["SCP-CAPINJECT-000"] },
-    { "id": "gate-capinject-1", "name": "DHT E1 real backend (Slice 1, Unit 1)", "stories": ["SCP-CAPINJECT-001"] },
+    { "id": "gate-capinject-1", "name": "DHT E1 + DidDht default removal + node DhtMode (Slice 1, Unit 1)", "stories": ["SCP-CAPINJECT-001"] },
     { "id": "gate-capinject-2", "name": "Pre-rotation seam (Slice 2, Unit 2)", "stories": ["SCP-CAPINJECT-002"] },
     { "id": "gate-capinject-3", "name": "Pre-rotation server floor (Slice 3, Unit 2)", "stories": ["SCP-CAPINJECT-003"] },
     { "id": "gate-capinject-4", "name": "Pre-rotation interactive floor (Slice 4, Unit 2)", "stories": ["SCP-CAPINJECT-004"] },
     { "id": "gate-capinject-5", "name": "Pre-rotation §5 ceremony + §6 re-selection (Slice 5, Unit 2)", "stories": ["SCP-CAPINJECT-005"] },
     { "id": "gate-capinject-6", "name": "Nullifier severance + switch deletion + G1 (Slice 6, Unit 2)", "stories": ["SCP-CAPINJECT-006"] },
     { "id": "gate-capinject-7", "name": "Swift native pre-rotation backends (Slice 7)", "stories": ["SCP-CAPINJECT-007"] },
-    { "id": "gate-capinject-8", "name": "Kotlin native pre-rotation backends (Slice 8)", "stories": ["SCP-CAPINJECT-008"] }
+    { "id": "gate-capinject-8", "name": "Kotlin native pre-rotation backends (Slice 8)", "stories": ["SCP-CAPINJECT-008"] },
+    { "id": "gate-capinject-9", "name": "E2 credentials real backend + seam (Slice 9, Unit 3)", "stories": ["SCP-CAPINJECT-009"] },
+    { "id": "gate-capinject-10", "name": "E3 blob impl-Default removal + explicit selection (Slice 10, Unit 3)", "stories": ["SCP-CAPINJECT-010"] },
+    { "id": "gate-capinject-11", "name": "E4 relay querier real MultiRelayQuerier (Slice 11, Unit 3)", "stories": ["SCP-CAPINJECT-011"] },
+    { "id": "gate-capinject-12", "name": "Python FIDO2 pre-rotation backend (Slice 12)", "stories": ["SCP-CAPINJECT-012"] },
+    { "id": "gate-capinject-13", "name": "TypeScript FIDO2 pre-rotation backend (Slice 13)", "stories": ["SCP-CAPINJECT-013"] }
   ],
   "stories": [
     {
       "id": "SCP-CAPINJECT-000",
-      "title": "Foundational module structure: move in-memory storage/push to an honest in_memory/ module (durability-only, runtime-selectable), keep nullifier doubles testing-gated, delete `pub use testing as software`, delete BridgeInMemoryStorage, re-point the server-feature storage path (F1)",
+      "title": "Module structure: move in-memory storage/push to an honest in_memory/ module (durability-only, runtime-selectable), keep nullifier doubles testing-gated, delete `pub use testing as software`, delete BridgeInMemoryStorage, re-point the server-feature storage path (F1)",
       "gate": "gate-capinject-0",
       "priority": "P0",
       "severity": "critical",
@@ -36,29 +41,29 @@
         "crates/scp-ffi/uniffi/src/runtime.rs",
         "crates/scp-ffi/uniffi/Cargo.toml"
       ],
-      "description": "ADR-062 Slice 0 (Unit 1, foundational, §Decision 0). scp-platform's `pub mod testing` welds five in-memory adapters and is re-aliased `pub use testing as software` (lib.rs:52) so durability-only STORAGE is imported in production from a testing-named path. Split by truth: (a) move `InMemoryStorage`+`InMemoryPush` into a new honest `crates/scp-platform/src/in_memory/` behind `in-memory-storage`/`in-memory-push` features (the latter pulls dep:uuid), compiled-available in shipped builds and selected explicitly via the existing `StorageConfig` seam (never default/fallback, §17.17 SCP-CAPSEL-8000/8011 — the OpenMLS-MemoryStorage case); (b) leave the nullifier doubles (`InMemoryKeyCustody`, `InMemoryDeviceAttestation`, `InMemoryPreRotationCustody`) in the `testing`-named module behind `testing`; (c) delete `pub use testing as software`; (d) delete `BridgeInMemoryStorage` (struct + impl Storage + `BridgeInMemoryStorageHandle`:275 + `BridgeInMemoryRepo`:285 + the third tuple element of `build_event_log_provider`:315, the common/src/lib.rs re-export, the three bridge runtime.rs incl. scp-ffi/src/runtime.rs:1112, the uniffi/Cargo.toml:63 comment) — bridges use `EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>` (the `EncryptingAdapter<S>` handle is generic, so the shape is preserved). F1 (the server-feature storage half): re-point `scp-ffi-common`'s `server` feature's `scp-platform/testing` edge (common/Cargo.toml:30) to `scp-platform/in-memory-storage`, and switch `server.rs`'s non-test STORAGE construction to the `in_memory` path in this slice (the custody/DHT phantoms at server.rs:322/435/455 are retyped in Slice 6, not here). This slice does NOT delete the switch or demote the nullifiers (that is Slice 6, which needs the real DHT + pre-rotation backends first) and has no dependency on any real backend. Note (ADR §Decision 0 module-naming): `in_memory/` houses only the durability-only types; the durability-vs-nullifier split is NOT inferable from module names alone — the module boundary encodes shippable-vs-test-only, the property G1 greps. Scope exception (prd.md story-scope): a module move + feature split + twin deletion is atomic by construction — a half-applied move breaks the build.",
+      "description": "ADR-062 Slice 0 (Unit 1, foundational, §Decision 0). Split scp-platform's `pub mod testing` by truth: (a) move `InMemoryStorage`+`InMemoryPush` into `crates/scp-platform/src/in_memory/` behind `in-memory-storage`/`in-memory-push` features (in-memory-push pulls dep:uuid), compiled-available and selected explicitly via `StorageConfig` (never default/fallback, §17.17 SCP-CAPSEL-8000/8011 — the OpenMLS-MemoryStorage case); (b) leave the nullifier doubles (`InMemoryKeyCustody`, `InMemoryDeviceAttestation`, `InMemoryPreRotationCustody`) in the `testing`-named module behind `testing`; (c) delete `pub use testing as software` (lib.rs:52); (d) delete `BridgeInMemoryStorage` (struct + impl Storage + `BridgeInMemoryStorageHandle`:275 + `BridgeInMemoryRepo`:285 + the third tuple element of `build_event_log_provider`:315, the common/src/lib.rs re-export, the three bridge runtime.rs incl. scp-ffi/src/runtime.rs:1112, the uniffi/Cargo.toml:63 comment) — bridges use `EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>` (the `EncryptingAdapter<S>` handle is generic). F1 storage half: re-point `scp-ffi-common`'s `server` feature `scp-platform/testing` edge (common/Cargo.toml:30) to `scp-platform/in-memory-storage`, and switch `server.rs`'s non-test STORAGE construction to the `in_memory` path (the custody phantoms server.rs:322/435 are Slice 6; the DHT constructor server.rs:455 is Slice 1). Does NOT delete the switch or demote nullifiers. Scope exception (prd.md): a module move + feature split + twin deletion is atomic — a half-applied move breaks the build.",
       "acceptanceCriteria": [
         "InMemoryStorage and InMemoryPush live in an honest module: crates/scp-platform/src/in_memory/storage.rs and push.rs exist, `grep -rn 'pub use.*InMemoryStorage\\|pub use.*InMemoryPush' crates/scp-platform/src/in_memory/mod.rs` matches, and `grep -rn 'InMemoryStorage\\|InMemoryPush' crates/scp-platform/src/testing/mod.rs` returns 0.",
-        "Two durability-only features exist and gate the module: `grep -nE '^in-memory-(storage|push) *=' crates/scp-platform/Cargo.toml` shows both (in-memory-push pulls dep:uuid); each in_memory/ submodule + re-export carries `#[cfg(feature = \"in-memory-<type>\")]`; and `cargo build -p scp-platform --no-default-features --features in-memory-storage` compiles InMemoryStorage WITHOUT enabling `testing` (grep the resolved features shows no `testing`).",
+        "Two durability-only features exist and gate the module: `grep -nE '^in-memory-(storage|push) *=' crates/scp-platform/Cargo.toml` shows both (in-memory-push pulls dep:uuid); each in_memory/ submodule + re-export carries `#[cfg(feature = \"in-memory-<type>\")]`; `cargo build -p scp-platform --no-default-features --features in-memory-storage` compiles InMemoryStorage WITHOUT enabling `testing`.",
         "`pub use testing as software` is deleted: `grep -n 'testing as software' crates/scp-platform/src/lib.rs` returns 0.",
-        "The three nullifier doubles remain testing-gated (unchanged this slice): `grep -n 'InMemoryKeyCustody\\|InMemoryDeviceAttestation\\|InMemoryPreRotationCustody' crates/scp-platform/src/testing/mod.rs` shows all three still behind the `#[cfg(feature = \"testing\")]` module gate.",
-        "BridgeInMemoryStorage is deleted: `grep -rn 'BridgeInMemoryStorage' crates/` returns 0; `build_event_log_provider` keeps its tuple shape backed by `EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>`; the three bridge runtime.rs (incl. scp-ffi/src/runtime.rs:1112) and the common/src/lib.rs re-export + uniffi/Cargo.toml:63 reference are updated.",
-        "F1 storage half: `grep -n 'scp-platform/testing' crates/scp-ffi/common/Cargo.toml` returns 0 (the `server` feature now pulls `scp-platform/in-memory-storage`), and the non-test STORAGE construction in crates/scp-ffi/common/src/server.rs uses `scp_platform::in_memory::InMemoryStorage` (grep). The custody/DHT phantoms at server.rs remain (retyped in Slice 6).",
-        "In-memory storage remains an explicit durability-only runtime option: the bridge `StorageConfig` in-memory arm resolves to `scp_platform::in_memory::InMemoryStorage` (grep the match arm) and no code path defaults/falls back to it (SCP-CAPSEL-8000/8001 preserved).",
-        "Full CI green: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings` (the switch still exists in this slice); and `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "The three nullifier doubles remain testing-gated: `grep -n 'InMemoryKeyCustody\\|InMemoryDeviceAttestation\\|InMemoryPreRotationCustody' crates/scp-platform/src/testing/mod.rs` shows all three behind the `#[cfg(feature = \"testing\")]` module gate.",
+        "BridgeInMemoryStorage is deleted: `grep -rn 'BridgeInMemoryStorage' crates/` returns 0; `build_event_log_provider` keeps its tuple shape backed by `EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>`; the three bridge runtime.rs + common/src/lib.rs re-export + uniffi/Cargo.toml:63 are updated.",
+        "F1 storage half: `grep -n 'scp-platform/testing' crates/scp-ffi/common/Cargo.toml` returns 0 (the `server` feature pulls `scp-platform/in-memory-storage`), and non-test STORAGE construction in crates/scp-ffi/common/src/server.rs uses `scp_platform::in_memory::InMemoryStorage`.",
+        "In-memory storage remains an explicit durability-only runtime option: the bridge `StorageConfig` in-memory arm resolves to `scp_platform::in_memory::InMemoryStorage` and no code path defaults/falls back to it (SCP-CAPSEL-8000/8001).",
+        "Full CI green: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings` (switch still exists this slice); `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with all stories present."
       ],
       "actionItems": [
-        "git mv crates/scp-platform/src/testing/{storage,push}.rs -> crates/scp-platform/src/in_memory/; add `pub mod in_memory;` gated `#[cfg(any(feature = \"in-memory-storage\", feature = \"in-memory-push\"))]`; delete `pub use testing as software`.",
-        "Add `in-memory-storage`/`in-memory-push` (dep:uuid) features in scp-platform/Cargo.toml; keep `testing` gating the three nullifier modules (and include the two storage primitives in the `testing` union).",
-        "Delete BridgeInMemoryStorage + aliases; back build_event_log_provider with `EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>`; update common/src/lib.rs, the three runtime.rs, uniffi/Cargo.toml:63.",
-        "F1 storage half: re-point common/Cargo.toml server feature to scp-platform/in-memory-storage; switch server.rs non-test storage construction to in_memory (leave custody/DHT phantoms for Slice 6).",
+        "git mv the storage/push adapters testing/ -> in_memory/; add `pub mod in_memory` gated on the two features; delete `pub use testing as software`.",
+        "Add in-memory-storage/in-memory-push (dep:uuid) features; keep `testing` gating the three nullifier modules.",
+        "Delete BridgeInMemoryStorage + aliases; back build_event_log_provider with EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>; update the three runtime.rs + common/src/lib.rs + uniffi/Cargo.toml:63.",
+        "F1 storage half: re-point common/Cargo.toml server feature; switch server.rs non-test storage construction to in_memory.",
         "Point the bridge StorageConfig in-memory arm at scp_platform::in_memory::InMemoryStorage; run full CI + review roster."
       ],
       "blockedBy": [],
       "sources": [
         { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 0. Honest module structure + durability-only storage stays a runtime option (foundational)" },
-        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "## Folding #1733 (close as folded — at Slice 3/6, not Slice 0)" },
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "## Folding #1733 (close as folded — at Slice 6, not Slice 0)" },
         { "file": ".docs/specs/17-persistence-and-storage.md", "section": "### 17.17.2 Security Classification of Development Arms" },
         { "file": ".docs/specs/17-persistence-and-storage.md", "section": "## 17.6 First-Party Storage Adapters (Client SDK)" }
       ],
@@ -66,14 +71,26 @@
     },
     {
       "id": "SCP-CAPINJECT-001",
-      "title": "DHT E1: ship real Pkarr on PyO3/NAPI (production-dht unconditional), demote in-memory DHT to a test-harness-only double behind scp-dht/testing, retype the shared chokepoints, fail closed",
+      "title": "DHT E1 (structural): remove the DidDht<D=InMemoryDhtClient> default type param + impl Default + new(); ship real Pkarr on PyO3/NAPI; node DhtMode::Memory -> test-harness-only + fail-closed DhtMode::Disabled; demote in-memory DHT to a test-harness double",
       "gate": "gate-capinject-1",
       "priority": "P0",
       "severity": "critical",
       "status": "pending",
       "files": [
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/config.rs",
+        "crates/scp-identity/Cargo.toml",
         "crates/scp-dht/Cargo.toml",
         "crates/scp-dht/src/dht_client/mod.rs",
+        "crates/scp-node/src/self_host.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/Cargo.toml",
+        "crates/scp-runtime/src/discovery/dht_context.rs",
+        "crates/scp-runtime/src/discovery/did_capabilities.rs",
+        "crates/scp-runtime/Cargo.toml",
+        "crates/scp-testing/src/helpers.rs",
+        "crates/scp-testing/Cargo.toml",
         "crates/scp-ffi/Cargo.toml",
         "crates/scp-ffi/napi/Cargo.toml",
         "crates/scp-ffi/common/Cargo.toml",
@@ -81,46 +98,50 @@
         "crates/scp-ffi/common/src/lib.rs",
         "crates/scp-ffi/common/src/bridge_instance.rs",
         "crates/scp-ffi/common/src/server.rs",
+        "crates/scp-ffi/common/src/resolvers.rs",
         "crates/scp-ffi/src/identity.rs",
         "crates/scp-ffi/napi/src/identity.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs",
         "crates/scp-ffi/common/tests/dht_capability_injection.rs",
+        ".docs/standards/construction.md",
         ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "ADR-062 Slice 1 (Unit 1, E1 HIGH; §Decision 1) — builds on SCP-CAPINJECT-000. PyO3/NAPI ship `InMemoryDhtClient` because `production-dht` is on uniffi/Cargo.toml but not scp-ffi/napi; DID publish/resolve is in-process only (#627) and rotation/migration use a fresh non-shared client (#1880). Make `production-dht` unconditional on scp-ffi/napi/common; introduce a shared `enum FfiDhtClient` in scp-ffi-common with a `Pkarr(PkarrDhtClient)` arm compiled unconditionally and an `InMemory(InMemoryDhtClient)` arm `#[cfg(any(test, feature = \"testing\"))]` — a TEST-HARNESS DOUBLE, not a runtime option; `ClientDhtConfig { gateways }` + `into_client -> Result<FfiDhtClient, DhtInitError>` + `impl From<scp_dht::DhtError>`. scp-dht cross-crate note (ADR §Decision 1): `InMemoryDhtClient` (dht_client/mod.rs:93) is an ungated pub struct in an unconditionally-linked crate and `#[cfg(test)]` does NOT cross crates — gate the TYPE behind a NEW `scp-dht/testing` feature wired to the consuming crates' [dev-dependencies] (and scp-node config.rs:1165, which also consumes it), so feature-absent implies type-absent. Retype the chokepoints bridge_instance.rs:358 (slot -> `OnceLock<Arc<FfiDhtClient>>`) and server.rs:35 (`ConcreteDidMethod` -> `DidDht<FfiDhtClient, SystemClock>`). Delete the throwaway/fresh-per-call clients (scp-ffi/src/identity.rs rotation_publish_client fallback, napi identity, uniffi make_dht_with_signer) so rotation/migration use the shared per-instance client + invalidate the cache. Fail closed via `DhtInitError` (SCP-CAPSEL-8001). Add DHT semantic-backend rows to the capability matrix. Closes #1518, re-satisfies #627, closes #1880 (PR keywords, not source). Scope exception: fix + type-gate + chokepoint retype are atomic.",
+      "description": "ADR-062 Slice 1 (Unit 1, E1 HIGH; §Decision 1 + D-A + D-B) — builds on SCP-CAPINJECT-000. STRUCTURAL ROOT FIX (D-A): in crates/scp-identity/src/dht.rs, remove the `= InMemoryDhtClient` default type parameter -> `pub struct DidDht<D: DhtClient, C: Clock = SystemClock>` (Clock default stays; SystemClock is not a nullifier), and DELETE `impl Default for DidDht<InMemoryDhtClient>` (:264) + the `pub fn new()` constructor (:270) that hardcode `InMemoryDhtClient::new()`. Every caller now constructs with an explicit DhtClient — PkarrDhtClient on production paths, InMemoryDhtClient only in `#[cfg(test)]`/`testing` code — so no silent in-memory DHT default is expressible (SCP-CAPSEL-8002 by construction). Blast radius (all in files[]): scp-identity/src/{dht.rs,config.rs}+Cargo.toml; scp-node/src/{self_host.rs,lib.rs,config.rs}+Cargo.toml; scp-runtime/src/discovery/{dht_context.rs,did_capabilities.rs}+Cargo.toml; scp-testing/src/helpers.rs+Cargo.toml; scp-ffi/common/src/{server.rs,resolvers.rs,bridge_instance.rs}; scp-ffi/{src,napi/src}/identity.rs; uniffi/src/bridge.rs (:3912/:8063/:9010/:9130/:16714 etc.). Then: `production-dht` unconditional on scp-ffi/napi/common; shared `enum FfiDhtClient` (Pkarr compiled unconditionally + `#[cfg(any(test, feature = \"testing\"))] InMemory`); retype the chokepoints bridge_instance.rs:358 + server.rs:35 onto FfiDhtClient (the D-A removal compile-forces converting server.rs:455's `InMemoryDhtClient::new()` HERE, moved out of Slice 6); `ClientDhtConfig { gateways }` + `into_client -> Result<_, DhtInitError>` fail-closed; delete throwaway/fresh-per-call clients (scp-ffi/src/identity.rs, napi, uniffi make_dht_with_signer). D-B (node DhtMode reconciliation): `build_memory_did_method` builds DidDht<InMemoryDhtClient> used for BOTH publish and resolve, so DhtMode::Memory is a §17.17.3 resolve-nullifier -> make `DhtMode::Memory` test-harness-only (gated), add a new fail-closed `DhtMode::Disabled` (resolve returns a typed Err, never a silent in-memory no-op), and update construction.md M2's DhtMode::Memory-is-fail-safe text to name Disabled as the fail-safe no-publish value. scp-dht/testing wiring: gate InMemoryDhtClient's type behind a NEW `scp-dht/testing` feature; scp-dht stays a NORMAL dependency; each bridge/consumer `testing` feature carries `scp-dht/testing` as a NORMAL feature edge, and each consumer constructing InMemoryDhtClient in its own tests lists `scp-dht/testing` in ITS [dev-dependencies] (scp-node, scp-runtime, scp-testing) — `scp-dht/testing` MUST NOT appear in any default/non-testing feature list. Add matrix DHT rows. Closes #1518, re-satisfies #627, closes #1880. Scope exception: the default-removal + type-gate + chokepoint retype + node DhtMode split are atomic (partial application breaks the build).",
       "acceptanceCriteria": [
-        "production-dht is unconditional on all three shipped-path FFI crates: `grep -nE 'production-dht' crates/scp-ffi/Cargo.toml crates/scp-ffi/common/Cargo.toml crates/scp-ffi/napi/Cargo.toml` shows scp-dht pulled with production-dht in each dependency features list; no `[features]` entry makes it optional.",
-        "A shared `enum FfiDhtClient` in scp-ffi-common has a Pkarr arm compiled unconditionally and an InMemory arm gated `#[cfg(any(test, feature = \"testing\"))]` (NOT any allow_in_memory_* feature): `grep -n 'pub enum FfiDhtClient' crates/scp-ffi/common/src/dht.rs` matches, the InMemory arm is immediately preceded by that cfg, `grep -n 'allow_in_memory' crates/scp-ffi/common/src/dht.rs` returns 0, and `impl scp_dht::DhtClient for FfiDhtClient` delegates publish/resolve.",
-        "InMemoryDhtClient is type-gated behind a NEW `scp-dht/testing` feature (cross-crate): `grep -n 'testing' crates/scp-dht/Cargo.toml` shows the feature; `pub struct InMemoryDhtClient` + impls in crates/scp-dht/src/dht_client/mod.rs carry `#[cfg(feature = \"testing\")]`; and the consuming crates enable `scp-dht/testing` only in [dev-dependencies]/test config (grep the FFI + scp-node Cargo.tomls shows scp-dht/testing NOT in a normal dependency features list).",
-        "A `ClientDhtConfig` distinct from scp-node's DhtMode exists with `into_client -> Result<FfiDhtClient, DhtInitError>` and `impl From<scp_dht::DhtError> for DhtInitError`: the three greps match and `grep -nE 'scp_node|DhtMode' crates/scp-ffi/common/src/dht.rs` returns 0.",
-        "Chokepoints retyped: `grep -n 'type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>' crates/scp-ffi/common/src/server.rs` and `grep -n 'dht_client: OnceLock<Arc<FfiDhtClient>>' crates/scp-ffi/common/src/bridge_instance.rs` both match; remaining InMemoryDhtClient refs in those files are inside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]`.",
-        "Throwaway clients deleted: outside `#[cfg(test)]`, `grep -nE 'InMemoryDhtClient::new\\(\\)' crates/scp-ffi/src/identity.rs crates/scp-ffi/napi/src/identity.rs` returns 0; the rotation_publish_client fallback and the uniffi make_dht_with_signer fresh-client are removed; an async test rotates a key and asserts a subsequent resolve through the shared resolver reflects the rotation.",
-        "Production DHT fails closed: `ClientDhtConfig::into_client` returns `Err(DhtInitError)` when Pkarr cannot be built; `grep -nE 'unwrap_or|or_else|InMemory' crates/scp-ffi/common/src/dht.rs` shows no in-memory/no-op substitution on failure; a unit test asserts an unsatisfiable production config yields Err.",
+        "The DidDht nullifier-default is removed (D-A): `grep -n 'DidDht<D: DhtClient = InMemoryDhtClient' crates/scp-identity/src/dht.rs` returns 0; `grep -n 'impl Default for DidDht<InMemoryDhtClient' crates/scp-identity/src/dht.rs` returns 0; and `grep -n 'pub fn new()' crates/scp-identity/src/dht.rs` returns 0 (the in-memory-hardcoding constructor is gone). The struct is `DidDht<D: DhtClient, C: Clock = SystemClock>`.",
+        "Every production caller constructs an explicit DhtClient; in-memory DHT appears only in test code: outside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]`, `grep -rn 'InMemoryDhtClient' crates/scp-identity crates/scp-node crates/scp-runtime crates/scp-ffi` returns 0; the workspace compiles with the default-param removed (bare-production `cargo build --workspace` with no testing features succeeds and InMemoryDhtClient is out of scope).",
+        "production-dht unconditional on the three FFI crates: `grep -nE 'production-dht' crates/scp-ffi/Cargo.toml crates/scp-ffi/common/Cargo.toml crates/scp-ffi/napi/Cargo.toml` shows scp-dht pulled with production-dht in each dependency features list; no `[features]` entry makes it optional.",
+        "A shared `enum FfiDhtClient` (Pkarr unconditional + `#[cfg(any(test, feature = \"testing\"))] InMemory`): `grep -n 'pub enum FfiDhtClient' crates/scp-ffi/common/src/dht.rs` matches, the InMemory arm is immediately preceded by that cfg, `grep -n 'allow_in_memory' crates/scp-ffi/common/src/dht.rs` returns 0, `impl scp_dht::DhtClient for FfiDhtClient` delegates publish/resolve.",
+        "InMemoryDhtClient type-gated behind a new `scp-dht/testing` feature wired as NORMAL edges: `grep -n 'testing' crates/scp-dht/Cargo.toml` shows the feature; the `pub struct InMemoryDhtClient` + impls carry `#[cfg(feature = \"testing\")]`; `scp-dht/testing` appears in the bridge/consumer `testing` feature lists AND in the [dev-dependencies] of scp-node/scp-runtime/scp-testing; and `scp-dht/testing` appears in NO default/non-testing feature list (grep the Cargo.tomls to confirm it is only under `testing = [...]` or `[dev-dependencies]`).",
+        "Chokepoints retyped incl. server.rs:455: `grep -n 'type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>' crates/scp-ffi/common/src/server.rs` and `grep -n 'dht_client: OnceLock<Arc<FfiDhtClient>>' crates/scp-ffi/common/src/bridge_instance.rs` both match; outside `#[cfg(test)]`, `grep -n 'InMemoryDhtClient::new()' crates/scp-ffi/common/src/server.rs` returns 0 (the :455 constructor converted here).",
+        "Throwaway/fresh-per-call clients deleted: outside `#[cfg(test)]`, `grep -nE 'InMemoryDhtClient::new\\(\\)' crates/scp-ffi/src/identity.rs crates/scp-ffi/napi/src/identity.rs` returns 0; the rotation_publish_client fallback and the uniffi make_dht_with_signer fresh-client are removed; an async test rotates a key and asserts a subsequent resolve through the shared resolver reflects the rotation.",
+        "Production DHT fails closed: `ClientDhtConfig::into_client` returns `Err(DhtInitError)` when Pkarr cannot be built; `grep -nE 'unwrap_or|or_else|InMemory' crates/scp-ffi/common/src/dht.rs` shows no in-memory/no-op substitution; a unit test asserts an unsatisfiable production config yields Err.",
+        "D-B node DhtMode reconciliation: `grep -n 'Disabled' crates/scp-node/src/config.rs` shows a new `DhtMode::Disabled` variant; `DhtMode::Memory` is gated `#[cfg(any(test, feature = \"testing\"))]`; a node built for production (no testing) that selects Disabled returns a typed Err on DID resolution (a test asserts this, not a silent None); and construction.md M2's `DhtMode::Memory`-is-fail-safe text is updated to name `Disabled` (grep .docs/standards/construction.md for `DhtMode::Disabled`).",
         ".docs/standards/sdk-capability-matrix.json records DHT shipped backend = Pkarr per binding; `grep -c 'Pkarr' .docs/standards/sdk-capability-matrix.json` >= 1; `python3.12 scripts/check-sdk-coverage.py` exits 0.",
         "Tests: an `#[ignore]`d live-Mainline roundtrip in crates/scp-ffi/common/tests/dht_capability_injection.rs, and a `#[cfg(not(feature = \"testing\"))]` compile assertion that FfiDhtClient resolves to Pkarr and InMemoryDhtClient is not in scope in a shipped build.",
-        "Full CI green: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings` (the switch still exists in slice 1); a bare-production `cargo build --workspace` with NO testing/allow_in_memory_custody (Pkarr-only graph compiles, InMemoryDhtClient absent); and `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "Full CI green: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings` (switch still exists this slice); a bare-production `cargo build --workspace` (no testing, no allow_in_memory_custody) — Pkarr-only graph compiles, InMemoryDhtClient type absent; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
-        "Add a `testing` feature to crates/scp-dht/Cargo.toml and `#[cfg(feature = \"testing\")]`-gate InMemoryDhtClient + impls; wire scp-dht/testing into the FFI + scp-node [dev-dependencies] only.",
-        "Enable scp-dht production-dht unconditionally on scp-ffi/napi/common.",
-        "Create crates/scp-ffi/common/src/dht.rs (FfiDhtClient enum + ClientDhtConfig + DhtInitError); declare in common/src/lib.rs.",
-        "Retype ConcreteDidMethod + the dht_client slot onto FfiDhtClient; build Pkarr via ClientDhtConfig::into_client at production sites.",
+        "Remove the DidDht `= InMemoryDhtClient` default type param + delete `impl Default for DidDht<InMemoryDhtClient>` + `pub fn new()`; migrate every caller to an explicit DhtClient (Pkarr prod; InMemoryDhtClient under `#[cfg(test)]`/`testing`).",
+        "Add a `testing` feature to crates/scp-dht/Cargo.toml, `#[cfg(feature = \"testing\")]`-gate InMemoryDhtClient; keep scp-dht a NORMAL dep; carry `scp-dht/testing` in each bridge/consumer `testing` feature + the [dev-dependencies] of scp-node/scp-runtime/scp-testing; never in a default list.",
+        "Enable production-dht unconditionally on scp-ffi/napi/common; create crates/scp-ffi/common/src/dht.rs (FfiDhtClient + ClientDhtConfig + DhtInitError); retype ConcreteDidMethod + the dht_client slot + convert server.rs:455.",
         "Delete throwaway clients (scp-ffi/src/identity.rs, napi, uniffi); route rotation/migration through the shared FfiDhtClient with cache invalidation.",
-        "Add matrix DHT rows; write the tests; run full CI + review roster; use PR closing keywords for #1518/#627/#1880."
+        "D-B: gate DhtMode::Memory test-harness-only, add fail-closed DhtMode::Disabled (typed Err on resolve), reconcile build_memory_did_method callers, update construction.md M2.",
+        "Add matrix DHT rows; write the tests; run full CI + review roster; PR closing keywords #1518/#627/#1880."
       ],
       "blockedBy": ["SCP-CAPINJECT-000"],
       "sources": [
-        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 1. DHT (E1) — ship real Pkarr; in-memory DHT becomes test-harness-only" },
-        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### Dispatch mechanism (per trait object-safety)" },
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 1. DHT (E1) — remove the nullifier default, ship real Pkarr, demote in-memory DHT to test-harness-only" },
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "## Non-goals / boundaries" },
         { "file": ".docs/specs/17-persistence-and-storage.md", "section": "### 17.17.3 The DHT Backend Is an Instance — and Its In-Memory Arm Is a Nullifier" },
         { "file": ".docs/specs/03-identity.md", "section": "### 3.10.6 Anti-Segmentation Invariant" }
       ],
-      "details": { "phase": "2", "adr": "ADR-062", "unit": "1", "slice": "Slice 1 (DHT E1)", "closes": "PR keywords: closes #1518, re-satisfies #627, closes #1880", "scopeException": "E1 fix + type-gate + chokepoint retype are indivisible" }
+      "details": { "phase": "2", "adr": "ADR-062", "unit": "1", "slice": "Slice 1 (DHT E1 + D-A default removal + D-B node DhtMode)", "closes": "PR keywords: closes #1518, re-satisfies #627, closes #1880", "scopeException": "default-removal + type-gate + chokepoint retype + node DhtMode split are atomic" }
     },
     {
       "id": "SCP-CAPINJECT-002",
-      "title": "Pre-rotation seam: PreRotationCustodyProvider FFI callback interface + CallbackPreRotationCustody adapter + FfiPreRotationCustody enum; retype the ~6 welded create-path sites; bridge-aliases + matrix row",
+      "title": "Pre-rotation seam: PreRotationCustodyProvider FFI callback interface + CallbackPreRotationCustody adapter + FfiPreRotationCustody enum (Callback + test InMemory only); retype the ~12 welded sites (bind with_custody -> Callback); delete the traits.rs default-in-production doc-comment; bridge-aliases + matrix row",
       "gate": "gate-capinject-2",
       "priority": "P0",
       "severity": "critical",
@@ -133,28 +154,30 @@
         "crates/scp-ffi/src/runtime.rs",
         "crates/scp-ffi/napi/src/identity.rs",
         "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
         "crates/scp-ffi/uniffi/src/bridge.rs",
         "crates/scp-ffi/uniffi/src/scp.udl",
         "scripts/bridge-aliases.json",
         ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "ADR-062 Slice 2 (Unit 2, E5; §Decision 4) — builds on the ACCEPTED ADR-054. Introduces the dispatch seam (no backend yet beyond the callback route + test-harness InMemory). Per ADR-054 §1: add the `PreRotationCustodyProvider` FFI callback interface (UniFFI `[Trait, WithForeign]` + PyO3 `Py<PyAny>` + NAPI threadsafe-function adapters) with the four canonical methods generate / public_key / import_seed_bytes / consume (mapped to the existing core `PreRotationCustody` trait methods per ADR-054's locked table — the core trait at traits.rs:740 is NOT renamed), and a `CallbackPreRotationCustody` adapter implementing the core trait over the foreign provider with the single-use handle invariant (invalidate in Rust after consume). Because `PreRotationCustody` is RPITIT (not object-safe; traits.rs:759/772/782) the seam is an `enum FfiPreRotationCustody { Callback(CallbackPreRotationCustody), IndependentPrincipal(KmsPreRotationCustody), EncryptedOffline(EncryptedOfflinePreRotationCustody), #[cfg(any(test, feature = \"testing\"))] InMemory(InMemoryPreRotationCustody) }` (mirroring FfiKeyCustody) — NOT `Arc<dyn>`, and NOT a bare `Arc<CallbackPreRotationCustody>` (which cannot hold the KMS/offline/test arms). In THIS slice the IndependentPrincipal/EncryptedOffline arms are declared (their backends land in Slices 3/4) so the enum type is complete; retype the ~6 ungated concrete create-path sites (scp-ffi/src/identity.rs:987, runtime.rs:1984; napi/src/identity.rs:1130, runtime.rs:1385; uniffi/src/bridge.rs:2467,9016,16716,20825,22590) onto `FfiPreRotationCustody`. Add `bridge-aliases.json` entries for the per-binding-cased callback methods (ADR-054 canonical names; else check-bridge-symmetry.sh trips). Add the pre-rotation-provider semantic-backend row to sdk-capability-matrix.json. This slice does not yet remove InMemoryPreRotationCustody from the shipped selection (Slice 6 does the severance once the floors ship); the create path may temporarily select the test InMemory arm ONLY under `#[cfg(any(test, feature=\"testing\"))]`, and the production default is left unset pending Slices 3-5 (fail-closed, not InMemory). Scope exception: the provider interface + enum + retype are one FFI-surface change.",
+      "description": "ADR-062 Slice 2 (Unit 2, E5; §Decision 4) — builds on ACCEPTED ADR-054. The dispatch seam only (no KMS/offline backend yet). Per ADR-054 §1: add the `PreRotationCustodyProvider` FFI callback interface (UniFFI [Trait, WithForeign] + PyO3 Py<PyAny> + NAPI TSFN) with the four canonical methods generate/public_key/import_seed_bytes/consume (mapped to the existing core `PreRotationCustody` trait methods per ADR-054's locked table — the core trait at traits.rs:740 is NOT renamed), and a `CallbackPreRotationCustody` adapter implementing the core trait with the single-use handle invariant. Because PreRotationCustody is RPITIT (traits.rs:759/772/782) the seam is an `enum FfiPreRotationCustody` — but to avoid front-loaded stubs the enum in THIS slice has ONLY `Callback(CallbackPreRotationCustody)` + `#[cfg(any(test, feature = \"testing\"))] InMemory(InMemoryPreRotationCustody)` (the IndependentPrincipal arm lands with its KMS backend in Slice 3, EncryptedOffline with its backend in Slice 4). Retype ALL ~12 ungated concrete create-path sites onto FfiPreRotationCustody: scp-ffi/src/identity.rs:987, runtime.rs:1984; napi/src/identity.rs:1130, runtime.rs:1385, napi/src/scp.rs:456/587/729; uniffi/src/bridge.rs:2467/9016/9136/9219/16716/20825/22590. The TWO identity_create_with_custody sites (napi scp.rs, uniffi bridge.rs:9136) MUST bind to the `Callback` arm (caller-supplied custody backs pre-rotation too); a blanket 0-InMemory AC MUST NOT be satisfiable by routing with_custody through a fail-closed/EncryptedOffline path. Delete the traits.rs doc-comment claiming InMemoryPreRotationCustody is the production default (a §3a violation). Add bridge-aliases.json entries for the per-binding-cased callback methods (else check-bridge-symmetry.sh trips). Add the pre-rotation-provider row to sdk-capability-matrix.json. No production default selects InMemory (fail closed pending Slices 3-5). Scope exception: the provider interface + enum + retype are one FFI-surface change.",
       "acceptanceCriteria": [
-        "The core `PreRotationCustody` trait is unchanged (not renamed): `grep -n 'trait PreRotationCustody' crates/scp-platform/src/traits.rs` matches with store_committed_pre_rotation_key / reveal_public_key / destroy_after_migration / custody_kind.",
-        "A `PreRotationCustodyProvider` FFI callback interface exists on all three bridges with the four canonical methods: `grep -rn 'PreRotationCustodyProvider' crates/scp-ffi/uniffi/src/bridge.rs crates/scp-ffi/src/identity.rs crates/scp-ffi/napi/src/identity.rs` matches on each; a `CallbackPreRotationCustody` adapter exists (`grep -rn 'CallbackPreRotationCustody' crates/scp-ffi/common/src`) with the single-use handle invalidated in Rust after consume (a test asserts a second consume/public_key returns HandleNotFound).",
-        "The seam is an enum, not dyn and not a bare adapter: `grep -n 'enum FfiPreRotationCustody' crates/scp-ffi/common/src/pre_rotation.rs` matches with arms Callback / IndependentPrincipal / EncryptedOffline and an InMemory arm `#[cfg(any(test, feature = \"testing\"))]`; `grep -n 'Arc<dyn PreRotationCustody>' crates/scp-ffi/common/src/pre_rotation.rs` returns 0.",
-        "All ~6 welded create-path sites are retyped onto FfiPreRotationCustody: `grep -rn 'Arc<scp_platform::testing::InMemoryPreRotationCustody>' crates/scp-ffi/src/identity.rs crates/scp-ffi/src/runtime.rs crates/scp-ffi/napi/src/identity.rs crates/scp-ffi/napi/src/runtime.rs crates/scp-ffi/uniffi/src/bridge.rs` returns 0 outside `#[cfg(test)]`/`#[cfg(feature=\"testing\")]`; the field type is `FfiPreRotationCustody` (grep).",
-        "bridge-aliases.json carries the per-binding-cased pre-rotation callback method aliases (generate/public_key->publicKey/import_seed_bytes->importSeedBytes/consume per ADR-054's table): `grep -n 'importSeedBytes\\|publicKey' scripts/bridge-aliases.json` matches, and `bash scripts/check-bridge-symmetry.sh` exits 0.",
-        ".docs/standards/sdk-capability-matrix.json has a pre-rotation-provider capability row recording the provider across Python/TypeScript/Swift-Kotlin bindings; `python3.12 scripts/check-sdk-coverage.py` exits 0.",
-        "No production default selects InMemory: outside `#[cfg(any(test, feature=\"testing\"))]`, `grep -rn 'InMemoryPreRotationCustody' crates/scp-ffi` returns 0; a create call on a build without the real backends (Slices 3/4 not yet wired) fails closed rather than defaulting to InMemory (a test asserts Err, not an InMemory selection).",
-        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; and `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "The core PreRotationCustody trait is unchanged: `grep -n 'trait PreRotationCustody' crates/scp-platform/src/traits.rs` matches with store_committed_pre_rotation_key / reveal_public_key / destroy_after_migration / custody_kind.",
+        "A `PreRotationCustodyProvider` FFI callback interface exists on all three bridges with the four canonical methods: `grep -rn 'PreRotationCustodyProvider' crates/scp-ffi/uniffi/src/bridge.rs crates/scp-ffi/src/identity.rs crates/scp-ffi/napi/src/identity.rs` matches; a `CallbackPreRotationCustody` adapter exists (`grep -rn 'CallbackPreRotationCustody' crates/scp-ffi/common/src`) with the single-use handle invalidated in Rust after consume (a test asserts a second consume/public_key returns HandleNotFound).",
+        "The seam is an enum with EXACTLY two arms this slice (no stubs): `grep -n 'enum FfiPreRotationCustody' crates/scp-ffi/common/src/pre_rotation.rs` matches with arms `Callback` and `#[cfg(any(test, feature = \"testing\"))] InMemory` and NO `IndependentPrincipal`/`EncryptedOffline` arms yet; `grep -n 'Arc<dyn PreRotationCustody>' crates/scp-ffi/common/src/pre_rotation.rs` returns 0.",
+        "All ~12 welded create-path sites are retyped onto FfiPreRotationCustody: `grep -rn 'Arc<scp_platform::testing::InMemoryPreRotationCustody>' crates/scp-ffi` returns 0 outside `#[cfg(test)]`/`#[cfg(feature=\"testing\")]`; the field type is `FfiPreRotationCustody` at all 12 sites (grep the enumerated files).",
+        "The two identity_create_with_custody sites bind to the Callback arm: `grep -n 'FfiPreRotationCustody::Callback' crates/scp-ffi/napi/src/scp.rs crates/scp-ffi/uniffi/src/bridge.rs` matches at the with-custody paths (bridge.rs:~9136), and a test asserts caller-supplied custody also backs the pre-rotation key (not silently routed to EncryptedOffline/fail-closed).",
+        "The traits.rs `default in production ... until backends wired in` doc-comment is deleted: `grep -n 'default in production' crates/scp-platform/src/traits.rs` returns 0.",
+        "bridge-aliases.json carries the per-binding-cased pre-rotation callback method aliases and `bash scripts/check-bridge-symmetry.sh` exits 0; `.docs/standards/sdk-capability-matrix.json` has a pre-rotation-provider row and `python3.12 scripts/check-sdk-coverage.py` exits 0.",
+        "No production default selects InMemory: outside `#[cfg(any(test, feature=\"testing\"))]`, `grep -rn 'InMemoryPreRotationCustody' crates/scp-ffi` returns 0; a create call on a build without the real backends fails closed rather than defaulting to InMemory (a test asserts Err).",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
-        "Add the PreRotationCustodyProvider FFI callback interface (UniFFI [Trait, WithForeign] + PyO3 Py<PyAny> + NAPI TSFN) with generate/public_key/import_seed_bytes/consume; add the CallbackPreRotationCustody adapter dispatching into the existing core-trait methods per ADR-054's locked table; enforce the single-use handle invariant in Rust.",
-        "Define `enum FfiPreRotationCustody` in crates/scp-ffi/common/src/pre_rotation.rs (Callback/IndependentPrincipal/EncryptedOffline/#[cfg(test/testing)] InMemory); declare in common/src/lib.rs.",
-        "Retype the ~6 welded create-path sites onto FfiPreRotationCustody; leave the production default unset (fail-closed) pending Slices 3-5.",
-        "Add bridge-aliases.json entries for the per-binding-cased callback methods; add the sdk-capability-matrix.json pre-rotation-provider row.",
+        "Add the PreRotationCustodyProvider FFI interface + CallbackPreRotationCustody adapter (single-use handle invariant) dispatching into the existing core-trait methods per ADR-054's locked table.",
+        "Define `enum FfiPreRotationCustody` with Callback + `#[cfg] InMemory` ONLY in crates/scp-ffi/common/src/pre_rotation.rs; declare in common/src/lib.rs.",
+        "Retype the ~12 welded sites onto FfiPreRotationCustody; bind the 2 with_custody sites to Callback; delete the traits.rs default-in-production doc-comment.",
+        "Add bridge-aliases.json entries + the sdk-capability-matrix.json pre-rotation-provider row.",
         "Run full CI (incl. check-bridge-symmetry.sh, check-sdk-coverage.py) + review roster."
       ],
       "blockedBy": ["SCP-CAPINJECT-000"],
@@ -163,11 +186,11 @@
         { "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md", "section": "### 1. A separate `PreRotationCustodyProvider` FFI callback interface" },
         { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.4.1 Pre-Rotation Key Custody" }
       ],
-      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2", "slice": "Slice 2 (pre-rotation seam)", "scopeException": "provider interface + enum seam + retype are one FFI-surface change" }
+      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2", "slice": "Slice 2 (pre-rotation seam; enum = Callback + test InMemory only)", "scopeException": "provider interface + enum + retype are one FFI-surface change" }
     },
     {
       "id": "SCP-CAPINJECT-003",
-      "title": "Pre-rotation server floor: independent-principal KMS/HSM/cloud-vault backend (§3a(a)); server-profile creation fails closed with no substrate; negative-reachability conformance test; zeroize derived key",
+      "title": "Pre-rotation server floor: KmsPreRotationCustody independent-principal backend (§3a(a)) + add the IndependentPrincipal enum arm; server-profile creation fails closed with no substrate; conformance PAIR (negative-reachability AND principal-distinctness); zeroize derived key",
       "gate": "gate-capinject-3",
       "priority": "P0",
       "severity": "critical",
@@ -180,20 +203,21 @@
         "crates/scp-node/src/config.rs",
         "crates/scp-testing/tests/integration/pre_rotation_residence.rs"
       ],
-      "description": "ADR-062 Slice 3 (Unit 2; §Decision 4, ADR-054 OQ2 §3a(a)) — builds on the seam (SCP-CAPINJECT-002). Ship the non-interactive-server floor: `KmsPreRotationCustody`, an independent-principal KMS/HSM/cloud-vault backend implementing the core `PreRotationCustody` trait, where the recovery authority resides under a principal DISTINCT from the operational-custody principal and the operational principal holds no read/use/decrypt/assume/delegate grant over it or any KEK in its wrapping/derivation chain (spec §9.7.4.1 item 3a(a)). It is wired into the `FfiPreRotationCustody::IndependentPrincipal` arm and becomes the server-profile default. If no independent-principal substrate is configured, identity creation on the server profile MUST fail closed — no fallback to co-located storage (§3a(a)). The recovery-authority residence is enforced at the backend/config boundary (KMS key policy), not by the codec. Conformance: the strengthened negative-reachability adversary test (ADR-054 §Strengthened conformance test) — hand the harness the full operational surface (every operational KeyCustody handle/key, every artifact + remote resource readable/assumable by the operational principal, followed transitively through every wrapping/derivation link) plus any published ciphertext, and assert it CANNOT reconstruct the 32-byte pre-rotation seed. Zeroize the derived AES/KEK key material, not just seed bytes. Scope exception: the backend + fail-closed wiring + conformance test are one substrate change.",
+      "description": "ADR-062 Slice 3 (Unit 2; §Decision 4, ADR-054 OQ2 §3a(a)) — builds on the seam (SCP-CAPINJECT-002). Ship the non-interactive-server floor: `KmsPreRotationCustody`, an independent-principal KMS/HSM/cloud-vault backend implementing the core PreRotationCustody trait, where the recovery authority resides under a principal DISTINCT from the operational-custody principal and the operational principal holds no read/use/decrypt/assume/delegate grant over it or any KEK/role in its wrapping/derivation chain (§9.7.4.1 item 3a(a)). ADD the `IndependentPrincipal(KmsPreRotationCustody)` arm to `FfiPreRotationCustody` in THIS slice (with its backend, no stub) and make it the server-profile default. No configured independent-principal substrate => server-profile creation fails closed (§3a(a)). Conformance = the ADR-054 PAIR — BOTH: (1) negative-reachability adversary test (harness gets the full operational surface + transitive wrapping links + published ciphertext, cannot reconstruct the 32-byte seed); AND (2) principal-distinctness structural assertion (the recovery-authority residence-id is distinct from the operational principal, and the operational grant set excludes read/use/decrypt/assume/delegate over EVERY secret/KEK/role in the derivation chain, not just the terminal KEK). Zeroize the derived AES/KEK key, not just seed bytes. Scope exception: backend + enum arm + fail-closed wiring + conformance PAIR are one substrate change.",
       "acceptanceCriteria": [
-        "`KmsPreRotationCustody` exists implementing the core PreRotationCustody trait: `grep -rn 'struct KmsPreRotationCustody' crates/scp-platform/src/pre_rotation/kms.rs` matches and `grep -rn 'impl PreRotationCustody for KmsPreRotationCustody' crates/scp-platform/src/pre_rotation/kms.rs` matches.",
-        "It is wired into the FfiPreRotationCustody::IndependentPrincipal arm and is the server-profile default: `grep -n 'IndependentPrincipal' crates/scp-ffi/common/src/pre_rotation.rs` matches and the server-profile construction selects it (grep the server default path in scp-node/src/config.rs or the bridge server path).",
-        "Server-profile creation fails closed with no configured independent-principal substrate (§3a(a)): an async/unit test asserts identity creation on the server profile returns a typed Err (no fallback to InMemory or co-located storage) when no KMS/HSM substrate is configured.",
-        "The negative-reachability adversary conformance test passes: a test in crates/scp-testing/tests/integration/pre_rotation_residence.rs hands the harness the full operational surface (operational KeyCustody handles/keys + operational-principal-readable/assumable artifacts + transitive wrapping links) plus any published ciphertext and asserts it CANNOT reconstruct the 32-byte pre-rotation seed (`grep -n 'negative.reachability\\|cannot_reconstruct\\|residence' crates/scp-testing/tests/integration/pre_rotation_residence.rs` matches; the test runs and passes).",
-        "Derived key material is zeroized: `grep -rn 'Zeroizing\\|zeroize' crates/scp-platform/src/pre_rotation/kms.rs` shows the derived KEK/AES key (not only the seed) is held in zeroizing memory.",
-        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; and `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`KmsPreRotationCustody` exists implementing the core trait: `grep -rn 'struct KmsPreRotationCustody' crates/scp-platform/src/pre_rotation/kms.rs` and `grep -rn 'impl PreRotationCustody for KmsPreRotationCustody' crates/scp-platform/src/pre_rotation/kms.rs` both match.",
+        "The IndependentPrincipal enum arm is added this slice: `grep -n 'IndependentPrincipal' crates/scp-ffi/common/src/pre_rotation.rs` matches, and it is the server-profile default (grep the server-profile construction path).",
+        "Server-profile creation fails closed with no configured substrate (§3a(a)): a test asserts server-profile identity creation returns a typed Err (no fallback to InMemory/co-located) when no KMS/HSM substrate is configured.",
+        "Conformance PAIR part 1 (negative-reachability): a test in crates/scp-testing/tests/integration/pre_rotation_residence.rs hands the harness the full operational surface + transitive wrapping links + published ciphertext and asserts it CANNOT reconstruct the 32-byte seed.",
+        "Conformance PAIR part 2 (principal-distinctness): the same test file asserts the recovery-authority residence-id is DISTINCT from the operational principal AND the operational grant set excludes read/use/decrypt/assume/delegate over every secret/KEK/role in the derivation chain (grep the test for `residence_id`/`assume`/`delegate`/`distinct`); BOTH parts MUST pass.",
+        "Derived key material is zeroized: `grep -rn 'Zeroizing\\|zeroize' crates/scp-platform/src/pre_rotation/kms.rs` shows the derived KEK/AES key (not only the seed) held in zeroizing memory.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
-        "Implement KmsPreRotationCustody in crates/scp-platform/src/pre_rotation/kms.rs (adapter over a pluggable KMS/HSM/cloud-vault client; principal-distinctness enforced by the operator's key policy), impl the core PreRotationCustody trait, zeroize the derived KEK/AES key.",
-        "Wire it into FfiPreRotationCustody::IndependentPrincipal and make it the server-profile default; make server-profile creation fail closed when no substrate is configured.",
-        "Write the negative-reachability adversary conformance test (crates/scp-testing/tests/integration/pre_rotation_residence.rs) per ADR-054's Strengthened-conformance-test description.",
+        "Implement KmsPreRotationCustody (adapter over a pluggable KMS/HSM/cloud-vault client; principal-distinctness enforced by the operator key policy), impl the core trait, zeroize the derived KEK/AES key.",
+        "Add the IndependentPrincipal arm to FfiPreRotationCustody; make it the server-profile default; server-profile creation fails closed with no substrate.",
+        "Write the conformance PAIR (negative-reachability + principal-distinctness incl. full-chain assume/delegate exclusion) in pre_rotation_residence.rs.",
         "Run full CI + review roster (cryptographer + security-reviewer mandatory)."
       ],
       "blockedBy": ["SCP-CAPINJECT-002"],
@@ -203,11 +227,11 @@
         { "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md", "section": "### Strengthened conformance test (the PAIR)" },
         { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.4.1 Pre-Rotation Key Custody" }
       ],
-      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2", "slice": "Slice 3 (server floor)", "scopeException": "backend + fail-closed wiring + conformance test are one substrate change" }
+      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2", "slice": "Slice 3 (server floor + IndependentPrincipal arm)", "scopeException": "backend + enum arm + fail-closed wiring + conformance PAIR are one substrate change" }
     },
     {
       "id": "SCP-CAPINJECT-004",
-      "title": "Pre-rotation interactive floor: encrypted-offline backend with user-supplied passphrase (§3a(b)) + minimum-strength check + Shamir 3-of-5 + BIP39 pure codecs; negative-reachability conformance test",
+      "title": "Pre-rotation interactive floor: EncryptedOfflinePreRotationCustody (user-supplied passphrase, >=128-bit min-strength, §3a(b)) + add the EncryptedOffline enum arm + Shamir 3-of-5 + BIP39 pure codecs; conformance PAIR (co-located-passphrase-fails + Shamir <3 shares)",
       "gate": "gate-capinject-4",
       "priority": "P0",
       "severity": "critical",
@@ -221,36 +245,36 @@
         "crates/scp-ffi/common/src/pre_rotation.rs",
         "crates/scp-testing/tests/integration/pre_rotation_residence.rs"
       ],
-      "description": "ADR-062 Slice 4 (Unit 2; §Decision 4, ADR-054 §2 + OQ2 §3a(b)) — builds on the seam (SCP-CAPINJECT-002). Ship the interactive-client floor and the shared cross-platform codecs: (a) `EncryptedOfflinePreRotationCustody` (AES-256-GCM, key via Argon2id memory=64 MiB/iter=3/parallelism=4) whose passphrase is USER-SUPPLIED per-recovery and never persisted server-reachably (§3a(b)) — the human is the independent principal; the SDK MUST enforce a minimum-strength check on the user passphrase (offline brute-force resistance against the published Argon2id params, since the ciphertext is adversary-visible) and reject low-entropy inputs; (b) Shamir 3-of-5 over GF(2^8) and BIP39 24-word mnemonic as pure/shared codecs. Wire the encrypted-offline backend into `FfiPreRotationCustody::EncryptedOffline`. These are the interactive-profile backends; the SDK MUST NOT offer auto-generated-passphrase encrypted-offline as a server-profile standalone floor (ADR-054 per-backend §3-soundness table). Zeroize the derived AES key AND the passphrase-derived material, not just the seed. Conformance: extend the negative-reachability adversary test to the encrypted-offline case — with a user-supplied passphrase NOT in any operational-reachable store, the harness (given the published ciphertext + full operational surface) CANNOT reconstruct the seed; and a co-located-passphrase variant MUST fail the test by construction (proving the test detects colocation). Scope exception: the interactive backend + codecs + conformance are one cryptographic unit.",
+      "description": "ADR-062 Slice 4 (Unit 2; §Decision 4, ADR-054 §2 + OQ2 §3a(b)) — builds on the seam (SCP-CAPINJECT-002). Ship the interactive-client floor + shared codecs: (a) `EncryptedOfflinePreRotationCustody` (AES-256-GCM, Argon2id memory=64 MiB/iter=3/parallelism=4) whose passphrase is USER-SUPPLIED per-recovery and never persisted server-reachably (§3a(b)); the SDK MUST enforce a minimum-strength check requiring >=128 bits of guessing entropy against the published Argon2id params using a real estimator (zxcvbn-class with a guess-count threshold equivalent to >= 2^128 offline guesses given the Argon2id cost), NOT a length heuristic, and reject low-entropy inputs; (b) Shamir 3-of-5 over GF(2^8) and BIP39 24-word pure codecs. ADD the `EncryptedOffline(EncryptedOfflinePreRotationCustody)` arm to FfiPreRotationCustody in THIS slice (with its backend). The SDK MUST NOT offer auto-generated-passphrase encrypted-offline as a server-profile standalone floor (ADR-054 per-backend §3-soundness). Zeroize the derived AES key AND the passphrase-derived material. Conformance = the ADR-054 PAIR for the encrypted-offline case: part 1 negative-reachability (user-supplied passphrase absent from operational stores => seed not reconstructable from operational surface + published ciphertext), part 2 principal-distinctness AND a co-located-passphrase variant MUST FAIL the test by construction; for Shamir, part 2 asserts fewer than 3 shares are operationally reachable. Scope exception: interactive backend + codecs + enum arm + conformance PAIR are one cryptographic unit.",
       "acceptanceCriteria": [
-        "`EncryptedOfflinePreRotationCustody` exists with the exact Argon2id parameters: `grep -rnE 'Argon2|65536|Aes256Gcm' crates/scp-platform/src/pre_rotation/encrypted_offline.rs` matches memory=64MiB(65536)/iter=3/parallelism=4 and AES-256-GCM; it impls the core PreRotationCustody trait; a roundtrip test (generate/import -> export encrypted -> restore -> public_key equal) passes.",
-        "The passphrase is user-supplied and a minimum-strength check is enforced: `grep -rnE 'min.*strength|entropy|reject' crates/scp-platform/src/pre_rotation/encrypted_offline.rs` matches, and a unit test asserts a low-entropy passphrase is rejected with a typed Err while a strong one is accepted.",
-        "Shamir 3-of-5 and BIP39 codecs exist as pure functions: `grep -rn 'fn ' crates/scp-platform/src/pre_rotation/shamir.rs crates/scp-platform/src/pre_rotation/bip39.rs` shows pure split/combine and mnemonic encode/decode; roundtrip tests pass (3-of-5 reconstructs; any 2 shares do not; BIP39 encode->decode is identity).",
-        "The encrypted-offline backend is wired into FfiPreRotationCustody::EncryptedOffline and is NOT offered as a server-profile standalone floor: `grep -n 'EncryptedOffline' crates/scp-ffi/common/src/pre_rotation.rs` matches, and a test asserts the server-profile menu excludes auto-generated-passphrase encrypted-offline (ADR-054 per-backend §3-soundness).",
-        "Derived key + passphrase material zeroized: `grep -rn 'Zeroizing\\|zeroize' crates/scp-platform/src/pre_rotation/encrypted_offline.rs` shows the derived AES key AND passphrase-derived buffers are zeroizing.",
-        "The negative-reachability conformance test covers encrypted-offline: the test in crates/scp-testing/tests/integration/pre_rotation_residence.rs asserts that with a user-supplied passphrase absent from operational-reachable stores the seed is NOT reconstructable from (operational surface + published ciphertext), AND a co-located-passphrase variant FAILS the test (grep the test for both cases).",
-        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; and `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`EncryptedOfflinePreRotationCustody` exists with the exact Argon2id parameters: `grep -rnE 'Argon2|65536|Aes256Gcm' crates/scp-platform/src/pre_rotation/encrypted_offline.rs` matches memory=64MiB(65536)/iter=3/parallelism=4 + AES-256-GCM; it impls the core trait; a roundtrip test passes.",
+        "The min-strength check requires >=128-bit guessing entropy via a real estimator: `grep -rnE '128|zxcvbn|guess|entropy' crates/scp-platform/src/pre_rotation/encrypted_offline.rs` matches a guess-count/entropy threshold (not a length check), and a unit test asserts a low-entropy passphrase is rejected with a typed Err while a strong one is accepted.",
+        "Shamir 3-of-5 and BIP39 pure codecs exist: roundtrip tests pass (3-of-5 reconstructs; any 2 shares do NOT; BIP39 encode->decode is identity).",
+        "The EncryptedOffline enum arm is added this slice and excluded from the server-profile standalone floor: `grep -n 'EncryptedOffline' crates/scp-ffi/common/src/pre_rotation.rs` matches, and a test asserts the server-profile menu excludes auto-generated-passphrase encrypted-offline.",
+        "Derived key + passphrase material zeroized: `grep -rn 'Zeroizing\\|zeroize' crates/scp-platform/src/pre_rotation/encrypted_offline.rs` shows both the derived AES key and passphrase-derived buffers are zeroizing.",
+        "Conformance PAIR covers encrypted-offline: the test asserts (part 1) a user-supplied passphrase absent from operational stores => seed not reconstructable, (part 2) a co-located-passphrase variant FAILS the test, and (Shamir) fewer than 3 shares operationally reachable (grep the test for all three).",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
-        "Implement EncryptedOfflinePreRotationCustody (AES-256-GCM + Argon2id, shared param source with §17.6/§17.8) with a user-supplied passphrase + minimum-strength check; zeroize derived key + passphrase material.",
-        "Implement Shamir 3-of-5 (GF(2^8)) and BIP39 24-word pure codecs in crates/scp-platform/src/pre_rotation/.",
-        "Wire EncryptedOffline into FfiPreRotationCustody; ensure the server-profile menu excludes auto-gen-passphrase encrypted-offline.",
-        "Extend the negative-reachability conformance test to the encrypted-offline (user-passphrase pass + co-located-passphrase fail) cases.",
+        "Implement EncryptedOfflinePreRotationCustody (AES-256-GCM + Argon2id, shared param source with §17.6/§17.8) with a user-supplied passphrase + >=128-bit-entropy min-strength estimator; zeroize derived key + passphrase material.",
+        "Implement Shamir 3-of-5 (GF(2^8)) + BIP39 24-word pure codecs.",
+        "Add the EncryptedOffline arm to FfiPreRotationCustody; ensure the server-profile menu excludes auto-gen-passphrase encrypted-offline.",
+        "Extend the conformance PAIR (negative-reachability + co-located-passphrase-fails + Shamir <3 shares).",
         "Run full CI + review roster (cryptographer + security-reviewer mandatory)."
       ],
       "blockedBy": ["SCP-CAPINJECT-002"],
       "sources": [
         { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 4. Pre-rotation custody (E5) — build the real per-profile backends now, per accepted ADR-054" },
         { "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md", "section": "### 2. Real SDK backends (§9.7.4.1 §4)" },
-        { "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md", "section": "### OQ2 resolved — per-profile floors (full menu retained)" },
+        { "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md", "section": "### Strengthened conformance test (the PAIR)" },
         { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.4.1 Pre-Rotation Key Custody" }
       ],
-      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2", "slice": "Slice 4 (interactive floor + codecs)", "scopeException": "interactive backend + codecs + conformance are one cryptographic unit" }
+      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2", "slice": "Slice 4 (interactive floor + EncryptedOffline arm + codecs)", "scopeException": "interactive backend + codecs + enum arm + conformance PAIR are one cryptographic unit" }
     },
     {
       "id": "SCP-CAPINJECT-005",
-      "title": "Pre-rotation §5 selection ceremony + §6 re-selection: per-profile filtered menu, non-interactive-server fail-closed branch, post-migration re-selection",
+      "title": "Pre-rotation §5 selection ceremony + §6 re-selection: per-profile filtered menu presenting ALL registered §3a-conforming backends ordered by security, non-interactive-server fail-closed branch, post-migration re-selection",
       "gate": "gate-capinject-5",
       "priority": "P0",
       "severity": "critical",
@@ -263,21 +287,21 @@
         "crates/scp-testing/tests/integration/pre_rotation_ceremony.rs",
         ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "ADR-062 Slice 5 (Unit 2; §Decision 4, ADR-054 §3, spec §9.7.4.1 §5/§6) — builds on the two floors (SCP-CAPINJECT-003, -004). Implement the SDK custody-selection ceremony: at identity creation present custody options ordered by security, FILTERED to those §3a-conforming for the active deployment profile (item 3a(a)/(b)); a backend the per-backend §3-soundness table marks unsound/degenerate for the profile MUST NOT be offered as a standalone conforming choice. The non-interactive-server branch replaces the plural human prompt with selection of an operator-configured independent-principal backend and fails closed if none is configured; the PreRotationCommitment is published only after the key is confirmed resident in the §3a-conforming substrate. §6: after a pre-rotation key is used for migration, the new pre-rotation key MUST re-enter §3a-conforming custody for the active profile (re-run §5, including the non-interactive-server branch). This makes the interactive menu genuinely plural where the platform offers multiple conforming backends (the native hardware backends of Slices 7/8 register here). Scope exception: the ceremony + re-selection are one control-flow unit spanning create + migrate.",
+      "description": "ADR-062 Slice 5 (Unit 2; §Decision 4, ADR-054 §3, spec §9.7.4.1 §5/§6) — builds on the two floors (SCP-CAPINJECT-003, -004). Implement the SDK custody-selection ceremony: present custody options ordered by security, FILTERED to §3a-conforming for the active profile; a backend the per-backend §3-soundness table marks unsound/degenerate MUST NOT be offered as a standalone conforming choice. The non-interactive-server branch replaces the plural human prompt with selection of an operator-configured independent-principal backend and fails closed if none configured; the PreRotationCommitment is published only after residence is confirmed. §6: after migration, the new pre-rotation key re-enters §3a-conforming custody (re-run §5). Ceremony-level completeness: ALL registered §3a-conforming backends for the profile MUST be presented (ordered) — not just one — so as native/FIDO2 backends register (Slices 7/8/12/13) the menu is genuinely plural where multiple conforming methods are reachable. Also makes callback-custody migration reveal->import reachable (remove the UniFFI Unsupported block). Scope exception: ceremony + re-selection span create + migrate as one control-flow unit.",
       "acceptanceCriteria": [
-        "The §5 ceremony presents a per-profile-filtered menu: `grep -rn 'profile' crates/scp-ffi/common/src/pre_rotation.rs` shows profile-based filtering, and a test asserts the interactive-profile menu includes only §3a-conforming backends and the server-profile path presents no plural human prompt (selects an operator-configured backend).",
-        "A backend unsound for the profile is never offered as a standalone floor: a test asserts auto-generated-passphrase encrypted-offline is absent from the server-profile menu (ADR-054 per-backend §3-soundness) and KMS/HSM is present.",
-        "Non-interactive-server fails closed with no configured backend: a test asserts server-profile creation returns a typed Err (no fallback) when no operator-configured independent-principal backend is set, and that the PreRotationCommitment is published only after residence is confirmed.",
+        "The §5 ceremony presents a per-profile-filtered menu of ALL registered §3a-conforming backends, ordered by security: `grep -rn 'profile' crates/scp-ffi/common/src/pre_rotation.rs` shows profile-based filtering, and a test registers 2+ conforming backends for the interactive profile and asserts BOTH are presented in security order (not just one).",
+        "A backend unsound for the profile is never offered as a standalone floor: a test asserts auto-generated-passphrase encrypted-offline is absent from the server-profile menu and KMS/HSM is present.",
+        "Non-interactive-server fails closed: a test asserts server-profile creation returns a typed Err (no fallback) when no operator-configured independent-principal backend is set, and PreRotationCommitment is published only after residence confirmation.",
         "§6 post-migration re-selection re-enters §3a-conforming custody: an async test drives create -> migrate and asserts the new pre-rotation key is placed in a §3a-conforming backend for the active profile (re-runs §5), not left in InMemory or the old substrate.",
-        "Callback-custody migration reveal->import is reachable (no longer fail-closed Unsupported): `grep -rn 'callback custody cannot import pre-rotation seed bytes' crates/scp-ffi/uniffi/src/bridge.rs` returns 0, and a test drives create-with-callback-custody -> migrate -> new #0 installed from the revealed bytes.",
-        ".docs/standards/sdk-capability-matrix.json reflects the ceremony/selection capability across bindings; `python3.12 scripts/check-sdk-coverage.py` exits 0.",
-        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; and `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "Callback-custody migration reveal->import is reachable: `grep -rn 'callback custody cannot import pre-rotation seed bytes' crates/scp-ffi/uniffi/src/bridge.rs` returns 0, and a test drives create-with-callback-custody -> migrate -> new #0 installed from the revealed bytes.",
+        ".docs/standards/sdk-capability-matrix.json reflects the ceremony/selection capability; `python3.12 scripts/check-sdk-coverage.py` exits 0.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
-        "Implement the §5 selection ceremony in the create path (per-profile filtered menu; server branch selects an operator-configured independent-principal backend and fails closed if none); publish PreRotationCommitment only after residence confirmation.",
-        "Implement §6 post-migration re-selection (re-run §5 for the new pre-rotation key); remove the UniFFI Unsupported block so callback-custody migration reveal->import works.",
-        "Add the ceremony/selection capability to sdk-capability-matrix.json; write the ceremony + re-selection tests (crates/scp-testing/tests/integration/pre_rotation_ceremony.rs).",
+        "Implement the §5 selection ceremony (per-profile filtered menu presenting ALL conforming backends ordered; server branch selects an operator-configured independent-principal backend + fails closed); publish PreRotationCommitment only after residence confirmation.",
+        "Implement §6 post-migration re-selection; remove the UniFFI Unsupported block so callback-custody migration reveal->import works.",
+        "Add the ceremony/selection capability to sdk-capability-matrix.json; write the ceremony + re-selection + all-backends-presented tests.",
         "Run full CI + review roster."
       ],
       "blockedBy": ["SCP-CAPINJECT-003", "SCP-CAPINJECT-004"],
@@ -290,7 +314,7 @@
     },
     {
       "id": "SCP-CAPINJECT-006",
-      "title": "Nullifier severance: demote in-memory custody + attestation + pre-rotation to test-harness-only, remove public custody=in_memory, delete the allow_in_memory_custody switch, sever testing edges (incl. F1 server.rs phantoms), fix stale matrix strings, add G1",
+      "title": "Nullifier severance: demote in-memory custody + attestation to test-harness-only, remove public custody=in_memory, delete allow_in_memory_custody, sever testing edges (incl. F1 server.rs custody phantoms), fix stale matrix strings, add G1 as a closed subset-allowlist",
       "gate": "gate-capinject-6",
       "priority": "P0",
       "severity": "critical",
@@ -320,25 +344,24 @@
         "TESTING.md",
         "CONTRIBUTING.md"
       ],
-      "description": "ADR-062 Slice 6 (Unit 2; §Decision 2/3/6) — depends on the DHT real backend (SCP-CAPINJECT-001) and the complete pre-rotation realization (SCP-CAPINJECT-005, transitively 002-004). Once no shipped path constructs a nullifier: (a) key custody — re-gate `FfiKeyCustody::InMemory` (custody.rs:38) from `#[cfg(feature = \"allow_in_memory_custody\")]` to `#[cfg(any(test, feature = \"testing\"))]`, and REMOVE the public `custody = \"in_memory\"` config value + seed-import path (napi/src/scp.rs:379 and siblings); real backends File/Sqlite/Callback already ship. (b) device attestation — re-gate InMemoryDeviceAttestation to `#[cfg(any(test, feature = \"testing\"))]`; a shipped SDK returns a typed Err for the attestation op (secure behavior at bridge.rs:3622), not a silent attest-valid (spec §9:187 makes the absence expected). (c) DELETE `allow_in_memory_custody` entirely (feature defs scp-ffi:27/napi:15/uniffi:32, every `#[cfg]` site, stale scp-runtime doc-prose commands.rs/supervisor.rs, CLAUDE.md clippy string, ci.yml/release.yml strings). (d) Sever the unconditional `scp-platform/testing` edges (scp-ffi/Cargo.toml:51, napi/Cargo.toml:55) and `dep:scp-testing` into each bridge's `testing` feature/dev-deps. (e) F1 completion — retype server.rs's IdentitySource<InMemoryKeyCustody> phantoms (:322,:435) to FileKeyCustody and drop the InMemoryDhtClient::new() (:455) + testing use. (f) Fix the 4 stale `allow_in_memory_custody` device-attestation strings in sdk-capability-matrix.json (~:117-132). (g) Add G1 (scripts/check-shipped-feature-graph.sh) asserting `scp-platform/testing`, `scp-dht/testing`, and `scp-testing` are absent from every shipped artifact graph (run per artifact INCLUDING --features server), with the stated soundness invariant. #1733 closes-as-folded here. Scope exception: deleting the switch requires renaming every cfg site + severing edges + retyping phantoms atomically or the build breaks.",
+      "description": "ADR-062 Slice 6 (Unit 2; §Decision 2/3/6) — depends on DHT real (SCP-CAPINJECT-001) and the complete pre-rotation realization (SCP-CAPINJECT-005, transitively 002-004). (a) Key custody: re-gate `FfiKeyCustody::InMemory` (custody.rs:38) from `#[cfg(feature = \"allow_in_memory_custody\")]` to `#[cfg(any(test, feature = \"testing\"))]`, and REMOVE the public `custody = \"in_memory\"` config value + seed-import path (napi/src/scp.rs:379). (b) Device attestation: re-gate InMemoryDeviceAttestation to `#[cfg(any(test, feature = \"testing\"))]`; shipped attestation op returns a typed Err (bridge.rs:3622), not silent attest-valid (spec §9:187). (c) DELETE `allow_in_memory_custody` entirely (feature defs scp-ffi:27/napi:15/uniffi:32, every cfg site, scp-runtime doc-prose, CLAUDE.md clippy string, ci.yml/release.yml). (d) Sever the unconditional `scp-platform/testing` edges (scp-ffi:51, napi:55) + `dep:scp-testing` into each bridge's `testing`/dev-deps. (e) F1 custody retype: server.rs IdentitySource<InMemoryKeyCustody> phantoms (:322,:435) -> FileKeyCustody, drop the testing use (the :455 DHT constructor was already converted in Slice 1). (f) Fix the 4 stale `allow_in_memory_custody` device-attestation strings in sdk-capability-matrix.json (:119/:120/:131/:132). (g) Add G1 (scripts/check-shipped-feature-graph.sh) as a SOLE closed subset-allowlist: assert the complete RESOLVED feature-set of each shipped artifact is a subset of an explicit per-artifact permitted-prod-features allowlist (anything not on the allowlist, named or not, FAILS) — NOT a denylist of named testing features; run per artifact INCLUDING --features server. #1733 closes-as-folded here. Scope exception: switch deletion + cfg-rename + edge-severance + phantom-retype + G1 are atomic.",
       "acceptanceCriteria": [
         "`allow_in_memory_custody` is deleted everywhere: `grep -rn 'allow_in_memory_custody' --include='*.toml' --include='*.rs' --include='*.yml' crates/ .github/` returns 0; `grep -n 'allow_in_memory_custody' CLAUDE.md TESTING.md CONTRIBUTING.md` returns 0; and `grep -c 'allow_in_memory_custody' .docs/standards/sdk-capability-matrix.json` returns 0 (the 4 stale device-attest strings fixed).",
-        "In-memory key custody is test-harness-only: `FfiKeyCustody::InMemory` is gated `#[cfg(any(test, feature = \"testing\"))]` (grep custody.rs + napi/uniffi; `grep -n 'allow_in_memory' crates/scp-ffi/src/custody.rs` returns 0), and the public `custody = \"in_memory\"` config value + seed-import path is removed (`grep -rn '\"in_memory\"' crates/scp-ffi/napi/src/scp.rs crates/scp-ffi/src/scp.rs` returns 0 outside `#[cfg(any(test, feature=\"testing\"))]`).",
-        "Device attestation is test-harness-only and declines cleanly: InMemoryDeviceAttestation bridge usage is gated `#[cfg(any(test, feature = \"testing\"))]`, and a test asserts the shipped attestation op returns a typed Err (not a silent attest-valid).",
-        "In-memory pre-rotation is test-harness-only (no shipped selection): outside `#[cfg(any(test, feature=\"testing\"))]`, `grep -rn 'InMemoryPreRotationCustody' crates/scp-ffi crates/scp-node` returns 0.",
-        "F1 completion: `grep -rn 'InMemoryKeyCustody\\|InMemoryDhtClient\\|scp_platform::testing' crates/scp-ffi/common/src/server.rs` returns 0 outside `#[cfg(test)]` (phantoms retyped to FileKeyCustody, the InMemoryDhtClient::new() dropped), and `grep -n 'scp-platform/testing' crates/scp-ffi/common/Cargo.toml` returns 0.",
-        "A shipped-config feature graph is nullifier-free (incl. server): for each shipped artifact's exact build invocation AND `cargo tree -e features -p scp-ffi --no-default-features --features server` (and napi/uniffi equivalents), `scp-platform/testing`, `scp-dht/testing`, and the `scp-testing` crate are ABSENT (grep the cargo-tree output returns 0 for each); `scp-platform/in-memory-storage` MAY be present.",
-        "The did:key/scp-testing chain is severed: the shipped-config cargo tree shows no `testing` feature on scp-core/scp-runtime/scp-protocol/scp-identity/scp-did (grep returns 0 for each).",
-        "G1 exists, is sound, and passes: `scripts/check-shipped-feature-graph.sh` derives each artifact's feature set from its own build config and asserts the three nullifier-bearing features absent (running per artifact including --features server); its header documents the soundness invariant (nullifier types are gated ONLY behind the three checked features, so feature-absence == type-absence); running it exits 0; it is added to the CLAUDE.md enforcement-files list.",
-        "Full CI green with the switch gone: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing -- -D warnings` (test-harness path now uses `testing`); a bare-production `cargo build --workspace` (no testing) compiling clean; and `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "In-memory key custody is test-harness-only: `FfiKeyCustody::InMemory` gated `#[cfg(any(test, feature = \"testing\"))]` (grep custody.rs + napi/uniffi; `grep -n 'allow_in_memory' crates/scp-ffi/src/custody.rs` returns 0); the public `custody = \"in_memory\"` config value + seed-import path removed (`grep -rn '\"in_memory\"' crates/scp-ffi/napi/src/scp.rs crates/scp-ffi/src/scp.rs` returns 0 outside `#[cfg(any(test, feature=\"testing\"))]`).",
+        "Device attestation is test-harness-only and declines cleanly: InMemoryDeviceAttestation bridge usage gated `#[cfg(any(test, feature = \"testing\"))]`; a test asserts the shipped attestation op returns a typed Err (not silent attest-valid).",
+        "F1 custody retype: `grep -rn 'InMemoryKeyCustody\\|scp_platform::testing' crates/scp-ffi/common/src/server.rs` returns 0 outside `#[cfg(test)]` (phantoms retyped to FileKeyCustody), and `grep -n 'scp-platform/testing' crates/scp-ffi/common/Cargo.toml` returns 0.",
+        "G1 is a SOLE closed subset-allowlist (not a denylist): scripts/check-shipped-feature-graph.sh derives each shipped artifact's COMPLETE resolved feature set from its own build config and asserts `resolved-feature-set ⊆ per-artifact permitted-prod-features allowlist`, failing on ANY feature not on the allowlist (grep the script for the subset/allowlist logic and confirm there is no `if feature == 'scp-platform/testing'`-style named denylist as the check); it runs per artifact INCLUDING `--features server`; running it exits 0 on the post-slice tree; it is added to the CLAUDE.md enforcement-files list.",
+        "G1 soundness invariant machine-checked: the script (or a companion assertion) verifies each bridge/consumer `testing` feature transitively pulls the checked test-harness features (so shipped-graph feature-absence == nullifier-type absence) — grep the script for the transitive-pull assertion.",
+        "A shipped-config feature graph is nullifier-free incl. the did:key edge: for each shipped artifact's exact build invocation AND `cargo tree -e features -p scp-ffi --no-default-features --features server`, the allowlist check passes and `scp-platform/testing`/`scp-dht/testing`/`scp-testing`/`scp-did/testing` are all absent (the ⊆-allowlist catches the scp-protocol/Cargo.toml:47 -> scp-did/testing edge too).",
+        "Full CI green with the switch gone: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing -- -D warnings` (test-harness path now uses `testing`); a bare-production `cargo build --workspace` (no testing) compiling clean; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
         "Re-gate FfiKeyCustody::InMemory + InMemoryDeviceAttestation to `#[cfg(any(test, feature = \"testing\"))]`; remove the public custody=in_memory config + seed-import path.",
-        "Delete the allow_in_memory_custody feature defs + rename every cfg site to `testing`; update scp-runtime doc-prose, CLAUDE.md clippy string, ci.yml/release.yml strings; move dep:scp-testing + the scp-platform/testing edges onto each bridge's `testing` feature/dev-deps.",
-        "F1: retype server.rs IdentitySource<InMemoryKeyCustody> phantoms (:322,:435) to FileKeyCustody, drop InMemoryDhtClient::new() (:455) + the testing use; ensure common/Cargo.toml server pulls no scp-platform/testing.",
+        "Delete the allow_in_memory_custody feature defs + rename every cfg site to `testing`; update scp-runtime doc-prose, CLAUDE.md clippy string, ci.yml/release.yml; move dep:scp-testing + the scp-platform/testing edges onto each bridge's `testing`/dev-deps.",
+        "F1: retype server.rs IdentitySource<InMemoryKeyCustody> phantoms (:322,:435) to FileKeyCustody, drop the testing use.",
         "Fix the 4 stale allow_in_memory_custody device-attest strings in sdk-capability-matrix.json.",
-        "Write scripts/check-shipped-feature-graph.sh (G1) with the documented soundness invariant, run per artifact incl. --features server; add it to the CLAUDE.md enforcement-files list; run full CI + review roster; close #1733 as folded referencing the ADR AC-map."
+        "Write scripts/check-shipped-feature-graph.sh (G1) as a closed subset-allowlist (per-artifact permitted-prod-features; fail on any non-allowlisted feature) with the transitive-pull soundness assertion; run per artifact incl. --features server; add to the CLAUDE.md enforcement-files list; run full CI + review roster; close #1733 as folded."
       ],
       "blockedBy": ["SCP-CAPINJECT-001", "SCP-CAPINJECT-005"],
       "sources": [
@@ -348,14 +371,14 @@
         { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "## Enforcement" },
         { "file": ".docs/specs/17-persistence-and-storage.md", "section": "### 17.17.2 Security Classification of Development Arms" }
       ],
-      "details": { "phase": "2", "adr": "ADR-062", "unit": "2", "slice": "Slice 6 (severance + switch deletion + G1)", "folds": "#1733 (close as folded here)", "scopeException": "switch deletion + cfg-rename + edge-severance + phantom-retype are atomic" }
+      "details": { "phase": "2", "adr": "ADR-062", "unit": "2", "slice": "Slice 6 (severance + switch deletion + G1 subset-allowlist)", "folds": "#1733 (close as folded here)", "scopeException": "switch deletion + cfg-rename + edge-severance + phantom-retype + G1 are atomic" }
     },
     {
       "id": "SCP-CAPINJECT-007",
       "title": "Swift native pre-rotation backends: implement PreRotationCustodyProvider against Secure Enclave / iCloud-Keychain-ADP / FIDO2 and register them into the §5 interactive-profile menu",
       "gate": "gate-capinject-7",
-      "priority": "P1",
-      "severity": "major",
+      "priority": "P0",
+      "severity": "critical",
       "status": "pending",
       "files": [
         "bindings/swift/Sources/SCP/PreRotationCustody/SecureEnclaveProvider.swift",
@@ -364,18 +387,18 @@
         "bindings/swift/Sources/SCP/PreRotationCustody/ProfileMenu.swift",
         "bindings/swift/Tests/SCPTests/PreRotationCustodyTests.swift"
       ],
-      "description": "ADR-062 Slice 7 (Unit 2, SDK-layer, scheduled — NOT future-work handwave; ADR-054 §2, Cross-language impact table) — builds on the seam (SCP-CAPINJECT-002) and registers into the §5 menu (SCP-CAPINJECT-005). Implement the Swift `PreRotationCustodyProvider` (the FFI callback interface from Slice 2) against the platform's §3a-conforming interactive backends: Secure Enclave on a secondary device, iCloud Keychain with Advanced Data Protection (platform-backed cloud key store), and FIDO2 via ASAuthorization security keys. Register each into the §5 selection ceremony's interactive-profile menu so the menu is genuinely plural on Apple platforms (beyond the encrypted-offline floor of Slice 4). These backends do NOT gate the severance (Slice 6) — the interactive floor is met by Slice 4; these enrich the menu. Hardware-in-the-loop assertions may be device-gated/`XCTSkip`; the provider wiring, profile-menu registration, and a software-simulated-substrate unit test are the machine-verifiable core.",
+      "description": "ADR-062 Slice 7 (Unit 2, SDK-layer; ADR-054 §2, Cross-language impact table) — builds on the seam (SCP-CAPINJECT-002) and registers into the §5 menu (SCP-CAPINJECT-005). Implement the Swift `PreRotationCustodyProvider` against the platform's §3a-conforming interactive backends: Secure Enclave on a secondary device, iCloud Keychain with Advanced Data Protection, and FIDO2 via ASAuthorization security keys. Register each into the §5 selection ceremony's interactive-profile menu so the menu is genuinely plural on Apple platforms. P0 because §5's present-all-conforming-backends MUST is only satisfied on Apple platforms once these register; the interactive floor (Slice 4) is met without them but the menu is degenerate without them where hardware is reachable. Hardware-in-the-loop assertions may be device-gated via XCTSkip; the provider wiring, menu registration, and a software-simulated-substrate unit test are the machine-verifiable core.",
       "acceptanceCriteria": [
-        "Three Swift providers implement the PreRotationCustodyProvider FFI interface: SecureEnclaveProvider, CloudKeychainProvider, Fido2Provider each conform to the generated `PreRotationCustodyProvider` protocol (grep the Swift sources for the protocol conformance + the four methods generate/publicKey/importSeedBytes/consume).",
+        "Three Swift providers implement the PreRotationCustodyProvider FFI protocol: SecureEnclaveProvider, CloudKeychainProvider, Fido2Provider each conform to the generated protocol with the four methods generate/publicKey/importSeedBytes/consume (grep the Swift sources).",
         "Each provider is registered into the §5 interactive-profile menu: `grep -rn 'SecureEnclave\\|CloudKeychain\\|Fido2' bindings/swift/Sources/SCP/PreRotationCustody/ProfileMenu.swift` matches, and a test asserts the interactive-profile menu on Apple platforms includes the three backends ordered by security.",
-        "A unit test exercises each provider against a software-simulated substrate (generate -> public_key -> consume with the single-use handle invariant), with hardware-in-the-loop paths device-gated via XCTSkip where unavailable; `bindings/swift` test target builds and the non-device tests pass.",
-        "The Swift SDK build is green: the Swift package builds (`swift build` / the project's Swift build command) and SwiftLint passes.",
+        "A unit test exercises each provider against a software-simulated substrate (generate -> publicKey -> consume with the single-use handle invariant), hardware paths device-gated via XCTSkip; the Swift test target builds and non-device tests pass.",
+        "The Swift SDK build is green: the Swift package builds and SwiftLint passes.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
         "Implement SecureEnclaveProvider / CloudKeychainProvider / Fido2Provider conforming to the generated PreRotationCustodyProvider protocol.",
         "Register the three into the §5 interactive-profile menu (ProfileMenu.swift), ordered by security.",
-        "Write PreRotationCustodyTests.swift (software-simulated substrate + device-gated hardware paths); run the Swift build + SwiftLint + review roster."
+        "Write PreRotationCustodyTests.swift (software-simulated + device-gated hardware); run the Swift build + SwiftLint + review roster."
       ],
       "blockedBy": ["SCP-CAPINJECT-005"],
       "sources": [
@@ -390,28 +413,28 @@
       "id": "SCP-CAPINJECT-008",
       "title": "Kotlin native pre-rotation backends: implement PreRotationCustodyProvider against Android Keystore StrongBox / cloud key vault / FIDO2-CTAP2 and register them into the §5 interactive-profile menu",
       "gate": "gate-capinject-8",
-      "priority": "P1",
-      "severity": "major",
+      "priority": "P0",
+      "severity": "critical",
       "status": "pending",
       "files": [
-        "bindings/kotlin/src/main/kotlin/works/limn/scp/prerotation/StrongBoxProvider.kt",
-        "bindings/kotlin/src/main/kotlin/works/limn/scp/prerotation/CloudVaultProvider.kt",
-        "bindings/kotlin/src/main/kotlin/works/limn/scp/prerotation/Fido2CtapProvider.kt",
-        "bindings/kotlin/src/main/kotlin/works/limn/scp/prerotation/ProfileMenu.kt",
-        "bindings/kotlin/src/test/kotlin/works/limn/scp/prerotation/PreRotationCustodyTest.kt"
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/prerotation/StrongBoxProvider.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/prerotation/CloudVaultProvider.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/prerotation/Fido2CtapProvider.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/prerotation/ProfileMenu.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/prerotation/PreRotationCustodyTest.kt"
       ],
-      "description": "ADR-062 Slice 8 (Unit 2, SDK-layer, scheduled; ADR-054 §2, Cross-language impact table) — builds on the seam (SCP-CAPINJECT-002) and registers into the §5 menu (SCP-CAPINJECT-005). Implement the Kotlin `PreRotationCustodyProvider` against the platform's §3a-conforming interactive backends: Android Keystore with StrongBox, a platform cloud key vault where available, and FIDO2/CTAP2. Register each into the §5 selection ceremony's interactive-profile menu so the menu is genuinely plural on Android (beyond the encrypted-offline floor of Slice 4). These do NOT gate the severance (Slice 6). Hardware-in-the-loop assertions may be device/emulator-gated; the provider wiring, menu registration, and a software-simulated-substrate unit test are the machine-verifiable core.",
+      "description": "ADR-062 Slice 8 (Unit 2, SDK-layer; ADR-054 §2, Cross-language impact table) — builds on the seam (SCP-CAPINJECT-002) and registers into the §5 menu (SCP-CAPINJECT-005). Implement the Kotlin `PreRotationCustodyProvider` against the platform's §3a-conforming interactive backends: Android Keystore with StrongBox, a platform cloud key vault where available, and FIDO2/CTAP2. StrongBox and FIDO2/CTAP2 are Android-specific and live under the scp-kt-android module; the profile-menu registration lives in the shared scp-kt module. Register each into the §5 selection ceremony's interactive-profile menu so the menu is genuinely plural on Android. P0 (same rationale as Slice 7). Hardware paths may be device/emulator-gated; the provider wiring, menu registration, and a software-simulated-substrate unit test are the machine-verifiable core. NOTE the real Kotlin source root is bindings/kotlin/scp-kt/ and bindings/kotlin/scp-kt-android/ (works/limn/scp package).",
       "acceptanceCriteria": [
-        "Three Kotlin providers implement the PreRotationCustodyProvider interface: StrongBoxProvider, CloudVaultProvider, Fido2CtapProvider each implement the generated `PreRotationCustodyProvider` interface with the four methods generate/publicKey/importSeedBytes/consume (grep the Kotlin sources).",
-        "Each provider is registered into the §5 interactive-profile menu: `grep -rn 'StrongBox\\|CloudVault\\|Fido2Ctap' bindings/kotlin/src/main/kotlin/works/limn/scp/prerotation/ProfileMenu.kt` matches, and a test asserts the interactive-profile menu on Android includes the three backends ordered by security.",
-        "A unit test exercises each provider against a software-simulated substrate (generate -> publicKey -> consume with the single-use handle invariant), with hardware paths device/emulator-gated; the Kotlin test target builds and non-device tests pass.",
+        "Three Kotlin providers implement the PreRotationCustodyProvider interface under the correct roots: StrongBoxProvider, CloudVaultProvider, Fido2CtapProvider each implement the generated interface with generate/publicKey/importSeedBytes/consume, under bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/prerotation/ (grep confirms the files exist there and implement the interface).",
+        "Each provider is registered into the §5 interactive-profile menu: `grep -rn 'StrongBox\\|CloudVault\\|Fido2Ctap' bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/prerotation/ProfileMenu.kt` matches, and a test asserts the interactive-profile menu on Android includes the three backends ordered by security.",
+        "A unit test exercises each provider against a software-simulated substrate (generate -> publicKey -> consume with the single-use handle invariant), hardware paths device/emulator-gated; the scp-kt-android test target builds and non-device tests pass.",
         "The Kotlin SDK build is green: `./gradlew assembleRelease` and `./gradlew detekt` pass.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
-        "Implement StrongBoxProvider / CloudVaultProvider / Fido2CtapProvider implementing the generated PreRotationCustodyProvider interface.",
-        "Register the three into the §5 interactive-profile menu (ProfileMenu.kt), ordered by security.",
-        "Write PreRotationCustodyTest.kt (software-simulated substrate + device-gated hardware paths); run ./gradlew assembleRelease + detekt + review roster."
+        "Implement StrongBoxProvider / CloudVaultProvider / Fido2CtapProvider under bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/prerotation/.",
+        "Register the three into the §5 interactive-profile menu (bindings/kotlin/scp-kt/.../ProfileMenu.kt), ordered by security.",
+        "Write PreRotationCustodyTest.kt under scp-kt-android (software-simulated + device-gated hardware); run ./gradlew assembleRelease + detekt + review roster."
       ],
       "blockedBy": ["SCP-CAPINJECT-005"],
       "sources": [
@@ -420,7 +443,179 @@
         { "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md", "section": "### 1. A separate `PreRotationCustodyProvider` FFI callback interface" },
         { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.4.1 Pre-Rotation Key Custody" }
       ],
-      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2", "slice": "Slice 8 (Kotlin native backends)", "layer": "SDK (bindings/kotlin)" }
+      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2", "slice": "Slice 8 (Kotlin native backends)", "layer": "SDK (bindings/kotlin/scp-kt + scp-kt-android)" }
+    },
+    {
+      "id": "SCP-CAPINJECT-009",
+      "title": "E2 credentials: delete the impl Default (live SCP-CAPSEL-8000/8011 fix), introduce the FfiCredentialStore enum seam + a real durable backend, demote InMemoryCredentialStore to test-harness-only",
+      "gate": "gate-capinject-9",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/bridge/credentials.rs",
+        "crates/scp-ffi/common/src/credentials.rs",
+        "crates/scp-ffi/common/src/lib.rs",
+        "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "ADR-062 Slice 9 (Unit 3, E2 HIGH; §Decision 5). The `impl Default for InMemoryCredentialStore` (credentials.rs:556) wired on shipped NAPI+PyO3 (napi/runtime.rs:313) is a LIVE SCP-CAPSEL-8000/8011 violation (a default selection) — its removal is not deferrable. `BridgeCredentialStore` is RPITIT -> introduce an `enum FfiCredentialStore { Durable(<real durable backend>), #[cfg(any(test, feature = \"testing\"))] InMemory(InMemoryCredentialStore) }`, DELETE the `impl Default`, require an explicit selection at the bridge construction boundary, and ship a real durable credential store (persisted bridge tokens). InMemoryCredentialStore -> test-harness-only. Classified durability-only (RAM-only tokens are re-obtainable by re-auth); the selection-boundary fix is the security-relevant part. Add the credentials-backend row to the capability matrix. Independent of the DHT/pre-rotation work (blockedBy []); gate-sequenced after Unit 1/2 but the impl-Default removal is a live fix and can land as soon as scheduled. Scope exception: the seam + durable backend + Default removal are one selection-boundary change.",
+      "acceptanceCriteria": [
+        "The `impl Default` is deleted (live SCP-CAPSEL-8000/8011 fix): `grep -n 'impl Default for InMemoryCredentialStore\\|impl Default for BridgeCredentialStore' crates/scp-runtime/src/bridge/credentials.rs` returns 0.",
+        "An `enum FfiCredentialStore` seam exists with a real Durable arm + a test-harness InMemory arm: `grep -n 'enum FfiCredentialStore' crates/scp-ffi/common/src/credentials.rs` matches with a `Durable` arm and an `InMemory` arm gated `#[cfg(any(test, feature = \"testing\"))]`.",
+        "The bridge requires an explicit credential-store selection (no default): outside `#[cfg(any(test, feature=\"testing\"))]`, `grep -rn 'InMemoryCredentialStore' crates/scp-ffi/napi/src/runtime.rs crates/scp-ffi/src/runtime.rs` returns 0, and a real durable backend is selected at construction (grep the construction site).",
+        "A real durable credential store persists tokens across restart: a test writes a bridge token, drops+reconstructs the store from the durable backend, and reads the token back (proving it is not RAM-only).",
+        ".docs/standards/sdk-capability-matrix.json has a credentials-backend row; `python3.12 scripts/check-sdk-coverage.py` exits 0.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Delete the impl Default in credentials.rs; add the FfiCredentialStore enum seam (Durable + `#[cfg] InMemory`); require explicit selection at the bridge boundary.",
+        "Implement a real durable credential store (persisted bridge tokens); demote InMemoryCredentialStore to test-harness-only.",
+        "Add the credentials-backend row to the capability matrix; write the persistence + selection tests; run full CI + review roster."
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 5. Credentials (E2), blob (E3), relay querier (E4) — classified + storied now (live SCP-CAPSEL fixes)" },
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "## Capability classification (§17.17.2 SCP-CAPSEL-8010 — mandatory before ship)" },
+        { "file": ".docs/specs/17-persistence-and-storage.md", "section": "### 17.17.2 Security Classification of Development Arms" }
+      ],
+      "details": { "phase": "2", "adr": "ADR-062", "unit": "3", "slice": "Slice 9 (E2 credentials)", "scopeException": "seam + durable backend + Default removal are one selection-boundary change" }
+    },
+    {
+      "id": "SCP-CAPINJECT-010",
+      "title": "E3 blob storage: delete impl Default for BlobStorageBackend (live SCP-CAPSEL-8011 fix), require the arm at relay/node init; InMemoryBlobStore stays durability-only explicit-only",
+      "gate": "gate-capinject-10",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/storage.rs",
+        "crates/scp-node/src/self_host.rs",
+        "crates/scp-node/src/config.rs"
+      ],
+      "description": "ADR-062 Slice 10 (Unit 3, E3 MED; §Decision 5). `BlobStorageBackend::InMemory` is the un-cfg'd variant (storage.rs:480) manufactured by `impl Default -> in_memory()` (storage.rs:561) — a LIVE SCP-CAPSEL-8011 violation (a durability-only arm as the default). Delete `impl Default for BlobStorageBackend` and require the arm to be selected explicitly at relay/node init (the construction boundary). `InMemoryBlobStore` stays durability-only and explicitly selectable (never default/fallback); §17.7 already ships Sqlite/redb/Postgres/S3 real backends. Classified durability-only (blob loss is availability, not a security nullification); the selection-boundary fix is the SCP-CAPSEL-8011 remediation. blockedBy [] (independent live fix). Scope exception: the Default removal + explicit-selection wiring are one selection-boundary change.",
+      "acceptanceCriteria": [
+        "The `impl Default for BlobStorageBackend` is deleted (live SCP-CAPSEL-8011 fix): `grep -n 'impl Default for BlobStorageBackend' crates/scp-transport/src/native/storage.rs` returns 0, and `grep -n 'fn default.*in_memory\\|BlobStorageBackend::default' crates/scp-transport` returns 0.",
+        "The blob backend is required (explicit selection) at relay/node init: the relay/node construction takes the blob backend as a non-Option argument (grep the construction signature in scp-node/src/self_host.rs) and there is no code path defaulting/falling back to InMemory (SCP-CAPSEL-8000/8001).",
+        "InMemoryBlobStore stays a legitimate explicit durability-only option: it remains selectable by explicit choice (a test constructs a relay with an explicit InMemory blob backend) but is never the default.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Delete impl Default for BlobStorageBackend; make the blob backend a required (non-Option) argument at relay/node init.",
+        "Keep InMemoryBlobStore explicitly selectable (never default/fallback); write the explicit-selection + no-default tests; run full CI + review roster."
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 5. Credentials (E2), blob (E3), relay querier (E4) — classified + storied now (live SCP-CAPSEL fixes)" },
+        { "file": ".docs/specs/17-persistence-and-storage.md", "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)" },
+        { "file": ".docs/specs/17-persistence-and-storage.md", "section": "### 17.17.1 Selection Requirements" }
+      ],
+      "details": { "phase": "2", "adr": "ADR-062", "unit": "3", "slice": "Slice 10 (E3 blob)", "scopeException": "Default removal + explicit-selection wiring are one selection-boundary change" }
+    },
+    {
+      "id": "SCP-CAPINJECT-011",
+      "title": "E4 relay querier: implement the real MultiRelayQuerier per §3.10.12 (the relay-resolution layer), demote NoOpRelayQuerier/InMemoryRelayQuerier to test-harness-only",
+      "gate": "gate-capinject-11",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/resolver.rs",
+        "crates/scp-identity/src/relay_querier.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-identity/Cargo.toml"
+      ],
+      "description": "ADR-062 Slice 11 (Unit 3, E4 MED; §Decision 5, spec §3.10.12). `NoOpRelayQuerier` (resolver.rs:309) is the shipped relay-resolution arm; it is classified a NULLIFIER of the §3.10.8 dual-layer suppression resilience (DHT-only resolution is correct per the §3.10.6 SHOULD, but removing the relay layer weakens the both-layers suppression defense and it fails OPEN — silently contributes no relay result). Remediation = implement the REAL `MultiRelayQuerier` (the relay-resolution layer that queries the identity's relays per §3.10.4/§3.10.12) so resolution uses BOTH layers per §3.10.6, and demote `NoOpRelayQuerier` + the test `InMemoryRelayQuerier` (resolver.rs:910) to test-harness-only. This is a genuine code-behind-spec completeness gap (§3.10.12 is a Phase-2 deliverable). blockedBy [] (independent of the DHT client/pre-rotation work — this is the relay-query layer, not the DHT client). Scope exception: the real querier + resolver wiring + NoOp demotion are one resolution-layer change.",
+      "acceptanceCriteria": [
+        "A real `MultiRelayQuerier` implementation exists that queries the identity's relays (§3.10.4/§3.10.12): `grep -rn 'impl MultiRelayQuerier for' crates/scp-identity/src/relay_querier.rs` matches a real (non-NoOp, non-InMemory) querier that performs relay QUERY, and the resolver composes both the relay layer and the DHT layer (grep the resolver's dual-layer path).",
+        "NoOpRelayQuerier + InMemoryRelayQuerier are test-harness-only: outside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]`, `grep -rn 'NoOpRelayQuerier\\|InMemoryRelayQuerier' crates/scp-identity/src` returns 0 references as the SHIPPED resolver arm (they may exist as test doubles gated by test/testing).",
+        "Dual-layer resolution is exercised: a test resolves a DID published to a relay (not the DHT) and asserts the relay layer returns it (proving relay-resolution is live, not NoOp), and a test asserts suppression on one layer is defeated by the other (§3.10.8).",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Implement a real MultiRelayQuerier (relay QUERY per §3.10.4/§3.10.12); wire it into the resolver's dual-layer resolution.",
+        "Demote NoOpRelayQuerier + InMemoryRelayQuerier to test-harness-only (test/testing-gated).",
+        "Write the dual-layer resolution + suppression-resilience tests; run full CI + review roster."
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 5. Credentials (E2), blob (E3), relay querier (E4) — classified + storied now (live SCP-CAPSEL fixes)" },
+        { "file": ".docs/specs/03-identity.md", "section": "### 3.10.12 Phase Integration" },
+        { "file": ".docs/specs/17-persistence-and-storage.md", "section": "### 17.17.2 Security Classification of Development Arms" }
+      ],
+      "details": { "phase": "2", "adr": "ADR-062", "unit": "3", "slice": "Slice 11 (E4 relay querier — §3.10.12)", "scopeException": "real querier + resolver wiring + NoOp demotion are one resolution-layer change" }
+    },
+    {
+      "id": "SCP-CAPINJECT-012",
+      "title": "Python FIDO2 pre-rotation backend: implement PreRotationCustodyProvider against USB FIDO2/CTAP2 on the desktop interactive profile and register it into the §5 menu",
+      "gate": "gate-capinject-12",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/prerotation/__init__.py",
+        "bindings/python/scp_sdk/prerotation/fido2_provider.py",
+        "bindings/python/scp_sdk/prerotation/profile_menu.py",
+        "bindings/python/tests/test_prerotation_fido2.py"
+      ],
+      "description": "ADR-062 Slice 12 (Unit 2b, D-C; ADR-054 §2). FIDO2/CTAP2 over a USB security key is reachable from desktop Python (the `fido2` library) on the INTERACTIVE-CLIENT profile (a CLI with a present human + USB key). Per §5's present-all-conforming-backends MUST, a Python interactive CLI where a USB FIDO2 key is reachable MUST offer it (§4 ranks FIDO2 Highest). Implement the Python `PreRotationCustodyProvider` (the FFI callback interface from Slice 2) against USB FIDO2/CTAP2 and register it into the §5 interactive-profile menu. This is the honest per-SDK scope decision (ADR §Residual #3): FIDO2 on the desktop interactive Python profile; a HEADLESS Python server uses the KMS floor (Slice 3), not FIDO2. P0 (same present-all-conforming rationale as Slices 7/8). Hardware-in-the-loop paths may be device-gated/skipped; the provider wiring, menu registration, and a software-simulated-authenticator unit test are the machine-verifiable core.",
+      "acceptanceCriteria": [
+        "A Python FIDO2 provider implements the PreRotationCustodyProvider interface: `grep -rn 'class Fido2Provider\\|generate\\|public_key\\|import_seed_bytes\\|consume' bindings/python/scp_sdk/prerotation/fido2_provider.py` shows the four methods against the generated provider interface (using the `fido2`/CTAP2 library).",
+        "It is registered into the §5 interactive-profile menu for desktop Python: `grep -rn 'Fido2\\|fido2' bindings/python/scp_sdk/prerotation/profile_menu.py` matches, and a test asserts the interactive-profile menu includes FIDO2 (ordered by security) while a simulated headless-server profile does NOT offer it (uses KMS).",
+        "A unit test exercises the provider against a software-simulated CTAP2 authenticator (generate -> public_key -> consume with the single-use handle invariant), hardware paths skipped when no key is present; `python3.12 -m pytest bindings/python/tests/test_prerotation_fido2.py -v` passes.",
+        "The Python SDK lint/type checks pass: `python3.12 -m ruff check bindings/python` exits 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Implement the Python Fido2Provider (USB FIDO2/CTAP2 via the `fido2` lib) against the generated PreRotationCustodyProvider interface.",
+        "Register it into the §5 interactive-profile menu; ensure a headless-server profile offers KMS not FIDO2.",
+        "Write test_prerotation_fido2.py (software-simulated authenticator + hardware-skip); run ruff + pytest + review roster."
+      ],
+      "blockedBy": ["SCP-CAPINJECT-005"],
+      "sources": [
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 4. Pre-rotation custody (E5) — build the real per-profile backends now, per accepted ADR-054" },
+        { "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md", "section": "### 2. Real SDK backends (§9.7.4.1 §4)" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.4.1 Pre-Rotation Key Custody" }
+      ],
+      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2b", "slice": "Slice 12 (Python FIDO2)", "layer": "SDK (bindings/python)" }
+    },
+    {
+      "id": "SCP-CAPINJECT-013",
+      "title": "TypeScript/Node FIDO2 pre-rotation backend: implement PreRotationCustodyProvider against USB FIDO2/CTAP2 on the desktop interactive profile and register it into the §5 menu",
+      "gate": "gate-capinject-13",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/typescript/src/prerotation/index.ts",
+        "bindings/typescript/src/prerotation/fido2-provider.ts",
+        "bindings/typescript/src/prerotation/profile-menu.ts",
+        "bindings/typescript/test/prerotation-fido2.test.ts"
+      ],
+      "description": "ADR-062 Slice 13 (Unit 2b, D-C; ADR-054 §2). FIDO2/CTAP2 over a USB security key is reachable from desktop Node/TypeScript (WebAuthn / a CTAP2 library) on the INTERACTIVE-CLIENT profile. Per §5's present-all-conforming-backends MUST, a Node/TS interactive CLI where a USB FIDO2 key is reachable MUST offer it. Implement the TypeScript `PreRotationCustodyProvider` (the FFI callback interface from Slice 2, via the NAPI bridge) against USB FIDO2/CTAP2 and register it into the §5 interactive-profile menu. Honest per-SDK scope (ADR §Residual #3): FIDO2 on the desktop interactive Node/TS profile; a HEADLESS Node server uses the KMS floor (Slice 3). P0 (same rationale). Hardware paths device-gated; provider wiring, menu registration, and a software-simulated-authenticator unit test are the machine-verifiable core.",
+      "acceptanceCriteria": [
+        "A TypeScript FIDO2 provider implements the PreRotationCustodyProvider interface: `grep -rn 'generate\\|publicKey\\|importSeedBytes\\|consume' bindings/typescript/src/prerotation/fido2-provider.ts` shows the four methods against the generated provider interface (USB FIDO2/CTAP2).",
+        "It is registered into the §5 interactive-profile menu for desktop Node/TS: `grep -rn 'Fido2\\|fido2' bindings/typescript/src/prerotation/profile-menu.ts` matches, and a test asserts the interactive-profile menu includes FIDO2 (ordered by security) while a simulated headless-server profile does NOT offer it (uses KMS).",
+        "A unit test exercises the provider against a software-simulated CTAP2 authenticator (generate -> publicKey -> consume with the single-use handle invariant), hardware paths skipped when no key is present; `bun test bindings/typescript/test/prerotation-fido2.test.ts` passes.",
+        "The TypeScript SDK lint/type checks pass: `cd bindings/typescript && bun run lint && bun run check` exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Implement the TS fido2-provider.ts (USB FIDO2/CTAP2) against the generated PreRotationCustodyProvider interface (via the NAPI bridge).",
+        "Register it into the §5 interactive-profile menu; ensure a headless-server profile offers KMS not FIDO2.",
+        "Write prerotation-fido2.test.ts (software-simulated authenticator + hardware-skip); run biome lint + tsc check + bun test + review roster."
+      ],
+      "blockedBy": ["SCP-CAPINJECT-005"],
+      "sources": [
+        { "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md", "section": "### 4. Pre-rotation custody (E5) — build the real per-profile backends now, per accepted ADR-054" },
+        { "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md", "section": "### 2. Real SDK backends (§9.7.4.1 §4)" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.4.1 Pre-Rotation Key Custody" }
+      ],
+      "details": { "phase": "2", "adr": "ADR-062 (realizes accepted ADR-054)", "unit": "2b", "slice": "Slice 13 (TypeScript FIDO2)", "layer": "SDK (bindings/typescript)" }
     }
   ]
 }
