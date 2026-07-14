@@ -2892,7 +2892,7 @@
         "cargo test -p scp-protocol succeeds"
       ],
       "actionItems": [
-        "Add the STREAM_XCTX_RECEIPT_DOMAIN const and CrossContextOutletStreamReceipt type in cross_context_saga.rs",
+        "Add the XCTX_STREAM_RECEIPT_DOMAIN const and CrossContextOutletStreamReceipt type in cross_context_saga.rs",
         "Implement the \u00a79.5.1 field-enumerated preimage with Fixed32(stream_manifest_hash) in the output slot",
         "Implement sign()/verify() mirroring the unary receipt",
         "Export the type from context/outlets/mod.rs",

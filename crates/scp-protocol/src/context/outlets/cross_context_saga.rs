@@ -1,6 +1,6 @@
 //! Cross-context outlet invocation saga signed types (spec §6.2.4).
 //!
-//! This module defines the two signed protocol types produced by the
+//! This module defines the three signed protocol types produced by the
 //! `CrossContextOutletInvocation` saga's terminal paths:
 //!
 //! - [`CrossContextOutletReceipt`] — the target's signed response on the return
@@ -19,10 +19,6 @@
 //!   making a one-sided commit durably auditable rather than a silent repudiation
 //!   primitive.
 //!
-//! Both preimages use the §9.5.1 canonical hash construction (domain-separated,
-//! field-enumerated, length-prefixed variable fields) — never raw concatenation,
-//! which would be splice-ambiguous across the variable-length string fields.
-//!
 //! - [`CrossContextOutletStreamReceipt`] — the streaming-saga sibling of
 //!   [`CrossContextOutletReceipt`] (ADR-061, §6.2.5). Identical construction and
 //!   self-verifying contract, but under the DISTINCT `SCP-XCTX-STREAM-RECEIPT-V1:`
@@ -34,6 +30,10 @@
 //!   re-executing the stream. A manifest root cannot share the unary separator: a
 //!   verifier of a closed preimage cannot tell whether to recompute `SHA-256(bytes)`
 //!   or interpret a Merkle root, so the algorithm is pinned by the separator.
+//!
+//! All three preimages use the §9.5.1 canonical hash construction (domain-separated,
+//! field-enumerated, length-prefixed variable fields) — never raw concatenation,
+//! which would be splice-ambiguous across the variable-length string fields.
 //!
 //! Domain separators (registered in §9.18.2):
 //! - `"SCP-XCTX-RECEIPT-V1:"` — cross-context outlet receipt signing.
@@ -56,7 +56,7 @@ pub const XCTX_RECEIPT_DOMAIN: &str = "SCP-XCTX-RECEIPT-V1:";
 /// never be confused across the two closed preimages: the separator pins the
 /// verification algorithm (recompute `SHA-256(output_jcs)` for the unary receipt vs.
 /// interpret the carried Merkle root for the streaming receipt).
-pub const STREAM_XCTX_RECEIPT_DOMAIN: &str = "SCP-XCTX-STREAM-RECEIPT-V1:";
+pub const XCTX_STREAM_RECEIPT_DOMAIN: &str = "SCP-XCTX-STREAM-RECEIPT-V1:";
 
 /// Domain separator for [`CrossContextDivergenceMarker`] signature preimages (§6.2.4, §9.18.2).
 pub const XCTX_DIVERGENCE_DOMAIN: &str = "SCP-XCTX-DIVERGENCE-V1:";
@@ -342,7 +342,7 @@ impl CrossContextOutletReceipt {
 /// cannot establish about itself is *signer authorization* (see [`Self::verify`]).
 ///
 /// The two receipts differ in exactly two ways: (1) this type signs under the
-/// distinct [`STREAM_XCTX_RECEIPT_DOMAIN`] separator, and (2) its preimage's output
+/// distinct [`XCTX_STREAM_RECEIPT_DOMAIN`] separator, and (2) its preimage's output
 /// slot carries `Fixed32(stream_manifest_hash)` — the RFC-6962 Merkle root over the
 /// sealed chunk sequence — instead of `Fixed32(output_hash)`. It carries no inline
 /// output bytes and **no chunk sequence**: the sealed root is captured durably,
@@ -443,7 +443,7 @@ impl CrossContextOutletStreamReceipt {
     /// `VarBytes(caller_did)`, `RawBytes16(nonce)`, `VarBytes(outlet_registration_id)`,
     /// `Fixed32(stream_manifest_hash)`, `VarBytes(outlet_invoked_event_id)`,
     /// `U8(chain_depth)`, `U64(timestamp_ms)`. Domain-separated by
-    /// [`STREAM_XCTX_RECEIPT_DOMAIN`], so the preimage can never collide with a
+    /// [`XCTX_STREAM_RECEIPT_DOMAIN`], so the preimage can never collide with a
     /// unary receipt preimage.
     ///
     /// # Errors
@@ -453,7 +453,7 @@ impl CrossContextOutletStreamReceipt {
     /// §9.10.3 bounds messages to 256 KB).
     pub fn signing_preimage(&self) -> Result<[u8; 32], CrossContextSagaError> {
         canonical_hash(
-            STREAM_XCTX_RECEIPT_DOMAIN,
+            XCTX_STREAM_RECEIPT_DOMAIN,
             &[
                 CanonicalField::Fixed32(&self.caller_context_id),
                 CanonicalField::Fixed32(&self.target_context_id),
@@ -515,7 +515,7 @@ impl CrossContextOutletStreamReceipt {
     /// Verify a cross-context streaming outlet receipt (ADR-061, §6.2.5).
     ///
     /// Verification reconstructs the §9.5.1 signature preimage from the receipt
-    /// fields (domain-separated by [`STREAM_XCTX_RECEIPT_DOMAIN`]) and checks the
+    /// fields (domain-separated by [`XCTX_STREAM_RECEIPT_DOMAIN`]) and checks the
     /// Ed25519 signature against `authorized_target_signing_key`.
     ///
     /// **Signer authorization (normative, §6.2.5).** As with the unary
@@ -1047,8 +1047,8 @@ mod tests {
     #[test]
     fn domains_are_distinct() {
         assert_ne!(XCTX_RECEIPT_DOMAIN, XCTX_DIVERGENCE_DOMAIN);
-        assert_ne!(STREAM_XCTX_RECEIPT_DOMAIN, XCTX_RECEIPT_DOMAIN);
-        assert_ne!(STREAM_XCTX_RECEIPT_DOMAIN, XCTX_DIVERGENCE_DOMAIN);
+        assert_ne!(XCTX_STREAM_RECEIPT_DOMAIN, XCTX_RECEIPT_DOMAIN);
+        assert_ne!(XCTX_STREAM_RECEIPT_DOMAIN, XCTX_DIVERGENCE_DOMAIN);
     }
 
     // ---- Streaming-saga receipt (SCP-XCTX-STREAM-RECEIPT-V1, SCP-OUT-043) ----
@@ -1189,35 +1189,63 @@ mod tests {
 
     #[test]
     fn stream_and_unary_receipts_reject_cross_separator_signatures() {
-        // AC5: cross-separator replay is impossible. A unary receipt and a
-        // streaming receipt built from the SAME shared fields (with the unary's
-        // output_hash equal to the streaming manifest root) still produce distinct
-        // signatures under distinct separators, so neither verifies as the other.
+        // AC5: cross-separator replay is impossible, and the DOMAIN SEPARATOR ALONE
+        // is what makes it impossible. Both receipts are built with byte-for-byte
+        // IDENTICAL output-slot bytes — the unary's output_hash = SHA-256(output_jcs)
+        // is pinned equal to the streaming receipt's stream_manifest_hash — and with
+        // identical values in every other shared field. The ONLY difference feeding
+        // the two preimages is the domain separator. Grafting either receipt's
+        // signature onto the other must therefore fail verification, proving the
+        // separator — not divergent output bytes — is the cause of rejection.
         let sk = test_signing_key(0xAA);
         let vk = sk.verifying_key();
 
-        // Choose the unary output_jcs so that SHA-256(output_jcs) equals the
-        // streaming receipt's stream_manifest_hash is NOT required; the separators
-        // alone guarantee rejection. Build both over otherwise-identical fields.
-        let stream = fixed_stream_receipt(&sk);
+        // Shared output-slot bytes: the unary receipt recomputes output_hash from
+        // output_jcs, so pin the streaming manifest root to that exact 32-byte value.
+        let output_jcs = br#"{"result":42}"#.to_vec();
+        let shared_output_slot: [u8; 32] = Sha256::digest(&output_jcs).into();
 
         let unary = CrossContextOutletReceipt::sign(
             &sk,
             CrossContextOutletReceiptFields {
-                caller_context_id: stream.caller_context_id,
-                target_context_id: stream.target_context_id,
-                caller_did: stream.caller_did.clone(),
-                nonce: stream.nonce,
-                outlet_registration_id: stream.outlet_registration_id.clone(),
-                output_jcs: b"{}".to_vec(),
-                outlet_invoked_event_id: stream.outlet_invoked_event_id.clone(),
-                chain_depth: stream.chain_depth,
-                timestamp_ms: stream.timestamp_ms,
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did:example:caller".to_owned(),
+                nonce: [0x33; 16],
+                outlet_registration_id: "calc.stream".to_owned(),
+                output_jcs,
+                outlet_invoked_event_id: "evt-outlet-invoked-1".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_709_654_400_000,
             },
         )
         .expect("sign unary");
 
-        // Graft the unary signature onto a streaming receipt and vice-versa.
+        let stream = CrossContextOutletStreamReceipt::sign(
+            &sk,
+            CrossContextOutletStreamReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did:example:caller".to_owned(),
+                nonce: [0x33; 16],
+                outlet_registration_id: "calc.stream".to_owned(),
+                stream_manifest_hash: shared_output_slot,
+                outlet_invoked_event_id: "evt-outlet-invoked-1".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_709_654_400_000,
+            },
+        )
+        .expect("sign stream");
+
+        // Setup guard: the output-slot bytes really are identical across the two
+        // receipts, so the separator is the sole remaining preimage difference.
+        assert_eq!(
+            unary.output_hash(),
+            stream.stream_manifest_hash,
+            "test setup: unary output_hash must equal the streaming manifest root"
+        );
+
+        // Graft the unary signature onto the streaming receipt and vice-versa.
         let mut stream_with_unary_sig = stream.clone();
         stream_with_unary_sig.signature = unary.signature;
         assert!(
@@ -1233,7 +1261,7 @@ mod tests {
         );
 
         assert_ne!(
-            STREAM_XCTX_RECEIPT_DOMAIN, XCTX_RECEIPT_DOMAIN,
+            XCTX_STREAM_RECEIPT_DOMAIN, XCTX_RECEIPT_DOMAIN,
             "the streaming and unary separators must differ"
         );
     }

@@ -63,9 +63,10 @@ pub mod summary;
 use crate::context::roles;
 
 pub use cross_context_saga::{
-    CommittedSide, CrossContextDivergenceMarker, CrossContextOutletReceipt,
-    CrossContextOutletStreamReceipt, CrossContextOutletStreamReceiptFields, CrossContextSagaError,
-    STREAM_XCTX_RECEIPT_DOMAIN, XCTX_DIVERGENCE_DOMAIN, XCTX_RECEIPT_DOMAIN,
+    CommittedSide, CrossContextDivergenceMarker, CrossContextDivergenceMarkerFields,
+    CrossContextOutletReceipt, CrossContextOutletReceiptFields, CrossContextOutletStreamReceipt,
+    CrossContextOutletStreamReceiptFields, CrossContextSagaError, XCTX_DIVERGENCE_DOMAIN,
+    XCTX_RECEIPT_DOMAIN, XCTX_STREAM_RECEIPT_DOMAIN,
 };
 pub use hash::{
     OUTLET_REGISTRATION_V2_DOMAIN, catalog_hash, compute_outlet_registration_canonical_bytes,
