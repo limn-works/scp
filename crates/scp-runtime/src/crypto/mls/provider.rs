@@ -935,6 +935,22 @@ impl MlsCryptoProvider {
     {
         use dashmap::mapref::entry::Entry;
 
+        // H2 (ADR-049 PR-7): fail closed if this context's crypto state has
+        // already been moved into the actor. `take_crypto_state` removes the
+        // entry from `contexts` AND records the id in `taken_context_ids`, so a
+        // taken context is absent from `contexts` — the `Entry::Vacant` guard
+        // below would otherwise pass and resurrect a DIVERGENT second MLS group
+        // (double-owner: provider and actor both sealing). This closes the
+        // write side of the one-way take invariant that `with_context` already
+        // enforces on the read side.
+        if self.taken_context_ids.contains(context_id) {
+            return Err(ContextCreationError::CreationFailed(format!(
+                "context state owned by actor — refusing to create a second MLS group for \
+                 context '{}'",
+                hex::encode(context_id)
+            )));
+        }
+
         // Reserve the slot up front via `entry`: this is an atomic
         // check-and-occupy on the `DashMap` shard, so two concurrent
         // creates for the same id cannot both pass the existence check.
@@ -1029,6 +1045,18 @@ impl MlsCryptoProvider {
     ) -> Result<(), ContextError> {
         use dashmap::mapref::entry::Entry;
 
+        // H2 (ADR-049 PR-7): fail closed if this context's crypto state has
+        // already been moved into the actor (see `create_group_into_slot`) —
+        // a taken context is absent from `contexts`, so the `Entry::Vacant`
+        // guard below would otherwise install a divergent second group.
+        if self.taken_context_ids.contains(context_id) {
+            return Err(ContextError::CreationFailed(format!(
+                "context state owned by actor — refusing to install a joined MLS group for \
+                 context '{}'",
+                hex::encode(context_id)
+            )));
+        }
+
         // Atomic check-and-occupy on the shard: two concurrent installs for
         // the same id cannot both pass the existence check.
         let Entry::Vacant(slot) = self.contexts.entry(*context_id) else {
@@ -1065,6 +1093,18 @@ impl MlsCryptoProvider {
     ///
     /// Returns [`ContextCreationError`] if sender key generation fails.
     pub fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        // H2 (ADR-049 PR-7): fail closed with the actionable "owned by actor"
+        // error if this context's crypto state has been moved into the actor.
+        // Without this, a taken context is absent from `contexts` and the
+        // `get_mut` below returns the generic "no MLS group" error, masking the
+        // real cause (a caller reaching the provider after actor ownership).
+        if self.taken_context_ids.contains(context_id) {
+            return Err(ContextCreationError::CreationFailed(format!(
+                "context state owned by actor — refusing to generate a sender key for \
+                 context '{}'",
+                hex::encode(context_id)
+            )));
+        }
         // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
         let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextCreationError::CryptoFailed(
@@ -5247,6 +5287,63 @@ mod tests {
                 assert_eq!(msg, "context state owned by actor");
             }
             other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    /// H2 (ADR-049 PR-7 hardening): once a context's crypto state has been
+    /// moved into the actor via `take_crypto_state`, the three provider
+    /// `contexts` write paths — `create_mls_group` (→ `create_group_into_slot`),
+    /// `install_joined_group`, and `generate_sender_key` — MUST fail closed
+    /// with the actionable "owned by actor" error. `take_crypto_state` removes
+    /// the entry from `contexts`, so WITHOUT the `taken_context_ids` guard the
+    /// `Entry::Vacant` reservation (or the `get_mut` in `generate_sender_key`)
+    /// would resurrect a divergent second group / silently mask the cause —
+    /// the double-owner vector where provider and actor both seal.
+    #[test]
+    fn taken_context_write_paths_fail_closed() {
+        let (alice, bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+
+        // Borrow a well-formed MLS group from bob BEFORE taking alice's state
+        // (used only to exercise `install_joined_group`; the H2 guard fires
+        // before the group value is inspected).
+        let bob_owned = bob.take_crypto_state(&ctx_id).unwrap();
+        let borrowed_group = bob_owned.mls_group;
+
+        // Move alice's crypto state into the actor — the context is now taken.
+        let _owned = alice.take_crypto_state(&ctx_id).unwrap();
+
+        // create_mls_group → create_group_into_slot: fail closed.
+        match alice
+            .create_mls_group(&ctx_id)
+            .expect_err("create must fail closed on a taken context")
+        {
+            ContextCreationError::CreationFailed(msg) => {
+                assert!(msg.contains("owned by actor"), "create msg: {msg}");
+            }
+            other => panic!("expected CreationFailed, got {other:?}"),
+        }
+
+        // install_joined_group: fail closed.
+        match alice
+            .install_joined_group(&ctx_id, borrowed_group)
+            .expect_err("install must fail closed on a taken context")
+        {
+            ContextError::CreationFailed(msg) => {
+                assert!(msg.contains("owned by actor"), "install msg: {msg}");
+            }
+            other => panic!("expected CreationFailed, got {other:?}"),
+        }
+
+        // generate_sender_key: fail closed with the actionable message (not the
+        // generic "no MLS group" one).
+        match alice
+            .generate_sender_key(&ctx_id)
+            .expect_err("generate_sender_key must fail closed on a taken context")
+        {
+            ContextCreationError::CreationFailed(msg) => {
+                assert!(msg.contains("owned by actor"), "gen msg: {msg}");
+            }
+            other => panic!("expected CreationFailed, got {other:?}"),
         }
     }
 
