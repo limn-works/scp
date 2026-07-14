@@ -2889,6 +2889,18 @@ impl MlsCryptoProvider {
         // should not retain raw X25519 secret key material.
         snapshot.wrapping_secret_key.zeroize();
 
+        // H2 / CM-006 (ADR-049 PR-7): this method hands the per-context crypto
+        // material OUT to seed an actor's `PerContextState` (welcome / restore /
+        // respawn / cold-restart), WITHOUT ever installing it into
+        // `self.contexts`. Record the context in `taken_context_ids` so the
+        // one-way take invariant holds on the seed path too: a subsequent
+        // provider `create_group_into_slot` / `install_joined_group` /
+        // `generate_sender_key` for this id now fails closed ("owned by actor")
+        // instead of finding a Vacant-and-unmarked slot and resurrecting a
+        // divergent second group (the double-owner vector). Idempotent on a warm
+        // respawn where `take_crypto_state` already marked the id.
+        self.taken_context_ids.insert(*context_id);
+
         Ok((
             owned,
             RestoredFloors {
@@ -4168,11 +4180,14 @@ mod tests {
         );
         assert!(owned.mls_group.epoch().is_ok());
 
-        // (b) No provider-side side effects: no inserted entry, no recorded take.
+        // (b) No `contexts` insert — the material is handed OUT, never installed.
         assert!(!provider2.contexts.contains_key(&ctx_id), "must NOT insert");
+        // H2 / CM-006: the seed path DOES record the take, so a later provider
+        // create/install/generate for this id fails closed instead of
+        // resurrecting a divergent second group (double-owner).
         assert!(
-            !provider2.taken_context_ids.contains(&ctx_id),
-            "must NOT take"
+            provider2.taken_context_ids.contains(&ctx_id),
+            "build_restored_owned must mark the context taken (CM-006)"
         );
 
         // (c) Floors match on BOTH axes, epoch/sequence in the right positions.

@@ -94,6 +94,7 @@ use scp_mls::group::ScpMlsGroup;
 // same `scp_mls` / `scp_protocol` primitives the provider calls; the provider's
 // copies are retained until the atomic core.
 use crate::crypto::mls::provider::MlsCryptoSnapshot;
+use crate::crypto::mls::provider::OwnedMlsCryptoState;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::ScpContextExtension;
 use scp_protocol::context::builder::{
@@ -1623,6 +1624,42 @@ impl PerContextState {
                 "no MLS group for this context".to_string(),
             )),
         }
+    }
+
+    /// Seed this actor state's encrypted-mode crypto from the owned material
+    /// that [`MlsCryptoProvider::take_crypto_state`] / `build_restored_owned`
+    /// hands out (ADR-049 PR-7 §15). Installs the moved [`OwnedMlsCryptoState`]
+    /// into [`Self::mode`] — wrapping the payload's non-optional `mls_group` /
+    /// `sender_key` in `Some(..)` (the actor holds them optionally because a
+    /// fresh Create actor spawns before its group exists) and starting the
+    /// DORMANT [`ContextCryptoState::recv_sequence_tracker`] empty — and routes
+    /// `send_sequence` onto [`Self::send_tracker`] via
+    /// [`SendSequenceTracker::from_persisted`] (the actor keeps the send counter
+    /// on `send_tracker`, never a crypto-state field; the AAD read/increment
+    /// order is preserved byte-for-byte — see `sequence.rs`).
+    ///
+    /// This is the single seed primitive for all five take/seed seams: the
+    /// in-dispatch Create/Join take (Mode-A, seeded from
+    /// `take_crypto_state` after the provider births the group) and the
+    /// pre-dispatch welcome / restore / respawn / cold-restart seed (Mode-B,
+    /// seeded from `build_restored_owned` — NO re-take, which on a warm respawn
+    /// would fail closed because the context is already in `taken_context_ids`).
+    ///
+    /// Floors (Class-M) are NOT part of the payload and are never seeded here —
+    /// they stay the sole authority of the Supervisor-owned `ContextFloors`
+    /// registry (ADR-049 §9 / PR-6).
+    pub(crate) fn seed_encrypted_crypto_from_owned(&mut self, owned: OwnedMlsCryptoState) {
+        self.mode = ContextModeState::Encrypted(Box::new(ContextCryptoState {
+            mls_group: Some(owned.mls_group),
+            sender_key: Some(owned.sender_key),
+            sender_key_store: owned.sender_key_store,
+            sender_key_epoch: owned.sender_key_epoch,
+            pending_distributions: owned.pending_distributions,
+            nonce_dedup: owned.nonce_dedup,
+            member_wrapping_keys: owned.member_wrapping_keys,
+            recv_sequence_tracker: HashMap::new(),
+        }));
+        self.send_tracker = SendSequenceTracker::from_persisted(owned.send_sequence);
     }
 
     /// Seals an [`InnerEnvelope`] into an outer-envelope byte blob (sender-key
@@ -3277,17 +3314,9 @@ mod crypto_ops_golden {
             .expect("take owned crypto material");
         let mut state =
             PerContextState::new_for_test_encrypted(ctx, 0, DID::from(local_did.to_owned()));
-        state.mode = ContextModeState::Encrypted(Box::new(ContextCryptoState {
-            mls_group: Some(owned.mls_group),
-            sender_key: Some(owned.sender_key),
-            sender_key_store: owned.sender_key_store,
-            sender_key_epoch: owned.sender_key_epoch,
-            pending_distributions: owned.pending_distributions,
-            nonce_dedup: owned.nonce_dedup,
-            member_wrapping_keys: owned.member_wrapping_keys,
-            recv_sequence_tracker: HashMap::new(),
-        }));
-        state.send_tracker = SendSequenceTracker::from_persisted(owned.send_sequence);
+        // Exercise the production seed primitive (ADR-049 PR-7) so its shape is
+        // pinned by the golden byte-identity tests in this module.
+        state.seed_encrypted_crypto_from_owned(owned);
         state
     }
 
