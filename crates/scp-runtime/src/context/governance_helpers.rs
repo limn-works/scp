@@ -1219,14 +1219,26 @@ pub async fn execute_add_member(
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
     // The invitee's KeyPackage is carried on the command envelope (`Some` on
-    // the invitation path). Under `cfg(test)`/`testing` with `None` the
-    // provider returns an empty `AddMemberOutput`, preserving the non-crypto
-    // pipeline tests. This is what makes `GovernanceAction::AddMember` do a
-    // REAL MLS add in production (§5.12.3) rather than erroring on a missing KP.
-    let add_output = deps
-        .crypto
-        .add_member(&context_id_bytes, did, key_package)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+    // the invitation path). Under `cfg(test)`/`testing` with `None` the actor
+    // returns an empty `AddMemberOutput`, preserving the non-crypto pipeline
+    // tests. This is what makes `GovernanceAction::AddMember` do a REAL MLS add
+    // in production (§5.12.3) rather than erroring on a missing KP.
+    //
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the MLS add runs on the ACTOR-OWNED
+    // crypto (`PerContextState::add_member`), not the provider — after the
+    // create/welcome take, `deps.crypto.add_member` fails closed
+    // ("context state owned by actor"). `add_member` is §9 Class-S (the epoch
+    // bump is durably persisted fail-closed before ack), reached only through
+    // `rest_mut()` inside `commit_class_s_keep`, mirroring the `join_context`
+    // add path. On add failure NO MLS rollback is needed (no member was added),
+    // matching the prior provider disposition; the error propagates unchanged.
+    let add_output = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            v.rest_mut()
+                .add_member(did.as_ref(), key_package, deps.clock.as_ref())
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))
+        })
+        .await?;
 
     // Clone the Welcome + Commit for the return value (the invitation-sealing
     // caller needs the Welcome to seal the bundle; the Commit is surfaced for
