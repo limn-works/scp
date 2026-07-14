@@ -791,10 +791,12 @@ async fn handle_build_local_checkpoint(
     // failure is logged but never fails the build (the reconnection driver
     // still receives + records the local checkpoint). Mirrors the
     // periodic `create_and_broadcast_checkpoint_if_due` contract.
-    // `send_checkpoint` takes a SHARED `&PerContextState`, reachable via `&*cell`.
+    // ADR-049 PR-7: `send_checkpoint` takes `&mut ClassSCell` (Send) and seals on
+    // the actor crypto view; `cell` is free here (the checkpoint-build view borrow
+    // above ended) and `checkpoint` is owned.
     if let Err(e) = crate::context::messaging_helpers::send_checkpoint(
         deps,
-        &*cell,
+        cell,
         context_id,
         sender_did,
         &sk,
@@ -889,10 +891,9 @@ async fn handle_send_heartbeat(
     // actor future. `send_heartbeat` reads the shared `&*cell` in its sync
     // prelude (ADR-049 Decision 7).
     let sk = signing_key.to_signing_key();
-    let result = crate::context::messaging_helpers::send_heartbeat(
-        deps, &*cell, context_id, sender_did, &sk,
-    )
-    .await;
+    let result =
+        crate::context::messaging_helpers::send_heartbeat(deps, cell, context_id, sender_did, &sk)
+            .await;
     match result {
         Ok(()) => {
             let _ = reply.send(Ok(()));

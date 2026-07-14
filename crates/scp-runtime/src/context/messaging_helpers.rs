@@ -1885,76 +1885,80 @@ pub async fn encrypt_and_send(
 /// every fan-out send fails. Callers that publish checkpoints opportunistically
 /// (the periodic-broadcast path in [`finalize_send`]) treat any error as
 /// best-effort and MUST NOT roll back the originating send.
-pub fn send_checkpoint<'d, 'c, 's, 'k, 'cp>(
-    deps: &'d ActorDeps,
-    state: &PerContextState,
-    context_id: &'c str,
-    sender_did: &'s DID,
-    signing_key: &'k ed25519_dalek::SigningKey,
-    checkpoint: &'cp scp_event_log::checkpoint::ConsistencyCheckpoint,
-) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c, 's, 'k, 'cp> {
-    // SYNC PRELUDE (ADR-049 Decision 7 Send-discipline): read `&PerContextState`
-    // (which is `!Sync`) here and produce OWNED routing data, so the returned
-    // future does NOT capture the `state` lifetime and stays `Send` (mirrors
-    // `persist_state_best_effort`). `state` is deliberately absent from `use<>`.
+pub async fn send_checkpoint(
+    deps: &ActorDeps,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    context_id: &str,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    checkpoint: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+) -> Result<(), ContextError> {
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): this is now a plain `async fn` taking
+    // `&mut ClassSCell` — `&mut PerContextState` is `Send`, so the crypto view can
+    // be held across the fan-out await and the former sync-prelude gymnastics (a
+    // `&PerContextState`-shared prelude producing owned routing data because
+    // `&PerContextState` is `!Send`) are gone.
     //
-    // Routing parallels the application-data send path (§9.10.4): broadcast
-    // contexts address the derivable broadcast RID; encrypted contexts fan out
-    // to each known peer pseudonym. An empty encrypted routing set (no peers
-    // known yet) is a legitimate no-op — there is simply nobody to inform.
-    let (broadcast_envelope, recipients_data, routing_ids) = if state.broadcast_context.is_some() {
-        let broadcast_rid = scp_protocol::context::broadcast_routing_id(context_id);
-        // Broadcast contexts carry the checkpoint inside an encrypted inner
-        // envelope addressed to the broadcast RID (the checkpoint exchange is
-        // an MLS-management-style message, not author-keyed broadcast content).
-        (None, std::collections::HashMap::new(), vec![broadcast_rid])
+    // Routing (shared reads via `cell` `Deref`) into OWNED data, parallel to the
+    // application-data send path (§9.10.4): broadcast contexts address the
+    // derivable broadcast RID; encrypted contexts fan out to each known peer
+    // pseudonym. An empty encrypted routing set is a legitimate no-op.
+    let (recipients_data, routing_ids) = if cell.broadcast_context.is_some() {
+        (
+            std::collections::HashMap::new(),
+            vec![scp_protocol::context::broadcast_routing_id(context_id)],
+        )
     } else {
-        let peer_pseudonyms: Vec<[u8; 32]> = state
+        let peer_pseudonyms: Vec<[u8; 32]> = cell
             .routing
             .peer_registry()
             .map(|reg| reg.values().copied().collect())
             .unwrap_or_default();
         (
-            None,
-            state.access.access_key_store.get_all(context_id),
+            cell.access.access_key_store.get_all(context_id),
             peer_pseudonyms,
         )
     };
 
-    async move {
-        let message = CheckpointMessage {
-            tag: CHECKPOINT_PAYLOAD_TAG.to_owned(),
-            checkpoint: checkpoint.clone(),
-        };
-        let payload = rmp_serde::to_vec_named(&message).map_err(|e| {
-            ContextError::CryptoFailed(format!("checkpoint message serialization: {e}"))
-        })?;
+    let message = CheckpointMessage {
+        tag: CHECKPOINT_PAYLOAD_TAG.to_owned(),
+        checkpoint: checkpoint.clone(),
+    };
+    let payload = rmp_serde::to_vec_named(&message).map_err(|e| {
+        ContextError::CryptoFailed(format!("checkpoint message serialization: {e}"))
+    })?;
 
-        encrypt_and_send(
-            deps,
-            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the checkpoint send is a
-            // `&PerContextState`-shared sync-prelude → `Send` future (it cannot
-            // hold a `&mut ContextCryptoState`), so it seals through the RETAINED
-            // provider path until the C4 send-cluster flip re-homes it ahead of
-            // the C6 provider-copy deletion.
-            None,
-            broadcast_envelope,
-            // Consistency checkpoints are device/human-originated signals, not
-            // agent-autonomous messages — sign under `#active` (ADR-039).
-            MessageSigner::Active(signing_key),
-            context_id,
-            sender_did,
-            &payload,
-            &recipients_data,
-            // Checkpoints do not consume the application content sequence; the
-            // receive path dispatches them before the sequence tracker.
-            0,
-            None,
-            &routing_ids,
-            MessageType::ConsistencyCheckpoint,
-        )
-        .await
-    }
+    // Seal through the actor's field-granular Class-C `&mut ContextCryptoState`.
+    let mut view = cell.class_c_view();
+    let Some(crypto_state) = view.mode_mut().crypto_mut() else {
+        // Broadcast context: no MLS `ContextCryptoState` to seal with. This is
+        // DELIVERY-IDENTICAL to the pre-PR-7 provider path (which errored "no MLS
+        // group" and was swallowed best-effort → nothing delivered); we simply
+        // drop the spurious warn. Whether broadcast-context checkpoints SHOULD
+        // deliver via MLS is a pre-existing gap — broadcast checkpoint
+        // MLS-delivery: tracked as a separate §9.9.3 finding (a broadcast-native
+        // redesign, outside this ownership move).
+        return Ok(());
+    };
+    encrypt_and_send(
+        deps,
+        Some(crypto_state),
+        None,
+        // Consistency checkpoints are device/human-originated signals, not
+        // agent-autonomous messages — sign under `#active` (ADR-039).
+        MessageSigner::Active(signing_key),
+        context_id,
+        sender_did,
+        &payload,
+        &recipients_data,
+        // Checkpoints do not consume the application content sequence; the
+        // receive path dispatches them before the sequence tracker.
+        0,
+        None,
+        &routing_ids,
+        MessageType::ConsistencyCheckpoint,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1990,107 +1994,92 @@ pub fn send_checkpoint<'d, 'c, 's, 'k, 'cp>(
 /// any error as best-effort (a failed heartbeat is itself a suppression
 /// signal, surfaced separately by the receiver's gap detection) and MUST NOT
 /// tear down the subscription on a single failure.
-pub fn send_heartbeat<'d, 'c, 's, 'k>(
-    deps: &'d ActorDeps,
-    state: &PerContextState,
-    context_id: &'c str,
-    sender_did: &'s DID,
-    signing_key: &'k ed25519_dalek::SigningKey,
-) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c, 's, 'k> {
-    // SYNC PRELUDE (ADR-049 Decision 7 Send-discipline): the send-authorization
-    // gates and routing reads touch `&PerContextState` (`!Sync`) here and produce
-    // an OWNED `Result`, so the returned future does NOT capture the `state`
-    // lifetime and stays `Send` (mirrors `persist_state_best_effort` /
-    // `send_checkpoint`). `state` is deliberately absent from `use<>`.
+pub async fn send_heartbeat(
+    deps: &ActorDeps,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    context_id: &str,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<(), ContextError> {
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): plain `async fn` taking `&mut ClassSCell`
+    // (Send), so the seal runs on the actor's crypto view held across the fan-out
+    // await — the former sync-prelude (needed only because `&PerContextState` is
+    // `!Send`) is gone.
     //
     // Send-authorization gates, mirroring `send_message` (§9.9.2 routes a
     // heartbeat through the same write path, so it must clear the same write
     // gates). Without these a member whose `MessagesWrite` capability was
-    // suspended or revoked could keep asserting liveness on the write path,
-    // and a heartbeat racing a context close could slip through after the
-    // context is no longer active.
-    type Prep = Result<
-        (
-            Option<BroadcastEnvelope>,
-            std::collections::HashMap<String, AccessKey>,
-            Vec<[u8; 32]>,
-        ),
-        ContextError,
-    >;
-    let prep: Prep = (|| {
-        // 1. The context must be active. A send racing context-close is rejected.
-        state::require_active(&state.handle)?;
-        // 2. Capability check (broadcast contexts have no per-member write
-        //    capability and address the public broadcast routing ID, exactly as
-        //    in `send_message`). A suspended capability surfaces a distinct
-        //    message so the scheduler's best-effort log is actionable.
-        if state.broadcast_context.is_none()
-            && !state
-                .role_state
-                .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
-        {
-            let is_suspended = state
-                .role_state
-                .suspended_for(sender_did.as_ref())
-                .is_some_and(|s| s.contains(&Capability::MessagesWrite));
-            let msg = if is_suspended {
-                format!("member {sender_did} write access has been revoked")
-            } else {
-                format!("member {sender_did} does not have messages:write capability")
-            };
-            return Err(ContextError::PermissionDenied(msg));
-        }
-
-        // Routing parallels the application-data and checkpoint send paths
-        // (§9.10.4): broadcast contexts address the derivable broadcast RID;
-        // encrypted contexts fan out to each known peer pseudonym. An empty
-        // encrypted routing set (no peers known yet) is a legitimate no-op —
-        // there is simply nobody to signal liveness to.
-        Ok(if state.broadcast_context.is_some() {
-            let broadcast_rid = scp_protocol::context::broadcast_routing_id(context_id);
-            (None, std::collections::HashMap::new(), vec![broadcast_rid])
+    // suspended or revoked could keep asserting liveness on the write path, and a
+    // heartbeat racing a context close could slip through after the context is no
+    // longer active. Shared reads via `cell` `Deref`.
+    state::require_active(&cell.handle)?;
+    if cell.broadcast_context.is_none()
+        && !cell
+            .role_state
+            .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
+    {
+        let is_suspended = cell
+            .role_state
+            .suspended_for(sender_did.as_ref())
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+        let msg = if is_suspended {
+            format!("member {sender_did} write access has been revoked")
         } else {
-            let peer_pseudonyms: Vec<[u8; 32]> = state
-                .routing
-                .peer_registry()
-                .map(|reg| reg.values().copied().collect())
-                .unwrap_or_default();
-            (
-                None,
-                state.access.access_key_store.get_all(context_id),
-                peer_pseudonyms,
-            )
-        })
-    })();
-
-    async move {
-        let (broadcast_envelope, recipients_data, routing_ids) = prep?;
-        encrypt_and_send(
-            deps,
-            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): like `send_checkpoint`, the
-            // heartbeat send is a `&PerContextState`-shared sync-prelude → `Send`
-            // future, so it seals through the RETAINED provider path until the C4
-            // send-cluster flip re-homes it ahead of the C6 provider-copy deletion.
-            None,
-            broadcast_envelope,
-            // Heartbeats are device/human-originated liveness beacons, not
-            // agent-autonomous messages — sign under `#active` (ADR-039).
-            MessageSigner::Active(signing_key),
-            context_id,
-            sender_did,
-            // Heartbeats carry NO user content — the empty payload is the whole
-            // point: a minimal liveness beacon, padded by the envelope machinery.
-            &[],
-            &recipients_data,
-            // Heartbeats do not consume the application content sequence; the
-            // receive path classifies them before the sequence tracker.
-            0,
-            None,
-            &routing_ids,
-            MessageType::Heartbeat,
-        )
-        .await
+            format!("member {sender_did} does not have messages:write capability")
+        };
+        return Err(ContextError::PermissionDenied(msg));
     }
+
+    // Routing parallels the application-data and checkpoint send paths (§9.10.4):
+    // broadcast contexts address the derivable broadcast RID; encrypted contexts
+    // fan out to each known peer pseudonym. An empty encrypted routing set is a
+    // legitimate no-op.
+    let (recipients_data, routing_ids) = if cell.broadcast_context.is_some() {
+        (
+            std::collections::HashMap::new(),
+            vec![scp_protocol::context::broadcast_routing_id(context_id)],
+        )
+    } else {
+        let peer_pseudonyms: Vec<[u8; 32]> = cell
+            .routing
+            .peer_registry()
+            .map(|reg| reg.values().copied().collect())
+            .unwrap_or_default();
+        (
+            cell.access.access_key_store.get_all(context_id),
+            peer_pseudonyms,
+        )
+    };
+
+    // Seal through the actor's field-granular Class-C `&mut ContextCryptoState`.
+    let mut view = cell.class_c_view();
+    let Some(crypto_state) = view.mode_mut().crypto_mut() else {
+        // Broadcast context: no MLS `ContextCryptoState`. Delivery-identical no-op
+        // (see `send_checkpoint`). Broadcast checkpoint MLS-delivery: tracked as a
+        // separate §9.9.3 finding.
+        return Ok(());
+    };
+    encrypt_and_send(
+        deps,
+        Some(crypto_state),
+        None,
+        // Heartbeats are device/human-originated liveness beacons, not
+        // agent-autonomous messages — sign under `#active` (ADR-039).
+        MessageSigner::Active(signing_key),
+        context_id,
+        sender_did,
+        // Heartbeats carry NO user content — the empty payload is the whole point:
+        // a minimal liveness beacon, padded by the envelope machinery.
+        &[],
+        &recipients_data,
+        // Heartbeats do not consume the application content sequence; the receive
+        // path classifies them before the sequence tracker.
+        0,
+        None,
+        &routing_ids,
+        MessageType::Heartbeat,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2508,7 +2497,9 @@ async fn create_and_broadcast_checkpoint_if_due(
             &*deps.event_log,
         )
     };
-    // `send_checkpoint` takes a SHARED `&PerContextState`, reachable via `&*cell`.
+    // ADR-049 PR-7: `send_checkpoint` now takes `&mut ClassSCell` (Send) and seals
+    // on the actor crypto view; `cell` is free here (the `due_checkpoint` view
+    // borrow above ended) and this is its last use.
     if let Some(checkpoint) = due_checkpoint
         && let Err(e) = send_checkpoint(deps, cell, context_id, sender_did, sk, &checkpoint).await
     {
