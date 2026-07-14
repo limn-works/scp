@@ -1468,6 +1468,41 @@ fn open_calls_decrypt_sender_layer() {
     );
 }
 
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the 11 steady-state crypto methods were
+// MOVED off `MlsCryptoProvider` onto the actor-owned `PerContextState`. This
+// asserts the provider retains ZERO definitions of any of them — a one-way move
+// (no dual-home), so a future refactor cannot silently re-add a provider-resident
+// twin that would seal/open behind the actor's back (double-owner, divergent
+// sequence, resurrected sender key). Birth/restore-seam methods (create_mls_group,
+// add_member, install_joined_group, take_crypto_state, build_restored_owned,
+// with_context, wrapping_keypair, destroy_mls_group, destroy_sender_key,
+// validate_key_package, store_member_sender_key) are RETAINED and deliberately not
+// listed. Additive coverage; weakens nothing.
+#[test]
+fn provider_steady_state_crypto_methods_are_deleted() {
+    const MOVED_METHODS: [&str; 11] = [
+        "seal",
+        "open",
+        "advance_epoch",
+        "rotate_sender_key",
+        "remove_member",
+        "remove_member_sender_key",
+        "mls_encrypt_management",
+        "local_sender_key_epoch",
+        "export_crypto_state",
+        "restore_crypto_state",
+        "drain_pending_sender_key_messages",
+    ];
+    for method in MOVED_METHODS {
+        let def = format!("fn {method}(");
+        assert!(
+            !PROVIDER_SRC.contains(&def),
+            "MlsCryptoProvider must NOT define `{method}` — the steady-state crypto \
+             seam moved onto the actor `PerContextState` (ADR-049 PR-7, one-way move)"
+        );
+    }
+}
+
 // --- Envelope layer (§13) — NOW WIRED ---
 
 #[test]
