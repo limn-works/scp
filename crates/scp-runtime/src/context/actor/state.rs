@@ -741,6 +741,40 @@ impl ContextModeState {
     pub const fn is_encrypted(&self) -> bool {
         matches!(self, Self::Encrypted(_))
     }
+
+    /// Mutable access to the encrypted-mode crypto sub-state, or `None` for a
+    /// broadcast context.
+    ///
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the Class-C send/receive seams reach
+    /// the field-granular [`ContextCryptoState`] through this accessor off the
+    /// `ClassCMut::mode_mut()` view, so the message hot path drives
+    /// [`ContextCryptoState::seal`] / [`ContextCryptoState::open`] on
+    /// `&mut ContextCryptoState` (coalesced Class-C) rather than a whole
+    /// `&mut PerContextState` (fail-closed Class-S). Broadcast contexts carry no
+    /// MLS crypto state and seal through [`BroadcastState`] instead.
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): production callers (the send/receive seal/open seams) wire in as the atomic-core seams land."
+    )]
+    pub(crate) fn crypto_mut(&mut self) -> Option<&mut ContextCryptoState> {
+        match self {
+            Self::Encrypted(crypto) => Some(crypto),
+            Self::Broadcast(_) => None,
+        }
+    }
+
+    /// Shared access to the encrypted-mode crypto sub-state, or `None` for a
+    /// broadcast context. Companion to [`Self::crypto_mut`].
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): production callers wire in as the atomic-core seams land."
+    )]
+    pub(crate) fn crypto(&self) -> Option<&ContextCryptoState> {
+        match self {
+            Self::Encrypted(crypto) => Some(crypto),
+            Self::Broadcast(_) => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -128,6 +128,64 @@ pub fn build_encrypted_envelope(
     // ADR-056: key the send-path crypto by the canonical digest (matches
     // `state.context_id` and the MLS group keyed at creation), not a re-hash
     // of the hex id.
+    let (inner, context_id_bytes) = build_inner_wire(
+        clock,
+        context_id,
+        sender_did,
+        payload,
+        signer,
+        recipients_data,
+        sequence,
+        source_provenance,
+        message_type,
+    )?;
+
+    // §9.10.4 privacy: the cleartext outer-envelope `routing_id` is zeroed for
+    // application data. One sealed blob is fanned out to N per-member pseudonym
+    // transport addresses (seal-once-send-to-all), so there is no single
+    // per-recipient value to embed here. Embedding the relay-derivable
+    // `context_routing_id(context_id)` would let a curious relay read it off
+    // every pseudonym-addressed app-data blob and re-correlate all senders,
+    // defeating the pseudonym scheme. The all-zero value is a RESERVED/forbidden
+    // pseudonym (§9.10.4), so it cannot collide with a real routing ID, and the
+    // receiver never reads this field for app-data (it routes on the transport
+    // key and MLS-decrypts `encrypted_blob`), so receive is unaffected.
+    // `create_outer_envelope` enforces `routing_id.len() == 32`, which a
+    // 32-byte zero sentinel satisfies.
+    let routing_id = [0u8; 32];
+    crypto.seal(
+        &context_id_bytes,
+        &inner,
+        &routing_id,
+        DEFAULT_BLOB_TTL_SECS,
+    )
+}
+
+/// Builds and signs the [`InnerEnvelope`] for an application-data send (access-key
+/// wrap → inner-envelope stamp+sign), returning it alongside the canonical
+/// 32-byte context-id digest.
+///
+/// Extracted from [`build_encrypted_envelope`] so the two seal seams — the
+/// retained provider path ([`build_encrypted_envelope`]) and the ADR-049 PR-7
+/// actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
+/// driven from the Class-C view in [`encrypt_and_send`]) — share ONE
+/// inner-envelope construction, so the sealed wire stays byte-identical across
+/// the flip (the 16 golden byte-identity tests continue to hold).
+#[allow(clippy::too_many_arguments)]
+fn build_inner_wire(
+    clock: &Arc<dyn Clock>,
+    context_id: &str,
+    sender_did: &DID,
+    payload: &[u8],
+    signer: MessageSigner<'_>,
+    recipients_data: &std::collections::HashMap<String, AccessKey>,
+    sequence: u64,
+    source_provenance: Option<&SourceContextInfo>,
+    message_type: MessageType,
+) -> Result<(InnerEnvelope, [u8; 32]), ContextError> {
+    // ADR-056: key the send-path crypto by the canonical digest (matches
+    // `state.context_id` and the MLS group keyed at creation), not a re-hash
+    // of the hex id.
     let context_id_bytes = state::context_id_to_bytes(context_id);
     let provenance = source_provenance.map(|source_info| {
         let target_context: scp_protocol::provenance::ContextId = context_id.to_owned();
@@ -188,24 +246,55 @@ pub fn build_encrypted_envelope(
     let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signer.key())
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    // §9.10.4 privacy: the cleartext outer-envelope `routing_id` is zeroed for
-    // application data. One sealed blob is fanned out to N per-member pseudonym
-    // transport addresses (seal-once-send-to-all), so there is no single
-    // per-recipient value to embed here. Embedding the relay-derivable
-    // `context_routing_id(context_id)` would let a curious relay read it off
-    // every pseudonym-addressed app-data blob and re-correlate all senders,
-    // defeating the pseudonym scheme. The all-zero value is a RESERVED/forbidden
-    // pseudonym (§9.10.4), so it cannot collide with a real routing ID, and the
-    // receiver never reads this field for app-data (it routes on the transport
-    // key and MLS-decrypts `encrypted_blob`), so receive is unaffected.
-    // `create_outer_envelope` enforces `routing_id.len() == 32`, which a
-    // 32-byte zero sentinel satisfies.
+    Ok((inner, context_id_bytes))
+}
+
+/// Builds and seals an application-data send through the ADR-049 PR-7 actor
+/// crypto state (Class-C `&mut ContextCryptoState`), the field-granular crypto
+/// sub-state reached via `ClassCMut::mode_mut()`. Byte-identical to the retained
+/// provider path [`build_encrypted_envelope`]: it shares [`build_inner_wire`] and
+/// passes the same all-zero app-data `routing_id`, `DEFAULT_BLOB_TTL_SECS`, and
+/// the caller-supplied `aad_sequence` (the authoritative sender-layer AAD
+/// sequence — today `MembershipState::next_sequence_number`, matching what the
+/// provider's `seal` derived from the inner envelope). `local_did` is sourced
+/// from `deps.crypto.local_did()` so the sealed sender-layer AAD binds the same
+/// local identity the provider used.
+#[allow(clippy::too_many_arguments)]
+fn build_encrypted_envelope_actor(
+    clock: &Arc<dyn Clock>,
+    crypto_state: &mut crate::context::actor::state::ContextCryptoState,
+    local_did: &str,
+    context_id: &str,
+    sender_did: &DID,
+    payload: &[u8],
+    signer: MessageSigner<'_>,
+    recipients_data: &std::collections::HashMap<String, AccessKey>,
+    aad_sequence: u64,
+    source_provenance: Option<&SourceContextInfo>,
+    message_type: MessageType,
+) -> Result<Vec<u8>, ContextError> {
+    let (inner, context_id_bytes) = build_inner_wire(
+        clock,
+        context_id,
+        sender_did,
+        payload,
+        signer,
+        recipients_data,
+        aad_sequence,
+        source_provenance,
+        message_type,
+    )?;
+    // §9.10.4 privacy: app-data outer `routing_id` is the 32-byte zero sentinel
+    // (see `build_encrypted_envelope`); the receiver routes on the transport key,
+    // never this field.
     let routing_id = [0u8; 32];
-    crypto.seal(
+    crypto_state.seal(
         &context_id_bytes,
+        local_did,
         &inner,
         &routing_id,
         DEFAULT_BLOB_TTL_SECS,
+        aad_sequence,
     )
 }
 
@@ -1261,20 +1350,34 @@ pub async fn send_message(
     };
 
     // Phase 2: encrypt + send.
-    let phase2_result = encrypt_and_send(
-        deps,
-        broadcast_envelope,
-        signer,
-        &context_id,
-        sender_did,
-        payload,
-        &recipients_data,
-        sequence,
-        source_provenance,
-        &send_routing_ids,
-        MessageType::Content,
-    )
-    .await;
+    //
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor's field-granular
+    // Class-C `&mut ContextCryptoState` (reached via `mode_mut().crypto_mut()`).
+    // Broadcast contexts have no crypto sub-state, so `crypto_mut()` is `None` and
+    // the broadcast branch of `encrypt_and_send` builds the wire without it. The
+    // `&mut` view is scoped to just this call so `cell` is free for the abort /
+    // finalize arms below (NLL). Holding a `&mut ContextCryptoState` across the
+    // fan-out await is `Send` (mirrors `handle_deliver_incoming`'s `class_c_view`
+    // held across its timeout await).
+    let phase2_result = {
+        let mut view = cell.class_c_view();
+        let crypto_state = view.mode_mut().crypto_mut();
+        encrypt_and_send(
+            deps,
+            crypto_state,
+            broadcast_envelope,
+            signer,
+            &context_id,
+            sender_did,
+            payload,
+            &recipients_data,
+            sequence,
+            source_provenance,
+            &send_routing_ids,
+            MessageType::Content,
+        )
+        .await
+    };
     if let Err(e) = phase2_result {
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // (via `&*cell`) BEFORE the existing escrow-void + ticket rollback. If the
@@ -1646,6 +1749,7 @@ fn deliver_checkpoint_message(
 #[allow(clippy::too_many_arguments)]
 pub async fn encrypt_and_send(
     deps: &ActorDeps,
+    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     broadcast_envelope: Option<BroadcastEnvelope>,
     signer: MessageSigner<'_>,
     context_id: &str,
@@ -1667,18 +1771,42 @@ pub async fn encrypt_and_send(
         let encrypt_start = std::time::Instant::now();
         // The key and stamped persona travel together in the one `MessageSigner`
         // straight into the single stamp+sign site, so they cannot diverge.
-        let result = build_encrypted_envelope(
-            &deps.clock,
-            &deps.crypto,
-            context_id,
-            sender_did,
-            payload,
-            signer,
-            recipients_data,
-            sequence,
-            source_provenance,
-            message_type,
-        )?;
+        //
+        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): when the caller supplies the
+        // field-granular Class-C `&mut ContextCryptoState` (the flipped seams —
+        // `send_message`), seal through the actor's crypto state
+        // ([`build_encrypted_envelope_actor`]). The `&PerContextState`-shared
+        // sync-prelude paths (`send_checkpoint` / `send_heartbeat`) pass `None`
+        // and use the RETAINED provider seal until the C4 send-cluster flip
+        // re-homes them ahead of the C6 provider-copy deletion. Both paths are
+        // byte-identical (shared `build_inner_wire`).
+        let result = match crypto_state {
+            Some(cs) => build_encrypted_envelope_actor(
+                &deps.clock,
+                cs,
+                deps.crypto.local_did(),
+                context_id,
+                sender_did,
+                payload,
+                signer,
+                recipients_data,
+                sequence,
+                source_provenance,
+                message_type,
+            )?,
+            None => build_encrypted_envelope(
+                &deps.clock,
+                &deps.crypto,
+                context_id,
+                sender_did,
+                payload,
+                signer,
+                recipients_data,
+                sequence,
+                source_provenance,
+                message_type,
+            )?,
+        };
         crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
         result
     };
@@ -1794,6 +1922,12 @@ pub fn send_checkpoint<'d, 'c, 's, 'k, 'cp>(
 
         encrypt_and_send(
             deps,
+            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the checkpoint send is a
+            // `&PerContextState`-shared sync-prelude → `Send` future (it cannot
+            // hold a `&mut ContextCryptoState`), so it seals through the RETAINED
+            // provider path until the C4 send-cluster flip re-homes it ahead of
+            // the C6 provider-copy deletion.
+            None,
             broadcast_envelope,
             // Consistency checkpoints are device/human-originated signals, not
             // agent-autonomous messages — sign under `#active` (ADR-039).
@@ -1923,6 +2057,11 @@ pub fn send_heartbeat<'d, 'c, 's, 'k>(
         let (broadcast_envelope, recipients_data, routing_ids) = prep?;
         encrypt_and_send(
             deps,
+            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): like `send_checkpoint`, the
+            // heartbeat send is a `&PerContextState`-shared sync-prelude → `Send`
+            // future, so it seals through the RETAINED provider path until the C4
+            // send-cluster flip re-homes it ahead of the C6 provider-copy deletion.
+            None,
             broadcast_envelope,
             // Heartbeats are device/human-originated liveness beacons, not
             // agent-autonomous messages — sign under `#active` (ADR-039).
