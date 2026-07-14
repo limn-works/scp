@@ -2514,6 +2514,94 @@ impl MlsCryptoProvider {
             return Ok(RestoredFloors::default());
         }
 
+        // ADR-049 §15(b) / SCP-CRYPTOMOVE-000d: share the security-critical
+        // snapshot deserialization with the owned-return path instead of
+        // duplicating it. `build_restored_owned` reconstructs the per-context
+        // MATERIAL + Class-M floors and restores the node-level wrapping
+        // keypair, WITHOUT touching the `contexts` map. This legacy path then
+        // re-wraps that owned material into the provider-internal
+        // `ContextCryptoState` and installs it. The external contract is
+        // byte-identical: still returns `RestoredFloors`, still inserts into
+        // `contexts`, and the wrapping keypair is still restored before the
+        // insert — now inside `build_restored_owned`, which runs first.
+        let (owned, floors) = self.build_restored_owned(context_id, data)?;
+
+        // Re-wrap the owned material into the provider-internal state — the
+        // exact inverse of `take_crypto_state`'s destructure (field names
+        // matched precisely, no field dropped or transposed).
+        let OwnedMlsCryptoState {
+            mls_group,
+            sender_key,
+            sender_key_store,
+            sender_key_epoch,
+            send_sequence,
+            pending_distributions,
+            nonce_dedup,
+            member_wrapping_keys,
+        } = owned;
+        let crypto_state = ContextCryptoState {
+            mls_group,
+            sender_key,
+            sender_key_store,
+            sender_key_epoch,
+            send_sequence,
+            pending_distributions,
+            nonce_dedup,
+            member_wrapping_keys,
+        };
+
+        // ADR-049 commit 12c.9f: lock-free `DashMap::insert`.
+        self.contexts.insert(*context_id, crypto_state);
+
+        Ok(floors)
+    }
+
+    /// Reconstructs the per-context MLS crypto MATERIAL from a persisted
+    /// snapshot and RETURNS it as an owned [`OwnedMlsCryptoState`] plus the
+    /// Class-M [`RestoredFloors`], WITHOUT inserting into the provider's
+    /// `contexts` map and WITHOUT calling
+    /// [`take_crypto_state`](Self::take_crypto_state).
+    ///
+    /// ADR-049 §15(b) / story SCP-CRYPTOMOVE-000d. This is the owned-return
+    /// restore seam: the atomic core (SCP-CRYPTOMOVE-001) seeds the per-context
+    /// actor directly from the returned material rather than reaching into a
+    /// provider-resident `contexts[ctx]` entry. The legacy insert-based
+    /// [`restore_crypto_state`](Self::restore_crypto_state) delegates here and
+    /// re-wraps the result into the provider-internal `ContextCryptoState`; it
+    /// is retained until the atomic core flips the call site.
+    ///
+    /// The returned [`OwnedMlsCryptoState`] is the PROVIDER-side owned mirror
+    /// (§15 keeps it distinct from the actor-side `ContextCryptoState`); this
+    /// method imports nothing from `context::actor`.
+    ///
+    /// # Side effect — node-level wrapping keypair
+    ///
+    /// The X25519 wrapping keypair (§9.16.1) is node-level, NOT per-context and
+    /// NOT part of [`OwnedMlsCryptoState`]; the atomic-core actor reads it via
+    /// the Prep B `pub(crate)` accessors
+    /// ([`wrapping_public_key`](Self::wrapping_public_key) /
+    /// [`wrapping_secret`](Self::wrapping_secret)). This method restores it into
+    /// the provider's `ArcSwap` slots here, in the same order the legacy insert
+    /// path did (before the caller installs the per-context material), so both
+    /// restore paths keep byte-parity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if `data` is empty (the owned path
+    /// must always yield material — unlike the legacy no-op-on-empty
+    /// [`restore_crypto_state`](Self::restore_crypto_state)), if deserialization
+    /// fails, or if the data is corrupt.
+    pub(crate) fn build_restored_owned(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(OwnedMlsCryptoState, RestoredFloors), ContextError> {
+        if data.is_empty() {
+            return Err(ContextError::CryptoFailed(
+                "cannot build owned crypto state from empty snapshot".into(),
+            ));
+        }
+
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(data)
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot deserialization: {e}")))?;
 
@@ -2647,7 +2735,7 @@ impl MlsCryptoProvider {
             .map(|(did, epoch, sequence)| (did, ReceiveFloor { epoch, sequence }))
             .collect();
 
-        let crypto_state = ContextCryptoState {
+        let owned = OwnedMlsCryptoState {
             mls_group: scp_group,
             sender_key: local_sender_key,
             sender_key_store,
@@ -2658,10 +2746,13 @@ impl MlsCryptoProvider {
             member_wrapping_keys,
         };
 
-        // Restore the provider-level X25519 wrapping keypair BEFORE inserting
-        // into the contexts map. This prevents partial state: if either
-        // ArcSwap store is observed mid-rotation the contexts map has not
-        // yet seen the new entry.
+        // Restore the provider-level (node-level) X25519 wrapping keypair
+        // before returning the owned material to the caller (the legacy
+        // `restore_crypto_state` path installs that material into the contexts
+        // map immediately after; the atomic core seeds the actor from it). This
+        // preserves the original ordering — the keypair rotates before any
+        // per-context entry becomes observable — so a reader never sees a
+        // partial pairing of new wrapping key with stale context state.
         //
         // ADR-049 commit 12c.9f: `ArcSwap::store` is atomic per-slot;
         // observing one slot pre-rotation and the other post-rotation is
@@ -2690,13 +2781,13 @@ impl MlsCryptoProvider {
         // should not retain raw X25519 secret key material.
         snapshot.wrapping_secret_key.zeroize();
 
-        // ADR-049 commit 12c.9f: lock-free `DashMap::insert`.
-        self.contexts.insert(*context_id, crypto_state);
-
-        Ok(RestoredFloors {
-            sender_epochs: restored_sender_epochs,
-            recv_sequence: restored_recv_sequence,
-        })
+        Ok((
+            owned,
+            RestoredFloors {
+                sender_epochs: restored_sender_epochs,
+                recv_sequence: restored_recv_sequence,
+            },
+        ))
     }
 
     /// Reads the `scp_context_params` (`0xFF02`) group-context extension
@@ -3826,6 +3917,308 @@ mod tests {
                 "pending distributions should be empty after restore"
             );
         }
+    }
+
+    /// ADR-049 PR-7 Prep D (SCP-CRYPTOMOVE-000d), AC4: `build_restored_owned`
+    /// reconstructs the full per-context MATERIAL and returns it OWNED, with
+    /// both floor axes, and WITHOUT inserting into `contexts` or recording a
+    /// take. Anti-transposition: epoch and sequence land in the right
+    /// `RestoredFloors` positions.
+    #[test]
+    fn build_restored_owned_returns_owned_material_without_insert() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let bob = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Populate a rich snapshot: remote sender key, member wrapping key,
+        // sender_key_epoch = 42.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
+            state.sender_key_epoch = 42;
+            state
+                .sender_key_store
+                .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
+            state
+                .member_wrapping_keys
+                .insert(bob.to_owned(), [0xAA; 32]);
+        }
+
+        // Capture originals for comparison (bytes, so no Clone dependence).
+        let (orig_local_key, orig_bob_key, orig_group_id) = {
+            let entry = provider.contexts.get(&ctx_id).unwrap();
+            let state = entry.value();
+            (
+                state.sender_key.as_bytes().to_vec(),
+                state
+                    .sender_key_store
+                    .get(&ctx_id_hex, bob)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+                state.mls_group.group_id().unwrap().to_vec(),
+            )
+        };
+
+        // Export with BOTH floor axes populated: per-sender epoch (bob, 5) and
+        // intra-epoch recv floor ReceiveFloor { epoch: 5, sequence: 3 }.
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                vec![(bob.to_owned(), 5)],
+                vec![(
+                    bob.to_owned(),
+                    ReceiveFloor {
+                        epoch: 5,
+                        sequence: 3,
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(!exported.is_empty());
+
+        // Fresh provider: build the owned material (no insert, no take).
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let (owned, floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+
+        // (a) Owned 8 fields match the snapshot. mls_group functional-equiv is
+        // the group-id parity + a readable epoch.
+        assert_eq!(owned.sender_key.as_bytes(), orig_local_key.as_slice());
+        assert_eq!(owned.sender_key_epoch, 42);
+        let owned_bob = owned
+            .sender_key_store
+            .get(&ctx_id_hex, bob)
+            .map(|k| k.as_bytes().to_vec());
+        assert_eq!(owned_bob, Some(orig_bob_key));
+        assert_eq!(
+            owned.member_wrapping_keys.get(bob).copied(),
+            Some([0xAA; 32])
+        );
+        assert!(owned.pending_distributions.is_empty());
+        assert_eq!(
+            owned.mls_group.group_id().unwrap(),
+            orig_group_id.as_slice()
+        );
+        assert!(owned.mls_group.epoch().is_ok());
+
+        // (b) No provider-side side effects: no inserted entry, no recorded take.
+        assert!(!provider2.contexts.contains_key(&ctx_id), "must NOT insert");
+        assert!(
+            !provider2.taken_context_ids.contains(&ctx_id),
+            "must NOT take"
+        );
+
+        // (c) Floors match on BOTH axes, epoch/sequence in the right positions.
+        assert!(
+            floors
+                .sender_epochs
+                .iter()
+                .any(|(d, e)| d == bob && *e == 5),
+            "per-sender epoch floor (bob, 5) must come back, got {:?}",
+            floors.sender_epochs
+        );
+        let bob_recv = floors
+            .recv_sequence
+            .iter()
+            .find(|(d, _)| d == bob)
+            .map(|(_, f)| (f.epoch, f.sequence))
+            .expect("bob's recv floor must come back");
+        assert_eq!(
+            bob_recv,
+            (5, 3),
+            "recv floor (epoch=5, seq=3), no transposition"
+        );
+    }
+
+    /// ADR-049 PR-7 Prep D (SCP-CRYPTOMOVE-000d): security parity. The
+    /// legacy insert path (`restore_crypto_state`) and the owned-return path
+    /// (`build_restored_owned`) must reconstruct byte-identical material and
+    /// set-equal floors from the SAME snapshot — the delegation shares one
+    /// deserialization body, so parity holds by construction and this pins it.
+    #[test]
+    fn build_restored_owned_matches_insert_path_parity() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let bob = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let ctx_id_hex = hex::encode(ctx_id);
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
+            state.sender_key_epoch = 11;
+            state
+                .sender_key_store
+                .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
+            state
+                .member_wrapping_keys
+                .insert(bob.to_owned(), [0xBB; 32]);
+        }
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                vec![(bob.to_owned(), 5)],
+                vec![(
+                    bob.to_owned(),
+                    ReceiveFloor {
+                        epoch: 5,
+                        sequence: 3,
+                    },
+                )],
+            )
+            .unwrap();
+
+        // Same bytes into both paths on two fresh providers.
+        let provider_a = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider_b = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let floors_a = provider_a.restore_crypto_state(&ctx_id, &exported).unwrap();
+        let (owned_b, floors_b) = provider_b.build_restored_owned(&ctx_id, &exported).unwrap();
+
+        // Floors set-equal on BOTH axes.
+        let a_epochs: std::collections::BTreeSet<(String, u64)> =
+            floors_a.sender_epochs.iter().cloned().collect();
+        let b_epochs: std::collections::BTreeSet<(String, u64)> =
+            floors_b.sender_epochs.iter().cloned().collect();
+        assert_eq!(a_epochs, b_epochs, "sender_epochs must be set-equal");
+        let a_recv: std::collections::BTreeSet<(String, u64, u64)> = floors_a
+            .recv_sequence
+            .iter()
+            .map(|(d, f)| (d.clone(), f.epoch, f.sequence))
+            .collect();
+        let b_recv: std::collections::BTreeSet<(String, u64, u64)> = floors_b
+            .recv_sequence
+            .iter()
+            .map(|(d, f)| (d.clone(), f.epoch, f.sequence))
+            .collect();
+        assert_eq!(a_recv, b_recv, "recv_sequence must be set-equal");
+
+        // provider_a's inserted 8 fields == owned_b's 8 fields.
+        let entry = provider_a.contexts.get(&ctx_id).unwrap();
+        let sa = entry.value();
+        // mls_group functional-equivalence: group id + epoch.
+        assert_eq!(
+            sa.mls_group.group_id().unwrap(),
+            owned_b.mls_group.group_id().unwrap(),
+            "mls_group group id parity"
+        );
+        assert_eq!(
+            sa.mls_group.epoch().unwrap(),
+            owned_b.mls_group.epoch().unwrap(),
+            "mls_group epoch parity"
+        );
+        assert_eq!(
+            sa.sender_key.as_bytes(),
+            owned_b.sender_key.as_bytes(),
+            "sender_key parity"
+        );
+        assert_eq!(
+            sa.sender_key_store
+                .get(&ctx_id_hex, bob)
+                .map(|k| k.as_bytes().to_vec()),
+            owned_b
+                .sender_key_store
+                .get(&ctx_id_hex, bob)
+                .map(|k| k.as_bytes().to_vec()),
+            "sender_key_store parity"
+        );
+        assert_eq!(
+            sa.sender_key_epoch, owned_b.sender_key_epoch,
+            "sender_key_epoch parity"
+        );
+        assert_eq!(
+            sa.send_sequence, owned_b.send_sequence,
+            "send_sequence parity"
+        );
+        assert_eq!(
+            sa.pending_distributions, owned_b.pending_distributions,
+            "pending_distributions parity"
+        );
+        assert_eq!(
+            sa.member_wrapping_keys, owned_b.member_wrapping_keys,
+            "member_wrapping_keys parity"
+        );
+        // nonce_dedup is `NonceDedup::new()` on both paths (same shared body),
+        // so it is equal by construction — no field is dropped or transposed.
+    }
+
+    /// ADR-049 PR-7 Prep D (SCP-CRYPTOMOVE-000d), D2 cold-restart replay:
+    /// a legacy snapshot with NO per-sender epoch map must yield the same
+    /// legacy back-compat floor (`sender_key_epoch.max(1)` per installed
+    /// sender) on the owned path as on the insert path — pinning that the
+    /// owned seam does not weaken the D2 rollback floor.
+    #[test]
+    fn build_restored_owned_yields_legacy_floor_parity() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let bob = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let ctx_id_hex = hex::encode(ctx_id);
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
+            state.sender_key_epoch = 7;
+            state
+                .sender_key_store
+                .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
+        }
+        // Simulate a legacy snapshot: export, then strip the per-sender map.
+        let exported = provider
+            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
+            .unwrap();
+        let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
+        snapshot.sender_key_epochs.clear();
+        let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+
+        let provider_a = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider_b = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let floors_a = provider_a
+            .restore_crypto_state(&ctx_id, &legacy_bytes)
+            .unwrap();
+        let (_owned_b, floors_b) = provider_b
+            .build_restored_owned(&ctx_id, &legacy_bytes)
+            .unwrap();
+
+        // Both paths seed bob's legacy floor from the global counter (7).
+        let a_epochs: std::collections::BTreeSet<(String, u64)> =
+            floors_a.sender_epochs.iter().cloned().collect();
+        let b_epochs: std::collections::BTreeSet<(String, u64)> =
+            floors_b.sender_epochs.iter().cloned().collect();
+        assert_eq!(
+            a_epochs, b_epochs,
+            "legacy back-compat floor must be identical on both paths"
+        );
+        assert!(
+            floors_b
+                .sender_epochs
+                .iter()
+                .any(|(did, epoch)| did == bob && *epoch == 7),
+            "owned path must seed the legacy floor (7) for the installed sender, got {:?}",
+            floors_b.sender_epochs
+        );
+    }
+
+    /// ADR-049 PR-7 Prep D (SCP-CRYPTOMOVE-000d): the owned path must always
+    /// yield material, so an empty snapshot is an ERROR (unlike the legacy
+    /// `restore_crypto_state`, whose empty-data no-op still returns
+    /// `Ok(default)` — see `restore_crypto_state_noop_on_empty_data`).
+    #[test]
+    fn build_restored_owned_rejects_empty_snapshot() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        let err = provider
+            .build_restored_owned(&ctx_id, &[])
+            .expect_err("empty snapshot must be rejected on the owned path");
+        assert!(
+            matches!(err, ContextError::CryptoFailed(_)),
+            "empty owned-restore must fail with CryptoFailed, got {err:?}"
+        );
     }
 
     /// Prep-D pass-through pin (ADR-049 PR-6): the floors that
