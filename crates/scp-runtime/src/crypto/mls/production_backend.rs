@@ -460,6 +460,7 @@ impl MlsBackend for ProductionMlsBackend {
     async fn validate_key_package(
         &self,
         key_package_bytes: &[u8],
+        clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError> {
         // Deserialize and validate against the SCP ciphersuite. This runs the
         // OpenMLS-side validation without holding any group state.
@@ -474,9 +475,11 @@ impl MlsBackend for ProductionMlsBackend {
         // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
         // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
         // clock. Re-validate the accepted `Lifetime` against the injected
-        // hardened clock and enforce the RFC 9420 max-range bound openmls's
-        // `validate` never applies. Additive hardening; never replaces openmls.
-        validate_key_package_lifetime(validated.life_time(), self.clock.as_ref())?;
+        // hardened clock (threaded in as `clock`, not read from backend state —
+        // SCP-CRYPTOMOVE-000c) and enforce the RFC 9420 max-range bound
+        // openmls's `validate` never applies. Additive hardening; never
+        // replaces openmls.
+        validate_key_package_lifetime(validated.life_time(), clock)?;
 
         // Guard the SCP ciphersuite invariant: any KP using a non-SCP
         // ciphersuite MUST be rejected even if OpenMLS validates it against
@@ -984,7 +987,7 @@ mod tests {
         let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
 
         let validated = backend
-            .validate_key_package(&bob_gen.key_package_bytes)
+            .validate_key_package(&bob_gen.key_package_bytes, &SystemClock)
             .await
             .unwrap();
         assert_eq!(validated.key_package_bytes, bob_gen.key_package_bytes);
@@ -993,8 +996,51 @@ mod tests {
     #[tokio::test]
     async fn validate_key_package_rejects_garbage() {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
-        let err = backend.validate_key_package(&[0u8; 64]).await.unwrap_err();
+        let err = backend
+            .validate_key_package(&[0u8; 64], &SystemClock)
+            .await
+            .unwrap_err();
         assert!(matches!(err, MlsError::AddMemberFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_key_package_stateless_clock_param_valid_and_expired() {
+        // SCP-CRYPTOMOVE-000c AC4: drive the stateless `MlsBackend::validate_key_package`
+        // form directly and assert both arms — a valid KeyPackage returns
+        // `Ok(ValidatedKeyPackage)`, and an expired-lifetime KeyPackage returns
+        // `MlsError::KeyPackageLifetimeInvalid` (the stateless form's variant; the
+        // retained `MlsCryptoProvider::validate_key_package` wrapper maps the same
+        // condition to `ContextError::InvalidKeyPackage`, asserted in
+        // `provider::tests::validate_key_package_rejects_expired_lifetime_at_gate`).
+        use scp_clock::TestClock;
+        use scp_mls::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+
+        // Mint the KeyPackage at the REAL present (backend clock is `SystemClock`)
+        // so openmls's un-injectable internal `is_valid` accepts it; the injected
+        // `clock` param is what drives the SCP hardened re-check below.
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let cred = test_credential("carol-stateless");
+        let generated = backend.generate_key_package(&cred, None).await.unwrap();
+
+        // Valid arm: clock at the real present → Ok(ValidatedKeyPackage).
+        let validated = backend
+            .validate_key_package(&generated.key_package_bytes, &SystemClock)
+            .await
+            .unwrap();
+        assert_eq!(validated.key_package_bytes, generated.key_package_bytes);
+
+        // Expired arm: advance the injected clock one full max-range past the
+        // present so the SCP bracket's `now < not_after` check fails.
+        let future_now = SystemClock.now_secs() + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS * 2;
+        let err = backend
+            .validate_key_package(&generated.key_package_bytes, &TestClock::new(future_now))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "expired lifetime under the injected clock must return \
+             KeyPackageLifetimeInvalid, got: {err:?}"
+        );
     }
 
     #[tokio::test]
