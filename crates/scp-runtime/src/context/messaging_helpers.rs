@@ -1562,8 +1562,18 @@ pub async fn deliver_incoming(
     drop(local_dids);
 
     // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
-    let Some(opened_envelope) =
-        decrypt_and_dispatch(deps, context_id, &context_id_bytes, encrypted_blob)?
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's field-granular
+    // Class-C `&mut ContextCryptoState` (`mode_mut().crypto_mut()`). Broadcast
+    // contexts carry no crypto sub-state (`None`), matching the retained provider
+    // fallback; the `&mut` view is released as soon as the sync call returns, so
+    // `view` is free for the dispatch cascade below.
+    let Some(opened_envelope) = decrypt_and_dispatch(
+        deps,
+        view.mode_mut().crypto_mut(),
+        context_id,
+        &context_id_bytes,
+        encrypted_blob,
+    )?
     else {
         // MLS Commit / Proposal — processed internally by the crypto layer,
         // no inner envelope to classify.
@@ -3081,14 +3091,26 @@ pub(in crate::context) fn stream_reservations_snapshot(
 /// messages.
 pub fn decrypt_and_dispatch(
     deps: &ActorDeps,
+    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     encrypted_blob: &[u8],
 ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
     let decrypt_start = std::time::Instant::now();
-    let open_result = deps
-        .crypto
-        .open(context_id_bytes, context_id, encrypted_blob)?;
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): when the caller supplies the
+    // field-granular Class-C `&mut ContextCryptoState` (the flipped receive seam,
+    // driven from `deliver_incoming`'s `ClassCMut` view), open through the actor's
+    // crypto state (byte-identical to the provider `open`, per the 16 golden
+    // tests). Test / not-yet-flipped callers pass `None` and use the RETAINED
+    // provider `open` until the C6 provider-copy deletion. `process_incoming_sender_key`
+    // + `set_sender_key_unchecked` below stay on the provider (receive-side, NOT
+    // in the delete set), and `local_did` is likewise retained.
+    let open_result = match crypto_state {
+        Some(cs) => cs.open(&*deps.clock, context_id_bytes, context_id, encrypted_blob)?,
+        None => deps
+            .crypto
+            .open(context_id_bytes, context_id, encrypted_blob)?,
+    };
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {

@@ -19868,7 +19868,7 @@ mod tests {
         // Deliver the LATER message (b, sequence 1) FIRST. Accepted; the registry
         // recv floor advances to exactly the surfaced receive_floor.
         let opened_b = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, ctx_str, &ctx_bytes, &msg_b,
+            &bob_deps, None, ctx_str, &ctx_bytes, &msg_b,
         )
         .expect("first (in-order) delivery must succeed")
         .expect("an Application envelope must surface");
@@ -19883,7 +19883,7 @@ mod tests {
         // MLS ciphertext (so MLS decrypts it), but an older floor. The authoritative
         // registry recv gate MUST reject it fail-closed, and NO envelope surfaces.
         let reorder = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, ctx_str, &ctx_bytes, &msg_a,
+            &bob_deps, None, ctx_str, &ctx_bytes, &msg_a,
         );
         // Pin the REASON: the rejection must be the registry recv-floor gate
         // (`FloorAdvanceError::RecvSequenceNotMonotonic`, whose Display is
@@ -19907,7 +19907,7 @@ mod tests {
 
         // A replay of the accepted message b is also rejected (no envelope).
         let replay = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, ctx_str, &ctx_bytes, &msg_b,
+            &bob_deps, None, ctx_str, &ctx_bytes, &msg_b,
         );
         assert!(
             replay.is_err(),
@@ -19991,7 +19991,7 @@ mod tests {
             .expect("alice seals at the rotated epoch");
 
         let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, ctx_str, &ctx_bytes, &sealed,
+            &bob_deps, None, ctx_str, &ctx_bytes, &sealed,
         )
         .expect("a recv at the just-advanced epoch must be ACCEPTED (no stale over-reject)")
         .expect("an Application envelope must surface");
