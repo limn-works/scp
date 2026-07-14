@@ -382,15 +382,21 @@ pub fn build_script(vec: &Vector) -> (Vec<ChunkPayload>, TerminalAction) {
 // ---------------------------------------------------------------------------
 // ReceiverSequenceTracker — the §5.4.5 receiver-side gap detector.
 //
-// NOTE: this is a TEST-LOCAL reimplementation of the §5.4.5 receiver rule, not
-// production code. Why a receiver tracker rather than a pump: the same-context
-// mpsc channel the runtime pump writes into is LOSSLESS and the pump renumbers
-// emissions consecutively, so it structurally CANNOT produce a gap. §5.4.5
-// places the obligation on the RECEIVER — "A receiver that observes a gap
-// (missing sequence) MUST cancel the stream with Execution::StreamGap and SHOULD
-// rerun." The live wire trigger (a relay-dropped chunk over transport) lands in
-// slice-3, at which point the production detector replaces this tracker; here we
-// replay the vector's gapped, per-chunk-signed transcript through the exact rule.
+// NOTE: this is a TEST ORACLE for the §5.4.5 receiver rule, not production code.
+// Why a receiver tracker rather than a pump: the same-context mpsc channel the
+// runtime pump writes into is LOSSLESS and the pump renumbers emissions
+// consecutively, so it structurally CANNOT produce a gap. §5.4.5 places the
+// obligation on the RECEIVER — "A receiver that observes a gap (missing sequence)
+// MUST cancel the stream with Execution::StreamGap and SHOULD rerun." Per the
+// §5.4.5 receiver-locus paragraph, the PRODUCTION receiver is the invoker-side
+// SDK InvocationHandle drain, which is the permanent, transport-agnostic home of
+// this invariant (dormant over the lossless same-context channel, load-bearing
+// when the invoker consumes chunks over a lossy transport). The live wire trigger
+// (a relay-dropped chunk over transport) lands in slice-3, where any cross-context
+// reassembly detector is reconciled with the SDK-drain check as defense-in-depth
+// — NOT as a replacement. This oracle synthesizes the exact receiver rule at the
+// Rust tier by replaying the vector's gapped, per-chunk-signed transcript, until a
+// lossy transport can drive the SDK drain live.
 // ---------------------------------------------------------------------------
 
 /// Outcome of observing one chunk against the running sequence expectation.
