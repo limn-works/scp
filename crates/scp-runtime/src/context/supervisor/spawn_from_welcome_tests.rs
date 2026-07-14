@@ -635,16 +635,14 @@ async fn spawn_from_welcome_yields_a_live_send_capable_actor() {
         "the joiner is tracked as a member"
     );
 
-    // The joined MLS group is resident in the joiner's crypto provider.
-    // `export_crypto_state` returns a NON-EMPTY serialized snapshot for an
-    // installed group and an EMPTY vec when the context is absent, so the
-    // non-emptiness is the presence discriminator.
+    // The joined MLS group is resident on the joiner's context ACTOR (ADR-049
+    // PR-7: the welcome path takes the crypto off the provider and seeds the
+    // live actor). `local_mls_epoch` returns `Some(epoch)` for an installed
+    // encrypted group and `None` for an absent context, so its `is_some()` is
+    // the presence discriminator.
     assert!(
-        !j.bob_crypto
-            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
-        "the joined MLS group is installed in the provider"
+        j.sup.local_mls_epoch(&j.ctx_id).await.is_some(),
+        "the joined MLS group is installed on the joiner actor"
     );
 
     // Event-log provider WIRED (AC1) AND joiner-local log EMPTY: the spawned
@@ -824,10 +822,7 @@ async fn persist_failure_leaves_no_half_keyed_actor() {
     // (An absent context exports an EMPTY snapshot; an installed one is
     // non-empty — see the happy-path test.)
     assert!(
-        j.bob_crypto
-            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        j.sup.local_mls_epoch(&j.ctx_id).await.is_none(),
         "the just-installed group must be torn back out on a persist failure"
     );
 
@@ -940,10 +935,7 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
         "the first join's live actor survives the rejected replay"
     );
     assert!(
-        !bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_some(),
         "the first join's installed group is intact"
     );
 }
@@ -1033,10 +1025,7 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
         "no actor may be registered after a pseudonym rejection"
     );
     assert!(
-        bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_none(),
         "no group may be installed after a pseudonym rejection"
     );
 
@@ -1105,10 +1094,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         "the broadcast context registered an actor"
     );
     assert!(
-        bob_crypto
-            .export_crypto_state(&collide_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&collide_id).await.is_none(),
         "the broadcast context's ENCRYPTED crypto slot is vacant (split registry) \
          — the install Vacant guard alone could not catch this collision"
     );
@@ -1281,10 +1267,7 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
     // Rollback fired: the just-installed group was destroyed. The one-shot seam
     // has cleared, so this export reads normally → empty for the now-absent group.
     assert!(
-        bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors once the one-shot seam has cleared")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_none(),
         "the installed group must be rolled back on a non-durable export"
     );
     // No actor registered — the keyless joiner never became reachable, and the
@@ -1466,10 +1449,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
         "no actor may be registered after a durable-collision reject"
     );
     assert!(
-        target_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        target_sup.local_mls_epoch(&ctx_id).await.is_none(),
         "no group may be installed after a durable-collision reject"
     );
 
@@ -1596,10 +1576,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     // unconditional teardown on `Elapsed` is still safe — the idempotent
     // `destroy_mls_group` / `delete_context` no-op.)
     assert!(
-        bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_none(),
         "no MLS group may be installed after a timed-out join"
     );
     assert!(
@@ -1843,10 +1820,7 @@ async fn assert_binding_refused_no_side_effects(
     // No crypto installed under the slot Bob tried to install into (an absent
     // context exports an EMPTY blob; an installed one is non-empty).
     assert!(
-        j.bob_crypto
-            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        j.sup.local_mls_epoch(&j.ctx_id).await.is_none(),
         "no MLS group may be installed after a binding refusal"
     );
     // No actor registered / reachable.
@@ -1985,10 +1959,7 @@ async fn join_group_without_scp_context_extension_is_refused() {
         "expected the rule-1 refusal (no 0xFF02 extension), got: {err:?}"
     );
     assert!(
-        j.bob_crypto
-            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        j.sup.local_mls_epoch(&j.ctx_id).await.is_none(),
         "no MLS group may be installed after a rule-1 refusal"
     );
     assert!(
@@ -2064,10 +2035,7 @@ async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
     );
     // Reject fired before any state build — nothing installed, no actor.
     assert!(
-        bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_none(),
         "no group may be installed after a signature refusal"
     );
     assert!(
@@ -2139,10 +2107,7 @@ async fn tampered_ciphertext_fails_aead_open() {
         "expected the AEAD open-failure refusal, got: {err:?}"
     );
     assert!(
-        bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_none(),
         "no group may be installed after an open failure"
     );
     assert!(
@@ -2196,10 +2161,7 @@ async fn tampered_bundle_signature_is_rejected() {
         "expected the creator-signature refusal, got: {err:?}"
     );
     assert!(
-        bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_none(),
         "no group may be installed after a signature refusal"
     );
     assert!(
@@ -2277,10 +2239,7 @@ async fn structurally_inconsistent_bundle_is_rejected() {
         "expected the structural-consistency refusal, got: {err:?}"
     );
     assert!(
-        bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_none(),
         "no group may be installed after a structural refusal"
     );
     assert!(
@@ -2384,10 +2343,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         "the invited joiner stands up a live, send-capable actor"
     );
     assert!(
-        !bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        bob_sup.local_mls_epoch(&ctx_id).await.is_some(),
         "bob's joined MLS group is installed"
     );
 
@@ -2904,10 +2860,7 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
         "an unregistered context yields None member_count — no admin was installed"
     );
     assert!(
-        bob_crypto
-            .export_crypto_state(&ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        sup.local_mls_epoch(&ctx_id).await.is_none(),
         "no MLS group may be installed after a creator-binding rejection"
     );
 }
@@ -2946,10 +2899,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
         "a live context actor is registered for the joiner"
     );
     assert!(
-        !j.bob_crypto
-            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        j.sup.local_mls_epoch(&j.ctx_id).await.is_some(),
         "the joined MLS group is resident in the crypto provider"
     );
     assert!(
@@ -2992,12 +2942,10 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     );
 
     // 2. Crypto group destroyed — a bare `despawn_actor` would leave it
-    //    resident (`export_crypto_state` returns EMPTY for an absent context).
+    //    resident (`local_mls_epoch` answers `None` once the actor's MLS group
+    //    is gone / the actor is despawned).
     assert!(
-        j.bob_crypto
-            .export_crypto_state(&j.ctx_bytes, Vec::new(), Vec::new(),)
-            .expect("export never errors")
-            .is_empty(),
+        j.sup.local_mls_epoch(&j.ctx_id).await.is_none(),
         "the resident MLS group is destroyed"
     );
 
