@@ -2223,49 +2223,36 @@ mod tests {
         let _sec_witness: zeroize::Zeroizing<[u8; 32]> = sec1;
     }
 
-    /// ADR-049 PR-7 prep E (SCP-CRYPTOMOVE-000e): the one-shot
-    /// `arm_rotation_failure_once` seam must make the NEXT
-    /// [`MlsCryptoProvider::rotate_sender_key`] return
-    /// [`ContextError::CryptoFailed`] WITHOUT committing the epoch/key (§9
-    /// Class-S sync-persist fail-closed; §15(c) "injected failure ⇒ rotation
-    /// returns `Err`, epoch NOT advanced" — the actual Class-S persist happens
-    /// in the actor after this call returns, and this seam makes the call fail
-    /// so that caller observes its fail-closed signal), then self-clear so the
-    /// subsequent rotation succeeds normally (epoch +1).
-    /// A single-member group suffices: the HPKE-seal loop skips the local
-    /// member, so an UNARMED rotation is deterministically `Ok`.
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): a normal sender-key rotation on the
+    /// actor's `PerContextState` advances the local sender-key epoch by exactly
+    /// one (§9.16.4/§9.16.5, relocated verbatim from the deleted provider
+    /// `rotate_sender_key`).
+    ///
+    /// COVERAGE FLAG (orchestrator / atomic-core): the §15(c) fault-INJECTION
+    /// half of the former `arm_rotation_failure_once_forces_fail_closed_then_normal`
+    /// is NOT relocated here. `arm_rotation_failure_once` / `force_rotation_failure`
+    /// are provider-resident, and the deleted provider `rotate_sender_key` was
+    /// their ONLY consumer — the actor `rotate_sender_key` (state.rs) does not read
+    /// the flag. Restoring the Class-S fail-closed injection coverage requires
+    /// re-homing that one-shot fault seam onto the actor rotate (a `state.rs`
+    /// change, per the Prep-E carry-forward) and asserting it as an atomic-core
+    /// test (map C8 "Class-S rotation fail-closed via Prep-E arm_rotation_failure_once").
     #[test]
-    fn arm_rotation_failure_once_forces_fail_closed_then_normal() {
+    fn rotate_sender_key_advances_epoch_on_actor() {
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
 
-        let epoch_before = provider.local_sender_key_epoch(&ctx_id);
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        let epoch_before = actor.local_sender_key_epoch();
 
-        // Arm the one-shot seam: the next rotation must fail closed.
-        provider.arm_rotation_failure_once();
-        assert!(
-            matches!(
-                provider.rotate_sender_key(&ctx_id),
-                Err(ContextError::CryptoFailed(_))
-            ),
-            "armed rotation must return CryptoFailed"
-        );
-        // Fail-closed: the injected failure fired BEFORE any mutation, so the
-        // epoch is unchanged — the rotation was NOT committed.
+        // A normal rotation persists a fresh key and advances the epoch by one.
+        actor.rotate_sender_key(TEST_DID).unwrap();
         assert_eq!(
-            provider.local_sender_key_epoch(&ctx_id),
-            epoch_before,
-            "failed rotation must NOT advance the epoch"
-        );
-
-        // One-shot cleared: the next rotation persists normally and advances
-        // the epoch by exactly one.
-        provider.rotate_sender_key(&ctx_id).unwrap();
-        assert_eq!(
-            provider.local_sender_key_epoch(&ctx_id),
+            actor.local_sender_key_epoch(),
             epoch_before + 1,
-            "post-clear rotation must advance the epoch by one"
+            "rotation must advance the epoch by exactly one"
         );
     }
 
@@ -2432,8 +2419,10 @@ mod tests {
             .add_member(&ctx_id, bob_did, Some(&kp_bytes))
             .unwrap();
 
-        // Remove Bob.
-        let result = provider.remove_member(&ctx_id, bob_did);
+        // Remove Bob through the relocated actor seam (member removal moved onto
+        // `PerContextState::remove_member`).
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        let result = actor.remove_member(TEST_DID, bob_did);
         assert!(result.is_ok(), "remove_member failed: {result:?}");
         let output = result.unwrap();
         assert!(
@@ -2449,10 +2438,10 @@ mod tests {
         provider.create_mls_group(&ctx_id).unwrap();
 
         // Self-removal (leave) returns empty commit bytes — the local node
-        // does not produce a Commit for its own departure.
-        let output = provider
-            .remove_member(&ctx_id, &provider.local_did)
-            .unwrap();
+        // does not produce a Commit for its own departure. Relocated onto the
+        // actor `remove_member` seam.
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        let output = actor.remove_member(TEST_DID, TEST_DID).unwrap();
         assert!(
             output.commit_bytes.is_empty(),
             "self-removal must return empty commit_bytes"
@@ -2465,7 +2454,11 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        let output = provider.advance_epoch(&ctx_id);
+        // Epoch advance moved onto `PerContextState::advance_epoch`, which sources
+        // the node-resident wrapping public key as a parameter.
+        let (wpub, _wsec) = provider.wrapping_keypair();
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        let output = actor.advance_epoch(wpub);
         assert!(output.is_ok(), "advance_epoch failed: {output:?}");
         let output = output.unwrap();
         assert!(
