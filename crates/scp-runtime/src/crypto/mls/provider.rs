@@ -3492,9 +3492,8 @@ mod tests {
             ),
         ];
 
-        let exported = provider
-            .export_crypto_state(&ctx_id, sender_key_epochs, recv_sequence_floors)
-            .unwrap();
+        let exported =
+            actor_export(&provider, &ctx_id, sender_key_epochs, recv_sequence_floors).unwrap();
         assert!(!exported.is_empty(), "keyed context must export non-empty");
 
         let snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
@@ -3550,15 +3549,16 @@ mod tests {
             );
         }
 
-        // Export with the authoritative floor (epoch 5) as the param.
-        let exported = provider
-            .export_crypto_state(&ctx_id, vec![(bob_did.to_owned(), 5)], Vec::new())
-            .unwrap();
+        // Export with the authoritative floor (epoch 5) as the param, through the
+        // relocated actor export seam.
+        let exported =
+            actor_export(&provider, &ctx_id, vec![(bob_did.to_owned(), 5)], Vec::new()).unwrap();
         assert!(!exported.is_empty());
 
-        // Restart: fresh provider, restore. The floor comes back in RestoredFloors.
+        // Restart: fresh provider, rebuild the owned material via the retained
+        // restore reader. The floor comes back in RestoredFloors.
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let restored = provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        let (owned, restored) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
         assert!(
             restored
                 .sender_epochs
@@ -3573,17 +3573,10 @@ mod tests {
         // itself is re-enforced by the registry once the caller merges
         // RestoredFloors (tested in the registry unit + cold-restart integration
         // tests).
-        {
-            let entry = provider2.contexts.get(&ctx_id).unwrap();
-            assert!(
-                entry
-                    .value()
-                    .sender_key_store
-                    .get(&ctx_id_hex, bob_did)
-                    .is_some(),
-                "restored provider must reinstall Bob's key material"
-            );
-        }
+        assert!(
+            owned.sender_key_store.get(&ctx_id_hex, bob_did).is_some(),
+            "restored material must reinstall Bob's key material"
+        );
     }
 
     #[test]
@@ -3602,11 +3595,10 @@ mod tests {
 
         // Carol has NO key material (removed), but her floor (9) is retained in
         // the registry and exported as a param.
-        let exported = provider
-            .export_crypto_state(&ctx_id, vec![(carol_did.to_owned(), 9)], Vec::new())
-            .unwrap();
+        let exported =
+            actor_export(&provider, &ctx_id, vec![(carol_did.to_owned(), 9)], Vec::new()).unwrap();
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let restored = provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        let (owned, restored) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
         // The removed-member floor survives in RestoredFloors …
         assert!(
@@ -3618,17 +3610,10 @@ mod tests {
             restored.sender_epochs
         );
         // … and no key material reappears for the removed member.
-        {
-            let entry = provider2.contexts.get(&ctx_id).unwrap();
-            assert!(
-                entry
-                    .value()
-                    .sender_key_store
-                    .get(&ctx_id_hex, carol_did)
-                    .is_none(),
-                "removed key must not reappear after restore"
-            );
-        }
+        assert!(
+            owned.sender_key_store.get(&ctx_id_hex, carol_did).is_none(),
+            "removed key must not reappear after restore"
+        );
     }
 
     #[test]
@@ -3667,17 +3652,16 @@ mod tests {
                 .set_unchecked(&ctx_id_hex, bob_did, generate_sender_key());
         }
 
-        // Export, then hand-edit the msgpack to drop the epoch map.
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
-            .unwrap();
+        // Export through the actor seam, then hand-edit the msgpack to drop the
+        // epoch map.
+        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let restored = provider2
-            .restore_crypto_state(&ctx_id, &legacy_bytes)
+        let (owned, restored) = provider2
+            .build_restored_owned(&ctx_id, &legacy_bytes)
             .expect("legacy snapshot (empty epoch map) must restore cleanly");
 
         // The legacy snapshot had no per-sender epoch map, so restore seeds every
@@ -3695,14 +3679,7 @@ mod tests {
         );
         // Sanity: `ctx_id_hex` is still the store key for the reinstalled material.
         assert!(
-            provider2
-                .contexts
-                .get(&ctx_id)
-                .unwrap()
-                .value()
-                .sender_key_store
-                .get(&ctx_id_hex, bob_did)
-                .is_some(),
+            owned.sender_key_store.get(&ctx_id_hex, bob_did).is_some(),
             "legacy restore must reinstall Bob's key material"
         );
     }
@@ -3747,18 +3724,16 @@ mod tests {
             );
         }
 
-        // Export, then strip the per-sender epoch map to simulate a
-        // legacy snapshot.
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
-            .unwrap();
+        // Export through the actor seam, then strip the per-sender epoch map to
+        // simulate a legacy snapshot.
+        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let restored = provider2
-            .restore_crypto_state(&ctx_id, &legacy_bytes)
+        let (_owned, restored) = provider2
+            .build_restored_owned(&ctx_id, &legacy_bytes)
             .expect("legacy restore must succeed");
 
         // OBSERVED BEHAVIOR (ADR-049 PR-6): the peer's restored floor in
@@ -3806,16 +3781,14 @@ mod tests {
                 .set_unchecked(&ctx_id_hex, bob_did, generate_sender_key());
         }
 
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
-            .unwrap();
+        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let restored = provider2
-            .restore_crypto_state(&ctx_id, &legacy_bytes)
+        let (owned, restored) = provider2
+            .build_restored_owned(&ctx_id, &legacy_bytes)
             .unwrap();
 
         // ADR-049 PR-6: the legacy seed (max(global, 1)) is returned in
@@ -3830,28 +3803,35 @@ mod tests {
         );
         // `ctx_id_hex` keys the reinstalled material.
         assert!(
-            provider2
-                .contexts
-                .get(&ctx_id)
-                .unwrap()
-                .value()
-                .sender_key_store
-                .get(&ctx_id_hex, bob_did)
-                .is_some()
+            owned.sender_key_store.get(&ctx_id_hex, bob_did).is_some()
         );
     }
 
     #[test]
     fn export_fails_on_destroyed_group() {
+        // Relocated onto the actor seam (ADR-049 PR-7): seed a live actor, confirm
+        // it exports non-empty, then `destroy_mls_group` on the actor and confirm
+        // the export goes empty — destroying the group clears exportability.
         let provider = make_provider();
         let ctx_id = make_context_id();
-
         provider.create_mls_group(&ctx_id).unwrap();
-        provider.destroy_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
 
-        // After destroy, export should return empty (context removed).
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
+        let (wpub, wsec) = provider.wrapping_keypair();
+        let mut actor = take_into_actor(&provider, &ctx_id);
+        assert!(
+            !actor
+                .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
+                .unwrap()
+                .is_empty(),
+            "live group must export non-empty state"
+        );
+
+        actor.destroy_mls_group().unwrap();
+
+        // After destroy, export should return empty (no MLS group).
+        let exported = actor
+            .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
             .unwrap();
         assert!(
             exported.is_empty(),
@@ -3864,7 +3844,9 @@ mod tests {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
-        let result = provider.restore_crypto_state(&ctx_id, b"not valid msgpack");
+        // The relocated restore reader is `build_restored_owned`; corrupt bytes
+        // must fail to deserialize.
+        let result = provider.build_restored_owned(&ctx_id, b"not valid msgpack");
         assert!(result.is_err(), "corrupt data should fail");
     }
 
@@ -3873,22 +3855,23 @@ mod tests {
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
 
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
-            .unwrap();
+        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
 
-        // Restore into a fresh provider twice — second should overwrite cleanly.
+        // Rebuild the owned material on a fresh provider twice — the second call
+        // must also yield working material (owned-return path, no insert to
+        // clobber). Seed an actor from the second result and confirm it is a
+        // coherent live encrypted state.
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        let (_owned1, _f1) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
+        let (owned2, _f2) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
-        // Should still be functional.
-        let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test", 0, 0);
-        assert!(
-            encrypted.is_ok(),
-            "second restore should produce working state"
-        );
+        let mut actor =
+            PerContextState::new_for_test_encrypted(ctx_id, 0, DID::from(TEST_DID.to_owned()));
+        actor.seed_encrypted_crypto_from_owned(owned2);
+        // A coherent restored state exposes a readable local sender-key epoch.
+        let _ = actor.local_sender_key_epoch();
     }
 
     #[test]
@@ -3904,19 +3887,13 @@ mod tests {
             state.mls_group.epoch().unwrap()
         };
 
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
-            .unwrap();
+        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        let (owned, _floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
-        // Verify epoch is preserved.
-        let epoch_after = {
-            let entry = provider2.contexts.get(&ctx_id).unwrap();
-            let state = entry.value();
-            state.mls_group.epoch().unwrap()
-        };
+        // Verify epoch is preserved on the restored owned material.
+        let epoch_after = owned.mls_group.epoch().unwrap();
 
         assert_eq!(
             epoch_before, epoch_after,
@@ -3944,10 +3921,8 @@ mod tests {
             "wrapping secret key must not be zero"
         );
 
-        // Export the crypto state.
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
-            .unwrap();
+        // Export the crypto state through the relocated actor seam.
+        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
         assert!(!exported.is_empty());
 
         // Create a fresh provider (simulates restart — gets a NEW random keypair).
@@ -3958,8 +3933,11 @@ mod tests {
             "fresh provider should have a DIFFERENT wrapping public key"
         );
 
-        // Restore the exported state into the fresh provider.
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        // Rebuild the owned material on the fresh provider. `build_restored_owned`
+        // restores the node-resident wrapping keypair into the provider's
+        // ArcSwap slots as a documented side effect (ADR-049 PR-7 OBS-2), which
+        // is exactly the persistence property this test pins.
+        let _ = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
         // After restore, the wrapping keypair must match the ORIGINAL, not the fresh one.
         let restored_public = provider2.wrapping_keypair.load().public;
