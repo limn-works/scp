@@ -307,9 +307,11 @@ impl CrossContextOutletInvocationPrepared {
 /// tests below.
 pub struct CrossContextStreamingOutletInvocationPrepared {
     /// The `SagaId` this durable capture is keyed by (spec §6.2.5 "captured
-    /// durably and incrementally … keyed by `SagaId`"). The `saga_pending`
-    /// map is already `SagaId`-keyed; carrying it on the struct makes the
-    /// key explicit on the replay snapshot.
+    /// durably and incrementally … keyed by `SagaId`"). The SCP-OUT-046 seal
+    /// FSM (PR-B) runs an off-mailbox seal task that holds this capture
+    /// *detached* from the `saga_pending` map, so the id must live on the
+    /// struct itself: the task keys its durable frontier write-backs — and the
+    /// seal at stream-close — by this `SagaId` without a live map handle.
     pub saga_id: SagaId,
     /// Calling context ID — raw 32-byte digest (§6.2.4 id-form rule).
     pub caller_context_id: [u8; 32],
@@ -423,7 +425,9 @@ pub struct CrossContextOutletInvocationSnapshot {
 /// property). Not bearer-bearing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossContextStreamingOutletInvocationSnapshot {
-    /// The `SagaId` the durable capture is keyed by.
+    /// The `SagaId` the durable capture is keyed by — mirror of the live
+    /// field the PR-B off-mailbox seal task uses to key its frontier
+    /// write-backs and the seal itself while detached from `saga_pending`.
     pub saga_id: String,
     /// The raw 32-byte caller context id.
     pub caller_context_id: [u8; 32],

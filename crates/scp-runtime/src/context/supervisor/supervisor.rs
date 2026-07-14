@@ -21127,32 +21127,26 @@ mod tests {
             "Class S: the staged saga must round-trip the snapshot"
         );
         // `SagaPreparedStateSnapshot`/`SagaPreparedState` mismatches are asserted
-        // via `matches!` + `if let` (no `panic!`/`unreachable!` — handler
-        // panic-ban gate). The `matches!` guard guarantees the `if let` body runs.
+        // via `let ... else { panic!(…) }` (this test module carries
+        // `#[allow(clippy::panic)]`), making the field checks unconditional.
         let xctx_snap = restored
             .saga_pending
             .get(&xctx_saga_id)
             .expect("Class S: cross-context saga must round-trip");
         // The enum now has a streaming sibling, so the bind is refutable; the
-        // `matches!` guard asserts the unary variant survived, then the `if let`
-        // body checks field-level fidelity.
-        assert!(
-            matches!(
-                xctx_snap,
-                SagaPreparedStateSnapshot::CrossContextOutletInvocation(_)
-            ),
-            "Class S: cross-context saga must round-trip as the unary variant"
-        );
-        if let SagaPreparedStateSnapshot::CrossContextOutletInvocation(snap) = xctx_snap {
-            assert_eq!(snap.caller_context_id, [0x5Au8; 32]);
-            assert_eq!(snap.target_context_id, [0x6Bu8; 32]);
-            assert_eq!(snap.caller_did, "did:example:class-s-caller");
-            assert_eq!(snap.outlet_registration_id, "class-s-outlet-v1");
-            assert_eq!(snap.ucan_proof_id, "class-s-ucan-token");
-            assert_eq!(snap.recorded_timestamp_ms, 1_700_000_000_456);
-            assert_eq!(snap.recorded_nonce, [0xC7u8; 16]);
-            assert_eq!(snap.recorded_chain_depth, 4);
-        }
+        // `let ... else` asserts the unary variant survived, then the body
+        // checks field-level fidelity.
+        let SagaPreparedStateSnapshot::CrossContextOutletInvocation(snap) = xctx_snap else {
+            panic!("Class S: cross-context saga must round-trip as the unary variant");
+        };
+        assert_eq!(snap.caller_context_id, [0x5Au8; 32]);
+        assert_eq!(snap.target_context_id, [0x6Bu8; 32]);
+        assert_eq!(snap.caller_did, "did:example:class-s-caller");
+        assert_eq!(snap.outlet_registration_id, "class-s-outlet-v1");
+        assert_eq!(snap.ucan_proof_id, "class-s-ucan-token");
+        assert_eq!(snap.recorded_timestamp_ms, 1_700_000_000_456);
+        assert_eq!(snap.recorded_nonce, [0xC7u8; 16]);
+        assert_eq!(snap.recorded_chain_depth, 4);
 
         // The mirror must rehydrate to the identical live `SagaPreparedState`
         // (the same-node restore contract). Exercise `into_prepared` directly.
@@ -21162,17 +21156,11 @@ mod tests {
             .expect("present")
             .clone()
             .into_prepared();
-        assert!(
-            matches!(
-                rehydrated,
-                SagaPreparedState::CrossContextOutletInvocation(_)
-            ),
-            "rehydration must preserve the unary cross-context outlet variant"
-        );
-        if let SagaPreparedState::CrossContextOutletInvocation(p) = rehydrated {
-            assert_eq!(p.recorded_chain_depth, 4);
-            assert_eq!(p.caller_did, DID("did:example:class-s-caller".to_owned()));
-        }
+        let SagaPreparedState::CrossContextOutletInvocation(p) = rehydrated else {
+            panic!("rehydration must preserve the unary cross-context outlet variant");
+        };
+        assert_eq!(p.recorded_chain_depth, 4);
+        assert_eq!(p.caller_did, DID("did:example:class-s-caller".to_owned()));
 
         // Committed cross-context outlet invocation (spec §6.2.4 "Exactly-once
         // execution with durable output capture"): the TARGET-side durable
