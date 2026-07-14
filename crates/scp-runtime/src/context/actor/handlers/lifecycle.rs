@@ -207,7 +207,7 @@ async fn dispatch_actor_inner(
             handle_flush_snapshot_actor(&*cell, deps, reply).await
         }
         LifecycleCommand::ShutdownSelf { reply } => {
-            handle_shutdown_self_actor(&*cell, deps, reply).await
+            handle_shutdown_self_actor(cell, deps, reply).await
         }
         LifecycleCommand::ReportBufferLen { reply } => {
             handle_report_buffer_len_actor(&*cell, reply)
@@ -586,15 +586,18 @@ fn handle_flush_snapshot_actor<'d>(
 // precise-capture `+ use<>` bound excludes the input lifetimes, so the `&state`
 // borrow ends before the returned `async move`.
 fn handle_shutdown_self_actor(
-    state: &PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> impl std::future::Future<Output = Outcome<()>> + Send + use<> {
     use crate::context::state::context_id_to_bytes;
 
-    let context_id = state.handle.context_id().to_owned();
+    let context_id = cell.handle.context_id().to_owned();
     let ctx_id_bytes = context_id_to_bytes(&context_id);
 
+    // Provider-side teardown (retained): a no-op for an actor-owned (taken)
+    // context, but still covers a context whose crypto never migrated off the
+    // provider (e.g. a birth-window failure before `take_crypto_state`).
     if let Err(e) = deps.crypto.destroy_sender_key(&ctx_id_bytes) {
         tracing::debug!(
             context_id = %context_id,
@@ -608,6 +611,24 @@ fn handle_shutdown_self_actor(
             error = %e,
             "failed to destroy MLS group during shutdown — may already be gone"
         );
+    }
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) H4 — whole-crypto disposal at the actor
+    // destroy seam. Now that the actor is the SOLE owner of the per-context crypto
+    // (the provider `destroy_*` above is a no-op for a taken context), tear the
+    // ACTOR-OWNED material down explicitly through the field-granular Class-C view
+    // (teardown is best-effort, not a fail-closed persist obligation). This
+    // matches the disposal hygiene the deleted provider gave by dropping its whole
+    // `contexts` entry, and — critically — deletes the OpenMLS epoch secrets that a
+    // bare `PerContextState` drop would leave resident in OpenMLS storage. A
+    // broadcast context carries no `ContextCryptoState` (`crypto_mut() == None`) so
+    // this is a clean no-op there. NOT marked `mutated`: shutdown must not persist
+    // an emptied crypto over the durable snapshot (a later respawn rehydrates it).
+    {
+        let mut view = cell.class_c_view();
+        if let Some(crypto) = view.mode_mut().crypto_mut() {
+            crypto.dispose_secrets();
+        }
     }
     // No per-actor background timer tasks to cancel: the TTL + governance
     // timers are ACTOR-OWNED arms reconciled inside `ContextActor::run()`

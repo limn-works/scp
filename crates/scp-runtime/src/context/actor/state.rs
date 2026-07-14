@@ -1876,6 +1876,43 @@ impl ContextCryptoState {
         rmp_serde::to_vec_named(&outer)
             .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))
     }
+
+    /// Disposes ALL per-context crypto material, matching the disposal hygiene
+    /// the deleted `MlsCryptoProvider` gave by dropping its whole `contexts` map
+    /// entry (ADR-049 PR-7 / SCP-CRYPTOMOVE-001 H4).
+    ///
+    /// Now that the actor is the SOLE owner of the per-context crypto (the
+    /// provider `destroy_*` twins are no-ops for a taken context), the actor MUST
+    /// explicitly tear the material down at its destroy seam. A bare drop of
+    /// `ContextCryptoState` is NOT sufficient for the MLS group: OpenMLS keeps
+    /// epoch-secret material in its storage provider that is only deleted by
+    /// [`scp_mls::group::destroy_group`] — dropping the in-memory handle leaves it
+    /// resident. This method:
+    ///
+    /// - runs `destroy_group` on the MLS group (deletes the OpenMLS epoch secrets),
+    ///   then nulls the handle;
+    /// - drops the local `sender_key` and the whole `sender_key_store`, whose
+    ///   `SenderKey`s zeroize on drop (`ZeroizeOnDrop`);
+    /// - clears the residual non-secret / bookkeeping fields (member wrapping
+    ///   public keys, queued distributions, nonce-dedup cache, recv tracker,
+    ///   epoch counter) so no stale material lingers on a still-live actor.
+    ///
+    /// Idempotent: safe to call on an already-disposed or never-populated state.
+    pub(crate) fn dispose_secrets(&mut self) {
+        if let Some(group) = self.mls_group.as_mut() {
+            let _ = scp_mls::group::destroy_group(group);
+        }
+        self.mls_group = None;
+        // Dropping the `SenderKey` / `SenderKeyStore` zeroizes the AES-256 key
+        // material via their `ZeroizeOnDrop` derive.
+        self.sender_key = None;
+        self.sender_key_store = SenderKeyStore::new();
+        self.member_wrapping_keys.clear();
+        self.pending_distributions.clear();
+        self.nonce_dedup = NonceDedup::new();
+        self.recv_sequence_tracker.clear();
+        self.sender_key_epoch = 0;
+    }
 }
 
 // MLS / HPKE / sender-layer primitives stay exactly the free-function /
