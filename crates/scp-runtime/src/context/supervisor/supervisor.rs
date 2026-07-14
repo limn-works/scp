@@ -21127,16 +21127,18 @@ mod tests {
             "Class S: the staged saga must round-trip the snapshot"
         );
         // `SagaPreparedStateSnapshot`/`SagaPreparedState` mismatches are asserted
-        // via `matches!` + `if let` (no `panic!`/`unreachable!` — handler
-        // panic-ban gate). The `matches!` guard guarantees the `if let` body runs.
+        // via `let ... else { panic!(…) }` (this test module carries
+        // `#[allow(clippy::panic)]`), making the field checks unconditional.
         let xctx_snap = restored
             .saga_pending
             .get(&xctx_saga_id)
             .expect("Class S: cross-context saga must round-trip");
-        // `SagaPreparedStateSnapshot` is a single-variant enum, so the bind is
-        // irrefutable — the round-trip preserving the cross-context variant is
-        // guaranteed by construction; here we assert the field-level fidelity.
-        let SagaPreparedStateSnapshot::CrossContextOutletInvocation(snap) = xctx_snap;
+        // The enum now has a streaming sibling, so the bind is refutable; the
+        // `let ... else` asserts the unary variant survived, then the body
+        // checks field-level fidelity.
+        let SagaPreparedStateSnapshot::CrossContextOutletInvocation(snap) = xctx_snap else {
+            panic!("Class S: cross-context saga must round-trip as the unary variant");
+        };
         assert_eq!(snap.caller_context_id, [0x5Au8; 32]);
         assert_eq!(snap.target_context_id, [0x6Bu8; 32]);
         assert_eq!(snap.caller_did, "did:example:class-s-caller");
@@ -21154,8 +21156,9 @@ mod tests {
             .expect("present")
             .clone()
             .into_prepared();
-        // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextOutletInvocation(p) = rehydrated;
+        let SagaPreparedState::CrossContextOutletInvocation(p) = rehydrated else {
+            panic!("rehydration must preserve the unary cross-context outlet variant");
+        };
         assert_eq!(p.recorded_chain_depth, 4);
         assert_eq!(p.caller_did, DID("did:example:class-s-caller".to_owned()));
 

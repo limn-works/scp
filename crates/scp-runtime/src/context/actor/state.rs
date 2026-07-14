@@ -3002,8 +3002,13 @@ mod tests {
         use crate::context::supervisor::saga_journal::SagaId;
         use crate::context::supervisor::saga_prepared_state::{
             CallerReservationRecord, CommittedOutletInvocation,
-            CrossContextOutletInvocationPrepared, SagaPreparedState,
+            CrossContextOutletInvocationPrepared, CrossContextStreamingOutletInvocationPrepared,
+            SagaPreparedState,
         };
+        use scp_protocol::context::outlets::stream::{
+            ChunkPayload, MerkleFrontier, OutletStreamChunk,
+        };
+        use scp_protocol::economy::types::Amount;
 
         let mut state =
             PerContextState::new_for_test_encrypted([0xC5u8; 32], 1_700_000_000, test_admin());
@@ -3027,6 +3032,49 @@ mod tests {
             .class_s
             .xctx_nonce_dedup
             .record([0x3Cu8; 16], 1_700_000_000);
+
+        // A staged STREAMING saga variant (ADR-061 seal phase; §6.2.5) — its
+        // live Merkle frontier + credit ledger must survive the Class-S
+        // mirror round-trip, and the rehydrated `frontier.root()` must
+        // reproduce (the AC7 durable-prefix reproducibility property).
+        let saga_stream = SagaId("saga-lossless-stream".to_owned());
+        let mut stream_frontier = MerkleFrontier::with_ceiling(1);
+        for seq in 0u64..3 {
+            stream_frontier
+                .push(&OutletStreamChunk {
+                    request_id: [0x6Au8; 16],
+                    sequence: seq,
+                    payload: ChunkPayload::Data {
+                        value: serde_json::json!({ "seq": seq }),
+                    },
+                    sig: [(seq & 0xFF) as u8 ^ 0x33; 64],
+                })
+                .expect("valid chunk hashes");
+        }
+        let stream_root = stream_frontier.root();
+        let stream_billed = stream_frontier.billed_count(); // ceiling 1 → seq {0,1}
+        let stream_leaves = stream_frontier.leaf_count();
+        state.class_s.saga_pending.insert(
+            saga_stream.clone(),
+            SagaPreparedState::CrossContextStreamingOutletInvocation(
+                CrossContextStreamingOutletInvocationPrepared {
+                    saga_id: saga_stream.clone(),
+                    caller_context_id: [0x7Au8; 32],
+                    target_context_id: [0x8Bu8; 32],
+                    caller_did: DID("did:example:lossless-stream-caller".to_owned()),
+                    outlet_registration_id: "lossless-stream-outlet-v1".to_owned(),
+                    ucan_proof_id: "lossless-stream-ucan".to_owned(),
+                    recorded_timestamp_ms: 1_700_000_000_789,
+                    recorded_nonce: [0x9Du8; 16],
+                    recorded_chain_depth: 4,
+                    frontier: stream_frontier,
+                    reserved: Amount::new(5_000),
+                    billed: Amount::new(2_000),
+                    billed_count: 2,
+                    cancel_ack_ceiling: 1,
+                },
+            ),
+        );
 
         let receipt =
             scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt::sign(
@@ -3123,14 +3171,17 @@ mod tests {
         state.governance.class_s.restore(gov_snap, &clock);
 
         // --- Assert observable state is value-stable ---
-        // saga_pending: the staged variant + its eight journaled fields survive.
-        assert_eq!(state.class_s.saga_pending.len(), 1);
-        // Single-variant enum: the bind is irrefutable.
+        // saga_pending: the staged variants + their journaled fields survive
+        // (the unary variant plus the streaming variant).
+        assert_eq!(state.class_s.saga_pending.len(), 2);
         let SagaPreparedState::CrossContextOutletInvocation(inner) = state
             .class_s
             .saga_pending
             .get(&saga_a)
-            .expect("saga restored");
+            .expect("saga restored")
+        else {
+            panic!("expected the unary cross-context outlet-invocation variant");
+        };
         assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
         assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
         assert_eq!(inner.caller_did.0, "did:example:lossless-caller");
@@ -3139,6 +3190,39 @@ mod tests {
         assert_eq!(inner.recorded_timestamp_ms, 1_700_000_000_123);
         assert_eq!(inner.recorded_nonce, [0x3Cu8; 16]);
         assert_eq!(inner.recorded_chain_depth, 2);
+        // The streaming variant survives too — including its live Merkle
+        // frontier and credit ledger. The rehydrated `frontier.root()` must
+        // reproduce the pre-snapshot root (AC7 durable-prefix witness).
+        let SagaPreparedState::CrossContextStreamingOutletInvocation(stream_inner) = state
+            .class_s
+            .saga_pending
+            .get(&saga_stream)
+            .expect("streaming saga restored")
+        else {
+            panic!("expected the streaming cross-context outlet-invocation variant");
+        };
+        assert_eq!(stream_inner.saga_id, saga_stream);
+        assert_eq!(stream_inner.caller_context_id, [0x7Au8; 32]);
+        assert_eq!(stream_inner.target_context_id, [0x8Bu8; 32]);
+        assert_eq!(
+            stream_inner.caller_did.0,
+            "did:example:lossless-stream-caller"
+        );
+        assert_eq!(
+            stream_inner.outlet_registration_id,
+            "lossless-stream-outlet-v1"
+        );
+        assert_eq!(stream_inner.ucan_proof_id, "lossless-stream-ucan");
+        assert_eq!(stream_inner.recorded_timestamp_ms, 1_700_000_000_789);
+        assert_eq!(stream_inner.recorded_nonce, [0x9Du8; 16]);
+        assert_eq!(stream_inner.recorded_chain_depth, 4);
+        assert_eq!(stream_inner.reserved, Amount::new(5_000));
+        assert_eq!(stream_inner.billed, Amount::new(2_000));
+        assert_eq!(stream_inner.billed_count, 2);
+        assert_eq!(stream_inner.cancel_ack_ceiling, 1);
+        assert_eq!(stream_inner.frontier.root(), stream_root);
+        assert_eq!(stream_inner.frontier.billed_count(), stream_billed);
+        assert_eq!(stream_inner.frontier.leaf_count(), stream_leaves);
         // xctx_nonce_dedup: the recorded nonce + TTL survive (a fresh replay of
         // the same nonce within the TTL is still detected).
         assert!(

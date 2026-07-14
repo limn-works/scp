@@ -3682,8 +3682,9 @@ mod tests {
             .saga_pending
             .get(&SagaId("saga-xctx-1".to_owned()))
             .unwrap();
-        // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextOutletInvocation(p) = staged;
+        let SagaPreparedState::CrossContextOutletInvocation(p) = staged else {
+            panic!("expected the unary cross-context outlet-invocation variant");
+        };
         assert_eq!(p.target_context_id, [0x33; 32]);
         assert_eq!(p.caller_did, DID(CALLER.to_owned()));
         assert_eq!(p.outlet_registration_id, OUTLET);
@@ -5342,7 +5343,9 @@ mod tests {
             .saga_pending
             .get(&saga)
             .expect("slot restored");
-        let SagaPreparedState::CrossContextOutletInvocation(p) = restored;
+        let SagaPreparedState::CrossContextOutletInvocation(p) = restored else {
+            panic!("expected the unary cross-context outlet-invocation variant");
+        };
         assert_eq!(
             p.ucan_proof_id, "gated-proof-index-42",
             "the restored slot must preserve ucan_proof_id (no lossy reconstruction)"
