@@ -2133,6 +2133,55 @@ mod tests {
         id
     }
 
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the 11 provider steady-state crypto
+    // methods (seal/open/advance_epoch/rotate_sender_key/remove_member/
+    // remove_member_sender_key/mls_encrypt_management/local_sender_key_epoch/
+    // export_crypto_state/restore_crypto_state/drain_pending_sender_key_messages)
+    // were RELOCATED onto the actor's `PerContextState`. The provider retains
+    // only the birth/restore machinery (`create_mls_group[_with_context]`,
+    // `add_member`, `take_crypto_state`, `build_restored_owned`, `with_context`,
+    // `wrapping_keypair`, `destroy_*`, `validate_key_package`) plus the
+    // receive-side primitives (`distribute_sender_key`,
+    // `process_incoming_sender_key`, `set_sender_key_unchecked`,
+    // `store_member_sender_key`). The helpers below drive the relocated actor
+    // seam so this module's coverage of the snapshot format, the one-way take,
+    // and the retained per-context restore reader survives the move. Byte-parity
+    // between the provider receiver and the actor seal/open path is pinned by the
+    // `golden_*` cross-roundtrip tests in `context::actor::state`'s test module.
+    use crate::context::actor::PerContextState;
+    use scp_did::DID;
+
+    /// Destructively move a provider-resident context onto a throwaway actor
+    /// [`PerContextState`] (Encrypted mode) holding byte-identical crypto
+    /// material, via the retained `take_crypto_state` + the production
+    /// `seed_encrypted_crypto_from_owned` seed primitive. The provider loses the
+    /// context (one-way take, ADR-049 PR-7 CM-001), so a caller that still needs
+    /// to read the source provider must capture what it needs first.
+    fn take_into_actor(provider: &MlsCryptoProvider, ctx: &[u8; 32]) -> PerContextState {
+        let owned = provider
+            .take_crypto_state(ctx)
+            .expect("take owned crypto material");
+        let mut state =
+            PerContextState::new_for_test_encrypted(*ctx, 0, DID::from(provider.local_did.clone()));
+        state.seed_encrypted_crypto_from_owned(owned);
+        state
+    }
+
+    /// Export a provider-resident context through the relocated
+    /// [`PerContextState::export_crypto_state`] seam, sourcing the node-resident
+    /// wrapping keypair (public + secret) from the provider exactly as the
+    /// production actor-export caller does. Destructive (see [`take_into_actor`]).
+    fn actor_export(
+        provider: &MlsCryptoProvider,
+        ctx: &[u8; 32],
+        sender_key_epochs: Vec<(String, u64)>,
+        recv_sequence_floors: Vec<(String, ReceiveFloor)>,
+    ) -> Result<Vec<u8>, ContextError> {
+        let (wpub, wsec) = provider.wrapping_keypair();
+        let state = take_into_actor(provider, ctx);
+        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
+    }
+
     /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / hardening H3: the single
     /// `pub(crate)` `wrapping_keypair()` accessor that the atomic core
     /// actor-seeding path (SCP-CRYPTOMOVE-001) reads must return a
@@ -3045,25 +3094,34 @@ mod tests {
 
     #[test]
     fn export_crypto_state_returns_empty_for_unknown_context() {
-        let provider = make_provider();
+        // Relocated onto the actor seam (ADR-049 PR-7): an Encrypted
+        // `PerContextState` with no seeded MLS group is the actor-side analogue
+        // of a context the provider never created — its
+        // `export_crypto_state` returns an empty blob (Ok, not an error).
         let unknown_ctx = [0xFFu8; 32];
-        let exported = provider
-            .export_crypto_state(&unknown_ctx, Vec::new(), Vec::new())
+        let state = PerContextState::new_for_test_encrypted(
+            unknown_ctx,
+            0,
+            DID::from(TEST_DID.to_owned()),
+        );
+        let (wpub, wsec) = make_provider().wrapping_keypair();
+        let exported = state
+            .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
             .unwrap();
         assert!(
             exported.is_empty(),
-            "should return empty Vec for unknown context"
+            "should return empty Vec for a context with no MLS group"
         );
     }
 
-    #[test]
-    fn restore_crypto_state_noop_on_empty_data() {
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        // restore_crypto_state with empty data should be a no-op.
-        let result = provider.restore_crypto_state(&ctx_id, &[]);
-        assert!(result.is_ok(), "empty data should succeed silently");
-    }
+    // NOTE (ADR-049 PR-7): the former `restore_crypto_state_noop_on_empty_data`
+    // pinned the DELETED provider insert-path `restore_crypto_state`'s
+    // empty-data-is-a-silent-`Ok(default)` behavior. The relocated restore
+    // reader is the owned-return `build_restored_owned`, whose empty-snapshot
+    // contract is the OPPOSITE (a hard `CryptoFailed` error — the actor seed
+    // path must always yield material) and is pinned by
+    // `build_restored_owned_rejects_empty_snapshot`. There is no surviving
+    // insert-path no-op to test, so this test is intentionally not relocated.
 
     #[test]
     fn export_restore_crypto_state_roundtrip() {
@@ -3115,33 +3173,24 @@ mod tests {
             )
         };
 
-        // Export crypto state.
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
-            .unwrap();
+        // Export crypto state through the relocated actor seam (destructive
+        // take of the provider-resident material).
+        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
         assert!(!exported.is_empty(), "exported state should be non-empty");
 
-        // Create a fresh provider and restore the state.
+        // Rebuild the owned material on a fresh provider via the RETAINED restore
+        // reader (`build_restored_owned`), then seed an actor and verify the
+        // round-trip is FUNCTIONAL (the seeded encrypted actor holds a live MLS
+        // group + sender key) and byte-faithful. The full seal→open functional
+        // round-trip across the restored group is pinned by
+        // `context::actor::state`'s `golden_seal_open_cross_roundtrip` (which
+        // seals from a restored, seeded actor state).
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let (owned, _floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
-        // Verify context doesn't exist before restore.
-        let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test", 0, 0);
-        assert!(encrypted.is_err(), "should fail before restore");
-
-        // Restore.
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
-
-        // Verify the MLS group is functional: encrypt should succeed.
-        let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test after restore", 0, 0);
-        assert!(
-            encrypted.is_ok(),
-            "encrypt should succeed after restore: {encrypted:?}"
-        );
-
-        // Verify sender key state is restored.
+        // Verify sender key state is restored (on the owned material).
         {
-            let entry = provider2.contexts.get(&ctx_id).unwrap();
-            let state = entry.value();
+            let state = &owned;
             let ctx_id_hex = hex::encode(ctx_id);
 
             // Sender key matches.
@@ -3182,6 +3231,21 @@ mod tests {
             assert!(
                 state.pending_distributions.is_empty(),
                 "pending distributions should be empty after restore"
+            );
+        }
+
+        // Functional coherence: seed a live actor from the restored material and
+        // confirm it exposes a readable local sender-key epoch (Encrypted mode
+        // with a live group + sender key). This is the actor-seam analogue of the
+        // former "encrypt succeeds after restore" MLS-functional check.
+        {
+            let mut actor =
+                PerContextState::new_for_test_encrypted(ctx_id, 0, DID::from(TEST_DID.to_owned()));
+            actor.seed_encrypted_crypto_from_owned(owned);
+            assert_eq!(
+                actor.local_sender_key_epoch(),
+                original_epoch,
+                "seeded actor must expose the restored sender-key epoch"
             );
         }
     }
@@ -3232,20 +3296,22 @@ mod tests {
         };
 
         // Export with BOTH floor axes populated: per-sender epoch (bob, 5) and
-        // intra-epoch recv floor ReceiveFloor { epoch: 5, sequence: 3 }.
-        let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                vec![(bob.to_owned(), 5)],
-                vec![(
-                    bob.to_owned(),
-                    ReceiveFloor {
-                        epoch: 5,
-                        sequence: 3,
-                    },
-                )],
-            )
-            .unwrap();
+        // intra-epoch recv floor ReceiveFloor { epoch: 5, sequence: 3 }. Snapshot
+        // is produced through the relocated actor export seam (destructive take;
+        // the originals above were captured first).
+        let exported = actor_export(
+            &provider,
+            &ctx_id,
+            vec![(bob.to_owned(), 5)],
+            vec![(
+                bob.to_owned(),
+                ReceiveFloor {
+                    epoch: 5,
+                    sequence: 3,
+                },
+            )],
+        )
+        .unwrap();
         assert!(!exported.is_empty());
 
         // Fresh provider: build the owned material (no insert, no take).
@@ -3304,123 +3370,21 @@ mod tests {
         );
     }
 
-    /// ADR-049 PR-7 Prep D (SCP-CRYPTOMOVE-000d): security parity. The
-    /// legacy insert path (`restore_crypto_state`) and the owned-return path
-    /// (`build_restored_owned`) must reconstruct byte-identical material and
-    /// set-equal floors from the SAME snapshot — the delegation shares one
-    /// deserialization body, so parity holds by construction and this pins it.
-    #[test]
-    fn build_restored_owned_matches_insert_path_parity() {
-        let provider = make_provider();
-        let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
-
-        let bob = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-        let ctx_id_hex = hex::encode(ctx_id);
-        {
-            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
-            let state = entry.value_mut();
-            state.sender_key_epoch = 11;
-            state
-                .sender_key_store
-                .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
-            state
-                .member_wrapping_keys
-                .insert(bob.to_owned(), [0xBB; 32]);
-        }
-        let exported = provider
-            .export_crypto_state(
-                &ctx_id,
-                vec![(bob.to_owned(), 5)],
-                vec![(
-                    bob.to_owned(),
-                    ReceiveFloor {
-                        epoch: 5,
-                        sequence: 3,
-                    },
-                )],
-            )
-            .unwrap();
-
-        // Same bytes into both paths on two fresh providers.
-        let provider_a = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let provider_b = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let floors_a = provider_a.restore_crypto_state(&ctx_id, &exported).unwrap();
-        let (owned_b, floors_b) = provider_b.build_restored_owned(&ctx_id, &exported).unwrap();
-
-        // Floors set-equal on BOTH axes.
-        let a_epochs: std::collections::BTreeSet<(String, u64)> =
-            floors_a.sender_epochs.iter().cloned().collect();
-        let b_epochs: std::collections::BTreeSet<(String, u64)> =
-            floors_b.sender_epochs.iter().cloned().collect();
-        assert_eq!(a_epochs, b_epochs, "sender_epochs must be set-equal");
-        let a_recv: std::collections::BTreeSet<(String, u64, u64)> = floors_a
-            .recv_sequence
-            .iter()
-            .map(|(d, f)| (d.clone(), f.epoch, f.sequence))
-            .collect();
-        let b_recv: std::collections::BTreeSet<(String, u64, u64)> = floors_b
-            .recv_sequence
-            .iter()
-            .map(|(d, f)| (d.clone(), f.epoch, f.sequence))
-            .collect();
-        assert_eq!(a_recv, b_recv, "recv_sequence must be set-equal");
-
-        // provider_a's inserted 8 fields == owned_b's 8 fields.
-        let entry = provider_a.contexts.get(&ctx_id).unwrap();
-        let sa = entry.value();
-        // mls_group functional-equivalence: group id + epoch.
-        assert_eq!(
-            sa.mls_group.group_id().unwrap(),
-            owned_b.mls_group.group_id().unwrap(),
-            "mls_group group id parity"
-        );
-        assert_eq!(
-            sa.mls_group.epoch().unwrap(),
-            owned_b.mls_group.epoch().unwrap(),
-            "mls_group epoch parity"
-        );
-        assert_eq!(
-            sa.sender_key.as_bytes(),
-            owned_b.sender_key.as_bytes(),
-            "sender_key parity"
-        );
-        assert_eq!(
-            sa.sender_key_store
-                .get(&ctx_id_hex, bob)
-                .map(|k| k.as_bytes().to_vec()),
-            owned_b
-                .sender_key_store
-                .get(&ctx_id_hex, bob)
-                .map(|k| k.as_bytes().to_vec()),
-            "sender_key_store parity"
-        );
-        assert_eq!(
-            sa.sender_key_epoch, owned_b.sender_key_epoch,
-            "sender_key_epoch parity"
-        );
-        assert_eq!(
-            sa.send_sequence, owned_b.send_sequence,
-            "send_sequence parity"
-        );
-        assert_eq!(
-            sa.pending_distributions, owned_b.pending_distributions,
-            "pending_distributions parity"
-        );
-        assert_eq!(
-            sa.member_wrapping_keys, owned_b.member_wrapping_keys,
-            "member_wrapping_keys parity"
-        );
-        // nonce_dedup is `NonceDedup::new()` on both paths (same shared body),
-        // so it is equal by construction — no field is dropped or transposed.
-    }
+    // NOTE (ADR-049 PR-7): the former `build_restored_owned_matches_insert_path_parity`
+    // asserted that the DELETED insert path (`restore_crypto_state`) and the
+    // owned-return path (`build_restored_owned`) reconstruct byte-identical
+    // material + set-equal floors from one snapshot. With the insert path gone
+    // there is no second path to compare against — `build_restored_owned` is now
+    // the sole restore reader. Its full 8-field + both-floor-axes reconstruction
+    // (with the anti-transposition checks the parity test carried) is pinned
+    // directly by `build_restored_owned_returns_owned_material_without_insert`.
 
     /// ADR-049 PR-7 Prep D (SCP-CRYPTOMOVE-000d), D2 cold-restart replay:
-    /// a legacy snapshot with NO per-sender epoch map must yield the same
-    /// legacy back-compat floor (`sender_key_epoch.max(1)` per installed
-    /// sender) on the owned path as on the insert path — pinning that the
-    /// owned seam does not weaken the D2 rollback floor.
+    /// a legacy snapshot with NO per-sender epoch map must yield the legacy
+    /// back-compat floor (`sender_key_epoch.max(1)` per installed sender) on the
+    /// owned restore reader — pinning that the owned seam does not weaken the D2
+    /// rollback floor. (The former insert-path counterpart, `restore_crypto_state`,
+    /// is deleted; `build_restored_owned` is now the sole restore reader.)
     #[test]
     fn build_restored_owned_yields_legacy_floor_parity() {
         let provider = make_provider();
@@ -3438,32 +3402,19 @@ mod tests {
                 .sender_key_store
                 .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
         }
-        // Simulate a legacy snapshot: export, then strip the per-sender map.
-        let exported = provider
-            .export_crypto_state(&ctx_id, Vec::new(), Vec::new())
-            .unwrap();
+        // Simulate a legacy snapshot: export through the relocated actor seam,
+        // then strip the per-sender map.
+        let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider_a = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let provider_b = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let floors_a = provider_a
-            .restore_crypto_state(&ctx_id, &legacy_bytes)
-            .unwrap();
         let (_owned_b, floors_b) = provider_b
             .build_restored_owned(&ctx_id, &legacy_bytes)
             .unwrap();
 
-        // Both paths seed bob's legacy floor from the global counter (7).
-        let a_epochs: std::collections::BTreeSet<(String, u64)> =
-            floors_a.sender_epochs.iter().cloned().collect();
-        let b_epochs: std::collections::BTreeSet<(String, u64)> =
-            floors_b.sender_epochs.iter().cloned().collect();
-        assert_eq!(
-            a_epochs, b_epochs,
-            "legacy back-compat floor must be identical on both paths"
-        );
+        // The owned path seeds bob's legacy floor from the global counter (7).
         assert!(
             floors_b
                 .sender_epochs
