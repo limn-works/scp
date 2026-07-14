@@ -1609,7 +1609,7 @@ pub async fn create_context(
     // pseudonym" unrepresentable in live state; broadcast contexts ignore the
     // pseudonym entirely. See `build_routing` for the `None`/sentinel rationale.
     let create_routing = build_routing(create_is_broadcast, local_pseudonym);
-    let per_context = PerContextState {
+    let mut per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
         // Convergent creator-assigned creation time — the same value stamped on
@@ -1701,6 +1701,28 @@ pub async fn create_context(
         event_log: None,
         mode,
     };
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 CREATE seam: the builder
+    // (`builder::create_context` above) BIRTHS the MLS group + local sender key
+    // into the provider (Encrypted mode only). TAKE that freshly-born crypto out
+    // of the provider (one-way: `take_crypto_state` removes the `contexts` entry
+    // AND records the id in `taken_context_ids`, so a subsequent provider
+    // birth/take fails closed — CM-001 double-owner guard) and SEED it onto the
+    // actor's `PerContextState` before the actor spawns. Seeding BEFORE spawn (vs
+    // in-dispatch) keeps the create path structurally identical to the restore
+    // seam and leaves NO window where a live actor holds an empty group. The
+    // send-sequence counter starts fresh at 0 for a newly-born group
+    // (`OwnedMlsCryptoState::send_sequence == 0`), which `from_persisted` inside
+    // `seed_encrypted_crypto_from_owned` installs. Broadcast contexts have NO MLS
+    // group (`create_is_broadcast` — the builder ran `init_broadcast_key`, not a
+    // group create), so there is nothing to take and the `Broadcast` mode stands.
+    if !create_is_broadcast {
+        let owned = deps
+            .crypto
+            .take_crypto_state(&context_id_bytes)
+            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        per_context.seed_encrypted_crypto_from_owned(owned);
+    }
 
     // ADR-049 Phase 2A finalization owned-state spawn: the create path
     // no longer writes the legacy contexts DashMap. It hands the freshly
