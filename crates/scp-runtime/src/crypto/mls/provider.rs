@@ -516,6 +516,24 @@ pub struct MlsCryptoProvider {
     /// clears itself) so a post-rollback export read still behaves normally.
     #[cfg(any(test, feature = "testing"))]
     force_export_failure: std::sync::atomic::AtomicBool,
+    /// One-shot test seam: when set, the NEXT [`Self::rotate_sender_key`]
+    /// call returns [`ContextError::CryptoFailed`] and resets the flag.
+    ///
+    /// This exists solely to induce a rotation-call failure that drives the
+    /// caller's ADR-049 §9 Class-S sync-persist fail-closed branch end-to-end
+    /// (§15(c)): the "injected failure ⇒ rotation returns `Err` with the
+    /// epoch/key NOT committed" criterion. Note the Class-S persist itself
+    /// happens in the ACTOR after this call returns, not in this function —
+    /// `rotate_sender_key` only mutates the provider's in-memory state and
+    /// queues distributions; this seam makes that call fail so the actor
+    /// observes its fail-closed signal. The real provider's in-process rotation
+    /// always generates a fresh key and increments successfully, so that
+    /// fail-closed branch is otherwise structurally unreachable. Gated behind
+    /// `#[cfg(any(test, feature = "testing"))]` so the production build carries
+    /// neither the field nor the branch. One-shot (fires once, then clears
+    /// itself) so a subsequent rotation succeeds normally.
+    #[cfg(any(test, feature = "testing"))]
+    force_rotation_failure: std::sync::atomic::AtomicBool,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -581,6 +599,8 @@ impl MlsCryptoProvider {
             taken_context_ids: DashSet::new(),
             #[cfg(any(test, feature = "testing"))]
             force_export_failure: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            force_rotation_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -594,6 +614,22 @@ impl MlsCryptoProvider {
     #[cfg(any(test, feature = "testing"))]
     pub fn arm_export_failure_once(&self) {
         self.force_export_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Arms the one-shot [`Self::force_rotation_failure`] seam: the NEXT
+    /// [`Self::rotate_sender_key`] call returns
+    /// [`ContextError::CryptoFailed`] and clears the flag.
+    ///
+    /// Test-only (see the field docs) — used to induce a rotation-call failure
+    /// that drives the caller's ADR-049 §9 Class-S sync-persist fail-closed
+    /// branch (§15(c)); the persist itself happens in the actor after
+    /// `rotate_sender_key` returns, not in this function. The real provider
+    /// cannot otherwise reach that branch (an in-process rotation always
+    /// generates a fresh key and increments the epoch successfully).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn arm_rotation_failure_once(&self) {
+        self.force_rotation_failure
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1488,6 +1524,28 @@ impl MlsCryptoProvider {
     /// Returns [`ContextError::CryptoFailed`] if key generation, HPKE
     /// sealing, or internal lock acquisition fails.
     pub fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        // One-shot test seam (see `force_rotation_failure`): induce a
+        // rotation-call failure that drives the caller's ADR-049 §9 Class-S
+        // sync-persist fail-closed branch (§15(c)) end-to-end. The persist
+        // itself happens in the actor after this call returns, not here —
+        // `rotate_sender_key` only mutates in-memory state and queues
+        // distributions; this early-return makes the call fail so the caller
+        // observes its fail-closed signal. Placed BEFORE any state read or
+        // mutation — no fresh key is generated and `sender_key_epoch` is NOT
+        // incremented, so an armed failure leaves the context byte-identical to
+        // its pre-call state (fail-closed: the epoch/key are never committed).
+        // `swap(false)` fires exactly once, then the flag is cleared so a
+        // subsequent rotation succeeds normally.
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .force_rotation_failure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ContextError::CryptoFailed(
+                "forced rotation persist failure (one-shot test seam)".to_owned(),
+            ));
+        }
+
         let ctx_id_hex = hex::encode(context_id);
         // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
         let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
@@ -2950,6 +3008,52 @@ mod tests {
         assert_eq!(
             *sec, *snap_sec,
             "wrapping_secret() must match the snapshot's secret half"
+        );
+    }
+
+    /// ADR-049 PR-7 prep E (SCP-CRYPTOMOVE-000e): the one-shot
+    /// `arm_rotation_failure_once` seam must make the NEXT
+    /// [`MlsCryptoProvider::rotate_sender_key`] return
+    /// [`ContextError::CryptoFailed`] WITHOUT committing the epoch/key (§9
+    /// Class-S sync-persist fail-closed; §15(c) "injected failure ⇒ rotation
+    /// returns `Err`, epoch NOT advanced" — the actual Class-S persist happens
+    /// in the actor after this call returns, and this seam makes the call fail
+    /// so that caller observes its fail-closed signal), then self-clear so the
+    /// subsequent rotation succeeds normally (epoch +1).
+    /// A single-member group suffices: the HPKE-seal loop skips the local
+    /// member, so an UNARMED rotation is deterministically `Ok`.
+    #[test]
+    fn arm_rotation_failure_once_forces_fail_closed_then_normal() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        let epoch_before = provider.local_sender_key_epoch(&ctx_id);
+
+        // Arm the one-shot seam: the next rotation must fail closed.
+        provider.arm_rotation_failure_once();
+        assert!(
+            matches!(
+                provider.rotate_sender_key(&ctx_id),
+                Err(ContextError::CryptoFailed(_))
+            ),
+            "armed rotation must return CryptoFailed"
+        );
+        // Fail-closed: the injected failure fired BEFORE any mutation, so the
+        // epoch is unchanged — the rotation was NOT committed.
+        assert_eq!(
+            provider.local_sender_key_epoch(&ctx_id),
+            epoch_before,
+            "failed rotation must NOT advance the epoch"
+        );
+
+        // One-shot cleared: the next rotation persists normally and advances
+        // the epoch by exactly one.
+        provider.rotate_sender_key(&ctx_id).unwrap();
+        assert_eq!(
+            provider.local_sender_key_epoch(&ctx_id),
+            epoch_before + 1,
+            "post-clear rotation must advance the epoch by one"
         );
     }
 
