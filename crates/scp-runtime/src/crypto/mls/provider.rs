@@ -2959,7 +2959,18 @@ impl MlsCryptoProvider {
     /// authoritative floor registry. `rotate_sender_key` stores the local key via
     /// `set_unchecked`, which does NOT populate the store's per-sender epoch map —
     /// so the local floor is this scalar. `pub(crate)`.
+    ///
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the production local-rotation seams
+    /// (`leave`/`revoke`/`remove`/`reset` + `mirror_forward_local_sender_epoch`)
+    /// now read the actor twin `PerContextState::local_sender_key_epoch`; this
+    /// provider method is dead on the non-test lib path (retained only for its own
+    /// provider unit tests below) and is deleted with the other provider
+    /// steady-state copies at C6.
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): production readers flipped to the actor twin in C4; retained for the provider unit tests until the C6 provider-copy deletion."
+    )]
     pub(crate) fn local_sender_key_epoch(&self, context_id: &[u8; 32]) -> u64 {
         // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
         self.contexts

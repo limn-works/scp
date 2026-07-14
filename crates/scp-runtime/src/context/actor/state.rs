@@ -2156,6 +2156,37 @@ impl PerContextState {
         })
     }
 
+    /// Removes the departed member's sender key AND wrapping key from the local
+    /// crypto sub-state, verbatim from
+    /// [`MlsCryptoProvider::remove_member_sender_key`].
+    ///
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the actor twin of the provider's
+    /// per-member sender-key prune. Prep-A moved most crypto orchestration to the
+    /// actor; this per-member removal twin was missed and is added here so the
+    /// remove / reset seams can flip off the provider. The receive-side anti-replay
+    /// floor for the departed member is NOT touched here — it lives in the
+    /// Supervisor-owned Class-M registry and is pruned by the caller via
+    /// `remove_member_floors` (mirroring the provider's PR-6 read-authority switch;
+    /// see [`MlsCryptoProvider::remove_member_sender_key`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] if this context has no encrypted crypto
+    /// sub-state (broadcast mode or a nulled group).
+    ///
+    /// [`MlsCryptoProvider::remove_member_sender_key`]: crate::crypto::mls::provider::MlsCryptoProvider::remove_member_sender_key
+    pub(crate) fn remove_member_sender_key(
+        &mut self,
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        let ctx_id_hex = hex::encode(self.context_id);
+        let crypto = self.encrypted_crypto_mut()?;
+        crypto.sender_key_store.remove(&ctx_id_hex, member_did);
+        // Also remove the member's wrapping key — they are no longer a member.
+        crypto.member_wrapping_keys.remove(member_did);
+        Ok(())
+    }
+
     /// Distributes the local sender key to `member_did` (ADR-007), verbatim from
     /// [`MlsCryptoProvider::distribute_sender_key`]. `local_did` enters as a
     /// parameter (node-resident).

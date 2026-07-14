@@ -1400,16 +1400,17 @@ pub async fn execute_remove_member(
                 .get(did.as_ref())
                 .map_or_else(String::new, |info| info.role_name.clone());
 
-            // H9: MLS group removal FIRST (hard security boundary).
-            let remove_output = deps
-                .crypto
-                .remove_member(&context_id_bytes, did)
+            // H9: MLS group removal FIRST (hard security boundary). ADR-049 PR-7:
+            // the whole in-closure crypto orchestration (MLS remove, per-member
+            // sender-key prune, sender-key rotation) is driven on the actor's
+            // `state` — all riding this ONE `commit_class_s_keep` fail-closed
+            // persist (Class-S), so the epoch bump is durable. `local_did` is
+            // sourced from the retained `deps.crypto.local_did()`.
+            let remove_output = state
+                .remove_member(deps.crypto.local_did(), did.as_ref())
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-            if let Err(e) = deps
-                .crypto
-                .remove_member_sender_key(&context_id_bytes, did.as_ref())
-            {
+            if let Err(e) = state.remove_member_sender_key(did.as_ref()) {
                 return fail_close_remove_member(
                     state,
                     deps,
@@ -1426,7 +1427,7 @@ pub async fn execute_remove_member(
             deps.supervisor
                 .remove_member_floors(&context_id_bytes, did.as_ref());
 
-            if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+            if let Err(e) = state.rotate_sender_key(deps.crypto.local_did()) {
                 return fail_close_remove_member(
                     state,
                     deps,
@@ -1437,17 +1438,15 @@ pub async fn execute_remove_member(
                 )
                 .map(|()| (String::new(), None));
             }
-            // ADR-049 PR-6: rotate succeeded (the Err arm returns above) — advance
-            // the rotated local epoch in the authoritative floor registry
-            // (fail-closed). ADR-049 PR-7: `rotate_sender_key` here is still on the
-            // retained provider (this remove site couples the rotate with the
-            // in-closure provider `remove_member` / `remove_member_sender_key`,
-            // flipped together in a later pass), so the epoch is read from the
-            // provider — read-authority follows write-authority.
+            // ADR-049 PR-6/PR-7: rotate succeeded (the Err arm returns above) —
+            // advance the durably-bumped local epoch (read from the actor `state`,
+            // which the rotate above advanced) in the authoritative floor registry
+            // (fail-closed anti-replay backstop). Read-authority follows
+            // write-authority.
             crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
                 deps,
                 &context_id_bytes,
-                deps.crypto.local_sender_key_epoch(&context_id_bytes),
+                state.local_sender_key_epoch(),
             )?;
 
             state.membership.remove_member(did);
@@ -1519,23 +1518,25 @@ pub async fn execute_remove_member(
             keep_broadcast_failure(cell, deps, context_id, failure).await?;
         }
 
-        // ADR-049 PR-7: retained-provider drain — this remove site's in-closure
-        // `rotate_sender_key` is still on the provider (coupled with the provider
-        // `remove_member` / `remove_member_sender_key`, flipped together later), so
-        // the producer queue is the provider's → `None`.
-        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            None,
-            context_id,
-            &context_id_bytes,
-        )
-        .await
+        // ADR-049 PR-7: drain through the actor's crypto state (same one the
+        // in-closure `rotate_sender_key` above populated); `&mut` view scoped so
+        // `cell` is free afterward.
         {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to deliver rotated sender keys after member removal"
-            );
+            let mut view = cell.class_c_view();
+            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+                deps,
+                view.mode_mut().crypto_mut(),
+                context_id,
+                &context_id_bytes,
+            )
+            .await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to deliver rotated sender keys after member removal"
+                );
+            }
         }
     }
 
@@ -2474,14 +2475,26 @@ pub async fn execute_establish_outlet_interface(
 // execute_reset_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-pipeline member-reset orchestration (remove+add+broadcast+rotate+drain) with the detailed §9 residual-of-coalescing rationale inline"
+)]
 pub async fn execute_reset_member(
-    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
     _reason: &str,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): reset now takes the whole `ClassSCell`
+    // (was a `ClassCMut` view) so the sender-key ROTATION can go through
+    // `commit_class_s_keep`→`rest_mut` — §9 classifies rotation as Class-S (the
+    // epoch bump must be durable), exactly as leave/revoke. The membership
+    // remove+add and the broadcast/retry bookkeeping remain the coalesced Class-C
+    // work they were (reset is a same-member key REFRESH, net-neutral on authority
+    // — see the residual-of-coalescing note below); those reach their fields
+    // through short-lived `cell.class_c_view()` borrows.
     let CommitMeta {
         pid: _,
         actor_did,
@@ -2489,10 +2502,12 @@ pub async fn execute_reset_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(view.handle_mut())?;
-
-    if !view.membership_class_c_mut().contains(did.as_ref()) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
+    {
+        let mut view = cell.class_c_view();
+        require_active(view.handle_mut())?;
+        if !view.membership_class_c_mut().contains(did.as_ref()) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
+        }
     }
 
     // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
@@ -2535,7 +2550,12 @@ pub async fn execute_reset_member(
     )
     .await
     {
-        apply_broadcast_failure(view.commit_broadcast_borrows(), deps, context_id, failure);
+        apply_broadcast_failure(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            failure,
+        );
     }
     if let Some(failure) = try_broadcast_commit(
         deps,
@@ -2548,7 +2568,12 @@ pub async fn execute_reset_member(
     )
     .await
     {
-        apply_broadcast_failure(view.commit_broadcast_borrows(), deps, context_id, failure);
+        apply_broadcast_failure(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            failure,
+        );
     }
 
     if let Err(e) = deps
@@ -2567,42 +2592,60 @@ pub async fn execute_reset_member(
     // (member-granular; siblings + the local scalar retained).
     deps.supervisor
         .remove_member_floors(&context_id_bytes, did.as_ref());
-    if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-        tracing::warn!(
-            context_id,
-            error = %e,
-            "rotate_sender_key failed after MLS reset"
-        );
-    } else {
-        // ADR-049 PR-6: advance the rotated local epoch in the authoritative
-        // floor registry (fail-closed). ADR-049 PR-7: `execute_reset_member`
-        // holds only a `ClassCMut` view (no `ClassSCell`), so it cannot drive the
-        // `commit_class_s_keep`→`rest_mut` rotate flip; the rotate stays on the
-        // retained provider here (pending a ruling on threading a cell / routing
-        // this rotation best-effort Class-C), so the epoch is read from the
-        // provider — read-authority follows write-authority.
-        crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
-            deps,
-            &context_id_bytes,
-            deps.crypto.local_sender_key_epoch(&context_id_bytes),
-        )?;
+    // ADR-049 PR-7 (RESET-SITE ruling a): the sender-key ROTATION is Class-S per
+    // §9 — the epoch bump is sync-persisted fail-closed via `commit_class_s_keep`
+    // (treated exactly like leave/revoke), NOT the coalesced best-effort it was
+    // when this site only held a `ClassCMut` view. Swallow-and-log disposition
+    // preserved on failure (rotation + distribution best-effort, M23); anti-replay
+    // backstop is the never-regressing registry floor (`mirror_forward`,
+    // `?`-propagated). `local_did` from the retained `deps.crypto.local_did()`.
+    let local_did = deps.crypto.local_did().to_owned();
+    match cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            s.rotate_sender_key(&local_did)?;
+            Ok(s.local_sender_key_epoch())
+        })
+        .await
+    {
+        Ok(epoch) => {
+            // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch (read from
+            // the actor state the rotate above advanced) in the authoritative floor
+            // registry (fail-closed backstop).
+            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                deps,
+                &context_id_bytes,
+                epoch,
+            )?;
+        }
+        Err(e) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "rotate_sender_key failed after MLS reset"
+            );
+        }
     }
 
-    // ADR-049 PR-7: retained-provider drain (this reset site's producer
-    // `rotate_sender_key` is still on the provider — see above), so `None`.
-    if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        deps,
-        None,
-        context_id,
-        &context_id_bytes,
-    )
-    .await
+    // ADR-049 PR-7: drain through the actor's crypto state (same one the rotation
+    // populated — reset has no separate `distribute_sender_key`, so `rotate` is the
+    // sole producer of the pending queue). `&mut` view scoped so `cell` is free.
     {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to deliver rotated sender keys after member reset"
-        );
+        let mut view = cell.class_c_view();
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            view.mode_mut().crypto_mut(),
+            context_id,
+            &context_id_bytes,
+        )
+        .await
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member reset"
+            );
+        }
     }
 
     deps.event_log
@@ -2613,10 +2656,15 @@ pub async fn execute_reset_member(
             timestamp_secs,
         )
         .await?;
-    *view.checkpoint_events_since_mut() += 1;
-    view.governance_class_c_mut()
-        .pending_epoch_resets_mut()
-        .push(did.clone());
+    // Coalesced Class-C bookkeeping through a short-lived view (the checkpoint
+    // counter + the pending epoch-reset queue are Class-C, ride the next persist).
+    {
+        let mut view = cell.class_c_view();
+        *view.checkpoint_events_since_mut() += 1;
+        view.governance_class_c_mut()
+            .pending_epoch_resets_mut()
+            .push(did.clone());
+    }
 
     Ok(())
 }
@@ -4297,7 +4345,7 @@ pub async fn dispatch_content_governance_action(
         }
         GovernanceAction::ResetMember { did, reason } => {
             execute_reset_member(
-                &mut cell.class_c_view(),
+                cell,
                 deps,
                 context_id,
                 did,
