@@ -3046,8 +3046,11 @@ impl MlsBackend for FailingBackend {
     async fn validate_key_package(
         &self,
         key_package_bytes: &[u8],
+        clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError> {
-        self.inner.validate_key_package(key_package_bytes).await
+        self.inner
+            .validate_key_package(key_package_bytes, clock)
+            .await
     }
     async fn generate_key_package(
         &self,

@@ -44,6 +44,7 @@ use async_trait::async_trait;
 use openmls::prelude::LeafNodeIndex;
 
 use super::storage_adapter::OpenMlsStorageAdapter;
+use scp_clock::Clock;
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
@@ -271,13 +272,23 @@ pub trait MlsBackend: Send + Sync {
     /// Validates a TLS-serialized `KeyPackage` for joinability. Does not
     /// touch any group state; callers use this before committing an add.
     ///
+    /// Stateless with respect to the backend: the hardened [`Clock`] used to
+    /// re-validate the accepted `Lifetime` (ADR-057 §Prereq-1) is threaded in
+    /// as the `clock` parameter rather than read from backend state, so this
+    /// method depends on no per-context or per-backend state (ADR-049
+    /// Decision 6 / SCP-CRYPTOMOVE-000c). Callers pass the same hardened clock
+    /// they inject everywhere else (never openmls's internal wall clock).
+    ///
     /// # Errors
     ///
     /// Returns [`MlsError::AddMemberFailed`] on validation failure (malformed
-    /// KP, signature invalid, ciphersuite mismatch).
+    /// KP, signature invalid, ciphersuite mismatch), or
+    /// [`MlsError::KeyPackageLifetimeInvalid`] when the accepted `Lifetime`
+    /// is expired / out of range under `clock`.
     async fn validate_key_package(
         &self,
         key_package_bytes: &[u8],
+        clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError>;
 
     /// Generates a fresh `KeyPackage` for `credential`, optionally with an

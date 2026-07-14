@@ -87,20 +87,23 @@
       "status": "pending",
       "files": [
         "crates/scp-runtime/src/crypto/mls/provider.rs",
-        "crates/scp-runtime/src/crypto/mls/backend.rs"
+        "crates/scp-runtime/src/crypto/mls/backend.rs",
+        "crates/scp-runtime/src/crypto/mls/production_backend.rs",
+        "crates/scp-runtime/src/context/supervisor/key_package_actor_tests.rs"
       ],
-      "description": "Additive prep for ADR-049 Decision 15. validate_key_package is stateless: MlsCryptoProvider::validate_key_package touches only self.clock (via validate_key_package_lifetime over self.clock.as_ref()), never with_context / self.contexts. So it is NOT an orchestration method on PerContextState; it becomes a stateless free-fn (or MlsBackend method) taking &dyn Clock. This lets the atomic core replace deps.crypto.validate_key_package with a stateless call rather than an actor-state method. Additive and green: define the stateless form; the provider's validate_key_package is retained (delegates to it or is left in place) until the atomic core flips call sites.",
+      "description": "Additive prep for ADR-049 Decision 15. validate_key_package is stateless: it touches only the injected clock (via validate_key_package_lifetime over the hardened Clock), never with_context / self.contexts. Per ADR-049 Decision 6 (which lists validate_key_package as an MlsBackend method), the stateless form is the MlsBackend trait method — NOT a new shared free function in the scp-runtime orchestration layer. It is made stateless by threading the hardened clock in as a `clock: &dyn Clock` parameter instead of reading backend state. This lets the atomic core replace deps.crypto.validate_key_package with a stateless MlsBackend call rather than an actor-state method. Additive and green: change the trait method signature (add clock param), thread it through the ProductionMlsBackend impl and the FailingBackend mock; the sync provider wrapper MlsCryptoProvider::validate_key_package is retained byte-identical (it already threads self.clock through the shared scp-mls validate_key_package_lifetime primitive, and a sync fn cannot call the async trait method without block_on, forbidden by ADR-049 Invariant 4) until the atomic core flips call sites.",
       "acceptanceCriteria": [
-        "A stateless validate_key_package form exists: grep confirms either a free function validate_key_package(.., clock: &dyn Clock) -> Result<(), ContextError> or an MlsBackend trait method that takes the key package + &dyn Clock and touches no per-context state.",
-        "It touches no contexts: grep over the new function body confirms zero references to self.contexts / with_context / taken_context_ids.",
-        "The provider method is retained for now: MlsCryptoProvider::validate_key_package still exists and either delegates to the stateless form or is left byte-identical (this story does not flip call sites).",
-        "A unit test drives the stateless form directly (valid key package passes; expired-lifetime key package returns the same error variant the provider path returns).",
+        "A stateless MlsBackend trait method exists: `MlsBackend::validate_key_package(&self, key_package_bytes: &[u8], clock: &dyn Clock) -> Result<ValidatedKeyPackage, MlsError>` in crates/scp-runtime/src/crypto/mls/backend.rs — grep confirms the `clock: &dyn Clock` parameter on the trait method, and the method takes no per-context state (ADR-049 Decision 6 arm).",
+        "It touches no contexts and no backend clock field: grep over the ProductionMlsBackend::validate_key_package body (crypto/mls/production_backend.rs) confirms zero references to self.contexts / with_context / taken_context_ids AND zero references to self.clock (the lifetime re-check uses the `clock` parameter, not backend state).",
+        "The provider method is retained for now: MlsCryptoProvider::validate_key_package still exists in crypto/mls/provider.rs and is left byte-identical (this story does not flip call sites; production call sites lifecycle_helpers.rs and governance_helpers.rs are unchanged).",
+        "A unit test drives the stateless MlsBackend::validate_key_package form directly: a valid KeyPackage returns Ok(ValidatedKeyPackage); an expired-lifetime KeyPackage (TestClock advanced past KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS) returns Err(MlsError::KeyPackageLifetimeInvalid). The retained provider wrapper MlsCryptoProvider::validate_key_package maps the same expired-lifetime condition to ContextError::InvalidKeyPackage, asserted by the existing provider::tests::validate_key_package_rejects_expired_lifetime_at_gate — both layers are covered.",
         "Full CI green: cargo fmt --all -- --check; the full-feature clippy command; DYLD_LIBRARY_PATH=... cargo test --workspace — all exit 0."
       ],
       "actionItems": [
-        "Extract validate_key_package's body into a stateless free-fn / MlsBackend method over &dyn Clock.",
-        "Have the retained provider method delegate to it (or leave it unchanged) — do not flip call sites.",
-        "Add a direct unit test (valid + expired-lifetime).",
+        "Make the MlsBackend::validate_key_package trait method stateless by adding a `clock: &dyn Clock` parameter (ADR-049 Decision 6 arm; no new shared free function).",
+        "Thread the clock param through the ProductionMlsBackend impl (use `clock`, not `self.clock`) and the FailingBackend mock, and update the trait method's test callers.",
+        "Leave the sync MlsCryptoProvider::validate_key_package wrapper unchanged — do not flip call sites.",
+        "Add a direct unit test (valid -> Ok(ValidatedKeyPackage); expired-lifetime -> Err(MlsError::KeyPackageLifetimeInvalid)).",
         "Run fmt + clippy + workspace tests."
       ],
       "blockedBy": [],
