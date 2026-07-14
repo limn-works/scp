@@ -1102,7 +1102,7 @@ mod tests {
             .append_outlet_invoked_verified(
                 &ctx_id,
                 &bad_event,
-                crate::context::outlets::stream::ChunksBilledSource::Sequence(&chunks),
+                &chunks,
                 "did:dht:z6MkInvoker",
                 1_700_000_000,
             )
@@ -1129,7 +1129,7 @@ mod tests {
             .append_outlet_invoked_verified(
                 &ctx_id,
                 &good_event,
-                crate::context::outlets::stream::ChunksBilledSource::Sequence(&chunks),
+                &chunks,
                 "did:dht:z6MkInvoker",
                 1_700_000_000,
             )
@@ -1168,7 +1168,7 @@ mod tests {
             .append_outlet_invoked_verified(
                 &ctx_id,
                 &event,
-                crate::context::outlets::stream::ChunksBilledSource::Sequence(&chunks),
+                &chunks,
                 "did:dht:z6MkInvoker",
                 1_700_000_000,
             )

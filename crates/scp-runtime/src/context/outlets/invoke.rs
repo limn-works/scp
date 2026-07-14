@@ -739,11 +739,13 @@ pub(crate) fn build_outlet_event(
         input_hash,
         output_hash: Some(output_hash),
         cost,
-        // Non-streaming invocation path: no chunks are produced, so the
-        // streaming event fields take their degenerate/no-manifest defaults
-        // — identical to the `#[serde(default …)]` values lifecycle.rs uses
-        // for events that pre-date the streaming taxonomy. No streaming
-        // behavior is introduced here; this is a shape reconcile only.
+        // Unary "plain outlet invocation" per ADR-061: commits `output_hash`
+        // and is NOT modeled as a stream (distinct delivery mode, not a
+        // degenerate one-chunk stream). No chunks are produced, so the
+        // streaming event fields take their no-manifest sentinels — identical
+        // to the `#[serde(default …)]` values lifecycle.rs uses for events that
+        // pre-date the streaming taxonomy. No streaming behavior is introduced
+        // here; this is a shape reconcile only.
         stream_chunk_count: 0,
         chunks_billed: 0,
         stream_manifest_hash: [0u8; 32],
@@ -1549,35 +1551,17 @@ pub trait OutletInvokedEventSink: Send + Sync {
     /// outlet stream, after the terminal chunk has been delivered to
     /// the chunk receiver.
     ///
-    /// `manifest` is the retained ADR-061 Merkle-frontier commitment the pump
-    /// folded over the emitted chunk sequence (root + billable/leaf counts). A
-    /// durable sink routes it into
-    /// [`ContextEventLogProvider::append_outlet_invoked_verified`](crate::context::builder::ContextEventLogProvider::append_outlet_invoked_verified)
-    /// as the `Frontier` source so the FULL §5.4.5:566 `chunks_billed`
-    /// wire-invariant is enforced at the real log-insert boundary against the
-    /// frontier the pump actually built — not the event's self-reported
-    /// aggregates. Capturing test sinks may ignore it.
-    fn record(&self, event: OutletInvokedEvent, manifest: StreamManifestCommitment);
-}
-
-/// The retained ADR-061 chunk-manifest commitment (RFC-6962 Merkle root +
-/// billable/leaf counts).
-///
-/// The §5.4.5 dispatch pump folds this over the emitted chunk sequence WITHOUT
-/// retaining the payload set. Handed to the [`OutletInvokedEventSink`] alongside
-/// the close event so a durable sink can wire-reject at the §5.4.5:566 append
-/// boundary against the frontier the pump actually built, rather than against
-/// the event's own self-reported fields (which would make the manifest equality
-/// tautological).
-#[derive(Debug, Clone, Copy)]
-pub struct StreamManifestCommitment {
-    /// RFC-6962 Merkle root over the sealed chunk leaves (`stream_manifest_hash`).
-    pub root: [u8; 32],
-    /// Count of billable `Data` leaves at or below the cancel-ack ceiling
-    /// (`chunks_billed`).
-    pub billed_count: u64,
-    /// Total leaf count including the terminal chunk (`stream_chunk_count`).
-    pub leaf_count: u64,
+    /// A durable sink persists the event through
+    /// [`ContextEventLogProvider::append_event`](crate::context::builder::ContextEventLogProvider::append_event),
+    /// whose override re-runs the durable event-local
+    /// `chunks_billed <= stream_chunk_count` backstop
+    /// ([`verify_outlet_invoked_event_local`](super::stream::verify_outlet_invoked_event_local)).
+    /// Same-context billing integrity is enforced INLINE in the pump before this
+    /// call (`AuditAnomaly::ChunksBilledSelfMismatch`), not re-derived here: the
+    /// pump does not retain the payload set, so the full §5.4.5:566 manifest
+    /// re-derivation applies only on the Sequence path (cross-context reassembly
+    /// / import, slice 3).
+    fn record(&self, event: OutletInvokedEvent);
 }
 
 /// The §5.4.5 close-time economic settlement of a streaming-native
@@ -3710,15 +3694,7 @@ where
             // cancel-ack ceiling, so the billing ceiling is `u64::MAX`.
             None,
         );
-        // Hand the retained frontier commitment so a durable sink can
-        // wire-reject at the §5.4.5:566 append boundary against the frontier
-        // this pump actually built.
-        let manifest = StreamManifestCommitment {
-            root: frontier.root(),
-            billed_count: frontier.billed_count(),
-            leaf_count: frontier.leaf_count(),
-        };
-        sink.record(event, manifest);
+        sink.record(event);
     }
 }
 
@@ -5699,7 +5675,7 @@ mod tests {
     }
 
     impl super::OutletInvokedEventSink for ChannelInvokedSink {
-        fn record(&self, event: OutletInvokedEvent, _manifest: super::StreamManifestCommitment) {
+        fn record(&self, event: OutletInvokedEvent) {
             let _ = self.tx.send(event);
         }
     }

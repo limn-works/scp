@@ -3259,14 +3259,21 @@ async fn run_stream_pump_v2(
     // outer manifest (renumbered, cancel-ack-truncated) — the only
     // manifest that matches what SDK consumers actually received. We record
     // exactly one event per stream via the `OutletInvokedEventSink::record`
-    // trait method, handing it the retained ADR-061 Merkle-frontier
-    // commitment. The FULL §5.4.5:566 frontier wire-invariant is enforced
-    // ONCE, at the durable log-insert boundary
-    // (`ContextEventLogProvider::append_outlet_invoked_verified`, fed this
-    // same frontier as its `Frontier` source) — the canonical enforcement
-    // path. We do NOT also re-run a near-tautological frontier check inline
-    // here (the event was built from this frontier), to avoid a dead
-    // duplicate of the append-boundary check.
+    // trait method; the durable sink persists it via the plain
+    // `append_event` boundary, whose override re-runs the durable event-local
+    // `chunks_billed <= stream_chunk_count` backstop.
+    //
+    // Same-context billing integrity is enforced HERE, inline: the pump's
+    // running escrow-ledger tally (`summary.billed_count`) is compared against
+    // the Merkle-fold reference (`summary.manifest_billed`) below, and any
+    // divergence is emitted as `AuditAnomaly::ChunksBilledSelfMismatch` on the
+    // event itself (never dropped). The pump does NOT retain the emitted
+    // payload set, so the full §5.4.5:566 manifest re-derivation
+    // (`verify_outlet_invoked_event_manifest` / `append_outlet_invoked_verified`)
+    // cannot run here — it applies only where the chunk sequence IS retained:
+    // the Sequence path (cross-context reassembly / import, slice 3). Re-running
+    // an equality against a commitment built from THIS same summary would be
+    // tautological, so we do not.
     if let Some(sink) = event_inputs.sink.as_ref() {
         // §5.4.5 round-8 (F2): on a self-consistency drift between the
         // pump's running `billed_count` (escrow ledger) and the
@@ -3311,20 +3318,7 @@ async fn run_stream_pump_v2(
             // `None` when the stream terminated without a cancel-ack.
             summary.cancel_ack_seq,
         );
-        // The retained ADR-061 frontier commitment (root + billable/leaf
-        // counts) the pump folded over the emitted sequence. The durable sink
-        // routes this into `append_outlet_invoked_verified` as the `Frontier`
-        // source, so the FULL §5.4.5:566 equality (`stream_manifest_hash ==
-        // root`, `chunks_billed == billed_count`, `stream_chunk_count ==
-        // leaf_count`) plus the durable event-local `<=` backstop both fire at
-        // the real log-insert boundary — against the frontier the pump built,
-        // not the event's self-reported fields.
-        let manifest = super::invoke::StreamManifestCommitment {
-            root: summary.manifest_root,
-            billed_count: u64::from(manifest_reference),
-            leaf_count: u64::from(summary.stream_chunk_count),
-        };
-        sink.record(event, manifest);
+        sink.record(event);
     }
 
     // §5.4.5 close-time economic settlement (E1). Fire the settlement sink
@@ -4767,11 +4761,7 @@ mod tests {
         >,
     }
     impl OutletInvokedEventSink for CapturingInvokedSink {
-        fn record(
-            &self,
-            event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
-            _manifest: super::super::invoke::StreamManifestCommitment,
-        ) {
+        fn record(&self, event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent) {
             let _ = self.tx.send(event);
         }
     }

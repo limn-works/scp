@@ -272,17 +272,18 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// holds only the opaque event and can enforce nothing stronger than the
     /// event-local `chunks_billed <= stream_chunk_count` backstop — this entry
     /// point re-derives the manifest root + billable count from the
-    /// caller-supplied [`ChunksBilledSource`] (a retained chunk sequence or the
-    /// ADR-061 O(log n) frontier) and rejects the event at log-insert time if
-    /// the recorded aggregates diverge. On success it serializes the event and
-    /// delegates to `append_event`, which re-runs the durable event-local
-    /// backstop. This is the CANONICAL verified-append boundary the §5.4.5
-    /// streaming pump routes its close event through (the pump supplies the
-    /// retained ADR-061 Merkle frontier as the `Frontier` source).
+    /// caller-supplied retained chunk sequence and rejects the event at
+    /// log-insert time if the recorded aggregates diverge. On success it
+    /// serializes the event and delegates to `append_event`, which re-runs the
+    /// durable event-local backstop. This is the verified-append boundary for
+    /// the paths that retain the payload set — cross-context reassembly / import
+    /// (slice 3). The same-context streaming pump does NOT route through here: it
+    /// does not retain the chunk sequence and persists via `append_event`,
+    /// enforcing same-context integrity inline
+    /// (`AuditAnomaly::ChunksBilledSelfMismatch`) plus the event-local backstop.
     ///
     /// [`OutletInvokedEvent`]:
     ///     scp_protocol::context::outlets::lifecycle::OutletInvokedEvent
-    /// [`ChunksBilledSource`]: crate::context::outlets::stream::ChunksBilledSource
     ///
     /// # Errors
     ///
@@ -294,13 +295,13 @@ pub trait ContextEventLogProvider: Send + Sync {
         &self,
         context_id: &[u8; 32],
         event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
-        source: crate::context::outlets::stream::ChunksBilledSource<'_>,
+        chunks: &[scp_protocol::context::outlets::stream::OutletStreamChunk],
         actor_did: &str,
         timestamp_secs: u64,
     ) -> Result<(), ContextCreationError> {
         // (1) FULL §5.4.5:566 manifest-derived equality — the tighter check the
         // opaque `append_event` boundary cannot make. Wire-reject on mismatch.
-        crate::context::outlets::stream::verify_outlet_invoked_event_manifest(event, source)
+        crate::context::outlets::stream::verify_outlet_invoked_event_manifest(event, chunks)
             .map_err(|err| {
                 let log_err =
                     crate::context::outlets::stream::chunks_billed_error_to_event_log_error(err);

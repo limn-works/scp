@@ -2126,12 +2126,18 @@ impl Supervisor {
     }
 
     /// Durably appends the §5.4.5 streaming `OutletInvokedEvent` at stream close
-    /// through the CANONICAL verified-append boundary
-    /// ([`ContextEventLogProvider::append_outlet_invoked_verified`]), feeding the
-    /// pump's retained ADR-061 Merkle-frontier commitment as the `Frontier`
-    /// source so the FULL §5.4.5:566 `chunks_billed` wire-invariant — and the
-    /// durable event-local `<=` backstop it delegates to — fire at the real
-    /// log-insert boundary, against the frontier the pump actually built.
+    /// through the plain [`ContextEventLogProvider::append_event`] boundary,
+    /// whose override re-runs the durable event-local
+    /// `chunks_billed <= stream_chunk_count` backstop
+    /// ([`verify_outlet_invoked_event_local`](crate::context::outlets::stream::verify_outlet_invoked_event_local)).
+    ///
+    /// Same-context billing integrity is enforced INLINE in the dispatch pump
+    /// before this call (`AuditAnomaly::ChunksBilledSelfMismatch`, escrow-ledger
+    /// vs Merkle-fold) — the pump does not retain the emitted payload set, so the
+    /// full §5.4.5:566 manifest re-derivation
+    /// ([`append_outlet_invoked_verified`](crate::context::builder::ContextEventLogProvider::append_outlet_invoked_verified))
+    /// applies only on the Sequence path (cross-context reassembly / import,
+    /// slice 3), not here.
     ///
     /// Called (fire-and-forget) by
     /// [`ActorOutletInvokedEventSink`](crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink),
@@ -2141,12 +2147,11 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns [`ContextError`] when no event-log provider is configured, or the
-    /// verified append rejects/serializes/persists the event.
+    /// append serializes/persists/backstop-rejects the event.
     pub(crate) async fn append_streaming_outlet_invoked_event(
         &self,
         context_id_bytes: [u8; 32],
         event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
-        manifest: crate::context::outlets::invoke::StreamManifestCommitment,
         actor_did: String,
     ) -> Result<(), ContextError> {
         let event_log = self.event_log_ref().ok_or_else(|| {
@@ -2164,16 +2169,15 @@ impl Supervisor {
             use scp_clock::Clock as _;
             clock.now_secs()
         });
+        let data = serde_json::to_vec(&event).map_err(|e| {
+            ContextError::EventLogFailed(format!("failed to serialize OutletInvokedEvent: {e}"))
+        })?;
         event_log
-            .append_outlet_invoked_verified(
+            .append_event(
                 &context_id_bytes,
-                &event,
-                crate::context::outlets::stream::ChunksBilledSource::Frontier {
-                    root: manifest.root,
-                    billed_count: manifest.billed_count,
-                    leaf_count: manifest.leaf_count,
-                },
+                scp_event_log::EventType::OutletInvoked,
                 &actor_did,
+                scp_event_log::EventPayload { data },
                 timestamp_secs,
             )
             .await

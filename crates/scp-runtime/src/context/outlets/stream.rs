@@ -1599,92 +1599,50 @@ pub const fn verify_outlet_invoked_event_local(
 // Full manifest-derived wire-invariant — §5.4.5:566 equality
 // =====================================================================
 
-/// Source from which the full §5.4.5:566 manifest-derived `chunks_billed`
-/// reference is re-derived at log-insert time.
-///
-/// `Copy` (both variants hold only a shared slice + `Copy` scalars) so the
-/// verification entry points take it by value without a borrow dance.
-#[derive(Clone, Copy)]
-pub enum ChunksBilledSource<'a> {
-    /// A retained chunk sequence (one-shot 2-chunk manifest, xctx reassembly,
-    /// import). The reference is recomputed by re-hashing leaves and counting
-    /// `@type == "data"` at/below the cancel-ack ceiling.
-    Sequence(&'a [OutletStreamChunk]),
-    /// The O(log n) frontier the dispatch pump retains (ADR-061) instead of
-    /// the payload set: the running root + billed/leaf counts.
-    Frontier {
-        /// RFC-6962 manifest root the pump folded over the emitted sequence.
-        root: [u8; 32],
-        /// Billable `Data`-chunk count at/below the cancel-ack ceiling.
-        billed_count: u64,
-        /// Total leaf (chunk) count including the terminal chunk.
-        leaf_count: u64,
-    },
-}
-
 /// Enforces the FULL §5.4.5:566 `chunks_billed` equality (manifest root +
 /// sealed sequence + cancel-ack) that [`verify_outlet_invoked_event_local`]
 /// (the event-local `<=` backstop) cannot.
 ///
-/// For [`ChunksBilledSource::Sequence`], re-derives `chunks_billed_ref` via
+/// Re-derives `chunks_billed_ref` from the retained chunk sequence via
 /// [`verify_chunks_billed`] AND checks
 /// `stream_manifest_hash == compute_chunk_manifest_root(chunks)` and
-/// `stream_chunk_count == chunks.len()`. For [`ChunksBilledSource::Frontier`],
-/// checks the event's three stream aggregates equal the frontier's.
+/// `stream_chunk_count == chunks.len()`. This applies only where the chunk
+/// sequence is retained — the Sequence path (cross-context reassembly / import,
+/// slice 3). The same-context dispatch pump does not retain the payload set and
+/// enforces same-context integrity via the inline
+/// `AuditAnomaly::ChunksBilledSelfMismatch` check plus the event-local `<=`
+/// backstop ([`verify_outlet_invoked_event_local`]), not this function.
 ///
 /// # Errors
 ///
 /// Returns [`ChunksBilledError::ChunksBilledMismatch`] when the recorded
 /// `chunks_billed` disagrees with the manifest-derived reference, when the
-/// recorded manifest root / leaf count diverge from the re-derived (or
-/// frontier-carried) values, or when the chunk sequence cannot be
-/// JCS-canonicalized into a manifest root. The runtime MUST refuse the event
-/// at log-insert time per the §5.4.5 wire-layer rejection rule.
+/// recorded manifest root / leaf count diverge from the re-derived values, or
+/// when the chunk sequence cannot be JCS-canonicalized into a manifest root.
+/// The runtime MUST refuse the event at log-insert time per the §5.4.5
+/// wire-layer rejection rule.
 pub fn verify_outlet_invoked_event_manifest(
     event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
-    source: ChunksBilledSource<'_>,
+    chunks: &[OutletStreamChunk],
 ) -> Result<(), ChunksBilledError> {
-    match source {
-        ChunksBilledSource::Sequence(chunks) => {
-            // (1) Full manifest-derived `chunks_billed` equality — the tighter
-            // check the event-local backstop cannot make.
-            verify_chunks_billed(chunks, event.chunks_billed, event.cancel_ack_seq)?;
-            // The manifest-derived reference for divergence reporting below.
-            // Equal to `event.chunks_billed` once (1) passes.
-            let reference =
-                compute_chunks_billed_ref(chunks, event.cancel_ack_seq.unwrap_or(u64::MAX));
-            let mismatch = || ChunksBilledError::ChunksBilledMismatch {
-                recorded: event.chunks_billed,
-                reference,
-            };
-            // (2) Manifest root + sealed-sequence binding: the recorded root
-            // and leaf count MUST match what re-hashing the sequence yields.
-            let root = compute_chunk_manifest_root(chunks).map_err(|_jcs_err| mismatch())?;
-            let leaf_count = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
-            if event.stream_manifest_hash != root
-                || u64::from(event.stream_chunk_count) != leaf_count
-            {
-                return Err(mismatch());
-            }
-            Ok(())
-        }
-        ChunksBilledSource::Frontier {
-            root,
-            billed_count,
-            leaf_count,
-        } => {
-            if event.stream_manifest_hash != root
-                || u64::from(event.chunks_billed) != billed_count
-                || u64::from(event.stream_chunk_count) != leaf_count
-            {
-                return Err(ChunksBilledError::ChunksBilledMismatch {
-                    recorded: event.chunks_billed,
-                    reference: u32::try_from(billed_count).unwrap_or(u32::MAX),
-                });
-            }
-            Ok(())
-        }
+    // (1) Full manifest-derived `chunks_billed` equality — the tighter
+    // check the event-local backstop cannot make.
+    verify_chunks_billed(chunks, event.chunks_billed, event.cancel_ack_seq)?;
+    // The manifest-derived reference for divergence reporting below.
+    // Equal to `event.chunks_billed` once (1) passes.
+    let reference = compute_chunks_billed_ref(chunks, event.cancel_ack_seq.unwrap_or(u64::MAX));
+    let mismatch = || ChunksBilledError::ChunksBilledMismatch {
+        recorded: event.chunks_billed,
+        reference,
+    };
+    // (2) Manifest root + sealed-sequence binding: the recorded root
+    // and leaf count MUST match what re-hashing the sequence yields.
+    let root = compute_chunk_manifest_root(chunks).map_err(|_jcs_err| mismatch())?;
+    let leaf_count = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
+    if event.stream_manifest_hash != root || u64::from(event.stream_chunk_count) != leaf_count {
+        return Err(mismatch());
     }
+    Ok(())
 }
 
 // =====================================================================

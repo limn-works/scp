@@ -33,7 +33,7 @@ use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
 
 use crate::context::outlets::dispatch::StreamEscrowRefundSink;
 use crate::context::outlets::invoke::{
-    OutletInvokedEventSink, StreamManifestCommitment, StreamSettlement, StreamSettlementSink,
+    OutletInvokedEventSink, StreamSettlement, StreamSettlementSink,
 };
 use crate::context::supervisor::supervisor::Supervisor;
 
@@ -185,8 +185,10 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
 
 /// Concrete [`OutletInvokedEventSink`] routing a stream's close-time §5.4.5
 /// `OutletInvokedEvent` to the durable context event log via the supervisor's
-/// verified-append boundary
-/// ([`Supervisor::append_streaming_outlet_invoked_event`]).
+/// append boundary
+/// ([`Supervisor::append_streaming_outlet_invoked_event`]), which persists
+/// through plain `append_event` and its durable event-local `<=` backstop
+/// (same-context integrity is enforced inline in the pump before `record`).
 ///
 /// Constructed INTERNALLY by the streaming open orchestrator
 /// (`Supervisor::open_outlet_stream`) — the FFI bridges pass `None` for the
@@ -232,13 +234,13 @@ impl ActorOutletInvokedEventSink {
 }
 
 impl OutletInvokedEventSink for ActorOutletInvokedEventSink {
-    fn record(&self, event: OutletInvokedEvent, manifest: StreamManifestCommitment) {
+    fn record(&self, event: OutletInvokedEvent) {
         let supervisor = Arc::clone(&self.supervisor);
         let context_id_bytes = self.context_id_bytes;
         let actor_did = self.actor_did.clone();
         self.runtime.spawn(async move {
             if let Err(e) = supervisor
-                .append_streaming_outlet_invoked_event(context_id_bytes, event, manifest, actor_did)
+                .append_streaming_outlet_invoked_event(context_id_bytes, event, actor_did)
                 .await
             {
                 // Best-effort: a torn-down context or persist failure leaves the
