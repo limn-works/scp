@@ -1595,6 +1595,254 @@ pub struct WrappingKeyPair {
 //     X25519 wrapping keypair, the injected [`Clock`]) enters as METHOD
 //     PARAMETERS — never stored on [`ContextCryptoState`].
 //
+/// The §9 Class-C COALESCED send/receive crypto orchestration (ADR-049 §15
+/// option-b receiver shape). `seal` / `open` / `mls_encrypt_management` operate
+/// on `&mut ContextCryptoState` — the crypto sub-state reachable through the
+/// Class-C `ClassCMut::mode_mut()` view — rather than a whole
+/// `&mut PerContextState`. The actor's persist-class type system hands out a
+/// whole `&mut PerContextState` ONLY on the fail-closed Class-S path
+/// (`ClassSCell::commit_class_s_keep` -> `rest_mut`); routing the message hot
+/// path there would force a per-message fail-closed persist, reversing §9's
+/// deliberate coalescing (and blowing the Decision-14 perf budget). The
+/// genuinely-Class-S orchestration (`rotate_sender_key` / `advance_epoch` /
+/// `remove_member`, downward-auth transitions) keeps the `&mut PerContextState`
+/// shape on [`PerContextState`].
+///
+/// `seal` does NOT touch the send sequence: the caller reserves it ONCE from the
+/// Class-C `send_tracker` view (the single canonical `SequenceReservation`) and
+/// passes the pre-increment high-water mark in as `aad_sequence`, so the wire
+/// AAD is byte-identical to the provider's `state.send_sequence` read order. The
+/// `#[cfg(test)]` [`PerContextState`] wrappers below preserve the original
+/// whole-state call shape for the golden byte-identity tests.
+#[allow(
+    dead_code,
+    reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): production callers (build_encrypted_envelope + the receive path) wire in as the atomic-core seams land; until then the golden byte-identity tests + the #[cfg(test)] PerContextState wrappers exercise these Class-C crypto methods."
+)]
+impl ContextCryptoState {
+    /// Seals an [`InnerEnvelope`] into an outer-envelope byte blob (sender-key
+    /// AES-256-GCM under MLS). `aad_sequence` is the caller-reserved
+    /// pre-increment send-sequence high-water mark; `local_did` and the raw
+    /// `context_id` digest enter as parameters (node-resident / whole-state).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] on an inner-envelope context-id resolution
+    /// mismatch, or any serialization / MLS / sender-layer failure.
+    pub(crate) fn seal(
+        &mut self,
+        context_id: &[u8; 32],
+        local_did: &str,
+        inner: &InnerEnvelope,
+        routing_id: &[u8],
+        blob_ttl: u32,
+        aad_sequence: u64,
+    ) -> Result<Vec<u8>, ContextError> {
+        // The sender-layer AEAD AAD MUST bind the RAW `context_id` string
+        // (UTF-8, 4-byte BE length prefix) per spec §9.16.1 + §9.5.1 — not the
+        // hex encoding of its 32-byte hash. The raw string is carried on the
+        // inner envelope.
+        let ctx_str = inner.context_id.as_str();
+
+        // Defense in depth: the supplied `context_id` MUST be the canonical
+        // digest of the inner envelope's `context_id` string (ADR-056). If they
+        // diverge, fail closed rather than emit an unverifiable ciphertext.
+        if crate::context::state::context_id_to_bytes(ctx_str) != *context_id {
+            return Err(ContextError::CryptoFailed(
+                "inner envelope context_id does not resolve to the supplied context_id".into(),
+            ));
+        }
+
+        let sender_key_epoch = self.sender_key_epoch;
+        let sender_key = self.sender_key.as_ref().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+
+        // 1. Serialize inner envelope to MessagePack.
+        let serialized = rmp_serde::to_vec_named(inner).map_err(|e| {
+            ContextError::CryptoFailed(format!("inner envelope serialization: {e}"))
+        })?;
+
+        // 2. Sender key encrypt (AES-256-GCM, ADR-007). AAD binds context_id,
+        // sender_did, epoch, and the caller-reserved sequence. Binds the RAW
+        // context_id string per §9.16.1 so the receive side can reconstruct it.
+        let sender_encrypted = scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer(
+            sender_key,
+            &serialized,
+            ctx_str,
+            local_did,
+            sender_key_epoch,
+            aad_sequence,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let with_header = scp_protocol::crypto::sender_keys::encrypt::build_sender_header(
+            sender_key_epoch,
+            aad_sequence,
+            &sender_encrypted,
+        );
+
+        // The `sender_key` shared borrow has ended; take the group mutably.
+        let mls_group = self.mls_group.as_mut().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+
+        // 3. MLS encrypt.
+        let mls_message = scp_mls::encrypt::encrypt(mls_group, &with_header)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let encrypted_blob = scp_mls::encrypt::serialize_ciphertext(&mls_message)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // 4. Wrap in outer envelope.
+        let outer = create_outer_envelope(
+            routing_id,
+            None, // no recipient hint for group messages
+            blob_ttl,
+            encrypted_blob,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        rmp_serde::to_vec_named(&outer)
+            .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))
+    }
+
+    /// Opens a received outer-envelope blob. `clock` (used to re-validate an
+    /// add-Commit's `KeyPackage` `Lifetime`) and the raw `context_id` digest
+    /// enter as parameters.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] on a `context_id_str` resolution mismatch,
+    /// or any MLS / sender-key / decode failure.
+    pub(crate) fn open(
+        &mut self,
+        clock: &dyn Clock,
+        context_id: &[u8; 32],
+        context_id_str: &str,
+        outer_bytes: &[u8],
+    ) -> Result<OpenResult, ContextError> {
+        // Defense in depth (symmetry with `seal`): the supplied `context_id`
+        // MUST be the canonical digest of `context_id_str` (ADR-056).
+        if crate::context::state::context_id_to_bytes(context_id_str) != *context_id {
+            return Err(ContextError::CryptoFailed(
+                "context_id_str does not resolve to the supplied context_id".into(),
+            ));
+        }
+
+        // Hex of the 32-byte id — the LOCAL sender-key store key. NOT the AAD.
+        let ctx_id_hex = hex::encode(context_id);
+
+        // Step 0: Deserialize outer envelope to extract MLS ciphertext.
+        let outer: OuterEnvelope = rmp_serde::from_slice(outer_bytes).map_err(|e| {
+            ContextError::CryptoFailed(format!("outer envelope deserialization: {e}"))
+        })?;
+
+        // Step 1: MLS decrypt and extract sender DID from credential.
+        let mls_group = self.mls_group.as_mut().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let content =
+            scp_mls::encrypt::decrypt_with_sender_did(mls_group, &outer.encrypted_blob, clock)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        match content {
+            scp_mls::encrypt::DecryptedContent::Application {
+                plaintext: mls_decrypted,
+                sender_did,
+            } => {
+                // §9.16.1 "Management prefix exclusivity": the SCPM_MAGIC check
+                // lives in exactly one shared helper.
+                if let Some(mgmt_payload) = try_strip_management_prefix(&mls_decrypted) {
+                    if mgmt_payload.len() > MAX_MANAGEMENT_PAYLOAD_SIZE {
+                        return Err(ContextError::CryptoFailed(
+                            "management payload exceeds size limit".into(),
+                        ));
+                    }
+                    return Ok(OpenResult::Management {
+                        sender_did,
+                        payload: mgmt_payload.to_vec(),
+                    });
+                }
+
+                // Step 2: Look up the sender's key from the sender key store.
+                let sender_key = self
+                    .sender_key_store
+                    .get(&ctx_id_hex, &sender_did)
+                    .cloned()
+                    .ok_or_else(|| ContextError::CryptoFailed("sender key lookup failed".into()))?;
+
+                // Step 3: Parse header and sender key decrypt. The AAD binds the
+                // RAW context_id string per §9.16.1, matching the `seal` path.
+                let (epoch, sequence, sender_ciphertext) =
+                    scp_protocol::crypto::sender_keys::encrypt::parse_sender_header(&mls_decrypted)
+                        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                let decrypted = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
+                    &sender_key,
+                    sender_ciphertext,
+                    context_id_str,
+                    &sender_did,
+                    epoch,
+                    sequence,
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                // Step 4: Deserialize as InnerEnvelope (padded payload intact —
+                // the caller strips padding + verifies integrity).
+                let inner = InnerEnvelope::from_bytes(&decrypted)
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                Ok(OpenResult::Application(Box::new(OpenedEnvelope {
+                    inner,
+                    sender_did,
+                    // ADR-049 PR-6: surface the received `(epoch, sequence)`
+                    // floor for the Class-M registry gate; enforcement is at the
+                    // messaging seam, not here.
+                    receive_floor: ReceiveFloor { epoch, sequence },
+                })))
+            }
+            scp_mls::encrypt::DecryptedContent::Commit { sender_did: _ } => Ok(OpenResult::Control),
+            scp_mls::encrypt::DecryptedContent::Proposal { sender_did: _ } => {
+                Ok(OpenResult::Control)
+            }
+        }
+    }
+
+    /// MLS-encrypts a management payload (SCPM-tagged), no sender-layer sequence.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] if the payload exceeds the size limit, or
+    /// on any MLS / serialization failure.
+    pub(crate) fn mls_encrypt_management(
+        &mut self,
+        plaintext: &[u8],
+        routing_id: &[u8],
+        blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        if plaintext.len() > MAX_MANAGEMENT_PAYLOAD_SIZE {
+            return Err(ContextError::CryptoFailed(
+                "management payload exceeds size limit".into(),
+            ));
+        }
+        let mls_group = self.mls_group.as_mut().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+
+        // Prepend the canonical SCPM magic to tag this as a management message.
+        let magic = &MANAGEMENT_MSG_MAGIC;
+        let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());
+        tagged.extend_from_slice(magic);
+        tagged.extend_from_slice(plaintext);
+        let mls_message = scp_mls::encrypt::encrypt(mls_group, &tagged)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let encrypted_blob = scp_mls::encrypt::serialize_ciphertext(&mls_message)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let outer = create_outer_envelope(routing_id, None, blob_ttl, encrypted_blob)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        rmp_serde::to_vec_named(&outer)
+            .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))
+    }
+}
+
 // MLS / HPKE / sender-layer primitives stay exactly the free-function /
 // backend calls the provider makes (`scp_mls::encrypt::*`,
 // `scp_mls::group::*`, `scp_mls::ratchet::*`,
@@ -1662,23 +1910,24 @@ impl PerContextState {
         self.send_tracker = SendSequenceTracker::from_persisted(owned.send_sequence);
     }
 
-    /// Seals an [`InnerEnvelope`] into an outer-envelope byte blob (sender-key
-    /// AES-256-GCM under MLS), verbatim from [`MlsCryptoProvider::seal`].
+    /// TEST-ONLY whole-state convenience over [`ContextCryptoState::seal`],
+    /// preserving the original call shape for the golden byte-identity tests.
     ///
-    /// The AAD sequence is the PRE-increment value — read from
-    /// [`SendSequenceTracker::last_issued`] BEFORE advancing — so the wire AAD
-    /// is byte-identical to the provider's `state.send_sequence` read/increment
-    /// order (see `sequence.rs` §"Sequence numbering convention"). `local_did`
-    /// enters as a parameter (node-resident).
+    /// Reads the pre-increment sequence from `send_tracker`, guards the
+    /// `u64::MAX` overflow boundary fail-closed (byte-for-byte with the
+    /// provider — nothing is emitted and the counter is left untouched at the
+    /// boundary), delegates the crypto to the field-granular
+    /// [`ContextCryptoState::seal`] core, then advances `send_tracker` on
+    /// success (the single canonical [`SequenceReservation`]). Production seals
+    /// through the Class-C view in `build_encrypted_envelope`, never this
+    /// wrapper (ADR-049 §15 option-b).
     ///
     /// # Errors
     ///
-    /// [`ContextError::CryptoFailed`] on a mode/group mismatch, an
+    /// [`ContextError::CryptoFailed`] on overflow, a mode/group mismatch, an
     /// inner-envelope context-id resolution mismatch, or any serialization /
     /// MLS / sender-layer failure.
-    ///
-    /// [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider::seal
-    /// [`SendSequenceTracker::last_issued`]: crate::context::actor::sequence::SendSequenceTracker::last_issued
+    #[cfg(test)]
     pub(crate) fn seal(
         &mut self,
         local_did: &str,
@@ -1687,124 +1936,43 @@ impl PerContextState {
         blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
         let context_id = self.context_id;
-        let Self {
-            mode, send_tracker, ..
-        } = self;
-        let ContextModeState::Encrypted(crypto) = mode else {
-            return Err(ContextError::CryptoFailed(
-                "no MLS group for this context".to_string(),
-            ));
-        };
-        let crypto = crypto.as_mut();
-
-        // The sender-layer AEAD AAD MUST bind the RAW `context_id` string
-        // (UTF-8, 4-byte BE length prefix) per spec §9.16.1 + §9.5.1 — not
-        // the hex encoding of its 32-byte hash. Binding anything else here
-        // breaks cross-implementation interop and the
-        // spec contract. The raw string is carried on the inner envelope.
-        let ctx_str = inner.context_id.as_str();
-
-        // Defense in depth: the actor's own `context_id` MUST be the canonical
-        // digest of the inner envelope's `context_id` string —
-        // `context_id_to_bytes(ctx_str)` (ADR-056). If they diverge, the AAD
-        // would bind a string unrelated to the routing / store keying, so fail
-        // closed rather than emit an unverifiable ciphertext.
-        if crate::context::state::context_id_to_bytes(ctx_str) != context_id {
-            return Err(ContextError::CryptoFailed(
-                "inner envelope context_id does not resolve to the supplied context_id".into(),
-            ));
-        }
-
-        // AAD sequence = the pre-increment high-water mark (matches the
-        // provider's `state.send_sequence` read at seal, provider.rs).
-        let aad_sequence = send_tracker.last_issued();
-        let sender_key_epoch = crypto.sender_key_epoch;
-        let sender_key = crypto.sender_key.as_ref().ok_or_else(|| {
-            ContextError::CryptoFailed("no MLS group for this context".to_string())
-        })?;
-
-        // 1. Serialize inner envelope to MessagePack.
-        let serialized = rmp_serde::to_vec_named(inner).map_err(|e| {
-            ContextError::CryptoFailed(format!("inner envelope serialization: {e}"))
-        })?;
-
-        // 2. Sender key encrypt (AES-256-GCM, ADR-007). AAD binds context_id,
-        // sender_did, epoch, and sequence. Binds the RAW context_id string per
-        // §9.16.1 so the receive side can reconstruct it.
-        let sender_encrypted = scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer(
-            sender_key,
-            &serialized,
-            ctx_str,
-            local_did,
-            sender_key_epoch,
-            aad_sequence,
-        )
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        let with_header = scp_protocol::crypto::sender_keys::encrypt::build_sender_header(
-            sender_key_epoch,
-            aad_sequence,
-            &sender_encrypted,
-        );
-
-        // The `sender_key` shared borrow has ended; take the group mutably.
-        let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
-            ContextError::CryptoFailed("no MLS group for this context".to_string())
-        })?;
-
-        // 3. MLS encrypt.
-        let mls_message = scp_mls::encrypt::encrypt(mls_group, &with_header)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        let encrypted_blob = scp_mls::encrypt::serialize_ciphertext(&mls_message)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        // 4. Wrap in outer envelope.
-        let outer = create_outer_envelope(
-            routing_id,
-            None, // no recipient hint for group messages
-            blob_ttl,
-            encrypted_blob,
-        )
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        // Advance the send sequence at exactly the provider's post-increment
-        // point (after the outer envelope is built, before its serialization).
-        //
-        // FAIL-CLOSED on overflow to match the provider byte-for-byte: the
-        // provider does `send_sequence.checked_add(1).ok_or_else(|| CryptoFailed(
-        // "send sequence counter overflow"))?` (provider.rs) — at `u64::MAX` it
-        // returns `Err` and emits NOTHING. `SendSequenceTracker::reserve_next`
-        // uses `saturating_add`, which at `u64::MAX` would SUCCEED and re-emit
-        // reusing AAD sequence `u64::MAX` (fail-OPEN). So guard the boundary here
-        // at the call site (the tracker's saturating semantics stay intact for
-        // the RAII rollback path) and error before reserving — the reservation is
-        // never taken, so the counter is left untouched exactly as the provider's
-        // `checked_add` leaves `send_sequence` unchanged on overflow. The already-
-        // computed `outer` is dropped, unemitted, mirroring the provider.
-        if send_tracker.last_issued() == u64::MAX {
+        // AAD sequence = the pre-increment high-water mark. Guard the overflow
+        // boundary BEFORE sealing so nothing is emitted at `u64::MAX` and the
+        // counter stays untouched (observably identical to the provider's
+        // `checked_add` fail-closed).
+        let aad_sequence = self.send_tracker.last_issued();
+        if aad_sequence == u64::MAX {
             return Err(ContextError::CryptoFailed(
                 "send sequence counter overflow".into(),
             ));
         }
-        // The RAII reservation is the actor-owned counterpart to the provider's
-        // `state.send_sequence.checked_add(1)`; a successful seal commits it.
-        crate::context::actor::sequence::SequenceReservation::reserve(send_tracker).commit();
-
-        rmp_serde::to_vec_named(&outer)
-            .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))
+        let crypto = self.encrypted_crypto_mut()?;
+        let blob = crypto.seal(
+            &context_id,
+            local_did,
+            inner,
+            routing_id,
+            blob_ttl,
+            aad_sequence,
+        )?;
+        // Advance exactly once on success — the caller-side counterpart to the
+        // provider's `state.send_sequence.checked_add(1)`.
+        crate::context::actor::sequence::SequenceReservation::reserve(&mut self.send_tracker)
+            .commit();
+        Ok(blob)
     }
 
-    /// Opens a received outer-envelope blob, verbatim from
-    /// [`MlsCryptoProvider::open`]. `clock` (used to re-validate an add-Commit's
-    /// `KeyPackage` `Lifetime`) enters as a parameter (node-resident).
+    /// TEST-ONLY whole-state convenience over [`ContextCryptoState::open`],
+    /// preserving the original call shape for the golden byte-identity tests.
+    /// Production opens through the Class-C view in the receive path
+    /// (ADR-049 §15 option-b).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a
     /// `context_id_str` resolution mismatch, or any MLS / sender-key / decode
     /// failure.
-    ///
-    /// [`MlsCryptoProvider::open`]: crate::crypto::mls::provider::MlsCryptoProvider::open
+    #[cfg(test)]
     pub(crate) fn open(
         &mut self,
         clock: &dyn Clock,
@@ -1813,131 +1981,27 @@ impl PerContextState {
     ) -> Result<OpenResult, ContextError> {
         let context_id = self.context_id;
         let crypto = self.encrypted_crypto_mut()?;
-
-        // Defense in depth (symmetry with `seal`): the actor's `context_id` MUST
-        // be the canonical digest of `context_id_str` (ADR-056).
-        if crate::context::state::context_id_to_bytes(context_id_str) != context_id {
-            return Err(ContextError::CryptoFailed(
-                "context_id_str does not resolve to the supplied context_id".into(),
-            ));
-        }
-
-        // Hex of the 32-byte id — the LOCAL sender-key store key. NOT the AAD.
-        let ctx_id_hex = hex::encode(context_id);
-
-        // Step 0: Deserialize outer envelope to extract MLS ciphertext.
-        let outer: OuterEnvelope = rmp_serde::from_slice(outer_bytes).map_err(|e| {
-            ContextError::CryptoFailed(format!("outer envelope deserialization: {e}"))
-        })?;
-
-        // Step 1: MLS decrypt and extract sender DID from credential.
-        let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
-            ContextError::CryptoFailed("no MLS group for this context".to_string())
-        })?;
-        let content =
-            scp_mls::encrypt::decrypt_with_sender_did(mls_group, &outer.encrypted_blob, clock)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        match content {
-            scp_mls::encrypt::DecryptedContent::Application {
-                plaintext: mls_decrypted,
-                sender_did,
-            } => {
-                // §9.16.1 "Management prefix exclusivity": the SCPM_MAGIC check
-                // lives in exactly one shared helper.
-                if let Some(mgmt_payload) = try_strip_management_prefix(&mls_decrypted) {
-                    if mgmt_payload.len() > MAX_MANAGEMENT_PAYLOAD_SIZE {
-                        return Err(ContextError::CryptoFailed(
-                            "management payload exceeds size limit".into(),
-                        ));
-                    }
-                    return Ok(OpenResult::Management {
-                        sender_did,
-                        payload: mgmt_payload.to_vec(),
-                    });
-                }
-
-                // Step 2: Look up the sender's key from the sender key store.
-                let sender_key = crypto
-                    .sender_key_store
-                    .get(&ctx_id_hex, &sender_did)
-                    .cloned()
-                    .ok_or_else(|| ContextError::CryptoFailed("sender key lookup failed".into()))?;
-
-                // Step 3: Parse header and sender key decrypt. The AAD binds the
-                // RAW context_id string per §9.16.1, matching the `seal` path.
-                let (epoch, sequence, sender_ciphertext) =
-                    scp_protocol::crypto::sender_keys::encrypt::parse_sender_header(&mls_decrypted)
-                        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-                let decrypted = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
-                    &sender_key,
-                    sender_ciphertext,
-                    context_id_str,
-                    &sender_did,
-                    epoch,
-                    sequence,
-                )
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-                // Step 4: Deserialize as InnerEnvelope (padded payload intact —
-                // the caller strips padding + verifies integrity).
-                let inner = InnerEnvelope::from_bytes(&decrypted)
-                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-                Ok(OpenResult::Application(Box::new(OpenedEnvelope {
-                    inner,
-                    sender_did,
-                    // ADR-049 PR-6: surface the received `(epoch, sequence)`
-                    // floor for the Class-M registry gate; enforcement is at the
-                    // messaging seam, not here.
-                    receive_floor: ReceiveFloor { epoch, sequence },
-                })))
-            }
-            scp_mls::encrypt::DecryptedContent::Commit { sender_did: _ } => Ok(OpenResult::Control),
-            scp_mls::encrypt::DecryptedContent::Proposal { sender_did: _ } => {
-                Ok(OpenResult::Control)
-            }
-        }
+        crypto.open(clock, &context_id, context_id_str, outer_bytes)
     }
 
-    /// MLS-encrypts a management payload, verbatim from
-    /// [`MlsCryptoProvider::mls_encrypt_management`].
+    /// TEST-ONLY whole-state convenience over
+    /// [`ContextCryptoState::mls_encrypt_management`], preserving the original
+    /// call shape for the golden byte-identity tests. Production encrypts
+    /// management payloads through the Class-C view (ADR-049 §15 option-b).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] if the payload exceeds the size limit, or
     /// on any MLS / serialization failure.
-    ///
-    /// [`MlsCryptoProvider::mls_encrypt_management`]: crate::crypto::mls::provider::MlsCryptoProvider::mls_encrypt_management
+    #[cfg(test)]
     pub(crate) fn mls_encrypt_management(
         &mut self,
         plaintext: &[u8],
         routing_id: &[u8],
         blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
-        if plaintext.len() > MAX_MANAGEMENT_PAYLOAD_SIZE {
-            return Err(ContextError::CryptoFailed(
-                "management payload exceeds size limit".into(),
-            ));
-        }
         let crypto = self.encrypted_crypto_mut()?;
-        let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
-            ContextError::CryptoFailed("no MLS group for this context".to_string())
-        })?;
-
-        // Prepend the canonical SCPM magic to tag this as a management message.
-        let magic = &MANAGEMENT_MSG_MAGIC;
-        let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());
-        tagged.extend_from_slice(magic);
-        tagged.extend_from_slice(plaintext);
-        let mls_message = scp_mls::encrypt::encrypt(mls_group, &tagged)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        let encrypted_blob = scp_mls::encrypt::serialize_ciphertext(&mls_message)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        let outer = create_outer_envelope(routing_id, None, blob_ttl, encrypted_blob)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        rmp_serde::to_vec_named(&outer)
-            .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))
+        crypto.mls_encrypt_management(plaintext, routing_id, blob_ttl)
     }
 
     /// Advances the MLS epoch (Update + self-Commit), verbatim from
