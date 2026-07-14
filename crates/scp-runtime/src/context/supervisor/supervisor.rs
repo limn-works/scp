@@ -12390,7 +12390,7 @@ impl Supervisor {
                     // 3. Build the Welcome-derived PerContextState. On any failure, roll the
                     //    just-installed group back so nothing keyed is left resident. (No
                     //    durable snapshot exists yet, so no `delete_context` is needed here.)
-                    let state = match Self::build_welcome_joiner_state(
+                    let mut state = match Self::build_welcome_joiner_state(
                         &deps,
                         &context_id,
                         &params,
@@ -12405,6 +12405,40 @@ impl Supervisor {
                             return Err(e);
                         }
                     };
+
+                    // 2b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 WELCOME seam: TAKE the
+                    //     just-installed joined group's crypto out of the provider and
+                    //     SEED it onto the actor state. This is a BIRTH seam, exactly
+                    //     like CREATE: `install_joined_group` (step 2, a RETAINED
+                    //     provider birth-seam) births the group + local sender key into
+                    //     the provider; `take_crypto_state` then hands it to the actor
+                    //     ONE-WAY (removes the `contexts` entry AND records
+                    //     `taken_context_ids`, so a subsequent provider birth/take for
+                    //     this id fails closed — CM-001 double-owner guard). No crypto is
+                    //     ever handed back to the provider. `build_welcome_joiner_state`
+                    //     deliberately built an EMPTY encrypted mode; `seed` installs the
+                    //     owned group + sender key and resumes `send_sequence` via
+                    //     `from_persisted` (a freshly-installed joiner group starts at 0).
+                    //     From here the actor `state` is the SOLE crypto authority — the
+                    //     durability check (3b) and the fail-closed persist (4) read the
+                    //     export off `state`, not the provider.
+                    //
+                    //     Rollback semantics past this point: the crypto now lives in
+                    //     `state`, so every early-return below DROPS it (zeroizing the
+                    //     `ScpMlsGroup` / `SenderKey`); the `destroy_mls_group` calls
+                    //     become defensive no-ops (the group is no longer provider-
+                    //     resident) and the `taken_context_ids` marker is LEFT in place
+                    //     (fail-closed — the id must not resurrect a divergent second
+                    //     group; a retry re-drives a fresh Welcome).
+                    let owned = match deps.crypto.take_crypto_state(&context_id_bytes) {
+                        Ok(owned) => owned,
+                        Err(e) => {
+                            let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                            return Err(e);
+                        }
+                    };
+                    state.seed_encrypted_crypto_from_owned(owned);
+
                     let handle = state.handle.clone();
 
                     // 3a. Activate the joiner's lifecycle handle. A freshly-built
@@ -12449,12 +12483,21 @@ impl Supervisor {
                     // (`deps.supervisor.export_*`) and threaded into
                     // `export_crypto_state` as the durable-blob params; the
                     // provider floor mirrors are deleted.
+                    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 WELCOME seam: the crypto is
+                    // now OWNED by the seeded actor `state` (taken from the provider in
+                    // step 2b), so read the export off `state` — identical to what
+                    // `build_snapshot_for_persist` (step 4) will persist. The X25519
+                    // wrapping keypair is node-level and enters as params from the
+                    // RETAINED `deps.crypto.wrapping_keypair()` accessor.
+                    let (welcome_wrapping_public, welcome_wrapping_secret) =
+                        deps.crypto.wrapping_keypair();
                     if !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
-                        &deps.crypto.export_crypto_state(
-                            &context_id_bytes,
+                        &state.export_crypto_state(
                             deps.supervisor.export_sender_key_epochs(&context_id_bytes),
                             deps.supervisor
                                 .export_recv_sequence_floors(&context_id_bytes),
+                            welcome_wrapping_public,
+                            &*welcome_wrapping_secret,
                         ),
                     ) {
                         let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
