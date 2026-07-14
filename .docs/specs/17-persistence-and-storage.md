@@ -1012,7 +1012,7 @@ These three requirements are exactly the three §17.6 states for storage, lifted
 
 ### 17.17.2 Security Classification of Development Arms
 
-Many capabilities ship a development/in-memory arm — an implementation intended for testing, CI, or local development. Every such arm MUST be classified, and its classification decides how — and whether — it may exist in a shipped production artifact.
+Many capabilities ship a development/in-memory arm — an implementation intended for testing, CI, or local development. Every such arm MUST be classified, and its classification decides how — and whether — it may exist in a shipped production artifact. The classification is **mandatory before the capability ships**: every provider capability enumerated in §17.17 (client storage, relay blob storage, DID/DHT resolution, credential storage, key custody, device attestation, relay querier) MUST have its development arm classified as durability-only or nullifier before that capability is present on any shipped path. A capability shipping with an *unclassified* development arm — one whose classification has never been recorded, so no one has decided whether it is a nullifier — is itself a violation of this section, independent of what the arm later turns out to be: the absence of a classification is a decision not made, which SCP-CAPSEL-8000's "no silent selection" forbids at the classification level.
 
 **SCP-CAPSEL-8010 — Every development arm carries exactly one of two classifications.** A capability's in-memory/development arm is either:
 
