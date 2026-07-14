@@ -1024,7 +1024,6 @@ pub async fn execute_revoke(
                 deps,
                 view.mode_mut().crypto_mut(),
                 context_id,
-                &context_id_bytes,
             )
             .await
             {
@@ -1527,7 +1526,6 @@ pub async fn execute_remove_member(
                 deps,
                 view.mode_mut().crypto_mut(),
                 context_id,
-                &context_id_bytes,
             )
             .await
             {
@@ -2636,7 +2634,6 @@ pub async fn execute_reset_member(
             deps,
             view.mode_mut().crypto_mut(),
             context_id,
-            &context_id_bytes,
         )
         .await
         {

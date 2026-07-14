@@ -273,11 +273,15 @@ pub async fn leave_context(
             let mls_commit_bytes = if is_broadcast {
                 None
             } else {
-                let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
-                if let Err(e) = deps
-                    .crypto
-                    .remove_member_sender_key(&context_id_bytes, member_did)
-                {
+                // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): MLS removal + per-member
+                // sender-key prune run on the actor's OWNED crypto state (the
+                // `rest_mut()` view above), not the provider — this is the last
+                // leave-path caller flipped off the deleted provider steady-state
+                // twins. `local_did` is node-resident identity (retained on the
+                // provider); the actor `remove_member` skips a self-leave.
+                let local_did = deps.crypto.local_did();
+                let remove_output = state.remove_member(local_did, member_did.as_ref())?;
+                if let Err(e) = state.remove_member_sender_key(member_did.as_ref()) {
                     tracing::warn!(
                         context_id = %context_id,
                         member = %member_did,
@@ -435,13 +439,8 @@ pub async fn leave_context(
             // Drain through the actor's crypto state (same one the rotation just
             // populated); `&mut` view scoped so `cell` is free afterward.
             let mut view = cell.class_c_view();
-            if let Err(e) = drain_and_deliver_sender_keys(
-                deps,
-                view.mode_mut().crypto_mut(),
-                &context_id,
-                &context_id_bytes,
-            )
-            .await
+            if let Err(e) =
+                drain_and_deliver_sender_keys(deps, view.mode_mut().crypto_mut(), &context_id).await
             {
                 tracing::warn!(
                     context_id = %context_id,
@@ -511,24 +510,23 @@ pub async fn leave_context(
 /// propagated (the receiver can recover via `SenderKeyRequest`).
 pub async fn drain_and_deliver_sender_keys(
     deps: &ActorDeps,
-    mut crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
+    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
 ) -> Result<(), ContextError> {
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): when the caller supplies the actor's
-    // field-granular Class-C `&mut ContextCryptoState` (a rotation site that
-    // flipped `rotate_sender_key` onto the actor, which populated the ACTOR's
-    // `pending_distributions`), drain + MLS-wrap through that SAME crypto state so
-    // producer (rotate) and consumer (drain) stay coherent. The retained-provider
-    // sites — and the join path, whose producer `add_member` is a retained
-    // birth-seam provider op — pass `None` and drain the PROVIDER queue. Both are
-    // byte-identical (same `mls_encrypt_management` shape).
-    let pending = match crypto_state.as_deref_mut() {
-        Some(cs) => std::mem::take(&mut cs.pending_distributions),
-        None => deps
-            .crypto
-            .drain_pending_sender_key_messages(context_id_bytes)?,
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): drain + MLS-wrap the rotated sender-key
+    // distributions through the actor's OWNED field-granular Class-C
+    // `&mut ContextCryptoState` — the SAME crypto state the producer
+    // (`rotate_sender_key` / `add_member`) populated, so producer and consumer
+    // stay coherent. The provider steady-state twins
+    // (`drain_pending_sender_key_messages` / `mls_encrypt_management`) are deleted;
+    // there is no provider queue to fall back to. A broadcast context has no MLS
+    // `ContextCryptoState` (`crypto_mut()` is `None`) and no sender-key
+    // distributions — draining nothing is correct (rotation is skipped for
+    // broadcast, so the queue is always empty here).
+    let Some(crypto_state) = crypto_state else {
+        return Ok(());
     };
+    let pending = std::mem::take(&mut crypto_state.pending_distributions);
     if !pending.is_empty() {
         let routing_id = scp_protocol::context::context_routing_id(context_id);
         for (target_did, message) in pending {
@@ -538,22 +536,10 @@ pub async fn drain_and_deliver_sender_keys(
                 message_len = message.len(),
                 "MLS-encrypting and sending rotated sender key distribution"
             );
-            let sealed = crypto_state.as_deref_mut().map_or_else(
-                || {
-                    deps.crypto.mls_encrypt_management(
-                        context_id_bytes,
-                        &message,
-                        &routing_id,
-                        crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
-                    )
-                },
-                |cs| {
-                    cs.mls_encrypt_management(
-                        &message,
-                        &routing_id,
-                        crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
-                    )
-                },
+            let sealed = crypto_state.mls_encrypt_management(
+                &message,
+                &routing_id,
+                crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
             );
             match sealed {
                 Ok(sealed) => {
@@ -1075,13 +1061,7 @@ pub async fn join_context(
     // so it drops before any rollback below re-borrows `cell`.
     let drain_result = {
         let mut view = cell.class_c_view();
-        drain_and_deliver_sender_keys(
-            deps,
-            view.mode_mut().crypto_mut(),
-            &context_id,
-            &context_id_bytes,
-        )
-        .await
+        drain_and_deliver_sender_keys(deps, view.mode_mut().crypto_mut(), &context_id).await
     };
     if let Err(e) = drain_result {
         // Drain failed catastrophically — roll back the MLS add on the actor,

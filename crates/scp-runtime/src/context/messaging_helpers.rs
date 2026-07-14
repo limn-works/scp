@@ -79,6 +79,9 @@ use crate::context::state::{
     PseudonymAnnouncement, emit_event_into,
 };
 use crate::context::supervisor::MessageSigner;
+// Only the `#[cfg(test)]`-gated provider seal twin `build_encrypted_envelope`
+// still names this type (ADR-049 PR-7 SCP-CRYPTOMOVE-001); gate the import with it.
+#[cfg(test)]
 use crate::crypto::mls::provider::MlsCryptoProvider;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
@@ -104,6 +107,13 @@ pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
 /// body; carried here so the actor-shape send path does not have to
 /// import from the legacy module.
 ///
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the production send seams
+/// (`send_message` / `send_checkpoint` / `send_heartbeat`) all seal through the
+/// actor's owned crypto state ([`build_encrypted_envelope_actor`]); this provider
+/// twin now serves only the send-path unit / pipeline tests that drive the seal
+/// helper directly. It is deleted when those test suites relocate onto the actor
+/// seam (C8 of the atomic crypto move).
+///
 /// # Routing
 ///
 /// The outer envelope's cleartext `routing_id` is zeroed (`[0u8; 32]`) for
@@ -112,6 +122,14 @@ pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
 /// envelope, and embedding the relay-derivable `context_routing_id` would leak
 /// a correlator to the relay (§9.10.4). The receiver ignores this field for
 /// app-data, routing on the transport key instead.
+//
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): no production caller remains (every send
+// seam seals through the actor via `build_encrypted_envelope_actor`); only the
+// send-path unit / pipeline test suites still drive this provider twin directly,
+// so it is `#[cfg(test)]`-gated until those suites relocate onto the actor seam
+// (C8). The source-text pipeline_wiring assertion scans the raw file, so the
+// gate does not affect it.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_encrypted_envelope(
     clock: &Arc<dyn Clock>,
@@ -285,8 +303,12 @@ fn build_encrypted_envelope_actor(
         message_type,
     )?;
     // §9.10.4 privacy: app-data outer `routing_id` is the 32-byte zero sentinel
-    // (see `build_encrypted_envelope`); the receiver routes on the transport key,
-    // never this field.
+    // — one sealed blob fans out to N per-member pseudonym transport addresses,
+    // so no single per-recipient value belongs here, and embedding the
+    // relay-derivable `context_routing_id` would leak a correlator to the relay.
+    // The all-zero value is a RESERVED/forbidden pseudonym that cannot collide
+    // with a real routing ID; the receiver routes on the transport key and never
+    // reads this field for app-data.
     let routing_id = [0u8; 32];
     crypto_state.seal(
         &context_id_bytes,
@@ -1782,41 +1804,33 @@ pub async fn encrypt_and_send(
         // The key and stamped persona travel together in the one `MessageSigner`
         // straight into the single stamp+sign site, so they cannot diverge.
         //
-        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): when the caller supplies the
-        // field-granular Class-C `&mut ContextCryptoState` (the flipped seams —
-        // `send_message`), seal through the actor's crypto state
-        // ([`build_encrypted_envelope_actor`]). The `&PerContextState`-shared
-        // sync-prelude paths (`send_checkpoint` / `send_heartbeat`) pass `None`
-        // and use the RETAINED provider seal until the C4 send-cluster flip
-        // re-homes them ahead of the C6 provider-copy deletion. Both paths are
-        // byte-identical (shared `build_inner_wire`).
-        let result = match crypto_state {
-            Some(cs) => build_encrypted_envelope_actor(
-                &deps.clock,
-                cs,
-                deps.crypto.local_did(),
-                context_id,
-                sender_did,
-                payload,
-                signer,
-                recipients_data,
-                sequence,
-                source_provenance,
-                message_type,
-            )?,
-            None => build_encrypted_envelope(
-                &deps.clock,
-                &deps.crypto,
-                context_id,
-                sender_did,
-                payload,
-                signer,
-                recipients_data,
-                sequence,
-                source_provenance,
-                message_type,
-            )?,
-        };
+        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor's OWNED
+        // field-granular Class-C `&mut ContextCryptoState`
+        // ([`build_encrypted_envelope_actor`]) — every non-broadcast send seam
+        // (`send_message` / `send_checkpoint` / `send_heartbeat`) now supplies it.
+        // The provider `build_encrypted_envelope` twin is deleted. This else-branch
+        // is only reached for a non-broadcast encrypted send (a broadcast send took
+        // the pre-built-envelope branch above), so a `None` crypto state means a
+        // non-broadcast context with no MLS group — fail closed.
+        let cs = crypto_state.ok_or_else(|| {
+            ContextError::CryptoFailed(
+                "no MLS crypto state for encrypted send (non-broadcast context has no group)"
+                    .to_string(),
+            )
+        })?;
+        let result = build_encrypted_envelope_actor(
+            &deps.clock,
+            cs,
+            deps.crypto.local_did(),
+            context_id,
+            sender_did,
+            payload,
+            signer,
+            recipients_data,
+            sequence,
+            source_provenance,
+            message_type,
+        )?;
         crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
         result
     };
@@ -3093,20 +3107,21 @@ pub fn decrypt_and_dispatch(
     encrypted_blob: &[u8],
 ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
     let decrypt_start = std::time::Instant::now();
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): when the caller supplies the
-    // field-granular Class-C `&mut ContextCryptoState` (the flipped receive seam,
-    // driven from `deliver_incoming`'s `ClassCMut` view), open through the actor's
-    // crypto state (byte-identical to the provider `open`, per the 16 golden
-    // tests). Test / not-yet-flipped callers pass `None` and use the RETAINED
-    // provider `open` until the C6 provider-copy deletion. `process_incoming_sender_key`
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
+    // field-granular Class-C `&mut ContextCryptoState` (driven from
+    // `deliver_incoming`'s `ClassCMut` view) — byte-identical to the deleted
+    // provider `open` twin (the 16 golden tests hold). `process_incoming_sender_key`
     // + `set_sender_key_unchecked` below stay on the provider (receive-side, NOT
-    // in the delete set), and `local_did` is likewise retained.
-    let open_result = match crypto_state {
-        Some(cs) => cs.open(&*deps.clock, context_id_bytes, context_id, encrypted_blob)?,
-        None => deps
-            .crypto
-            .open(context_id_bytes, context_id, encrypted_blob)?,
-    };
+    // in the delete set), and `local_did` is likewise retained. A `None` crypto
+    // state means a context with no MLS group (a broadcast context, which never
+    // reaches this MLS-decrypt path — its receive path is author-signed) — fail
+    // closed, matching the deleted provider `open`'s "no MLS group" error.
+    let cs = crypto_state.ok_or_else(|| {
+        ContextError::CryptoFailed(
+            "no MLS crypto state for decrypt (context has no group)".to_string(),
+        )
+    })?;
+    let open_result = cs.open(&*deps.clock, context_id_bytes, context_id, encrypted_blob)?;
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {
