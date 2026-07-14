@@ -141,10 +141,12 @@ pub struct StreamEntry {
     /// escrow reserve (`cost_per_chunk × grant`). `Amount(0)` for Query /
     /// zero-cost outlets (no top-up).
     cost_per_chunk: scp_core::economy::Amount,
-    /// Per-stream monotonic grant counter (§5.4.5 `monotonic_seq`, starts at 0).
-    /// The bridge assigns each internally-signed grant a strictly-increasing
-    /// value via `fetch_add`, so callers never track or forge it.
-    grant_seq: std::sync::atomic::AtomicU64,
+    // NOTE: the §5.4.5 `monotonic_seq` grant counter is NOT held here. It lives
+    // exclusively in durable `Storage` under
+    // `context/{context_id}/stream_credit_counter/{request_id}` (SCP-OUT-034
+    // AC31) so it survives an SDK restart mid-stream and never regresses.
+    // `grant_credit` reads/increments/persists it via
+    // `ProtocolRepoVariant::next_stream_credit_seq`.
 }
 
 // ---------------------------------------------------------------------------
@@ -652,9 +654,6 @@ pub(crate) async fn outlet_stream_open_impl(
             request_id,
             stream_epoch,
             cost_per_chunk,
-            // §5.4.5 `monotonic_seq` starts at 0; the first grant's `fetch_add`
-            // returns 0, the next 1, and so on — strictly increasing.
-            grant_seq: std::sync::atomic::AtomicU64::new(0),
         },
     );
     Ok(handle_id)
@@ -730,12 +729,24 @@ pub(crate) async fn outlet_stream_poll_next_impl(
 /// Grants `grant` additional billable chunks of credit to a live stream. The
 /// bridge SIGNS the [`OutletStreamCredit`] INTERNALLY under the pinned invoker's
 /// custody key (mirroring how `cancel` signs internally) and auto-assigns the
-/// §5.4.5 `monotonic_seq` from the per-`StreamEntry` counter — so no SDK ever
+/// §5.4.5 `monotonic_seq` from a DURABLE per-stream cursor — so no SDK ever
 /// needs the invoker key (ADR-006) or a caller-tracked replay counter, and the
 /// public surface is a plain `u32`.
 ///
 /// CRITICAL #1: rejects a `caller_did` that is not the pinned invoker with
 /// `SCP-PERM-3001` before touching runtime state.
+///
+/// # Crash-safe `monotonic_seq` (SCP-OUT-034 AC31)
+///
+/// The seq is sourced from durable `Storage` under
+/// `context/{context_id}/stream_credit_counter/{request_id}` via
+/// [`ProtocolRepoVariant::next_stream_credit_seq`](scp_ffi_common::bridge_runtime::ProtocolRepoVariant::next_stream_credit_seq),
+/// NOT an in-memory counter: read the cursor, persist `+1` before signing, use
+/// the pre-increment value. An SDK restart mid-stream reloads the persisted
+/// cursor, so a resumed grant's seq is strictly greater than any prior in-flight
+/// value and the runtime `CreditTracker` never rejects it as `CreditReplay`. The
+/// read-modify-write and the grant apply run under the SAME per-stream control
+/// lock, so concurrent self-grants receive strictly-ordered seqs.
 ///
 /// # Escrow / money-conservation
 ///
@@ -766,19 +777,10 @@ pub(crate) async fn outlet_stream_grant_credit_impl(
 
     // Look up the live stream, verify caller == pinned invoker (CRITICAL #1), and
     // copy/clone every pinned field the credit preimage + reserve need OUT of the
-    // DashMap shard guard so no ref is held across the `.await`. The monotonic
-    // grant counter is bumped here under the guard (a sync atomic op) — the first
-    // grant gets seq 0.
-    let (
-        handle,
-        context_id,
-        outlet_id,
-        caveats_binding,
-        request_id,
-        stream_epoch,
-        cost_per_chunk,
-        monotonic_seq,
-    ) = {
+    // DashMap shard guard so no ref is held across the `.await`. The
+    // `monotonic_seq` is NOT assigned here — it comes from the durable per-stream
+    // cursor below (SCP-OUT-034 AC31).
+    let (handle, context_id, outlet_id, caveats_binding, request_id, stream_epoch, cost_per_chunk) = {
         let entry = bi
             .outlet_stream_registry
             .get(handle_id)
@@ -786,9 +788,6 @@ pub(crate) async fn outlet_stream_grant_credit_impl(
         if caller_did != entry.invoker_did {
             return Err(caller_not_invoker_err(caller_did, &entry.invoker_did));
         }
-        let monotonic_seq = entry
-            .grant_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (
             Arc::clone(&entry.handle),
             entry.context_id.clone(),
@@ -797,14 +796,40 @@ pub(crate) async fn outlet_stream_grant_credit_impl(
             entry.request_id,
             entry.stream_epoch,
             entry.cost_per_chunk,
-            monotonic_seq,
         )
     };
 
     // Resolve the invoker's custody-backed signer (the key never enters the
     // runtime address space — ADR-006). Done off the DashMap ref.
     let signer = resolve_stream_signer(bi, caller_did).await?;
-    // §5.4.5 SCP-OUTLET-CREDIT-V1 preimage over the pinned stream identity.
+
+    let supervisor = Arc::clone(bi.context_manager_or_error()?);
+    let invoker_did_typed: scp_did::DID = caller_did.to_owned().into();
+
+    // Hold the per-stream control lock across the WHOLE grant — the durable seq
+    // read-modify-write, the sign, the reserve, and the apply. This serializes
+    // seq-assign with apply so two concurrent self-grants receive
+    // strictly-ordered seqs; the data plane uses the SEPARATE `receiver` lock, so
+    // a `poll_next` parked awaiting a chunk is never blocked by this hold.
+    let handle_guard = handle.lock().await;
+
+    // 0. Crash-safe `monotonic_seq` (SCP-OUT-034 AC31): read the durable
+    //    per-stream cursor on this instance's `Storage` backend, persist `+1`
+    //    BEFORE signing, and use the pre-increment value. An SDK restart
+    //    mid-stream reloads the persisted cursor, so a resumed grant's seq never
+    //    regresses below any prior in-flight value and the runtime
+    //    `CreditTracker` never rejects it as `CreditReplay`.
+    let monotonic_seq = bi
+        .protocol_repository
+        .next_stream_credit_seq(&context_id, &request_id)
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("failed to assign durable monotonic_seq: {e}"),
+            code: codes::CTX_2001.to_owned(),
+        })?;
+
+    // §5.4.5 SCP-OUTLET-CREDIT-V1 preimage over the pinned stream identity (now
+    // that the durable seq is known).
     let preimage = compute_credit_sig_preimage(
         &context_id,
         &outlet_id,
@@ -814,9 +839,6 @@ pub(crate) async fn outlet_stream_grant_credit_impl(
         stream_epoch,
         &caveats_binding,
     );
-
-    let supervisor = Arc::clone(bi.context_manager_or_error()?);
-    let invoker_did_typed: scp_did::DID = caller_did.to_owned().into();
 
     // 1. Sign the credit grant through custody.
     let sig = signer
@@ -853,7 +875,10 @@ pub(crate) async fn outlet_stream_grant_credit_impl(
     //    logged-and-swallowed (the original grant error is the caller-facing
     //    outcome); the reverse is applied IN MEMORY regardless of the persist
     //    outcome (`commit_class_s_keep`), so the credit is never lost.
-    let apply = handle.lock().await.apply_credit_grant(&credit, reserved);
+    //    Applied under the already-held `handle_guard` — never re-lock `handle`
+    //    (the tokio `Mutex` is not reentrant, so a second `handle.lock().await`
+    //    would deadlock).
+    let apply = handle_guard.apply_credit_grant(&credit, reserved);
     match apply {
         Ok(_new_total) => Ok(()),
         Err(grant_err) => {

@@ -240,6 +240,62 @@ impl MerkleEventLogProvider {
         }
     }
 
+    /// Appends an [`OutletInvokedEvent`] after enforcing the FULL §5.4.5:566
+    /// manifest-derived `chunks_billed` wire-invariant.
+    ///
+    /// Unlike the raw [`append_event`](ContextEventLogProvider::append_event)
+    /// boundary — which holds only the opaque event and can enforce nothing
+    /// stronger than the event-local `chunks_billed <= stream_chunk_count`
+    /// backstop — this entry point re-derives the manifest root + billable
+    /// count from the caller-supplied [`ChunksBilledSource`] (a retained chunk
+    /// sequence or the ADR-061 O(log n) frontier) and rejects the event at
+    /// log-insert time if the recorded aggregates diverge. On success it
+    /// serializes the event and delegates to `append_event`, which re-runs the
+    /// durable event-local backstop.
+    ///
+    /// [`OutletInvokedEvent`]:
+    ///     scp_protocol::context::outlets::lifecycle::OutletInvokedEvent
+    /// [`ChunksBilledSource`]: crate::context::outlets::stream::ChunksBilledSource
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the manifest
+    /// verification rejects the event (the wire-layer `ChunksBilledMismatch`),
+    /// when the event cannot be serialized, or when the underlying append
+    /// fails (e.g. no log initialized for the context).
+    pub async fn append_outlet_invoked_verified(
+        &self,
+        context_id: &[u8; 32],
+        event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+        source: crate::context::outlets::stream::ChunksBilledSource<'_>,
+        actor_did: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        // (1) FULL §5.4.5:566 manifest-derived equality — the tighter check the
+        // opaque `append_event` boundary cannot make. Wire-reject on mismatch.
+        crate::context::outlets::stream::verify_outlet_invoked_event_manifest(event, source)
+            .map_err(|err| {
+                let log_err =
+                    crate::context::outlets::stream::chunks_billed_error_to_event_log_error(err);
+                ContextCreationError::EventLogFailed(log_err.to_string())
+            })?;
+        // (2) Serialize and append through the standard boundary, which
+        // re-runs the durable event-local `<=` backstop.
+        let data = serde_json::to_vec(event).map_err(|e| {
+            ContextCreationError::EventLogFailed(format!(
+                "failed to serialize OutletInvokedEvent: {e}"
+            ))
+        })?;
+        self.append_event(
+            context_id,
+            EventType::OutletInvoked,
+            actor_did,
+            EventPayload { data },
+            timestamp_secs,
+        )
+        .await
+    }
+
     /// Returns the events for a context, if a log exists.
     ///
     /// Useful for auditing and verification. Returns `None` if no log
@@ -916,6 +972,7 @@ mod tests {
             chunks_billed,
             stream_manifest_hash: [0x11; 32],
             stream_terminal_status: StreamTerminalStatus::Ok,
+            cancel_ack_seq: None,
             audit_anomaly: None,
         };
         EventPayload {
@@ -986,6 +1043,194 @@ mod tests {
             .await
             .expect("chunks_billed == stream_chunk_count must append");
         assert_eq!(provider.entries(&ctx_id).unwrap().len(), 2);
+    }
+
+    /// Builds an `OutletStreamChunk` carrying a `Data` payload at `seq`.
+    fn stream_data_chunk(seq: u64) -> scp_protocol::context::outlets::stream::OutletStreamChunk {
+        scp_protocol::context::outlets::stream::OutletStreamChunk {
+            request_id: [0x33; 16],
+            sequence: seq,
+            payload: scp_protocol::context::outlets::stream::ChunkPayload::Data {
+                value: serde_json::json!({ "v": seq }),
+            },
+            sig: [0u8; 64],
+        }
+    }
+
+    /// Builds an `OutletStreamChunk` carrying a non-billable `Progress`
+    /// payload at `seq`.
+    fn stream_progress_chunk(
+        seq: u64,
+    ) -> scp_protocol::context::outlets::stream::OutletStreamChunk {
+        scp_protocol::context::outlets::stream::OutletStreamChunk {
+            request_id: [0x33; 16],
+            sequence: seq,
+            payload: scp_protocol::context::outlets::stream::ChunkPayload::Progress {
+                pct: 5_000,
+                note: None,
+            },
+            sig: [0u8; 64],
+        }
+    }
+
+    /// Builds an `OutletStreamChunk` carrying a terminal `End` payload at
+    /// `seq`.
+    fn stream_end_chunk(seq: u64) -> scp_protocol::context::outlets::stream::OutletStreamChunk {
+        use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+        scp_protocol::context::outlets::stream::OutletStreamChunk {
+            request_id: [0x33; 16],
+            sequence: seq,
+            payload: scp_protocol::context::outlets::stream::ChunkPayload::End {
+                aggregate: serde_json::Value::Null,
+                provenance: DataProvenance {
+                    source_context: "ctx-test".to_owned(),
+                    source_type: SourceType::Persistent,
+                    counterparties: Vec::new(),
+                    purpose: None,
+                    discovery_method: DiscoveryMethod::OutOfBand,
+                    age: std::time::Duration::from_secs(0),
+                    memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                    chain_depth: 0,
+                    chain_path: None,
+                    payment_amount: None,
+                    payment_adapter: None,
+                    payment_receipt_id: None,
+                },
+                execution_time_ms: 0,
+            },
+            sig: [0u8; 64],
+        }
+    }
+
+    /// Builds an `OutletInvokedEvent` for the manifest-verified append path.
+    #[allow(clippy::too_many_arguments)]
+    fn manifest_invoked_event(
+        stream_chunk_count: u32,
+        chunks_billed: u32,
+        stream_manifest_hash: [u8; 32],
+        cancel_ack_seq: Option<u64>,
+    ) -> scp_protocol::context::outlets::lifecycle::OutletInvokedEvent {
+        use scp_protocol::context::outlets::OutletStatus;
+        use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
+        use scp_protocol::context::outlets::stream::StreamTerminalStatus;
+        OutletInvokedEvent {
+            request_id: "00000000000000000000000000000001".to_owned(),
+            outlet_id: "outlet-x".to_owned(),
+            invoker_did: scp_did::DID("did:dht:z6MkInvoker".to_owned()),
+            status: OutletStatus::Success,
+            execution_time_ms: 5,
+            input_hash: "0".repeat(64),
+            output_hash: None,
+            cost: None,
+            stream_chunk_count,
+            chunks_billed,
+            stream_manifest_hash,
+            stream_terminal_status: StreamTerminalStatus::Ok,
+            cancel_ack_seq,
+            audit_anomaly: None,
+        }
+    }
+
+    /// **034 AC22** — `append_outlet_invoked_verified` re-derives the FULL
+    /// §5.4.5:566 manifest-derived `chunks_billed` reference from the retained
+    /// chunk `Sequence` and wire-rejects an event whose recorded `chunks_billed`
+    /// diverges, appending NO event; a corrected event then appends.
+    ///
+    /// Fixture: 10 chunks = 8 `Data` (seq 0..8) + `Progress`@8 + `End`@9, with
+    /// `cancel_ack_seq = Some(5)` ⇒ billable `Data` with `seq <= 5` = 6.
+    #[tokio::test]
+    async fn append_outlet_invoked_verified_rejects_wrong_chunks_billed_034_ac22() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [22u8; 32];
+        provider.init_event_log(&ctx_id).await.unwrap();
+
+        // 8 Data (seq 0..8) + Progress@8 + End@9 = 10 chunks total.
+        let mut chunks: Vec<_> = (0..8).map(stream_data_chunk).collect();
+        chunks.push(stream_progress_chunk(8));
+        chunks.push(stream_end_chunk(9));
+        assert_eq!(chunks.len(), 10);
+        let root = scp_protocol::context::outlets::stream::compute_chunk_manifest_root(&chunks)
+            .expect("manifest root");
+
+        // WRONG chunks_billed = 8; the manifest-derived reference is 6.
+        let bad_event = manifest_invoked_event(10, 8, root, Some(5));
+        let err = provider
+            .append_outlet_invoked_verified(
+                &ctx_id,
+                &bad_event,
+                crate::context::outlets::stream::ChunksBilledSource::Sequence(&chunks),
+                "did:dht:z6MkInvoker",
+                1_700_000_000,
+            )
+            .await
+            .expect_err("recorded chunks_billed=8 diverges from manifest reference=6");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunks_billed mismatch"),
+            "error must surface the §5.4.5 ChunksBilledMismatch: {msg}"
+        );
+        assert!(
+            msg.contains("recorded=8") && msg.contains("reference=6"),
+            "error must carry recorded=8 / reference=6: {msg}"
+        );
+        // No event was appended — the log has no entries.
+        assert!(
+            provider.entries(&ctx_id).unwrap().is_empty(),
+            "wire-rejected event must not be appended"
+        );
+
+        // Corrected chunks_billed = 6 (the manifest reference) now appends.
+        let good_event = manifest_invoked_event(10, 6, root, Some(5));
+        provider
+            .append_outlet_invoked_verified(
+                &ctx_id,
+                &good_event,
+                crate::context::outlets::stream::ChunksBilledSource::Sequence(&chunks),
+                "did:dht:z6MkInvoker",
+                1_700_000_000,
+            )
+            .await
+            .expect("corrected event whose chunks_billed==manifest reference must append");
+        assert_eq!(
+            provider.entries(&ctx_id).unwrap().len(),
+            1,
+            "corrected event appended exactly once"
+        );
+    }
+
+    /// **034 AC21** — the `chunks_billed <= stream_chunk_count` invariant holds
+    /// for a correctly-built streaming event AND the FULL manifest verification
+    /// accepts it (the positive path of AC22): billable count (6) never exceeds
+    /// the total chunk count (10), and the manifest root + leaf count match.
+    #[tokio::test]
+    async fn append_outlet_invoked_verified_accepts_well_formed_event_034_ac21() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [21u8; 32];
+        provider.init_event_log(&ctx_id).await.unwrap();
+
+        let mut chunks: Vec<_> = (0..8).map(stream_data_chunk).collect();
+        chunks.push(stream_progress_chunk(8));
+        chunks.push(stream_end_chunk(9));
+        let root = scp_protocol::context::outlets::stream::compute_chunk_manifest_root(&chunks)
+            .expect("manifest root");
+
+        let event = manifest_invoked_event(10, 6, root, Some(5));
+        // Invariant: billable subset never exceeds the total.
+        assert!(
+            event.chunks_billed <= event.stream_chunk_count,
+            "chunks_billed (6) must be <= stream_chunk_count (10)"
+        );
+        provider
+            .append_outlet_invoked_verified(
+                &ctx_id,
+                &event,
+                crate::context::outlets::stream::ChunksBilledSource::Sequence(&chunks),
+                "did:dht:z6MkInvoker",
+                1_700_000_000,
+            )
+            .await
+            .expect("well-formed manifest-consistent event must append");
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 1);
     }
 
     /// §5.4.5 C1: the unary saga's `OutletInvoked` join-record payload (a

@@ -67,7 +67,8 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::VerifyingKey;
 use scp_protocol::context::outlets::error_codes;
 use scp_protocol::context::outlets::stream::{
-    ChunkPayload, MlsEpoch, OutletStreamChunk, OutletStreamCredit, verify_credit_signature,
+    ChunkPayload, MlsEpoch, OutletStreamChunk, OutletStreamCredit, compute_chunk_manifest_root,
+    verify_credit_signature,
 };
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
@@ -1037,10 +1038,16 @@ impl CancelAckTracker {
 
     /// Records `OutletCancel` arrival. `next_seq` is the next-to-emit
     /// sequence at the moment of arrival and becomes the cancel-ack
-    /// billing ceiling. The §5.4.5 predicate is inclusive: a chunk is
-    /// billable when `sequence <= ceiling`, so the chunk AT the ceiling
-    /// (`sequence == next_seq`) IS billable; only chunks strictly above
-    /// it (`sequence > next_seq`) are NOT billable. See
+    /// sequence (`cancel_ack_seq`). Per §5.4.5:530(3) that sequence slot
+    /// belongs to the **terminal cancel-ack chunk**, and per §5.4.5:530(1)
+    /// any `Data`/`Progress` still in flight at `sequence >= cancel_ack_seq`
+    /// is dropped-and-not-billed by the pump gate
+    /// ([`super::invoke::apply_stream_chunk_gate`], `>=` boundary). The
+    /// §5.4.5:558/563 `chunks_billed` formula
+    /// (`compute_chunks_billed_ref`) stays **inclusive** (`sequence <=
+    /// cancel_ack_seq`); it yields the correct count because the sealed
+    /// manifest carries only `Data` at `sequence < cancel_ack_seq` (the
+    /// cancel-ack slot holds the non-`Data` terminal). See
     /// [`Self::billing_ceiling`] and `compute_chunks_billed_ref`.
     ///
     /// Idempotent: a second `OutletCancel` after the first is a
@@ -1560,6 +1567,98 @@ pub const fn verify_outlet_invoked_event_local(
         });
     }
     Ok(())
+}
+
+// =====================================================================
+// Full manifest-derived wire-invariant — §5.4.5:566 equality
+// =====================================================================
+
+/// Source from which the full §5.4.5:566 manifest-derived `chunks_billed`
+/// reference is re-derived at log-insert time.
+///
+/// `Copy` (both variants hold only a shared slice + `Copy` scalars) so the
+/// verification entry points take it by value without a borrow dance.
+#[derive(Clone, Copy)]
+pub enum ChunksBilledSource<'a> {
+    /// A retained chunk sequence (one-shot 2-chunk manifest, xctx reassembly,
+    /// import). The reference is recomputed by re-hashing leaves and counting
+    /// `@type == "data"` at/below the cancel-ack ceiling.
+    Sequence(&'a [OutletStreamChunk]),
+    /// The O(log n) frontier the dispatch pump retains (ADR-061) instead of
+    /// the payload set: the running root + billed/leaf counts.
+    Frontier {
+        /// RFC-6962 manifest root the pump folded over the emitted sequence.
+        root: [u8; 32],
+        /// Billable `Data`-chunk count at/below the cancel-ack ceiling.
+        billed_count: u64,
+        /// Total leaf (chunk) count including the terminal chunk.
+        leaf_count: u64,
+    },
+}
+
+/// Enforces the FULL §5.4.5:566 `chunks_billed` equality (manifest root +
+/// sealed sequence + cancel-ack) that [`verify_outlet_invoked_event_local`]
+/// (the event-local `<=` backstop) cannot.
+///
+/// For [`ChunksBilledSource::Sequence`], re-derives `chunks_billed_ref` via
+/// [`verify_chunks_billed`] AND checks
+/// `stream_manifest_hash == compute_chunk_manifest_root(chunks)` and
+/// `stream_chunk_count == chunks.len()`. For [`ChunksBilledSource::Frontier`],
+/// checks the event's three stream aggregates equal the frontier's.
+///
+/// # Errors
+///
+/// Returns [`ChunksBilledError::ChunksBilledMismatch`] when the recorded
+/// `chunks_billed` disagrees with the manifest-derived reference, when the
+/// recorded manifest root / leaf count diverge from the re-derived (or
+/// frontier-carried) values, or when the chunk sequence cannot be
+/// JCS-canonicalized into a manifest root. The runtime MUST refuse the event
+/// at log-insert time per the §5.4.5 wire-layer rejection rule.
+pub fn verify_outlet_invoked_event_manifest(
+    event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+    source: ChunksBilledSource<'_>,
+) -> Result<(), ChunksBilledError> {
+    match source {
+        ChunksBilledSource::Sequence(chunks) => {
+            // (1) Full manifest-derived `chunks_billed` equality — the tighter
+            // check the event-local backstop cannot make.
+            verify_chunks_billed(chunks, event.chunks_billed, event.cancel_ack_seq)?;
+            // The manifest-derived reference for divergence reporting below.
+            // Equal to `event.chunks_billed` once (1) passes.
+            let reference =
+                compute_chunks_billed_ref(chunks, event.cancel_ack_seq.unwrap_or(u64::MAX));
+            let mismatch = || ChunksBilledError::ChunksBilledMismatch {
+                recorded: event.chunks_billed,
+                reference,
+            };
+            // (2) Manifest root + sealed-sequence binding: the recorded root
+            // and leaf count MUST match what re-hashing the sequence yields.
+            let root = compute_chunk_manifest_root(chunks).map_err(|_jcs_err| mismatch())?;
+            let leaf_count = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
+            if event.stream_manifest_hash != root
+                || u64::from(event.stream_chunk_count) != leaf_count
+            {
+                return Err(mismatch());
+            }
+            Ok(())
+        }
+        ChunksBilledSource::Frontier {
+            root,
+            billed_count,
+            leaf_count,
+        } => {
+            if event.stream_manifest_hash != root
+                || u64::from(event.chunks_billed) != billed_count
+                || u64::from(event.stream_chunk_count) != leaf_count
+            {
+                return Err(ChunksBilledError::ChunksBilledMismatch {
+                    recorded: event.chunks_billed,
+                    reference: u32::try_from(billed_count).unwrap_or(u32::MAX),
+                });
+            }
+            Ok(())
+        }
+    }
 }
 
 // =====================================================================
@@ -2449,6 +2548,7 @@ mod tests {
             chunks_billed,
             stream_manifest_hash: [0u8; 32],
             stream_terminal_status: StreamTerminalStatus::Ok,
+            cancel_ack_seq: None,
             audit_anomaly: None,
         }
     }
@@ -2506,30 +2606,29 @@ mod tests {
 
     #[test]
     fn billing_integration_mid_stream_cancel_at_seq_5() {
-        // 8 Data chunks delivered, OutletCancel arrives at next-to-emit
-        // seq = 5 (so chunks 0..=4 are billable, 5..=7 are NOT).
+        // 034 AC24: an executor produces 8 Data, but an OutletCancel arrives
+        // at the next-to-emit cursor 5, so `cancel_ack_seq = 5`. Per
+        // §5.4.5:530(3) that sequence slot belongs to the TERMINAL cancel-ack
+        // chunk, and per §5.4.5:530(1) the pump gate
+        // (`apply_stream_chunk_gate`, `sequence >= cancel_ack_seq`) drops the
+        // 3 post-cancel in-flight Data (seq 5,6,7) without billing them. So
+        // the SEALED MANIFEST the runtime actually commits is `Data[0..5]`
+        // followed by the terminal `End` AT seq 5 — no Data ever occupies the
+        // cancel-ack slot. The §5.4.5:558/563 `chunks_billed` formula stays
+        // INCLUSIVE (`i <= cancel_ack_seq`); over this spec-compliant sealed
+        // manifest it counts the 5 Data at seq 0..4 (the `End` at seq 5 is
+        // non-Data) and yields 5 with `cancel_ack_seq = 5` — no fudge to 4.
         let mut chunks = Vec::new();
-        for i in 0..8 {
+        for i in 0..5 {
             chunks.push(make_data_chunk(i));
         }
-        chunks.push(make_end_chunk(8));
-        // The runtime would emit terminal at seq 8; cancel-ack-seq
-        // is set to 5 by record_cancel(5, _). Per §5.4.5, chunks
-        // with sequence <= 5 are billable (5 Data chunks: indices 0..=4
-        // with sequence 0..=4). Note "<=5" includes seq 5, but seq 5 is
-        // a Data chunk in this fixture, so the count is 6 if we include it.
-        // The spec text says "chunks already in flight at that
-        // sequence are NOT counted as billable above the cutoff" —
-        // the cutoff is `cancel_ack_seq` (next-to-emit at moment of
-        // arrival). Per the predicate `i <= cancel_ack_seq`, chunks
-        // with index 0..=cancel_ack_seq are billable, exclusive of
-        // anything beyond. The predicate from §5.4.5 line 726 reads
-        // `i <= cancel_ack_seq`, so seq 5 IS included.
-        // For the round-3 AC "chunks_billed=5 (not 8)" the cutoff
-        // must be cancel_ack_seq=4 (i.e., 0..=4 inclusive = 5 chunks).
-        // Use cancel_ack_seq = 4 to model "5 billable chunks".
-        let count = compute_chunks_billed_ref(&chunks, 4);
-        assert_eq!(count, 5);
+        // Terminal cancel-ack chunk occupies `cancel_ack_seq` (= 5).
+        chunks.push(make_end_chunk(5));
+        let count = compute_chunks_billed_ref(&chunks, 5);
+        assert_eq!(
+            count, 5,
+            "inclusive i<=5 over the sealed manifest (Data seq 0..4 + terminal End at seq 5) = 5"
+        );
     }
 
     #[test]

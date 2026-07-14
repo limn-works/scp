@@ -748,6 +748,7 @@ pub(crate) fn build_outlet_event(
         chunks_billed: 0,
         stream_manifest_hash: [0u8; 32],
         stream_terminal_status: StreamTerminalStatus::Ok,
+        cancel_ack_seq: None,
         audit_anomaly: None,
     }
 }
@@ -2449,8 +2450,9 @@ pub async fn one_shot_to_stream(value: serde_json::Value, tx: &mpsc::Sender<Chun
 ///
 /// Consulted under the shared session lock. `Forward` is the happy
 /// path (decrement credit, optionally accrue escrow). `Stall` arms
-/// the credit-stall timer. `DropAboveCancelAck` silently drops the
-/// chunk per §5.4.5 cancel-ack ceiling.
+/// the credit-stall timer. `DropAboveCancelAck` silently drops a
+/// non-terminal chunk at OR above the cancel-ack sequence (§5.4.5:530 —
+/// the cancel-ack slot belongs to the terminal chunk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamGateOutcome {
     /// Chunk passes the gate — caller forwards it and advances seq.
@@ -2458,7 +2460,9 @@ pub enum StreamGateOutcome {
     /// Credit exhausted. Caller arms the stall timer and parks the
     /// chunk until a fresh grant arrives.
     Stall,
-    /// Cancel-ack ceiling exceeded. Caller drops without billing.
+    /// Non-terminal chunk at or above the cancel-ack sequence. Caller
+    /// drops it without billing or advancing the emission cursor, so the
+    /// terminal cancel-ack chunk lands on `cancel_ack_seq` (§5.4.5:530(3)).
     DropAboveCancelAck,
     /// §5.4.5:758 cumulative billable ceiling reached — the stream has
     /// already emitted `min(credit_window, max_calls)` billable Data
@@ -2493,8 +2497,20 @@ pub const fn is_billable_chunk(chunk: &OutletStreamChunk, ceiling: u64) -> bool 
 /// chunks:
 ///
 /// 1. Compare `chunk.sequence` against
-///    [`super::stream::CancelAckTracker::billing_ceiling`] —
-///    chunks above the ceiling return [`StreamGateOutcome::DropAboveCancelAck`].
+///    [`super::stream::CancelAckTracker::billing_ceiling`] — non-terminal
+///    chunks at OR above the cancel-ack sequence return
+///    [`StreamGateOutcome::DropAboveCancelAck`]. The boundary is `>=`, not
+///    `>`, because §5.4.5:530(3) reserves the cancel-ack sequence slot for
+///    the terminal cancel-ack chunk: after a cancel, `cancel_ack_seq` is the
+///    next-to-emit cursor, the framework's terminal chunk takes exactly that
+///    sequence, and any in-flight `Data`/`Progress` the executor emits at
+///    `sequence >= cancel_ack_seq` is dropped-and-not-billed (§5.4.5:530(1)
+///    "chunks already in flight at that sequence are NOT counted as
+///    billable"). An uncancelled stream's ceiling is `u64::MAX`, so `>=`
+///    never fires on it. This keeps the §5.4.5:558/563 **inclusive**
+///    `chunks_billed` formula unchanged while guaranteeing the sealed
+///    manifest never carries a billable `Data` at the cancel-ack slot (the
+///    terminal is there), so the inclusive count correctly excludes it.
 /// 2. §5.4.5:758 cumulative ceiling: if the chunk is billable (a `Data`
 ///    chunk at/below the cancel-ack ceiling) AND the §5.4.5:758
 ///    cumulative ceiling has already been reached
@@ -2524,7 +2540,14 @@ pub fn apply_stream_chunk_gate(
         return StreamGateOutcome::Forward;
     }
     let ceiling = cancel_ack.billing_ceiling();
-    if chunk.sequence > ceiling {
+    // §5.4.5:530(3): the terminal cancel-ack chunk occupies `cancel_ack_seq`
+    // (== the pinned next-to-emit cursor). Any non-terminal chunk the
+    // executor emits at `sequence >= cancel_ack_seq` is a post-cancel
+    // in-flight chunk that MUST be dropped-and-not-billed (§5.4.5:530(1)) —
+    // dropping it here (a no-op that does not advance the emission cursor)
+    // lets the terminal cancel-ack chunk land on `cancel_ack_seq`. For an
+    // uncancelled stream `ceiling == u64::MAX`, so this never fires.
+    if chunk.sequence >= ceiling {
         return StreamGateOutcome::DropAboveCancelAck;
     }
     // §5.4.5:758 cumulative billable ceiling. Only billable (Data,
@@ -3650,6 +3673,9 @@ where
             // from — the frontier IS the tally — so no anomaly is possible
             // here.
             None,
+            // Inner invoke pump does not process `OutletCancel` — it has no
+            // cancel-ack ceiling, so the billing ceiling is `u64::MAX`.
+            None,
         );
         sink.record(event);
     }
@@ -3774,20 +3800,52 @@ pub(crate) fn build_streaming_outlet_event(
     // and for the inner-invoke pump (which does not maintain a separate
     // running tally to diverge from).
     audit_anomaly: Option<scp_protocol::context::outlets::lifecycle::AuditAnomaly>,
+    // §5.4.5:558-566 cancel-ack billing ceiling. `Some(seq)` records the
+    // pinned cancel-ack sequence written into the event alongside
+    // `stream_terminal_status` (the highest `Data`-chunk sequence still
+    // billable). `None` when the stream terminated without a cancel-ack, in
+    // which case the §5.4.5 predicate ceiling is `u64::MAX`.
+    cancel_ack_seq: Option<u64>,
 ) -> OutletInvokedEvent {
+    // §5.4.5:578 — a stream closed by a *graceful* cancel-ack (an
+    // `OutletCancel` was observed AND the executor delivered a normal `End`
+    // within the cancel-ack window) records the dedicated `Cancelled`
+    // terminal status rather than `Ok`, so the audit record distinguishes a
+    // cancellation from an uncancelled completion. A cancel that instead
+    // closes via a terminal `Error` (an executor error, or the
+    // `SCP-OUTLET-6135` cancel-ack-timeout) keeps `Error(code)` — the failure
+    // is the more informative status and AC13 expects `6135` there.
+    // `cancel_ack_seq.is_some()` witnesses "a cancel was observed"; the
+    // inner-invoke pump passes `None` and therefore never reports `Cancelled`.
+    let (legacy_status, terminal_status) = match (cancel_ack_seq, &terminal.terminal_status) {
+        (Some(_), StreamTerminalStatus::Ok) => {
+            (OutletStatus::Cancelled, StreamTerminalStatus::Cancelled)
+        }
+        _ => (terminal.legacy_status, terminal.terminal_status.clone()),
+    };
     OutletInvokedEvent {
         request_id: hex::encode(request_id),
         outlet_id: outlet_id.to_owned(),
         invoker_did: invoker_did.clone(),
-        status: terminal.legacy_status,
+        status: legacy_status,
         execution_time_ms,
         input_hash,
         output_hash: terminal.output_hash.clone(),
+        // §5.4.5:570-579 defines the streaming `OutletInvokedEvent` shape
+        // with exactly the four stream fields below and NO `cost`. Per
+        // §5.4.5:555 + §19.15.5 the per-stream billed amount is recorded in
+        // the close-time `PaymentReceipt` (issued by the settlement sink),
+        // not duplicated on this event. Recording it here would put an
+        // economic value on a field the spec's event shape omits and
+        // duplicate the receipt's authoritative amount — a divergence, not a
+        // completeness fix. `cost` therefore stays `None` on the streaming
+        // path (the settlement sink at stream close owns the amount).
         cost: None,
         stream_chunk_count,
         chunks_billed,
         stream_manifest_hash,
-        stream_terminal_status: terminal.terminal_status.clone(),
+        stream_terminal_status: terminal_status,
+        cancel_ack_seq,
         audit_anomaly,
     }
 }
@@ -5589,6 +5647,407 @@ mod tests {
         assert_eq!(
             events[0].reason,
             Some(scp_protocol::context::outlets::OutletVerifiedReason::HandlerPanicked)
+        );
+    }
+
+    /// An [`OutletInvokedEventSink`] that forwards each recorded event over an
+    /// unbounded channel — a Mutex-free capture surface (Mutex is banned in
+    /// scp-runtime; the reference in-memory sinks live on other crates).
+    struct ChannelInvokedSink {
+        tx: tokio::sync::mpsc::UnboundedSender<OutletInvokedEvent>,
+    }
+
+    impl super::OutletInvokedEventSink for ChannelInvokedSink {
+        fn record(&self, event: OutletInvokedEvent) {
+            let _ = self.tx.send(event);
+        }
+    }
+
+    /// Drains every event a [`ChannelInvokedSink`] captured (call after the
+    /// stream has fully closed and the spawned task has dropped its sink).
+    fn drain_invoked_events(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutletInvokedEvent>,
+    ) -> Vec<OutletInvokedEvent> {
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// **033 AC10 / 034 AC7** — a streaming executor that outlives the timeout
+    /// is force-closed by the framework with a terminal `Error` chunk carrying
+    /// `code == SCP-OUTLET-6130` (`CODE_EXECUTION_FAULT`) and `terminal: true`.
+    ///
+    /// The framework routes the timeout under the `execution.timeout`
+    /// (`SLUG_EXECUTION_TIMEOUT`) slug — emitted on the `tracing` diagnostic;
+    /// the chunk message itself is the human-readable "timed out after {N}ms"
+    /// form (see [`build_terminal_chunk`]).
+    #[tokio::test]
+    async fn invoke_outlet_streaming_timeout_emits_terminal_fault_033_ac10_034_ac7() {
+        struct SlowStreamingExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for SlowStreamingExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                // Emit one Data chunk, then sleep well past the timeout so the
+                // framework's deadline fires before a terminal is returned.
+                let _ = tx
+                    .send(ChunkPayload::Data {
+                        value: serde_json::json!({ "tick": 0 }),
+                    })
+                    .await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(SlowStreamingExecutor);
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            Some(50), // 50ms timeout — fires before the 5s sleep.
+            executor,
+            None,
+            None,
+            None,
+            None,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        let terminal = chunks
+            .last()
+            .expect("stream must emit at least the terminal chunk");
+        match &terminal.payload {
+            ChunkPayload::Error {
+                code,
+                message,
+                terminal: is_terminal,
+            } => {
+                assert_eq!(
+                    code, CODE_EXECUTION_FAULT,
+                    "streaming timeout maps to SCP-OUTLET-6130 (CODE_EXECUTION_FAULT)"
+                );
+                assert!(*is_terminal, "timeout terminal chunk must be terminal");
+                assert!(
+                    message.contains("timed out"),
+                    "timeout terminal message describes the deadline, got: {message}"
+                );
+            }
+            other => panic!("expected terminal Error chunk on timeout, got {other:?}"),
+        }
+    }
+
+    /// **035 AC2** — a 5-chunk stream (4 `Data` + framework `End`) emits
+    /// EXACTLY ONE `OutletInvokedEvent` with `stream_chunk_count == 5`.
+    #[tokio::test]
+    async fn invoke_outlet_emits_single_event_with_chunk_count_035_ac2() {
+        struct FourDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for FourDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..4u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(FourDataExecutor);
+        let (tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: std::sync::Arc<dyn super::OutletInvokedEventSink> =
+            std::sync::Arc::new(ChannelInvokedSink { tx });
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            Some(sink),
+            None,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        assert_eq!(chunks.len(), 5, "4 Data + 1 terminal End = 5 chunks");
+        let events = drain_invoked_events(&mut event_rx);
+        assert_eq!(events.len(), 1, "exactly ONE OutletInvokedEvent per stream");
+        assert_eq!(
+            events[0].stream_chunk_count, 5,
+            "event stream_chunk_count counts all 5 chunks including the terminal End"
+        );
+        assert_eq!(
+            events[0].stream_terminal_status,
+            StreamTerminalStatus::Ok,
+            "a clean End close records the Ok terminal status"
+        );
+    }
+
+    /// **035 AC5** — a non-streaming (one-shot) invocation emits ONE event
+    /// with `stream_chunk_count == 2` (Data + End). §5.4.5:607: "A
+    /// non-streaming invocation is a stream that emits exactly two chunks:
+    /// Data(output) followed by End(output) ... the wire contract is always
+    /// the streaming form." A one-shot executor overrides only the
+    /// non-streaming `exec_action`; the default `exec_action_stream` routes
+    /// its single value through `one_shot_to_stream` (one `Data` chunk) and
+    /// the framework appends the terminal `End`, yielding exactly two chunks.
+    #[tokio::test]
+    async fn invoke_outlet_one_shot_emits_two_chunk_event_035_ac5() {
+        struct OneShotExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for OneShotExecutor {
+            // Non-streaming: returns a single value. The default
+            // `exec_action_stream` adapter turns it into a Data chunk; the
+            // framework appends the terminal End.
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                Ok(serde_json::json!({ "sum": 3 }))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(OneShotExecutor);
+        let (tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: std::sync::Arc<dyn super::OutletInvokedEventSink> =
+            std::sync::Arc::new(ChannelInvokedSink { tx });
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            Some(sink),
+            None,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        assert_eq!(
+            chunks.len(),
+            2,
+            "one-shot invocation is a two-chunk stream: Data(output) + End"
+        );
+        let events = drain_invoked_events(&mut event_rx);
+        assert_eq!(events.len(), 1, "exactly ONE OutletInvokedEvent per stream");
+        assert_eq!(
+            events[0].stream_chunk_count, 2,
+            "035 AC5: one-shot invocation emits an event with stream_chunk_count == 2"
+        );
+        assert_eq!(
+            events[0].stream_terminal_status,
+            StreamTerminalStatus::Ok,
+            "clean End close on the one-shot path records Ok"
+        );
+    }
+
+    /// **035 AC4** — a failed stream (executor returns `Err`, framework emits a
+    /// terminal `Error`) emits ONE event with
+    /// `stream_terminal_status == Error(code)`.
+    #[tokio::test]
+    async fn invoke_outlet_failed_stream_records_error_terminal_status_035_ac4() {
+        struct FailingExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for FailingExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                // One Data chunk, then fail — the framework appends a terminal
+                // Error chunk on the Err return.
+                let _ = tx
+                    .send(ChunkPayload::Data {
+                        value: serde_json::json!({ "tick": 0 }),
+                    })
+                    .await;
+                Err(super::OutletExecutorError::Failed(
+                    "operator-side failure".to_owned(),
+                ))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(FailingExecutor);
+        let (tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: std::sync::Arc<dyn super::OutletInvokedEventSink> =
+            std::sync::Arc::new(ChannelInvokedSink { tx });
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            Some(sink),
+            None,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        assert!(
+            matches!(
+                chunks.last().map(|c| &c.payload),
+                Some(ChunkPayload::Error { terminal: true, .. })
+            ),
+            "failed stream ends in a terminal Error chunk"
+        );
+        let events = drain_invoked_events(&mut event_rx);
+        assert_eq!(events.len(), 1, "exactly ONE OutletInvokedEvent per stream");
+        match &events[0].stream_terminal_status {
+            StreamTerminalStatus::Error(code) => assert_eq!(
+                code, CODE_EXECUTION_FAULT,
+                "failed-stream terminal status carries the executor-fault code"
+            ),
+            other => panic!("expected Error terminal status, got {other:?}"),
+        }
+    }
+
+    /// **035 AC6** — event-log replay reconstructs `stream_manifest_hash`
+    /// identically: the manifest root recorded on the emitted event equals an
+    /// INDEPENDENT recomputation of `compute_chunk_manifest_root` over the very
+    /// chunk sequence the receiver observed.
+    #[tokio::test]
+    async fn invoke_outlet_manifest_hash_reconstructs_on_replay_035_ac6() {
+        struct ThreeDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for ThreeDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..3u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(ThreeDataExecutor);
+        let (tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: std::sync::Arc<dyn super::OutletInvokedEventSink> =
+            std::sync::Arc::new(ChannelInvokedSink { tx });
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            Some(sink),
+            None,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        // The exact ordered chunk sequence the receiver observed (3 Data +
+        // terminal End), signed and sequence-numbered by the framework.
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        assert_eq!(chunks.len(), 4, "3 Data + terminal End");
+
+        let events = drain_invoked_events(&mut event_rx);
+        assert_eq!(events.len(), 1, "exactly ONE OutletInvokedEvent per stream");
+        let recorded_root = events[0].stream_manifest_hash;
+
+        // Independent replay reconstruction: recompute the RFC-6962 root over
+        // the same sealed chunk sequence and assert byte-identity.
+        let replayed_root =
+            scp_protocol::context::outlets::stream::compute_chunk_manifest_root(&chunks)
+                .expect("manifest root recomputation");
+        assert_eq!(
+            recorded_root, replayed_root,
+            "recorded stream_manifest_hash must reconstruct identically on replay"
+        );
+        assert_ne!(
+            recorded_root, [0u8; 32],
+            "a non-empty stream commits a non-sentinel manifest root"
         );
     }
 }

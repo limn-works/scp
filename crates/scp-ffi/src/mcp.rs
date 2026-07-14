@@ -1061,6 +1061,7 @@ impl ContextProvider for FfiBridgeProvider {
             chunks_billed: 0,
             stream_manifest_hash: [0u8; 32],
             stream_terminal_status: scp_core::context::outlets::stream::StreamTerminalStatus::Ok,
+            cancel_ack_seq: None,
             audit_anomaly: None,
         };
 

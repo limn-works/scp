@@ -422,6 +422,49 @@ impl ProtocolRepoVariant {
             }
         }
     }
+
+    /// Reads, increments, and persists the durable per-stream `monotonic_seq`
+    /// grant cursor on whichever `Storage` backend this repository wraps
+    /// (SCP-OUT-034 AC31), returning the seq to assign to THIS grant.
+    ///
+    /// Dispatches to
+    /// [`next_grant_monotonic_seq`](crate::outlet_stream_credit::next_grant_monotonic_seq)
+    /// over the variant's own `Storage` (`ProtocolRepository::storage()`), so
+    /// the cursor shares the single per-instance backend that also holds the
+    /// event log / snapshots — and is reclaimed by the same
+    /// `delete_context` prefix sweep. The `napi-rs` and `UniFFI` bridges call
+    /// this from `outlet_stream_grant_credit`; the `PyO3` bridge calls the
+    /// underlying helper directly against its `StorageProvider`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamCreditCounterError`](crate::outlet_stream_credit::StreamCreditCounterError)
+    /// if the key is invalid, storage I/O fails, the persisted bytes cannot be
+    /// decoded, or the counter would overflow.
+    pub async fn next_stream_credit_seq(
+        &self,
+        context_id: &str,
+        request_id: &[u8; 16],
+    ) -> Result<u64, crate::outlet_stream_credit::StreamCreditCounterError> {
+        match self {
+            Self::InMemory(repo) => {
+                crate::outlet_stream_credit::next_grant_monotonic_seq(
+                    repo.storage(),
+                    context_id,
+                    request_id,
+                )
+                .await
+            }
+            Self::Sqlite(repo) => {
+                crate::outlet_stream_credit::next_grant_monotonic_seq(
+                    repo.storage(),
+                    context_id,
+                    request_id,
+                )
+                .await
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
