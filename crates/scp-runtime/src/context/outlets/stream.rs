@@ -67,7 +67,8 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::VerifyingKey;
 use scp_protocol::context::outlets::error_codes;
 use scp_protocol::context::outlets::stream::{
-    ChunkPayload, MlsEpoch, OutletStreamChunk, OutletStreamCredit, verify_credit_signature,
+    ChunkPayload, MlsEpoch, OutletStreamChunk, OutletStreamCredit, compute_chunk_manifest_root,
+    verify_credit_signature,
 };
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
@@ -1005,8 +1006,18 @@ pub enum CancelState {
         cancel_ack_at: Instant,
     },
     /// Cancel-ack window closed (terminal chunk delivered or timer
-    /// fired).
-    Closed,
+    /// fired). Carries the pinned `cancel_ack_seq` when an `OutletCancel`
+    /// was observed BEFORE the terminal transition, so the billing ceiling
+    /// SURVIVES `record_terminal` — `None` means the stream closed without
+    /// ever observing a cancel. Without carrying the value, a post-terminal
+    /// `cancel_ack_seq()` / `billing_ceiling()` read would silently collapse
+    /// to `None` / `u64::MAX` and mis-bill a reordered close.
+    Closed {
+        /// The pinned cancel-ack sequence carried across the terminal
+        /// transition (`Some` iff an `OutletCancel` was observed before close),
+        /// so the billing ceiling is not lost after `record_terminal`.
+        cancel_ack_seq: Option<u64>,
+    },
 }
 
 /// Per-stream cancel-ack lifecycle (§5.4.5).
@@ -1037,10 +1048,16 @@ impl CancelAckTracker {
 
     /// Records `OutletCancel` arrival. `next_seq` is the next-to-emit
     /// sequence at the moment of arrival and becomes the cancel-ack
-    /// billing ceiling. The §5.4.5 predicate is inclusive: a chunk is
-    /// billable when `sequence <= ceiling`, so the chunk AT the ceiling
-    /// (`sequence == next_seq`) IS billable; only chunks strictly above
-    /// it (`sequence > next_seq`) are NOT billable. See
+    /// sequence (`cancel_ack_seq`). Per §5.4.5:530(3) that sequence slot
+    /// belongs to the **terminal cancel-ack chunk**, and per §5.4.5:530(1)
+    /// any `Data`/`Progress` still in flight at `sequence >= cancel_ack_seq`
+    /// is dropped-and-not-billed by the pump gate
+    /// ([`super::invoke::apply_stream_chunk_gate`], `>=` boundary). The
+    /// §5.4.5:558/563 `chunks_billed` formula
+    /// (`compute_chunks_billed_ref`) stays **inclusive** (`sequence <=
+    /// cancel_ack_seq`); it yields the correct count because the sealed
+    /// manifest carries only `Data` at `sequence < cancel_ack_seq` (the
+    /// cancel-ack slot holds the non-`Data` terminal). See
     /// [`Self::billing_ceiling`] and `compute_chunks_billed_ref`.
     ///
     /// Idempotent: a second `OutletCancel` after the first is a
@@ -1056,20 +1073,31 @@ impl CancelAckTracker {
     }
 
     /// Marks the tracker `Closed` after the terminal chunk has been
-    /// delivered. Idempotent.
+    /// delivered. Idempotent. Preserves the pinned `cancel_ack_seq` across
+    /// the terminal transition so a later `cancel_ack_seq()` /
+    /// `billing_ceiling()` read cannot silently lose the ceiling (robustness
+    /// against a future reorder that reads the tracker AFTER close).
     pub const fn record_terminal(&mut self) {
-        self.state = CancelState::Closed;
+        let cancel_ack_seq = match self.state {
+            CancelState::Pending { cancel_ack_seq, .. } => Some(cancel_ack_seq),
+            CancelState::Closed { cancel_ack_seq } => cancel_ack_seq,
+            CancelState::Active => None,
+        };
+        self.state = CancelState::Closed { cancel_ack_seq };
     }
 
-    /// Returns `Some(cancel_ack_seq)` when the tracker is `Pending`
-    /// or `Closed` (terminal already emitted but cancel was
-    /// observed); the §5.4.5 chunks_billed predicate uses this
-    /// ceiling.
+    /// Returns `Some(cancel_ack_seq)` when an `OutletCancel` was observed —
+    /// in the `Pending` state, and in the `Closed` state when the cancel was
+    /// observed BEFORE the terminal transition (the pinned ceiling survives
+    /// `record_terminal`). Returns `None` for an `Active` stream and for a
+    /// `Closed` stream that terminated without ever observing a cancel. The
+    /// §5.4.5 chunks_billed predicate uses this ceiling.
     #[must_use]
     pub const fn cancel_ack_seq(&self) -> Option<u64> {
         match self.state {
-            CancelState::Active | CancelState::Closed => None,
+            CancelState::Active => None,
             CancelState::Pending { cancel_ack_seq, .. } => Some(cancel_ack_seq),
+            CancelState::Closed { cancel_ack_seq } => cancel_ack_seq,
         }
     }
 
@@ -1079,12 +1107,17 @@ impl CancelAckTracker {
     /// `count(Data leaves with index <= ceiling)`; an `Active`
     /// stream's ceiling is `u64::MAX` and the predicate reduces to
     /// "every Data leaf is billable", per §5.4.5 wire-rejection
-    /// rule.
+    /// rule. A `Closed` tracker keeps the pinned ceiling (or `u64::MAX`
+    /// when no cancel was ever observed) — see [`Self::record_terminal`].
     #[must_use]
     pub const fn billing_ceiling(&self) -> u64 {
         match self.state {
-            CancelState::Active | CancelState::Closed => u64::MAX,
+            CancelState::Active => u64::MAX,
             CancelState::Pending { cancel_ack_seq, .. } => cancel_ack_seq,
+            CancelState::Closed { cancel_ack_seq } => match cancel_ack_seq {
+                Some(seq) => seq,
+                None => u64::MAX,
+            },
         }
     }
 
@@ -1100,7 +1133,7 @@ impl CancelAckTracker {
             CancelState::Pending { cancel_ack_at, .. } => {
                 now.saturating_duration_since(cancel_ack_at) >= self.cancel_ack_window
             }
-            CancelState::Active | CancelState::Closed => false,
+            CancelState::Active | CancelState::Closed { .. } => false,
         }
     }
 
@@ -1558,6 +1591,58 @@ pub const fn verify_outlet_invoked_event_local(
             recorded: event.chunks_billed,
             reference: event.stream_chunk_count,
         });
+    }
+    Ok(())
+}
+
+// =====================================================================
+// Full manifest-derived wire-invariant — §5.4.5:566 equality
+// =====================================================================
+
+/// Enforces the FULL §5.4.5:566 `chunks_billed` equality (manifest root +
+/// sealed sequence + cancel-ack) that [`verify_outlet_invoked_event_local`]
+/// (the event-local `<=` backstop) cannot.
+///
+/// Re-derives `chunks_billed_ref` from the retained chunk sequence via
+/// [`verify_chunks_billed`] AND checks
+/// `stream_manifest_hash == compute_chunk_manifest_root(chunks)` and
+/// `stream_chunk_count == chunks.len()`. This applies only where the chunk
+/// sequence is retained — the cross-context receiver-side recording boundary
+/// (SCP-OUT-036 AC7; §5.4.5:566), where a context re-derives the manifest over
+/// its independently-reassembled chunk sequence. The same-context dispatch pump
+/// does not retain the payload set and
+/// enforces same-context integrity via the inline
+/// `AuditAnomaly::ChunksBilledSelfMismatch` check plus the event-local `<=`
+/// backstop ([`verify_outlet_invoked_event_local`]), not this function.
+///
+/// # Errors
+///
+/// Returns [`ChunksBilledError::ChunksBilledMismatch`] when the recorded
+/// `chunks_billed` disagrees with the manifest-derived reference, when the
+/// recorded manifest root / leaf count diverge from the re-derived values, or
+/// when the chunk sequence cannot be JCS-canonicalized into a manifest root.
+/// The runtime MUST refuse the event at log-insert time per the §5.4.5
+/// wire-layer rejection rule.
+pub(crate) fn verify_outlet_invoked_event_manifest(
+    event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+    chunks: &[OutletStreamChunk],
+) -> Result<(), ChunksBilledError> {
+    // (1) Full manifest-derived `chunks_billed` equality — the tighter
+    // check the event-local backstop cannot make.
+    verify_chunks_billed(chunks, event.chunks_billed, event.cancel_ack_seq)?;
+    // The manifest-derived reference for divergence reporting below.
+    // Equal to `event.chunks_billed` once (1) passes.
+    let reference = compute_chunks_billed_ref(chunks, event.cancel_ack_seq.unwrap_or(u64::MAX));
+    let mismatch = || ChunksBilledError::ChunksBilledMismatch {
+        recorded: event.chunks_billed,
+        reference,
+    };
+    // (2) Manifest root + sealed-sequence binding: the recorded root
+    // and leaf count MUST match what re-hashing the sequence yields.
+    let root = compute_chunk_manifest_root(chunks).map_err(|_jcs_err| mismatch())?;
+    let leaf_count = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
+    if event.stream_manifest_hash != root || u64::from(event.stream_chunk_count) != leaf_count {
+        return Err(mismatch());
     }
     Ok(())
 }
@@ -2088,6 +2173,36 @@ mod tests {
     }
 
     #[test]
+    fn cancel_ack_seq_survives_terminal_transition() {
+        // Robustness (round-9 F5): the pinned cancel-ack ceiling must survive
+        // `record_terminal` so a read AFTER close still bills against it rather
+        // than silently collapsing to `None` / `u64::MAX`.
+        let mut tracker = CancelAckTracker::new(5);
+        let now = Instant::now();
+        tracker.record_cancel(4, now);
+        assert_eq!(tracker.cancel_ack_seq(), Some(4));
+        assert_eq!(tracker.billing_ceiling(), 4);
+        tracker.record_terminal();
+        assert_eq!(
+            tracker.cancel_ack_seq(),
+            Some(4),
+            "cancel_ack_seq must survive the terminal transition"
+        );
+        assert_eq!(
+            tracker.billing_ceiling(),
+            4,
+            "billing_ceiling must survive the terminal transition"
+        );
+
+        // A stream that closes WITHOUT ever observing a cancel keeps the
+        // uncancelled ceiling (`u64::MAX`) and reports no cancel-ack sequence.
+        let mut uncancelled = CancelAckTracker::new(5);
+        uncancelled.record_terminal();
+        assert_eq!(uncancelled.cancel_ack_seq(), None);
+        assert_eq!(uncancelled.billing_ceiling(), u64::MAX);
+    }
+
+    #[test]
     fn cancel_ack_terminal_payload_carries_distinct_code() {
         let payload = CancelAckTracker::cancel_ack_timeout_payload();
         match payload {
@@ -2449,6 +2564,7 @@ mod tests {
             chunks_billed,
             stream_manifest_hash: [0u8; 32],
             stream_terminal_status: StreamTerminalStatus::Ok,
+            cancel_ack_seq: None,
             audit_anomaly: None,
         }
     }
@@ -2506,30 +2622,29 @@ mod tests {
 
     #[test]
     fn billing_integration_mid_stream_cancel_at_seq_5() {
-        // 8 Data chunks delivered, OutletCancel arrives at next-to-emit
-        // seq = 5 (so chunks 0..=4 are billable, 5..=7 are NOT).
+        // 034 AC24: an executor produces 8 Data, but an OutletCancel arrives
+        // at the next-to-emit cursor 5, so `cancel_ack_seq = 5`. Per
+        // §5.4.5:530(3) that sequence slot belongs to the TERMINAL cancel-ack
+        // chunk, and per §5.4.5:530(1) the pump gate
+        // (`apply_stream_chunk_gate`, `sequence >= cancel_ack_seq`) drops the
+        // 3 post-cancel in-flight Data (seq 5,6,7) without billing them. So
+        // the SEALED MANIFEST the runtime actually commits is `Data[0..5]`
+        // followed by the terminal `End` AT seq 5 — no Data ever occupies the
+        // cancel-ack slot. The §5.4.5:558/563 `chunks_billed` formula stays
+        // INCLUSIVE (`i <= cancel_ack_seq`); over this spec-compliant sealed
+        // manifest it counts the 5 Data at seq 0..4 (the `End` at seq 5 is
+        // non-Data) and yields 5 with `cancel_ack_seq = 5` — no fudge to 4.
         let mut chunks = Vec::new();
-        for i in 0..8 {
+        for i in 0..5 {
             chunks.push(make_data_chunk(i));
         }
-        chunks.push(make_end_chunk(8));
-        // The runtime would emit terminal at seq 8; cancel-ack-seq
-        // is set to 5 by record_cancel(5, _). Per §5.4.5, chunks
-        // with sequence <= 5 are billable (5 Data chunks: indices 0..=4
-        // with sequence 0..=4). Note "<=5" includes seq 5, but seq 5 is
-        // a Data chunk in this fixture, so the count is 6 if we include it.
-        // The spec text says "chunks already in flight at that
-        // sequence are NOT counted as billable above the cutoff" —
-        // the cutoff is `cancel_ack_seq` (next-to-emit at moment of
-        // arrival). Per the predicate `i <= cancel_ack_seq`, chunks
-        // with index 0..=cancel_ack_seq are billable, exclusive of
-        // anything beyond. The predicate from §5.4.5 line 726 reads
-        // `i <= cancel_ack_seq`, so seq 5 IS included.
-        // For the round-3 AC "chunks_billed=5 (not 8)" the cutoff
-        // must be cancel_ack_seq=4 (i.e., 0..=4 inclusive = 5 chunks).
-        // Use cancel_ack_seq = 4 to model "5 billable chunks".
-        let count = compute_chunks_billed_ref(&chunks, 4);
-        assert_eq!(count, 5);
+        // Terminal cancel-ack chunk occupies `cancel_ack_seq` (= 5).
+        chunks.push(make_end_chunk(5));
+        let count = compute_chunks_billed_ref(&chunks, 5);
+        assert_eq!(
+            count, 5,
+            "inclusive i<=5 over the sealed manifest (Data seq 0..4 + terminal End at seq 5) = 5"
+        );
     }
 
     #[test]

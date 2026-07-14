@@ -297,6 +297,28 @@ pub struct OutletInvokedEvent {
     /// error-with-code (§5.4.5 event-log shape).
     #[serde(default = "default_stream_terminal_status")]
     pub stream_terminal_status: StreamTerminalStatus,
+    /// Cancel-ack sequence that fixes the §5.4.5 billing ceiling when the
+    /// stream was cancelled (§5.4.5:558-566). `Some(seq)` records the
+    /// pinned cancel-ack sequence — the highest `Data`-chunk sequence that
+    /// is still billable; every `Data` chunk with `sequence > seq` is
+    /// dropped before emission and never billed. `None` means the stream
+    /// terminated without a cancel-ack (normal `End` or terminal `Error`),
+    /// so the ceiling is `u64::MAX` and every emitted `Data` chunk is
+    /// billable (matches [`crate::context::outlets::stream::MerkleFrontier`]
+    /// unbounded-ceiling semantics and the runtime `verify_chunks_billed`
+    /// `unwrap_or(u64::MAX)`).
+    ///
+    /// This is a **separate top-level field**, not a payload of
+    /// [`StreamTerminalStatus::Cancelled`], because the cancel-ack ceiling
+    /// is orthogonal to the terminal status: a cancelled stream whose
+    /// executor emits a terminal `Error` after the cancel keeps the ceiling
+    /// (status `Error`, `cancel_ack_seq = Some(..)`). It is NOT part of any
+    /// signed preimage — distinct from `OutletCancel.next_seq`, which IS
+    /// bound into `SCP-OUTLET-CANCEL-V1`. `skip_serializing_if` keeps the
+    /// wire bytes byte-identical on the non-cancel path, so existing
+    /// event KATs are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_ack_seq: Option<u64>,
     /// Audit anomaly attached when the runtime recorded the event with
     /// the manifest-derived `chunks_billed` after detecting a divergence
     /// from the pump's running tally (§5.4.5 round-8). `None` on the
@@ -503,6 +525,7 @@ mod tests {
             chunks_billed: 1,
             stream_manifest_hash: [0xABu8; 32],
             stream_terminal_status: StreamTerminalStatus::Ok,
+            cancel_ack_seq: None,
             audit_anomaly: None,
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -523,6 +546,14 @@ mod tests {
         assert!(
             !json.contains("audit_anomaly"),
             "audit_anomaly: None must be omitted from the wire form: {json}"
+        );
+        // Non-cancel path: cancel_ack_seq is None and MUST be omitted from
+        // the wire form (skip_serializing_if) so the byte layout is
+        // identical to pre-cancel-ack-field events — existing KATs hold.
+        assert_eq!(deserialized.cancel_ack_seq, None);
+        assert!(
+            !json.contains("cancel_ack_seq"),
+            "cancel_ack_seq: None must be omitted from the wire form: {json}"
         );
     }
 
@@ -545,6 +576,7 @@ mod tests {
             chunks_billed: 2,
             stream_manifest_hash: [0u8; 32],
             stream_terminal_status: StreamTerminalStatus::Ok,
+            cancel_ack_seq: None,
             audit_anomaly: Some(AuditAnomaly::ChunksBilledSelfMismatch {
                 pump_recorded: 5,
                 manifest_reference: 2,
@@ -573,6 +605,43 @@ mod tests {
         });
         let parsed2: OutletInvokedEvent = serde_json::from_value(with_unknown).unwrap();
         assert_eq!(parsed2.audit_anomaly, None);
+    }
+
+    /// SCP-OUT-035 AC[3]: a cancelled stream records
+    /// `stream_terminal_status: Cancelled` AND a top-level
+    /// `cancel_ack_seq: Some(k)` (the billing ceiling), both of which
+    /// round-trip through the wire form. Unlike the non-cancel path, the
+    /// cancel-ack sequence IS present on the wire.
+    #[test]
+    fn outlet_invoked_event_cancel_ack_seq_roundtrips_on_cancel_path() {
+        let event = OutletInvokedEvent {
+            request_id: "req-cancel".to_owned(),
+            outlet_id: "outlet-cancel".to_owned(),
+            invoker_did: "did:dht:z6MkInvoker".into(),
+            status: OutletStatus::Cancelled,
+            execution_time_ms: 11,
+            input_hash: "ab".to_owned(),
+            output_hash: None,
+            cost: None,
+            stream_chunk_count: 6,
+            chunks_billed: 5,
+            stream_manifest_hash: [0x11u8; 32],
+            stream_terminal_status: StreamTerminalStatus::Cancelled,
+            cancel_ack_seq: Some(5),
+            audit_anomaly: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("cancel_ack_seq"),
+            "cancel path must serialize cancel_ack_seq: {json}"
+        );
+        let parsed: OutletInvokedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cancel_ack_seq, Some(5));
+        assert_eq!(
+            parsed.stream_terminal_status,
+            StreamTerminalStatus::Cancelled
+        );
+        assert_eq!(parsed.chunks_billed, 5);
     }
 
     /// Legacy events serialized BEFORE SCP-OUT-035 omit the four new

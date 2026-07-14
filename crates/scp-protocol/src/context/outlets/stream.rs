@@ -3043,4 +3043,126 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-035 AC[11]/[12] — INDEPENDENT RFC-6962 known-answer tests.
+    //
+    // These pin `compute_chunk_leaf_hash` / `compute_chunk_interior_hash` /
+    // `compute_chunk_manifest_root` against a *second, independent* RFC-6962
+    // implementation written inline below (raw `Sha256`, recursive split-at-
+    // largest-power-of-two `MTH`) AND against hardcoded golden hex digests.
+    // The independent oracle deliberately does NOT call any of the library's
+    // manifest functions, so a regression in the domain separator, tag
+    // bytes, child order, or tree shape is caught even if it were mirrored
+    // into a copy-pasted helper.
+    // -----------------------------------------------------------------------
+
+    /// Independent leaf hash: `SHA-256("SCP-OUTLET-CHUNK-V1:" ‖ 0x00 ‖
+    /// canonical_jcs(chunk))`. Computed with a raw hasher — never calls
+    /// [`compute_chunk_leaf_hash`].
+    fn indep_leaf(chunk: &OutletStreamChunk) -> [u8; 32] {
+        let jcs = crate::jcs::to_vec(chunk).expect("chunk canonicalizes");
+        let mut h = Sha256::new();
+        h.update(b"SCP-OUTLET-CHUNK-V1:");
+        h.update([0x00]);
+        h.update(&jcs);
+        h.finalize().into()
+    }
+
+    /// Independent interior hash: `SHA-256("SCP-OUTLET-CHUNK-V1:" ‖ 0x01 ‖
+    /// left ‖ right)`. Never calls [`compute_chunk_interior_hash`].
+    fn indep_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"SCP-OUTLET-CHUNK-V1:");
+        h.update([0x01]);
+        h.update(left);
+        h.update(right);
+        h.finalize().into()
+    }
+
+    /// Independent RFC-6962 §2.1 Merkle Tree Hash via the canonical
+    /// recursive definition: split at the largest power of two strictly
+    /// less than `n`. Structurally distinct from the library's iterative
+    /// level-by-level pair-and-promote, so agreement is meaningful.
+    fn indep_mth(chunks: &[OutletStreamChunk]) -> [u8; 32] {
+        match chunks.len() {
+            0 => [0u8; 32],
+            1 => indep_leaf(&chunks[0]),
+            n => {
+                // k = largest power of two strictly less than n.
+                let mut k = 1usize;
+                while k << 1 < n {
+                    k <<= 1;
+                }
+                let (left, right) = chunks.split_at(k);
+                indep_node(&indep_mth(left), &indep_mth(right))
+            }
+        }
+    }
+
+    /// AC[11]: the library leaf hash of a fixed 10-chunk manifest matches
+    /// the independent leaf hasher AND a hardcoded golden for chunk 0.
+    #[test]
+    fn independent_leaf_kat_matches_library() {
+        let chunks: Vec<OutletStreamChunk> =
+            (0..10).map(|i| chunk_of_kind(i, (i % 4) as u8)).collect();
+        for (i, c) in chunks.iter().enumerate() {
+            let lib = compute_chunk_leaf_hash(c).unwrap();
+            let indep = indep_leaf(c);
+            assert_eq!(lib, indep, "leaf {i} diverged from independent hasher");
+        }
+        // Hardcoded golden for chunk 0 (Data @ seq 0), pinning the exact
+        // leaf preimage bytes (domain sep ‖ 0x00 ‖ jcs).
+        let golden_leaf0 = "4eee760677a6ca760ff1d411dd53067eaff63f8b95f5d40e1c068da11dc9e8d4";
+        assert_eq!(
+            hex::encode(compute_chunk_leaf_hash(&chunks[0]).unwrap()),
+            golden_leaf0,
+            "leaf-0 golden KAT drift"
+        );
+    }
+
+    /// AC[12]: the library interior hash and manifest root of fixed 2-leaf
+    /// and 4-leaf manifests match the independent recursive RFC-6962 MTH
+    /// AND hardcoded golden roots.
+    #[test]
+    fn independent_interior_and_root_kat_matches_library() {
+        // Interior-node KAT: two fixed leaves.
+        let c0 = chunk_of_kind(0, 0);
+        let c1 = chunk_of_kind(1, 0);
+        let l0 = compute_chunk_leaf_hash(&c0).unwrap();
+        let l1 = compute_chunk_leaf_hash(&c1).unwrap();
+        assert_eq!(
+            compute_chunk_interior_hash(&l0, &l1),
+            indep_node(&l0, &l1),
+            "interior hash diverged from independent hasher"
+        );
+
+        // 2-leaf root.
+        let two = [c0, c1];
+        assert_eq!(
+            compute_chunk_manifest_root(&two).unwrap(),
+            indep_mth(&two),
+            "2-leaf root diverged from independent MTH"
+        );
+        let golden_root2 = "04183441720a2024662106a362a77392ce46f8f90bcd770013efc2c4b9026fb2";
+        assert_eq!(
+            hex::encode(compute_chunk_manifest_root(&two).unwrap()),
+            golden_root2,
+            "2-leaf root golden KAT drift"
+        );
+
+        // 4-leaf root (perfect tree; exercises interior-of-interior).
+        let four: Vec<OutletStreamChunk> = (0..4).map(|i| chunk_of_kind(i, 0)).collect();
+        assert_eq!(
+            compute_chunk_manifest_root(&four).unwrap(),
+            indep_mth(&four),
+            "4-leaf root diverged from independent MTH"
+        );
+        let golden_root4 = "6fcec837b7fad4699ad2c3691d1e6c4e35956dc382df57be8df43f6bb485fbef";
+        assert_eq!(
+            hex::encode(compute_chunk_manifest_root(&four).unwrap()),
+            golden_root4,
+            "4-leaf root golden KAT drift"
+        );
+    }
 }

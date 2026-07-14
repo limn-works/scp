@@ -105,6 +105,13 @@ pub use bridge_instance::{
 #[cfg(feature = "resolvers")]
 pub mod bridge_runtime;
 
+// Crash-safe per-stream `monotonic_seq` grant counter (SCP-OUT-034 AC31) shared
+// by all three bridges. Persists the cursor to durable `Storage` so an SDK
+// restart never regresses the §5.4.5 credit-grant sequence. Requires
+// scp-platform (behind `resolvers`, which always pulls it in).
+#[cfg(feature = "resolvers")]
+pub mod outlet_stream_credit;
+
 // Shared context-parameter builder for all FFI bridges.
 // Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]

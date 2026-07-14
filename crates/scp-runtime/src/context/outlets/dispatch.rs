@@ -106,7 +106,6 @@ use super::stream::{
     OriginAdmissionTracker, StreamAdmissionTracker, StreamEscrow, StreamIdentity,
     admission_outcome_to_slug, coerce_estimated_chunk_count, cumulative_reserve_amount,
     effective_max_billable_chunks, enforce_estimated_chunk_count_bound, open_error_to_slug,
-    verify_outlet_invoked_event_local,
 };
 
 use scp_protocol::context::outlets::registry::OutletRegistry;
@@ -2717,13 +2716,14 @@ async fn run_stream_pump_v2(
     // as it is emitted — the pump NEVER retains the full payload set for
     // the manifest (ADR-061: "never accumulates the full payload set in
     // memory"). The frontier's billing ceiling is unbounded
-    // (`MerkleFrontier::new`): the pump drops above-cancel-ack `Data`
-    // chunks at the gate BEFORE they reach `ingest_stream_chunk`, so every
-    // pushed `Data` chunk is at/below the eventual cancel-ack sequence and
-    // the unbounded ceiling yields the same billed count as the pinned one
-    // (equivalently, `compute_chunks_billed_ref(emitted_manifest,
-    // cancel_ack_seq)` over the emitted set — none of which exceeds the
-    // ceiling).
+    // (`MerkleFrontier::new`): the pump drops `Data` chunks at
+    // `sequence >= cancel_ack_seq` at the gate BEFORE they reach
+    // `ingest_stream_chunk` (§5.4.5:530(3) — the cancel-ack slot holds the
+    // terminal), so every pushed `Data` chunk is STRICTLY below the
+    // cancel-ack sequence and the unbounded ceiling yields the same billed
+    // count as the pinned one (equivalently,
+    // `compute_chunks_billed_ref(emitted_manifest, cancel_ack_seq)` over the
+    // emitted set — whose `Data` all sit below the ceiling).
     let mut frontier = scp_protocol::context::outlets::stream::MerkleFrontier::new();
     let mut terminal_summary = super::invoke::StreamTerminalSummary::default();
     let mut next_seq: u64 = 0;
@@ -3058,10 +3058,7 @@ async fn run_stream_pump_v2(
                     // an unsigned chunk on the wire.
                     break;
                 };
-                // Only advance the emission cursor AFTER signing
-                // succeeded — a failed-signature path must not burn a
-                // sequence number.
-                next_seq = next_seq.saturating_add(1);
+                let terminal = final_chunk.payload.is_terminal();
                 // Crisp invariant: every chunk reaching a bridge consumer
                 // verifies under the pinned operator key. In debug
                 // builds we re-verify the sig we just produced, so a
@@ -3078,38 +3075,73 @@ async fn run_stream_pump_v2(
                     "dispatch pump: just-signed chunk fails to verify under the pinned operator key — \
                      signing/verifying preimage drift",
                 );
-                {
+                // §5.4.5:530(3) cancel-boundary atomicity (round-9 F1). The
+                // per-chunk gate above ran in an EARLIER `state.write()`
+                // window; the operator-signature build between then and here
+                // is an off-lock `.await`. An `OutletCancel` delivered on a
+                // SEPARATE task (`apply_outlet_cancel_signed`) can acquire the
+                // lock DURING that signing await and pin `cancel_ack_seq` at or
+                // below this chunk's `seq`. Re-read the LIVE ceiling under the
+                // accrual lock and mirror the gate's `>=` drop, so the
+                // drop-decision, the escrow/credit bill, the frontier ingest,
+                // and the emission-cursor bump are ALL atomic with respect to
+                // `record_cancel`. Without this re-check the gate (which saw
+                // `ceiling == u64::MAX`) would Forward an in-flight `Data` that
+                // the freshly-pinned ceiling now reserves for the terminal
+                // cancel-ack chunk — silently over-billing by one and recording
+                // a `cancel_ack_seq` the sealed manifest contradicts.
+                let dropped = {
                     let mut guard = state
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let g = &mut *guard;
-                    accrue_data_chunk_if_billable(&mut g.escrow, &g.cancel_ack, &final_chunk);
-                    // §5.4.5:758 cumulative ceiling: advance
-                    // `billed_emitted` for THIS forwarded chunk iff it is
-                    // billable (Data, at/below the cancel-ack ceiling) —
-                    // the SAME `is_billable_chunk` predicate the escrow
-                    // accrual above uses, so the cumulative counter and the
-                    // escrow ledger can never disagree on what was billed.
-                    if super::invoke::is_billable_chunk(
-                        &final_chunk,
-                        g.cancel_ack.billing_ceiling(),
-                    ) {
-                        g.credit.record_billed_emission();
+                    if !terminal && seq >= g.cancel_ack.billing_ceiling() {
+                        // Drop-and-not-bill, exactly as the gate's
+                        // `DropAboveCancelAck` arm would have: NO accrual, NO
+                        // frontier ingest, NO forward, and — critically — DO
+                        // NOT advance the emission cursor. The terminal
+                        // cancel-ack chunk takes this `seq` slot next.
+                        true
+                    } else {
+                        // Advance the emission cursor ONLY for a chunk we will
+                        // actually bill/emit — a dropped (or failed-sign) chunk
+                        // must not burn a sequence number.
+                        next_seq = next_seq.saturating_add(1);
+                        accrue_data_chunk_if_billable(&mut g.escrow, &g.cancel_ack, &final_chunk);
+                        // §5.4.5:758 cumulative ceiling: advance
+                        // `billed_emitted` for THIS forwarded chunk iff it is
+                        // billable (Data, at/below the cancel-ack ceiling) —
+                        // the SAME `is_billable_chunk` predicate the escrow
+                        // accrual above uses, so the cumulative counter and the
+                        // escrow ledger can never disagree on what was billed.
+                        if super::invoke::is_billable_chunk(
+                            &final_chunk,
+                            g.cancel_ack.billing_ceiling(),
+                        ) {
+                            g.credit.record_billed_emission();
+                        }
+                        // §5.4.5 next-emission-cursor publication — the bridge
+                        // layer reads this value to derive the canonical
+                        // `cancel_ack_seq` written into `OutletStreamCancel`
+                        // preimages (see
+                        // `StreamSessionHandle::current_next_emission_seq`).
+                        // Bumped under the SAME lock as the bill decision so a
+                        // racing `apply_outlet_cancel` either observes the
+                        // cursor before this forward (cancel pins the
+                        // pre-forward cursor) or after (post-forward cursor),
+                        // never half-stamped.
+                        g.next_emission_seq = next_seq;
+                        false
                     }
-                    // §5.4.5 next-emission-cursor publication — the
-                    // bridge layer reads this value to derive the
-                    // canonical `cancel_ack_seq` written into
-                    // `OutletStreamCancel` preimages (see
-                    // `StreamSessionHandle::current_next_emission_seq`).
-                    // Bump under the same lock as the gate decision so
-                    // a racing `apply_outlet_cancel` either observes
-                    // the cursor before this forward (cancel pins the
-                    // pre-forward cursor) or after (cancel pins the
-                    // post-forward cursor), never half-stamped.
-                    g.next_emission_seq = next_seq;
+                };
+                if dropped {
+                    // A cancel pinned the ceiling at/below this chunk's slot
+                    // during signing. Loop back for the next upstream chunk;
+                    // the terminal cancel-ack chunk will occupy `next_seq`
+                    // (== the pinned `cancel_ack_seq`).
+                    continue;
                 }
                 ingest_stream_chunk(&mut frontier, &mut terminal_summary, &final_chunk);
-                let terminal = final_chunk.payload.is_terminal();
                 if outer_tx.send(final_chunk).await.is_err() {
                     break;
                 }
@@ -3225,11 +3257,23 @@ async fn run_stream_pump_v2(
 
     // §5.4.5 OutletInvokedEvent emission. The dispatch pump owns the
     // outer manifest (renumbered, cancel-ack-truncated) — the only
-    // manifest that matches what SDK consumers actually received. We
-    // (i) run the event-local wire-invariant before emitting (the same
-    // invariant the event-log appender enforces at log-insert, surfacing
-    // drift here as defense-in-depth), and (ii) record exactly one event
-    // per stream via the `OutletInvokedEventSink::record` trait method.
+    // manifest that matches what SDK consumers actually received. We record
+    // exactly one event per stream via the `OutletInvokedEventSink::record`
+    // trait method; the durable sink persists it via the plain
+    // `append_event` boundary, whose override re-runs the durable event-local
+    // `chunks_billed <= stream_chunk_count` backstop.
+    //
+    // Same-context billing integrity is enforced HERE, inline: the pump's
+    // running escrow-ledger tally (`summary.billed_count`) is compared against
+    // the Merkle-fold reference (`summary.manifest_billed`) below, and any
+    // divergence is emitted as `AuditAnomaly::ChunksBilledSelfMismatch` on the
+    // event itself (never dropped). The pump does NOT retain the emitted
+    // payload set, so the full §5.4.5:566 manifest re-derivation
+    // (`verify_outlet_invoked_event_manifest` / `append_outlet_invoked_verified`)
+    // cannot run here — it applies only where the chunk sequence IS retained:
+    // the Sequence path (cross-context reassembly / import, slice 3). Re-running
+    // an equality against a commitment built from THIS same summary would be
+    // tautological, so we do not.
     if let Some(sink) = event_inputs.sink.as_ref() {
         // §5.4.5 round-8 (F2): on a self-consistency drift between the
         // pump's running `billed_count` (escrow ledger) and the
@@ -3269,29 +3313,12 @@ async fn run_stream_pump_v2(
             summary.manifest_root,
             &summary.terminal_summary,
             audit_anomaly,
+            // §5.4.5:558-566 — the pinned cancel-ack sequence (the billing
+            // ceiling) written into the event alongside `stream_terminal_status`.
+            // `None` when the stream terminated without a cancel-ack.
+            summary.cancel_ack_seq,
         );
-        // Defense-in-depth advisory pre-record check: the event carries the
-        // frontier-derived `chunks_billed`, so it MUST satisfy the
-        // event-local wire-invariant the appender enforces at log-insert
-        // (`chunks_billed <= stream_chunk_count`). This can only fail on a
-        // frontier accounting bug (billed out-running the leaf count) — the
-        // appender would reject it, so we drop + log here rather than emit a
-        // record the appender will refuse. The FULL manifest-derivation
-        // (`chunks_billed == compute_chunks_billed_ref(chunks, ...)`) is NOT
-        // re-checkable here without the chunk Vec (deliberately dropped per
-        // ADR-061); it was enforced at emission time by the gate that drops
-        // above-ceiling `Data` chunks before ingest.
-        if let Err(verify_err) = verify_outlet_invoked_event_local(&event) {
-            tracing::error!(
-                request_id = %hex::encode(request_id),
-                outlet_id = %event_inputs.outlet_id,
-                error = ?verify_err,
-                "OutletInvokedEvent dropped: event-local wire-invariant failed \
-                 (chunks_billed exceeds stream_chunk_count — frontier accounting bug)"
-            );
-        } else {
-            sink.record(event);
-        }
+        sink.record(event);
     }
 
     // §5.4.5 close-time economic settlement (E1). Fire the settlement sink
@@ -4713,6 +4740,882 @@ mod tests {
         assert_eq!(
             g.cancel_ack_seq, None,
             "self-verify failure must NOT record a cancel-ack seq"
+        );
+    }
+
+    // =================================================================
+    // SCP-OUT-034/035 — pump-level economic + event-capture ACs.
+    //
+    // These drive the real `run_stream_pump_v2` end-to-end with an
+    // `OutletInvokedEventSink` and a `StreamSettlementSink` wired so the
+    // close-time event and settlement are observable. `build_test_state`
+    // pins the SAME fixed key as both operator signer AND invoker credit
+    // key, so signed credit grants / cancels verify under the pinned key.
+    // =================================================================
+
+    /// Captures every close-time `OutletInvokedEvent` over an unbounded
+    /// channel (Mutex-free — Mutex is banned in scp-runtime).
+    struct CapturingInvokedSink {
+        tx: tokio::sync::mpsc::UnboundedSender<
+            scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+        >,
+    }
+    impl OutletInvokedEventSink for CapturingInvokedSink {
+        fn record(&self, event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent) {
+            let _ = self.tx.send(event);
+        }
+    }
+
+    /// Captures every close-time `StreamSettlement` over an unbounded channel.
+    struct CapturingSettlementSink {
+        tx: tokio::sync::mpsc::UnboundedSender<StreamSettlement>,
+    }
+    impl super::super::invoke::StreamSettlementSink for CapturingSettlementSink {
+        fn settle(&self, settlement: StreamSettlement) {
+            let _ = self.tx.send(settlement);
+        }
+        fn persist_reservation<'a>(
+            &'a self,
+            _context_id: &str,
+            _request_id: scp_protocol::context::outlets::stream::RequestId,
+            _record: super::super::invoke::StreamReservationRecord,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), scp_protocol::context::ContextError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Everything a capturing-pump test drives + observes.
+    struct CapturingPump {
+        handle: StreamSessionHandle,
+        outer_rx: mpsc::Receiver<OutletStreamChunk>,
+        summary_rx: tokio::sync::oneshot::Receiver<StreamCloseSummary>,
+        pump_join: tokio::task::JoinHandle<()>,
+        inner_tx: mpsc::Sender<OutletStreamChunk>,
+        event_rx: tokio::sync::mpsc::UnboundedReceiver<
+            scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+        >,
+        settle_rx: tokio::sync::mpsc::UnboundedReceiver<StreamSettlement>,
+    }
+
+    /// Overwrites the escrow ledger so per-`Data` accrual + close-time refund
+    /// operate over a known `(cost_per_chunk, reserved)` hold.
+    fn set_escrow(state: &Arc<RwLock<SharedSessionState>>, cost_per_chunk: u64, reserved: u64) {
+        let mut g = state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.escrow = super::super::stream::StreamEscrow::from_reserved(
+            Amount::new(cost_per_chunk),
+            Amount::new(reserved),
+        );
+    }
+
+    /// Re-pins the credit tracker with a fresh `(credit_window, max_calls)`.
+    fn set_credit(
+        state: &Arc<RwLock<SharedSessionState>>,
+        credit_window: u32,
+        max_calls: Option<u32>,
+    ) {
+        let mut g = state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = g.credit.identity().clone();
+        let pk = *g.credit.invoker_pk();
+        g.credit = CreditTracker::new(credit_window, pk, identity, max_calls);
+    }
+
+    /// Spawns `run_stream_pump_v2` with capturing event + settlement sinks and
+    /// the given stall / cancel-ack timer durations + counter-reserve cost.
+    fn spawn_capturing_pump(
+        state: Arc<RwLock<SharedSessionState>>,
+        request_id: RequestId,
+        stall: Duration,
+        cancel_ack: Duration,
+        cost_per_chunk: u64,
+        amount_cumulative_reserved: u64,
+    ) -> CapturingPump {
+        let grant_wake = Arc::new(Notify::new());
+        let cancel_wake = Arc::new(Notify::new());
+        let terminate_wake = Arc::new(Notify::new());
+        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(64);
+        let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(64);
+        let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (settle_tx, settle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let event_sink: Arc<dyn OutletInvokedEventSink> =
+            Arc::new(CapturingInvokedSink { tx: event_tx });
+        let settlement_sink: Arc<dyn super::super::invoke::StreamSettlementSink> =
+            Arc::new(CapturingSettlementSink { tx: settle_tx });
+
+        let pump_state = Arc::clone(&state);
+        let pump_grant = Arc::clone(&grant_wake);
+        let pump_cancel = Arc::clone(&cancel_wake);
+        let pump_terminate = Arc::clone(&terminate_wake);
+        let pump_join = tokio::spawn(async move {
+            run_stream_pump_v2(
+                pump_state,
+                pump_grant,
+                pump_cancel,
+                pump_terminate,
+                inner_rx,
+                outer_tx,
+                summary_tx,
+                stall,
+                cancel_ack,
+                request_id,
+                PumpEventEmissionInputs {
+                    sink: Some(event_sink),
+                    settlement_sink: Some(settlement_sink),
+                    context_id: "ctx-test".to_owned(),
+                    outlet_id: "outlet-test".to_owned(),
+                    invoker_did: scp_did::DID("did:dht:invoker".to_owned()),
+                    input_hash: "0".repeat(64),
+                    start: Instant::now(),
+                    economic_policy_snapshot: None,
+                    counter_reserve: CounterReserveSettlement {
+                        amount_cumulative_reserved,
+                        reserved_chunks: 0,
+                        ucan_cid: "bafyrei-test".to_owned(),
+                        cost_per_chunk: Amount::new(cost_per_chunk),
+                    },
+                },
+            )
+            .await;
+        });
+        let handle = StreamSessionHandle {
+            receiver: None,
+            state,
+            grant_wake,
+            cancel_wake,
+            terminate_wake,
+            summary_rx: None,
+            request_id,
+        };
+        CapturingPump {
+            handle,
+            outer_rx,
+            summary_rx,
+            pump_join,
+            inner_tx,
+            event_rx,
+            settle_rx,
+        }
+    }
+
+    /// Sends one `Data` chunk with the given per-stream `sequence` on the inner
+    /// channel (the pump re-numbers under its own outer cursor).
+    async fn send_inner_data(inner_tx: &mpsc::Sender<OutletStreamChunk>, seq: u64) {
+        inner_tx
+            .send(OutletStreamChunk {
+                request_id: [0u8; 16],
+                sequence: seq,
+                payload: ChunkPayload::Data {
+                    value: serde_json::json!({ "i": seq }),
+                },
+                sig: [0u8; 64],
+            })
+            .await
+            .expect("inner send");
+    }
+
+    /// Sends a terminal `End` chunk on the inner channel.
+    async fn send_inner_end(inner_tx: &mpsc::Sender<OutletStreamChunk>, seq: u64) {
+        use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+        inner_tx
+            .send(OutletStreamChunk {
+                request_id: [0u8; 16],
+                sequence: seq,
+                payload: ChunkPayload::End {
+                    aggregate: serde_json::Value::Null,
+                    provenance: DataProvenance {
+                        source_context: "ctx-test".to_owned(),
+                        source_type: SourceType::Persistent,
+                        counterparties: Vec::new(),
+                        purpose: None,
+                        discovery_method: DiscoveryMethod::OutOfBand,
+                        age: Duration::from_secs(0),
+                        memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                        chain_depth: 0,
+                        chain_path: None,
+                        payment_amount: None,
+                        payment_adapter: None,
+                        payment_receipt_id: None,
+                    },
+                    execution_time_ms: 0,
+                },
+                sig: [0u8; 64],
+            })
+            .await
+            .expect("inner send end");
+    }
+
+    /// Drains `outer_rx`, returning `(data_count, terminal_payload)`.
+    async fn drain_outer(
+        outer_rx: &mut mpsc::Receiver<OutletStreamChunk>,
+    ) -> (u32, Option<ChunkPayload>) {
+        let mut data = 0u32;
+        let mut terminal = None;
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_secs(5), outer_rx.recv()).await
+        {
+            let is_terminal = chunk.payload.is_terminal();
+            match chunk.payload {
+                ChunkPayload::Data { .. } => data += 1,
+                other if is_terminal => {
+                    terminal = Some(other);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (data, terminal)
+    }
+
+    /// A [`StreamSigner`] that delegates to an in-process key but BLOCKS the
+    /// `block_on_call`-th `sign` invocation on a barrier — modelling the
+    /// off-lock signing `.await` window during which a concurrent
+    /// `OutletCancel` can land (round-9 F1). Produces a VALID signature under
+    /// the pinned operator key on release (delegates to the inner signer), so
+    /// the pump's just-signed `debug_assert!` self-verify still holds.
+    struct BarrierSigner {
+        inner: super::super::signer::InProcessStreamSigner,
+        calls: std::sync::atomic::AtomicUsize,
+        block_on_call: usize,
+        sign_started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    #[async_trait::async_trait]
+    impl super::super::signer::StreamSigner for BarrierSigner {
+        async fn sign(
+            &self,
+            preimage: &[u8],
+        ) -> Result<[u8; 64], super::super::signer::StreamSignerError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.block_on_call {
+                // Announce the boundary chunk is mid-sign, then park until the
+                // test has recorded the concurrent cancel.
+                self.sign_started.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.sign(preimage).await
+        }
+        fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
+            self.inner.verifying_key()
+        }
+    }
+
+    /// **round-9 F1** — cancel-boundary billing TOCTOU. A concurrent
+    /// `OutletCancel` that lands DURING the off-lock signing `.await` of an
+    /// in-flight boundary `Data` chunk (whose per-chunk gate already returned
+    /// `Forward` under `ceiling == u64::MAX`) must NOT be billed. The
+    /// post-signing re-check mirrors the gate's `>=` drop, so the in-flight
+    /// `Data` is dropped-not-billed, `chunks_billed` stays correct, and the
+    /// terminal chunk occupies the pinned `cancel_ack_seq` slot. Before the
+    /// fix, the second (accrual) lock window re-read a ceiling of 5 and billed
+    /// the boundary `Data` at seq 5 (`5 <= 5`), silently over-billing by one.
+    #[tokio::test]
+    async fn pump_cancel_during_signing_drops_boundary_data_not_billed_round9_f1() {
+        let state = build_test_state();
+        set_credit(&state, 32, None);
+        set_escrow(&state, 10, 1_000);
+
+        let sign_started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        {
+            let mut g = state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.operator_signer = Arc::new(BarrierSigner {
+                inner: super::super::signer::InProcessStreamSigner::new(fixed_signing_key()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                // seq 0..=4 sign non-blocking (calls 1..=5); the sixth Data
+                // (outer seq 5) blocks mid-sign.
+                block_on_call: 6,
+                sign_started: Arc::clone(&sign_started),
+                release: Arc::clone(&release),
+            });
+        }
+
+        let state_for_cancel = Arc::clone(&state);
+        let request_id: RequestId = [0xC9; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            10,
+            0,
+        );
+
+        // Five billable Data chunks (outer seq 0..=4); drain each so the
+        // emission cursor advances to 5 (five sign calls completed).
+        for seq in 0..5 {
+            send_inner_data(&pump.inner_tx, seq).await;
+            let chunk = tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv())
+                .await
+                .expect("data chunk forwarded")
+                .expect("stream open");
+            assert!(matches!(chunk.payload, ChunkPayload::Data { .. }));
+            assert_eq!(chunk.sequence, seq);
+        }
+
+        // Sixth Data: its gate returns Forward (no cancel yet), then its signing
+        // blocks on the barrier.
+        send_inner_data(&pump.inner_tx, 5).await;
+        tokio::time::timeout(Duration::from_secs(5), sign_started.notified())
+            .await
+            .expect("boundary chunk reached the signing barrier");
+
+        // Concurrent cancel lands DURING signing, pinning cancel_ack_seq at the
+        // live emission cursor (5) — exactly what apply_outlet_cancel_signed
+        // does to the tracker.
+        {
+            let mut g = state_for_cancel
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cursor = g.next_emission_seq;
+            assert_eq!(cursor, 5, "five chunks emitted before the cancel");
+            g.cancel_ack.record_cancel(cursor, Instant::now());
+            g.cancel_ack_seq = g.cancel_ack.cancel_ack_seq();
+            g.cancel_ack_armed = true;
+        }
+
+        // Release the signature; the post-signing re-check must DROP the
+        // in-flight boundary Data (seq 5 >= ceiling 5).
+        release.notify_one();
+
+        // Deliver the terminal End; it takes the pinned cancel_ack_seq slot (5).
+        send_inner_end(&pump.inner_tx, 6).await;
+
+        let mut extra_data = 0u32;
+        let mut terminal_seq = None;
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv()).await
+        {
+            if chunk.payload.is_terminal() {
+                terminal_seq = Some(chunk.sequence);
+                break;
+            }
+            if matches!(chunk.payload, ChunkPayload::Data { .. }) {
+                extra_data += 1;
+            }
+        }
+        assert_eq!(
+            extra_data, 0,
+            "the in-flight boundary Data must be dropped, never forwarded"
+        );
+        assert_eq!(
+            terminal_seq,
+            Some(5),
+            "the terminal chunk occupies the pinned cancel_ack_seq slot"
+        );
+
+        pump.pump_join.await.expect("pump settles");
+        let summary = pump.summary_rx.await.expect("summary published");
+        assert_eq!(
+            summary.billed_count, 5,
+            "exactly five Data chunks billed — the boundary in-flight Data is NOT over-billed"
+        );
+        assert_eq!(summary.cancel_ack_seq, Some(5));
+
+        let events: Vec<_> = std::iter::from_fn(|| pump.event_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 1, "exactly one OutletInvokedEvent");
+        assert_eq!(events[0].chunks_billed, 5, "event bills five, not six");
+        assert_eq!(events[0].cancel_ack_seq, Some(5));
+        assert_eq!(
+            events[0].stream_chunk_count, 6,
+            "five Data + one terminal End leaves"
+        );
+
+        let settlements: Vec<_> = std::iter::from_fn(|| pump.settle_rx.try_recv().ok()).collect();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].billed_count, 5,
+            "settlement bills five — no over-bill of the dropped boundary Data"
+        );
+    }
+
+    /// **034 AC11** — a terminal `Error{terminal:true}` emitted with ZERO
+    /// credit still closes the stream successfully; terminal chunks bypass the
+    /// credit gate (they are never billed), so `chunks_billed == 0`.
+    #[tokio::test]
+    async fn pump_terminal_error_with_zero_credit_succeeds_034_ac11() {
+        let state = build_test_state();
+        set_credit(&state, 0, None); // zero credit window
+        set_escrow(&state, 1, 0);
+        let request_id: RequestId = [0xA1; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            1,
+            0,
+        );
+
+        // Send a terminal Error with 0 credit available.
+        pump.inner_tx
+            .send(OutletStreamChunk {
+                request_id: [0u8; 16],
+                sequence: 0,
+                payload: ChunkPayload::Error {
+                    code: scp_protocol::context::outlets::error_codes::CODE_EXECUTION_FAULT
+                        .to_owned(),
+                    message: "operator terminal error".to_owned(),
+                    terminal: true,
+                },
+                sig: [0u8; 64],
+            })
+            .await
+            .expect("inner send error");
+
+        let (data, terminal) = drain_outer(&mut pump.outer_rx).await;
+        assert_eq!(data, 0, "no Data chunks were sent");
+        assert!(
+            matches!(terminal, Some(ChunkPayload::Error { terminal: true, .. })),
+            "terminal Error forwarded despite zero credit"
+        );
+        pump.pump_join.await.expect("pump settles");
+        let summary = pump.summary_rx.await.expect("summary published");
+        assert_eq!(summary.billed_count, 0, "terminal chunks are never billed");
+
+        let events: Vec<_> = std::iter::from_fn(|| pump.event_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 1, "exactly one OutletInvokedEvent");
+        assert_eq!(events[0].chunks_billed, 0);
+    }
+
+    /// **034 AC23** — a 10-`Data` + `End` stream bills exactly `10 × cost`: the
+    /// event records `chunks_billed == 10` and the settlement receipt bills
+    /// `10 × cost_per_chunk` with zero refund.
+    #[tokio::test]
+    async fn pump_ten_data_bills_ten_times_cost_034_ac23() {
+        let state = build_test_state();
+        // credit_window 32 (default) admits all 10; escrow holds 10 × cost=1.
+        set_escrow(&state, 1, 10);
+        let request_id: RequestId = [0xA2; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            1,  // cost_per_chunk
+            10, // amount_cumulative_reserved
+        );
+
+        for seq in 0..10u64 {
+            send_inner_data(&pump.inner_tx, seq).await;
+        }
+        send_inner_end(&pump.inner_tx, 10).await;
+
+        let (data, terminal) = drain_outer(&mut pump.outer_rx).await;
+        assert_eq!(data, 10, "all 10 Data chunks forwarded");
+        assert!(
+            matches!(terminal, Some(ChunkPayload::End { .. })),
+            "closes on End"
+        );
+        pump.pump_join.await.expect("pump settles");
+        let summary = pump.summary_rx.await.expect("summary published");
+        assert_eq!(summary.billed_count, 10, "10 Data chunks billed");
+
+        let events: Vec<_> = std::iter::from_fn(|| pump.event_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 1, "exactly one event");
+        assert_eq!(events[0].chunks_billed, 10, "event bills 10 Data chunks");
+        assert_eq!(
+            events[0].stream_chunk_count, 11,
+            "11 total chunks (10 Data + terminal End)"
+        );
+
+        let settlements: Vec<_> = std::iter::from_fn(|| pump.settle_rx.try_recv().ok()).collect();
+        assert_eq!(settlements.len(), 1, "exactly one settlement");
+        assert_eq!(
+            settlements[0].billed_amount.value(),
+            10,
+            "settlement bills 10 × cost_per_chunk(1)"
+        );
+        assert_eq!(settlements[0].billed_count, 10);
+        assert_eq!(settlements[0].refund_amount.value(), 0, "nothing unspent");
+    }
+
+    /// **034 AC9** — 100 `Data` chunks flow under `credit_window = 32` when the
+    /// invoker issues a fresh signed grant after each window drains; the stream
+    /// completes with all 100 delivered plus the terminal `End`.
+    #[tokio::test]
+    async fn pump_hundred_chunks_with_periodic_grants_complete_034_ac9() {
+        use scp_protocol::context::outlets::stream::{CreditGrantSigningInputs, sign_credit_grant};
+        let state = build_test_state();
+        set_credit(&state, 32, Some(1_000)); // window 32, generous hard cap
+        set_escrow(&state, 0, 0); // zero-cost stream — focus on credit flow
+        let request_id: RequestId = [0xA9; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            0,
+            0,
+        );
+
+        // Pinned identity for signing grants (build_test_state fixture values).
+        let identity = super::super::stream::StreamIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "outlet-test".to_owned(),
+            stream_epoch: 1,
+            caveats_binding: [0xAB; 32],
+        };
+        let signing_key = fixed_signing_key();
+        let make_grant = |grant: u32, monotonic_seq: u64| {
+            let sig = sign_credit_grant(
+                &signing_key,
+                &CreditGrantSigningInputs {
+                    context_id: &identity.context_id,
+                    outlet_id: &identity.outlet_id,
+                    request_id: &request_id,
+                    grant,
+                    monotonic_seq,
+                    stream_epoch: identity.stream_epoch,
+                    caveats_binding: &identity.caveats_binding,
+                },
+            );
+            OutletStreamCredit {
+                request_id,
+                grant,
+                monotonic_seq,
+                sig,
+            }
+        };
+
+        // Feeder: push 100 Data then End.
+        let feeder_tx = pump.inner_tx.clone();
+        let feeder = tokio::spawn(async move {
+            for seq in 0..100u64 {
+                if feeder_tx
+                    .send(OutletStreamChunk {
+                        request_id: [0u8; 16],
+                        sequence: seq,
+                        payload: ChunkPayload::Data {
+                            value: serde_json::json!({ "i": seq }),
+                        },
+                        sig: [0u8; 64],
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            send_inner_end(&feeder_tx, 100).await;
+        });
+
+        // Consumer: drain, granting +32 credit each time the delivered count
+        // crosses a fresh window boundary. The initial window is 32.
+        let mut data = 0u32;
+        let mut terminal = None;
+        let mut monotonic_seq = 1u64;
+        let mut next_grant_at = 32u32;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv()).await {
+                Ok(Some(chunk)) => {
+                    let is_terminal = chunk.payload.is_terminal();
+                    match chunk.payload {
+                        ChunkPayload::Data { .. } => {
+                            data += 1;
+                            // Replenish BEFORE the window fully drains so the
+                            // executor never stalls permanently.
+                            if data >= next_grant_at.saturating_sub(4) {
+                                pump.handle
+                                    .apply_credit_grant(
+                                        &make_grant(32, monotonic_seq),
+                                        Amount::new(0),
+                                    )
+                                    .expect("grant accepted");
+                                monotonic_seq += 1;
+                                next_grant_at = next_grant_at.saturating_add(32);
+                            }
+                        }
+                        other if is_terminal => {
+                            terminal = Some(other);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => panic!("pump stalled — grants did not replenish credit"),
+            }
+        }
+
+        assert_eq!(
+            data, 100,
+            "all 100 Data chunks delivered across credit windows"
+        );
+        assert!(
+            matches!(terminal, Some(ChunkPayload::End { .. })),
+            "stream completes with terminal End"
+        );
+        feeder.await.expect("feeder joins");
+        pump.pump_join.await.expect("pump settles");
+        let summary = pump.summary_rx.await.expect("summary published");
+        assert_eq!(summary.billed_count, 100, "100 Data chunks billed");
+    }
+
+    /// **034 AC13** — an `OutletCancel` followed by executor silence forces the
+    /// cancel-ack timeout: the framework emits its own terminal
+    /// `Error{code: SCP-OUTLET-6135}` at the cancel-ack sequence and flushes
+    /// stream state.
+    #[tokio::test]
+    async fn pump_cancel_then_silence_forces_cancel_ack_timeout_034_ac13() {
+        let state = build_test_state();
+        set_escrow(&state, 1, 10);
+        let request_id: RequestId = [0x13; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_secs(30),    // stall timer — not exercised
+            Duration::from_millis(150), // short cancel-ack window
+            1,
+            10,
+        );
+
+        // Apply a signed cancel at the live cursor (0 — no chunk emitted yet),
+        // then stay silent so the executor never emits a terminal chunk.
+        let signer = super::super::signer::InProcessStreamSigner::new(fixed_signing_key());
+        let cancel_id = CancelIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "outlet-test".to_owned(),
+            caveats_binding: [0xAB; 32],
+        };
+        let recorded = pump
+            .handle
+            .apply_outlet_cancel_signed(&signer, &cancel_id)
+            .await
+            .expect("signed cancel accepted");
+        assert_eq!(recorded, Some(0), "cancel-ack pinned at the live cursor");
+
+        // The cancel-ack timer fires → framework terminal Error(6135).
+        let (_data, terminal) = drain_outer(&mut pump.outer_rx).await;
+        let ChunkPayload::Error {
+            code,
+            terminal: is_terminal,
+            ..
+        } = terminal.expect("framework emits a forced terminal on cancel-ack timeout")
+        else {
+            unreachable!("expected terminal Error");
+        };
+        assert!(is_terminal);
+        assert_eq!(
+            code,
+            scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+            "cancel-ack timeout maps to SCP-OUTLET-6135",
+        );
+        pump.pump_join.await.expect("pump settles");
+        let _ = pump
+            .summary_rx
+            .await
+            .expect("summary published — stream state flushed");
+    }
+
+    /// **034 AC25** — a credit stall after 3 `Data` chunks (credit window = 3,
+    /// no further grant) forces the credit-stall timeout: `chunks_billed == 3`
+    /// and the unspent escrow (`reserved − 3 × cost`) is refunded.
+    #[tokio::test]
+    async fn pump_credit_stall_after_three_data_refunds_unspent_034_ac25() {
+        let state = build_test_state();
+        set_credit(&state, 3, Some(1_000)); // window 3, high hard cap → Stall not CreditExhausted
+        set_escrow(&state, 1, 10); // reserve 10, only 3 will bill
+        let request_id: RequestId = [0x25; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_millis(150), // short credit-stall window
+            Duration::from_secs(30),
+            1,
+            10,
+        );
+
+        // Flood 6 Data — only 3 fit in the credit window; the 4th stalls.
+        for seq in 0..6u64 {
+            let _ = pump
+                .inner_tx
+                .send(OutletStreamChunk {
+                    request_id: [0u8; 16],
+                    sequence: seq,
+                    payload: ChunkPayload::Data {
+                        value: serde_json::json!({ "i": seq }),
+                    },
+                    sig: [0u8; 64],
+                })
+                .await;
+        }
+
+        let (data, terminal) = drain_outer(&mut pump.outer_rx).await;
+        assert_eq!(
+            data, 3,
+            "exactly credit_window(3) Data chunks delivered before stall"
+        );
+        let ChunkPayload::Error {
+            code,
+            terminal: is_terminal,
+            ..
+        } = terminal.expect("credit-stall timer emits a forced terminal")
+        else {
+            unreachable!("expected terminal Error");
+        };
+        assert!(is_terminal);
+        assert_eq!(
+            code,
+            scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT_STALL,
+            "credit stall maps to SCP-OUTLET-6133",
+        );
+        pump.pump_join.await.expect("pump settles");
+        let summary = pump.summary_rx.await.expect("summary published");
+        assert_eq!(
+            summary.billed_count, 3,
+            "only the 3 delivered Data chunks billed"
+        );
+
+        let settlements: Vec<_> = std::iter::from_fn(|| pump.settle_rx.try_recv().ok()).collect();
+        assert_eq!(settlements.len(), 1, "exactly one settlement");
+        assert_eq!(settlements[0].billed_amount.value(), 3, "3 × cost billed");
+        assert_eq!(
+            settlements[0].refund_amount.value(),
+            7,
+            "unspent escrow (10 − 3) refunded — chain-depth slot + escrow released",
+        );
+    }
+
+    /// **035 AC3 / 034 AC24** — a mid-stream cancel truncates billing: the
+    /// event records `cancel_ack_seq == Some(k)` and the chunks emitted ABOVE
+    /// the cancel-ack sequence are NOT billed, so `chunks_billed` reflects the
+    /// pinned ceiling — strictly fewer than the total `Data` chunks the
+    /// executor pushed — and the unspent escrow is refunded.
+    ///
+    /// NOTE on the §5.4.5:566 predicate `chunks_billed_ref = |{ i : @type ==
+    /// data && i <= cancel_ack_seq }|`: with `cancel_ack_seq = 5` the pinned
+    /// sequence slot `5` belongs to the **terminal cancel-ack chunk**
+    /// (§5.4.5:530(3)), NOT to a billable `Data`. The gate drops every
+    /// non-terminal chunk at `sequence >= 5` (`DropAboveCancelAck`, the `>=`
+    /// boundary), so the sealed manifest carries `Data` only at outer sequences
+    /// `0..=4` — FIVE chunks. The inclusive `i <= cancel_ack_seq` predicate
+    /// therefore counts exactly those five (there is no `Data` at slot `5`; the
+    /// terminal `End` occupies it), and the three post-cancel in-flight `Data`
+    /// the executor pushes at sequences `>= 5` are never emitted or billed —
+    /// the load-bearing protective property (chunks at/after the cancel-ack are
+    /// not billed). This asserts the deterministic terminal-occupies-the-slot
+    /// behavior the implementation encodes: `chunks_billed == 5`.
+    #[tokio::test]
+    async fn pump_midstream_cancel_truncates_billing_035_ac3_034_ac24() {
+        let state = build_test_state();
+        set_escrow(&state, 1, 8); // reserve for the 8 Data the executor pushes
+        let request_id: RequestId = [0x24; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            1,
+            8,
+        );
+
+        // Deliver 5 Data (outer cursor advances to 5) before cancelling.
+        for seq in 0..5u64 {
+            send_inner_data(&pump.inner_tx, seq).await;
+        }
+        for _ in 0..5 {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv())
+                .await
+                .expect("chunk within 5s")
+                .expect("chunk present");
+            assert!(matches!(chunk.payload, ChunkPayload::Data { .. }));
+        }
+
+        // Cancel at the live cursor (5). The runtime reads its own cursor.
+        let signer = super::super::signer::InProcessStreamSigner::new(fixed_signing_key());
+        let cancel_id = CancelIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "outlet-test".to_owned(),
+            caveats_binding: [0xAB; 32],
+        };
+        let recorded = pump
+            .handle
+            .apply_outlet_cancel_signed(&signer, &cancel_id)
+            .await
+            .expect("signed cancel accepted");
+        assert_eq!(recorded, Some(5), "cancel-ack pinned at emission cursor 5");
+
+        // Executor pushes 3 more Data (8 produced total) then a terminal End.
+        // §5.4.5:530(3): `cancel_ack_seq=5` is the terminal cancel-ack chunk's
+        // slot, so the framework's terminal `End` takes outer seq 5 and every
+        // one of the 3 post-cancel in-flight Data (gate `sequence >= 5`) is
+        // dropped-and-not-billed (§5.4.5:530(1)). Net: Data seq 0..4 billed
+        // (5); seq 5 = terminal; seq 6,7 never emitted.
+        for seq in 5..8u64 {
+            send_inner_data(&pump.inner_tx, seq).await;
+        }
+        send_inner_end(&pump.inner_tx, 8).await;
+
+        // Drain remaining until terminal.
+        let (more_data, terminal) = drain_outer(&mut pump.outer_rx).await;
+        assert_eq!(
+            more_data, 0,
+            "no post-cancel Data reaches the wire — all dropped at the gate (seq >= cancel_ack_seq)"
+        );
+        assert!(
+            matches!(terminal, Some(ChunkPayload::End { .. })),
+            "terminal End (the cancel-ack terminal chunk) closes the stream"
+        );
+        pump.pump_join.await.expect("pump settles");
+        let summary = pump.summary_rx.await.expect("summary published");
+        assert_eq!(
+            summary.cancel_ack_seq,
+            Some(5),
+            "cancel-ack sequence recorded on the summary",
+        );
+        assert_eq!(
+            summary.billed_count, 5,
+            "§5.4.5:530(3): the terminal occupies seq 5, post-cancel Data (seq >= 5) are dropped, \
+             so only Data seq 0..4 are billed (5) — not the 8 the executor produced"
+        );
+        assert_eq!(
+            summary.stream_chunk_count, 6,
+            "sealed manifest = Data seq 0..4 (5) + the terminal End at seq 5 = 6 leaves"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| pump.event_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 1, "exactly one event");
+        assert_eq!(
+            events[0].cancel_ack_seq,
+            Some(5),
+            "035 AC3: the close event records the cancel-ack ceiling",
+        );
+        // 035 AC3: a graceful cancel-ack close (cancel observed + terminal
+        // `End`) records the dedicated `Cancelled` terminal status, not `Ok`.
+        assert_eq!(
+            events[0].stream_terminal_status,
+            scp_protocol::context::outlets::stream::StreamTerminalStatus::Cancelled,
+            "035 AC3: graceful cancel-ack close records Cancelled terminal status",
+        );
+        assert_eq!(
+            events[0].status,
+            scp_protocol::context::outlets::OutletStatus::Cancelled,
+            "035 AC3: legacy status mirrors the Cancelled terminal status",
+        );
+        assert_eq!(
+            events[0].chunks_billed, 5,
+            "event bills the truncated set: Data seq 0..4 (5), not the 8 produced"
+        );
+
+        let settlements: Vec<_> = std::iter::from_fn(|| pump.settle_rx.try_recv().ok()).collect();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].billed_amount.value(), 5, "5 × cost billed");
+        assert_eq!(
+            settlements[0].refund_amount.value(),
+            3,
+            "unspent escrow (8 reserved − 5 billed) refunded",
         );
     }
 }
