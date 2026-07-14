@@ -194,6 +194,20 @@ Code that does not fully implement its documented contract (acceptance criterion
 
 All languages: PR review must verify that any function described as a stub in code comments has a corresponding PRD story with `status != "done"`.
 
+### No dev/test-only stand-in may mask a missing production implementation
+
+A stub is honest about its gap on its own path. It is a **separate, forbidden failure** for a stub — or any production code path — to reach for a **dev/test-only construct** to *appear* functional in production. Prohibited on every shipped path:
+
+- A **security nullifier** — in-memory/plaintext key custody, an always-succeeds attestation or certificate verifier, a non-resolving or in-memory DID/DHT resolver, an in-memory pre-rotation recovery custody — used because the real backend isn't built yet.
+- A **`#[cfg(test)]`- or `testing`-feature-gated type**, an in-memory/no-op adapter, or a `*::testing::*` construct constructed on a production create/run path.
+- A **placeholder value** — hardcoded default, empty result, `None`/`null`/`""`, or a value reconstructed from arguments — standing in for data that a real implementation would produce.
+
+**The rule:** if the real implementation is not ready, the capability **fails closed** — return a typed error, or produce the honest protocol-supported absent state (e.g., an identity created with *no* recovery commitment rather than one backed by an in-memory nullifier). It does **not** silently fall back to the dev stand-in. A dev stand-in that ships in production emits a *false guarantee* — callers believe a security property holds when it does not — which is strictly worse than the capability being honestly absent, because absence is detectable and a nullifier lies.
+
+**Deferral boundary:** deferring the *real backend* to a tracked workstream (issue/RFC) is legitimate. Shipping a dev stand-in *for it* in the interim is not. The two are independent: sever the nullifier now (make it test-harness-only, fail closed in prod); build the real backend on its own schedule.
+
+**Mechanical enforcement:** the shipped-feature-graph prove-absence gate (per ADR-062 / spec §17.17) asserts `resolved-feature-set(artifact) ⊆ an allowlist of durability-only features` and admits **zero nullifier features — no exceptions**. There is no "documented," "tracked," or "legible" allowlisted nullifier edge; a tracked deferral of the real backend does not earn one. Durability-only in-memory arms (state-loss only, no nullified security property — e.g. in-memory storage/push) remain legitimate *explicitly-selected* runtime options and are the only in-memory constructs the allowlist admits. See spec §17.17 for the durability-only-vs-nullifier classification.
+
 ## Async Patterns
 
 All SCP SDK operations involving I/O (network, storage, crypto operations) are async. Each language uses its native async mechanism.

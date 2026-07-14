@@ -93,3 +93,13 @@ Is this creating debt that's worth it?
 - **Flag silent scope changes.** If the implementation adds, removes, or reinterprets requirements without discussion, that's a finding.
 - **If no spec exists**, note this and evaluate against the product vision and design principles directly.
 - **Be honest about uncertainty.** If you can't determine alignment without more context, say so rather than guessing.
+
+## Mandate: no dev/test-only stand-in masking production (MANDATORY)
+
+Flag as a finding — with the same severity as a correctness bug — any dev/test-only construct reachable on a **shipped production path** that masks an unfinished real implementation or stubs for prod:
+
+- a security **nullifier** — in-memory/plaintext key custody, an always-succeeds attestation/certificate verifier, a non-resolving or in-memory DID/DHT resolver, an in-memory pre-rotation recovery custody;
+- a `#[cfg(test)]`- or `testing`-feature-gated type, an in-memory/no-op adapter, or a `*::testing::*` construct built on a production create/run path;
+- a placeholder value — hardcoded default, empty result, `None`/`null`/`""`, reconstructed-from-args — standing in for data a real implementation would produce.
+
+The correct behavior is **fail closed** (a typed error, or the honest protocol-supported absent state), never a silent fallback to the stand-in. A dev stand-in shipped in production emits a *false guarantee* — callers believe a security property holds when it does not — which is strictly worse than the capability being honestly absent (absence is detectable; a nullifier lies). Deferring the *real backend* to a tracked issue/RFC is legitimate; shipping a stand-in *for it* in the interim is not — the two are independent (sever the nullifier now and fail closed; build the backend on its own schedule). The prove-absence gate allowlists durability-only features and **zero nullifiers, no exceptions** — challenge any "documented," "tracked," or "legible" allowlisted nullifier edge as the exact anti-pattern this rule forbids. See CLAUDE.md builder tenets, `.docs/standards/sdk-common.md` §Stub and Placeholder Policy, and spec §17.17 (durability-only-vs-nullifier classification).

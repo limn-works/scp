@@ -135,3 +135,13 @@ If any cell is empty, the change is incomplete — that is your finding.
 - **Never weaken enforcement to close a gap.** If a check fails, the gap is real; fixing the gap is the resolution, not editing the check. The enforcement-file list in `CLAUDE.md` is off-limits except to *add* coverage.
 - **A gap is not "out of scope."** "Follow-up," "tracked separately," "not blocking," "future enhancement" are deflections, not verdicts. If the artifact scopes it, it is in scope. Report it.
 - **Be specific.** Every finding cites a file:line and the artifact §it violates. "Feels incomplete" is not a finding; "criterion 7 (§5.14.13 GRANT leaf) has no code in `crates/scp-ffi/napi/`" is.
+
+## Mandate: no dev/test-only stand-in masking production (MANDATORY)
+
+Flag as a finding — with the same severity as a correctness bug — any dev/test-only construct reachable on a **shipped production path** that masks an unfinished real implementation or stubs for prod:
+
+- a security **nullifier** — in-memory/plaintext key custody, an always-succeeds attestation/certificate verifier, a non-resolving or in-memory DID/DHT resolver, an in-memory pre-rotation recovery custody;
+- a `#[cfg(test)]`- or `testing`-feature-gated type, an in-memory/no-op adapter, or a `*::testing::*` construct built on a production create/run path;
+- a placeholder value — hardcoded default, empty result, `None`/`null`/`""`, reconstructed-from-args — standing in for data a real implementation would produce.
+
+The correct behavior is **fail closed** (a typed error, or the honest protocol-supported absent state), never a silent fallback to the stand-in. A dev stand-in shipped in production emits a *false guarantee* — callers believe a security property holds when it does not — which is strictly worse than the capability being honestly absent (absence is detectable; a nullifier lies). Deferring the *real backend* to a tracked issue/RFC is legitimate; shipping a stand-in *for it* in the interim is not — the two are independent (sever the nullifier now and fail closed; build the backend on its own schedule). The prove-absence gate allowlists durability-only features and **zero nullifiers, no exceptions** — challenge any "documented," "tracked," or "legible" allowlisted nullifier edge as the exact anti-pattern this rule forbids. See CLAUDE.md builder tenets, `.docs/standards/sdk-common.md` §Stub and Placeholder Policy, and spec §17.17 (durability-only-vs-nullifier classification).
