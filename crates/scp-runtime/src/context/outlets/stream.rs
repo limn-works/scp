@@ -1623,7 +1623,7 @@ pub const fn verify_outlet_invoked_event_local(
 /// when the chunk sequence cannot be JCS-canonicalized into a manifest root.
 /// The runtime MUST refuse the event at log-insert time per the §5.4.5
 /// wire-layer rejection rule.
-pub fn verify_outlet_invoked_event_manifest(
+pub(crate) fn verify_outlet_invoked_event_manifest(
     event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
     chunks: &[OutletStreamChunk],
 ) -> Result<(), ChunksBilledError> {
