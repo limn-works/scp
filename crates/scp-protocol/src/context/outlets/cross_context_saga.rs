@@ -23,8 +23,21 @@
 //! field-enumerated, length-prefixed variable fields) — never raw concatenation,
 //! which would be splice-ambiguous across the variable-length string fields.
 //!
+//! - [`CrossContextOutletStreamReceipt`] — the streaming-saga sibling of
+//!   [`CrossContextOutletReceipt`] (ADR-061, §6.2.5). Identical construction and
+//!   self-verifying contract, but under the DISTINCT `SCP-XCTX-STREAM-RECEIPT-V1:`
+//!   separator and closing its preimage with `Fixed32(stream_manifest_hash)` — the
+//!   RFC-6962 Merkle root over the sealed chunk sequence, carried DIRECTLY — instead
+//!   of `Fixed32(output_hash)`. It carries no inline output bytes and no chunk
+//!   sequence (boundedness): reproducibility on replay comes from the SagaId-keyed
+//!   durable capture of the root at stream-close (seal phase), never from
+//!   re-executing the stream. A manifest root cannot share the unary separator: a
+//!   verifier of a closed preimage cannot tell whether to recompute `SHA-256(bytes)`
+//!   or interpret a Merkle root, so the algorithm is pinned by the separator.
+//!
 //! Domain separators (registered in §9.18.2):
 //! - `"SCP-XCTX-RECEIPT-V1:"` — cross-context outlet receipt signing.
+//! - `"SCP-XCTX-STREAM-RECEIPT-V1:"` — cross-context streaming-saga receipt signing.
 //! - `"SCP-XCTX-DIVERGENCE-V1:"` — cross-context divergence marker signing.
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -35,6 +48,15 @@ use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
 /// Domain separator for [`CrossContextOutletReceipt`] signature preimages (§6.2.4, §9.18.2).
 pub const XCTX_RECEIPT_DOMAIN: &str = "SCP-XCTX-RECEIPT-V1:";
+
+/// Domain separator for [`CrossContextOutletStreamReceipt`] signature preimages
+/// (ADR-061, §6.2.5, §9.18.2).
+///
+/// DISTINCT from [`XCTX_RECEIPT_DOMAIN`] so a manifest root and an output hash can
+/// never be confused across the two closed preimages: the separator pins the
+/// verification algorithm (recompute `SHA-256(output_jcs)` for the unary receipt vs.
+/// interpret the carried Merkle root for the streaming receipt).
+pub const STREAM_XCTX_RECEIPT_DOMAIN: &str = "SCP-XCTX-STREAM-RECEIPT-V1:";
 
 /// Domain separator for [`CrossContextDivergenceMarker`] signature preimages (§6.2.4, §9.18.2).
 pub const XCTX_DIVERGENCE_DOMAIN: &str = "SCP-XCTX-DIVERGENCE-V1:";
@@ -292,6 +314,215 @@ impl CrossContextOutletReceipt {
     /// control `target_context_id` could otherwise sign a receipt naming it. By
     /// requiring the resolved key as an input, signature validity here is
     /// equivalent to "signed by the key authorized for `target_context_id`".
+    ///
+    /// # Errors
+    ///
+    /// - [`CrossContextSagaError::PreimageConstruction`] if the preimage cannot
+    ///   be built (unreachable in practice).
+    /// - [`CrossContextSagaError::SignatureInvalid`] if the signature does not
+    ///   verify against the reconstructed preimage and the supplied key.
+    pub fn verify(
+        &self,
+        authorized_target_signing_key: &VerifyingKey,
+    ) -> Result<(), CrossContextSagaError> {
+        let preimage = self.signing_preimage()?;
+        let signature = Signature::from_bytes(&self.signature);
+        authorized_target_signing_key
+            .verify_strict(&preimage, &signature)
+            .map_err(|e| CrossContextSagaError::SignatureInvalid(e.to_string()))
+    }
+}
+
+/// The target's signed response on the cross-context **streaming** outlet
+/// invocation return path (ADR-061 *Receipt (streaming)*, §6.2.5).
+///
+/// The streaming sibling of [`CrossContextOutletReceipt`]. Same self-verifying
+/// contract — every preimage field is carried on the receipt, so a verifier
+/// reconstructs the preimage from the receipt alone; the one thing the receipt
+/// cannot establish about itself is *signer authorization* (see [`Self::verify`]).
+///
+/// The two receipts differ in exactly two ways: (1) this type signs under the
+/// distinct [`STREAM_XCTX_RECEIPT_DOMAIN`] separator, and (2) its preimage's output
+/// slot carries `Fixed32(stream_manifest_hash)` — the RFC-6962 Merkle root over the
+/// sealed chunk sequence — instead of `Fixed32(output_hash)`. It carries no inline
+/// output bytes and **no chunk sequence**: the sealed root is captured durably,
+/// keyed by `SagaId`, at stream-close, so replay reproduces the same receipt from
+/// that captured root without re-executing the stream (boundedness — the receipt is
+/// a fixed size regardless of stream length).
+///
+/// # Field semantics (normative, §6.2.5)
+///
+/// - `caller_context_id` / `target_context_id` — raw 32-byte context-id digests
+///   (`Fixed32` in the preimage, 64-hex on the wire). Never the `"standing-"`-
+///   prefixed display string (§5.15.8 id-form rule).
+/// - `nonce` — the staged 16-byte correlation/dedup token (B's copy of the wire
+///   nonce). It is the join key between the two event-log records.
+/// - `stream_manifest_hash` — the RFC-6962 Merkle root over the sealed chunk
+///   sequence, carried directly (`Fixed32` in the preimage). Captured at
+///   stream-close and keyed by `SagaId` for deterministic replay.
+/// - `chain_depth` — **B's re-derived inbound depth** (`incoming + 1`), identical
+///   to the value B wrote into `OutletInvoked`, never the caller-asserted envelope
+///   value. A `u8` per §6.2.0 (`max_chain_depth` range `[1, 255]`).
+/// - `timestamp_ms` — **B's Prepare-B capture instant** (the staged
+///   `recorded_timestamp_ms`, "when the target accepted the call"), never the
+///   caller's send time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossContextOutletStreamReceipt {
+    /// Raw 32-byte digest of the initiating (caller) context.
+    #[serde(with = "crate::serde_util::serde_hash_32")]
+    pub caller_context_id: [u8; 32],
+    /// Raw 32-byte digest of the executing (target) context — the context B
+    /// verified and streamed the outlet in.
+    #[serde(with = "crate::serde_util::serde_hash_32")]
+    pub target_context_id: [u8; 32],
+    /// The caller principal DID the receipt is issued to (confused-deputy binding).
+    pub caller_did: String,
+    /// Staged 16-byte correlation/dedup nonce (B's copy of the wire value).
+    #[serde(with = "crate::serde_util::serde_nonce_16")]
+    pub nonce: [u8; 16],
+    /// Context-local outlet registration id B executed (indexes B's own registry).
+    pub outlet_registration_id: String,
+    /// The RFC-6962 Merkle root over the sealed chunk sequence, carried directly.
+    #[serde(with = "crate::serde_util::serde_hash_32")]
+    pub stream_manifest_hash: [u8; 32],
+    /// The target's `OutletInvoked` event-log entry id this receipt links to.
+    pub outlet_invoked_event_id: String,
+    /// B's re-derived inbound chain depth (`incoming + 1`), never caller-asserted.
+    pub chain_depth: u8,
+    /// B's Prepare-B capture instant in Unix milliseconds (staged `recorded_timestamp_ms`).
+    pub timestamp_ms: u64,
+    /// The target's Ed25519 signature over [`Self::signing_preimage`].
+    #[serde(with = "crate::serde_util::serde_signature_64")]
+    pub signature: [u8; 64],
+}
+
+/// The unsigned field set for [`CrossContextOutletStreamReceipt::sign`], named so
+/// the call site cannot transpose same-typed arguments.
+///
+/// The streaming sibling of [`CrossContextOutletReceiptFields`]: the two adjacent
+/// `[u8; 32]` ids (`caller_context_id` / `target_context_id`) plus the extra
+/// `[u8; 32]` `stream_manifest_hash`, and three `String` fields (`caller_did` /
+/// `outlet_registration_id` / `outlet_invoked_event_id`) are all same-typed
+/// transposition surfaces. A swap of any same-typed pair would compile and sign a
+/// self-consistent-but-wrong receipt. Naming every field at the call site makes a
+/// swap a compile-visible field-name error. Per the Agent-first API tenet: one flat
+/// named-field object, no builder, no ordering to track.
+///
+/// The target's Active Signing Key stays a SEPARATE parameter of
+/// [`CrossContextOutletStreamReceipt::sign`] — it is signing capability material,
+/// not a receipt field.
+pub struct CrossContextOutletStreamReceiptFields {
+    /// Raw 32-byte digest of the initiating (caller) context.
+    pub caller_context_id: [u8; 32],
+    /// Raw 32-byte digest of the executing (target) context.
+    pub target_context_id: [u8; 32],
+    /// The caller principal DID the receipt is issued to (confused-deputy binding).
+    pub caller_did: String,
+    /// Staged 16-byte correlation/dedup nonce (B's copy of the wire value).
+    pub nonce: [u8; 16],
+    /// Context-local outlet registration id B executed (indexes B's own registry).
+    pub outlet_registration_id: String,
+    /// The RFC-6962 Merkle root over the sealed chunk sequence, carried directly.
+    pub stream_manifest_hash: [u8; 32],
+    /// The target's `OutletInvoked` event-log entry id this receipt links to.
+    pub outlet_invoked_event_id: String,
+    /// B's re-derived inbound chain depth (`incoming + 1`), never caller-asserted.
+    pub chain_depth: u8,
+    /// B's Prepare-B capture instant in Unix milliseconds (staged `recorded_timestamp_ms`).
+    pub timestamp_ms: u64,
+}
+
+impl CrossContextOutletStreamReceipt {
+    /// Build the §9.5.1 canonical signing preimage for this streaming receipt.
+    ///
+    /// Field order is **normative** (ADR-061 *Receipt (streaming)*, §6.2.5) and
+    /// mirrors the unary [`CrossContextOutletReceipt::signing_preimage`] exactly,
+    /// with `Fixed32(stream_manifest_hash)` in the output slot in place of
+    /// `Fixed32(output_hash)`:
+    /// `Fixed32(caller_context_id)`, `Fixed32(target_context_id)`,
+    /// `VarBytes(caller_did)`, `RawBytes16(nonce)`, `VarBytes(outlet_registration_id)`,
+    /// `Fixed32(stream_manifest_hash)`, `VarBytes(outlet_invoked_event_id)`,
+    /// `U8(chain_depth)`, `U64(timestamp_ms)`. Domain-separated by
+    /// [`STREAM_XCTX_RECEIPT_DOMAIN`], so the preimage can never collide with a
+    /// unary receipt preimage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossContextSagaError::PreimageConstruction`] only if a
+    /// variable-length field exceeds `u32::MAX` bytes (unreachable in practice;
+    /// §9.10.3 bounds messages to 256 KB).
+    pub fn signing_preimage(&self) -> Result<[u8; 32], CrossContextSagaError> {
+        canonical_hash(
+            STREAM_XCTX_RECEIPT_DOMAIN,
+            &[
+                CanonicalField::Fixed32(&self.caller_context_id),
+                CanonicalField::Fixed32(&self.target_context_id),
+                CanonicalField::VarBytes(self.caller_did.as_bytes()),
+                CanonicalField::RawBytes(&self.nonce),
+                CanonicalField::VarBytes(self.outlet_registration_id.as_bytes()),
+                CanonicalField::Fixed32(&self.stream_manifest_hash),
+                CanonicalField::VarBytes(self.outlet_invoked_event_id.as_bytes()),
+                CanonicalField::U8(self.chain_depth),
+                CanonicalField::U64(self.timestamp_ms),
+            ],
+        )
+        .map_err(|e| CrossContextSagaError::PreimageConstruction(e.to_string()))
+    }
+
+    /// Fields needed to construct and sign a [`CrossContextOutletStreamReceipt`].
+    ///
+    /// `stream_manifest_hash` MUST already be the RFC-6962 Merkle root captured at
+    /// stream-close and keyed by the `SagaId` (seal phase); the receipt carries that
+    /// exact 32-byte root so a replay reproduces the identical signature without
+    /// re-executing the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossContextSagaError::PreimageConstruction`] if the preimage
+    /// cannot be built (unreachable in practice; §9.10.3 bounds messages to 256 KB).
+    pub fn sign(
+        target_signing_key: &SigningKey,
+        fields: CrossContextOutletStreamReceiptFields,
+    ) -> Result<Self, CrossContextSagaError> {
+        let CrossContextOutletStreamReceiptFields {
+            caller_context_id,
+            target_context_id,
+            caller_did,
+            nonce,
+            outlet_registration_id,
+            stream_manifest_hash,
+            outlet_invoked_event_id,
+            chain_depth,
+            timestamp_ms,
+        } = fields;
+        let mut receipt = Self {
+            caller_context_id,
+            target_context_id,
+            caller_did,
+            nonce,
+            outlet_registration_id,
+            stream_manifest_hash,
+            outlet_invoked_event_id,
+            chain_depth,
+            timestamp_ms,
+            signature: [0u8; 64],
+        };
+        let preimage = receipt.signing_preimage()?;
+        receipt.signature = target_signing_key.sign_prehashed_preimage(&preimage);
+        Ok(receipt)
+    }
+
+    /// Verify a cross-context streaming outlet receipt (ADR-061, §6.2.5).
+    ///
+    /// Verification reconstructs the §9.5.1 signature preimage from the receipt
+    /// fields (domain-separated by [`STREAM_XCTX_RECEIPT_DOMAIN`]) and checks the
+    /// Ed25519 signature against `authorized_target_signing_key`.
+    ///
+    /// **Signer authorization (normative, §6.2.5).** As with the unary
+    /// [`CrossContextOutletReceipt::verify`], the caller MUST pass the **Active
+    /// Signing Key authorized to act for `target_context_id`**, resolved via the
+    /// target context's membership/governance (§3, §7). This function does NOT trust
+    /// the receipt to name its own authorizing key.
     ///
     /// # Errors
     ///
@@ -816,5 +1047,293 @@ mod tests {
     #[test]
     fn domains_are_distinct() {
         assert_ne!(XCTX_RECEIPT_DOMAIN, XCTX_DIVERGENCE_DOMAIN);
+        assert_ne!(STREAM_XCTX_RECEIPT_DOMAIN, XCTX_RECEIPT_DOMAIN);
+        assert_ne!(STREAM_XCTX_RECEIPT_DOMAIN, XCTX_DIVERGENCE_DOMAIN);
+    }
+
+    // ---- Streaming-saga receipt (SCP-XCTX-STREAM-RECEIPT-V1, SCP-OUT-043) ----
+
+    /// A fixed, fully-populated streaming receipt for byte-exactness assertions.
+    fn fixed_stream_receipt(signing_key: &SigningKey) -> CrossContextOutletStreamReceipt {
+        CrossContextOutletStreamReceipt::sign(
+            signing_key,
+            CrossContextOutletStreamReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did:example:caller".to_owned(),
+                nonce: [0x33; 16],
+                outlet_registration_id: "calc.stream".to_owned(),
+                stream_manifest_hash: [0x55; 32],
+                outlet_invoked_event_id: "evt-outlet-invoked-1".to_owned(),
+                chain_depth: 3,
+                timestamp_ms: 1_709_654_400_000,
+            },
+        )
+        .expect("sign should succeed")
+    }
+
+    #[test]
+    fn stream_receipt_preimage_is_byte_exact() {
+        let sk = test_signing_key(0xAA);
+        let receipt = fixed_stream_receipt(&sk);
+
+        // Independently reconstruct the preimage byte-for-byte: domain prefix,
+        // then each of the nine fields in the normative order with length prefixes.
+        // The output slot carries Fixed32(stream_manifest_hash) directly — no
+        // SHA-256 recompute (unlike the unary receipt's output_hash).
+        let mut h = Sha256::new();
+        h.update(b"SCP-XCTX-STREAM-RECEIPT-V1:");
+        h.update([0x11; 32]); // Fixed32(caller_context_id)
+        h.update([0x22; 32]); // Fixed32(target_context_id)
+        h.update(18u32.to_be_bytes()); // len("did:example:caller")
+        h.update(b"did:example:caller");
+        h.update([0x33; 16]); // RawBytes16(nonce) — no length prefix
+        h.update(11u32.to_be_bytes()); // len("calc.stream")
+        h.update(b"calc.stream");
+        h.update([0x55; 32]); // Fixed32(stream_manifest_hash) — carried directly
+        h.update(20u32.to_be_bytes()); // len("evt-outlet-invoked-1")
+        h.update(b"evt-outlet-invoked-1");
+        h.update([3u8]); // U8(chain_depth)
+        h.update(1_709_654_400_000u64.to_be_bytes()); // U64(timestamp_ms)
+        let expected: [u8; 32] = h.finalize().into();
+
+        assert_eq!(
+            receipt.signing_preimage().expect("preimage"),
+            expected,
+            "stream receipt preimage must match the normative §6.2.5 field order"
+        );
+    }
+
+    #[test]
+    fn stream_receipt_round_trip_sign_verify_is_deterministic() {
+        // Deterministic signature for a fixed key + fixed manifest root — the
+        // replay-reproducibility property (AC6): re-signing the same captured root
+        // yields byte-identical bytes, and the receipt verifies.
+        let sk = test_signing_key(0xAA);
+        let a = fixed_stream_receipt(&sk);
+        let b = fixed_stream_receipt(&sk);
+        assert_eq!(
+            a.signature, b.signature,
+            "Ed25519 over a fixed prehashed preimage is deterministic (replay-repro)"
+        );
+        a.verify(&sk.verifying_key())
+            .expect("valid streaming receipt must verify against the authorized key");
+    }
+
+    #[test]
+    fn stream_receipt_tamper_each_covered_field_fails_verify() {
+        let sk = test_signing_key(0xAA);
+        let vk = sk.verifying_key();
+        let base = fixed_stream_receipt(&sk);
+
+        // caller_context_id
+        let mut t = base.clone();
+        t.caller_context_id[0] ^= 0xFF;
+        assert!(t.verify(&vk).is_err());
+
+        // target_context_id
+        let mut t = base.clone();
+        t.target_context_id[0] ^= 0xFF;
+        assert!(t.verify(&vk).is_err());
+
+        // caller_did
+        let mut t = base.clone();
+        t.caller_did.push('x');
+        assert!(t.verify(&vk).is_err());
+
+        // nonce
+        let mut t = base.clone();
+        t.nonce[0] ^= 0xFF;
+        assert!(t.verify(&vk).is_err());
+
+        // outlet_registration_id
+        let mut t = base.clone();
+        t.outlet_registration_id = "calc.other".to_owned();
+        assert!(t.verify(&vk).is_err());
+
+        // stream_manifest_hash (the Merkle root — bound directly into the preimage)
+        let mut t = base.clone();
+        t.stream_manifest_hash[0] ^= 0xFF;
+        assert!(t.verify(&vk).is_err());
+
+        // outlet_invoked_event_id
+        let mut t = base.clone();
+        t.outlet_invoked_event_id = "evt-outlet-invoked-2".to_owned();
+        assert!(t.verify(&vk).is_err());
+
+        // chain_depth
+        let mut t = base.clone();
+        t.chain_depth = 4;
+        assert!(t.verify(&vk).is_err());
+
+        // timestamp_ms (consumes `base` — last tamper case in this test)
+        let mut t = base;
+        t.timestamp_ms += 1;
+        assert!(t.verify(&vk).is_err());
+    }
+
+    #[test]
+    fn stream_receipt_wrong_signer_fails_authorization() {
+        // A streaming receipt validly signed by one key must fail when verified
+        // against a DIFFERENT key — the signer-authorization input binds the
+        // receipt to the key authorized for target_context_id.
+        let signer = test_signing_key(0xAA);
+        let receipt = fixed_stream_receipt(&signer);
+
+        let wrong_authorized = test_signing_key(0xBB).verifying_key();
+        assert!(
+            receipt.verify(&wrong_authorized).is_err(),
+            "a valid Ed25519 signature by a non-authorized key must fail verify"
+        );
+    }
+
+    #[test]
+    fn stream_and_unary_receipts_reject_cross_separator_signatures() {
+        // AC5: cross-separator replay is impossible. A unary receipt and a
+        // streaming receipt built from the SAME shared fields (with the unary's
+        // output_hash equal to the streaming manifest root) still produce distinct
+        // signatures under distinct separators, so neither verifies as the other.
+        let sk = test_signing_key(0xAA);
+        let vk = sk.verifying_key();
+
+        // Choose the unary output_jcs so that SHA-256(output_jcs) equals the
+        // streaming receipt's stream_manifest_hash is NOT required; the separators
+        // alone guarantee rejection. Build both over otherwise-identical fields.
+        let stream = fixed_stream_receipt(&sk);
+
+        let unary = CrossContextOutletReceipt::sign(
+            &sk,
+            CrossContextOutletReceiptFields {
+                caller_context_id: stream.caller_context_id,
+                target_context_id: stream.target_context_id,
+                caller_did: stream.caller_did.clone(),
+                nonce: stream.nonce,
+                outlet_registration_id: stream.outlet_registration_id.clone(),
+                output_jcs: b"{}".to_vec(),
+                outlet_invoked_event_id: stream.outlet_invoked_event_id.clone(),
+                chain_depth: stream.chain_depth,
+                timestamp_ms: stream.timestamp_ms,
+            },
+        )
+        .expect("sign unary");
+
+        // Graft the unary signature onto a streaming receipt and vice-versa.
+        let mut stream_with_unary_sig = stream.clone();
+        stream_with_unary_sig.signature = unary.signature;
+        assert!(
+            stream_with_unary_sig.verify(&vk).is_err(),
+            "a unary SCP-XCTX-RECEIPT-V1 signature must be rejected by the streaming verify"
+        );
+
+        let mut unary_with_stream_sig = unary;
+        unary_with_stream_sig.signature = stream.signature;
+        assert!(
+            unary_with_stream_sig.verify(&vk).is_err(),
+            "a streaming SCP-XCTX-STREAM-RECEIPT-V1 signature must be rejected by the unary verify"
+        );
+
+        assert_ne!(
+            STREAM_XCTX_RECEIPT_DOMAIN, XCTX_RECEIPT_DOMAIN,
+            "the streaming and unary separators must differ"
+        );
+    }
+
+    #[test]
+    fn stream_receipt_splice_resistance_registration_id_boundary() {
+        // Two receipts differing only in where the caller_did / outlet_registration_id
+        // boundary falls must produce different preimages — length-prefixing prevents
+        // the splice ambiguity raw concatenation would admit.
+        let sk = test_signing_key(0xAA);
+
+        let a = CrossContextOutletStreamReceipt::sign(
+            &sk,
+            CrossContextOutletStreamReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did:example:ab".to_owned(),
+                nonce: [0x33; 16],
+                outlet_registration_id: "coutlet".to_owned(),
+                stream_manifest_hash: [0x55; 32],
+                outlet_invoked_event_id: "evt".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1,
+            },
+        )
+        .expect("sign a");
+        let b = CrossContextOutletStreamReceipt::sign(
+            &sk,
+            CrossContextOutletStreamReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did:example:a".to_owned(),
+                nonce: [0x33; 16],
+                outlet_registration_id: "bcoutlet".to_owned(),
+                stream_manifest_hash: [0x55; 32],
+                outlet_invoked_event_id: "evt".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1,
+            },
+        )
+        .expect("sign b");
+
+        assert_ne!(
+            a.signing_preimage().expect("a"),
+            b.signing_preimage().expect("b"),
+            "boundary shift between caller_did and outlet_registration_id must change the preimage"
+        );
+    }
+
+    #[test]
+    fn stream_receipt_splice_resistance_event_id_boundary() {
+        // Symmetric splice check across the outlet_invoked_event_id VarBytes boundary.
+        let sk = test_signing_key(0xAA);
+
+        let a = CrossContextOutletStreamReceipt::sign(
+            &sk,
+            CrossContextOutletStreamReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did".to_owned(),
+                nonce: [0x33; 16],
+                outlet_registration_id: "t".to_owned(),
+                stream_manifest_hash: [0x55; 32],
+                outlet_invoked_event_id: "evtX".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1,
+            },
+        )
+        .expect("sign a");
+        let b = CrossContextOutletStreamReceipt::sign(
+            &sk,
+            CrossContextOutletStreamReceiptFields {
+                caller_context_id: [0x11; 32],
+                target_context_id: [0x22; 32],
+                caller_did: "did".to_owned(),
+                nonce: [0x33; 16],
+                outlet_registration_id: "t".to_owned(),
+                stream_manifest_hash: [0x55; 32],
+                outlet_invoked_event_id: "evt".to_owned(),
+                chain_depth: 1,
+                timestamp_ms: 1,
+            },
+        )
+        .expect("sign b");
+        // a carries "evtX"; b carries "evt". Distinct VarBytes → distinct preimage.
+        assert_ne!(
+            a.signing_preimage().expect("a"),
+            b.signing_preimage().expect("b")
+        );
+    }
+
+    #[test]
+    fn stream_receipt_serde_round_trip() {
+        let sk = test_signing_key(0xAA);
+        let receipt = fixed_stream_receipt(&sk);
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        let back: CrossContextOutletStreamReceipt =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(receipt, back);
+        back.verify(&sk.verifying_key())
+            .expect("round-tripped streaming receipt still verifies");
     }
 }
