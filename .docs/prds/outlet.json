@@ -2885,14 +2885,14 @@
         "pub const STREAM domain constant equals \"SCP-XCTX-STREAM-RECEIPT-V1:\" \u2014 grep -n 'SCP-XCTX-STREAM-RECEIPT-V1' crates/scp-protocol/src/context/outlets/cross_context_saga.rs returns a `pub const` declaration whose value is that exact separator string",
         "struct CrossContextOutletStreamReceipt exists with a stream_manifest_hash: [u8; 32] field (the Merkle root carried directly) and NO output_hash / inline-output field \u2014 grep -n 'stream_manifest_hash: \\[u8; 32\\]' crates/scp-protocol/src/context/outlets/cross_context_saga.rs returns the field",
         "The signature preimage is the \u00a79.5.1 canonical_hash construction over exactly nine fields in order [Fixed32(caller_context_id), Fixed32(target_context_id), VarBytes(caller_did), RawBytes16(nonce), VarBytes(outlet_registration_id), Fixed32(stream_manifest_hash), VarBytes(outlet_invoked_event_id), U8(chain_depth), U64(timestamp_ms)] \u2014 a KAT test asserts the byte-exact preimage for fixed inputs",
-        "CrossContextOutletStreamReceipt::sign(fields, signing_key) -> Self and ::verify(&self, verifying_key) -> Result<(), ReceiptError> exist and round-trip: a signed receipt verifies, and any single-field mutation of the receipt fails verify with a signature error",
+        "CrossContextOutletStreamReceipt::sign(target_signing_key, fields) -> Result<Self, CrossContextSagaError> and ::verify(&self, authorized_target_signing_key) -> Result<(), CrossContextSagaError> exist and round-trip (mirroring the unary CrossContextOutletReceipt sign/verify signatures and reusing CrossContextSagaError — no new error type): a signed receipt verifies, and any single-field mutation of the receipt fails verify with a signature error",
         "The domain separator differs from XCTX_RECEIPT_DOMAIN, so a unary SCP-XCTX-RECEIPT-V1 signature is REJECTED by CrossContextOutletStreamReceipt::verify and vice-versa (cross-separator replay is impossible) \u2014 regression test",
         "Known-answer / replay-repro test: given a fixed stream_manifest_hash captured for a SagaId, sign() produces a deterministic signature and verify() accepts it; the receipt carries no chunk sequence (boundedness preserved \u2014 the receipt struct has no Vec<...chunk...> field)",
         "The unary CrossContextOutletReceipt and XCTX_RECEIPT_DOMAIN are unchanged \u2014 grep confirms SCP-XCTX-RECEIPT-V1 preimage still closes with Fixed32(output_hash)",
         "cargo test -p scp-protocol succeeds"
       ],
       "actionItems": [
-        "Add the STREAM_XCTX_RECEIPT_DOMAIN const and CrossContextOutletStreamReceipt type in cross_context_saga.rs",
+        "Add the XCTX_STREAM_RECEIPT_DOMAIN const and CrossContextOutletStreamReceipt type in cross_context_saga.rs",
         "Implement the \u00a79.5.1 field-enumerated preimage with Fixed32(stream_manifest_hash) in the output slot",
         "Implement sign()/verify() mirroring the unary receipt",
         "Export the type from context/outlets/mod.rs",
