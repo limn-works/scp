@@ -29,8 +29,12 @@ use std::sync::Arc;
 use scp_did::DID;
 use scp_protocol::economy::types::Amount;
 
+use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
+
 use crate::context::outlets::dispatch::StreamEscrowRefundSink;
-use crate::context::outlets::invoke::{StreamSettlement, StreamSettlementSink};
+use crate::context::outlets::invoke::{
+    OutletInvokedEventSink, StreamManifestCommitment, StreamSettlement, StreamSettlementSink,
+};
 use crate::context::supervisor::supervisor::Supervisor;
 
 /// Concrete [`StreamEscrowRefundSink`] routing an open-time escrow reversal to
@@ -176,6 +180,72 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
                 )
             })?
         })
+    }
+}
+
+/// Concrete [`OutletInvokedEventSink`] routing a stream's close-time §5.4.5
+/// `OutletInvokedEvent` to the durable context event log via the supervisor's
+/// verified-append boundary
+/// ([`Supervisor::append_streaming_outlet_invoked_event`]).
+///
+/// Constructed INTERNALLY by the streaming open orchestrator
+/// (`Supervisor::open_outlet_stream`) — the FFI bridges pass `None` for the
+/// caller-facing `invoked_event_sink`, so wiring this sink supervisor-side is
+/// what makes the §5.4.5 "ONE event per stream at close" record durable in
+/// production (mirrors the internally-wired [`ActorStreamSettlementSink`]). The
+/// `record` callback is `Sync` fire-and-forget: it spawns the async append onto
+/// the captured runtime handle. A missing/torn-down event log or a persist
+/// failure is surfaced to the operator log (the money-moving settlement is a
+/// separate sink; this one carries the audit record).
+pub(crate) struct ActorOutletInvokedEventSink {
+    /// The supervisor whose shared event-log provider owns the target context's
+    /// durable log.
+    supervisor: Arc<Supervisor>,
+    /// The canonical event-log key for the hosting context
+    /// (`context_id_to_bytes`), pinned at open.
+    context_id_bytes: [u8; 32],
+    /// The §5.4.5 stream `invoker_did`, recorded as the event-log leaf's
+    /// `actor_did`.
+    actor_did: String,
+    /// Runtime handle captured at construction (the pump fires `record` on a
+    /// runtime task; capturing keeps this uniform with the sibling sinks).
+    runtime: tokio::runtime::Handle,
+}
+
+impl ActorOutletInvokedEventSink {
+    /// Wrap a supervisor `Arc` + the hosting context's event-log key + the
+    /// stream `invoker_did` as the durable close-event sink, capturing the
+    /// current runtime handle. Sole non-test constructor: the streaming open
+    /// orchestrator (`Supervisor::open_outlet_stream`).
+    pub(crate) fn new(
+        supervisor: Arc<Supervisor>,
+        context_id_bytes: [u8; 32],
+        actor_did: String,
+    ) -> Self {
+        Self {
+            supervisor,
+            context_id_bytes,
+            actor_did,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl OutletInvokedEventSink for ActorOutletInvokedEventSink {
+    fn record(&self, event: OutletInvokedEvent, manifest: StreamManifestCommitment) {
+        let supervisor = Arc::clone(&self.supervisor);
+        let context_id_bytes = self.context_id_bytes;
+        let actor_did = self.actor_did.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = supervisor
+                .append_streaming_outlet_invoked_event(context_id_bytes, event, manifest, actor_did)
+                .await
+            {
+                // Best-effort: a torn-down context or persist failure leaves the
+                // operator log the only record of the durable-append failure.
+                tracing::warn!("streaming OutletInvokedEvent durable append failed: {e}");
+            }
+        });
     }
 }
 

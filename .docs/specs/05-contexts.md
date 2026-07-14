@@ -576,6 +576,9 @@ OutletInvokedEvent {
   chunks_billed:          u32,        // Data chunks at or below cancel-ack sequence
   stream_manifest_hash:   [u8; 32],   // Merkle root over chunk leaves; see below
   stream_terminal_status: StreamTerminalStatus, // Ok | Error(code) | Cancelled
+  cancel_ack_seq:         Option<u64>, // pinned cancel-ack sequence = the chunks_billed
+                                       // ceiling; None when the stream terminated
+                                       // without a cancel (ceiling = u64::MAX)
 }
 ```
 

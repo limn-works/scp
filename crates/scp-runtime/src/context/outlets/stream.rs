@@ -1006,8 +1006,18 @@ pub enum CancelState {
         cancel_ack_at: Instant,
     },
     /// Cancel-ack window closed (terminal chunk delivered or timer
-    /// fired).
-    Closed,
+    /// fired). Carries the pinned `cancel_ack_seq` when an `OutletCancel`
+    /// was observed BEFORE the terminal transition, so the billing ceiling
+    /// SURVIVES `record_terminal` — `None` means the stream closed without
+    /// ever observing a cancel. Without carrying the value, a post-terminal
+    /// `cancel_ack_seq()` / `billing_ceiling()` read would silently collapse
+    /// to `None` / `u64::MAX` and mis-bill a reordered close.
+    Closed {
+        /// The pinned cancel-ack sequence carried across the terminal
+        /// transition (`Some` iff an `OutletCancel` was observed before close),
+        /// so the billing ceiling is not lost after `record_terminal`.
+        cancel_ack_seq: Option<u64>,
+    },
 }
 
 /// Per-stream cancel-ack lifecycle (§5.4.5).
@@ -1063,20 +1073,31 @@ impl CancelAckTracker {
     }
 
     /// Marks the tracker `Closed` after the terminal chunk has been
-    /// delivered. Idempotent.
+    /// delivered. Idempotent. Preserves the pinned `cancel_ack_seq` across
+    /// the terminal transition so a later `cancel_ack_seq()` /
+    /// `billing_ceiling()` read cannot silently lose the ceiling (robustness
+    /// against a future reorder that reads the tracker AFTER close).
     pub const fn record_terminal(&mut self) {
-        self.state = CancelState::Closed;
+        let cancel_ack_seq = match self.state {
+            CancelState::Pending { cancel_ack_seq, .. } => Some(cancel_ack_seq),
+            CancelState::Closed { cancel_ack_seq } => cancel_ack_seq,
+            CancelState::Active => None,
+        };
+        self.state = CancelState::Closed { cancel_ack_seq };
     }
 
-    /// Returns `Some(cancel_ack_seq)` when the tracker is `Pending`
-    /// or `Closed` (terminal already emitted but cancel was
-    /// observed); the §5.4.5 chunks_billed predicate uses this
-    /// ceiling.
+    /// Returns `Some(cancel_ack_seq)` when an `OutletCancel` was observed —
+    /// in the `Pending` state, and in the `Closed` state when the cancel was
+    /// observed BEFORE the terminal transition (the pinned ceiling survives
+    /// `record_terminal`). Returns `None` for an `Active` stream and for a
+    /// `Closed` stream that terminated without ever observing a cancel. The
+    /// §5.4.5 chunks_billed predicate uses this ceiling.
     #[must_use]
     pub const fn cancel_ack_seq(&self) -> Option<u64> {
         match self.state {
-            CancelState::Active | CancelState::Closed => None,
+            CancelState::Active => None,
             CancelState::Pending { cancel_ack_seq, .. } => Some(cancel_ack_seq),
+            CancelState::Closed { cancel_ack_seq } => cancel_ack_seq,
         }
     }
 
@@ -1086,12 +1107,17 @@ impl CancelAckTracker {
     /// `count(Data leaves with index <= ceiling)`; an `Active`
     /// stream's ceiling is `u64::MAX` and the predicate reduces to
     /// "every Data leaf is billable", per §5.4.5 wire-rejection
-    /// rule.
+    /// rule. A `Closed` tracker keeps the pinned ceiling (or `u64::MAX`
+    /// when no cancel was ever observed) — see [`Self::record_terminal`].
     #[must_use]
     pub const fn billing_ceiling(&self) -> u64 {
         match self.state {
-            CancelState::Active | CancelState::Closed => u64::MAX,
+            CancelState::Active => u64::MAX,
             CancelState::Pending { cancel_ack_seq, .. } => cancel_ack_seq,
+            CancelState::Closed { cancel_ack_seq } => match cancel_ack_seq {
+                Some(seq) => seq,
+                None => u64::MAX,
+            },
         }
     }
 
@@ -1107,7 +1133,7 @@ impl CancelAckTracker {
             CancelState::Pending { cancel_ack_at, .. } => {
                 now.saturating_duration_since(cancel_ack_at) >= self.cancel_ack_window
             }
-            CancelState::Active | CancelState::Closed => false,
+            CancelState::Active | CancelState::Closed { .. } => false,
         }
     }
 
@@ -2184,6 +2210,36 @@ mod tests {
         let later = now + Duration::from_secs(1);
         tracker.record_cancel(99, later); // ignored
         assert_eq!(tracker.cancel_ack_seq(), Some(3));
+    }
+
+    #[test]
+    fn cancel_ack_seq_survives_terminal_transition() {
+        // Robustness (round-9 F5): the pinned cancel-ack ceiling must survive
+        // `record_terminal` so a read AFTER close still bills against it rather
+        // than silently collapsing to `None` / `u64::MAX`.
+        let mut tracker = CancelAckTracker::new(5);
+        let now = Instant::now();
+        tracker.record_cancel(4, now);
+        assert_eq!(tracker.cancel_ack_seq(), Some(4));
+        assert_eq!(tracker.billing_ceiling(), 4);
+        tracker.record_terminal();
+        assert_eq!(
+            tracker.cancel_ack_seq(),
+            Some(4),
+            "cancel_ack_seq must survive the terminal transition"
+        );
+        assert_eq!(
+            tracker.billing_ceiling(),
+            4,
+            "billing_ceiling must survive the terminal transition"
+        );
+
+        // A stream that closes WITHOUT ever observing a cancel keeps the
+        // uncancelled ceiling (`u64::MAX`) and reports no cancel-ack sequence.
+        let mut uncancelled = CancelAckTracker::new(5);
+        uncancelled.record_terminal();
+        assert_eq!(uncancelled.cancel_ack_seq(), None);
+        assert_eq!(uncancelled.billing_ceiling(), u64::MAX);
     }
 
     #[test]

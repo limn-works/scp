@@ -2125,6 +2125,61 @@ impl Supervisor {
         self.helper_persistence.get()
     }
 
+    /// Durably appends the §5.4.5 streaming `OutletInvokedEvent` at stream close
+    /// through the CANONICAL verified-append boundary
+    /// ([`ContextEventLogProvider::append_outlet_invoked_verified`]), feeding the
+    /// pump's retained ADR-061 Merkle-frontier commitment as the `Frontier`
+    /// source so the FULL §5.4.5:566 `chunks_billed` wire-invariant — and the
+    /// durable event-local `<=` backstop it delegates to — fire at the real
+    /// log-insert boundary, against the frontier the pump actually built.
+    ///
+    /// Called (fire-and-forget) by
+    /// [`ActorOutletInvokedEventSink`](crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink),
+    /// which the streaming open orchestrator wires internally so the close event
+    /// is persisted in production regardless of the FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] when no event-log provider is configured, or the
+    /// verified append rejects/serializes/persists the event.
+    pub(crate) async fn append_streaming_outlet_invoked_event(
+        &self,
+        context_id_bytes: [u8; 32],
+        event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+        manifest: crate::context::outlets::invoke::StreamManifestCommitment,
+        actor_did: String,
+    ) -> Result<(), ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::append_streaming_outlet_invoked_event — event_log provider not configured"
+                    .to_owned(),
+            )
+        })?;
+        // Local committer-assigned leaf timestamp: the same-context streaming
+        // close event is authored once, by the operator's node (not a
+        // cross-member convergent commit leaf), so a wall-clock reading is
+        // correct here. A missing clock falls back to 0 rather than failing the
+        // append.
+        let timestamp_secs = self.clock_ref().map_or(0, |clock| {
+            use scp_clock::Clock as _;
+            clock.now_secs()
+        });
+        event_log
+            .append_outlet_invoked_verified(
+                &context_id_bytes,
+                &event,
+                crate::context::outlets::stream::ChunksBilledSource::Frontier {
+                    root: manifest.root,
+                    billed_count: manifest.billed_count,
+                    leaf_count: manifest.leaf_count,
+                },
+                &actor_did,
+                timestamp_secs,
+            )
+            .await
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
     /// Cheap reference to the supervisor's wall-clock source. Returns
     /// `None` if [`Self::with_providers`] was not used.
     #[must_use]
@@ -11308,6 +11363,22 @@ impl Supervisor {
                     reservation.generation,
                 ),
             );
+
+        // §5.4.5 / SCP-OUT-035 — the durable close-event sink, wired INTERNALLY
+        // here (not by the FFI caller, which passes `None`) so the "ONE event
+        // per stream at close" record is persisted in production and the full
+        // §5.4.5:566 wire-rejection fires at the real log-insert boundary. A
+        // caller-supplied `invoked_event_sink` (tests capturing the event) takes
+        // precedence; otherwise the durable production sink is used.
+        let durable_invoked_sink: Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink> =
+            Arc::new(
+                crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink::new(
+                    Arc::clone(self),
+                    crate::context::state::context_id_to_bytes(context_id),
+                    invoker_did.as_ref().to_owned(),
+                ),
+            );
+        let invoked_event_sink = invoked_event_sink.or(Some(durable_invoked_sink));
 
         // §5.4.5 / §9.18.B — the three-tier concurrent-stream admission caps
         // are AUTHORITATIVE from the hosting context's live `ContextParams`,
@@ -28478,6 +28549,266 @@ mod open_outlet_stream_tests {
             captured.load(Ordering::SeqCst),
             1,
             "exactly one §19.15.5 receipt captured for the billed count"
+        );
+    }
+
+    /// **SCP-OUT-035 durable persistence (round-9 F2)** — the streaming close
+    /// event is PERSISTED in production. `open_outlet_stream` wires the durable
+    /// [`ActorOutletInvokedEventSink`](crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink)
+    /// INTERNALLY (the FFI bridges pass `None`), so a streaming close writes
+    /// EXACTLY ONE `OutletInvokedEvent` to the context event log — routed
+    /// through the verified `append_outlet_invoked_verified` boundary — carrying
+    /// the correct `chunks_billed`, `stream_manifest_hash`, and `cancel_ack_seq`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_outlet_stream_persists_one_invoked_event_035() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let supervisor = build_supervisor(&captured);
+
+        // Initialize the durable event log for the hosting context so the
+        // close-event append lands (full context creation normally does this).
+        supervisor
+            .event_log_ref()
+            .expect("event log configured")
+            .init_event_log(&[CTX_BYTE; 32])
+            .await
+            .expect("init event log");
+
+        let role_state = authorizing_role_state();
+        let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+        // 1-second cancel-ack timeout on the CONTEXT so the blocked executor's
+        // stream is force-terminated fast after the signed cancel.
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key(),
+            scp_protocol::context::ContextParams {
+                stream_cancel_ack_secs: 1,
+                ..scp_protocol::context::ContextParams::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        state.role_state = role_state.clone();
+        state
+            .membership
+            .add_member(invoker(), "owner".to_owned(), Vec::new());
+        state
+            .governance
+            .budget_tracker
+            .grant(&invoker(), Amount::new(1_000_000));
+        state.governance.economic_policy = Some(policy());
+        let deps = supervisor
+            .build_actor_deps(&invoker())
+            .await
+            .expect("build_actor_deps");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn_actor_with_state");
+
+        let mut registry = OutletRegistry::new();
+        register_outlet(&mut registry, &role_state, registration(), &invoker().0)
+            .expect("register streaming outlet");
+
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        let request_id: RequestId = [CTX_BYTE; 16];
+        let caveats_jcs = caveats.to_canonical_json_bytes().expect("jcs");
+        let caveats_binding = compute_caveats_binding(
+            UCAN_CID.as_bytes(),
+            &request_id,
+            &invoker().0,
+            DECLARED_ESTIMATE,
+            &caveats_jcs,
+        );
+        let identity = StreamIdentity {
+            context_id: ctx_key(),
+            outlet_id: "calculator".to_owned(),
+            stream_epoch: 1,
+            caveats_binding,
+        };
+        let invoker_key = SigningKey::from_bytes(&[0x24; 32]);
+        let invoker_pk = invoker_key.verifying_key();
+        let operator_signer: Arc<dyn StreamSigner> =
+            Arc::new(InProcessStreamSigner::new(invoker_key.clone()));
+
+        let params = OpenStreamParams {
+            identity: identity.clone(),
+            caps: AdmissionCaps {
+                per_invoker: 10,
+                per_origin_invoker: 10,
+                per_outlet: 10,
+            },
+            invoker_did: invoker().0,
+            origin_invoker_did: invoker().0,
+            cost_per_chunk: Amount::new(COST_PER_CHUNK),
+            available_balance: Amount::new(1_000_000),
+            reserved_escrow: Amount::new(0),
+            declared_estimated_chunk_count: Some(DECLARED_ESTIMATE),
+            credit_window: 999,
+            caveats: caveats.clone(),
+            invoker_pk,
+            operator_signer: Arc::clone(&operator_signer),
+            stream_credit_stall_secs: 999,
+            stream_cancel_ack_secs: 3_600,
+            stream_ucan_recheck_secs: 999,
+            ucan_cid: UCAN_CID.to_owned(),
+            request_id,
+            revocation_checker: Arc::new(
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+            ),
+            economic_policy_snapshot: None,
+        };
+        let invocation_binding = Some(InvocationCaveatBinding {
+            caveats,
+            ucan_cid: UCAN_CID.to_owned(),
+        });
+
+        let executor: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
+        let outlet_id: OutletId = "calculator".to_owned();
+        // `invoked_event_sink` is `None` — exactly what the FFI bridges pass. The
+        // supervisor must wire the durable sink itself.
+        let mut handle = supervisor
+            .open_outlet_stream(
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                executor,
+                None,
+                None,
+                None,
+                invocation_binding,
+                params,
+            )
+            .await
+            .expect("open_outlet_stream accepts a well-formed streaming open");
+
+        let mut rx = handle.receiver().expect("receiver");
+        let summary_rx = handle.close_summary().expect("close summary");
+
+        let grant = OutletStreamCredit {
+            request_id,
+            grant: 8,
+            monotonic_seq: 1,
+            sig: sign_credit_grant(
+                &invoker_key,
+                &CreditGrantSigningInputs {
+                    context_id: &ctx_key(),
+                    outlet_id: "calculator",
+                    request_id: &request_id,
+                    grant: 8,
+                    monotonic_seq: 1,
+                    stream_epoch: 1,
+                    caveats_binding: &caveats_binding,
+                },
+            ),
+        };
+        handle
+            .apply_credit_grant(&grant, Amount::new(0))
+            .expect("signed credit grant applies");
+
+        let mut data_seen = 0u32;
+        for _ in 0..DATA_CHUNKS {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("data chunk within 5s")
+                .expect("data chunk present");
+            if matches!(chunk.payload, ChunkPayload::Data { .. }) {
+                data_seen += 1;
+            }
+        }
+        assert_eq!(data_seen, DATA_CHUNKS, "all executor Data chunks delivered");
+
+        let cancel_signer = InProcessStreamSigner::new(invoker_key.clone());
+        let cancel_identity = CancelIdentity {
+            context_id: ctx_key(),
+            outlet_id: "calculator".to_owned(),
+            caveats_binding,
+        };
+        let cancel_ack_seq = handle
+            .apply_outlet_cancel_signed(&cancel_signer, &cancel_identity)
+            .await
+            .expect("signed cancel applies");
+        assert_eq!(cancel_ack_seq, Some(u64::from(DATA_CHUNKS)));
+
+        // Drain to the terminal chunk.
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(chunk)
+                        if matches!(
+                            chunk.payload,
+                            ChunkPayload::End { .. } | ChunkPayload::Error { terminal: true, .. }
+                        ) =>
+                    {
+                        break true;
+                    }
+                    Some(_) => {}
+                    None => break false,
+                }
+            }
+        })
+        .await
+        .expect("terminal chunk within 5s");
+        assert!(terminal, "the stream reaches a terminal chunk");
+
+        // Let the close settle.
+        let _ = tokio::time::timeout(Duration::from_secs(5), summary_rx)
+            .await
+            .expect("close summary resolves")
+            .expect("summary channel not dropped");
+
+        // The durable sink appends the close event asynchronously at close; poll
+        // the log until the ONE OutletInvokedEvent lands.
+        let invoked = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let entries = supervisor
+                    .event_log_ref()
+                    .expect("event log configured")
+                    .event_log_entries(&[CTX_BYTE; 32])
+                    .expect("entries query ok")
+                    .unwrap_or_default();
+                let invoked: Vec<_> = entries
+                    .into_iter()
+                    .filter(|e| e.event_type == scp_event_log::EventType::OutletInvoked)
+                    .collect();
+                if !invoked.is_empty() {
+                    break invoked;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("one OutletInvokedEvent persisted within 5s");
+
+        assert_eq!(
+            invoked.len(),
+            1,
+            "EXACTLY ONE OutletInvokedEvent per stream at close"
+        );
+        let event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent =
+            serde_json::from_slice(&invoked[0].payload.data)
+                .expect("the durable leaf decodes as an OutletInvokedEvent");
+        assert_eq!(
+            event.chunks_billed, DATA_CHUNKS,
+            "durable event records the 3 billable Data chunks"
+        );
+        assert_eq!(
+            event.stream_chunk_count,
+            DATA_CHUNKS + 1,
+            "3 Data + one terminal chunk"
+        );
+        assert_eq!(
+            event.cancel_ack_seq,
+            Some(u64::from(DATA_CHUNKS)),
+            "durable event records the pinned cancel-ack sequence"
+        );
+        assert_ne!(
+            event.stream_manifest_hash, [0u8; 32],
+            "durable event commits a non-empty manifest root"
         );
     }
 

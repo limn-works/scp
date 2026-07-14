@@ -1548,7 +1548,36 @@ pub trait OutletInvokedEventSink: Send + Sync {
     /// Records the §5.4.5 stream-close event. Called exactly once per
     /// outlet stream, after the terminal chunk has been delivered to
     /// the chunk receiver.
-    fn record(&self, event: OutletInvokedEvent);
+    ///
+    /// `manifest` is the retained ADR-061 Merkle-frontier commitment the pump
+    /// folded over the emitted chunk sequence (root + billable/leaf counts). A
+    /// durable sink routes it into
+    /// [`ContextEventLogProvider::append_outlet_invoked_verified`](crate::context::builder::ContextEventLogProvider::append_outlet_invoked_verified)
+    /// as the `Frontier` source so the FULL §5.4.5:566 `chunks_billed`
+    /// wire-invariant is enforced at the real log-insert boundary against the
+    /// frontier the pump actually built — not the event's self-reported
+    /// aggregates. Capturing test sinks may ignore it.
+    fn record(&self, event: OutletInvokedEvent, manifest: StreamManifestCommitment);
+}
+
+/// The retained ADR-061 chunk-manifest commitment (RFC-6962 Merkle root +
+/// billable/leaf counts).
+///
+/// The §5.4.5 dispatch pump folds this over the emitted chunk sequence WITHOUT
+/// retaining the payload set. Handed to the [`OutletInvokedEventSink`] alongside
+/// the close event so a durable sink can wire-reject at the §5.4.5:566 append
+/// boundary against the frontier the pump actually built, rather than against
+/// the event's own self-reported fields (which would make the manifest equality
+/// tautological).
+#[derive(Debug, Clone, Copy)]
+pub struct StreamManifestCommitment {
+    /// RFC-6962 Merkle root over the sealed chunk leaves (`stream_manifest_hash`).
+    pub root: [u8; 32],
+    /// Count of billable `Data` leaves at or below the cancel-ack ceiling
+    /// (`chunks_billed`).
+    pub billed_count: u64,
+    /// Total leaf count including the terminal chunk (`stream_chunk_count`).
+    pub leaf_count: u64,
 }
 
 /// The §5.4.5 close-time economic settlement of a streaming-native
@@ -3532,6 +3561,10 @@ struct StreamingTaskInputs<E: ?Sized> {
 /// the `clippy::too_many_lines` ceiling. The task runs on the tokio
 /// runtime; when it finishes, the chunk channel closes and the
 /// receiver returned to the caller observes EOS.
+#[allow(
+    clippy::too_many_lines,
+    reason = "single linear drive→pump→terminal→emit sequence; splitting further would thread the frontier/terminal-summary/signing-ctx state across seams for no clarity gain"
+)]
 async fn run_streaming_executor_task<E>(inputs: StreamingTaskInputs<E>)
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -3677,7 +3710,15 @@ where
             // cancel-ack ceiling, so the billing ceiling is `u64::MAX`.
             None,
         );
-        sink.record(event);
+        // Hand the retained frontier commitment so a durable sink can
+        // wire-reject at the §5.4.5:566 append boundary against the frontier
+        // this pump actually built.
+        let manifest = StreamManifestCommitment {
+            root: frontier.root(),
+            billed_count: frontier.billed_count(),
+            leaf_count: frontier.leaf_count(),
+        };
+        sink.record(event, manifest);
     }
 }
 
@@ -5658,7 +5699,7 @@ mod tests {
     }
 
     impl super::OutletInvokedEventSink for ChannelInvokedSink {
-        fn record(&self, event: OutletInvokedEvent) {
+        fn record(&self, event: OutletInvokedEvent, _manifest: super::StreamManifestCommitment) {
             let _ = self.tx.send(event);
         }
     }

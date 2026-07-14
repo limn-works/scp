@@ -102,11 +102,10 @@ use super::invoke::{
     release_stream_admission,
 };
 use super::stream::{
-    AdmissionCaps, AdmissionOutcome, CancelAckTracker, ChunksBilledSource, CreditTracker,
-    GrantError, OpenError, OriginAdmissionTracker, StreamAdmissionTracker, StreamEscrow,
-    StreamIdentity, admission_outcome_to_slug, coerce_estimated_chunk_count,
-    cumulative_reserve_amount, effective_max_billable_chunks, enforce_estimated_chunk_count_bound,
-    open_error_to_slug, verify_outlet_invoked_event_manifest,
+    AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, GrantError, OpenError,
+    OriginAdmissionTracker, StreamAdmissionTracker, StreamEscrow, StreamIdentity,
+    admission_outcome_to_slug, coerce_estimated_chunk_count, cumulative_reserve_amount,
+    effective_max_billable_chunks, enforce_estimated_chunk_count_bound, open_error_to_slug,
 };
 
 use scp_protocol::context::outlets::registry::OutletRegistry;
@@ -3059,10 +3058,7 @@ async fn run_stream_pump_v2(
                     // an unsigned chunk on the wire.
                     break;
                 };
-                // Only advance the emission cursor AFTER signing
-                // succeeded — a failed-signature path must not burn a
-                // sequence number.
-                next_seq = next_seq.saturating_add(1);
+                let terminal = final_chunk.payload.is_terminal();
                 // Crisp invariant: every chunk reaching a bridge consumer
                 // verifies under the pinned operator key. In debug
                 // builds we re-verify the sig we just produced, so a
@@ -3079,38 +3075,73 @@ async fn run_stream_pump_v2(
                     "dispatch pump: just-signed chunk fails to verify under the pinned operator key — \
                      signing/verifying preimage drift",
                 );
-                {
+                // §5.4.5:530(3) cancel-boundary atomicity (round-9 F1). The
+                // per-chunk gate above ran in an EARLIER `state.write()`
+                // window; the operator-signature build between then and here
+                // is an off-lock `.await`. An `OutletCancel` delivered on a
+                // SEPARATE task (`apply_outlet_cancel_signed`) can acquire the
+                // lock DURING that signing await and pin `cancel_ack_seq` at or
+                // below this chunk's `seq`. Re-read the LIVE ceiling under the
+                // accrual lock and mirror the gate's `>=` drop, so the
+                // drop-decision, the escrow/credit bill, the frontier ingest,
+                // and the emission-cursor bump are ALL atomic with respect to
+                // `record_cancel`. Without this re-check the gate (which saw
+                // `ceiling == u64::MAX`) would Forward an in-flight `Data` that
+                // the freshly-pinned ceiling now reserves for the terminal
+                // cancel-ack chunk — silently over-billing by one and recording
+                // a `cancel_ack_seq` the sealed manifest contradicts.
+                let dropped = {
                     let mut guard = state
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let g = &mut *guard;
-                    accrue_data_chunk_if_billable(&mut g.escrow, &g.cancel_ack, &final_chunk);
-                    // §5.4.5:758 cumulative ceiling: advance
-                    // `billed_emitted` for THIS forwarded chunk iff it is
-                    // billable (Data, at/below the cancel-ack ceiling) —
-                    // the SAME `is_billable_chunk` predicate the escrow
-                    // accrual above uses, so the cumulative counter and the
-                    // escrow ledger can never disagree on what was billed.
-                    if super::invoke::is_billable_chunk(
-                        &final_chunk,
-                        g.cancel_ack.billing_ceiling(),
-                    ) {
-                        g.credit.record_billed_emission();
+                    if !terminal && seq >= g.cancel_ack.billing_ceiling() {
+                        // Drop-and-not-bill, exactly as the gate's
+                        // `DropAboveCancelAck` arm would have: NO accrual, NO
+                        // frontier ingest, NO forward, and — critically — DO
+                        // NOT advance the emission cursor. The terminal
+                        // cancel-ack chunk takes this `seq` slot next.
+                        true
+                    } else {
+                        // Advance the emission cursor ONLY for a chunk we will
+                        // actually bill/emit — a dropped (or failed-sign) chunk
+                        // must not burn a sequence number.
+                        next_seq = next_seq.saturating_add(1);
+                        accrue_data_chunk_if_billable(&mut g.escrow, &g.cancel_ack, &final_chunk);
+                        // §5.4.5:758 cumulative ceiling: advance
+                        // `billed_emitted` for THIS forwarded chunk iff it is
+                        // billable (Data, at/below the cancel-ack ceiling) —
+                        // the SAME `is_billable_chunk` predicate the escrow
+                        // accrual above uses, so the cumulative counter and the
+                        // escrow ledger can never disagree on what was billed.
+                        if super::invoke::is_billable_chunk(
+                            &final_chunk,
+                            g.cancel_ack.billing_ceiling(),
+                        ) {
+                            g.credit.record_billed_emission();
+                        }
+                        // §5.4.5 next-emission-cursor publication — the bridge
+                        // layer reads this value to derive the canonical
+                        // `cancel_ack_seq` written into `OutletStreamCancel`
+                        // preimages (see
+                        // `StreamSessionHandle::current_next_emission_seq`).
+                        // Bumped under the SAME lock as the bill decision so a
+                        // racing `apply_outlet_cancel` either observes the
+                        // cursor before this forward (cancel pins the
+                        // pre-forward cursor) or after (post-forward cursor),
+                        // never half-stamped.
+                        g.next_emission_seq = next_seq;
+                        false
                     }
-                    // §5.4.5 next-emission-cursor publication — the
-                    // bridge layer reads this value to derive the
-                    // canonical `cancel_ack_seq` written into
-                    // `OutletStreamCancel` preimages (see
-                    // `StreamSessionHandle::current_next_emission_seq`).
-                    // Bump under the same lock as the gate decision so
-                    // a racing `apply_outlet_cancel` either observes
-                    // the cursor before this forward (cancel pins the
-                    // pre-forward cursor) or after (cancel pins the
-                    // post-forward cursor), never half-stamped.
-                    g.next_emission_seq = next_seq;
+                };
+                if dropped {
+                    // A cancel pinned the ceiling at/below this chunk's slot
+                    // during signing. Loop back for the next upstream chunk;
+                    // the terminal cancel-ack chunk will occupy `next_seq`
+                    // (== the pinned `cancel_ack_seq`).
+                    continue;
                 }
                 ingest_stream_chunk(&mut frontier, &mut terminal_summary, &final_chunk);
-                let terminal = final_chunk.payload.is_terminal();
                 if outer_tx.send(final_chunk).await.is_err() {
                     break;
                 }
@@ -3226,11 +3257,16 @@ async fn run_stream_pump_v2(
 
     // §5.4.5 OutletInvokedEvent emission. The dispatch pump owns the
     // outer manifest (renumbered, cancel-ack-truncated) — the only
-    // manifest that matches what SDK consumers actually received. We
-    // (i) run the event-local wire-invariant before emitting (the same
-    // invariant the event-log appender enforces at log-insert, surfacing
-    // drift here as defense-in-depth), and (ii) record exactly one event
-    // per stream via the `OutletInvokedEventSink::record` trait method.
+    // manifest that matches what SDK consumers actually received. We record
+    // exactly one event per stream via the `OutletInvokedEventSink::record`
+    // trait method, handing it the retained ADR-061 Merkle-frontier
+    // commitment. The FULL §5.4.5:566 frontier wire-invariant is enforced
+    // ONCE, at the durable log-insert boundary
+    // (`ContextEventLogProvider::append_outlet_invoked_verified`, fed this
+    // same frontier as its `Frontier` source) — the canonical enforcement
+    // path. We do NOT also re-run a near-tautological frontier check inline
+    // here (the event was built from this frontier), to avoid a dead
+    // duplicate of the append-boundary check.
     if let Some(sink) = event_inputs.sink.as_ref() {
         // §5.4.5 round-8 (F2): on a self-consistency drift between the
         // pump's running `billed_count` (escrow ledger) and the
@@ -3275,39 +3311,20 @@ async fn run_stream_pump_v2(
             // `None` when the stream terminated without a cancel-ack.
             summary.cancel_ack_seq,
         );
-        // Defense-in-depth advisory pre-record check: the event carries the
-        // frontier-derived `chunks_billed`, root, and leaf count, so it MUST
-        // equal the ADR-061 O(log n) frontier the pump folded over the emitted
-        // sequence. We enforce the FULL §5.4.5:566 frontier equality here —
-        // `stream_manifest_hash == frontier.root`, `chunks_billed ==
-        // frontier.billed_count`, and `stream_chunk_count ==
-        // frontier.leaf_count` — not merely the event-local `chunks_billed <=
-        // stream_chunk_count` bound. The frontier IS the retained manifest
-        // commitment (the payload set is deliberately dropped per ADR-061), so
-        // this is the strongest check re-derivable at close without re-hashing
-        // the chunk Vec. On mismatch (a frontier accounting bug) we drop + log
-        // rather than emit a record the durable appender would refuse. The
-        // durable event-local backstop inside `append_event` still runs at
-        // log-insert time.
-        if let Err(verify_err) = verify_outlet_invoked_event_manifest(
-            &event,
-            ChunksBilledSource::Frontier {
-                root: summary.manifest_root,
-                billed_count: u64::from(manifest_reference),
-                leaf_count: u64::from(summary.stream_chunk_count),
-            },
-        ) {
-            tracing::error!(
-                request_id = %hex::encode(request_id),
-                outlet_id = %event_inputs.outlet_id,
-                error = ?verify_err,
-                "OutletInvokedEvent dropped: full frontier wire-invariant failed \
-                 (event aggregates diverge from the retained manifest frontier — \
-                 frontier accounting bug)"
-            );
-        } else {
-            sink.record(event);
-        }
+        // The retained ADR-061 frontier commitment (root + billable/leaf
+        // counts) the pump folded over the emitted sequence. The durable sink
+        // routes this into `append_outlet_invoked_verified` as the `Frontier`
+        // source, so the FULL §5.4.5:566 equality (`stream_manifest_hash ==
+        // root`, `chunks_billed == billed_count`, `stream_chunk_count ==
+        // leaf_count`) plus the durable event-local `<=` backstop both fire at
+        // the real log-insert boundary — against the frontier the pump built,
+        // not the event's self-reported fields.
+        let manifest = super::invoke::StreamManifestCommitment {
+            root: summary.manifest_root,
+            billed_count: u64::from(manifest_reference),
+            leaf_count: u64::from(summary.stream_chunk_count),
+        };
+        sink.record(event, manifest);
     }
 
     // §5.4.5 close-time economic settlement (E1). Fire the settlement sink
@@ -4750,7 +4767,11 @@ mod tests {
         >,
     }
     impl OutletInvokedEventSink for CapturingInvokedSink {
-        fn record(&self, event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent) {
+        fn record(
+            &self,
+            event: scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+            _manifest: super::super::invoke::StreamManifestCommitment,
+        ) {
             let _ = self.tx.send(event);
         }
     }
@@ -4963,6 +4984,170 @@ mod tests {
             }
         }
         (data, terminal)
+    }
+
+    /// A [`StreamSigner`] that delegates to an in-process key but BLOCKS the
+    /// `block_on_call`-th `sign` invocation on a barrier — modelling the
+    /// off-lock signing `.await` window during which a concurrent
+    /// `OutletCancel` can land (round-9 F1). Produces a VALID signature under
+    /// the pinned operator key on release (delegates to the inner signer), so
+    /// the pump's just-signed `debug_assert!` self-verify still holds.
+    struct BarrierSigner {
+        inner: super::super::signer::InProcessStreamSigner,
+        calls: std::sync::atomic::AtomicUsize,
+        block_on_call: usize,
+        sign_started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    #[async_trait::async_trait]
+    impl super::super::signer::StreamSigner for BarrierSigner {
+        async fn sign(
+            &self,
+            preimage: &[u8],
+        ) -> Result<[u8; 64], super::super::signer::StreamSignerError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.block_on_call {
+                // Announce the boundary chunk is mid-sign, then park until the
+                // test has recorded the concurrent cancel.
+                self.sign_started.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.sign(preimage).await
+        }
+        fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
+            self.inner.verifying_key()
+        }
+    }
+
+    /// **round-9 F1** — cancel-boundary billing TOCTOU. A concurrent
+    /// `OutletCancel` that lands DURING the off-lock signing `.await` of an
+    /// in-flight boundary `Data` chunk (whose per-chunk gate already returned
+    /// `Forward` under `ceiling == u64::MAX`) must NOT be billed. The
+    /// post-signing re-check mirrors the gate's `>=` drop, so the in-flight
+    /// `Data` is dropped-not-billed, `chunks_billed` stays correct, and the
+    /// terminal chunk occupies the pinned `cancel_ack_seq` slot. Before the
+    /// fix, the second (accrual) lock window re-read a ceiling of 5 and billed
+    /// the boundary `Data` at seq 5 (`5 <= 5`), silently over-billing by one.
+    #[tokio::test]
+    async fn pump_cancel_during_signing_drops_boundary_data_not_billed_round9_f1() {
+        let state = build_test_state();
+        set_credit(&state, 32, None);
+        set_escrow(&state, 10, 1_000);
+
+        let sign_started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        {
+            let mut g = state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.operator_signer = Arc::new(BarrierSigner {
+                inner: super::super::signer::InProcessStreamSigner::new(fixed_signing_key()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                // seq 0..=4 sign non-blocking (calls 1..=5); the sixth Data
+                // (outer seq 5) blocks mid-sign.
+                block_on_call: 6,
+                sign_started: Arc::clone(&sign_started),
+                release: Arc::clone(&release),
+            });
+        }
+
+        let state_for_cancel = Arc::clone(&state);
+        let request_id: RequestId = [0xC9; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            10,
+            0,
+        );
+
+        // Five billable Data chunks (outer seq 0..=4); drain each so the
+        // emission cursor advances to 5 (five sign calls completed).
+        for seq in 0..5 {
+            send_inner_data(&pump.inner_tx, seq).await;
+            let chunk = tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv())
+                .await
+                .expect("data chunk forwarded")
+                .expect("stream open");
+            assert!(matches!(chunk.payload, ChunkPayload::Data { .. }));
+            assert_eq!(chunk.sequence, seq);
+        }
+
+        // Sixth Data: its gate returns Forward (no cancel yet), then its signing
+        // blocks on the barrier.
+        send_inner_data(&pump.inner_tx, 5).await;
+        tokio::time::timeout(Duration::from_secs(5), sign_started.notified())
+            .await
+            .expect("boundary chunk reached the signing barrier");
+
+        // Concurrent cancel lands DURING signing, pinning cancel_ack_seq at the
+        // live emission cursor (5) — exactly what apply_outlet_cancel_signed
+        // does to the tracker.
+        {
+            let mut g = state_for_cancel
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cursor = g.next_emission_seq;
+            assert_eq!(cursor, 5, "five chunks emitted before the cancel");
+            g.cancel_ack.record_cancel(cursor, Instant::now());
+            g.cancel_ack_seq = g.cancel_ack.cancel_ack_seq();
+            g.cancel_ack_armed = true;
+        }
+
+        // Release the signature; the post-signing re-check must DROP the
+        // in-flight boundary Data (seq 5 >= ceiling 5).
+        release.notify_one();
+
+        // Deliver the terminal End; it takes the pinned cancel_ack_seq slot (5).
+        send_inner_end(&pump.inner_tx, 6).await;
+
+        let mut extra_data = 0u32;
+        let mut terminal_seq = None;
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv()).await
+        {
+            if chunk.payload.is_terminal() {
+                terminal_seq = Some(chunk.sequence);
+                break;
+            }
+            if matches!(chunk.payload, ChunkPayload::Data { .. }) {
+                extra_data += 1;
+            }
+        }
+        assert_eq!(
+            extra_data, 0,
+            "the in-flight boundary Data must be dropped, never forwarded"
+        );
+        assert_eq!(
+            terminal_seq,
+            Some(5),
+            "the terminal chunk occupies the pinned cancel_ack_seq slot"
+        );
+
+        pump.pump_join.await.expect("pump settles");
+        let summary = pump.summary_rx.await.expect("summary published");
+        assert_eq!(
+            summary.billed_count, 5,
+            "exactly five Data chunks billed — the boundary in-flight Data is NOT over-billed"
+        );
+        assert_eq!(summary.cancel_ack_seq, Some(5));
+
+        let events: Vec<_> = std::iter::from_fn(|| pump.event_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 1, "exactly one OutletInvokedEvent");
+        assert_eq!(events[0].chunks_billed, 5, "event bills five, not six");
+        assert_eq!(events[0].cancel_ack_seq, Some(5));
+        assert_eq!(
+            events[0].stream_chunk_count, 6,
+            "five Data + one terminal End leaves"
+        );
+
+        let settlements: Vec<_> = std::iter::from_fn(|| pump.settle_rx.try_recv().ok()).collect();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].billed_count, 5,
+            "settlement bills five — no over-bill of the dropped boundary Data"
+        );
     }
 
     /// **034 AC11** — a terminal `Error{terminal:true}` emitted with ZERO
@@ -5320,12 +5505,18 @@ mod tests {
     /// executor pushed — and the unspent escrow is refunded.
     ///
     /// NOTE on the §5.4.5:566 predicate `chunks_billed_ref = |{ i : @type ==
-    /// data && i <= cancel_ack_seq }|`: with `cancel_ack_seq = 5` the runtime
-    /// bills `Data` at outer sequences `0..=5` (SIX chunks). The two `Data` at
-    /// sequences `6, 7` are dropped (`DropAboveCancelAck`) and never billed —
-    /// the load-bearing protective property (chunks past the cancel-ack are not
-    /// billed). This asserts the deterministic `<= cancel_ack_seq` behavior the
-    /// implementation encodes.
+    /// data && i <= cancel_ack_seq }|`: with `cancel_ack_seq = 5` the pinned
+    /// sequence slot `5` belongs to the **terminal cancel-ack chunk**
+    /// (§5.4.5:530(3)), NOT to a billable `Data`. The gate drops every
+    /// non-terminal chunk at `sequence >= 5` (`DropAboveCancelAck`, the `>=`
+    /// boundary), so the sealed manifest carries `Data` only at outer sequences
+    /// `0..=4` — FIVE chunks. The inclusive `i <= cancel_ack_seq` predicate
+    /// therefore counts exactly those five (there is no `Data` at slot `5`; the
+    /// terminal `End` occupies it), and the three post-cancel in-flight `Data`
+    /// the executor pushes at sequences `>= 5` are never emitted or billed —
+    /// the load-bearing protective property (chunks at/after the cancel-ack are
+    /// not billed). This asserts the deterministic terminal-occupies-the-slot
+    /// behavior the implementation encodes: `chunks_billed == 5`.
     #[tokio::test]
     async fn pump_midstream_cancel_truncates_billing_035_ac3_034_ac24() {
         let state = build_test_state();

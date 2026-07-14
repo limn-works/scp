@@ -265,6 +265,64 @@ pub trait ContextEventLogProvider: Send + Sync {
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
+    /// Appends an [`OutletInvokedEvent`] after enforcing the FULL §5.4.5:566
+    /// manifest-derived `chunks_billed` wire-invariant.
+    ///
+    /// Unlike the raw [`append_event`](Self::append_event) boundary — which
+    /// holds only the opaque event and can enforce nothing stronger than the
+    /// event-local `chunks_billed <= stream_chunk_count` backstop — this entry
+    /// point re-derives the manifest root + billable count from the
+    /// caller-supplied [`ChunksBilledSource`] (a retained chunk sequence or the
+    /// ADR-061 O(log n) frontier) and rejects the event at log-insert time if
+    /// the recorded aggregates diverge. On success it serializes the event and
+    /// delegates to `append_event`, which re-runs the durable event-local
+    /// backstop. This is the CANONICAL verified-append boundary the §5.4.5
+    /// streaming pump routes its close event through (the pump supplies the
+    /// retained ADR-061 Merkle frontier as the `Frontier` source).
+    ///
+    /// [`OutletInvokedEvent`]:
+    ///     scp_protocol::context::outlets::lifecycle::OutletInvokedEvent
+    /// [`ChunksBilledSource`]: crate::context::outlets::stream::ChunksBilledSource
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] when the manifest
+    /// verification rejects the event (the wire-layer `ChunksBilledMismatch`),
+    /// when the event cannot be serialized, or when the underlying append
+    /// fails (e.g. no log initialized for the context).
+    async fn append_outlet_invoked_verified(
+        &self,
+        context_id: &[u8; 32],
+        event: &scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
+        source: crate::context::outlets::stream::ChunksBilledSource<'_>,
+        actor_did: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextCreationError> {
+        // (1) FULL §5.4.5:566 manifest-derived equality — the tighter check the
+        // opaque `append_event` boundary cannot make. Wire-reject on mismatch.
+        crate::context::outlets::stream::verify_outlet_invoked_event_manifest(event, source)
+            .map_err(|err| {
+                let log_err =
+                    crate::context::outlets::stream::chunks_billed_error_to_event_log_error(err);
+                ContextCreationError::EventLogFailed(log_err.to_string())
+            })?;
+        // (2) Serialize and append through the standard boundary, which
+        // re-runs the durable event-local `<=` backstop.
+        let data = serde_json::to_vec(event).map_err(|e| {
+            ContextCreationError::EventLogFailed(format!(
+                "failed to serialize OutletInvokedEvent: {e}"
+            ))
+        })?;
+        self.append_event(
+            context_id,
+            scp_event_log::EventType::OutletInvoked,
+            actor_did,
+            scp_event_log::EventPayload { data },
+            timestamp_secs,
+        )
+        .await
+    }
+
     /// Appends a `MemberJoined` / `MemberLeft` leaf carrying a subject-bearing
     /// [`MembershipChangePayload`](scp_event_log::payload::MembershipChangePayload).
     ///

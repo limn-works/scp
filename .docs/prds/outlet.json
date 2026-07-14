@@ -2104,7 +2104,11 @@
       "status": "done",
       "files": [
         "crates/scp-event-log/src/lib.rs",
-        "crates/scp-runtime/src/context/manager/outlets.rs"
+        "crates/scp-protocol/src/context/outlets/lifecycle.rs",
+        "crates/scp-protocol/src/context/outlets/stream.rs",
+        "crates/scp-runtime/src/context/outlets/invoke.rs",
+        "crates/scp-runtime/src/context/outlets/dispatch.rs",
+        "crates/scp-runtime/src/context/providers/event_log.rs"
       ],
       "description": "Extend the existing `OutletInvokedEvent` variant (introduced in SCP-OUT-003 \u2192 renumbered) with FOUR stream fields: `stream_chunk_count: u32`, `chunks_billed: u32`, `stream_manifest_hash: [u8; 32]`, `stream_terminal_status: StreamTerminalStatus`. Emit exactly ONE OutletInvokedEvent per stream, at stream close (terminal chunk emitted). The `stream_manifest_hash` is the Merkle root over chunk leaves constructed per \u00a75.4.5 with RFC 6962 tag bytes (0x00/0x01) under the SCP-OUTLET-CHUNK-V1: domain separator. No per-chunk inclusion-proof API is exposed on the SDK surface in this revision \u2014 the manifest root commitment is the protocol-level invariant, and auditing tools MAY reconstruct proofs off-line by replaying the event log and the retained chunk sequence (API convenience deferred per ADR-049 \u00a76 and discussion #1698). The `chunks_billed` field records Data chunks at or below cancel_ack_seq that were validly delivered (see SCP-OUT-034 billing semantics in this gate's renumbering).",
       "acceptanceCriteria": [
@@ -2266,8 +2270,7 @@
       ],
       "blockedBy": [
         "SCP-OUT-033",
-        "SCP-OUT-034",
-        "SCP-OUT-036"
+        "SCP-OUT-034"
       ],
       "sources": [
         {
