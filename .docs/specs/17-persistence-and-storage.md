@@ -425,25 +425,29 @@ The `Storage` trait operates on opaque bytes. Platform-specific encryption happe
 | `SqliteStorage` | `rusqlite` + `bundled-sqlcipher`, WAL mode | Native (all) | **Default production backend** — universal | Phase 2 |
 | `FilesystemStorage` | Key -> file path | POSIX systems | Server/CLI, inspectable/debuggable storage | Phase 2 |
 
+Storage selection is the **first and canonical instance** of the general capability-selection principle in §17.17. The rules in this subsection — selection is mandatory, selection fails closed, the runtime never defaults storage, and in-memory storage is dev/test-only — are the storage specialization of the mandatory/fails-closed/never-default requirements (SCP-CAPSEL-8000/8001/8002) and the durability-only-vs-nullifier classification (SCP-CAPSEL-8010/8011) that §17.17 defines for *every* provider capability. Read §17.17 for the general form; this subsection is where it was first stated and remains the worked example.
+
 ### In-Memory Storage Is Dev/Test-Only
 
 In-memory storage — `InMemoryStorage`, the FFI-layer `BridgeInMemoryStorage`, and `EncryptingAdapter<InMemoryStorage>` — is a development and test affordance only. It MUST NOT be used as a production system-of-record.
 
 In-memory storage loses all state on process restart. For SCP, that state includes MLS group state, identity keys, the event log, and provenance records. Losing it on restart contradicts the durability and provenance tenets directly: a restarted node would silently lose its cryptographic membership, its append-only audit trail, and its identity. Production deployments MUST use a durable, encrypted backend — `SqliteStorage` (SQLCipher) is the default.
 
+Under the §17.17 classification, in-memory storage is a **durability-only affordance** (SCP-CAPSEL-8010/8011), not a security nullifier: it forgets state but presents no false guarantee. It fails closed — a restarted node with lost state simply has no state; it cannot silently answer as though the state were intact. It is therefore explicitly selectable in any build, but — like every durability-only arm — never a default, never a fallback, and never the only reachable storage arm in a shipped SDK. Contrast the in-memory DHT backend (§17.17.3), which fails *open* and is a nullifier.
+
 ### Storage Selection Is Mandatory
 
-Storage selection is mandatory. Constructing an `SCP` without an explicit storage choice is an error (`SCP-STORAGE-8000`); there is no default. The two choices are `{type: in_memory}` (development) and `{type: sqlite, ...}` (production). Bridges that can express this requirement at compile time (e.g. the typed UniFFI `StorageConfig` constructor, the required Swift/Kotlin/TypeScript constructor argument) MUST do so; bridges that cannot (the dynamically-typed PyO3 dict, the JSON-string NAPI factory) MUST reject a missing selection at runtime with `SCP-STORAGE-8000`. No bridge or SDK may expose a zero-argument constructor that silently selects a storage backend on the caller's behalf.
+Storage selection is the storage instance of SCP-CAPSEL-8000 (§17.17.1). Storage selection is mandatory. Constructing an `SCP` without an explicit storage choice is an error (`SCP-STORAGE-8000`, the storage-specific error surface of SCP-CAPSEL-8000); there is no default. The two choices are `{type: in_memory}` (development) and `{type: sqlite, ...}` (production). Bridges that can express this requirement at compile time (e.g. the typed UniFFI `StorageConfig` constructor, the required Swift/Kotlin/TypeScript constructor argument) MUST do so; bridges that cannot (the dynamically-typed PyO3 dict, the JSON-string NAPI factory) MUST reject a missing selection at runtime with `SCP-STORAGE-8000`. No bridge or SDK may expose a zero-argument constructor that silently selects a storage backend on the caller's behalf.
 
 ### Storage Selection Fails Closed
 
-When a caller selects a durable storage backend (e.g. `Sqlite`) and the backend cannot be opened — bad path, insufficient permissions, corruption, or a wrong key/passphrase — the bridge or builder layer MUST return an error. Silent fallback to in-memory storage, or to no storage at all, is FORBIDDEN.
+This is the storage instance of SCP-CAPSEL-8001 (§17.17.1). When a caller selects a durable storage backend (e.g. `Sqlite`) and the backend cannot be opened — bad path, insufficient permissions, corruption, or a wrong key/passphrase — the bridge or builder layer MUST return an error. Silent fallback to in-memory storage, or to no storage at all, is FORBIDDEN.
 
 In-memory storage is reachable only through an explicit in-memory selection (`{type: "in_memory"}`). It MUST NOT be reachable as a degradation path from a failed durable-backend open. A failed durable open is a terminal error the caller observes, not a condition the system silently recovers from by downgrading durability.
 
 ### The Runtime Never Defaults Storage
 
-The runtime core (`scp-runtime`) MUST NOT manufacture or default a storage backend. Storage is supplied by the caller at the bridge or builder layer and threaded into the supervisor as a required (non-optional) parameter. This requirement is enforced by the type system — the supervisor construction surface takes storage as a non-`Option` argument, so there is no code path by which the runtime can run without a caller-supplied backend. The choice of backend (durable vs. in-memory) is made once, at the bridge/builder layer, never silently inside the runtime.
+This is the storage instance of SCP-CAPSEL-8002 (§17.17.1). The runtime core (`scp-runtime`) MUST NOT manufacture or default a storage backend. Storage is supplied by the caller at the bridge or builder layer and threaded into the supervisor as a required (non-optional) parameter. This requirement is enforced by the type system — the supervisor construction surface takes storage as a non-`Option` argument, so there is no code path by which the runtime can run without a caller-supplied backend. The choice of backend (durable vs. in-memory) is made once, at the bridge/builder layer, never silently inside the runtime.
 
 ### SQLite Is the Universal Default
 
@@ -574,6 +578,8 @@ base_dir/
 
 ## 17.7 First-Party BlobStore Adapters (Relay/Server)
 
+Relay blob storage is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001), the runtime never defaults it (SCP-CAPSEL-8002), and `InMemoryBlobStore` is a durability-only development arm (SCP-CAPSEL-8010/8011) — explicitly selectable, never a default or fallback, never the sole reachable arm in a shipped relay.
+
 | Adapter | Backend | Good for | Ships in |
 |---------|---------|----------|----------|
 | `InMemoryBlobStore` | `HashMap` + secondary index | Testing, dev | Phase 1 (exists) |
@@ -648,6 +654,8 @@ The `BlobStorage` trait provides streaming variants of `store` and `get` for bac
 ## 17.8 Platform-Specific Key Custody
 
 Key custody is NOT part of this spec — it is the existing `KeyCustody` trait (ADR-006). Referenced here for completeness of the persistence picture:
+
+Key custody is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001) and the runtime never defaults it (SCP-CAPSEL-8002). Its in-memory arm (`InMemoryKeyCustody`, plaintext keys) is a **security nullifier**, not a durability-only affordance, and so must be provably absent from shipped production artifacts (SCP-CAPSEL-8012) — the realization is downstream in ADR-062.
 
 | Platform | Key Storage | Key Types | Notes |
 |----------|-------------|-----------|-------|
@@ -983,3 +991,51 @@ For each unresolved saga:
 - **Non-canonical key suffix — key-namespace anomaly (normative).** Distinct from the corrupt-framing case above: a journal entry may be well-framed and fully decodable yet be stored under a NON-canonical key — a key whose trailing seq suffix is not the canonical 20-digit zero-padded decimal sequence (`:020d`, §17) that the append path writes, including a 20-digit-but-out-of-`u64`-range value. This is a key-namespace anomaly, not an "undecodable" record, and it is dangerous precisely because latest-per-saga selection is the lexicographic MAX key per saga: a non-canonical suffix can sort ABOVE every real zero-padded seq and thereby win selection, overriding the canonical latest entry. Such an entry MUST be SKIPPED, flagged via the same `saga_repair_needed` metric, and MUST NEVER win latest-per-saga selection — the same sweep-isolation guarantee as the corrupt-entry case applies: every other unresolved saga is still recovered, the anomalous entry is neither replayed nor marked resolved, and it awaits operator repair. The read path enforces this in parity with the append path, which only ever emits canonical, in-range `:020d` suffixes.
 
 **Permanently-deleted caller (normative).** The ONE case reaped to terminal-`Aborted` rather than carried forward is a caller context PERMANENTLY DELETED from durable persistence: its reservation record died with the context, so there is nothing left to reverse locally and carrying the entry forward would loop forever without resolving. (An external escrow hold staged on a since-deleted context is irrecoverable from journal evidence alone and is settled by operator / external-system reconciliation — see §6.2.4.)
+
+## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults
+
+Storage (§17.6) is one instance of a rule that governs **every provider capability** in SCP. A *provider capability* is any pluggable dependency the system resolves to a concrete implementation at construction time and that carries a runtime "which implementation?" choice: client storage (§17.6), relay blob storage (§17.7), DID/DHT resolution (§3.10), credential storage, key custody (§17.8), device attestation, and the relay querier are the current set. Each such capability falls under the normative rule stated here.
+
+§17.6 ("First-Party Storage Adapters") is the **first and canonical instance** of this rule. The sub-rules it states for storage — *Storage Selection Is Mandatory*, *Storage Selection Fails Closed*, *The Runtime Never Defaults Storage*, and *In-Memory Storage Is Dev/Test-Only* — are the storage specialization of the general requirements below. Storage got this discipline first; every other provider capability is held to the same standard.
+
+**Scope of this section (ownership boundary).** This section is protocol-normative: it defines *what* must hold for every capability, and it defines the security classification that decides how a capability's development arm may exist in a shipped artifact. It deliberately does **not** prescribe the engineering realization — the dispatch shape (a typed selector versus an injected interface), how a build is configured, or the mechanism by which a nullifier arm's absence is *proven*. Those are downstream of this section and are specified in ADR-062. When this section says a nullifier arm "MUST be provably absent," it states the requirement; the proof mechanism is the ADR's to define.
+
+### 17.17.1 Selection Requirements
+
+**SCP-CAPSEL-8000 — Selection is mandatory; there is no default.** Every provider capability with a runtime implementation choice MUST be explicitly selected by the caller at the construction boundary (the SDK/bridge/builder layer where a client, node, or relay is assembled). Constructing without an explicit selection for a required capability is an error. No constructor — in any binding — may expose a zero-argument form, an omit-the-field form, or any other shape that silently selects an implementation on the caller's behalf. Bindings that can express the requirement at compile time (a required constructor argument, a config type with no default) MUST do so; bindings that cannot (dynamically-typed or string-configured surfaces) MUST reject a missing selection at runtime with a dedicated error. `SCP-STORAGE-8000` (§17.6) is the storage-specific error surface of this rule.
+
+**SCP-CAPSEL-8001 — Selection fails closed.** When a caller selects a production backend and that backend cannot be satisfied — a resource cannot be opened, a dependency is unreachable, a key or credential is wrong, or the named implementation can never succeed — the construction boundary MUST return a terminal error the caller observes. Silent fallback to a development/in-memory arm, to a no-op implementation, or to no backend at all is FORBIDDEN. A development/in-memory arm is reachable ONLY through an explicit selection of that arm, never as a degradation path from a failed production selection. A best-effort, silently-swallowed failure is defensible only for a real backend's transient flakiness (e.g. a momentarily unreachable network peer that a later retry reaches); it is never defensible for a stub or in-memory arm that can never satisfy the guarantee at all.
+
+**SCP-CAPSEL-8002 — The runtime never defaults or manufactures a backend.** The runtime core MUST NOT manufacture, default, or infer a provider backend for any capability. The selection is made once, at the construction boundary, and threaded into the runtime as a required (non-optional) parameter. There MUST be no code path by which the runtime runs a capability against an implementation the caller did not explicitly supply.
+
+These three requirements are exactly the three §17.6 states for storage, lifted to every capability. A capability that satisfies all three cannot silently run against an implementation the operator did not choose, and cannot silently downgrade to a weaker one when the chosen one is unavailable.
+
+### 17.17.2 Security Classification of Development Arms
+
+Many capabilities ship a development/in-memory arm — an implementation intended for testing, CI, or local development. Every such arm MUST be classified, and its classification decides how — and whether — it may exist in a shipped production artifact.
+
+**SCP-CAPSEL-8010 — Every development arm carries exactly one of two classifications.** A capability's in-memory/development arm is either:
+
+- a **durability-only affordance** — it may lose state (e.g. on process restart) but nullifies **no** security or verifiability property; or
+- a **security nullifier** — it nullifies a security or verifiability property the capability is responsible for (authenticity, reachability, freshness, revocation, attestation, or confidentiality).
+
+The classification is a property of *what the arm destroys*, not of how convenient it is. An arm that merely forgets state is durability-only. An arm that silently voids a guarantee a relying party depends on is a nullifier, however convenient. A durability-only arm fails **closed** — losing its state leaves the system unable to answer, not able to answer falsely. A nullifier fails **open** — it continues to answer, but its answer no longer carries the guarantee the caller believes it does.
+
+**SCP-CAPSEL-8011 — Durability-only arms are explicitly selectable, never default, never fallback, and never the only reachable arm in a shipped SDK.** A durability-only arm (e.g. in-memory storage, §17.6) MAY be compiled into any build and selected explicitly. It MUST NOT be a default (SCP-CAPSEL-8000), MUST NOT be reached as a fallback from a failed production selection (SCP-CAPSEL-8001), and a shipped SDK MUST also make a durable production arm reachable — a durability-only arm may never be the sole option a shipped artifact offers for its capability.
+
+**SCP-CAPSEL-8012 — Security-nullifier arms MUST be provably absent from shipped production artifacts.** A nullifier arm MUST NOT be *present in* — not merely unreachable within — a shipped production artifact. Absence is a property of the artifact, not of a runtime branch: a nullifier that is compiled in but guarded by a runtime flag is still an attack surface and still violates this rule, because the guarantee then rests on a flag never being flipped rather than on the dangerous code being gone. The *mechanism* by which absence is established and proven for a given artifact is downstream (ADR-062); the normative requirement is that a shipped production artifact contains no security-nullifier arm for any capability.
+
+> **ID note.** The classification IDs SCP-CAPSEL-8010/8011/8012/8013 are internal to this section and intentionally do NOT parallel the unrelated, pre-existing `SCP-STORAGE-8010`..`SCP-STORAGE-8013` block (browser/`scp-client-wasm` snapshot error codes, `sdk-common.md`). Only SCP-CAPSEL-8000 deliberately mirrors SCP-STORAGE-8000 (both name the storage-selection-mandatory rule). Do not read the matching `801x` suffixes as a cross-reference — there is no relationship between the two `801x` ranges.
+
+### 17.17.3 The DHT Backend Is an Instance — and Its In-Memory Arm Is a Nullifier
+
+DID/DHT resolution (§3.10) is a provider capability, so its backend selection is governed by §17.17.1 exactly as storage is: a shipped SDK must select its DHT backend explicitly, must fail closed when a production DHT backend is unsatisfiable, and must not let the runtime default one.
+
+**SCP-CAPSEL-8013 — In-memory DHT resolution is a security nullifier, categorically more dangerous than in-memory storage.** An in-memory DHT backend preserves the self-certification authenticity of any record it happens to hold (§3.10.8) — but **reachability and freshness are network properties**, and an in-memory backend destroys both: a publish reaches no peer, and a resolve sees no peer's writes. Under it, publishing to the DHT layer silently no-ops — a key rotation or revocation (§3.9 rotation-is-publication) is written into a process-local map no other resolver ever consults. The harm is *not* that rotation can never propagate: in a deployment whose relay layer (§3.10.2) is healthy, the rotation still propagates via relays and §3.10.7 highest-sequence-wins still defeats a stale DHT record. The harm is twofold and precise:
+
+- **Silent false success.** The SDK reports a successful publish while one of the two layers §3.10.6 mandates received nothing. This is categorically different from the *explicit, warned* DHT opt-out §3.10.6 permits (`disable_dht()`, which logs "DID resolution layer disabled. This identity may not be resolvable by all peers."): that opt-out is a legible, consented reduction of reach; an in-memory DHT backend is an unwarned misrepresentation of what was published. The nullifier is the *silence*, not the reduced reach.
+- **Loss of dual-layer suppression resilience (§3.10.8).** With a real DHT, an attacker must suppress a document on ALL of an identity's relays AND the DHT to prevent resolution. An in-memory DHT contributes nothing to that redundancy, collapsing the required attack to relay-only suppression — and leaving any resolver that must fall back to the DHT (all of an identity's relays unreachable, §3.10.3; or a non-SCP BEP44 client that reaches only the DHT, §3.10.6) with stale-or-absent data that still verifies by signature.
+
+Because its publish reports success while doing nothing and its resolve contributes no freshness, an in-memory DHT arm fails **open** on the DHT layer. That is the sharp contrast with in-memory storage (§17.6), which fails **closed**: a restarted node with lost state cannot silently present a false guarantee, it simply has no state. An in-memory DHT arm is therefore a **security nullifier**, not a durability-only affordance, and is governed by SCP-CAPSEL-8012 (provably absent from shipped production artifacts), not SCP-CAPSEL-8011.
+
+This is the determination the general rule exists to force. Two capabilities can each offer an "in-memory" arm, and one (storage) is a legitimate development affordance while the other (DHT) is a shipped-artifact security hole. Uniformly treating both as "just the dev backend" is the error §17.17 closes: the durability-only-vs-nullifier classification MUST be made explicitly, per capability, against the property that capability is responsible for — never assumed uniform across capabilities because they share the label "in-memory."
