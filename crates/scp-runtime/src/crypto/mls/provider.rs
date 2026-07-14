@@ -405,6 +405,20 @@ pub struct RestoredFloors {
 
 /// Production `ContextCryptoProvider` backed by `OpenMLS`.
 ///
+/// Node-resident X25519 wrapping keypair (§9.16.1), held as one unit so the
+/// public and secret halves rotate and are read atomically (ADR-049 PR-7
+/// hardening H3). Stored behind a single [`ArcSwap`] on [`MlsCryptoProvider`].
+struct WrappingKeypair {
+    /// X25519 wrapping public key for sender key HPKE (§9.16.1). Published in
+    /// the MLS `LeafNode` `scp_wrapping_key` extension.
+    public: [u8; 32],
+    /// X25519 wrapping secret key for sender key HPKE (§9.16.1). Used to open
+    /// HPKE-sealed sender key responses. Wrapped in [`Zeroizing`] so the prior
+    /// key material is zeroized when the last `Arc` to this pair drops (i.e. on
+    /// rotation, when the `ArcSwap` slot is replaced).
+    secret: Zeroizing<[u8; 32]>,
+}
+
 /// Manages per-context MLS groups and sender keys. Thread-safe via internal
 /// `Mutex`-protected maps.
 ///
@@ -419,6 +433,17 @@ pub struct RestoredFloors {
 /// Concurrent calls for the same context are serialized at a higher level by
 /// the per-context actor's single-threaded command loop (ADR-049), so
 /// contention on these mutexes is minimal.
+///
+/// # Wrapping-keypair atomicity (ADR-049 PR-7 hardening H3)
+///
+/// The node-resident X25519 wrapping keypair is stored as a SINGLE
+/// [`WrappingKeypair`] behind ONE [`ArcSwap`], so the public and secret halves
+/// rotate and are read as one unit. A prior design held the two halves in two
+/// separate `ArcSwap` slots; a reader that loaded the public half and then the
+/// secret half across two `.load()` calls could observe a torn pair (public of
+/// generation N with secret of N+1) if a rotation interleaved. That is closed by
+/// construction here: every read goes through a single `.load()` of the combined
+/// slot (see [`MlsCryptoProvider::wrapping_keypair`]).
 pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
@@ -458,26 +483,19 @@ pub struct MlsCryptoProvider {
     /// during the 12c.9f → 12 window the provider continues to hold the
     /// authoritative copy for non-actor callers.
     broadcast_keys: DashMap<[u8; 32], SenderKey>,
-    /// X25519 wrapping public key for sender key HPKE (§9.16.1).
-    /// Published in the MLS `LeafNode` `scp_wrapping_key` extension.
+    /// Node-resident X25519 wrapping keypair for sender key HPKE (§9.16.1) —
+    /// public half published in the MLS `LeafNode` `scp_wrapping_key` extension,
+    /// secret half used to open HPKE-sealed sender key responses.
     ///
-    /// Held in [`ArcSwap`] so the snapshot-restore path (which takes
-    /// `&self`) can replace the keypair atomically without contention.
-    /// The supervisor mirrors this slot per-identity via
-    /// [`crate::context::supervisor::Supervisor::wrapping_public_key_for`]
-    /// — both pointers are kept consistent on
-    /// [`MlsCryptoProvider`] writes through the supervisor's
-    /// `set_wrapping_keys` accessor.
-    wrapping_public_key: ArcSwap<[u8; 32]>,
-    /// X25519 wrapping secret key for sender key HPKE (§9.16.1).
-    /// Used to open HPKE-sealed sender key responses.
-    ///
-    /// Held in [`ArcSwap<Zeroizing<[u8; 32]>>`] so rotation is atomic and
-    /// the prior key material is zeroized when the last `Arc` to it
-    /// drops. Reader discipline (load → use → drop within the same
-    /// poll) is enforced at every callsite — no callsite stores the
-    /// loaded `Arc` in a struct field.
-    wrapping_secret_key: ArcSwap<Zeroizing<[u8; 32]>>,
+    /// Held as a SINGLE [`WrappingKeypair`] behind ONE [`ArcSwap`] (ADR-049 PR-7
+    /// hardening H3) so the pair rotates and is read atomically — the
+    /// snapshot-restore path (which takes `&self`) replaces both halves in one
+    /// `.store()`, and every reader loads both halves from one `.load()`,
+    /// closing the two-slot torn-read window. Rotation is atomic and the prior
+    /// key material is zeroized when the last `Arc` to the pair drops. Reader
+    /// discipline (load → use → drop within the same poll) is enforced at every
+    /// callsite — no callsite stores the loaded `Arc` in a struct field.
+    wrapping_keypair: ArcSwap<WrappingKeypair>,
     /// Contexts whose crypto state has been destructively moved into a
     /// [`crate::context::actor::ContextActor`] via
     /// [`Self::take_crypto_state`] (ADR-049 commit 12).
@@ -594,8 +612,10 @@ impl MlsCryptoProvider {
             hpke_backend,
             contexts: DashMap::new(),
             broadcast_keys: DashMap::new(),
-            wrapping_public_key: ArcSwap::from_pointee(wrapping_public_key),
-            wrapping_secret_key: ArcSwap::from_pointee(Zeroizing::new(wrapping_secret_key)),
+            wrapping_keypair: ArcSwap::from_pointee(WrappingKeypair {
+                public: wrapping_public_key,
+                secret: Zeroizing::new(wrapping_secret_key),
+            }),
             taken_context_ids: DashSet::new(),
             #[cfg(any(test, feature = "testing"))]
             force_export_failure: std::sync::atomic::AtomicBool::new(false),
@@ -931,7 +951,7 @@ impl MlsCryptoProvider {
         // Load through ArcSwap; the returned guard is dropped before
         // the create_group call because we copy the bytes into a stack
         // array.
-        let wrapping_pk = **self.wrapping_public_key.load();
+        let wrapping_pk = self.wrapping_keypair.load().public;
         let mls_group = build_group(&credential, &wrapping_pk)
             .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
 
@@ -1701,17 +1721,17 @@ impl MlsCryptoProvider {
                 // `ArcSwap`. The returned `Arc` is held only for the
                 // duration of the HPKE-open call (no `.await` between
                 // load and drop).
-                let wrapping_secret_guard = self.wrapping_secret_key.load();
+                let wrapping_keypair_guard = self.wrapping_keypair.load();
                 let sender_key = crate::crypto::sender_keys::key_protocol::hpke_open_sender_key(
                     &response.hpke_sealed_key,
                     &response.ephemeral_pubkey,
-                    &wrapping_secret_guard,
+                    &wrapping_keypair_guard.secret,
                     &ctx_id_hex,
                     &response.sender_did,
                     response.epoch,
                 )
                 .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
-                drop(wrapping_secret_guard);
+                drop(wrapping_keypair_guard);
 
                 // Verify the sender DID matches the claimed sender. This is
                 // AUTHENTICATION (the HPKE tag + DID binding), NOT floor gating,
@@ -2303,7 +2323,7 @@ impl MlsCryptoProvider {
         use tls_codec::Serialize as TlsSerializeTrait;
 
         // ADR-049 commit 12c.9f: load wrapping pubkey through `ArcSwap`.
-        let wrapping_pk = **self.wrapping_public_key.load();
+        let wrapping_pk = self.wrapping_keypair.load().public;
         self.with_context(context_id, |state| {
             let commit = scp_mls::ratchet::propose_update_with_wrapping_key(
                 &mut state.mls_group,
@@ -2441,8 +2461,12 @@ impl MlsCryptoProvider {
         // Read the provider-level wrapping keypair for persistence.
         // ADR-049 commit 12c.9f: load through `ArcSwap` and copy the
         // bytes immediately so guards drop before snapshot serialization.
-        let pub_key_bytes = **self.wrapping_public_key.load();
-        let secret_key_bytes: Vec<u8> = self.wrapping_secret_key.load().to_vec();
+        // Single `.load()` of the combined slot (H3): the public and secret
+        // halves are copied out of one atomic snapshot, never torn across a
+        // rotation.
+        let wrapping_keypair_guard = self.wrapping_keypair.load();
+        let pub_key_bytes = wrapping_keypair_guard.public;
+        let secret_key_bytes: Vec<u8> = wrapping_keypair_guard.secret.to_vec();
 
         let mut snapshot = MlsCryptoSnapshot {
             mls_storage_entries,
@@ -2502,47 +2526,33 @@ impl MlsCryptoProvider {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn wrapping_keypair_snapshot(&self) -> ([u8; 32], zeroize::Zeroizing<[u8; 32]>) {
-        let public = **self.wrapping_public_key.load();
-        let secret = zeroize::Zeroizing::new(***self.wrapping_secret_key.load());
-        (public, secret)
+        self.wrapping_keypair()
     }
 
-    /// Returns a copy of this provider's node-resident X25519 wrapping
-    /// **public** key (the HPKE recipient key advertised in the `0xFF01`
-    /// wrapping leaf so peers can seal sender keys to this member).
+    /// Returns a copy of this provider's node-resident X25519 wrapping keypair
+    /// `(public, secret)` from a SINGLE atomic `ArcSwap` load (ADR-049 PR-7
+    /// hardening H3). The public half is the HPKE recipient key advertised in
+    /// the `0xFF01` wrapping leaf; the secret half opens sender keys sealed to
+    /// this member and is returned in [`zeroize::Zeroizing`] so it zeroes on
+    /// drop (no bare `[u8; 32]` secret escapes the provider).
     ///
-    /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b): the Prep A per-context crypto
-    /// methods on `PerContextState` take the node-resident wrapping keypair as a
-    /// METHOD PARAMETER (never stored on `ContextCryptoState`). The atomic core
-    /// actor-seeding path (SCP-CRYPTOMOVE-001) therefore needs to read the
-    /// keypair off the provider to hand it in. This `pub(crate)` accessor
-    /// exposes the public half in the PRODUCTION build without routing through
-    /// [`Self::wrapping_keypair_snapshot`], which stays test-gated so the raw
-    /// secret is never reachable from the production public API.
+    /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / hardening H3: the Prep A
+    /// per-context crypto methods on `PerContextState` take the node-resident
+    /// wrapping keypair as a METHOD PARAMETER (never stored on
+    /// `ContextCryptoState`). The atomic core actor-seeding path
+    /// (SCP-CRYPTOMOVE-001) reads the keypair off the provider to hand it in.
+    /// This SINGLE combined accessor supersedes the earlier two separate
+    /// `wrapping_public_key()` / `wrapping_secret()` accessors: reading both
+    /// halves through one `.load()` makes the pair atomic by construction, so a
+    /// rotation can never pair a public of generation N with a secret of N+1.
     #[must_use]
     #[allow(
         dead_code,
-        reason = "ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b): node-resident accessor lands ahead of the atomic move; production caller is the atomic core actor-seeding path (SCP-CRYPTOMOVE-001). Exercised now by a crate-internal parity unit test."
+        reason = "ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / H3: node-resident accessor lands ahead of the atomic move; production caller is the atomic core actor-seeding path (SCP-CRYPTOMOVE-001). Exercised now by a crate-internal unit test."
     )]
-    pub(crate) fn wrapping_public_key(&self) -> [u8; 32] {
-        **self.wrapping_public_key.load()
-    }
-
-    /// Returns a `Zeroizing` copy of this provider's node-resident X25519
-    /// wrapping **secret** key (used to HPKE-open sender keys sealed to this
-    /// member). The returned buffer zeroes on drop, so the secret does not
-    /// linger in caller memory once the returned value is dropped.
-    ///
-    /// Companion to [`Self::wrapping_public_key`] for the SCP-CRYPTOMOVE-001
-    /// actor-seeding path (see that method's note). The `Zeroizing` return type
-    /// is load-bearing: no bare `[u8; 32]` secret escapes the provider.
-    #[must_use]
-    #[allow(
-        dead_code,
-        reason = "ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b): node-resident accessor lands ahead of the atomic move; production caller is the atomic core actor-seeding path (SCP-CRYPTOMOVE-001). Exercised now by a crate-internal parity unit test."
-    )]
-    pub(crate) fn wrapping_secret(&self) -> zeroize::Zeroizing<[u8; 32]> {
-        zeroize::Zeroizing::new(***self.wrapping_secret_key.load())
+    pub(crate) fn wrapping_keypair(&self) -> ([u8; 32], zeroize::Zeroizing<[u8; 32]>) {
+        let guard = self.wrapping_keypair.load();
+        (guard.public, zeroize::Zeroizing::new(*guard.secret))
     }
 
     /// Restores per-context cryptographic state from a previously exported
@@ -2812,12 +2822,12 @@ impl MlsCryptoProvider {
         // per-context entry becomes observable — so a reader never sees a
         // partial pairing of new wrapping key with stale context state.
         //
-        // ADR-049 commit 12c.9f: `ArcSwap::store` is atomic per-slot;
-        // observing one slot pre-rotation and the other post-rotation is
-        // possible only across the two stores below, but both rotate
-        // together to the same `snapshot` source so any in-flight reader
-        // sees a consistent pair (either old/old or new/new) at the
-        // protocol boundary that uses both keys (HPKE seal + open).
+        // ADR-049 PR-7 hardening H3: the wrapping keypair is a SINGLE
+        // `ArcSwap<WrappingKeypair>` slot, so the public and secret halves
+        // rotate in ONE atomic `.store()` — an in-flight reader always sees a
+        // consistent pair (either old/old or new/new). This closes the
+        // prior two-store window where one slot could be observed rotated
+        // while the other lagged.
         //
         // Legacy snapshots (pre-wrapping-key persistence) have default
         // [0u8; 32] — skip restore in that case to keep the fresh keypair.
@@ -2827,10 +2837,10 @@ impl MlsCryptoProvider {
             let mut secret = Zeroizing::new([0u8; 32]);
             secret.copy_from_slice(&snapshot.wrapping_secret_key);
 
-            self.wrapping_public_key
-                .store(Arc::new(snapshot.wrapping_public_key));
-            self.wrapping_secret_key
-                .store(Arc::new(Zeroizing::new(*secret)));
+            self.wrapping_keypair.store(Arc::new(WrappingKeypair {
+                public: snapshot.wrapping_public_key,
+                secret: Zeroizing::new(*secret),
+            }));
         }
 
         // SECURITY: Zeroize the wrapping secret key bytes remaining in the
@@ -2979,36 +2989,45 @@ mod tests {
         id
     }
 
-    /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b): the `pub(crate)`
-    /// `wrapping_public_key()` / `wrapping_secret()` accessors that the atomic
-    /// core actor-seeding path (SCP-CRYPTOMOVE-001) will read must observe the
-    /// SAME node-resident keypair as the test-gated
+    /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / hardening H3: the single
+    /// `pub(crate)` `wrapping_keypair()` accessor that the atomic core
+    /// actor-seeding path (SCP-CRYPTOMOVE-001) reads must return a
+    /// self-consistent `(public, secret)` pair from ONE atomic `ArcSwap` load,
+    /// stable across repeated calls, and must observe the SAME node-resident
+    /// keypair as the test-gated
     /// [`MlsCryptoProvider::wrapping_keypair_snapshot`] ground truth. Also pins
-    /// the AC#2 contract that the secret accessor returns `Zeroizing` (no bare
+    /// the contract that the secret half returns `Zeroizing` (no bare
     /// `[u8; 32]` secret escapes the provider) via a load-bearing type witness.
     #[test]
-    fn wrapping_accessors_match_snapshot_and_secret_is_zeroizing() {
+    fn wrapping_keypair_single_load_matches_snapshot_and_secret_is_zeroizing() {
         let provider = make_provider();
 
         // Ground truth: the identity-level wrapping keypair as the test-gated
-        // snapshot reports it.
+        // snapshot reports it (which now delegates to `wrapping_keypair`).
         let (snap_pub, snap_sec) = provider.wrapping_keypair_snapshot();
 
-        // Parity: the production `pub(crate)` accessors observe the same bytes.
+        // The single combined accessor returns the SAME pair, and is stable
+        // across repeated calls (no torn read between the two halves).
+        let (pub1, sec1) = provider.wrapping_keypair();
+        let (pub2, sec2) = provider.wrapping_keypair();
+        assert_eq!(pub1, pub2, "wrapping_keypair() public half must be stable");
         assert_eq!(
-            provider.wrapping_public_key(),
-            snap_pub,
-            "wrapping_public_key() must match the snapshot's public half"
+            *sec1, *sec2,
+            "wrapping_keypair() secret half must be stable"
+        );
+        assert_eq!(
+            pub1, snap_pub,
+            "wrapping_keypair() public must match the snapshot"
+        );
+        assert_eq!(
+            *sec1, *snap_sec,
+            "wrapping_keypair() secret must match the snapshot"
         );
 
-        // AC#2 type witness: the return type is `Zeroizing<[u8; 32]>`, not a
-        // bare secret. This binding is load-bearing — it fails to compile if the
+        // Type witness: the secret half is `Zeroizing<[u8; 32]>`, not a bare
+        // secret. This binding is load-bearing — it fails to compile if the
         // signature ever regresses to a plain `[u8; 32]`.
-        let sec: zeroize::Zeroizing<[u8; 32]> = provider.wrapping_secret();
-        assert_eq!(
-            *sec, *snap_sec,
-            "wrapping_secret() must match the snapshot's secret half"
-        );
+        let _sec_witness: zeroize::Zeroizing<[u8; 32]> = sec1;
     }
 
     /// ADR-049 PR-7 prep E (SCP-CRYPTOMOVE-000e): the one-shot
@@ -3653,7 +3672,7 @@ mod tests {
             scp_mls::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
         assert_eq!(
             extracted,
-            Some(**provider.wrapping_public_key.load()),
+            Some(provider.wrapping_keypair.load().public),
             "own leaf node must contain provider's wrapping public key"
         );
     }
@@ -3765,7 +3784,7 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
 
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let bob_wrapping_pk = **bob_provider.wrapping_public_key.load();
+        let bob_wrapping_pk = bob_provider.wrapping_keypair.load().public;
         let (bob_kp_bundle, _bob_signer, _bob_mls) =
             generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping_pk), &SystemClock)
                 .unwrap();
@@ -3846,7 +3865,7 @@ mod tests {
         bob_provider.create_mls_group(&ctx_id).unwrap();
 
         let ctx_hex = hex::encode(ctx_id);
-        let bob_wrapping_pk = **bob_provider.wrapping_public_key.load();
+        let bob_wrapping_pk = bob_provider.wrapping_keypair.load().public;
         let (sealed_vec, ephemeral_pub) =
             crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
@@ -4814,8 +4833,8 @@ mod tests {
         provider.create_mls_group(&ctx_id).unwrap();
 
         // Capture the original wrapping keypair.
-        let original_public = **provider.wrapping_public_key.load();
-        let original_secret: [u8; 32] = ***provider.wrapping_secret_key.load();
+        let original_public = provider.wrapping_keypair.load().public;
+        let original_secret: [u8; 32] = *provider.wrapping_keypair.load().secret;
 
         // Sanity: the keypair should not be all zeros.
         assert_ne!(
@@ -4835,7 +4854,7 @@ mod tests {
 
         // Create a fresh provider (simulates restart — gets a NEW random keypair).
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
-        let fresh_public = **provider2.wrapping_public_key.load();
+        let fresh_public = provider2.wrapping_keypair.load().public;
         assert_ne!(
             fresh_public, original_public,
             "fresh provider should have a DIFFERENT wrapping public key"
@@ -4845,8 +4864,8 @@ mod tests {
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
         // After restore, the wrapping keypair must match the ORIGINAL, not the fresh one.
-        let restored_public = **provider2.wrapping_public_key.load();
-        let restored_secret: [u8; 32] = ***provider2.wrapping_secret_key.load();
+        let restored_public = provider2.wrapping_keypair.load().public;
+        let restored_secret: [u8; 32] = *provider2.wrapping_keypair.load().secret;
 
         assert_eq!(
             restored_public, original_public,
