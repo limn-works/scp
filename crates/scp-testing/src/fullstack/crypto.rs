@@ -22,16 +22,25 @@
 //!
 //! # What is real
 //!
-//! - `OpenMLS` group create / add / remove / encrypt / decrypt (via the
-//!   concrete provider's inherent methods, which delegate to the same
-//!   `group::*` / `encrypt::*` primitives as production).
-//! - HPKE-sealed sender-key distribution (`distribute_sender_key`,
-//!   `process_incoming_sender_key`), MLS-wrapped for transport.
+//! - `OpenMLS` group create / add / remove / encrypt / decrypt. On the receive
+//!   side (Commit merge, sender-key install, message decrypt) this now runs
+//!   through the REAL per-context actor via
+//!   [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob)
+//!   (ADR-049 PR-7, SCP-CRYPTOMOVE-001) — the provider `open` /
+//!   `mls_encrypt_management` / `drain_pending_sender_key_messages` twins were
+//!   deleted when crypto ownership moved onto the actor. Group create / add and
+//!   the sender-key request/response (pull) primitives remain on the concrete
+//!   provider.
+//! - HPKE-sealed sender-key distribution, MLS-wrapped for transport: the
+//!   inviter's actor pushes it during `invite_member`; the harness harvests the
+//!   pushed blob from the transport and re-delivers it to the joiner through the
+//!   actor receive path.
 //! - AES-256-KW access-key wrapping / unwrapping of content.
 //!
 //! # What is test infrastructure
 //!
 //! - The [`KeyExchange`] side channel that moves the bootstrap bytes
+//!   (sealed invitation, harvested sender-key blobs, epoch-advance Commits)
 //!   between `FullStackNode`s without a live relay.
 
 use std::sync::Arc;
@@ -44,10 +53,12 @@ use super::exchange::KeyExchange;
 /// Harness-side crypto helper for one `FullStackNode`.
 ///
 /// Holds the node's concrete [`MlsCryptoProvider`] plus a handle on the
-/// shared [`KeyExchange`]. The provider is the single source of MLS truth on
-/// the joiner side; on the creator side the actor takes ownership of the
-/// per-context state at spawn time, so creator-side reads route through the
-/// `Supervisor` mailbox (see [`super::node::FullStackNode`]).
+/// shared [`KeyExchange`]. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the per-context
+/// MLS group / sender-key decrypt state is owned by the context ACTOR (creator
+/// and joiner alike now stand up a live actor), so every receive-side MLS
+/// operation routes through the `Supervisor` mailbox (see
+/// [`super::node::FullStackNode`]); the provider retains only the birth /
+/// sender-key request-response primitives.
 pub struct E2eCryptoProvider {
     /// Real crypto provider — every MLS / sender-key / access-key
     /// primitive flows through this field.
@@ -117,41 +128,20 @@ impl E2eCryptoProvider {
             .deposit_commit(*context_id, member_did, commit_bytes);
     }
 
-    /// Applies every pending epoch-advance Commit deposited for this node.
+    /// Takes (drains) every raw epoch-advance Commit deposited for this node,
+    /// in deposit order.
     ///
-    /// Each raw Commit is wrapped in a throwaway `OuterEnvelope` and fed to
-    /// [`MlsCryptoProvider::open`], which routes it through the MLS control
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the provider `open` twin is deleted —
+    /// Commits are now merged through the REAL actor receive path. The caller
+    /// ([`super::node::FullStackNode`]) wraps each raw Commit in a throwaway
+    /// `OuterEnvelope` and feeds it to
+    /// [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob),
+    /// which routes it through the actor's `decrypt_and_dispatch` MLS control
     /// path and merges the staged commit (advancing the group epoch).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError`](scp_core::context::ContextError) if Commit
-    /// processing fails.
-    pub fn process_pending_commits(
-        &self,
-        context_id_str: &str,
-        context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::ContextError> {
-        let commits = {
-            let mut exchange = self.exchange();
-            exchange.take_commits(context_id, self.local_did.as_ref())
-        };
-        for commit_bytes in commits {
-            let wrapped =
-                super::node::wrap_raw_mls_message(&hex::encode(context_id), commit_bytes)?;
-            match self.provider.open(context_id, context_id_str, &wrapped)? {
-                // A Commit advances the epoch and surfaces as a control
-                // message — no payload is produced.
-                scp_core::context::builder::OpenResult::Control => {}
-                scp_core::context::builder::OpenResult::Application(_)
-                | scp_core::context::builder::OpenResult::Management { .. } => {
-                    return Err(scp_core::context::ContextError::CryptoFailed(
-                        "commit channel carried a non-control MLS message".to_owned(),
-                    ));
-                }
-            }
-        }
-        Ok(())
+    #[must_use]
+    pub fn take_pending_commits(&self, context_id: &[u8; 32]) -> Vec<Vec<u8>> {
+        self.exchange()
+            .take_commits(context_id, self.local_did.as_ref())
     }
 
     // -- Sender keys: MLS-wrapped distribution side channel ----------------
@@ -168,83 +158,20 @@ impl E2eCryptoProvider {
             .deposit_sender_key_message(*context_id, joiner_did, msg);
     }
 
-    /// Distributes this node's sender key to `target_did`: queues the
-    /// HPKE-sealed distribution on the provider, drains and MLS-wraps it, and
-    /// deposits the wrapped bytes in the exchange for the target to pick up.
+    /// Takes (drains) every MLS-wrapped sender-key distribution message
+    /// deposited for this node, in deposit order.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError`](scp_core::context::ContextError) on
-    /// distribution, drain, or MLS-wrap failure.
-    pub fn distribute_sender_key(
-        &self,
-        context_id: &[u8; 32],
-        target_did: &str,
-    ) -> Result<(), scp_core::context::ContextError> {
-        self.provider
-            .distribute_sender_key(context_id, target_did)?;
-        let routing_id = scp_core::context::context_routing_id(&hex::encode(context_id));
-        let pending = self
-            .provider
-            .drain_pending_sender_key_messages(context_id)?;
-        for (target, message) in pending {
-            let wrapped =
-                self.provider
-                    .mls_encrypt_management(context_id, &message, &routing_id, 3600)?;
-            self.deposit_sender_key_message(context_id, &target, wrapped);
-        }
-        Ok(())
-    }
-
-    /// Processes every MLS-wrapped sender-key distribution message deposited
-    /// for this node: MLS-open each one, then feed the management payload to
-    /// [`MlsCryptoProvider::process_incoming_sender_key`].
-    ///
-    /// Must be called after [`Self::join_from_welcome`] (the node needs its
-    /// MLS group to decrypt the wrapped messages).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError`](scp_core::context::ContextError) if MLS-open
-    /// or sender-key processing fails.
-    pub fn pickup_sender_key_messages(
-        &self,
-        context_id_str: &str,
-        context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::ContextError> {
-        let messages = {
-            let mut exchange = self.exchange();
-            exchange.take_sender_key_messages(context_id, self.local_did.as_ref())
-        };
-        for wrapped in messages {
-            match self.provider.open(context_id, context_id_str, &wrapped)? {
-                scp_core::context::builder::OpenResult::Management {
-                    sender_did,
-                    payload,
-                } => {
-                    // ADR-049 PR-6: `process_incoming_sender_key` now returns the
-                    // authenticated `(key, epoch)` without installing; install it
-                    // via `set_sender_key_unchecked`. This full-stack harness is a
-                    // trusted pickup path (no adversarial-exporter registry gate).
-                    let (key, _epoch) = self.provider.process_incoming_sender_key(
-                        context_id,
-                        &sender_did,
-                        &payload,
-                    )?;
-                    self.provider
-                        .set_sender_key_unchecked(context_id, &sender_did, key);
-                }
-                // A non-management message in the sender-key channel means
-                // the wrong bytes were deposited — fail loudly rather than
-                // silently dropping key material.
-                scp_core::context::builder::OpenResult::Application(_)
-                | scp_core::context::builder::OpenResult::Control => {
-                    return Err(scp_core::context::ContextError::CryptoFailed(
-                        "sender-key channel carried a non-management MLS message".to_owned(),
-                    ));
-                }
-            }
-        }
-        Ok(())
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the provider `open` /
+    /// `mls_encrypt_management` twins are deleted. Each drained blob is a full
+    /// `OuterEnvelope` (harvested from the inviter's transport, where the
+    /// inviter's actor pushed it during `invite_member`). The caller
+    /// ([`super::node::FullStackNode`]) feeds each straight to
+    /// [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob),
+    /// whose `decrypt_and_dispatch` MLS-opens it and installs the authenticated
+    /// sender key through the same gate-before-install path production uses.
+    #[must_use]
+    pub fn take_pending_sender_key_messages(&self, context_id: &[u8; 32]) -> Vec<Vec<u8>> {
+        self.exchange()
+            .take_sender_key_messages(context_id, self.local_did.as_ref())
     }
 }

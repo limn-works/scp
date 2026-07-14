@@ -326,9 +326,12 @@ impl FullStackNode {
     /// creator calls `Supervisor::invite_member`, which runs the in-actor MLS
     /// add + broadcasts the epoch Commit + updates the creator's `role_state`, and
     /// returns a creator-signed, HPKE-sealed [`super::exchange::PendingJoin`].
-    /// The creator then distributes its sender key (`invite_member` does NOT), and
-    /// deposits the sealed bundle, the epoch Commit, and every member's access
-    /// key for the joiner to pick up. See the module docs for the full sequence.
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the inviter's actor pushes its
+    /// MLS-wrapped sender key onto the transport during the in-actor add, so the
+    /// creator harvests that pushed blob from the capture buffer (rather than the
+    /// deleted provider `distribute`/`drain`/`mls_encrypt_management` path) and
+    /// deposits it, the sealed bundle, and the epoch Commit for the joiner to
+    /// pick up. See the module docs for the full sequence.
     ///
     /// # Errors
     ///
@@ -416,18 +419,15 @@ impl FullStackNode {
             },
         );
 
-        // 7. Distribute THIS node's sender key to the new member — `invite_member`
-        //    does NOT distribute sender keys on add, so the joiner needs it to
-        //    decrypt the creator's traffic. Deposits directly into the exchange
-        //    (does not touch the transport capture buffer).
-        self.crypto.distribute_sender_key(&ctx_bytes, member_did)?;
-
-        // 8. Extract the epoch-advance Commit from the actor's WelcomeGenerated
+        // 7. Extract the epoch-advance Commit from the actor's WelcomeGenerated
         //    event and deposit it for every existing member so their MLS group
         //    advances to the new epoch. The Welcome itself travels INSIDE the
         //    sealed bundle, so `welcome_bytes` is discarded here. Every OTHER
         //    event is buffered so the tests' later `drain_events` still sees it.
+        //    Capture the (broadcast) Commit ciphertext so the sender-key harvest
+        //    in step 8 can distinguish it from the inviter's sender-key push.
         let drained = self.manager.drain_events(context_id).await;
+        let mut commit_ct: Option<Vec<u8>> = None;
         {
             let mut pending = self
                 .pending_events
@@ -435,16 +435,16 @@ impl FullStackNode {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for event in drained {
                 if let ContextEvent::WelcomeGenerated { commit_bytes, .. } = event {
+                    commit_ct = Some(commit_bytes.0.clone());
                     for existing in &existing_members {
                         // Deposit the epoch-advance Commit only for OTHER existing
                         // members on separate nodes. Exclude the newly-added member
                         // (it joins via the Welcome, not a Commit) AND this node —
-                        // the inviter ran the add in-actor on its own SHARED
-                        // provider, so its MLS group already advanced to the new
-                        // epoch. Re-depositing the Commit for `self.did` would make
-                        // its later `decrypt_message` → `process_pending_commits`
-                        // replay it, double-advancing the epoch and breaking the
-                        // B→A roundtrip with an epoch mismatch.
+                        // the inviter ran the add in-actor on its OWN actor, so its
+                        // MLS group already advanced to the new epoch. Re-depositing
+                        // the Commit for `self.did` would make its later
+                        // `feed_pending_incoming` replay it, double-advancing the
+                        // epoch and breaking the B→A roundtrip with an epoch mismatch.
                         if existing != member_did && existing.as_str() != self.did.as_ref() {
                             self.crypto.deposit_commit(
                                 &ctx_bytes,
@@ -459,12 +459,26 @@ impl FullStackNode {
             }
         }
 
-        // 9. `invite_member` broadcast the epoch Commit to the transport, so the
-        //    capture buffer now holds it. The raw commit_bytes were already
-        //    deposited for existing members from the event in step 8, so clear
-        //    the buffer to keep `take_sent_ciphertexts` clean for later
-        //    application-ciphertext assertions.
-        let _ = std::mem::take(&mut *self.lock_sent());
+        // 8. Harvest THIS node's sender-key distribution for the new member.
+        //    ADR-049 PR-7 (SCP-CRYPTOMOVE-001): `invite_member` runs the add in
+        //    the inviter's actor, whose drain-and-deliver pushes the inviter's
+        //    MLS-wrapped sender key onto the transport (captured in `self.sent`).
+        //    The provider `distribute_sender_key` → `drain` →
+        //    `mls_encrypt_management` manual path is deleted, so harvest the
+        //    pushed blob(s) here — every captured envelope that is NOT the
+        //    (broadcast) epoch Commit — and deposit them for the joiner to feed
+        //    through its actor receive path (`feed_pending_incoming`). Taking the
+        //    buffer also clears it, keeping `take_sent_ciphertexts` clean for
+        //    later application-ciphertext assertions.
+        {
+            let captured = std::mem::take(&mut *self.lock_sent());
+            for (_routing_id, ct) in captured {
+                if commit_ct.as_deref() != Some(ct.as_slice()) {
+                    self.crypto
+                        .deposit_sender_key_message(&ctx_bytes, member_did, ct);
+                }
+            }
+        }
 
         // NOTE: the new member's access keys are NOT pushed here. The creator
         // (this node) holds every member's §9.17 access key in its OWN actor
@@ -474,15 +488,6 @@ impl FullStackNode {
         // actor-loop distribution this replaces is deferred and tracked (#2050).
 
         Ok(())
-    }
-
-    /// Reads every per-member access key from THIS node's context actor via
-    /// the `GetAllAccessKeys` mailbox query.
-    async fn get_all_access_keys(
-        &self,
-        context_id: &str,
-    ) -> Result<HashMap<String, scp_core::crypto::access_keys::AccessKey>, ContextError> {
-        dispatch_get_all_access_keys(&self.manager, context_id).await
     }
 
     /// Joins a context from the sealed invitation the creator deposited in the
@@ -553,13 +558,12 @@ impl FullStackNode {
             .spawn_actor_from_welcome(self.did.clone(), &custody, &active_handle, req)
             .await?;
 
-        // 5. Joiner-side pickup: sender-key distribution messages and any
-        //    pending epoch-advance Commits. (§9.17 access keys are acquired via
+        // 5. Joiner-side pickup: pending epoch-advance Commits and the pushed
+        //    sender-key distribution messages, fed through the REAL actor
+        //    receive path (ADR-049 PR-7). (§9.17 access keys are acquired via
         //    the real pull in step 7, not a deposit/pickup side-channel.)
-        self.crypto
-            .pickup_sender_key_messages(context_id_str, context_id)?;
-        self.crypto
-            .process_pending_commits(context_id_str, context_id)?;
+        self.feed_pending_incoming(context_id_str, context_id)
+            .await?;
 
         // 6. Joiner→incumbent sender-key exchange via the spec's PULL protocol
         //    (§9.16.2), the canonical new-member mechanism. Neither `invite_member`
@@ -963,38 +967,39 @@ impl FullStackNode {
 
     /// Opens a captured ciphertext through the MLS + sender-key + inner-envelope
     /// layers and returns the decrypted [`InnerEnvelope`] without unwrapping the
-    /// access-key content layer.
+    /// access-key content layer, so tests can inspect `message_type` /
+    /// `sequence` / `payload` (e.g. assert a sent heartbeat is tagged
+    /// `MessageType::Heartbeat` and carries sequence `0`, §9.9.2).
     ///
-    /// Lets tests inspect `message_type` / `sequence` / `payload` on the inner
-    /// envelope — e.g. to assert a sent heartbeat is tagged
-    /// `MessageType::Heartbeat` and carries sequence `0` (§9.9.2).
+    /// # Blocked on an actor inspection command (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
+    ///
+    /// This inspection needs the RAW decrypted `InnerEnvelope` (its
+    /// `message_type` and `sequence`), which the deleted provider `open` twin
+    /// used to surface. The only public receive path now is
+    /// [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob),
+    /// which returns the access-key-UNWRAPPED plaintext for an application
+    /// message and collapses Control / Heartbeat / Management to `None` — it does
+    /// NOT expose the inner header. Restoring this requires a NEW read-only actor
+    /// command (e.g. `MessagingCommand::InspectIncoming` returning the
+    /// `OpenedEnvelope`'s `inner`), which is out of this harness's scope. Until
+    /// that lands, this method fails closed rather than fabricate an inner header.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] if any decryption or verification step fails,
-    /// or if the open yields a control / management result rather than an
-    /// application envelope.
+    /// Always returns [`ContextError::CryptoFailed`] pending the actor
+    /// inner-envelope inspection command described above.
     pub fn open_inner_envelope(
         &self,
-        context_id_str: &str,
-        context_id: &[u8; 32],
-        ciphertext: &[u8],
+        _context_id_str: &str,
+        _context_id: &[u8; 32],
+        _ciphertext: &[u8],
     ) -> Result<scp_core::envelope::inner::InnerEnvelope, ContextError> {
-        self.crypto
-            .process_pending_commits(context_id_str, context_id)?;
-        match self
-            .crypto
-            .provider
-            .open(context_id, context_id_str, ciphertext)?
-        {
-            scp_core::context::builder::OpenResult::Application(env) => Ok(env.inner),
-            scp_core::context::builder::OpenResult::Control => {
-                Err(ContextError::CryptoFailed("open returned Control".into()))
-            }
-            scp_core::context::builder::OpenResult::Management { .. } => Err(
-                ContextError::CryptoFailed("open returned Management".into()),
-            ),
-        }
+        Err(ContextError::CryptoFailed(
+            "open_inner_envelope: raw inner-envelope inspection requires a read-only \
+             actor command (deleted provider `open` twin, ADR-049 PR-7); \
+             deliver_commit_blob does not surface the inner header"
+                .to_owned(),
+        ))
     }
 
     /// Takes all captured application ciphertexts sent by this node and clears
@@ -1018,105 +1023,75 @@ impl FullStackNode {
         context_id_str: &str,
         context_id: &[u8; 32],
         ciphertext: &[u8],
-        sender_did: &str,
+        _sender_did: &str,
     ) -> Result<Vec<u8>, ContextError> {
-        // Apply any pending epoch-advance commits to sync the MLS epoch.
-        self.crypto
-            .process_pending_commits(context_id_str, context_id)?;
+        // Ingest any deposited epoch-advance Commits + pushed sender-key
+        // distributions through the REAL actor receive path first, so the MLS
+        // epoch is synced and the sender's key is installed before the
+        // application ciphertext is opened. (The reverse joiner→incumbent
+        // sender-key direction is handled at join time by the PULL protocol,
+        // `incumbents_pull_joiner_sender_key`.)
+        self.feed_pending_incoming(context_id_str, context_id)
+            .await?;
 
-        // Ingest any PUSHED sender-key distribution addressed to this node
-        // before opening (the incumbent→joiner direction: the inviter proactively
-        // pushes its key to the joiner at `add_member`, sealed to the joiner's
-        // stable wrapping key, and the joiner picks it up here). The reverse
-        // joiner→incumbent direction is handled at join time by the PULL protocol
-        // (`incumbents_pull_joiner_sender_key`), not by push, so nothing is
-        // deposited for it — but this pickup is still required so a joiner
-        // decrypting an incumbent's message resolves the incumbent's key here
-        // rather than failing with `sender key lookup failed`.
-        self.crypto
-            .pickup_sender_key_messages(context_id_str, context_id)?;
-
-        // Open: outer envelope → MLS decrypt → sender-key decrypt → inner
-        // envelope → strip padding → integrity check.
-        let opened = match self
-            .crypto
-            .provider
-            .open(context_id, context_id_str, ciphertext)?
-        {
-            scp_core::context::builder::OpenResult::Application(env) => *env,
-            scp_core::context::builder::OpenResult::Control => {
-                return Err(ContextError::CryptoFailed("open returned Control".into()));
-            }
-            scp_core::context::builder::OpenResult::Management {
-                sender_did: mgmt_sender,
-                payload,
-            } => {
-                // ADR-049 PR-6: install the authenticated key (decomposed
-                // process_incoming no longer installs). Trusted harness path.
-                let (key, _epoch) = self.crypto.provider.process_incoming_sender_key(
-                    context_id,
-                    &mgmt_sender,
-                    &payload,
-                )?;
-                self.crypto
-                    .provider
-                    .set_sender_key_unchecked(context_id, &mgmt_sender, key);
-                return Err(ContextError::CryptoFailed(
-                    "open returned Management".into(),
-                ));
-            }
-        };
-
-        // Strip padding to recover the serialized WrappedContent.
-        let stripped = scp_core::envelope::strip_padding(&opened.inner.payload)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        // Deserialize WrappedContent and unwrap the access-key layer.
-        let wrapped: scp_core::crypto::access_keys::WrappedContent =
-            rmp_serde::from_slice(&stripped).map_err(|e| {
-                ContextError::CryptoFailed(format!("WrappedContent deserialization: {e}"))
-            })?;
-
-        // Unwrap with this node's OWN §9.17 access key, read from its context
-        // actor's access_key_store (the single source of truth for access keys):
-        // the creator minted its own at create; a joiner installed its own via
-        // the real §9.17 pull at join (`pull_access_keys_from_creator`).
-        let local_did = self.did.as_ref().to_string();
-        let access_key = self
-            .get_all_access_keys(context_id_str)
+        // Open through the real actor receive path (ADR-049 PR-7,
+        // SCP-CRYPTOMOVE-001): `Supervisor::deliver_commit_blob` dispatches
+        // `MessagingCommand::DeliverIncoming` to this node's context actor,
+        // which runs `decrypt_and_dispatch` (outer envelope → MLS decrypt →
+        // sender-key decrypt → inner envelope → anti-replay) followed by the
+        // §9.17 access-key unwrap, returning the recovered plaintext. The
+        // provider `open` twin is deleted; the actor is the sole crypto
+        // authority for its context.
+        match self
+            .manager
+            .deliver_commit_blob(context_id_str, ciphertext.to_vec())
             .await?
-            .remove(&local_did)
-            .ok_or_else(|| {
-                ContextError::CryptoFailed(format!(
-                    "no access key for {local_did} in context {context_id_str}"
-                ))
-            })?;
-
-        scp_core::crypto::access_keys::wrapping::unwrap_content(
-            &wrapped,
-            &local_did,
-            &access_key,
-            context_id_str,
-            sender_did,
-            0,
-            0,
-        )
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))
+        {
+            Some((plaintext, _sender)) => Ok(plaintext),
+            None => Err(ContextError::CryptoFailed(
+                "decrypt_message: blob classified as control/management, not application content"
+                    .to_owned(),
+            )),
+        }
     }
 
-    /// Picks up and processes any sender-key distribution messages deposited
-    /// for this node in the shared exchange.
+    /// Feeds every deposited epoch-advance Commit and pushed sender-key
+    /// distribution blob for this node through the REAL actor receive path.
+    ///
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): replaces the deleted provider
+    /// `open` / `mls_encrypt_management` pickup twins. Each blob is dispatched
+    /// via [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob),
+    /// whose `decrypt_and_dispatch` merges Commits (advancing the MLS epoch) and
+    /// installs authenticated sender keys through the same gate-before-install
+    /// path production uses. Commits are applied BEFORE sender-key blobs so a
+    /// sender key wrapped at a post-Commit epoch is decryptable. Sender-key
+    /// blobs are full `OuterEnvelope`s (harvested from the inviter's transport
+    /// in [`Self::add_member`]); raw Commits are wrapped in a throwaway
+    /// `OuterEnvelope` first. `deliver_commit_blob` returns `None` for both
+    /// (Control / Management), so the `Option` is intentionally discarded.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the crypto provider.
-    pub fn pickup_sender_keys(
+    /// Propagates [`ContextError`] if any deliver step fails.
+    async fn feed_pending_incoming(
         &self,
         context_id_str: &str,
         context_id: &[u8; 32],
     ) -> Result<(), ContextError> {
-        self.crypto
-            .pickup_sender_key_messages(context_id_str, context_id)
+        for commit_bytes in self.crypto.take_pending_commits(context_id) {
+            let wrapped = wrap_raw_mls_message(context_id_str, commit_bytes)?;
+            let _ = self
+                .manager
+                .deliver_commit_blob(context_id_str, wrapped)
+                .await?;
+        }
+        for wrapped in self.crypto.take_pending_sender_key_messages(context_id) {
+            let _ = self
+                .manager
+                .deliver_commit_blob(context_id_str, wrapped)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Drains events for a context.
