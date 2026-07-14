@@ -2509,14 +2509,31 @@ pub async fn execute_reset_member(
     }
 
     // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
-    let remove_output = deps
-        .crypto
-        .remove_member(&context_id_bytes, did)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-    let add_output = deps
-        .crypto
-        .add_member(&context_id_bytes, did, None)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the MLS group is actor-owned, so the
+    // remove+add mutate the actor's OWNED group via `rest_mut()`. The whole
+    // `&mut PerContextState` these MLS ops require is reachable ONLY through a
+    // Class-S combinator (the coalesced Class-C view is field-granular by
+    // construction and cannot hand out `rest_mut()`), so the net-neutral
+    // remove+add pair is persisted fail-closed via `commit_class_s_keep` — a safe
+    // over-persist versus the former provider path's coalesced write (reset is a
+    // rare governance op, not the hot send path; the membership effect is
+    // net-neutral, so nothing security-critical rides on the persist class). The
+    // two commit-byte outputs drive the async broadcasts below. `local_did` is
+    // node-resident (retained `deps.crypto.local_did()`), read once here and
+    // reused by the rotation block below.
+    let local_did = deps.crypto.local_did().to_owned();
+    let (remove_output, add_output) = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            let remove_output = s
+                .remove_member(&local_did, did.as_ref())
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let add_output = s
+                .add_member(did.as_ref(), None, deps.clock.as_ref())
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            Ok((remove_output, add_output))
+        })
+        .await?;
 
     // Member reset operates on a coalesced `ClassCMut` view (best-effort). The
     // broadcasts are async; on failure the retry-queue bookkeeping is applied
@@ -2574,9 +2591,17 @@ pub async fn execute_reset_member(
         );
     }
 
-    if let Err(e) = deps
-        .crypto
-        .remove_member_sender_key(&context_id_bytes, did.as_ref())
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): remove the reset member's stale sender
+    // key from the actor-owned store. Routed through `commit_class_s_keep` because
+    // the sender-key store lives behind the whole-`&mut PerContextState` reachable
+    // only via a Class-S combinator; the persist is fail-closed but the outcome is
+    // swallowed to preserve the prior best-effort disposition (the anti-replay
+    // backstop is the never-regressing registry floor pruned just below).
+    if let Err(e) = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            v.rest_mut().remove_member_sender_key(did.as_ref())
+        })
+        .await
     {
         tracing::warn!(
             context_id,
@@ -2596,8 +2621,7 @@ pub async fn execute_reset_member(
     // when this site only held a `ClassCMut` view. Swallow-and-log disposition
     // preserved on failure (rotation + distribution best-effort, M23); anti-replay
     // backstop is the never-regressing registry floor (`mirror_forward`,
-    // `?`-propagated). `local_did` from the retained `deps.crypto.local_did()`.
-    let local_did = deps.crypto.local_did().to_owned();
+    // `?`-propagated). `local_did` was read once above and is reused here.
     match cell
         .commit_class_s_keep(deps, context_id, |mut v| {
             let s = v.rest_mut();
