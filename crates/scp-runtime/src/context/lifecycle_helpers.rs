@@ -982,12 +982,29 @@ pub async fn join_context(
         },
     };
 
-    // Phase 3: MLS add_member + sender key distribution (crypto mutations).
-    // On failure: void escrow + rollback ticket. No MLS rollback needed
-    // because add_member itself failed (no state change occurred).
-    let add_output = match deps
-        .crypto
-        .add_member(&context_id_bytes, &member_did, kp_bytes)
+    // Phase 3: MLS add_member + sender-key distribution (crypto mutations).
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) STEP-C C2 JOIN seam: after the CREATE
+    // seam the actor OWNS this context's crypto (`take_crypto_state`), so the
+    // provider's `add_member` / `distribute_sender_key` now fail closed
+    // ("owned by actor"). Route the WHOLE join crypto cluster through the actor's
+    // OWNED `ContextCryptoState` instead (one-way take preserved — no crypto is
+    // ever handed back to the provider). Member ADD advances the MLS epoch, which
+    // is §9 Class-S (consistent with the `advance_epoch` / `rotate_sender_key`
+    // rulings) and is reachable only through `rest_mut()` (the `PerContextState`
+    // crypto methods hold no field-granular Class-C view), so the add + the
+    // sender-key distribution are sync-persisted fail-closed via
+    // `commit_class_s_keep`. `local_did` is node-resident (read off the provider,
+    // which retains it as a birth-seam).
+    let local_did = deps.crypto.local_did().to_owned();
+
+    // add_member — Class-S. On failure NO MLS rollback is needed (the add itself
+    // failed, so no member was added), matching the prior provider disposition.
+    let add_output = match cell
+        .commit_class_s_keep(deps, &context_id, |mut v| {
+            v.rest_mut()
+                .add_member(&member_did, kp_bytes, deps.clock.as_ref())
+        })
+        .await
     {
         Ok(output) => output,
         Err(e) => {
@@ -1011,15 +1028,24 @@ pub async fn join_context(
         }
     };
 
-    if let Err(e) = deps
-        .crypto
-        .distribute_sender_key(&context_id_bytes, &member_did)
+    // distribute_sender_key — Class-S. On failure roll back the just-added member
+    // on the ACTOR (best-effort MLS remove + sender-key prune) + the registry
+    // floor, then the nonce/escrow/ticket rollback.
+    if let Err(e) = cell
+        .commit_class_s_keep(deps, &context_id, |mut v| {
+            v.rest_mut().distribute_sender_key(&local_did, &member_did)
+        })
+        .await
     {
-        // Sender key distribution failed after MLS add — rollback MLS state.
-        let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
-        let _ = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, &member_did);
+        // Sender-key distribution failed after MLS add — roll back the MLS state
+        // on the actor's owned crypto (§9 Class-S, fail-closed persist).
+        let _ = cell
+            .commit_class_s_keep(deps, &context_id, |mut v| {
+                let s = v.rest_mut();
+                let _ = s.remove_member(&local_did, &member_did);
+                s.remove_member_sender_key(&member_did)
+            })
+            .await;
         // ADR-049 PR-6: prune the departed member's Class-M registry floors
         // (member-granular; siblings + the local scalar retained).
         deps.supervisor
@@ -1041,20 +1067,33 @@ pub async fn join_context(
         return Err(err);
     }
 
-    // Drain pending HPKE-sealed sender key distribution messages and
-    // deliver them via the MLS management channel (§9.16.2). MLS-wrap
-    // is mandatory — see comment on `drain_and_deliver_sender_keys`.
-    // ADR-049 PR-7: the producer here is `distribute_sender_key` (a retained
-    // birth-seam provider op, populating the PROVIDER queue), so drain the
-    // provider queue → `None`.
-    if let Err(e) = drain_and_deliver_sender_keys(deps, None, &context_id, &context_id_bytes).await
-    {
-        // Drain failed catastrophically — roll back MLS state, sender
-        // key, escrow, and economy ticket so the join is fully aborted.
-        let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
-        let _ = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, &member_did);
+    // Drain pending HPKE-sealed sender-key distribution messages and deliver them
+    // via the MLS management channel (§9.16.2). MLS-wrap is mandatory — see
+    // comment on `drain_and_deliver_sender_keys`. ADR-049 PR-7: the producer is
+    // now the ACTOR `distribute_sender_key` above (actor-owned queue), so drain
+    // the ACTOR queue via the Class-C crypto view (`Some(..)`). The view is scoped
+    // so it drops before any rollback below re-borrows `cell`.
+    let drain_result = {
+        let mut view = cell.class_c_view();
+        drain_and_deliver_sender_keys(
+            deps,
+            view.mode_mut().crypto_mut(),
+            &context_id,
+            &context_id_bytes,
+        )
+        .await
+    };
+    if let Err(e) = drain_result {
+        // Drain failed catastrophically — roll back the MLS add on the actor,
+        // the sender key, the registry floor, the escrow, and the economy ticket
+        // so the join is fully aborted.
+        let _ = cell
+            .commit_class_s_keep(deps, &context_id, |mut v| {
+                let s = v.rest_mut();
+                let _ = s.remove_member(&local_did, &member_did);
+                s.remove_member_sender_key(&member_did)
+            })
+            .await;
         // ADR-049 PR-6: prune the departed member's Class-M registry floors
         // (member-granular; siblings + the local scalar retained).
         deps.supervisor
@@ -1086,10 +1125,14 @@ pub async fn join_context(
         &member_did,
         add_output,
     ) {
-        let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
-        let _ = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, &member_did);
+        // Roll back the MLS add on the actor's owned crypto (§9 Class-S).
+        let _ = cell
+            .commit_class_s_keep(deps, &context_id, |mut v| {
+                let s = v.rest_mut();
+                let _ = s.remove_member(&local_did, &member_did);
+                s.remove_member_sender_key(&member_did)
+            })
+            .await;
         // ADR-049 PR-6: prune the departed member's Class-M registry floors
         // (member-granular; siblings + the local scalar retained).
         deps.supervisor

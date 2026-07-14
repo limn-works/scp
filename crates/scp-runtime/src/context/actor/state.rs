@@ -98,8 +98,9 @@ use crate::crypto::mls::provider::OwnedMlsCryptoState;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::ScpContextExtension;
 use scp_protocol::context::builder::{
-    AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC, MAX_MANAGEMENT_PAYLOAD_SIZE,
-    OpenResult, OpenedEnvelope, ReceiveFloor, RemoveMemberOutput, try_strip_management_prefix,
+    AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
+    MAX_MANAGEMENT_PAYLOAD_SIZE, OpenResult, OpenedEnvelope, ReceiveFloor, RemoveMemberOutput,
+    try_strip_management_prefix,
 };
 use scp_protocol::crypto::sender_keys::{
     SenderKeyDistributionMessage, SenderKeyResponse, generate_sender_key,
@@ -2066,6 +2067,144 @@ impl PerContextState {
         })?;
 
         Ok(AdvanceEpochOutput { commit_bytes })
+    }
+
+    /// Adds a member to the MLS group by their optional TLS-serialized
+    /// `KeyPackage` bytes, verbatim from [`MlsCryptoProvider::add_member`] — but
+    /// operating on THIS actor's OWNED `ScpMlsGroup` instead of a provider
+    /// `contexts` entry.
+    ///
+    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) STEP-C C2 JOIN seam (option A). Member
+    /// ADD on a LIVE, actor-owned context is a steady-state crypto orchestration
+    /// op, so it belongs on the actor — the completeness twin of
+    /// [`Self::remove_member`] (Prep-A moved `remove_member` but missed
+    /// `add_member`, the same gap as the `remove_member_sender_key` twin). The
+    /// provider `add_member` is RETAINED for the create-time BIRTH only (before
+    /// `take_crypto_state` hands the crypto to the actor); once the actor owns the
+    /// crypto the provider's `with_context` returns "owned by actor", so the JOIN
+    /// handler routes here. One-way take is preserved — no crypto is ever handed
+    /// back to the provider.
+    ///
+    /// With `Some(bytes)` performs the real MLS add via
+    /// [`Self::add_member_from_bytes`]. With `None` (no `KeyPackage`) the
+    /// `testing`/`cfg(test)` build returns an empty output (mock-equivalent, so
+    /// integration tests that don't produce real MLS key packages still exercise
+    /// the non-crypto pipeline — byte-for-byte with the provider) and production
+    /// returns an error. `clock` enters as a parameter (node-resident, injected —
+    /// ADR-057 §Prereq-1).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
+    /// `KeyPackage`, no `KeyPackage` in production, or any MLS / serialization
+    /// failure.
+    ///
+    /// [`MlsCryptoProvider::add_member`]: crate::crypto::mls::provider::MlsCryptoProvider::add_member
+    pub(crate) fn add_member(
+        &mut self,
+        member_did: &str,
+        key_package_bytes: Option<&[u8]>,
+        clock: &dyn Clock,
+    ) -> Result<AddMemberOutput, ContextError> {
+        // The invitee's KeyPackage is supplied explicitly (the governance
+        // `AddMember` path carries it on the actor command envelope).
+        if let Some(bytes) = key_package_bytes {
+            return self.add_member_from_bytes(member_did, bytes, clock);
+        }
+
+        // No KeyPackage. Preserve the provider's mock-equivalent return so
+        // integration tests that don't produce real MLS key packages continue to
+        // exercise the non-crypto pipeline (role state sync, event logging,
+        // governance side effects) — byte-for-byte with
+        // `MlsCryptoProvider::add_member`.
+        if cfg!(any(test, feature = "testing")) {
+            let _ = member_did; // used only by the real path
+            return Ok(AddMemberOutput::default());
+        }
+        Err(ContextError::CryptoFailed(
+            "production actor add_member requires MLS key package bytes \
+             (none supplied for this member)"
+                .to_string(),
+        ))
+    }
+
+    /// Real MLS add-member from explicit `KeyPackage` bytes on this actor's OWNED
+    /// group, verbatim from `MlsCryptoProvider::add_member_from_bytes` (ADR-049
+    /// PR-7 STEP-C). Pre-validates the key package to extract the invitee's X25519
+    /// wrapping key (needed to HPKE-seal the sender key to them later), performs
+    /// the MLS add (advancing the group epoch), records the wrapping key, and
+    /// returns the TLS-serialized Welcome (for the joiner) + Commit (for existing
+    /// members).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
+    /// `KeyPackage`, or any MLS / serialization failure.
+    fn add_member_from_bytes(
+        &mut self,
+        member_did: &str,
+        bytes: &[u8],
+        clock: &dyn Clock,
+    ) -> Result<AddMemberOutput, ContextError> {
+        use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
+        use openmls::prelude::{KeyPackageIn, ProtocolVersion};
+        use openmls_traits::OpenMlsProvider as _;
+
+        // Pre-validate the key package to extract the wrapping key BEFORE the add
+        // operation consumes it, and BEFORE borrowing the crypto sub-state (no
+        // `self` borrow held across this validation). Key package bytes arrive as
+        // TLS-serialized KeyPackageIn (not MlsMessageIn).
+        let wrapping_key = {
+            KeyPackageIn::tls_deserialize(&mut &*bytes)
+                .ok()
+                .and_then(|kp_in| {
+                    let provider_tmp = scp_mls::InMemoryMlsProvider::default();
+                    kp_in
+                        .validate(provider_tmp.crypto(), ProtocolVersion::Mls10)
+                        .ok()
+                        .and_then(|verified| {
+                            scp_mls::wrapping_extension::extract_wrapping_key(
+                                verified.leaf_node().extensions(),
+                            )
+                            .ok()
+                            .flatten()
+                        })
+                })
+        };
+
+        // Deserialize to KeyPackageIn for the actual add operation.
+        let kp_in = KeyPackageIn::tls_deserialize(&mut &*bytes)
+            .map_err(|e| ContextError::CryptoFailed(format!("key package deserialization: {e}")))?;
+
+        let crypto = self.encrypted_crypto_mut()?;
+        let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+
+        let result = scp_mls::group::add_member(mls_group, kp_in, clock)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // TLS-serialize Welcome and Commit for cross-process delivery.
+        let welcome_bytes = result
+            .welcome
+            .tls_serialize_detached()
+            .map_err(|e| ContextError::CryptoFailed(format!("serializing welcome: {e}")))?;
+        let commit_bytes = result
+            .commit
+            .tls_serialize_detached()
+            .map_err(|e| ContextError::CryptoFailed(format!("serializing commit: {e}")))?;
+
+        // Store the member's wrapping key if present.
+        if let Some(wk) = wrapping_key {
+            crypto
+                .member_wrapping_keys
+                .insert(member_did.to_owned(), wk);
+        }
+
+        Ok(AddMemberOutput {
+            welcome_bytes,
+            commit_bytes,
+        })
     }
 
     /// Removes a member from the MLS group, verbatim from
