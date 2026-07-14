@@ -32,6 +32,7 @@ from scp_sdk.errors import (
     OutletError,
     ProtocolError,
     StreamAlreadyClosed,
+    StreamGap,
     UcanPermissionError,
     ValidationError,
 )
@@ -614,6 +615,149 @@ class TestPublicSurfaceInvariant:
                 if "invoke_stream" in line or "invokeStream" in line:
                     offenders.append(f"{path}: {line.strip()}")
         assert offenders == [], f"public invoke_stream found in: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# AC6 conformance-vector smoke: each of the 7 cross-layer streaming vectors
+# (tests/conformance/vectors/outlet_stream_vectors.json) drives the mock and
+# asserts the SDK reaches the vector's expected terminal.
+# ---------------------------------------------------------------------------
+
+_VECTORS_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "tests"
+    / "conformance"
+    / "vectors"
+    / "outlet_stream_vectors.json"
+)
+
+
+def _load_vectors() -> dict[str, dict[str, Any]]:
+    data = json.loads(_VECTORS_PATH.read_text(encoding="utf-8"))
+    return {v["name"]: v for v in data["vectors"]}
+
+
+_VECTORS: dict[str, dict[str, Any]] = _load_vectors()
+
+_EXPECTED_NAMES = frozenset(
+    {
+        "non_streaming",
+        "multi_chunk",
+        "cancellation",
+        "error_terminal",
+        "error_recoverable",
+        "sequence_gap",
+        "credit_exhaustion",
+    }
+)
+
+
+def _vector_chunks(vector: dict[str, Any]) -> list[bytes]:
+    """Serialize a vector's chunk list into the mock's wire-byte playback."""
+    return [_chunk(c["sequence"], c["payload"]) for c in vector["chunks"]]
+
+
+def _end_aggregate(vector: dict[str, Any]) -> Any:
+    for c in vector["chunks"]:
+        if c["payload"].get("@type") == "end":
+            return c["payload"]["aggregate"]
+    return None
+
+
+class TestConformanceVectorSmoke:
+    """AC6: the 7 cross-layer streaming vectors -> the SDK's expected terminal.
+
+    IMPORTANT boundary — where the terminal comes from:
+
+    - ``credit_exhaustion`` and ``cancellation`` surface a terminal the BRIDGE
+      delivers. The mock plays a framework terminal (a ``terminal: true`` Error
+      for credit exhaustion; a cancel-ack ``End`` after the consumer cancels)
+      and the SDK faithfully surfaces ``poll_next``'s terminal — the SDK cannot
+      itself stall an executor, so it does not synthesize these terminals.
+    - ONLY ``sequence_gap`` requires ACTIVE SDK-side detection: the drain tracks
+      the expected sequence, detects the hole ITSELF, signs the cancel through
+      the bridge, and raises :class:`StreamGap`. The mock feeds NO pre-baked
+      cancel-ack for that vector (that would be test-gaming) — the recorded
+      cancel call proves the SDK generated it.
+    """
+
+    def test_vectors_cover_exactly_the_seven_names(self) -> None:
+        assert set(_VECTORS) == _EXPECTED_NAMES
+
+    async def test_non_streaming_ok(self) -> None:
+        v = _VECTORS["non_streaming"]
+        result = await _invoke(_FakeNative(_vector_chunks(v)))
+        assert result.value == {"sum": 3}
+        assert result.value == _end_aggregate(v)
+
+    async def test_multi_chunk_ok(self) -> None:
+        v = _VECTORS["multi_chunk"]
+        result = await _invoke(_FakeNative(_vector_chunks(v)))
+        assert result.value == {"total": 10}
+        assert result.value == _end_aggregate(v)
+
+    async def test_error_recoverable_ok(self) -> None:
+        # The non-terminal Error (seq1) is yielded as a chunk but does NOT
+        # terminate; data seq2/seq3 then End seq4 close with Ok.
+        v = _VECTORS["error_recoverable"]
+        handle = _invoke(_FakeNative(_vector_chunks(v)))
+        collected = [chunk async for chunk in handle]
+        assert [c.kind for c in collected] == ["data", "error", "data", "data", "end"]
+        assert collected[1].payload["terminal"] is False
+        result = await handle
+        assert result.value == _end_aggregate(v)
+
+    async def test_error_terminal_raises_typed_error_6130(self) -> None:
+        v = _VECTORS["error_terminal"]
+        assert v["expected_error_code"] == "SCP-OUTLET-6130"
+        with pytest.raises(OutletError) as excinfo:
+            await _invoke(_FakeNative(_vector_chunks(v)))
+        assert excinfo.value.code == "SCP-OUTLET-6130"
+
+    async def test_credit_exhaustion_raises_typed_error_6133(self) -> None:
+        # Bridge-delivered terminal: mock plays data seq0 then a framework
+        # Error seq1 {terminal:true, code 6133}. The SDK surfaces it faithfully.
+        v = _VECTORS["credit_exhaustion"]
+        assert v["expected_error_code"] == "SCP-OUTLET-6133"
+        with pytest.raises(OutletError) as excinfo:
+            await _invoke(_FakeNative(_vector_chunks(v)))
+        assert excinfo.value.code == "SCP-OUTLET-6133"
+
+    async def test_cancellation_reaches_terminal(self) -> None:
+        # Bridge-delivered terminal: consumer calls cancel() after chunk index 1;
+        # the mock plays through to its cancel-ack End. The SDK records the cancel
+        # and surfaces the bridge's terminal (Cancelled).
+        v = _VECTORS["cancellation"]
+        native = _FakeNative(_vector_chunks(v))
+        handle = _invoke(native)
+        idx = 0
+        async for _chunk_seen in handle:
+            if idx == 1:
+                await handle.cancel()
+            idx += 1
+        assert native.cancel_calls == [("stream-1", "did:dht:caller")]
+        assert idx == len(v["chunks"])
+        result = await handle
+        assert result.value == {"cancelled": True}
+
+    async def test_sequence_gap_detected_signed_cancel_and_raises_6131(self) -> None:
+        # ACTIVE SDK detection: mock plays data seq0, seq1, seq3 (seq2 MISSING).
+        # The drain detects the gap at seq3, itself signs a cancel through the
+        # bridge, and raises StreamGap(6131). NO pre-baked cancel-ack is fed.
+        v = _VECTORS["sequence_gap"]
+        assert v["expected_error_code"] == "SCP-OUTLET-6131"
+        native = _FakeNative(_vector_chunks(v))
+        handle = _invoke(native)
+        with pytest.raises(StreamGap) as excinfo:
+            await handle
+        assert excinfo.value.code == "SCP-OUTLET-6131"
+        # The SDK ITSELF signed the receiver cancel (not fed by the mock).
+        assert native.cancel_calls == [("stream-1", "did:dht:caller")]
+        # Terminal cache: the gap is sticky and control-plane is now guarded.
+        with pytest.raises(StreamGap):
+            await handle
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.grant_credit(Credit(1))
 
 
 class TestChunkParsing:

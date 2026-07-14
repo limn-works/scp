@@ -24,6 +24,7 @@ import {
   OutletError,
   ProtocolError,
   StreamAlreadyClosed,
+  StreamGap,
   ValidationError,
 } from "./errors";
 import type { OutletCost, OutletDefinition, OutletKind, TestVector } from "./types";
@@ -417,6 +418,13 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
   /** Captured terminal state, read back by `aggregate()`. */
   #aggregate: Aggregate | null = null;
   #error: OutletError | null = null;
+  /**
+   * §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk must
+   * carry. Strictly monotonic per request_id, starting at 0; a chunk whose
+   * sequence differs is a {@link StreamGap} (defense-in-depth — same-context
+   * streams never gap over their lossless ordered channel).
+   */
+  #expectedSequence = 0;
 
   /** @internal Construct via {@link Outlets.invoke}, never directly. */
   constructor(native: OutletStreamNative, params: StreamOpenParams) {
@@ -494,6 +502,29 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
         return { done: true, value: undefined };
       }
       const chunk = OutletStreamChunk._fromBridgeBytes(toBytes(raw));
+      if (chunk.sequence !== this.#expectedSequence) {
+        // §5.4.5 "Ordering and gaps": a non-contiguous sequence (a hole, or a
+        // regression) is a receiver-detected StreamGap. Mark the drain terminal,
+        // cancel the stream through the SAME bridge path public cancel() uses,
+        // and throw — WITHOUT yielding the offending chunk. The check spans all
+        // chunk kinds (Data/Progress/End/Error) since sequences are strictly
+        // monotonic across them.
+        this.#closed = true;
+        const gap = new StreamGap(
+          `outlet stream sequence gap: expected ${this.#expectedSequence}, ` +
+            `got ${chunk.sequence} (§5.4.5)`,
+        );
+        this.#error = gap;
+        // Best-effort receiver cancel: the StreamGap is the reported terminal,
+        // so a cancel-path failure must not mask it.
+        try {
+          await this.#sendCancel(handleId);
+        } catch {
+          // best-effort teardown
+        }
+        throw gap;
+      }
+      this.#expectedSequence += 1;
       if (chunk.isTerminal) {
         // Terminal chunk closes the stream. Capture the terminal state for
         // aggregate(), mark closed, then still YIELD the terminal chunk so an
@@ -619,6 +650,16 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
       this.#closed = true;
       return;
     }
+    await this.#sendCancel(handleId);
+  }
+
+  /**
+   * Sign and send an `OutletCancel` through the bridge (§5.4.5). The single
+   * bridge cancel round-trip shared by the public {@link cancel} and the
+   * drain's {@link StreamGap} teardown, so both cancel through the identical
+   * signed path.
+   */
+  async #sendCancel(handleId: string): Promise<void> {
     try {
       await this.#native.outletStreamCancel(handleId, this.#params.callerDid);
     } catch (cause) {

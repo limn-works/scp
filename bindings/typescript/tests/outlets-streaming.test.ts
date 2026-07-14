@@ -26,6 +26,7 @@ import {
   OutletError,
   ProtocolError,
   StreamAlreadyClosed,
+  StreamGap,
   UcanPermissionError,
   ValidationError,
 } from "../src/errors";
@@ -573,6 +574,173 @@ describe("chunk parsing", () => {
     expect(c.requestId).toBe("aabb");
     expect(c.signature).toBe("ccdd");
     expect(c.kind).toBe("data");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC6 conformance-vector smoke: each of the 7 cross-layer streaming vectors
+// (tests/conformance/vectors/outlet_stream_vectors.json) drives the fake and
+// asserts the SDK reaches the vector's expected terminal.
+// ---------------------------------------------------------------------------
+
+interface VectorChunk {
+  readonly sequence: number;
+  readonly payload: Record<string, unknown>;
+}
+interface Vector {
+  readonly name: string;
+  readonly chunks: readonly VectorChunk[];
+  readonly expected_end_status: string;
+  readonly expected_error_code: string | null;
+}
+
+const VECTORS_PATH = join(
+  import.meta.dir,
+  "..",
+  "..",
+  "..",
+  "tests",
+  "conformance",
+  "vectors",
+  "outlet_stream_vectors.json",
+);
+
+function loadVectors(): Map<string, Vector> {
+  const data = JSON.parse(readFileSync(VECTORS_PATH, "utf8")) as { vectors: Vector[] };
+  return new Map(data.vectors.map((v) => [v.name, v]));
+}
+
+const VECTORS = loadVectors();
+const EXPECTED_NAMES = new Set([
+  "non_streaming",
+  "multi_chunk",
+  "cancellation",
+  "error_terminal",
+  "error_recoverable",
+  "sequence_gap",
+  "credit_exhaustion",
+]);
+
+function vec(name: string): Vector {
+  const v = VECTORS.get(name);
+  if (v === undefined) {
+    throw new Error(`missing vector: ${name}`);
+  }
+  return v;
+}
+
+/** Serialize a vector's chunk list into the fake's wire-byte playback. */
+function vectorChunks(v: Vector): Uint8Array[] {
+  return v.chunks.map((c) => chunk(c.sequence, c.payload));
+}
+
+function endAggregate(v: Vector): unknown {
+  return v.chunks.find((c) => c.payload["@type"] === "end")?.payload.aggregate;
+}
+
+/**
+ * AC6: the 7 cross-layer streaming vectors -> the SDK's expected terminal.
+ *
+ * IMPORTANT boundary — where the terminal comes from:
+ *
+ * - `credit_exhaustion` and `cancellation` surface a terminal the BRIDGE
+ *   delivers. The fake plays a framework terminal (a `terminal: true` Error for
+ *   credit exhaustion; a cancel-ack `End` after the consumer cancels) and the
+ *   SDK faithfully surfaces `pollNext`'s terminal — the SDK cannot itself stall
+ *   an executor, so it does not synthesize these terminals.
+ * - ONLY `sequence_gap` requires ACTIVE SDK-side detection: the drain tracks the
+ *   expected sequence, detects the hole ITSELF, signs the cancel through the
+ *   bridge, and throws {@link StreamGap}. The fake feeds NO pre-baked cancel-ack
+ *   for that vector (that would be test-gaming) — the recorded cancel call
+ *   proves the SDK generated it.
+ */
+describe("AC6 conformance-vector smoke", () => {
+  it("covers exactly the seven vector names", () => {
+    expect(new Set(VECTORS.keys())).toEqual(EXPECTED_NAMES);
+  });
+
+  it("non_streaming -> Ok, aggregate {sum:3}", async () => {
+    const v = vec("non_streaming");
+    const result = await invoke(new FakeNative(vectorChunks(v)));
+    expect(result.value).toEqual({ sum: 3 });
+    expect(result.value).toEqual(endAggregate(v));
+  });
+
+  it("multi_chunk -> Ok, aggregate {total:10}", async () => {
+    const v = vec("multi_chunk");
+    const result = await invoke(new FakeNative(vectorChunks(v)));
+    expect(result.value).toEqual({ total: 10 });
+    expect(result.value).toEqual(endAggregate(v));
+  });
+
+  it("error_recoverable -> Ok (non-terminal Error is yielded but does not close)", async () => {
+    const v = vec("error_recoverable");
+    const handle = invoke(new FakeNative(vectorChunks(v)));
+    const collected = await collect(handle);
+    expect(collected.map((c) => c.kind)).toEqual(["data", "error", "data", "data", "end"]);
+    expect((collected[1] as OutletStreamChunk).payload.terminal).toBe(false);
+    const result = await handle.aggregate();
+    expect(result.value).toEqual(endAggregate(v));
+  });
+
+  it("error_terminal -> raises typed OutletError SCP-OUTLET-6130", async () => {
+    const v = vec("error_terminal");
+    expect(v.expected_error_code).toBe("SCP-OUTLET-6130");
+    try {
+      await invoke(new FakeNative(vectorChunks(v))).aggregate();
+      throw new Error("expected OutletError");
+    } catch (e) {
+      expect(e).toBeInstanceOf(OutletError);
+      expect((e as OutletError).code).toBe("SCP-OUTLET-6130");
+    }
+  });
+
+  it("credit_exhaustion -> raises typed OutletError SCP-OUTLET-6133 (bridge terminal)", async () => {
+    const v = vec("credit_exhaustion");
+    expect(v.expected_error_code).toBe("SCP-OUTLET-6133");
+    try {
+      await invoke(new FakeNative(vectorChunks(v))).aggregate();
+      throw new Error("expected OutletError");
+    } catch (e) {
+      expect(e).toBeInstanceOf(OutletError);
+      expect((e as OutletError).code).toBe("SCP-OUTLET-6133");
+    }
+  });
+
+  it("cancellation -> Cancelled (consumer cancels; bridge cancel-ack End terminates)", async () => {
+    const v = vec("cancellation");
+    const fake = new FakeNative(vectorChunks(v));
+    const handle = invoke(fake);
+    let idx = 0;
+    for await (const _c of handle) {
+      if (idx === 1) {
+        await handle.cancel();
+      }
+      idx += 1;
+    }
+    expect(fake.cancelCalls).toEqual([["stream-1", "did:dht:caller"]]);
+    expect(idx).toBe(v.chunks.length);
+    const result = await handle.aggregate();
+    expect(result.value).toEqual({ cancelled: true });
+  });
+
+  it("sequence_gap -> ACTIVE SDK detection: signed cancel + StreamGap SCP-OUTLET-6131", async () => {
+    const v = vec("sequence_gap");
+    expect(v.expected_error_code).toBe("SCP-OUTLET-6131");
+    const fake = new FakeNative(vectorChunks(v));
+    const handle = invoke(fake);
+    try {
+      await handle.aggregate();
+      throw new Error("expected StreamGap");
+    } catch (e) {
+      expect(e).toBeInstanceOf(StreamGap);
+      expect((e as StreamGap).code).toBe("SCP-OUTLET-6131");
+    }
+    // The SDK ITSELF signed the receiver cancel (not fed by the fake).
+    expect(fake.cancelCalls).toEqual([["stream-1", "did:dht:caller"]]);
+    // Terminal cache: the gap is sticky and control-plane is now guarded.
+    await expect(handle.aggregate()).rejects.toBeInstanceOf(StreamGap);
+    await expect(handle.grantCredit(new Credit(1))).rejects.toBeInstanceOf(StreamAlreadyClosed);
   });
 });
 

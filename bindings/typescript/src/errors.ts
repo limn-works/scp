@@ -168,6 +168,31 @@ export class StreamAlreadyClosed extends ProtocolError {
   }
 }
 
+/**
+ * A gap (missing sequence) in an outlet stream's chunk sequence (§5.4.5).
+ *
+ * Sequence values are strictly monotonic per `request_id`; a receiver that
+ * observes a gap (a missing or regressed sequence) MUST cancel the stream and
+ * surface this error (spec §5.4.5 "Ordering and gaps",
+ * `OutletErrorClass::Execution::StreamGap`). The SDK {@link InvocationHandle}
+ * drain is that receiver: it tracks the expected next sequence and, on any
+ * non-contiguous chunk, signs an `OutletCancel` through the bridge and throws
+ * this error. A same-context stream flows over a lossless ordered channel so a
+ * gap never occurs in production — this is a defense-in-depth monotonicity
+ * check mirroring the §5.4.5 receiver-side recheck posture.
+ *
+ * Sits at the same inheritance depth as its protocol-class siblings
+ * ({@link InvalidGrant}, {@link StreamAlreadyClosed}) under
+ * {@link ProtocolError}. Carries the execution-class code `SCP-OUTLET-6131`
+ * (`execution.stream-gap`).
+ */
+export class StreamGap extends ProtocolError {
+  constructor(message: string, code = "SCP-OUTLET-6131") {
+    super(message, code);
+    this.name = "StreamGap";
+  }
+}
+
 /** Input validation, schema, parameter failures. */
 export class ValidationError extends ScpError {
   constructor(message: string, code: string) {

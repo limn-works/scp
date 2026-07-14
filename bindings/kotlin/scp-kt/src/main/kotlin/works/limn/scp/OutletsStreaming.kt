@@ -97,6 +97,28 @@ public class StreamAlreadyClosed(
     code: String = "SCP-OUTLET-6100",
 ) : OutletProtocolException(message, code)
 
+/**
+ * A gap (missing sequence) in an outlet stream's chunk sequence (§5.4.5).
+ *
+ * Sequence values are strictly monotonic per `request_id`; a receiver that
+ * observes a gap (a missing or regressed sequence) MUST cancel the stream and
+ * surface this error (spec §5.4.5 "Ordering and gaps",
+ * `OutletErrorClass::Execution::StreamGap`). The SDK [InvocationHandle] drain is
+ * that receiver: it tracks the expected next sequence and, on any non-contiguous
+ * chunk, signs an `OutletCancel` through the bridge and throws this. A
+ * same-context stream flows over a lossless ordered channel so a gap never
+ * occurs in production — this is a defense-in-depth monotonicity check mirroring
+ * the §5.4.5 receiver-side recheck posture.
+ *
+ * A protocol-class sibling of [InvalidGrant] / [StreamAlreadyClosed] under
+ * [OutletProtocolException], carrying the execution-class code `SCP-OUTLET-6131`
+ * (`execution.stream-gap`).
+ */
+public class StreamGap(
+    message: String,
+    code: String = "SCP-OUTLET-6131",
+) : OutletProtocolException(message, code)
+
 // ---------------------------------------------------------------------------
 // Credit — a validated, non-zero u32 stream-credit grant (§5.4.5).
 // ---------------------------------------------------------------------------
@@ -384,6 +406,19 @@ public class InvocationHandle internal constructor(
     @Volatile
     private var terminalError: ScpException? = null
 
+    /** Captured [StreamGap] terminal, re-thrown by a re-[aggregate] after a gap. */
+    @Volatile
+    private var streamGapError: StreamGap? = null
+
+    /**
+     * §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk must
+     * carry. Strictly monotonic per `request_id`, starting at 0; a chunk whose
+     * sequence differs is a [StreamGap] (defense-in-depth — same-context streams
+     * never gap over their lossless ordered channel).
+     */
+    @Volatile
+    private var expectedSequence: Long = 0
+
     /** Opens the stream exactly once (idempotent), returning the bridge handle id. */
     private suspend fun ensureOpen(): String {
         handleId?.let { return it }
@@ -429,6 +464,26 @@ public class InvocationHandle internal constructor(
                 return null
             }
             val chunk = OutletStreamChunk.fromBridgeBytes(raw)
+            if (chunk.sequence != expectedSequence) {
+                // §5.4.5 "Ordering and gaps": a non-contiguous sequence (a hole,
+                // or a regression) is a receiver-detected StreamGap. Mark the
+                // drain terminal, cancel the stream through the SAME bridge path
+                // public cancel() uses, and throw — WITHOUT returning the
+                // offending chunk. The check spans all chunk kinds
+                // (Data/Progress/End/Error) since sequences are strictly
+                // monotonic across them.
+                closed = true
+                val gap =
+                    StreamGap(
+                        "outlet stream sequence gap: expected $expectedSequence, got ${chunk.sequence} (§5.4.5)",
+                    )
+                streamGapError = gap
+                // Best-effort receiver cancel: the StreamGap is the reported
+                // terminal, so a cancel-path failure must not mask it.
+                runCatching { sendCancel(id) }
+                throw gap
+            }
+            expectedSequence += 1
             if (chunk.isTerminal) {
                 // Capture the terminal state for aggregate(), mark closed, then
                 // still return the terminal chunk so a collector observes it.
@@ -465,7 +520,9 @@ public class InvocationHandle internal constructor(
                 break
             }
         }
-        terminalError?.let { throw it }
+        // A gap terminal takes priority over a bridge Error terminal; either is
+        // re-thrown here on a re-aggregate (a single throw keeps ThrowsCount≤2).
+        (streamGapError ?: terminalError)?.let { throw it }
         return aggregateResult
             ?: throw OutletProtocolException("outlet stream closed without an End chunk")
     }
@@ -527,6 +584,15 @@ public class InvocationHandle internal constructor(
             closed = true
             return
         }
+        sendCancel(id)
+    }
+
+    /**
+     * Signs and sends an `OutletCancel` through the bridge (§5.4.5). The single
+     * bridge cancel round-trip shared by the public [cancel] and the drain's
+     * [StreamGap] teardown, so both cancel through the identical signed path.
+     */
+    private suspend fun sendCancel(id: String) {
         native.outletStreamCancel(id, params.callerDid)
     }
 }

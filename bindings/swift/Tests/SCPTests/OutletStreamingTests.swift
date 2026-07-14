@@ -501,6 +501,129 @@ extension OutletStreamingTests {
     }
 }
 
+// MARK: - AC6 conformance-vector smoke tests
+
+/// AC6: the 7 cross-layer streaming vectors -> the SDK's expected terminal.
+///
+/// IMPORTANT boundary — where the terminal comes from:
+///
+/// - `credit_exhaustion` and `cancellation` surface a terminal the BRIDGE
+///   delivers. The mock plays a framework terminal (a `terminal: true` Error for
+///   credit exhaustion; a cancel-ack `End` after the consumer cancels) and the
+///   SDK faithfully surfaces `pollNext`'s terminal — the SDK cannot itself stall
+///   an executor, so it does not synthesize these terminals.
+/// - ONLY `sequence_gap` requires ACTIVE SDK-side detection: the drain tracks
+///   the expected sequence, detects the hole ITSELF, signs the cancel through
+///   the bridge, and throws ``OutletError/sequenceGap(msg:code:)``. The mock
+///   feeds NO pre-baked cancel-ack for that vector (that would be test-gaming) —
+///   the recorded cancel call proves the SDK generated it.
+extension OutletStreamingTests {
+    func testConformanceVectorsCoverExactlySevenNames() throws {
+        let vectors = try loadStreamVectors()
+        XCTAssertEqual(Set(vectors.keys), [
+            "non_streaming", "multi_chunk", "cancellation", "error_terminal",
+            "error_recoverable", "sequence_gap", "credit_exhaustion"
+        ])
+    }
+
+    func testVectorNonStreamingOk() async throws {
+        let vector = try XCTUnwrap(try loadStreamVectors()["non_streaming"])
+        let result = try await invoke(FakeNative(chunks: vector.chunkData)).aggregate()
+        XCTAssertEqual(result.value, ["sum": 3])
+    }
+
+    func testVectorMultiChunkOk() async throws {
+        let vector = try XCTUnwrap(try loadStreamVectors()["multi_chunk"])
+        let result = try await invoke(FakeNative(chunks: vector.chunkData)).aggregate()
+        XCTAssertEqual(result.value, ["total": 10])
+    }
+
+    func testVectorErrorRecoverableOk() async throws {
+        // The non-terminal Error (seq1) is yielded as a chunk but does NOT close.
+        let vector = try XCTUnwrap(try loadStreamVectors()["error_recoverable"])
+        let handle = invoke(FakeNative(chunks: vector.chunkData))
+        var collected: [OutletStreamChunk] = []
+        for try await streamChunk in handle {
+            collected.append(streamChunk)
+        }
+        XCTAssertEqual(collected.map(\.kind), ["data", "error", "data", "data", "end"])
+        XCTAssertEqual(collected[1].payload["terminal"]?.boolValue, false)
+        let result = try await handle.aggregate()
+        XCTAssertEqual(result.value, ["recovered": true])
+    }
+
+    func testVectorErrorTerminalRaises6130() async throws {
+        let vector = try XCTUnwrap(try loadStreamVectors()["error_terminal"])
+        XCTAssertEqual(vector.expectedErrorCode, "SCP-OUTLET-6130")
+        do {
+            _ = try await invoke(FakeNative(chunks: vector.chunkData)).aggregate()
+            XCTFail("expected a terminal-error throw")
+        } catch let ScpError.Outlet(_, code) {
+            XCTAssertEqual(code, "SCP-OUTLET-6130")
+        }
+    }
+
+    func testVectorCreditExhaustionRaises6133() async throws {
+        // Bridge-delivered terminal: mock plays data seq0 then a framework Error
+        // seq1 {terminal:true, code 6133}. The SDK surfaces it faithfully.
+        let vector = try XCTUnwrap(try loadStreamVectors()["credit_exhaustion"])
+        XCTAssertEqual(vector.expectedErrorCode, "SCP-OUTLET-6133")
+        do {
+            _ = try await invoke(FakeNative(chunks: vector.chunkData)).aggregate()
+            XCTFail("expected a terminal-error throw")
+        } catch let ScpError.Outlet(_, code) {
+            XCTAssertEqual(code, "SCP-OUTLET-6133")
+        }
+    }
+
+    func testVectorCancellationReachesTerminal() async throws {
+        // Bridge-delivered terminal: consumer cancels after chunk index 1; the
+        // mock plays through to its cancel-ack End. The SDK records the cancel
+        // and surfaces the bridge's terminal (Cancelled).
+        let vector = try XCTUnwrap(try loadStreamVectors()["cancellation"])
+        let native = FakeNative(chunks: vector.chunkData)
+        let handle = invoke(native)
+        var idx = 0
+        for try await _ in handle {
+            if idx == 1 { try await handle.cancel() }
+            idx += 1
+        }
+        let cancelCalls = await native.cancelCalls
+        XCTAssertEqual(cancelCalls.count, 1)
+        XCTAssertEqual(idx, vector.chunkData.count)
+        let result = try await handle.aggregate()
+        XCTAssertEqual(result.value, ["cancelled": true])
+    }
+
+    func testVectorSequenceGapDetectedSignedCancelRaises6131() async throws {
+        // ACTIVE SDK detection: mock plays data seq0, seq1, seq3 (seq2 MISSING).
+        // The drain detects the gap at seq3, itself signs a cancel through the
+        // bridge, and throws sequenceGap(6131). NO pre-baked cancel-ack is fed.
+        let vector = try XCTUnwrap(try loadStreamVectors()["sequence_gap"])
+        XCTAssertEqual(vector.expectedErrorCode, "SCP-OUTLET-6131")
+        let native = FakeNative(chunks: vector.chunkData)
+        let handle = invoke(native)
+        do {
+            _ = try await handle.aggregate()
+            XCTFail("expected a sequenceGap throw")
+        } catch let OutletError.sequenceGap(_, code) {
+            XCTAssertEqual(code, "SCP-OUTLET-6131")
+        }
+        // The SDK ITSELF signed the receiver cancel (not fed by the mock).
+        let cancelCalls = await native.cancelCalls
+        XCTAssertEqual(cancelCalls.count, 1)
+        // Terminal cache: the gap is sticky and control-plane is now guarded.
+        do {
+            _ = try await handle.aggregate()
+            XCTFail("expected cached sequenceGap")
+        } catch OutletError.sequenceGap {}
+        do {
+            try await handle.grantCredit(Credit(1))
+            XCTFail("expected streamAlreadyClosed")
+        } catch OutletError.streamAlreadyClosed {}
+    }
+}
+
 // MARK: - Wire-shape chunk builders + invocation helpers
 
 private extension OutletStreamingTests {
@@ -569,6 +692,55 @@ private extension OutletStreamingTests {
             ucanToken: "ucan-abc",
             callerDid: callerDid
         )
+    }
+
+    // MARK: - AC6 conformance-vector loading
+
+    /// One decoded conformance vector: its scripted chunk-byte playback plus the
+    /// expected terminal, loaded from the single source of truth
+    /// `tests/conformance/vectors/outlet_stream_vectors.json`.
+    struct StreamVector {
+        let name: String
+        let chunkData: [Data]
+        let expectedEndStatus: String
+        let expectedErrorCode: String?
+    }
+
+    /// The repo-root vectors file, resolved by walking up from this test file
+    /// (`.../bindings/swift/Tests/SCPTests/…` → repo root).
+    var vectorsFileURL: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // SCPTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // swift
+            .deletingLastPathComponent() // bindings
+            .deletingLastPathComponent() // repo root
+            .appendingPathComponent("tests/conformance/vectors/outlet_stream_vectors.json")
+    }
+
+    /// Loads the 7 vectors, serializing each chunk into the mock's wire bytes
+    /// via the same `chunk(_:_:)` builder the other smoke tests use.
+    func loadStreamVectors() throws -> [String: StreamVector] {
+        let raw = try Data(contentsOf: vectorsFileURL)
+        let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: raw) as? [String: Any])
+        let vectors = try XCTUnwrap(root["vectors"] as? [[String: Any]])
+        var out: [String: StreamVector] = [:]
+        for vector in vectors {
+            let name = try XCTUnwrap(vector["name"] as? String)
+            let chunks = try XCTUnwrap(vector["chunks"] as? [[String: Any]])
+            let chunkData: [Data] = try chunks.map { entry in
+                let seq = try XCTUnwrap(entry["sequence"] as? Int)
+                let payload = try XCTUnwrap(entry["payload"] as? [String: Any])
+                return try chunk(seq, payload)
+            }
+            out[name] = try StreamVector(
+                name: name,
+                chunkData: chunkData,
+                expectedEndStatus: XCTUnwrap(vector["expected_end_status"] as? String),
+                expectedErrorCode: vector["expected_error_code"] as? String
+            )
+        }
+        return out
     }
 }
 

@@ -21,13 +21,20 @@ import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import kotlinx.serialization.json.put
 import uniffi.scp.ScpException
+import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -244,6 +251,51 @@ private fun invoke(
         ucanToken = UCAN,
         callerDid = callerDid,
     )
+
+// ---------------------------------------------------------------------------
+// AC6 conformance-vector loading (single source of truth:
+// tests/conformance/vectors/outlet_stream_vectors.json).
+// ---------------------------------------------------------------------------
+
+/** Walk up from the test JVM's working dir until the repo-root vectors file is found. */
+private fun locateVectorsFile(): File {
+    var dir: File? = File(System.getProperty("user.dir"))
+    while (dir != null) {
+        val candidate = File(dir, "tests/conformance/vectors/outlet_stream_vectors.json")
+        if (candidate.isFile) return candidate
+        dir = dir.parentFile
+    }
+    error("could not locate outlet_stream_vectors.json from ${System.getProperty("user.dir")}")
+}
+
+private val VECTORS: Map<String, JsonObject> =
+    run {
+        val text = locateVectorsFile().readText()
+        val root = Json.parseToJsonElement(text).jsonObject
+        root["vectors"]!!.jsonArray.associate { el ->
+            val obj = el.jsonObject
+            obj["name"]!!.jsonPrimitive.content to obj
+        }
+    }
+
+/** Serialize a vector's chunk list into the mock's wire-byte playback. */
+private fun vectorChunks(vector: JsonObject): List<ByteArray> =
+    vector["chunks"]!!.jsonArray.map { el ->
+        val entry = el.jsonObject
+        chunk(entry["sequence"]!!.jsonPrimitive.long, entry["payload"]!!.jsonObject)
+    }
+
+private fun endAggregate(vector: JsonObject): JsonElement? =
+    vector["chunks"]!!
+        .jsonArray
+        .map { it.jsonObject }
+        .firstOrNull { it["payload"]!!.jsonObject["@type"]?.jsonPrimitive?.contentOrNull == "end" }
+        ?.get("payload")
+        ?.jsonObject
+        ?.get("aggregate")
+
+private fun expectedErrorCode(vector: JsonObject): String? =
+    (vector["expected_error_code"] as? JsonPrimitive)?.contentOrNull
 
 // ---------------------------------------------------------------------------
 // Credit value class.
@@ -672,4 +724,119 @@ class ChunkParsingTest {
         assertEquals("ccdd", parsed.signature)
         assertEquals("data", parsed.kind)
     }
+}
+
+// ---------------------------------------------------------------------------
+// AC6 conformance-vector smoke: each of the 7 cross-layer streaming vectors ->
+// the SDK's expected terminal.
+//
+// IMPORTANT boundary — where the terminal comes from:
+//
+// - credit_exhaustion and cancellation surface a terminal the BRIDGE delivers.
+//   The mock plays a framework terminal (a terminal:true Error for credit
+//   exhaustion; a cancel-ack End after the consumer cancels) and the SDK
+//   faithfully surfaces outletStreamPollNext's terminal — the SDK cannot itself
+//   stall an executor, so it does not synthesize these terminals.
+// - ONLY sequence_gap requires ACTIVE SDK-side detection: the drain tracks the
+//   expected sequence, detects the hole ITSELF, signs the cancel through the
+//   bridge, and throws [StreamGap]. The mock feeds NO pre-baked cancel-ack for
+//   that vector (that would be test-gaming) — the recorded cancel call proves
+//   the SDK generated it.
+// ---------------------------------------------------------------------------
+
+class ConformanceVectorSmokeTest {
+    @Test
+    fun `vectors cover exactly the seven names`() {
+        assertEquals(
+            setOf(
+                "non_streaming", "multi_chunk", "cancellation", "error_terminal",
+                "error_recoverable", "sequence_gap", "credit_exhaustion",
+            ),
+            VECTORS.keys,
+        )
+    }
+
+    @Test
+    fun `non_streaming reaches Ok with sum aggregate`() =
+        runTest {
+            val v = VECTORS.getValue("non_streaming")
+            val result = invoke(FakeNative(vectorChunks(v))).aggregate()
+            assertEquals(buildJsonObject { put("sum", 3) }, result.value)
+            assertEquals(endAggregate(v), result.value)
+        }
+
+    @Test
+    fun `multi_chunk reaches Ok with total aggregate`() =
+        runTest {
+            val v = VECTORS.getValue("multi_chunk")
+            val result = invoke(FakeNative(vectorChunks(v))).aggregate()
+            assertEquals(buildJsonObject { put("total", 10) }, result.value)
+            assertEquals(endAggregate(v), result.value)
+        }
+
+    @Test
+    fun `error_recoverable yields non-terminal error then reaches Ok`() =
+        runTest {
+            val v = VECTORS.getValue("error_recoverable")
+            val handle = invoke(FakeNative(vectorChunks(v)))
+            val collected = handle.asFlow().toList()
+            assertEquals(listOf("data", "error", "data", "data", "end"), collected.map { it.kind })
+            val result = handle.aggregate()
+            assertEquals(endAggregate(v), result.value)
+        }
+
+    @Test
+    fun `error_terminal raises typed ScpException 6130`() =
+        runTest {
+            val v = VECTORS.getValue("error_terminal")
+            assertEquals("SCP-OUTLET-6130", expectedErrorCode(v))
+            val ex = assertFailsWith<ScpException.Outlet> { invoke(FakeNative(vectorChunks(v))).aggregate() }
+            assertEquals("SCP-OUTLET-6130", ex.code)
+        }
+
+    @Test
+    fun `credit_exhaustion raises typed ScpException 6133 (bridge terminal)`() =
+        runTest {
+            val v = VECTORS.getValue("credit_exhaustion")
+            assertEquals("SCP-OUTLET-6133", expectedErrorCode(v))
+            val ex = assertFailsWith<ScpException.Outlet> { invoke(FakeNative(vectorChunks(v))).aggregate() }
+            assertEquals("SCP-OUTLET-6133", ex.code)
+        }
+
+    @Test
+    fun `cancellation records cancel and reaches terminal`() =
+        runTest {
+            val v = VECTORS.getValue("cancellation")
+            val native = FakeNative(vectorChunks(v))
+            val handle = invoke(native)
+            var idx = 0
+            handle.asFlow().collect { _ ->
+                if (idx == 1) handle.cancel()
+                idx++
+            }
+            assertEquals(listOf("stream-1" to CALLER), native.cancelCalls)
+            assertEquals(v["chunks"]!!.jsonArray.size, idx)
+            val result = handle.aggregate()
+            assertEquals(endAggregate(v), result.value)
+        }
+
+    @Test
+    fun `sequence_gap detected signs cancel and raises StreamGap 6131`() =
+        runTest {
+            // ACTIVE SDK detection: mock plays data seq0, seq1, seq3 (seq2
+            // MISSING). The drain detects the gap at seq3, itself signs a cancel
+            // through the bridge, and throws StreamGap(6131). NO pre-baked
+            // cancel-ack is fed.
+            val v = VECTORS.getValue("sequence_gap")
+            assertEquals("SCP-OUTLET-6131", expectedErrorCode(v))
+            val native = FakeNative(vectorChunks(v))
+            val handle = invoke(native)
+            val ex = assertFailsWith<StreamGap> { handle.aggregate() }
+            assertEquals("SCP-OUTLET-6131", ex.code)
+            // The SDK ITSELF signed the receiver cancel (not fed by the mock).
+            assertEquals(listOf("stream-1" to CALLER), native.cancelCalls)
+            // Terminal cache: the gap is sticky and control-plane is now guarded.
+            assertFailsWith<StreamGap> { handle.aggregate() }
+            assertFailsWith<StreamAlreadyClosed> { handle.grantCredit(Credit(1u)) }
+        }
 }

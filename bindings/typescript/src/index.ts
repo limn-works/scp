@@ -236,6 +236,7 @@ export {
   ScpError,
   StorageError,
   StreamAlreadyClosed,
+  StreamGap,
   TransportError,
   UcanPermissionError,
   ValidationError,

@@ -91,6 +91,15 @@ public enum OutletError: Error, Sendable, Equatable {
     /// single shared drain, a stream that closed without an `End` chunk, or a
     /// malformed chunk from the bridge.
     case protocolViolation(msg: String, code: String)
+
+    /// A gap (missing sequence) in the stream's chunk sequence (§5.4.5
+    /// "Ordering and gaps", `OutletErrorClass::Execution::StreamGap`). Sequence
+    /// values are strictly monotonic per `request_id`; the drain tracks the
+    /// expected next sequence and, on any non-contiguous chunk, cancels the
+    /// stream through the bridge and throws this — a defense-in-depth
+    /// monotonicity check (a same-context stream never gaps over its lossless
+    /// ordered channel). Carries the execution-class code `SCP-OUTLET-6131`.
+    case sequenceGap(msg: String, code: String)
 }
 
 // MARK: - Credit — a validated non-zero u32 stream-credit grant (§5.4.5)
@@ -431,6 +440,15 @@ public actor InvocationHandle {
     /// Captured terminal state, read back by ``aggregate()``.
     private var aggregateResult: Aggregate?
     private var terminalError: ScpError?
+    /// Captured ``OutletError/sequenceGap(msg:code:)`` terminal, re-thrown by a
+    /// re-``aggregate()`` after a gap closed the drain.
+    private var streamGapError: OutletError?
+    /// §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk
+    /// must carry. Strictly monotonic per `request_id`, starting at 0; a chunk
+    /// whose sequence differs is a ``OutletError/sequenceGap(msg:code:)``
+    /// (defense-in-depth — same-context streams never gap over their lossless
+    /// ordered channel).
+    private var expectedSequence: UInt64 = 0
 
     init(bridge: any OutletStreamNative, params: OutletStreamOpenParams) {
         self.bridge = bridge
@@ -498,6 +516,26 @@ public actor InvocationHandle {
             return nil
         }
         let chunk = try OutletStreamChunk.parse(raw)
+        if chunk.sequence != expectedSequence {
+            // §5.4.5 "Ordering and gaps": a non-contiguous sequence (a hole, or
+            // a regression) is a receiver-detected StreamGap. Mark the drain
+            // terminal, cancel the stream through the SAME bridge path public
+            // cancel() uses, and throw — WITHOUT returning the offending chunk.
+            // The check spans all chunk kinds (Data/Progress/End/Error) since
+            // sequences are strictly monotonic across them.
+            closed = true
+            let gap = OutletError.sequenceGap(
+                msg: "outlet stream sequence gap: expected \(expectedSequence), "
+                    + "got \(chunk.sequence) (§5.4.5)",
+                code: "SCP-OUTLET-6131"
+            )
+            streamGapError = gap
+            // Best-effort receiver cancel: the StreamGap is the reported
+            // terminal, so a cancel-path failure must not mask it.
+            try? await sendCancel(id)
+            throw gap
+        }
+        expectedSequence += 1
         if chunk.isTerminal {
             // Terminal chunk closes the stream. Capture the terminal state for
             // aggregate(), mark closed, then still return the terminal chunk so
@@ -532,6 +570,7 @@ public actor InvocationHandle {
         while !closed {
             _ = try await drainNext()
         }
+        if let streamGapError { throw streamGapError }
         if let terminalError { throw terminalError }
         guard let aggregateResult else {
             throw OutletError.protocolViolation(
@@ -597,6 +636,14 @@ public actor InvocationHandle {
             closed = true
             return
         }
+        try await sendCancel(id)
+    }
+
+    /// Signs and sends an `OutletCancel` through the bridge (§5.4.5). The single
+    /// bridge cancel round-trip shared by the public ``cancel()`` and the
+    /// drain's ``OutletError/sequenceGap(msg:code:)`` teardown, so both cancel
+    /// through the identical signed path.
+    private func sendCancel(_ id: String) async throws {
         try await bridge.cancel(handleId: id, callerDid: params.callerDid)
     }
 }

@@ -42,6 +42,7 @@ from scp_sdk.errors import (
     OutletError,
     ProtocolError,
     StreamAlreadyClosed,
+    StreamGap,
     ValidationError,
 )
 
@@ -571,6 +572,7 @@ class InvocationHandle:
         "_closed",
         "_draining",
         "_error",
+        "_expected_sequence",
         "_handle_id",
         "_native",
         "_open_lock",
@@ -592,6 +594,11 @@ class InvocationHandle:
         # Captured terminal state, read back by aggregate().
         self._aggregate: Aggregate | None = None
         self._error: OutletError | None = None
+        # §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk
+        # must carry. Strictly monotonic per request_id, starting at 0; a chunk
+        # whose sequence differs is a StreamGap (defense-in-depth — same-context
+        # streams never gap over their lossless ordered channel).
+        self._expected_sequence = 0
 
     async def _ensure_open(self) -> str:
         """Open the stream exactly once (idempotent), returning the bridge
@@ -651,6 +658,27 @@ class InvocationHandle:
                 self._closed = True
                 raise StopAsyncIteration
             chunk = OutletStreamChunk._from_bridge_bytes(bytes(raw))
+            if chunk.sequence != self._expected_sequence:
+                # §5.4.5 "Ordering and gaps": a non-contiguous sequence (a hole,
+                # or a regression) is a receiver-detected StreamGap. Mark the
+                # drain terminal, cancel the stream through the SAME bridge path
+                # public cancel() uses, and raise — WITHOUT yielding the offending
+                # chunk. The check spans all chunk kinds (Data/Progress/End/Error)
+                # since sequences are strictly monotonic across them.
+                self._closed = True
+                gap = StreamGap(
+                    f"outlet stream sequence gap: expected {self._expected_sequence}, "
+                    f"got {chunk.sequence} (§5.4.5)",
+                )
+                self._error = gap
+                # Best-effort receiver cancel: the StreamGap is the reported
+                # terminal, so a cancel-path failure must not mask it.
+                try:
+                    await self._send_cancel(handle_id)
+                except Exception:  # best-effort teardown
+                    pass
+                raise gap
+            self._expected_sequence += 1
             if chunk.is_terminal:
                 # Terminal chunk closes the stream. Capture the terminal state
                 # for aggregate(), mark closed, then still YIELD the terminal
@@ -766,6 +794,15 @@ class InvocationHandle:
             # Never opened — cancel is a local close, not a bridge round-trip.
             self._closed = True
             return
+        await self._send_cancel(handle_id)
+
+    async def _send_cancel(self, handle_id: str) -> None:
+        """Sign and send an ``OutletCancel`` through the bridge (§5.4.5).
+
+        The single bridge cancel round-trip shared by the public
+        :meth:`cancel` and the drain's StreamGap teardown, so both cancel
+        through the identical signed path.
+        """
         try:
             await asyncio.to_thread(
                 self._native.outlet_stream_cancel,
