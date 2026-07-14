@@ -2449,6 +2449,44 @@ impl MlsCryptoProvider {
         (public, secret)
     }
 
+    /// Returns a copy of this provider's node-resident X25519 wrapping
+    /// **public** key (the HPKE recipient key advertised in the `0xFF01`
+    /// wrapping leaf so peers can seal sender keys to this member).
+    ///
+    /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b): the Prep A per-context crypto
+    /// methods on `PerContextState` take the node-resident wrapping keypair as a
+    /// METHOD PARAMETER (never stored on `ContextCryptoState`). The atomic core
+    /// actor-seeding path (SCP-CRYPTOMOVE-001) therefore needs to read the
+    /// keypair off the provider to hand it in. This `pub(crate)` accessor
+    /// exposes the public half in the PRODUCTION build without routing through
+    /// [`Self::wrapping_keypair_snapshot`], which stays test-gated so the raw
+    /// secret is never reachable from the production public API.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b): node-resident accessor lands ahead of the atomic move; production caller is the atomic core actor-seeding path (SCP-CRYPTOMOVE-001). Exercised now by a crate-internal parity unit test."
+    )]
+    pub(crate) fn wrapping_public_key(&self) -> [u8; 32] {
+        **self.wrapping_public_key.load()
+    }
+
+    /// Returns a `Zeroizing` copy of this provider's node-resident X25519
+    /// wrapping **secret** key (used to HPKE-open sender keys sealed to this
+    /// member). The returned buffer zeroes on drop, so the secret does not
+    /// linger in caller memory once the returned value is dropped.
+    ///
+    /// Companion to [`Self::wrapping_public_key`] for the SCP-CRYPTOMOVE-001
+    /// actor-seeding path (see that method's note). The `Zeroizing` return type
+    /// is load-bearing: no bare `[u8; 32]` secret escapes the provider.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b): node-resident accessor lands ahead of the atomic move; production caller is the atomic core actor-seeding path (SCP-CRYPTOMOVE-001). Exercised now by a crate-internal parity unit test."
+    )]
+    pub(crate) fn wrapping_secret(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(***self.wrapping_secret_key.load())
+    }
+
     /// Restores per-context cryptographic state from a previously exported
     /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)),
     /// returning the Class-M [`RestoredFloors`] the caller merges into the
@@ -2790,6 +2828,38 @@ mod tests {
         let mut id = [0u8; 32];
         id[0] = 0x42;
         id
+    }
+
+    /// ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b): the `pub(crate)`
+    /// `wrapping_public_key()` / `wrapping_secret()` accessors that the atomic
+    /// core actor-seeding path (SCP-CRYPTOMOVE-001) will read must observe the
+    /// SAME node-resident keypair as the test-gated
+    /// [`MlsCryptoProvider::wrapping_keypair_snapshot`] ground truth. Also pins
+    /// the AC#2 contract that the secret accessor returns `Zeroizing` (no bare
+    /// `[u8; 32]` secret escapes the provider) via a load-bearing type witness.
+    #[test]
+    fn wrapping_accessors_match_snapshot_and_secret_is_zeroizing() {
+        let provider = make_provider();
+
+        // Ground truth: the identity-level wrapping keypair as the test-gated
+        // snapshot reports it.
+        let (snap_pub, snap_sec) = provider.wrapping_keypair_snapshot();
+
+        // Parity: the production `pub(crate)` accessors observe the same bytes.
+        assert_eq!(
+            provider.wrapping_public_key(),
+            snap_pub,
+            "wrapping_public_key() must match the snapshot's public half"
+        );
+
+        // AC#2 type witness: the return type is `Zeroizing<[u8; 32]>`, not a
+        // bare secret. This binding is load-bearing — it fails to compile if the
+        // signature ever regresses to a plain `[u8; 32]`.
+        let sec: zeroize::Zeroizing<[u8; 32]> = provider.wrapping_secret();
+        assert_eq!(
+            *sec, *snap_sec,
+            "wrapping_secret() must match the snapshot's secret half"
+        );
     }
 
     #[test]
