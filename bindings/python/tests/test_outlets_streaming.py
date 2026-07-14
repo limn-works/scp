@@ -16,6 +16,7 @@ capability) is covered by the Rust PyO3 live-poll test in
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
@@ -26,10 +27,13 @@ import pytest
 
 from scp_sdk.context import Context
 from scp_sdk.errors import (
+    ContextError,
     InvalidGrant,
     OutletError,
     ProtocolError,
     StreamAlreadyClosed,
+    UcanPermissionError,
+    ValidationError,
 )
 from scp_sdk.outlets import (
     Aggregate,
@@ -129,19 +133,57 @@ class _FakeNative:
         )
         return self._handle_id
 
-    def outlet_stream_poll_next(self, handle_id: str) -> bytes | None:
+    def outlet_stream_poll_next(self, handle_id: str) -> list[int] | None:
         with self._lock:
             if self._i >= len(self._chunks):
                 return None
             chunk = self._chunks[self._i]
             self._i += 1
-            return chunk
+            # PyO3 marshals the bridge's `Vec<u8>` to a Python `list[int]`, not
+            # `bytes` — mirror that so the SDK's `bytes(raw)` coercion stays
+            # honestly exercised.
+            return list(chunk)
 
     def outlet_stream_grant_credit(self, handle_id: str, caller_did: str, grant: int) -> None:
         self.grant_calls.append((handle_id, caller_did, grant))
 
     def outlet_stream_cancel(self, handle_id: str, caller_did: str) -> None:
         self.cancel_calls.append((handle_id, caller_did))
+
+
+def _bridge_exc(name: str, message: str) -> Exception:
+    """Build a `_scp_core`-style bridge exception whose CLASS NAME drives
+    `BRIDGE_ERROR_MAP` translation (the SDK dispatches on `type(exc).__name__`,
+    matching how the real PyO3 bridge raises `UcanError` / `ValidationError` /
+    `ContextError` classes)."""
+    return type(name, (Exception,), {})(message)
+
+
+class _RaisingOpenNative(_FakeNative):
+    """A bridge whose `outlet_stream_open` rejects."""
+
+    def __init__(self, exc: Exception) -> None:
+        super().__init__([])
+        self._open_exc = exc
+
+    def outlet_stream_open(self, *args: Any, **kwargs: Any) -> str:
+        raise self._open_exc
+
+
+class _RaisingPollNative(_FakeNative):
+    """A bridge that streams `fail_after` chunks then rejects mid-drain."""
+
+    def __init__(self, chunks: list[bytes], exc: Exception, fail_after: int) -> None:
+        super().__init__(chunks)
+        self._poll_exc = exc
+        self._fail_after = fail_after
+        self._polls = 0
+
+    def outlet_stream_poll_next(self, handle_id: str) -> list[int] | None:
+        self._polls += 1
+        if self._polls > self._fail_after:
+            raise self._poll_exc
+        return super().outlet_stream_poll_next(handle_id)
 
 
 def _make_ctx(
@@ -374,6 +416,9 @@ class TestControlPlane:
         native = _FakeNative([_data(0, {"n": 0}), _end(1, {"n": 0})])
         handle = _invoke(native)
 
+        # Open the stream first (pull one chunk); cancel then signs at the bridge.
+        # (cancel BEFORE any open is a local no-op — see TestCancelBeforeOpen.)
+        await handle.__anext__()
         await handle.cancel()
 
         assert native.cancel_calls == [("stream-1", "did:dht:caller")]
@@ -431,6 +476,88 @@ class TestLifecycleGuard:
         _ = [chunk async for chunk in handle]
         with pytest.raises(StreamAlreadyClosed):
             await handle.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Bridge-error translation: data-plane FFI rejections surface as SDK types.
+# ---------------------------------------------------------------------------
+
+
+class TestBridgeErrorTranslation:
+    async def test_open_ucan_denial_surfaces_as_ucan_permission_error(self) -> None:
+        native = _RaisingOpenNative(_bridge_exc("UcanError", "authorization denied"))
+        handle = _invoke(native)
+        with pytest.raises(UcanPermissionError):
+            await handle  # aggregate() drains -> open() rejects
+
+    async def test_open_schema_violation_surfaces_as_validation_error(self) -> None:
+        native = _RaisingOpenNative(_bridge_exc("ValidationError", "input schema"))
+        handle = _invoke(native)
+        with pytest.raises(ValidationError):
+            async for _chunk in handle:  # first __anext__ opens -> rejects
+                pass
+
+    async def test_poll_mid_drain_error_surfaces_as_sdk_type(self) -> None:
+        # Stream one Data chunk, then the bridge rejects the next poll with a
+        # ContextError (e.g. unknown handle / transport fault) mid-drain.
+        native = _RaisingPollNative(
+            [_data(0, {"n": 0})],
+            _bridge_exc("ContextError", "no active stream"),
+            fail_after=1,
+        )
+        handle = _invoke(native)
+        with pytest.raises(ContextError):
+            _ = [chunk async for chunk in handle]
+
+
+# ---------------------------------------------------------------------------
+# Concurrent-consumer guard: a second driver on the shared drain fails loud.
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentConsumer:
+    async def test_second_concurrent_driver_raises_protocol_error(self) -> None:
+        native = _FakeNative([_data(i, {"n": i}) for i in range(5)])
+        handle = _invoke(native)
+
+        # Start a first drive and let it reach its outstanding poll await.
+        first = asyncio.ensure_future(handle.__anext__())
+        await asyncio.sleep(0)  # yield so `first` sets _draining and suspends
+
+        with pytest.raises(ProtocolError):
+            await handle.__anext__()  # second concurrent driver -> loud failure
+
+        await first  # let the legitimate first driver finish
+
+
+# ---------------------------------------------------------------------------
+# cancel() before first poll is a local no-op close (no stream open).
+# ---------------------------------------------------------------------------
+
+
+class TestCancelBeforeOpen:
+    async def test_cancel_before_open_does_not_open_stream(self) -> None:
+        native = _FakeNative([_data(0, {"n": 0}), _end(1, {"n": 0})])
+        handle = _invoke(native)
+
+        await handle.cancel()
+
+        # No stream was opened and no bridge cancel was signed.
+        assert native.open_calls == []
+        assert native.cancel_calls == []
+        # The handle is now closed: further control-plane calls are guarded.
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.cancel()
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.grant_credit(Credit(1))
+
+    async def test_grant_credit_before_open_does_open_stream(self) -> None:
+        # A grant needs a live stream, so grant_credit (unlike cancel) opens.
+        native = _FakeNative([_end(0, {"n": 0})])
+        handle = _invoke(native)
+        await handle.grant_credit(Credit(2))
+        assert len(native.open_calls) == 1
+        assert native.grant_calls == [("stream-1", "did:dht:caller", 2)]
 
 
 # ---------------------------------------------------------------------------

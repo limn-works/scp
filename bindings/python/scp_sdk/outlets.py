@@ -1,18 +1,30 @@
-"""Outlet-related dataclasses and cross-context/session wrappers for the SCP Python SDK.
+"""Outlet types and the single-verb streaming invocation surface for the SCP Python SDK.
 
-Contains :class:`OutletDefinition` and :class:`TestVector`, the two types
-needed for outlet registration and verification within SCP contexts, plus
-module-level async functions for cross-context outlet invocation and
-stateful outlet sessions:
+Registration / definition types:
 
-- :func:`invoke_cross_context` -- Invoke an outlet across context boundaries.
-- :func:`session_create` -- Create a stateful outlet session.
-- :func:`session_invoke` -- Invoke an outlet within an active session.
-- :func:`session_close` -- Close a stateful outlet session.
+- :class:`OutletDefinition` -- an outlet registered in a context (§5.4.1).
+- :class:`OutletKind` -- Query vs Action semantic class (§5.4.2).
+- :class:`OutletCost` -- per-invocation cost metadata (§5.4.1).
+- :class:`TestVector` -- an input/output pair for outlet verification.
+- :class:`SagaResult` -- the committed terminal of a §6.2.4 cross-context saga.
+
+The streaming invocation surface (§5.4.5, SCP-OUT-006 / SCP-OUT-038) — the
+SINGLE public verb ``ctx.outlets.invoke(...)`` and the objects it returns:
+
+- :class:`Outlets` -- the ``ctx.outlets`` accessor holding :meth:`Outlets.invoke`.
+- :class:`InvocationHandle` -- awaitable (aggregated ``End`` result) + async-iterable
+  (per-chunk) handle with :meth:`~InvocationHandle.grant_credit` /
+  :meth:`~InvocationHandle.cancel` control-plane methods.
+- :class:`Credit` -- validated non-zero ``u32`` credit-grant newtype.
+- :class:`OutletStreamChunk` -- one decoded stream chunk.
+- :class:`Aggregate` -- the aggregated terminal result of an invocation.
+
+The streaming FFI ops are wrapped BEHIND :class:`InvocationHandle`: the SDK
+exposes no separate stream-invocation, poll, or credit-grant free function.
 
 See ``.docs/adrs/phase-3.md`` ADR-014 acceptance criterion 3,
-``.docs/standards/python.md`` for conventions, and spec section 6.2 /
-6.2.1 for cross-context invocation and stateful sessions.
+``.docs/standards/python.md`` for conventions, spec §5.4 for outlets, and
+§5.4.5 for progressive output (streaming).
 """
 
 from __future__ import annotations
@@ -516,9 +528,22 @@ class InvocationHandle:
       :class:`OutletStreamChunk` (``Data`` and ``Progress`` included) up to and
       including the terminal chunk.
 
-    Both surfaces share one underlying stream and one terminal-capture: a
-    consumer may iterate to completion and then ``await handle`` to recover the
-    ``Aggregate`` without re-draining.
+    **One shared drain, three directions.** Both surfaces consume the SAME
+    underlying stream and share one terminal-capture; the executor's chunk
+    sequence is drained exactly once. So:
+
+    1. **iterate then aggregate** — after ``async for`` runs to the terminal,
+       ``await handle`` / :meth:`aggregate` returns the CACHED ``Aggregate``
+       (no re-drain).
+    2. **aggregate then iterate** — after ``await handle``, a subsequent
+       ``async for`` yields NOTHING (the stream is already fully drained).
+    3. **partial-iterate then aggregate** — ``aggregate`` drains the REMAINING
+       chunks to the terminal and returns the executor's ``End.aggregate``.
+
+    A stream has a single consumer: draining it from two coroutines
+    concurrently (e.g. two ``async for`` loops, or ``await`` racing iteration)
+    raises :class:`~scp_sdk.errors.ProtocolError` on the second driver rather
+    than silently splitting the chunk sequence between them.
 
     Two control-plane methods extend the handle:
 
@@ -530,15 +555,21 @@ class InvocationHandle:
 
     The stream is opened lazily — ``invoke`` returns immediately without
     blocking, and the ``outlet_stream_open`` FFI call happens on first
-    iteration, ``await``, ``grant_credit``, or ``cancel``. The blocking PyO3
-    calls (``open`` / ``poll_next`` / ``grant_credit`` / ``cancel`` run
-    ``block_on`` internally) are dispatched via :func:`asyncio.to_thread` so
-    they never block the event loop.
+    iteration, ``await``, or ``grant_credit`` (a grant needs a live stream).
+    ``cancel`` on a never-opened handle is a local no-op close — it does NOT
+    open the stream (no escrow reservation / admission slot) just to cancel it.
+    The blocking PyO3 calls (``open`` / ``poll_next`` / ``grant_credit`` /
+    ``cancel`` run ``block_on`` internally) are dispatched via
+    :func:`asyncio.to_thread` so they never block the event loop, and any
+    bridge rejection they raise is translated to the matching SDK exception
+    type (``UcanPermissionError`` / ``ValidationError`` / ``ContextError`` /
+    …) on every surface — data plane and control plane alike.
     """
 
     __slots__ = (
         "_aggregate",
         "_closed",
+        "_draining",
         "_error",
         "_handle_id",
         "_native",
@@ -554,6 +585,10 @@ class InvocationHandle:
         # Set once a terminal chunk (End / terminal Error) is observed, or the
         # sender drops without a terminal. Gates the control-plane lifecycle.
         self._closed = False
+        # In-flight re-entrancy guard: True while a ``__anext__`` poll is
+        # outstanding, so a second concurrent driver fails loud instead of
+        # stealing chunks from the shared single-consumer drain.
+        self._draining = False
         # Captured terminal state, read back by aggregate().
         self._aggregate: Aggregate | None = None
         self._error: OutletError | None = None
@@ -568,18 +603,24 @@ class InvocationHandle:
         async with self._open_lock:
             if self._handle_id is None:
                 p = self._params
-                handle_id = await asyncio.to_thread(
-                    self._native.outlet_stream_open,
-                    p.context_id,
-                    p.outlet_id,
-                    p.input,
-                    p.caller_did,
-                    p.ucan_token,
-                    p.proof_tokens,
-                    p.spending_ucan,
-                    p.timeout_ms,
-                    p.estimated_chunk_count,
-                )
+                try:
+                    handle_id = await asyncio.to_thread(
+                        self._native.outlet_stream_open,
+                        p.context_id,
+                        p.outlet_id,
+                        p.input,
+                        p.caller_did,
+                        p.ucan_token,
+                        p.proof_tokens,
+                        p.spending_ucan,
+                        p.timeout_ms,
+                        p.estimated_chunk_count,
+                    )
+                except Exception as exc:
+                    # Open rejections (UCAN denial, input-schema violation,
+                    # escrow InsufficientFunds/overflow) surface on the first
+                    # await / iteration / control call as the matching SDK type.
+                    raise _translate_bridge_error(exc) from exc
                 self._handle_id = str(handle_id)
             return self._handle_id
 
@@ -589,31 +630,47 @@ class InvocationHandle:
     async def __anext__(self) -> OutletStreamChunk:
         if self._closed:
             raise StopAsyncIteration
-        handle_id = await self._ensure_open()
-        raw = await asyncio.to_thread(self._native.outlet_stream_poll_next, handle_id)
-        if raw is None:
-            # Abnormal terminal: sender dropped without a terminal chunk.
-            self._closed = True
-            raise StopAsyncIteration
-        chunk = OutletStreamChunk._from_bridge_bytes(bytes(raw))
-        if chunk.is_terminal:
-            # Terminal chunk closes the stream. Capture the terminal state for
-            # aggregate(), mark closed, then still YIELD the terminal chunk so
-            # an iterating consumer observes it (End counts toward the visible
-            # chunk sequence).
-            self._closed = True
-            if chunk.kind == "end":
-                self._aggregate = Aggregate(
-                    value=chunk.payload.get("aggregate"),
-                    provenance=_as_dict(chunk.payload.get("provenance")),
-                    execution_time_ms=int(chunk.payload.get("execution_time_ms", 0)),
-                )
-            elif chunk.kind == "error":
-                self._error = OutletError(
-                    str(chunk.payload.get("message", "outlet stream error")),
-                    code=str(chunk.payload.get("code", "SCP-OUTLET-6000")),
-                )
-        return chunk
+        if self._draining:
+            raise ProtocolError(
+                "InvocationHandle is already being drained by another consumer; "
+                "an outlet stream has a single shared drain — do not iterate or "
+                "await it from two coroutines concurrently",
+                code="SCP-OUTLET-6100",
+            )
+        self._draining = True
+        try:
+            handle_id = await self._ensure_open()
+            try:
+                raw = await asyncio.to_thread(self._native.outlet_stream_poll_next, handle_id)
+            except Exception as exc:
+                # A mid-drain bridge rejection (unknown handle, transport fault)
+                # surfaces on `async for` / `aggregate` as the matching SDK type.
+                raise _translate_bridge_error(exc) from exc
+            if raw is None:
+                # Abnormal terminal: sender dropped without a terminal chunk.
+                self._closed = True
+                raise StopAsyncIteration
+            chunk = OutletStreamChunk._from_bridge_bytes(bytes(raw))
+            if chunk.is_terminal:
+                # Terminal chunk closes the stream. Capture the terminal state
+                # for aggregate(), mark closed, then still YIELD the terminal
+                # chunk so an iterating consumer observes it (End counts toward
+                # the visible chunk sequence).
+                self._closed = True
+                if chunk.kind == "end":
+                    self._aggregate = Aggregate(
+                        value=chunk.payload.get("aggregate"),
+                        provenance=_as_dict(chunk.payload.get("provenance")),
+                        execution_time_ms=int(chunk.payload.get("execution_time_ms", 0)),
+                    )
+                elif chunk.kind == "error":
+                    self._error = OutletError(
+                        str(chunk.payload.get("message", "outlet stream error")),
+                        code=str(chunk.payload.get("code", "SCP-OUTLET-6000")),
+                    )
+            return chunk
+        finally:
+            self._draining = False
 
     def __await__(self) -> Generator[Any, None, Aggregate]:
         return self.aggregate().__await__()
@@ -691,6 +748,11 @@ class InvocationHandle:
         cancel-ack chunk within ``stream_cancel_ack_secs``; billing reflects
         the ``cancel_ack_seq``.
 
+        Cancelling a handle whose stream was never opened is a local no-op
+        close: it marks the handle closed WITHOUT opening the stream, so a
+        cancel never reserves escrow / an admission slot (and never surfaces an
+        open-time rejection) just to tear the stream down.
+
         Raises :class:`~scp_sdk.errors.StreamAlreadyClosed` if the stream has
         already reached a terminal chunk; otherwise propagates any bridge
         rejection (e.g. ``SCP-PERM-3001`` for a non-invoker caller).
@@ -699,7 +761,11 @@ class InvocationHandle:
             raise StreamAlreadyClosed(
                 "cannot cancel: the outlet stream has already closed",
             )
-        handle_id = await self._ensure_open()
+        handle_id = self._handle_id
+        if handle_id is None:
+            # Never opened — cancel is a local close, not a bridge round-trip.
+            self._closed = True
+            return
         try:
             await asyncio.to_thread(
                 self._native.outlet_stream_cancel,
