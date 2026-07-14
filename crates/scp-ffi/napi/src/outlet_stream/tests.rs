@@ -451,3 +451,671 @@ async fn seed_owner_document_into_resolver(
         .await
         .expect("publish into the resolver-visible store");
 }
+
+// ---------------------------------------------------------------------------
+// SCP-OUT-039 (§5.4.5) — outlet streaming conformance vectors, NAPI tier.
+//
+// This lives as an INTERNAL test module (not an external `tests/` file) because
+// the napi cdylib's runtime symbols (`napi_wrap` / `napi_unwrap` / …) are only
+// satisfiable via the `scp-ffi-napi-test-stubs` static lib inside the crate's
+// OWN `#[cfg(test)]` link graph — an external integration-test target fails to
+// link them (which is why the crate has zero `[[test]]` blocks and every napi
+// test lives in a `#[cfg(test)] mod`). The vectors are replayed through the
+// ACTUAL public NAPI bridge exports (`Scp::outlet_stream_verify_chunk_signature`
+// / `Scp::outlet_stream_compute_caveats_binding`, `Buffer` in/out).
+//
+// Coverage here is WIRE INTEGRITY over all 7 vectors + the receiver-side
+// `sequence_gap` check. The LIVE open→poll→drain terminal-status behaviour of
+// these vectors is covered by the gated `live_poll_next_drains_to_terminal`
+// test above and by the runtime tiers (SCP-OUT-039 deliverables 2/3 in
+// scp-testing).
+// ---------------------------------------------------------------------------
+mod streaming_vectors {
+    use napi::bindgen_prelude::Buffer;
+    use scp_core::context::outlets::stream::{
+        ChunkPayload, OutletStreamChunk, compute_caveats_binding, sign_chunk,
+    };
+    use scp_core::trust::caveats::InvocationCaveats;
+
+    /// The §25.2 reference operator Ed25519 seed (RFC 8032 §7.1 Test Vector 1).
+    const REFERENCE_OPERATOR_SEED: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    const VECTOR_CONTEXT_ID: &str = "scp-out-039-ctx";
+    /// The Ed25519 public key the §25.2 seed above actually derives (verified via
+    /// `ed25519_dalek`, OpenSSL, and a standalone RFC-8032 impl). Pinned so a
+    /// corrupted seed byte fails loudly. Matches the §25.2 public key
+    /// (`…daa62325af021a68f707511a`, RFC 8032 §7.1 TV1) and the repo KAT `REF_PUBKEY`.
+    const EXPECTED_OPERATOR_PK: [u8; 32] = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07,
+        0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+        0x51, 0x1a,
+    ];
+    /// §5.4.5 stream-gap code (shared `CODE_EXECUTION_CREDIT`, slug
+    /// `execution.stream-gap`).
+    const CODE_STREAM_GAP: &str = "SCP-OUTLET-6131";
+
+    fn vectors() -> serde_json::Value {
+        let raw =
+            include_str!("../../../../../tests/conformance/vectors/outlet_stream_vectors.json");
+        serde_json::from_str(raw).expect("vectors JSON parses")
+    }
+
+    fn sample_provenance() -> scp_core::provenance::DataProvenance {
+        use scp_core::context::params::MemoryScope;
+        use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+        DataProvenance {
+            source_context: "scp-out-039-source".to_owned(),
+            source_type: SourceType::Persistent,
+            counterparties: Vec::new(),
+            purpose: None,
+            discovery_method: DiscoveryMethod::OutOfBand,
+            age: std::time::Duration::from_secs(0),
+            memory_scope: MemoryScope::Full,
+            chain_depth: 0,
+            chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
+        }
+    }
+
+    fn payload_from_vector(payload: &serde_json::Value) -> ChunkPayload {
+        match payload["@type"].as_str().expect("payload @type") {
+            "data" => ChunkPayload::Data {
+                value: payload["value"].clone(),
+            },
+            "progress" => ChunkPayload::Progress {
+                pct: u16::try_from(payload["pct"].as_u64().expect("pct")).expect("pct u16"),
+                note: payload["note"].as_str().map(str::to_owned),
+            },
+            "end" => ChunkPayload::End {
+                aggregate: payload["aggregate"].clone(),
+                provenance: sample_provenance(),
+                execution_time_ms: payload["execution_time_ms"].as_u64().expect("exec ms"),
+            },
+            "error" => ChunkPayload::Error {
+                code: payload["code"].as_str().expect("code").to_owned(),
+                message: payload["message"].as_str().expect("message").to_owned(),
+                terminal: payload["terminal"].as_bool().expect("terminal"),
+            },
+            other => panic!("unknown payload @type: {other}"),
+        }
+    }
+
+    fn request_id_from_open(open: &serde_json::Value) -> [u8; 16] {
+        let arr = open["request_id"].as_array().expect("request_id array");
+        assert_eq!(arr.len(), 16, "request_id is 16 bytes");
+        let mut id = [0u8; 16];
+        for (i, byte) in arr.iter().enumerate() {
+            id[i] = u8::try_from(byte.as_u64().expect("byte")).expect("byte u8");
+        }
+        id
+    }
+
+    /// Receiver-side ordering check (§5.4.5 "Ordering and gaps"): a missing
+    /// sequence MUST cancel with `execution.stream-gap` (`SCP-OUTLET-6131`).
+    struct ReceiverSequenceTracker {
+        expected: u64,
+    }
+    impl ReceiverSequenceTracker {
+        fn new() -> Self {
+            Self { expected: 0 }
+        }
+        fn observe(&mut self, sequence: u64) -> Option<&'static str> {
+            if sequence == self.expected {
+                self.expected += 1;
+                None
+            } else {
+                Some(CODE_STREAM_GAP)
+            }
+        }
+    }
+
+    /// Every chunk of every vector replayed through the ACTUAL NAPI pure-wrapper
+    /// exports: verify is `true` under the §25.2 key, `false` under a wrong key,
+    /// and the caveats-binding export equals the core helper byte-for-byte.
+    #[test]
+    fn all_seven_vectors_wire_integrity_through_napi_exports() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let operator = ed25519_dalek::SigningKey::from_bytes(&REFERENCE_OPERATOR_SEED);
+        assert_eq!(
+            operator.verifying_key().as_bytes(),
+            &EXPECTED_OPERATOR_PK,
+            "the §25.2 reference seed must derive its ground-truth public key"
+        );
+        let operator_pk = operator.verifying_key().as_bytes().to_vec();
+        let wrong_pk = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32])
+            .verifying_key()
+            .as_bytes()
+            .to_vec();
+        let caveats_jcs = InvocationCaveats::empty()
+            .to_canonical_json_bytes()
+            .expect("empty caveats JCS");
+
+        let doc = vectors();
+        let vecs = doc["vectors"].as_array().expect("vectors array");
+        assert_eq!(vecs.len(), 7, "exactly 7 streaming conformance vectors");
+        let mut total_chunks = 0usize;
+        for vector in vecs {
+            let open = &vector["open"];
+            let outlet_id = open["outlet_id"].as_str().expect("outlet_id").to_owned();
+            let invoker_did = open["invoker_did"]
+                .as_str()
+                .expect("invoker_did")
+                .to_owned();
+            let estimated_chunk_count =
+                u32::try_from(open["estimated_chunk_count"].as_u64().expect("estimate"))
+                    .expect("estimate u32");
+            let request_id = request_id_from_open(open);
+            let ucan_cid = open["ucan_cid"].as_str().expect("ucan_cid").to_owned();
+
+            // caveats_binding uses the vector's declared ucan_cid, so it equals the
+            // vector's pinned KAT (§25.21) at every SDK tier byte-for-byte.
+            let binding_wrapper = scp
+                .outlet_stream_compute_caveats_binding(
+                    Buffer::from(ucan_cid.clone().into_bytes()),
+                    Buffer::from(request_id.to_vec()),
+                    invoker_did.clone(),
+                    estimated_chunk_count,
+                    Buffer::from(caveats_jcs.clone()),
+                )
+                .expect("napi binding wrapper");
+            let binding_core = compute_caveats_binding(
+                ucan_cid.as_bytes(),
+                &request_id,
+                &invoker_did,
+                estimated_chunk_count,
+                &caveats_jcs,
+            );
+            assert_eq!(
+                binding_wrapper.as_ref(),
+                binding_core.as_slice(),
+                "vector {}: NAPI caveats-binding export must match the core helper",
+                vector["name"]
+            );
+            let binding = <[u8; 32]>::try_from(binding_wrapper.as_ref()).expect("32 bytes");
+            let binding_hex = {
+                use std::fmt::Write as _;
+                let mut h = String::with_capacity(64);
+                for b in binding {
+                    let _ = write!(h, "{b:02x}");
+                }
+                h
+            };
+            assert_eq!(
+                binding_hex,
+                open["expected_caveats_binding"]
+                    .as_str()
+                    .expect("expected_caveats_binding"),
+                "vector {}: computed caveats_binding must equal the vector's pinned KAT",
+                vector["name"]
+            );
+
+            for chunk_desc in vector["chunks"].as_array().expect("chunks array") {
+                let sequence = chunk_desc["sequence"].as_u64().expect("sequence");
+                let payload = payload_from_vector(&chunk_desc["payload"]);
+                let sig = sign_chunk(
+                    &operator,
+                    VECTOR_CONTEXT_ID,
+                    &outlet_id,
+                    &request_id,
+                    sequence,
+                    &binding,
+                    &payload,
+                )
+                .expect("chunk signs under §25.2 key");
+                let chunk = OutletStreamChunk {
+                    request_id,
+                    sequence,
+                    payload,
+                    sig,
+                };
+                let chunk_bytes = serde_json::to_vec(&chunk).expect("chunk serializes");
+                assert!(
+                    scp.outlet_stream_verify_chunk_signature(
+                        Buffer::from(chunk_bytes.clone()),
+                        Buffer::from(operator_pk.clone()),
+                        VECTOR_CONTEXT_ID.to_owned(),
+                        outlet_id.clone(),
+                        Buffer::from(binding.to_vec()),
+                    )
+                    .expect("napi verify Ok"),
+                    "vector {} seq {sequence}: NAPI verify accepts the §25.2-signed chunk",
+                    vector["name"]
+                );
+                assert!(
+                    !scp.outlet_stream_verify_chunk_signature(
+                        Buffer::from(chunk_bytes),
+                        Buffer::from(wrong_pk.clone()),
+                        VECTOR_CONTEXT_ID.to_owned(),
+                        outlet_id.clone(),
+                        Buffer::from(binding.to_vec()),
+                    )
+                    .expect("napi verify false under wrong key"),
+                    "vector {} seq {sequence}: NAPI verify rejects a wrong key",
+                    vector["name"]
+                );
+                total_chunks += 1;
+            }
+        }
+        // 2 + 11 + 4 + 2 + 5 + 3 + 2 == 29 chunk descriptors across the 7 vectors.
+        assert_eq!(total_chunks, 29, "every chunk descriptor exercised");
+    }
+
+    /// `sequence_gap`: the receiver tracker cancels with `SCP-OUTLET-6131` at the
+    /// third chunk of the gapped `[0,1,3]` transcript (each chunk authentically
+    /// §25.2-signed and accepted by the NAPI verify export).
+    #[test]
+    fn sequence_gap_receiver_tracker_cancels_with_6131_through_napi() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let operator = ed25519_dalek::SigningKey::from_bytes(&REFERENCE_OPERATOR_SEED);
+        assert_eq!(
+            operator.verifying_key().as_bytes(),
+            &EXPECTED_OPERATOR_PK,
+            "the §25.2 reference seed must derive its ground-truth public key"
+        );
+        let operator_pk = operator.verifying_key().as_bytes().to_vec();
+        let caveats_jcs = InvocationCaveats::empty()
+            .to_canonical_json_bytes()
+            .expect("empty caveats JCS");
+
+        let doc = vectors();
+        let vector = doc["vectors"]
+            .as_array()
+            .expect("vectors array")
+            .iter()
+            .find(|v| v["name"] == "sequence_gap")
+            .expect("sequence_gap vector");
+        let open = &vector["open"];
+        let outlet_id = open["outlet_id"].as_str().expect("outlet_id").to_owned();
+        let invoker_did = open["invoker_did"]
+            .as_str()
+            .expect("invoker_did")
+            .to_owned();
+        let estimated_chunk_count =
+            u32::try_from(open["estimated_chunk_count"].as_u64().expect("estimate"))
+                .expect("estimate u32");
+        let request_id = request_id_from_open(open);
+        let ucan_cid = open["ucan_cid"].as_str().expect("ucan_cid").to_owned();
+        let binding = compute_caveats_binding(
+            ucan_cid.as_bytes(),
+            &request_id,
+            &invoker_did,
+            estimated_chunk_count,
+            &caveats_jcs,
+        );
+
+        // The tracker is a test-local reimplementation of the §5.4.5 receiver
+        // gap-cancel rule (a lossless same-context pump cannot produce a gap; the
+        // live trigger is slice-3 transport). It replays the vector's gapped
+        // transcript over a really-signed chunk sequence.
+        let mut tracker = ReceiverSequenceTracker::new();
+        let mut cancelled_at: Option<(u64, &'static str)> = None;
+        for chunk_desc in vector["chunks"].as_array().expect("chunks array") {
+            let sequence = chunk_desc["sequence"].as_u64().expect("sequence");
+            let payload = payload_from_vector(&chunk_desc["payload"]);
+            let sig = sign_chunk(
+                &operator,
+                VECTOR_CONTEXT_ID,
+                &outlet_id,
+                &request_id,
+                sequence,
+                &binding,
+                &payload,
+            )
+            .expect("gap chunk signs");
+            let chunk = OutletStreamChunk {
+                request_id,
+                sequence,
+                payload,
+                sig,
+            };
+            let chunk_bytes = serde_json::to_vec(&chunk).expect("serializes");
+            assert!(
+                scp.outlet_stream_verify_chunk_signature(
+                    Buffer::from(chunk_bytes),
+                    Buffer::from(operator_pk.clone()),
+                    VECTOR_CONTEXT_ID.to_owned(),
+                    outlet_id.clone(),
+                    Buffer::from(binding.to_vec()),
+                )
+                .expect("napi verify Ok"),
+                "gap transcript chunk seq {sequence} is authentically signed"
+            );
+            if cancelled_at.is_none()
+                && let Some(code) = tracker.observe(sequence)
+            {
+                cancelled_at = Some((sequence, code));
+            }
+        }
+        assert_eq!(
+            cancelled_at,
+            Some((3, CODE_STREAM_GAP)),
+            "receiver tracker cancels with SCP-OUTLET-6131 at gapped sequence 3"
+        );
+        assert_eq!(vector["expected_end_status"], "Cancelled");
+        assert_eq!(vector["expected_error_code"], CODE_STREAM_GAP);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SCP-OUT-039 (§5.4.5) — LIVE single-shot-seam vectors through the real NAPI
+// bridge. The `streaming_vectors` module above covers all-7-vector WIRE
+// INTEGRITY (pure wrappers); this section drives the ACTUAL open→poll→drain
+// control plane for the vectors the single-shot `BridgeStreamExecutor` seam CAN
+// produce — `non_streaming`, `error_terminal`, `cancellation` (the same set the
+// PyO3 reference drives live). `multi_chunk` / `error_recoverable` need a
+// multi-chunk executor the single-shot handler seam cannot produce, and
+// `credit_exhaustion`'s stall cannot be produced by a one-shot handler (it emits
+// exactly one billable chunk and closes) — those stay covered at the runtime
+// tiers (deliverables 2/3). These live tests reuse the same gated resolver/DID
+// seeding helpers as `live_poll_next_drains_to_terminal`. Named
+// `streaming_vectors_live` so the `streaming_vectors` test filter selects them
+// alongside the wire-integrity module above.
+// ---------------------------------------------------------------------------
+#[cfg(all(
+    feature = "allow_in_memory_custody",
+    feature = "testing",
+    feature = "outlet-capability-test-grant"
+))]
+mod streaming_vectors_live {
+    use super::*;
+
+    /// Fixture for a live SCP-OUT-039 vector stream: the retained `Scp` (owns the
+    /// bridge instance), the shared `bi`, the opened stream `handle_id`, and the
+    /// pinned invoker + a stranger DID (for the CRITICAL #1 caller check).
+    struct LiveVectorFixture {
+        _scp: crate::scp::Scp,
+        bi: std::sync::Arc<NapiBridgeInstance>,
+        handle_id: String,
+        invoker: String,
+        stranger: String,
+    }
+
+    /// Stands up a live zero-cost Action outlet stream driven by `handler`, mirroring
+    /// `live_poll_next_drains_to_terminal`'s setup exactly (per-instance resolver,
+    /// member seeding, OutletCallAll grant, delegated UCAN), and returns the opened
+    /// stream fixture. `outlet_name` disambiguates the outlet per test.
+    #[cfg(all(
+        feature = "allow_in_memory_custody",
+        feature = "testing",
+        feature = "outlet-capability-test-grant"
+    ))]
+    async fn open_live_vector_stream(
+        outlet_name: &str,
+        handler: crate::runtime::OutletHandler,
+    ) -> LiveVectorFixture {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let resolver_dht = install_seedable_resolver(&bi);
+
+        let creator_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (creator)");
+        let creator = creator_identity.inner.did.clone();
+        let invoker_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (invoker)");
+        let invoker = invoker_identity.inner.did.clone();
+        let stranger_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (stranger)");
+        let stranger = stranger_identity.inner.did.clone();
+
+        seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
+
+        let params = serde_json::json!({
+            "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+            "governance": "single_admin",
+            "memoryScope": "ephemeral",
+        })
+        .to_string();
+        let handle = crate::context::context_create_on(&bi, &creator_identity, params)
+            .await
+            .expect("context_create");
+        let ctx = handle.context_id();
+
+        let definition = crate::outlets::NapiOutletDefinition {
+            name: outlet_name.to_owned(),
+            description: "SCP-OUT-039 live vector outlet".to_owned(),
+            kind: crate::outlets::NapiOutletKind::Action,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: creator.clone(),
+            cost: None,
+        };
+        let outlet_id = crate::outlets::outlet_register_on(&bi, &handle, definition)
+            .await
+            .expect("outlet_register");
+
+        crate::runtime::register_outlet_handler(&bi, &ctx, &outlet_id, handler)
+            .expect("register_outlet_handler");
+
+        let supervisor = crate::runtime::supervisor(&bi).expect("supervisor");
+        supervisor
+            .test_insert_member(&ctx, scp_did::DID(invoker.clone()), "member")
+            .await
+            .expect("test_insert_member");
+        supervisor
+            .test_grant_member_capability(&ctx, scp_did::DID(invoker.clone()), "outlet_call:*")
+            .await
+            .expect("grant OutletCallAll");
+
+        let ucan = crate::ucan::ucan_mint_on(
+            &bi,
+            &handle,
+            invoker.clone(),
+            vec!["outlet_call:*".to_owned()],
+            None,
+        )
+        .await
+        .expect("ucan_mint");
+
+        let handle_id = outlet_stream_open_on(
+            &bi,
+            &handle,
+            outlet_id.clone(),
+            r#"{"a":"1","b":"2"}"#.to_owned(),
+            invoker.clone(),
+            ucan.encoded().clone(),
+            None,
+            None,
+            None,
+            Some(1),
+        )
+        .await
+        .expect("member invoker opens a live stream");
+
+        LiveVectorFixture {
+            _scp: scp,
+            bi,
+            handle_id,
+            invoker,
+            stranger,
+        }
+    }
+
+    /// `non_streaming` (§5.4.5 degenerate stream): the single-shot handler returns
+    /// the vector's aggregate; the live pump delivers exactly one `Data` chunk whose
+    /// value equals the vector's first Data, then the framework `End` closes it. The
+    /// delivered sequences are monotonic from 0.
+    #[cfg(all(
+        feature = "allow_in_memory_custody",
+        feature = "testing",
+        feature = "outlet-capability-test-grant"
+    ))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_streaming_vector_drains_data_then_end_live() {
+        use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk as Chunk};
+
+        // The vector's non_streaming Data payload value is {"sum":3}.
+        let handler: crate::runtime::OutletHandler =
+            std::sync::Arc::new(|_input| Ok(serde_json::json!({ "sum": 3 })));
+        let fx = open_live_vector_stream("napi_vec_non_streaming", handler).await;
+
+        let mut seqs = Vec::new();
+        let mut first_data_value = None;
+        let mut saw_end = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                outlet_stream_poll_next_on(&fx.bi, &fx.handle_id),
+            )
+            .await
+            .expect("poll_next resolves within 10s (fail fast, don't hang)")
+            {
+                Ok(Some(bytes)) => {
+                    let chunk: Chunk = serde_json::from_slice(&bytes).unwrap();
+                    seqs.push(chunk.sequence);
+                    match &chunk.payload {
+                        ChunkPayload::Data { value } if first_data_value.is_none() => {
+                            first_data_value = Some(value.clone());
+                        }
+                        ChunkPayload::End { .. } => {
+                            saw_end = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(saw_end, "non_streaming reaches a framework End terminal");
+        assert_eq!(
+            first_data_value,
+            Some(serde_json::json!({ "sum": 3 })),
+            "the delivered Data chunk carries the vector's {{\"sum\":3}} value"
+        );
+        assert!(
+            seqs.iter().enumerate().all(|(i, s)| *s == i as u64),
+            "delivered sequences are monotonic from 0: {seqs:?}"
+        );
+    }
+
+    /// `error_terminal` (§5.4.5): a faulting single-shot handler maps to a framework
+    /// terminal `Error{terminal:true, code:"SCP-OUTLET-6130"}` (execution.handler-panic).
+    #[cfg(all(
+        feature = "allow_in_memory_custody",
+        feature = "testing",
+        feature = "outlet-capability-test-grant"
+    ))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn error_terminal_vector_maps_handler_fault_to_6130_live() {
+        use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk as Chunk};
+
+        let handler: crate::runtime::OutletHandler =
+            std::sync::Arc::new(|_input| Err("handler fault".to_owned()));
+        let fx = open_live_vector_stream("napi_vec_error_terminal", handler).await;
+
+        let mut terminal_code = None;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                outlet_stream_poll_next_on(&fx.bi, &fx.handle_id),
+            )
+            .await
+            .expect("poll_next resolves within 10s (fail fast, don't hang)")
+            {
+                Ok(Some(bytes)) => {
+                    let chunk: Chunk = serde_json::from_slice(&bytes).unwrap();
+                    if let ChunkPayload::Error { code, terminal, .. } = &chunk.payload
+                        && *terminal
+                    {
+                        terminal_code = Some(code.clone());
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            terminal_code.as_deref(),
+            Some("SCP-OUTLET-6130"),
+            "a faulting handler yields a terminal Error with the execution-fault code"
+        );
+    }
+
+    /// `cancellation` (§5.4.5 cancel-ack): the pinned invoker's signed cancel through
+    /// the real control plane drives the stream to a framework terminal; a non-invoker
+    /// caller is rejected SCP-PERM-3001 (CRITICAL #1).
+    #[cfg(all(
+        feature = "allow_in_memory_custody",
+        feature = "testing",
+        feature = "outlet-capability-test-grant"
+    ))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_vector_control_plane_reaches_terminal_live() {
+        use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk as Chunk};
+
+        let handler: crate::runtime::OutletHandler =
+            std::sync::Arc::new(|_input| Ok(serde_json::json!({ "n": 0 })));
+        let fx = open_live_vector_stream("napi_vec_cancellation", handler).await;
+
+        // Drain the first Data chunk (parks on the live pump).
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            outlet_stream_poll_next_on(&fx.bi, &fx.handle_id),
+        )
+        .await
+        .expect("first poll resolves within 10s (fail fast, don't hang)")
+        .unwrap()
+        .expect("first poll returns the handler's Data chunk");
+        let first_chunk: Chunk = serde_json::from_slice(&first).unwrap();
+        assert!(matches!(first_chunk.payload, ChunkPayload::Data { .. }));
+
+        // CRITICAL #1: a non-invoker cancel is rejected before any signing.
+        let stranger_err = outlet_stream_cancel_on(&fx.bi, &fx.handle_id, &fx.stranger)
+            .await
+            .expect_err("a non-invoker cancel must be rejected");
+        assert!(
+            format!("{stranger_err}").contains(codes::PERM_3001),
+            "non-invoker cancel is rejected with SCP-PERM-3001: {stranger_err}"
+        );
+
+        // The pinned invoker's bridge-signed cancel must NOT be a signature/auth
+        // failure (SCP-OUTLET-6110); the stream may already be closing (benign race).
+        if let Err(e) = outlet_stream_cancel_on(&fx.bi, &fx.handle_id, &fx.invoker).await {
+            assert!(
+                !format!("{e}").contains("SCP-OUTLET-6110"),
+                "a correctly bridge-signed cancel must not be a signature/auth failure: {e}"
+            );
+        }
+
+        // Drain to a framework terminal chunk.
+        let mut saw_terminal = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                outlet_stream_poll_next_on(&fx.bi, &fx.handle_id),
+            )
+            .await
+            .expect("poll_next resolves within 10s (fail fast, don't hang)")
+            {
+                Ok(Some(bytes)) => {
+                    let chunk: Chunk = serde_json::from_slice(&bytes).unwrap();
+                    if chunk.payload.is_terminal() {
+                        saw_terminal = true;
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_terminal,
+            "the cancelled stream reaches a terminal chunk"
+        );
+    }
+}

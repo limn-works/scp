@@ -17,7 +17,7 @@ The following Ed25519 keypair is used across all test vectors for consistency. I
 
 **Ed25519 Public Key (32 bytes):**
 ```
-0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa3f4a18446b0b8d183f8e3
+0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 ```
 
 This is the RFC 8032 Section 7.1 Test Vector 1 keypair. Implementations that cannot reproduce this public key from the seed have a broken Ed25519 implementation and MUST NOT proceed with SCP interoperability testing.
@@ -465,7 +465,7 @@ Domain: `"SCP-KEY-CONTINUITY-V1:"`
 
 ```
 Input:
-  root_key (#0):    0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa3f4a18446b0b8d183f8e3 (32 bytes)
+  root_key (#0):    0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a (32 bytes)
   active_key (#active): 0x3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c (32 bytes)
   agent_key (#agent):   0xfc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025 (32 bytes)
 
@@ -852,3 +852,44 @@ Expected SHA-256 (= canonical_attestation_bytes output):
 The Ed25519 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5; Ed25519 is deterministic, so the reference implementation reproduces the same signature bytes on every run.
 
 This vector is mechanically enforced by `vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs`, which pins the expected hash, reconstructs the preimage byte-for-byte, and verifies the signed attestation through the production `verify_attestation` path.
+
+## 25.21 Outlet Streaming Conformance Vectors (§5.4.5)
+
+Progressive-output (streaming) outlet invocation (§5.4.5, ADR-061) is exercised by a shared set of 7 scenario vectors that pin the observable behaviour of a stream end-to-end: the ordered chunk transcript, the credit-grant timing, the cancellation billing boundary, and the terminal status recorded in the `OutletInvokedEvent` (`StreamTerminalStatus`, §5.4.5 "Event log shape"). Unlike the cryptographic known-answer vectors above, these are **behavioural** vectors — they carry payload *descriptors*, not literal signed wire bytes. Every chunk signature (`OutletStreamChunk.sig`) and every `caveats_binding` is **recomputed** by the harness at replay time under the §25.2 reference operator key (RFC 8032 §7.1 Test Vector 1, seed `0x9d61…7f60`), because the operator signature preimage (`SCP-OUTLET-CHUNK-SIG-V1:`, §5.4.5) binds the per-stream `request_id`, `sequence`, and `caveats_binding`, none of which are fixed until the stream is opened.
+
+The canonical vector file is `tests/conformance/vectors/outlet_stream_vectors.json` (top-level `{version, vectors:[7]}`). The four language SDKs consume the **same** JSON so the drain-side chunk decoding, credit granting, cancellation, and terminal-status mapping match the Rust core byte-for-byte across bindings.
+
+### Scenario matrix
+
+| Vector | Outlet kind | Scenario | `expected_end_status` | `expected_error_code` |
+|--------|-------------|----------|-----------------------|-----------------------|
+| `non_streaming` | action | Degenerate two-chunk stream (`Data` then `End`); the §5.4.5 "Non-streaming invocation" case | `Ok` | — |
+| `multi_chunk` | query | Ten `Data` chunks followed by `End`; ordered multi-chunk transcript (§5.4.5 ordering) | `Ok` | — |
+| `cancellation` | query | Signed `OutletCancel` mid-stream; cancel-ack terminal pins the billing boundary (§5.4.5 "Cancellation and billing boundary") | `Cancelled` | — |
+| `error_terminal` | action | Executor fault emits a terminal `Error{terminal:true}` (§5.4.5 billing: terminal `Error` before any billable `Data` refunds full escrow) | `Error` | `SCP-OUTLET-6130` |
+| `error_recoverable` | query | Non-terminal `Error{terminal:false}` is informational; the stream continues and closes `Ok` (§5.4.5 `ChunkPayload::Error` semantics) | `Ok` | — |
+| `sequence_gap` | query | Receiver observes a missing `sequence` (0,1,3 — 2 dropped) and MUST cancel (§5.4.5 "Ordering and gaps") | `Cancelled` | `SCP-OUTLET-6131` |
+| `credit_exhaustion` | query | Credit window of 1, no grant → the executor stalls past `stream_credit_stall_secs` → framework credit-stall terminal (§5.4.5 "Credit-based backpressure") | `Error` | `SCP-OUTLET-6133` |
+
+All rows cite §5.4.5. Sequences are strictly monotonic from `0`; the producer pump renumbers emitted chunks under its own outer cursor, so the runtime-driven replays assert monotonic-from-zero rather than the vector's literal sequence field (which is authoritative only for the receiver-side gap check).
+
+### Two error-code traps (do not conflate)
+
+- **`credit_exhaustion` → `SCP-OUTLET-6133` / `execution.credit-stall`**, NOT `6131`. The round-4 cancel-ack-vs-credit-stall split gave the credit-stall terminal its own dedicated code (`CODE_EXECUTION_CREDIT_STALL`, `crates/scp-protocol/src/context/outlets/error_codes.rs`). A window that reaches zero and is not replenished within `stream_credit_stall_secs` is `CreditStall` (`TerminateReason::CreditStall`), distinct from the cumulative-ceiling `execution.credit-exhausted` (6131).
+- **`sequence_gap` → `SCP-OUTLET-6131` / `execution.stream-gap`** (consolidated). `SLUG_EXECUTION_STREAM_GAP = "execution.stream-gap"` shares `CODE_EXECUTION_CREDIT` (`SCP-OUTLET-6131`) with `execution.credit-exhausted` and `execution.stream-cap-exhausted` — three Execution-class resource/ordering slugs under one code.
+
+### Replay locations
+
+The vectors are replayed at every layer so a regression at any tier is caught:
+
+| Layer | Location | Coverage |
+|-------|----------|----------|
+| Runtime (direct) | `crates/scp-testing/tests/integration/outlet_stream_conformance.rs` | All 7 through the raw `open_stream_session` dispatch pump; `sequence_gap` via the receiver tracker; `credit_exhaustion` via a real 1-second credit-stall timer. |
+| Runtime (through-open-path) | `crates/scp-testing/tests/integration/outlet_stream_vectors_through_open_path.rs` | All 7 through the real `Supervisor::open_outlet_stream` control path with context/outlet/member/UCAN registration and runtime-derived-cursor cancel signing. |
+| PyO3 bridge | `crates/scp-ffi/tests/outlet_stream_vectors_real.rs` | `non_streaming`, `cancellation`, `error_terminal` driven live through `outlet_stream_open`→`poll_next`→`grant_credit`/`cancel`; `sequence_gap` via the receiver tracker over a signed transcript; `multi_chunk`/`error_recoverable`/`credit_exhaustion` are covered at the runtime layer (the PyO3 handler seam is single-shot per `BridgeStreamExecutor`). |
+| NAPI bridge | `crates/scp-ffi/napi/src/outlet_stream/tests.rs` (`#[cfg(test)]` `mod streaming_vectors` + `mod streaming_vectors_live`) | Same live/runtime split, driven through the NAPI `_on` exports. Internal module, not an external `tests/` target: the napi addon is a `cdylib` whose runtime symbols only link under `#[cfg(test)]`, so an external test target cannot resolve them. `mod streaming_vectors` carries all-7-vector wire integrity + `sequence_gap`; `mod streaming_vectors_live` drives `non_streaming`/`cancellation`/`error_terminal` live. |
+| UniFFI bridge | `crates/scp-ffi/uniffi/tests/outlet_stream_vectors_real.rs` (external, all-7 wire integrity + `sequence_gap`) + `crates/scp-ffi/uniffi/src/outlet_stream/tests.rs` (`#[cfg(test)]` `mod streaming_vectors_live`) | The external target verifies wire integrity for all 7; the live open→poll of `non_streaming`/`cancellation`/`error_terminal` needs crate-internal setup seams (`Scp.inner` is `pub(crate)`), so it lives in the internal module. |
+| WASM (pure wrappers) | `crates/scp-client-wasm/src/lib.rs` (`#[cfg(test)]`) | For each of the 7 vectors, every chunk is signed under the §25.2 operator key and asserted `true` under `outletStreamVerifyChunkSignature` (and `false` under a wrong key); `outletStreamComputeCaveatsBinding` matches the core helper. WASM has no tokio runtime (ADR-034/057), so it verifies **wire integrity**, not terminal status. |
+| SDK drains | Python / TypeScript / Swift / Kotlin SDK smoke tests | Land via the SDK half of SCP-OUT-039, consuming this same vector JSON. |
+
+Because the PyO3/NAPI/UniFFI handler-registration seam produces a single aggregate value (`BridgeStreamExecutor`, `crates/scp-ffi/src/outlet_stream.rs`), the three multi-emission vectors — `multi_chunk` (10 `Data` chunks), `error_recoverable` (`Data` → non-terminal `Error` → `Data`), and `credit_exhaustion` (needs a second billable chunk to park past the window) — cannot be produced by a single-shot handler and are therefore **not faked** at the bridge layer; they are covered at the runtime tiers (every real-bridge test documents this deferral explicitly). `error_terminal` is NOT deferred — a single-shot handler that returns `Err` maps to the framework terminal `Error` `SCP-OUTLET-6130`, so it is driven live at all three bridges. The receiver-side `sequence_gap` check is a Rust-layer receiver tracker at every tier because a lossless same-context pump cannot produce a gap; the live gap trigger is slice-3 transport, and the SDK-drain gap detection is the SDK half of SCP-OUT-039. The tracker's emitted code is the consolidated `SCP-OUTLET-6131` (`execution.stream-gap`), a test-local reimplementation of the §5.4.5 receiver rule — when the slice-3 transport gap path lands, the production detector replaces the tracker.

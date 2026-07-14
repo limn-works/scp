@@ -88,5 +88,14 @@ path = "tests/e2e_bridge.rs"
 # harness (`new_in_memory_for_test`, `scp-platform/testing`).
 required-features = ["allow_in_memory_custody"]
 
+[[test]]
+# SCP-OUT-039 (C12) — outlet-streaming conformance vectors replayed through the
+# real PyO3 bridge exports. The pure tests (schema + receiver-gap tracker) need
+# only the in-memory harness; the live-bridge tests additionally gate on
+# `testing` + `outlet-capability-test-grant` (see the `live` module).
+name = "outlet_stream_vectors_real"
+path = "tests/outlet_stream_vectors_real.rs"
+required-features = ["allow_in_memory_custody"]
+
 [lints]
 workspace = true

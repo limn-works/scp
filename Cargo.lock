@@ -5660,6 +5660,8 @@ dependencies = [
  "scp-identity",
  "scp-node",
  "scp-platform",
+ "scp-protocol",
+ "scp-runtime",
  "scp-transport",
  "serde",
  "serde_json",

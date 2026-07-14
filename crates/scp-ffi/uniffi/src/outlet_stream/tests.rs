@@ -485,3 +485,301 @@ async fn live_poll_next_drains_to_terminal() {
         "post-terminal poll is a not-found error: {after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SCP-OUT-039 (§5.4.5) — LIVE single-shot-seam vectors through the real UniFFI
+// bridge. The EXTERNAL `crates/scp-ffi/uniffi/tests/outlet_stream_vectors_real.rs`
+// carries all-7-vector WIRE INTEGRITY (pure wrappers); the LIVE open→poll→drain
+// control plane requires crate-internal setup seams (`Scp.inner` is `pub(crate)`,
+// handler registration goes through `handle.outlet_handlers`, member seeding
+// through the `bi`-scoped supervisor), so it lives here as an internal module.
+// This drives the vectors the single-shot `BridgeStreamExecutor` seam CAN produce
+// — `non_streaming`, `error_terminal`, `cancellation` (the same set the PyO3
+// reference drives live). `multi_chunk` / `error_recoverable` need a multi-chunk
+// executor and `credit_exhaustion`'s stall cannot be produced by a one-shot
+// handler; those stay covered at the runtime tiers (deliverables 2/3). Named
+// `streaming_vectors_live` so the `streaming_vectors` test filter selects it.
+// ---------------------------------------------------------------------------
+#[cfg(all(
+    feature = "allow_in_memory_custody",
+    feature = "testing",
+    feature = "outlet-capability-test-grant"
+))]
+mod streaming_vectors_live {
+    use super::*;
+
+    /// Fixture for a live SCP-OUT-039 vector stream: the retained `Scp` (owns the
+    /// bridge instance), the shared `bi`, the opened stream `handle_id`, and the
+    /// pinned invoker + a stranger DID (for the CRITICAL #1 caller check).
+    struct LiveVectorFixture {
+        _scp: Arc<crate::scp::Scp>,
+        bi: Arc<UniffiBridgeInstance>,
+        handle_id: String,
+        invoker: String,
+        stranger: String,
+    }
+
+    /// Stands up a live zero-cost Action outlet stream driven by `handler`,
+    /// mirroring `live_poll_next_drains_to_terminal`'s setup exactly, and returns
+    /// the opened stream fixture. `outlet_name` disambiguates the outlet per test.
+    async fn open_live_vector_stream(
+        outlet_name: &str,
+        handler: OutletHandler,
+    ) -> LiveVectorFixture {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+
+        let resolver_dht = install_seedable_resolver(&bi);
+
+        let creator_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (creator)");
+        let creator = creator_identity.did.clone();
+        let invoker_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (invoker)");
+        let invoker = invoker_identity.did.clone();
+        let stranger_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (stranger)");
+        let stranger = stranger_identity.did.clone();
+
+        seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
+
+        let handle = scp
+            .context_create(
+                Arc::clone(&creator_identity),
+                streaming_context_params(&[
+                    "outlet:call:*",
+                    "messages:read",
+                    "messages:write",
+                    "governance:propose",
+                ]),
+            )
+            .await
+            .expect("context_create");
+        let ctx = handle.context_id.clone();
+
+        let definition = crate::bridge::OutletDefinition {
+            name: outlet_name.to_owned(),
+            description: "SCP-OUT-039 live vector outlet".to_owned(),
+            kind: crate::bridge::OutletKind::Action,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: creator.clone(),
+            cost: None,
+        };
+        let outlet_id = scp
+            .outlet_register(Arc::clone(&handle), definition)
+            .await
+            .expect("outlet_register");
+
+        handle
+            .outlet_handlers
+            .lock()
+            .await
+            .insert(outlet_id.clone(), handler);
+
+        let supervisor = Arc::clone(
+            bi.context_manager_expect()
+                .expect("supervisor must be initialized"),
+        );
+        supervisor
+            .test_insert_member(&ctx, scp_did::DID(invoker.clone()), "member")
+            .await
+            .expect("test_insert_member");
+        supervisor
+            .test_grant_member_capability(&ctx, scp_did::DID(invoker.clone()), "outlet_call:*")
+            .await
+            .expect("grant OutletCallAll");
+
+        let ucan = scp
+            .ucan_mint(
+                Arc::clone(&handle),
+                invoker.clone(),
+                vec!["outlet_call:*".to_owned()],
+                None,
+            )
+            .await
+            .expect("ucan_mint");
+
+        let handle_id = outlet_stream_open_impl(
+            &bi,
+            &handle,
+            outlet_id.clone(),
+            r#"{"a":"1","b":"2"}"#.to_owned(),
+            invoker.clone(),
+            ucan.encoded(),
+            None,
+            None,
+            None,
+            Some(1),
+        )
+        .await
+        .expect("member invoker opens a live stream");
+
+        LiveVectorFixture {
+            _scp: scp,
+            bi,
+            handle_id,
+            invoker,
+            stranger,
+        }
+    }
+
+    /// `non_streaming` (§5.4.5 degenerate stream): the single-shot handler returns
+    /// the vector's aggregate; the live pump delivers one `Data` chunk whose value
+    /// equals the vector's first Data, then the framework `End` closes it, with
+    /// monotonic-from-0 sequences.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_streaming_vector_drains_data_then_end_live() {
+        use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk as Chunk};
+
+        let handler: OutletHandler = Arc::new(|_input| Ok(serde_json::json!({ "sum": 3 })));
+        let fx = open_live_vector_stream("uniffi_vec_non_streaming", handler).await;
+
+        let mut seqs = Vec::new();
+        let mut first_data_value = None;
+        let mut saw_end = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                outlet_stream_poll_next_impl(&fx.bi, &fx.handle_id),
+            )
+            .await
+            .expect("poll_next resolves within 10s (fail fast, don't hang)")
+            {
+                Ok(Some(bytes)) => {
+                    let chunk: Chunk = serde_json::from_slice(&bytes).unwrap();
+                    seqs.push(chunk.sequence);
+                    match &chunk.payload {
+                        ChunkPayload::Data { value } if first_data_value.is_none() => {
+                            first_data_value = Some(value.clone());
+                        }
+                        ChunkPayload::End { .. } => {
+                            saw_end = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(saw_end, "non_streaming reaches a framework End terminal");
+        assert_eq!(
+            first_data_value,
+            Some(serde_json::json!({ "sum": 3 })),
+            "the delivered Data chunk carries the vector's {{\"sum\":3}} value"
+        );
+        assert!(
+            seqs.iter().enumerate().all(|(i, s)| *s == i as u64),
+            "delivered sequences are monotonic from 0: {seqs:?}"
+        );
+    }
+
+    /// `error_terminal` (§5.4.5): a faulting single-shot handler maps to a
+    /// framework terminal `Error{terminal:true, code:"SCP-OUTLET-6130"}`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn error_terminal_vector_maps_handler_fault_to_6130_live() {
+        use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk as Chunk};
+
+        let handler: OutletHandler = Arc::new(|_input| Err("handler fault".to_owned()));
+        let fx = open_live_vector_stream("uniffi_vec_error_terminal", handler).await;
+
+        let mut terminal_code = None;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                outlet_stream_poll_next_impl(&fx.bi, &fx.handle_id),
+            )
+            .await
+            .expect("poll_next resolves within 10s (fail fast, don't hang)")
+            {
+                Ok(Some(bytes)) => {
+                    let chunk: Chunk = serde_json::from_slice(&bytes).unwrap();
+                    if let ChunkPayload::Error { code, terminal, .. } = &chunk.payload
+                        && *terminal
+                    {
+                        terminal_code = Some(code.clone());
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            terminal_code.as_deref(),
+            Some("SCP-OUTLET-6130"),
+            "a faulting handler yields a terminal Error with the execution-fault code"
+        );
+    }
+
+    /// `cancellation` (§5.4.5 cancel-ack): the pinned invoker's signed cancel
+    /// through the real control plane drives the stream to a framework terminal; a
+    /// non-invoker caller is rejected SCP-PERM-3001 (CRITICAL #1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_vector_control_plane_reaches_terminal_live() {
+        use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk as Chunk};
+
+        let handler: OutletHandler = Arc::new(|_input| Ok(serde_json::json!({ "n": 0 })));
+        let fx = open_live_vector_stream("uniffi_vec_cancellation", handler).await;
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            outlet_stream_poll_next_impl(&fx.bi, &fx.handle_id),
+        )
+        .await
+        .expect("first poll resolves within 10s (fail fast, don't hang)")
+        .unwrap()
+        .expect("first poll returns the handler's Data chunk");
+        let first_chunk: Chunk = serde_json::from_slice(&first).unwrap();
+        assert!(matches!(first_chunk.payload, ChunkPayload::Data { .. }));
+
+        let stranger_err = outlet_stream_cancel_impl(&fx.bi, &fx.handle_id, &fx.stranger)
+            .await
+            .expect_err("a non-invoker cancel must be rejected");
+        assert!(
+            format!("{stranger_err}").contains(codes::PERM_3001),
+            "non-invoker cancel is rejected with SCP-PERM-3001: {stranger_err}"
+        );
+
+        if let Err(e) = outlet_stream_cancel_impl(&fx.bi, &fx.handle_id, &fx.invoker).await {
+            assert!(
+                !format!("{e}").contains("SCP-OUTLET-6110"),
+                "a correctly bridge-signed cancel must not be a signature/auth failure: {e}"
+            );
+        }
+
+        let mut saw_terminal = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                outlet_stream_poll_next_impl(&fx.bi, &fx.handle_id),
+            )
+            .await
+            .expect("poll_next resolves within 10s (fail fast, don't hang)")
+            {
+                Ok(Some(bytes)) => {
+                    let chunk: Chunk = serde_json::from_slice(&bytes).unwrap();
+                    if chunk.payload.is_terminal() {
+                        saw_terminal = true;
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_terminal,
+            "the cancelled stream reaches a terminal chunk"
+        );
+    }
+}
