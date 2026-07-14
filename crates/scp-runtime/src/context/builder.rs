@@ -276,8 +276,10 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// log-insert time if the recorded aggregates diverge. On success it
     /// serializes the event and delegates to `append_event`, which re-runs the
     /// durable event-local backstop. This is the verified-append boundary for
-    /// the paths that retain the payload set — cross-context reassembly / import
-    /// (slice 3). The same-context streaming pump does NOT route through here: it
+    /// the cross-context receiver-side recording (SCP-OUT-036 AC7; §5.4.5:566) —
+    /// the path that retains the payload set to re-derive the manifest over its
+    /// independently-reassembled chunk sequence. The same-context streaming pump
+    /// does NOT route through here: it
     /// does not retain the chunk sequence and persists via `append_event`,
     /// enforcing same-context integrity inline
     /// (`AuditAnomaly::ChunksBilledSelfMismatch`) plus the event-local backstop.

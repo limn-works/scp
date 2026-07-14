@@ -1607,8 +1607,10 @@ pub const fn verify_outlet_invoked_event_local(
 /// [`verify_chunks_billed`] AND checks
 /// `stream_manifest_hash == compute_chunk_manifest_root(chunks)` and
 /// `stream_chunk_count == chunks.len()`. This applies only where the chunk
-/// sequence is retained — the Sequence path (cross-context reassembly / import,
-/// slice 3). The same-context dispatch pump does not retain the payload set and
+/// sequence is retained — the cross-context receiver-side recording boundary
+/// (SCP-OUT-036 AC7; §5.4.5:566), where a context re-derives the manifest over
+/// its independently-reassembled chunk sequence. The same-context dispatch pump
+/// does not retain the payload set and
 /// enforces same-context integrity via the inline
 /// `AuditAnomaly::ChunksBilledSelfMismatch` check plus the event-local `<=`
 /// backstop ([`verify_outlet_invoked_event_local`]), not this function.
