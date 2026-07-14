@@ -216,7 +216,7 @@ async fn dispatch_actor_inner(
             handle_clear_needs_reconnect_actor(cell, &context_id, reply)
         }
         LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
-            handle_issue_mls_update_actor(cell, deps, &context_id, reply)
+            handle_issue_mls_update_actor(cell, deps, &context_id, reply).await
         }
     }
 }
@@ -682,14 +682,12 @@ fn handle_clear_needs_reconnect_actor(
 /// advances the group epoch locally. Replies with the TLS-serialized MLS
 /// Commit bytes for the caller to distribute to all members. Used by the
 /// reconnection driver's Phase 5.
-fn handle_issue_mls_update_actor(
+async fn handle_issue_mls_update_actor(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
 ) -> Outcome<()> {
-    use crate::context::state::context_id_to_bytes;
-
     // Broadcast contexts have no MLS group — an Update is meaningless.
     // Pure read via `Deref` on the cell.
     if cell.broadcast_context.is_some() {
@@ -699,34 +697,37 @@ fn handle_issue_mls_update_actor(
         return Outcome::ok(());
     }
 
-    let ctx_id_bytes = context_id_to_bytes(context_id);
-    let result = deps
-        .crypto
-        .advance_epoch(&ctx_id_bytes)
-        .map(|out| out.commit_bytes);
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001, advance_epoch ruling): the MLS epoch
+    // advance is §9 Class-S — the MLS ratchet AND the `mls_epoch` counter that
+    // `LocalMlsEpoch` reads must be durable before ack (a coalesced roll-back
+    // would leave remaining members on a new epoch while this node still reports
+    // the old one). Drive the actor's `advance_epoch` inside `commit_class_s_keep`
+    // -> `rest_mut` so both ride the ONE fail-closed persist. The former SEPARATE
+    // coalesced `epoch.mls_epoch += 1` mirror (an artifact of the old
+    // provider-authoritative arch, where the provider ratcheted and the actor only
+    // shadowed) is subsumed here: the actor `advance_epoch` ratchets the group but
+    // does not itself bump the `mls_epoch` scalar, so the single authoritative bump
+    // now lives in the Class-S closure. `wrapping_public_key` comes from the
+    // retained `deps.crypto.wrapping_keypair()`.
+    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    let result = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            let out = s.advance_epoch(wrapping_public_key)?;
+            s.epoch.mls_epoch = s.epoch.mls_epoch.saturating_add(1);
+            Ok(out.commit_bytes)
+        })
+        .await;
 
-    // advance_epoch ratchets the supervisor-owned MLS group to a new
-    // epoch; mirror the local epoch onto actor-owned state so a
-    // subsequent LocalMlsEpoch query reflects the advance. This is a
-    // COALESCED Class-C mutation (the run loop persists on `mutated`), so it
-    // routes through the non-persisting `class_c_view`.
-    let mutated = if result.is_ok() {
-        let mut view = cell.class_c_view();
-        let epoch = view.epoch_mut();
-        epoch.mls_epoch = epoch.mls_epoch.saturating_add(1);
-        true
-    } else {
-        false
-    };
-
+    let mutated = result.is_ok();
     let _ = reply.send(result);
     if mutated {
         Outcome::ok_mutated(())
     } else {
-        // advance_epoch failed — the early `result.is_ok()` branch did NOT
-        // bump the epoch, so no actor-owned state changed. Report an
-        // unmutated error so the actor's post-dispatch persistence does not
-        // treat this turn as dirtying state.
+        // advance_epoch (or its fail-closed persist) failed — preserve the
+        // handler's existing disposition: report an unmutated error so the
+        // post-dispatch persistence does not treat this turn as dirtying state
+        // (the fail-closed persist inside the combinator is authoritative).
         Outcome::err(ContextError::CryptoFailed(format!(
             "IssueMlsUpdate failed for context {context_id}"
         )))

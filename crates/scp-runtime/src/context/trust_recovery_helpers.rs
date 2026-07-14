@@ -230,12 +230,22 @@ pub async fn recovery_advance_epoch(
     // 1. Validate the context is active.
     require_active(&cell.handle)?;
 
-    // 2. Perform the MLS epoch advance (Update + self-Commit). Operates
-    //    on the supervisor-scoped `MlsCryptoProvider` contexts map; this
-    //    will move onto `state.mode` directly when the MLS provider
-    //    dissolves (plan §"MlsCryptoProvider dissolution"). If this
-    //    fails the bookkeeping counter is NOT incremented.
-    let epoch_output = deps.crypto.advance_epoch(&context_id_bytes)?;
+    // 2. Perform the MLS epoch advance (Update + self-Commit). ADR-049 PR-7
+    //    (SCP-CRYPTOMOVE-001): now driven on the actor `state.mode` via
+    //    `commit_class_s_keep` -> `rest_mut` — §9 Class-S, the ratchet is durable
+    //    before the Commit is broadcast (this is the highest-stakes safety-gated
+    //    advance; see the broadcast note below). `wrapping_public_key` from the
+    //    retained `deps.crypto.wrapping_keypair()`. If this fails (or its
+    //    fail-closed persist fails) the error `?`-propagates and the bookkeeping
+    //    counter is NOT incremented — disposition preserved.
+    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    let epoch_commit_bytes = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            v.rest_mut()
+                .advance_epoch(wrapping_public_key)
+                .map(|out| out.commit_bytes)
+        })
+        .await?;
 
     // 2b. Broadcast the MLS Commit to all members so they advance their group
     //     epoch and ratchet key material AWAY from the compromised keys. Broadcast
@@ -252,7 +262,7 @@ pub async fn recovery_advance_epoch(
     if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
-        epoch_output.commit_bytes,
+        epoch_commit_bytes,
         &CommitOperation::RecoveryAdvanceEpoch,
     )
     .await

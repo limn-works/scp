@@ -2927,7 +2927,12 @@ pub async fn execute_rotate_content_keys(
                 bc.rotate_all_author_keys()?;
                 None
             } else {
-                let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
+                // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): advance the MLS epoch on the
+                // actor state (already inside this fail-closed `commit_class_s_keep`
+                // closure — §9 Class-S). `wrapping_public_key` from the retained
+                // `deps.crypto.wrapping_keypair()`. Behavior otherwise unchanged
+                // (content-key rotation does not touch the `mls_epoch` mirror).
+                let epoch_out = state.advance_epoch(deps.crypto.wrapping_keypair().0)?;
 
                 let member_dids: Vec<String> = state
                     .membership
