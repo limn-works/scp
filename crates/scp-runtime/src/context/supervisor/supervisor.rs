@@ -3610,7 +3610,7 @@ impl Supervisor {
     ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_trust_recovery_command(
-        &self,
+        self: &Arc<Self>,
         cmd: TrustRecoveryCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // Phase 2A.1 of ADR-049 — trust_recovery is the first migrated
@@ -3699,7 +3699,7 @@ impl Supervisor {
     ///   providers attached, or a closed reply channel surfacing as
     ///   [`ContextError::TransportFailed`]).
     async fn recovery_notify_contact(
-        &self,
+        self: &Arc<Self>,
         recovering_did: &str,
         contact_did: &str,
         payload: &[u8],
@@ -3783,7 +3783,10 @@ impl Supervisor {
     /// erroring — this is a supported operation, not an unknown-context
     /// fault.
     #[allow(clippy::too_many_lines)] // flat match over every trust-recovery variant
-    async fn dispatch_trust_recovery_direct(&self, cmd: TrustRecoveryCommand) -> Outcome<()> {
+    async fn dispatch_trust_recovery_direct(
+        self: &Arc<Self>,
+        cmd: TrustRecoveryCommand,
+    ) -> Outcome<()> {
         const TRUST_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
@@ -3846,32 +3849,20 @@ impl Supervisor {
             }
             // Unlike the other per-context recovery variants, a
             // `RecoverySendNotification` to an unregistered context is a
-            // legitimate, supported operation. This direct path is reached
-            // for ANY context with no live actor at recovery time (ADR-049
-            // lazy-spawn), of two distinct shapes:
-            //   - the synthetic `identity-private-state` pseudo-context (PSK
-            //     rotation, spec §9.12 step 6), deliberately never registered
-            //     as a per-context actor; and
-            //   - real (64-hex) member contexts during compromise recovery —
-            //     the `revoke_ucans` (seq 1) and `rotate_key_packages` (seq 2)
-            //     steps in `identity/recovery.rs` dispatch real member ids with
-            //     no registration gate.
-            // Both need only the supervisor-shared crypto + transport
-            // providers — no per-context membership, governance, or MLS group
-            // state. Seal and send directly through the shared providers,
-            // keying through the canonical ADR-056 chokepoint
-            // `context_id_to_bytes` so the seal lands in the same slot as the
-            // registered-actor handler's `recovery_send_notification` (the
-            // decoded 32-byte digest for a real id, the hashed synthetic label
-            // otherwise). The envelope's `inner.epoch` is hardcoded to 0: the
-            // direct path has no per-context actor state to read `mls_epoch`
-            // from. This is safe because `inner.epoch` is a signed *plaintext*
-            // field that is NOT AAD-bound — the epoch the AAD does bind is the
-            // *sender-key* epoch, drawn from real crypto state inside `seal`,
-            // not this envelope field — and the recipient's recovery handler
-            // ignores `inner.epoch` entirely, so the hardcoded 0 does not
-            // affect openability even when a real unregistered member context
-            // has a digest-keyed MLS group at a non-zero MLS epoch.
+            // legitimate, supported operation. Since PR-7 moved the MLS crypto
+            // state onto the per-context actor (one-way take), the direct path
+            // no longer seals through the retired supervisor-scoped provider: it
+            // lazily respawns the target context's actor from its persisted
+            // snapshot and dispatches the notification to that actor's mailbox,
+            // where the actor-shape `recovery_send_notification` handler seals
+            // through the authoritative owned `ContextCryptoState`. Real
+            // (64-hex) member contexts (`revoke_ucans` seq 1 /
+            // `rotate_key_packages` seq 2) respawn and seal via the mailbox; the
+            // synthetic `identity-private-state` pseudo-context (PSK rotation
+            // §9.12 step 6) is non-64-hex with no snapshot and no production MLS
+            // group, so it returns the same "no MLS group" error the retired
+            // provider seal produced (best-effort no-op). See
+            // `recovery_send_notification_direct` for the full contract.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
                 let signing_key = payload.signing_key.to_signing_key();
                 let send_result = self
@@ -3898,122 +3889,171 @@ impl Supervisor {
         }
     }
 
-    /// Seals and sends a recovery notification for a context with no
-    /// registered actor, using only the supervisor-shared crypto and
-    /// transport providers (ADR-049 §9.12).
+    /// Delivers a recovery notification for a context with no live actor by
+    /// lazily respawning that actor from its persisted snapshot and dispatching
+    /// the notification to its mailbox (ADR-049 §9.12, PR-7 SCP-CRYPTOMOVE-001).
     ///
-    /// This is the supervisor-direct twin of the per-context actor's
+    /// This is the supervisor-direct fallback for the per-context actor's
     /// [`recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification)
-    /// helper, reached when the target context has no registered actor.
-    /// It is used by identity-scoped recovery steps — chiefly PSK
-    /// rotation (step 6) — whose synthetic `identity-private-state`
-    /// pseudo-context is never registered as a per-context actor. Because
-    /// no MLS group exists for that synthetic context, the envelope is
-    /// constructed with `epoch == 0`, exactly as the registered-actor
-    /// handler does when `state.epoch.mls_epoch` is its default 0.
+    /// handler, reached when the target context has no registered actor. Since
+    /// PR-7 moved the MLS crypto state onto the per-context actor (one-way
+    /// take), this path can no longer seal through the retired supervisor-scoped
+    /// provider; it instead respawns the actor so the notification is sealed by
+    /// the authoritative owned `ContextCryptoState` (the actor drives the
+    /// persist-before-ack send sequence, so the reserved AAD sequence is
+    /// nonce-safe — no risk of the transient-materialize `(epoch, sequence)`
+    /// reuse the seal fork rejected).
     ///
-    /// This direct path is reached for ANY context with no live actor at
-    /// recovery time (ADR-049 lazy-spawn), NOT only the synthetic
-    /// pseudo-context. Two distinct callers exercise it:
+    /// Two shapes reach here at recovery time (ADR-049 lazy-spawn):
     ///
-    /// - The synthetic `identity-private-state` pseudo-context (PSK
-    ///   rotation §9.12 step 6), which is never a real (64-hex) context id.
-    /// - Real (64-hex) member contexts that simply have no spawned actor at
-    ///   recovery time — e.g. the
-    ///   [`revoke_ucans`](crate::identity::recovery) (seq 1) and
+    /// - Real (64-hex) member contexts that simply have no spawned actor —
+    ///   e.g. the [`revoke_ucans`](crate::identity::recovery) (seq 1) and
     ///   [`rotate_key_packages`](crate::identity::recovery) (seq 2)
     ///   compromise-recovery notifications, which dispatch to a real member
-    ///   context id with no registration gate.
-    ///
-    /// Because both shapes reach here, the seal MUST key off the canonical
-    /// ADR-056 resolver [`context_id_to_bytes`](crate::context::state::context_id_to_bytes):
-    /// it decodes a real 64-hex id to its 32-byte digest — matching the
-    /// registered-actor handler
-    /// [`recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification),
-    /// which also keys via that resolver — and hashes a synthetic, non-64-hex
-    /// label via `SHA-256`. The raw
-    /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive
-    /// must NOT be used here: on a real id it would compute
-    /// `SHA-256(hex(digest))`, double-hashing and keying a slot no member
-    /// listens on — the ADR-056 fail-open. The relay routing ID is taken from
-    /// the domain-separated
-    /// [`context_routing_id`](scp_protocol::context::context_routing_id),
-    /// which requires no per-context state.
+    ///   context id with no registration gate. These respawn from their
+    ///   persisted Active snapshot and seal via the mailbox. In practice
+    ///   `restore_on_startup` eagerly spawns an actor for every persisted
+    ///   Active context, so live recovery flows normally reach the mailbox
+    ///   directly; this fallback covers only the transient crash-respawn gap.
+    /// - The synthetic `identity-private-state` pseudo-context (PSK rotation
+    ///   §9.12 step 6), which is never a real (64-hex) context id, never a
+    ///   registered actor, and has no persisted snapshot. In production it has
+    ///   no MLS group (`seed_identity_private_state_group` is test-only), so the
+    ///   retired provider seal ALSO failed "no MLS group" and was swallowed
+    ///   (`rotate_psk` returns false — a best-effort no-op). This method
+    ///   preserves that exact contract: it returns the same "no MLS group"
+    ///   [`ContextError::CryptoFailed`] for any non-64-hex id WITHOUT attempting
+    ///   a snapshot respawn that cannot exist (which would emit a spurious
+    ///   "state is lost" error and consume the crash budget on every rotation).
+    ///   Whether production PSK delivery SHOULD work is a pre-existing question,
+    ///   tracked separately — not changed here.
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no crypto / transport / clock
-    ///   provider has been attached to the supervisor.
-    /// - [`ContextError::CryptoFailed`] if envelope signing or sealing
-    ///   fails.
-    /// - Any [`ContextError`] surfaced by the transport's `send_message`.
-    async fn recovery_send_notification_direct(
-        &self,
+    /// - [`ContextError::CryptoFailed`] ("no MLS group for this context") for a
+    ///   non-64-hex synthetic id — the preserved best-effort no-op contract.
+    /// - [`ContextError::ActorCrashed`] if a real context cannot be respawned
+    ///   (genuinely lost snapshot) or the respawned actor vanishes before
+    ///   dispatch — fail-closed and retryable.
+    /// - [`ContextError::TransportFailed`] if the mailbox reply channel closes.
+    /// - Any [`ContextError`] surfaced by the actor-shape handler's seal /
+    ///   transport send.
+    // Manual `Box::pin(async move { … })` (NOT `async fn`) is REQUIRED, not a
+    // stack optimization: this method is transitively reachable from a spawned
+    // `ContextActor::run()` future (via the actor-shape cross-context
+    // `recovery_notify_contact` → `dispatch_recovery_send_notification`), and it
+    // calls `respawn_from_snapshot`, which constructs a fresh `run()` future to
+    // `tokio::spawn`. As an `async fn` its opaque return type would make
+    // `run()`'s type/`Send` inference cyclic (`run` ⊇ … ⊇
+    // `recovery_send_notification_direct` ⊇ `respawn` ⊇ `run`) and fail to
+    // resolve (E0391). Returning an explicit `Pin<Box<dyn Future + Send>>`
+    // erases this method's opaque type: `run()`'s inference sees a trait object
+    // that is `Send` by declaration and stops descending into the recursive
+    // concrete type, breaking the cycle. Owned copies of the borrowed arguments
+    // are captured so the returned future borrows only `self` (`&Arc<Self>`).
+    fn recovery_send_notification_direct<'a>(
+        self: &'a Arc<Self>,
         context_id: &str,
         sender_did: &str,
         payload: &[u8],
         sequence: u64,
         signing_key: &ed25519_dalek::SigningKey,
-    ) -> Result<(), ContextError> {
-        let not_init = || {
-            ContextError::NotInitialized(
-                "recovery_send_notification_direct: providers not attached".to_owned(),
-            )
-        };
-        let crypto = self.crypto_ref().ok_or_else(not_init)?;
-        let transport = self.transport_ref().ok_or_else(not_init)?;
-        let clock = self.clock_ref().ok_or_else(not_init)?;
-
-        // Resolve the keying bytes through the canonical ADR-056 chokepoint
-        // (see the doc comment above). This path is reached for ANY
-        // unregistered context: the synthetic `identity-private-state`
-        // pseudo-context (PSK rotation §9.12 step 6, hashed because it is a
-        // non-64-hex label) AND real (64-hex) member contexts with no live
-        // actor — e.g. the `revoke_ucans` / `rotate_key_packages` compromise-
-        // recovery notifications, which decode to their 32-byte digest. Using
-        // the raw `context_id_bytes` primitive here would double-hash a real id
-        // (`SHA-256(hex(digest))`) and key a slot no member listens on, the
-        // ADR-056 fail-open. The resolver matches the registered-actor handler
-        // `recovery_send_notification`, so both paths key the same slot.
-        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
-
-        // No MLS group exists for an unregistered context, so the epoch is
-        // 0 — matching the registered-actor handler's behaviour when
-        // `state.epoch.mls_epoch` holds its default value.
-        let current_epoch = 0;
-
-        let timestamp = clock.now_millis();
-        let params = scp_protocol::envelope::inner::InnerEnvelopeParams {
-            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-            context_id,
-            sender_did,
-            epoch: current_epoch,
-            generation: 0,
-            sequence,
-            timestamp,
-            message_type: scp_protocol::envelope::inner::MessageType::Recovery,
-            payload,
-            provenance: None,
-            signing_key_id: scp_did::SigningKeyId::Active,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ContextError>> + Send + 'a>>
+    {
+        use crate::context::actor::commands::{
+            ContextCommand, RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
         };
 
-        let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let context_id = context_id.to_owned();
+        let sender_did = sender_did.to_owned();
+        let payload = payload.to_vec();
+        let signing_key = signing_key.clone();
 
-        // Domain-separated routing ID for relay routing, distinct from the
-        // canonical-resolver `context_id_bytes` (digest for a real id, hash of
-        // a synthetic label) used above for MLS crypto keying.
-        let routing_id = scp_protocol::context::context_routing_id(context_id);
-        let encrypted = crypto.seal(
-            &context_id_bytes,
-            &inner,
-            &routing_id,
-            300, // 5 minute blob TTL
-        )?;
+        Box::pin(async move {
+            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) lazy-spawn seal: the per-context
+            // MLS crypto state is now OWNED by the context's actor (one-way take),
+            // so a recovery notification can no longer seal through the retired
+            // supervisor-scoped provider. Instead, respawn the target context's
+            // actor from its persisted snapshot and dispatch the notification to
+            // its mailbox, where the actor-shape `recovery_send_notification`
+            // handler seals through the authoritative owned `ContextCryptoState`
+            // (nonce-safe: the actor drives the persist-before-ack send sequence).
+            //
+            // Only a REAL (64-hex) context id — decodable by the ADR-056 chokepoint
+            // `context_id_to_bytes` — can be respawned. The synthetic
+            // `identity-private-state` pseudo-context (PSK rotation §9.12 step 6) is
+            // never a registered actor and has NO persisted snapshot, and in
+            // production has no MLS group at all (`seed_identity_private_state_group`
+            // is test-only), so the retired provider seal ALSO failed with "no MLS
+            // group" and was swallowed (`rotate_psk` returned false — a best-effort
+            // no-op). Preserve that exact contract: return the same "no MLS group"
+            // error for any non-real context id rather than respawning a snapshot
+            // that cannot exist (which would emit a spurious "state is lost" error
+            // and pollute the crash-window budget on every PSK rotation). The
+            // 64-hex-lowercase predicate mirrors `context_id_to_bytes`'s canonical
+            // branch (ADR-056).
+            let is_real_context_id = context_id.len() == 64
+                && context_id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !is_real_context_id {
+                return Err(ContextError::CryptoFailed(
+                    "no MLS group for this context".to_string(),
+                ));
+            }
 
-        transport.send_message(&routing_id, &encrypted).await?;
+            // Derive `owning_did` exactly as the watchdog respawn path does: prefer
+            // a registered local DID (the node performing the recovery), falling
+            // back to a context-id-derived seed. Restore/respawn does not key crypto
+            // on this DID (it rehydrates the snapshot's MLS state), so the seed
+            // fallback is sound and never fabricates a foreign participant.
+            let owning_did = self
+                .local_dids_ref()
+                .load()
+                .iter()
+                .min()
+                .cloned()
+                .unwrap_or_else(|| DID(context_id.clone()));
 
-        Ok(())
+            // Respawn holds `bootstrap_spawn_lock` internally and is re-entrancy-
+            // safe (the caller holds no bootstrap lock). A failed respawn (genuinely
+            // lost snapshot for a real context) fails closed — the direct path is
+            // defensively reached only in the transient crash-respawn gap, since
+            // `restore_on_startup` eagerly spawns an actor for every persisted
+            // Active context, so live compromise-recovery flows normally reach the
+            // mailbox directly, not here. (The whole method is boxed as a
+            // `dyn Future + Send` — see the note on its signature — so this plain
+            // `.await` on the actor-spawning respawn does not reopen the cycle.)
+            self.respawn_from_snapshot(&context_id, &owning_did).await?;
+
+            // The actor is registered now — dispatch the notification straight to
+            // its mailbox (NOT back through `dispatch_trust_recovery_command`, so a
+            // transient lookup miss cannot re-enter this respawn path and loop).
+            let Some(actor) = self.lookup(&context_id) else {
+                return Err(ContextError::ActorCrashed(format!(
+                    "{context_id} (respawned actor vanished before recovery-notification dispatch)"
+                )));
+            };
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let send_payload = RecoverySendNotificationPayload {
+                context_id: context_id.clone(),
+                sender_did,
+                payload,
+                sequence,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            };
+            let cmd =
+                ContextCommand::TrustRecovery(TrustRecoveryCommand::RecoverySendNotification {
+                    payload: Box::new(send_payload),
+                    reply: reply_tx,
+                });
+            Self::dispatch_via_mailbox(&actor, cmd).await?;
+            reply_rx.await.map_err(|_| {
+                ContextError::TransportFailed(
+                    "recovery_send_notification_direct: mailbox reply channel closed".to_owned(),
+                )
+            })?
+        })
     }
 
     /// Direct supervisor-scoped dispatch for [`QueriesCommand`] variants

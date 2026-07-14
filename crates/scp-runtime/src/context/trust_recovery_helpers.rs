@@ -351,10 +351,11 @@ pub async fn recovery_advance_epoch(
 /// purposes (spec §9.12 step 5).
 ///
 /// State-owning signature: reads `state.epoch.mls_epoch` for envelope
-/// construction and `deps.clock` for the timestamp. Sealing routes
-/// through `deps.crypto` (still supervisor-scoped during the migration
-/// window); transport delivery via `deps.transport`. Does NOT mutate
-/// `state`.
+/// construction and `deps.clock` for the timestamp. Sealing routes through
+/// the actor-owned `ContextCryptoState` (the Class-C `crypto_mut()` view),
+/// reserving from the actor's authoritative `send_tracker`; transport
+/// delivery via `deps.transport`. Mutates only the coalesced Class-C
+/// `send_tracker` counter (advanced once per successful seal).
 pub async fn recovery_send_notification(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
@@ -395,12 +396,48 @@ pub async fn recovery_send_notification(
     // chokepoint-resolved 32-byte digest `context_id_bytes` (per ADR-056,
     // resolved above via `context_id_to_bytes`) used for MLS crypto keying.
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    let encrypted = deps.crypto.seal(
-        &context_id_bytes,
-        &inner,
-        &routing_id,
-        300, // 5 minute blob TTL
-    )?;
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor-owned
+    // `ContextCryptoState` (the field-granular Class-C `crypto_mut()` view), not
+    // the retired supervisor-scoped provider. Recovery notifications share the
+    // actor's authoritative send-sequence counter with ordinary sends, so this
+    // reserves from the same `send_tracker`: read the pre-increment high-water
+    // mark as the sender-layer AAD sequence (byte-identical to the provider,
+    // which read `state.send_sequence` then post-incremented), guard the
+    // `u64::MAX` overflow boundary fail-closed BEFORE sealing so nothing is
+    // emitted and the counter is left untouched at the ceiling, seal, then
+    // advance the tracker exactly once on a successful seal via the single
+    // canonical `SequenceReservation`. A `?`-early return on seal failure leaves
+    // the counter untouched, matching the provider's `checked_add(1)`
+    // fail-closed. The send-tracker bookkeeping is a coalesced Class-C mutation
+    // (the run loop persists on `mutated`), routed through the non-persisting
+    // `class_c_view`.
+    // Seal inside a block so the `class_c_view` (whose field-granular borrows of
+    // `PerContextState` are `Send + !Sync`) is dropped BEFORE the transport
+    // `.await` below — the enclosing actor future must stay `Send`.
+    let encrypted = {
+        let mut view = cell.class_c_view();
+        let aad_sequence = view.send_tracker_mut().last_issued();
+        if aad_sequence == u64::MAX {
+            return Err(ContextError::CryptoFailed(
+                "send sequence counter overflow".into(),
+            ));
+        }
+        let crypto = view.mode_mut().crypto_mut().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let encrypted = crypto.seal(
+            &context_id_bytes,
+            deps.crypto.local_did(),
+            &inner,
+            &routing_id,
+            300, // 5 minute blob TTL
+            aad_sequence,
+        )?;
+        crate::context::actor::sequence::SequenceReservation::reserve(view.send_tracker_mut())
+            .commit();
+        encrypted
+    };
 
     // Send via transport using the domain-separated routing ID.
     deps.transport.send_message(&routing_id, &encrypted).await?;
