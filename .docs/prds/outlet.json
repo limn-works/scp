@@ -3037,7 +3037,7 @@
       "gate": "gate-streaming-saga",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/actor/handlers/saga.rs",
         "crates/scp-runtime/src/context/supervisor/supervisor.rs",
