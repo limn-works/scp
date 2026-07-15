@@ -49,9 +49,15 @@ use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::crypto::sender_keys::{
-    NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse, SenderKeyStore,
-    generate_sender_key, generate_wrapping_keypair,
+    NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyStore, generate_sender_key,
+    generate_wrapping_keypair,
 };
+// `SenderKeyResponse` is only constructed by the sender-key PUSH/answer paths
+// that PR-7 moved onto the actor; the retained provider copies
+// (`distribute_sender_key`, `handle_sender_key_request`) are test/fixture-only
+// (`#[cfg(any(test, feature = "testing"))]`), so the import is gated to match.
+#[cfg(any(test, feature = "testing"))]
+use scp_protocol::crypto::sender_keys::SenderKeyResponse;
 
 // ---------------------------------------------------------------------------
 // MlsCryptoSnapshot — serializable per-context crypto state for persistence
@@ -1367,6 +1373,16 @@ impl MlsCryptoProvider {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if distribution fails.
+    ///
+    /// # ADR-049 PR-7 — test/fixture-only
+    ///
+    /// The steady-state join-time sender-key PUSH moved onto the actor
+    /// ([`ContextCryptoState::distribute_sender_key`](crate::context::actor::state::ContextCryptoState::distribute_sender_key));
+    /// production is zero-grep clean of this provider copy (a taken, actor-owned
+    /// context pushes on the actor). Retained under
+    /// `#[cfg(any(test, feature = "testing"))]` solely for provider-level
+    /// two-party test fixtures.
+    #[cfg(any(test, feature = "testing"))]
     pub fn distribute_sender_key(
         &self,
         context_id: &[u8; 32],
@@ -1536,6 +1552,14 @@ impl MlsCryptoProvider {
     ///
     /// Returns [`ContextError::CryptoFailed`] if no group is registered for
     /// `context_id`.
+    ///
+    /// # ADR-049 PR-7 — test/fixture-only
+    ///
+    /// The steady-state pull-answer store moved onto the actor; production is
+    /// zero-grep clean of this provider copy. Retained under
+    /// `#[cfg(any(test, feature = "testing"))]` solely for provider-level
+    /// two-party test fixtures.
+    #[cfg(any(test, feature = "testing"))]
     pub fn store_member_sender_key(
         &self,
         context_id: &[u8; 32],
@@ -1569,6 +1593,14 @@ impl MlsCryptoProvider {
     /// is unreachable there; the registry gate has already advanced the floor,
     /// so even a (hypothetical) missing-context skip is fail-safe (the floor
     /// advanced, no key below it can ever be admitted).
+    ///
+    /// # ADR-049 PR-7 — test/fixture-only
+    ///
+    /// The steady-state install moved onto the actor; production is zero-grep
+    /// clean of this provider copy. Retained under
+    /// `#[cfg(any(test, feature = "testing"))]` solely for provider-level
+    /// two-party test fixtures.
+    #[cfg(any(test, feature = "testing"))]
     pub fn set_sender_key_unchecked(
         &self,
         context_id: &[u8; 32],

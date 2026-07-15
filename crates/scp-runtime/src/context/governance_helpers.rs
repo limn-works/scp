@@ -1215,9 +1215,47 @@ pub async fn execute_add_member(
     // one DID using a KeyPackage minted for a different identity. Under
     // `cfg(test)`/`testing` with `None` this is a no-op (matches the mock
     // fixture); in production a mismatched or malformed KP is rejected here.
-    deps.crypto
-        .validate_key_package(did.as_ref(), key_package)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+    //
+    // ADR-049 §15 / SCP-CRYPTOMOVE-000c: the stateless validation routes through
+    // the stateless `MlsBackend` (`deps.mls`) — the provider `validate_key_package`
+    // copy is retired (§15 grants no carve-out). The stateless backend validates
+    // signature / lifetime / ciphersuite but does NOT bind identity, so the
+    // DID binding is preserved here via `scp_mls::group::key_package_in_did`,
+    // which authenticates the KP credential DID under the same hardened clock the
+    // MLS add uses.
+    match key_package {
+        Some(bytes) => {
+            deps.mls
+                .validate_key_package(bytes, deps.clock.as_ref())
+                .await
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let kp_in = {
+                use openmls::prelude::tls_codec::Deserialize as _;
+                openmls::prelude::KeyPackageIn::tls_deserialize(&mut &*bytes).map_err(|e| {
+                    ContextError::MembershipFailed(format!("key package deserialization: {e}"))
+                })?
+            };
+            let owner_did: &str = did.as_ref();
+            let cred_did = scp_mls::group::key_package_in_did(
+                &kp_in,
+                openmls::prelude::ProtocolVersion::Mls10,
+                deps.clock.as_ref(),
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            if cred_did.as_str() != owner_did {
+                return Err(ContextError::MembershipFailed(
+                    "key package credential DID does not match target DID".to_string(),
+                ));
+            }
+        }
+        None => {
+            if !cfg!(any(test, feature = "testing")) {
+                return Err(ContextError::MembershipFailed(
+                    "production add_member requires MLS key package bytes".to_string(),
+                ));
+            }
+        }
+    }
 
     // The invitee's KeyPackage is carried on the command envelope (`Some` on
     // the invitation path). Under `cfg(test)`/`testing` with `None` the actor

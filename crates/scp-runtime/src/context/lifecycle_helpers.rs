@@ -818,8 +818,51 @@ pub async fn join_context(
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
     // Validate key package before any mutations (idempotent, no lock needed).
+    //
+    // ADR-049 §15 / SCP-CRYPTOMOVE-000c: stateless KP validation routes through
+    // the stateless `MlsBackend` (`deps.mls`) — the provider copy is retired, and
+    // §15 grants it no carve-out ("`validate_key_package` … becomes a stateless
+    // free-fn / `MlsBackend` method over `&dyn Clock`"). The backend validates
+    // signature / lifetime / ciphersuite but does NOT bind identity, so the
+    // load-bearing binding (the KP credential DID MUST equal the envelope's
+    // `owner_did`, formerly enforced inside the provider method) is preserved
+    // explicitly via the `scp_mls::group::key_package_in_did` primitive, which
+    // authenticates the DID under the same hardened clock `add_member` uses.
+    // Under `cfg(test)`/`testing` a `None` KP is accepted (mock fixtures);
+    // production requires real bytes.
     let kp_bytes = key_package.mls_key_package_bytes.as_deref();
-    deps.crypto.validate_key_package(&member_did, kp_bytes)?;
+    match kp_bytes {
+        Some(bytes) => {
+            deps.mls
+                .validate_key_package(bytes, deps.clock.as_ref())
+                .await
+                .map_err(|e| ContextError::InvalidKeyPackage(e.to_string()))?;
+            let kp_in = {
+                use openmls::prelude::tls_codec::Deserialize as _;
+                openmls::prelude::KeyPackageIn::tls_deserialize(&mut &*bytes).map_err(|e| {
+                    ContextError::InvalidKeyPackage(format!("TLS deserialization: {e}"))
+                })?
+            };
+            let cred_did = scp_mls::group::key_package_in_did(
+                &kp_in,
+                openmls::prelude::ProtocolVersion::Mls10,
+                deps.clock.as_ref(),
+            )
+            .map_err(|e| ContextError::InvalidKeyPackage(e.to_string()))?;
+            if member_did != cred_did {
+                return Err(ContextError::InvalidKeyPackage(
+                    "key package credential DID does not match owner_did".to_string(),
+                ));
+            }
+        }
+        None => {
+            if !cfg!(any(test, feature = "testing")) {
+                return Err(ContextError::InvalidKeyPackage(
+                    "production MlsBackend requires MLS key package bytes".to_string(),
+                ));
+            }
+        }
+    }
 
     // Phase 1: state + sybil + economy enforcement against actor-owned
     // state. This happens BEFORE any crypto mutations so that a rejected
