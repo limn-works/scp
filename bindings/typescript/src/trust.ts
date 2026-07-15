@@ -466,6 +466,28 @@ export const __PASSED_BEFORE: Readonly<Record<UcanFailureCategory, ReadonlySet<s
 };
 
 // ---------------------------------------------------------------------------
+// Absorption allowlist constant
+// ---------------------------------------------------------------------------
+
+/**
+ * The bracket-wrapped SCP error code prefix that {@link validateOneCapUri}
+ * absorbs into a narrowed {@link CapabilityValidation} verdict.
+ *
+ * Only errors whose message starts with this string are treated as normal UCAN
+ * pipeline failures (every `UcanError` variant maps to this single code via the
+ * exhaustive match in `ucan_errors.rs`). All other codes are genuine faults and
+ * propagate.
+ *
+ * **Exported for lockstep test coupling** — `tests/trust.test.ts` imports this
+ * constant so the test assertion is coupled to the runtime regex, not a
+ * duplicate literal. If this value changes, the test will fail loudly.
+ *
+ * Must stay in sync with `_PIPELINE_ABSORBED_CODES` in the Python SDK
+ * (`trust.py`) and with `ucan_errors.rs::ucan_error_code`.
+ */
+export const PIPELINE_ABSORBED_CODE_PREFIX = "[SCP-PERM-3001]";
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -520,7 +542,7 @@ async function validateOneCapUri(
     // (handle-affinity misuse), and any future codes are genuine faults and
     // must propagate rather than being silently folded into a false verdict.
     const msg = error instanceof Error ? error.message : String(error);
-    if (/^\[SCP-PERM-3001\]/.test(msg)) {
+    if (msg.startsWith(PIPELINE_ABSORBED_CODE_PREFIX)) {
       const passed = __PASSED_BEFORE[__classifyUcanError(msg)];
       return {
         tokensValid: passed.has("tokensValid"),
