@@ -2953,7 +2953,7 @@
       "gate": "gate-streaming-saga",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/outlets_helpers.rs",
         "crates/scp-runtime/src/context/outlets/invoke.rs",
