@@ -107,8 +107,17 @@ mod wasm_impl {
 
         /// Stores `value` under `key`, replacing any existing value. Throws on
         /// storage access failure or quota exhaustion.
+        ///
+        /// `value` is passed **by value** (an owned `Vec<u8>`), so wasm-bindgen
+        /// marshals it as a JS-owned `Uint8Array` copy detached from wasm linear
+        /// memory — NOT a `subarray` view into it (which `&[u8]` would produce).
+        /// This is load-bearing: the embedder's natural `set(k, v) { map.set(k, v) }`
+        /// retains the array, and a view would then alias wasm memory that later
+        /// allocations reuse, silently corrupting every previously-stored snapshot.
+        /// Handing over an owned copy makes the contract sound for any embedder,
+        /// not only one that defensively copies.
         #[wasm_bindgen(method, catch, js_name = "set")]
-        fn set(this: &JsStorage, key: &str, value: &[u8]) -> Result<(), JsValue>;
+        fn set(this: &JsStorage, key: &str, value: Vec<u8>) -> Result<(), JsValue>;
 
         /// Removes the value stored under `key`. Idempotent. Throws on storage
         /// access failure.
@@ -166,7 +175,10 @@ mod wasm_impl {
         }
 
         fn put(&self, key: &str, value: Vec<u8>) -> Result<(), String> {
-            self.inner.set(key, &value).map_err(|e| js_err("set", &e))
+            // Move the owned bytes into JS: wasm-bindgen hands the JS `set` a
+            // detached `Uint8Array` copy (not a wasm-memory view), so an embedder
+            // that retains the array cannot alias reused wasm memory.
+            self.inner.set(key, value).map_err(|e| js_err("set", &e))
         }
 
         fn delete(&self, key: &str) -> Result<(), String> {
