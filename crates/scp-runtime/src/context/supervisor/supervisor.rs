@@ -6780,6 +6780,129 @@ impl Supervisor {
             .await;
     }
 
+    /// Key-bearing streaming-saga crash-recovery truncated close (SCP-OUT-046
+    /// #136 AC7). The REAL seal path for a saga that crashed with only a durable
+    /// prefix (witness absent): given the target's Active Signing Key (supplied
+    /// per-call — the runtime holds none autonomously; FFI-reconnect surfaces it,
+    /// deferred to SCP-OUT-047; the unit test supplies it), it seals the RESTORED
+    /// durable prefix and resolves the saga `Committed`.
+    ///
+    /// The target (B) actor rehydrated the `SagaId`-keyed frontier from its
+    /// Class-S snapshot at respawn
+    /// ([`CrossContextStreamingOutletInvocationSnapshot::into_prepared`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot::into_prepared)),
+    /// so `frontier.root()` / `billed_count()` reproduce bit-identically over the
+    /// durable prefix. This method dispatches [`SagaPhaseMessage::CommitBStreamSettle`]
+    /// (seal over the restored prefix, settle at the prefix `billed_count`), then
+    /// APPLIES the settlement off-mailbox (recovery holds `Arc<Supervisor>`, so no
+    /// re-entrant self-dispatch) against B's CURRENT generation, records the A-side
+    /// `CrossContextOutletInvoked` dual-log leaf, and resolves the journal
+    /// `Committed`.
+    ///
+    /// NEVER calls `open_outlet_stream` / never re-invokes the executor (re-invoking
+    /// a non-deterministic LLM would break §6.2.4 replay determinism). A replayed
+    /// close short-circuits on the `xctx_committed_stream_outputs` witness (the
+    /// handler re-emits the stored capture with `settlement: None`, so the money
+    /// never moves twice).
+    ///
+    /// # Errors
+    ///
+    /// [`SagaError::NeedsRepair`] carrying `saga_id` if the target is not resident
+    /// or the seal dispatch fails (the saga stays unresolved for a later retry).
+    pub async fn recover_streaming_saga_truncated_close(
+        self: &Arc<Self>,
+        saga_id: SagaId,
+        target_context_id: [u8; 32],
+        target_signing_key: crate::context::actor::commands::SigningKeyBytes,
+    ) -> Result<(), SagaError> {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        use scp_protocol::context::outlets::stream::StreamTerminalStatus;
+
+        let target_hex = hex::encode(target_context_id);
+        let Some(actor) = self.lookup(&target_hex) else {
+            return Err(SagaError::NeedsRepair {
+                saga_id,
+                message: format!(
+                    "streaming saga truncated-close recovery — target context '{target_hex}' is \
+                     not a resident actor"
+                ),
+            });
+        };
+
+        // Seal the RESTORED durable prefix. The truncated close carries an `Error`
+        // terminal (the stream crashed without a clean `End`); the receipt attests
+        // the manifest root of the durable prefix regardless of terminal status.
+        let seal_saga_id = saga_id.clone();
+        let outcome = match actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
+                    saga_id: seal_saga_id,
+                    terminal_status: StreamTerminalStatus::Error(
+                        "SCP-OUT-046: streaming saga sealed over the durable prefix at crash \
+                         recovery (truncated close)"
+                            .to_owned(),
+                    ),
+                    cancel_ack_seq: None,
+                    target_signing_key,
+                    reply,
+                })
+            })
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return Err(SagaError::NeedsRepair {
+                    saga_id,
+                    message: format!(
+                        "streaming saga truncated-close recovery — CommitBStreamSettle failed: \
+                         {err}"
+                    ),
+                });
+            }
+        };
+
+        // Record the A-side `CrossContextOutletInvoked` leaf FIRST (borrows the
+        // whole `outcome` before the settlement move), using the SAME helper the
+        // seal task uses. Best-effort (the durable witness is authoritative).
+        if let Some(a_event_log) = self.event_log_ref().cloned() {
+            crate::context::outlets::invoke::record_streaming_saga_a_event(
+                &a_event_log,
+                &saga_id,
+                &outcome,
+            )
+            .await;
+        }
+
+        // Apply the settlement off-mailbox against B's CURRENT generation (the
+        // reserve-time generation was lost in the crash; B respawned with the hold
+        // restored). `None` on a replay — the money already moved on the first
+        // settle, so recovery never double-settles.
+        if let Some(settlement) = outcome.settlement
+            && let Err(err) = self
+                .settle_outlet_stream_via_actor(*settlement, outcome.generation)
+                .await
+        {
+            tracing::error!(
+                saga_id = %saga_id.0,
+                %err,
+                "streaming saga truncated-close recovery — settlement apply failed; the \
+                 durable reserve is reconciled by the restore-time sweep"
+            );
+        }
+
+        let _ = self
+            .saga_journal
+            .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
+            .await;
+        tracing::info!(
+            saga_id = %saga_id.0,
+            billed_count = outcome.billed_count,
+            manifest_root = %hex::encode(outcome.stream_manifest_hash),
+            "streaming saga recovery — key-bearing truncated close sealed the durable prefix \
+             (no re-invoke); resolved Committed"
+        );
+        Ok(())
+    }
+
     /// Lift the private [`RunSagaError`] (the FSM's internal [`ContextError`] +
     /// the `needs_repair` flag) into the typed terminal [`SagaError`] the
     /// cross-context entry point returns (ADR-049 §3a):
@@ -7533,6 +7656,16 @@ impl Supervisor {
     /// only a genuinely-unresolvable divergence (one-sided commit / unreachable
     /// side / non-reconstructible entry) stays `NeedsRepair` for operator repair.
     async fn recover_committing_entry(&self, entry: &JournalEntry) {
+        // Streaming saga (SCP-OUT-046 #136): keyless witness-based resolution. The
+        // runtime holds NO signing key autonomously, so it cannot seal a truncated
+        // prefix on the startup sweep — it can only confirm an already-sealed saga
+        // (witness present ⇒ Committed) or hold it for the key-bearing recovery
+        // surface (witness absent ⇒ NeedsRepair, escrow held).
+        if let Some(target_hex) = Self::streaming_saga_target_hex(entry) {
+            self.recover_streaming_committing_entry(entry, &target_hex)
+                .await;
+            return;
+        }
         let resolution = match Self::reconstruct_xctx_prepared(entry) {
             Some(prepared) => {
                 self.redrive_xctx_commit_in_progress(&entry.saga_id, &prepared)
@@ -7595,6 +7728,111 @@ impl Supervisor {
                      NeedsRepair for operator review"
                 );
             }
+        }
+    }
+
+    /// Discriminant: returns the TARGET context id (raw-digest hex) iff the
+    /// journal entry is a STREAMING saga (SCP-OUT-046 #136), else `None`.
+    ///
+    /// The streaming saga journals a 2-element `[caller_hex, target_hex]`
+    /// participant set (both 64-char raw-digest hex) with EMPTY evidence (it
+    /// journals public metadata only — no `MessagePack` prepared wire). The unary
+    /// saga journals a 3-element `[caller_hex, caller_did, outlet_reg]` with
+    /// NON-empty evidence, and `TestForceNeedsRepair` a single-element set — so
+    /// "2 raw-digest-hex participants + empty evidence" is a sound structural
+    /// discriminant that never collides with the other saga shapes.
+    fn streaming_saga_target_hex(entry: &JournalEntry) -> Option<String> {
+        const RAW_DIGEST_HEX_LEN: usize = 64;
+        if !entry.evidence.is_empty() || entry.participants.len() != 2 {
+            return None;
+        }
+        let is_raw_digest_hex = |s: &String| {
+            s.len() == RAW_DIGEST_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
+        };
+        if is_raw_digest_hex(&entry.participants[0]) && is_raw_digest_hex(&entry.participants[1]) {
+            Some(entry.participants[1].clone())
+        } else {
+            None
+        }
+    }
+
+    /// Keyless streaming-saga `Committing` resolution on the startup sweep
+    /// (SCP-OUT-046 #136 AC7). Sends a READ-ONLY
+    /// [`SagaPhaseMessage::StreamSettleCheckWitness`] to the target (B) actor:
+    ///
+    /// - **witness present** — B already durably sealed on the first pass (the
+    ///   seal-close landed before the crash). Resolve the journal `Committed`; a
+    ///   replayed close would re-emit idempotently, never re-invoking the outlet.
+    /// - **witness absent** — only a durable prefix exists. The runtime holds no
+    ///   signing key autonomously, so it CANNOT seal here. Append a `NeedsRepair`
+    ///   terminal and HOLD the escrow (never auto-void — B may have rendered
+    ///   service). The key-bearing
+    ///   [`Self::recover_streaming_saga_truncated_close`] is the seal path
+    ///   (FFI-reconnect surfaces the key; deferred to SCP-OUT-047). An
+    ///   unreachable / non-resident target is treated as unsealed (NeedsRepair).
+    async fn recover_streaming_committing_entry(&self, entry: &JournalEntry, target_hex: &str) {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        let saga_id = &entry.saga_id;
+        let witness_present = if let Some(actor) = self.lookup(target_hex) {
+            let check_saga_id = saga_id.clone();
+            match actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
+                        saga_id: check_saga_id,
+                        reply,
+                    })
+                })
+                .await
+            {
+                Ok(present) => present,
+                Err(err) => {
+                    tracing::warn!(
+                        saga_id = %saga_id,
+                        %err,
+                        "streaming saga recovery — StreamSettleCheckWitness send failed; \
+                         treating as unsealed (NeedsRepair, escrow held)"
+                    );
+                    false
+                }
+            }
+        } else {
+            tracing::warn!(
+                saga_id = %saga_id,
+                target = %target_hex,
+                "streaming saga recovery — target actor not resident; treating as unsealed \
+                 (NeedsRepair, escrow held)"
+            );
+            false
+        };
+
+        if witness_present {
+            let _ = self
+                .saga_journal
+                .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
+                .await;
+            tracing::info!(
+                saga_id = %saga_id,
+                "streaming saga recovery — seal witness present; resolved Committed \
+                 (idempotent, no re-invoke, no operator repair)"
+            );
+        } else {
+            let _ = self
+                .saga_journal
+                .append(JournalEntry {
+                    saga_id: saga_id.clone(),
+                    state: SagaState::NeedsRepair,
+                    participants: entry.participants.clone(),
+                    evidence: Zeroizing::new(Vec::new()),
+                    timestamp_ms: current_timestamp_ms(),
+                    seq_per_saga: entry.seq_per_saga.saturating_add(1),
+                })
+                .await;
+            crate::metrics::record_saga_repair_needed();
+            tracing::error!(
+                saga_id = %saga_id,
+                "streaming saga recovery — seal witness ABSENT; no autonomous signing key to \
+                 seal the truncated prefix — NeedsRepair, escrow HELD for the key-bearing close"
+            );
         }
     }
 

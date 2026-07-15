@@ -2430,9 +2430,14 @@ async fn commit_b_stream_settle(
     target_signing_key: &SigningKeyBytes,
     reply: CommitBStreamSettleReply,
 ) -> Outcome<()> {
+    // B's CURRENT spawn-generation (Class-C, read via Deref) — carried on the
+    // outcome so the key-bearing crash-recovery close settles against the
+    // respawned instance's restored hold (SCP-OUT-046 #136). The normal seal
+    // task ignores it (it uses the reserve-time generation).
+    let generation = cell.generation;
     // Replay: re-emit the stored capture byte-for-byte; never re-seal / re-sign.
     if let Some(committed) = cell.class_s.xctx_committed_stream_outputs.get(saga_id) {
-        return reemit_committed_stream_settle(committed, reply);
+        return reemit_committed_stream_settle(committed, generation, reply);
     }
 
     match commit_b_stream_first_settle(
@@ -2442,6 +2447,7 @@ async fn commit_b_stream_settle(
         terminal_status,
         cancel_ack_seq,
         target_signing_key,
+        generation,
     )
     .await
     {
@@ -2466,6 +2472,7 @@ async fn commit_b_stream_settle(
 /// re-invoked and nothing is re-signed.
 fn reemit_committed_stream_settle(
     committed: &CommittedStreamingOutletInvocation,
+    generation: u64,
     reply: CommitBStreamSettleReply,
 ) -> Outcome<()> {
     match jcs_stream_receipt_bytes(&committed.receipt) {
@@ -2481,6 +2488,7 @@ fn reemit_committed_stream_settle(
                 // REPLAY: the money already moved on the first settle — the seal
                 // task must NOT re-apply it (idempotent seal-close).
                 settlement: None,
+                generation,
             }));
             Outcome::ok(())
         }
@@ -2510,6 +2518,7 @@ async fn commit_b_stream_first_settle(
     terminal_status: &StreamTerminalStatus,
     cancel_ack_seq: Option<u64>,
     target_signing_key: &SigningKeyBytes,
+    generation: u64,
 ) -> Result<CommitBStreamSettleOutcome, (bool, ContextError)> {
     // Peek to derive the persist `context_id` and reject the no-slot case as
     // `(false, 13042)` with NO persist (the authoritative move-out is inside `f`).
@@ -2648,8 +2657,17 @@ async fn commit_b_stream_first_settle(
         Err(err) => return Err((false, err)),
     };
 
-    commit_b_stream_settle_finalize(cell, deps, saga_id, &target_hex, terminal_status, cancel_ack_seq, captured)
-        .await
+    commit_b_stream_settle_finalize(
+        cell,
+        deps,
+        saga_id,
+        &target_hex,
+        terminal_status,
+        cancel_ack_seq,
+        captured,
+        generation,
+    )
+    .await
 }
 
 /// The data the streaming capture combinator produces for the post-persist
@@ -2688,6 +2706,7 @@ async fn commit_b_stream_settle_finalize(
     terminal_status: &StreamTerminalStatus,
     cancel_ack_seq: Option<u64>,
     captured: CommitBStreamCaptured,
+    generation: u64,
 ) -> Result<CommitBStreamSettleOutcome, (bool, ContextError)> {
     let CommitBStreamCaptured {
         prepared,
@@ -2773,6 +2792,7 @@ async fn commit_b_stream_settle_finalize(
         // The FIRST seal returns the complete settlement for the off-mailbox
         // seal task to APPLY (escrow refund + billed capture + counter release).
         settlement: Some(Box::new(settlement)),
+        generation,
     })
 }
 

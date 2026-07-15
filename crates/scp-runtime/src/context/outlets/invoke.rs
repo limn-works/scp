@@ -5229,7 +5229,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
 /// guarantee is the durable `xctx_committed_stream_outputs` witness + the journal,
 /// so a receiver-side recording fault surfaces to the audit log rather than
 /// un-committing the sealed saga. Never re-signs, never re-invokes.
-async fn record_streaming_saga_a_event(
+pub(crate) async fn record_streaming_saga_a_event(
     a_event_log: &std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
     saga_id: &crate::context::supervisor::saga_journal::SagaId,
     outcome: &crate::context::actor::commands::CommitBStreamSettleOutcome,

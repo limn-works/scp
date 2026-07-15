@@ -3122,6 +3122,13 @@ pub struct CommitBStreamSettleOutcome {
     /// (the money already moved on the first settle; the seal task must NOT
     /// re-apply it). Boxed to keep the outcome small.
     pub settlement: Option<Box<crate::context::outlets::invoke::StreamSettlement>>,
+    /// B's CURRENT spawn-generation at seal time (SCP-OUT-046 #136). The normal
+    /// seal task ignores it (it settles under the RESERVE-time generation for the
+    /// confused-deputy drop-on-respawn guard). The KEY-BEARING crash-recovery
+    /// truncated close uses it: after a crash B respawned with the durable state
+    /// restored, so the recovery settlement must target B's CURRENT generation to
+    /// APPLY against the restored hold (the reserve-time generation is lost).
+    pub generation: u64,
 }
 
 /// Reply-channel type alias for [`SagaPhaseMessage::CommitBStreamSettle`].
