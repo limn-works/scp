@@ -372,6 +372,26 @@ jobs:
           targets: wasm32-unknown-unknown
       - run: cargo check -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
+  wasm-test:
+    needs: check-draft
+    name: WASM / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      # Runs the `#[wasm_bindgen_test]` cases under Node — the real wasm32
+      # execution the `wasm-protocol` build gate only compiles. Covers the
+      # cross-target determinism KAT wasm entries, the error-mapping `JsValue`
+      # wrapping, and the `JsStorage` extern round-trip (ADR-057 Prerequisite 5).
+      - run: wasm-pack test --node crates/scp-client-wasm
+
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
     needs: changes
@@ -1112,6 +1132,7 @@ jobs:
       - no-mutable-globals-ts
       - no-mutable-globals-kotlin
       - wasm-protocol
+      - wasm-test
       - rust-fmt
       - rust-clippy
       - rust-test
@@ -1155,6 +1176,7 @@ jobs:
             "${{ needs.no-mutable-globals-ts.result }}" \
             "${{ needs.no-mutable-globals-kotlin.result }}" \
             "${{ needs.wasm-protocol.result }}" \
+            "${{ needs.wasm-test.result }}" \
             "${{ needs.rust-fmt.result }}" \
             "${{ needs.rust-clippy.result }}" \
             "${{ needs.rust-test.result }}" \
