@@ -72,3 +72,29 @@ Symptom: `evaluateLayer1` / `evaluate_trust` always returns all-false (or `Trust
 This means a token with an out-of-ceiling `att[1]` and an in-ceiling `att[0]` will produce `withinCeiling: true`. Full multi-att ceiling validation requires bridge-level support (a single `ucanValidate` call that verifies ALL att entries against the ceiling, consuming the nonce only once). Until that support lands, the SDK validates att[0] only.
 
 The bridge (SCP production) always mints single-att tokens, so this limitation does not affect normal operation.
+
+## Revocation prefix narrowing: only `"token revoked:"` is a pipeline result
+
+`validate.rs` step 10 emits exactly `UcanError::TokenRevoked` → Display `"token revoked: {cid}"`.
+This is the *only* error a revoked token produces at the UCAN pipeline level.
+
+Two other revocation-related messages exist but are **operational** (admin-side
+revocation-management failures emitted by the revocation-store write path, never by
+step-10 validation):
+
+- `"revocation unauthorized: ..."` — the caller lacked permission to revoke
+- `"revocation failed: ..."` — the write to the revocation store failed
+
+These operational messages are NOT step-10 results. If they ever surface, they should
+classify as `"unknown"` → all-false (fail-closed). They must be kept **out** of
+`_REVOCATION_PREFIXES` (Python) and `REVOCATION_PREFIXES` (TypeScript) in both SDKs.
+
+**Rule:** `_REVOCATION_PREFIXES` / `REVOCATION_PREFIXES` must contain exactly one entry:
+`"token revoked:"`. Adding the operational prefixes is a regression — a genuinely-revoked
+token could then be misclassified into a more-passing category if the Rust pipeline
+messages ever changed, narrowing the `not_revoked` verdict incorrectly.
+
+This cross-SDK invariant is pinned by the conformance gate
+`test_operational_errors_classify_as_unknown` in `tests/test_ucan_conformance.py`.
+If that gate is red, do not add the operational prefixes to fix it — find why the bridge
+is emitting them from step 10 (it shouldn't be).
