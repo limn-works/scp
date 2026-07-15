@@ -61,13 +61,16 @@ use scp_protocol::crypto::ucan::validate::{
 
 use scp_protocol::context::outlets::cross_context_saga::{
     CommittedSide, CrossContextDivergenceMarker, CrossContextDivergenceMarkerFields,
-    CrossContextOutletReceipt, CrossContextOutletReceiptFields,
+    CrossContextOutletReceipt, CrossContextOutletReceiptFields, CrossContextOutletStreamReceipt,
+    CrossContextOutletStreamReceiptFields,
 };
+use scp_protocol::context::outlets::stream::{OutletStreamChunk, StreamTerminalStatus};
 
 use crate::context::actor::commands::{
     CommitBReserveOutcome, CommitBReserveReply, CommitBSettleOutcome, CommitBSettleReply,
-    PrepareAOutcome, PrepareBOutcome, PreparedAFields, PreparedBFields, SagaPhaseMessage,
-    SagaReject, SigningKeyBytes, saga_reject,
+    CommitBStreamSettleOutcome, CommitBStreamSettleReply, PrepareAOutcome, PrepareBOutcome,
+    PrepareBStreamingFields, PreparedAFields, PreparedBFields, SagaPhaseMessage, SagaReject,
+    SigningKeyBytes, saga_reject,
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
@@ -79,7 +82,9 @@ use crate::context::messaging_helpers::{
 use crate::context::outlets_helpers::reserve_outlet_economy;
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
-    CommittedOutletInvocation, CrossContextOutletInvocationPrepared, SagaPreparedState,
+    CommittedOutletInvocation, CommittedStreamingOutletInvocation,
+    CrossContextOutletInvocationPrepared, CrossContextStreamingOutletInvocationPrepared,
+    SagaPreparedState,
 };
 
 /// Eviction TTL for B's per-target cross-context-saga nonce-dedup cache
@@ -191,8 +196,105 @@ pub(crate) async fn dispatch(
         prepare @ (SagaPhaseMessage::PrepareA { .. } | SagaPhaseMessage::PrepareB { .. }) => {
             dispatch_prepare_phase(cell, deps, prepare).await
         }
+        // ADR-061 seal-phase arms route to their OWN dedicated helper so the
+        // §6.2.4 prepare/commit routers stay within the per-function line budget.
+        stream @ (SagaPhaseMessage::PrepareBStreaming { .. }
+        | SagaPhaseMessage::StreamCaptureAppend { .. }
+        | SagaPhaseMessage::CommitBStreamSettle { .. }
+        | SagaPhaseMessage::StreamSettleCheckWitness { .. }) => {
+            dispatch_stream_phase(cell, deps, stream).await
+        }
         // Commit (split) / Abort / divergence-marker arms (slice 4).
         other => dispatch_commit_phase(cell, deps, other).await,
+    }
+}
+
+/// Dispatch the ADR-061 streaming-saga seal-phase messages (spec §6.2.5). Split
+/// out of [`dispatch`] so it — and the §6.2.4 prepare/commit routers — each stay
+/// within the per-function line budget. The four seal-phase messages all run on
+/// the LOCAL target (B) actor: `PrepareBStreaming` stages the durable slot,
+/// `StreamCaptureAppend` folds each chunk, `CommitBStreamSettle` seals at close,
+/// and `StreamSettleCheckWitness` is the read-only recovery witness check.
+async fn dispatch_stream_phase(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    cmd: SagaPhaseMessage,
+) -> Outcome<()> {
+    match cmd {
+        SagaPhaseMessage::PrepareBStreaming {
+            saga_id,
+            fields,
+            reply,
+        } => {
+            let PrepareBStreamingFields {
+                caller_context_id,
+                target_context_id,
+                caller_did,
+                outlet_registration_id,
+                ucan_proof_id,
+                input,
+                asserted_chain_depth,
+                asserted_nonce,
+                asserted_timestamp_ms,
+                caller_source_role,
+                reserved,
+                cost_per_chunk,
+            } = *fields;
+            let req = PrepareBRequest {
+                saga_id,
+                caller_context_id,
+                target_context_id,
+                caller_did,
+                outlet_registration_id,
+                ucan_proof_id,
+                input,
+                asserted_chain_depth,
+                asserted_nonce,
+                asserted_timestamp_ms,
+                caller_source_role,
+            };
+            prepare_b_streaming(cell, deps, req, reserved, cost_per_chunk, reply).await
+        }
+        SagaPhaseMessage::StreamCaptureAppend {
+            saga_id,
+            chunk,
+            reply,
+        } => stream_capture_append(cell, deps, &saga_id, *chunk, reply).await,
+        SagaPhaseMessage::CommitBStreamSettle {
+            saga_id,
+            terminal_status,
+            cancel_ack_seq,
+            target_signing_key,
+            reply,
+        } => {
+            commit_b_stream_settle(
+                cell,
+                deps,
+                &saga_id,
+                &terminal_status,
+                cancel_ack_seq,
+                &target_signing_key,
+                reply,
+            )
+            .await
+        }
+        SagaPhaseMessage::StreamSettleCheckWitness { saga_id, reply } => {
+            stream_settle_check_witness(cell, &saga_id, reply)
+        }
+        // Non-seal phases are matched in `dispatch` and never routed here; return
+        // a typed error per their reply shape (NEVER panic — ADR-049 §10).
+        SagaPhaseMessage::PrepareA { reply, .. } => misrouted(reply, "PrepareA"),
+        SagaPhaseMessage::PrepareB { reply, .. } => misrouted(reply, "PrepareB"),
+        SagaPhaseMessage::CommitBReserve { reply, .. } => misrouted(reply, "CommitBReserve"),
+        SagaPhaseMessage::CommitBSettle { reply, .. } => misrouted(reply, "CommitBSettle"),
+        SagaPhaseMessage::CommitACheckWitness { reply, .. } => {
+            misrouted(reply, "CommitACheckWitness")
+        }
+        SagaPhaseMessage::CommitA { reply, .. } => misrouted(reply, "CommitA"),
+        SagaPhaseMessage::Abort { reply, .. } => misrouted(reply, "Abort"),
+        SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => {
+            misrouted(reply, "EmitDivergenceMarker")
+        }
     }
 }
 
@@ -251,6 +353,11 @@ async fn dispatch_prepare_phase(
             };
             prepare_b(cell, deps, req, reply).await
         }
+        // Streaming seal-phase Prepare-B routes to `dispatch_stream_phase`; it is
+        // statically unreachable here (mis-route → typed error, never panic).
+        SagaPhaseMessage::PrepareBStreaming { reply, .. } => {
+            misrouted(reply, "PrepareBStreaming")
+        }
         // Commit-side phases are matched in `dispatch` and never routed here.
         // The `dispatch` router partitions Prepare vs Commit before calling
         // this helper, so these arms are statically unreachable; return a typed
@@ -265,6 +372,15 @@ async fn dispatch_prepare_phase(
         SagaPhaseMessage::Abort { reply, .. } => misrouted(reply, "Abort"),
         SagaPhaseMessage::EmitDivergenceMarker { reply, .. } => {
             misrouted(reply, "EmitDivergenceMarker")
+        }
+        SagaPhaseMessage::StreamCaptureAppend { reply, .. } => {
+            misrouted(reply, "StreamCaptureAppend")
+        }
+        SagaPhaseMessage::CommitBStreamSettle { reply, .. } => {
+            misrouted(reply, "CommitBStreamSettle")
+        }
+        SagaPhaseMessage::StreamSettleCheckWitness { reply, .. } => {
+            misrouted(reply, "StreamSettleCheckWitness")
         }
     }
 }
@@ -357,11 +473,25 @@ async fn dispatch_commit_phase(
             )
             .await
         }
+        // ADR-061 seal-phase arms route to `dispatch_stream_phase`; statically
+        // unreachable here (mis-route → typed error, never panic).
+        SagaPhaseMessage::StreamCaptureAppend { reply, .. } => {
+            misrouted(reply, "StreamCaptureAppend")
+        }
+        SagaPhaseMessage::CommitBStreamSettle { reply, .. } => {
+            misrouted(reply, "CommitBStreamSettle")
+        }
+        SagaPhaseMessage::StreamSettleCheckWitness { reply, .. } => {
+            misrouted(reply, "StreamSettleCheckWitness")
+        }
         // Prepare arms are matched in `dispatch` and never routed here. They
         // are statically unreachable; return a typed error per their reply
         // shape (NEVER panic — ADR-049 §10 handler panic ban).
         SagaPhaseMessage::PrepareA { reply, .. } => misrouted(reply, "PrepareA"),
         SagaPhaseMessage::PrepareB { reply, .. } => misrouted(reply, "PrepareB"),
+        SagaPhaseMessage::PrepareBStreaming { reply, .. } => {
+            misrouted(reply, "PrepareBStreaming")
+        }
     }
 }
 
@@ -1950,6 +2080,598 @@ fn jcs_receipt_bytes(receipt: &CrossContextOutletReceipt) -> Result<Vec<u8>, Con
     scp_protocol::jcs::to_vec(receipt).map_err(|e| {
         ContextError::CryptoFailed(format!(
             "SCP-SAGA-13035: Commit-B receipt serialization failed: {e}"
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Streaming-saga seal phase — target-context actor (ADR-061; spec §6.2.5)
+// ---------------------------------------------------------------------------
+
+/// [`SagaPhaseMessage::PrepareBStreaming`] handler (ADR-061 seal phase; spec
+/// §6.2.5). Runs on the LOCAL target (B) actor. The streaming-saga sibling of
+/// [`prepare_b`]: it re-runs the IDENTICAL §6.2.4 Prepare-B validation gate
+/// (`run_prepare_b_checks` + the inbound §6.2.0.2 rate consume) and captures the
+/// same B-controlled provenance, but stages a
+/// [`SagaPreparedState::CrossContextStreamingOutletInvocation`] slot (an empty
+/// `MerkleFrontier::new()` + the pinned escrow ledger `reserved`/`cost_per_chunk`,
+/// zeroed `billed`/`billed_count`, unbounded cancel-ack ceiling) instead of the
+/// unary eight-field projection. Same keep-nonce/restore-slot Class-S split as
+/// [`prepare_b`]. The staged frontier is the durable, `SagaId`-keyed capture the
+/// off-mailbox seal task folds chunks into and seals at close.
+async fn prepare_b_streaming(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    req: PrepareBRequest,
+    reserved: scp_protocol::economy::types::Amount,
+    cost_per_chunk: scp_protocol::economy::types::Amount,
+    reply: tokio::sync::oneshot::Sender<Result<PrepareBOutcome, ContextError>>,
+) -> Outcome<()> {
+    // Identical read-only §6.2.4 validation gate as the unary Prepare-B.
+    if let Err(rej) = run_prepare_b_checks(&*cell, deps, &req) {
+        let sketch = outcome_error_sketch(&rej.error);
+        let _ = reply.send(Ok(PrepareBOutcome::Rejected(rej)));
+        return Outcome::err(sketch);
+    }
+
+    // (7) Inbound RATE — the only Class-C mutation — through `class_c_view()`.
+    if let Err(rej) =
+        consume_inbound_interface_rate_limit(cell.class_c_view(), deps, &req.outlet_registration_id)
+    {
+        let sketch = outcome_error_sketch(&rej.error);
+        let _ = reply.send(Ok(PrepareBOutcome::Rejected(rej)));
+        return Outcome::err(sketch);
+    }
+
+    // Capture B-controlled, replay-deterministic provenance (identical to unary).
+    let recorded_timestamp_ms = deps.clock.now_millis();
+    let recorded_nonce = req.asserted_nonce;
+    let recorded_chain_depth = req.asserted_chain_depth.saturating_add(1);
+    let now_secs = deps.clock.now_secs();
+
+    // Stage the STREAMING prepared slot: an empty frontier (unbounded ceiling —
+    // the pump drops above-cancel-ack chunks before emission, so the seal task
+    // never folds one) + the pinned escrow ledger. `billed`/`billed_count` start
+    // at zero and advance monotonically as `StreamCaptureAppend` folds chunks.
+    let prepared = CrossContextStreamingOutletInvocationPrepared {
+        saga_id: req.saga_id.clone(),
+        caller_context_id: req.caller_context_id,
+        target_context_id: req.target_context_id,
+        caller_did: req.caller_did.clone(),
+        outlet_registration_id: req.outlet_registration_id.clone(),
+        ucan_proof_id: req.ucan_proof_id.clone().unwrap_or_default(),
+        recorded_timestamp_ms,
+        recorded_nonce,
+        recorded_chain_depth,
+        frontier: scp_protocol::context::outlets::stream::MerkleFrontier::new(),
+        reserved,
+        cost_per_chunk,
+        billed: scp_protocol::economy::types::Amount::new(0),
+        billed_count: 0,
+        cancel_ack_ceiling: u64::MAX,
+    };
+
+    let target_hex = hex_context_id(&req.target_context_id);
+    let saga_id = req.saga_id.clone();
+    if let Err(persist_err) = cell
+        .commit_class_s_keep_restore_split(
+            deps,
+            &target_hex,
+            |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+            |mut view| {
+                let class_s = view.class_s_mut();
+                // (a) Record the accepted nonce — KEEP direction (fail-closed).
+                class_s.xctx_nonce_dedup.evict_expired(now_secs);
+                class_s
+                    .xctx_nonce_dedup
+                    .record(req.asserted_nonce, now_secs);
+                // (b) Stage the streaming prepared slot — RESTORE direction.
+                class_s.saga_pending.insert(
+                    saga_id.clone(),
+                    SagaPreparedState::CrossContextStreamingOutletInvocation(prepared),
+                );
+                Ok(())
+            },
+            |class_s, keys_before| {
+                class_s.saga_pending.retain(|k, _| keys_before.contains(k));
+            },
+        )
+        .await
+    {
+        let sketch = outcome_error_sketch(&persist_err);
+        let _ = reply.send(Err(persist_err));
+        return Outcome::err_mutated(sketch);
+    }
+
+    let _ = reply.send(Ok(PrepareBOutcome::Prepared(PreparedBFields {
+        recorded_timestamp_ms,
+        recorded_nonce,
+        recorded_chain_depth,
+    })));
+    Outcome::ok_mutated(())
+}
+
+/// [`SagaPhaseMessage::StreamSettleCheckWitness`] handler (ADR-061 seal phase;
+/// §17.16.4 crash recovery). Runs on the LOCAL target (B) actor. READ-ONLY: no
+/// mutation, no Class-S persist. Reports whether this `SagaId` is already
+/// durably sealed (present in `xctx_committed_stream_outputs`) — the streaming
+/// sibling of [`commit_a_check_witness`]. The autonomous crash-recovery sweep
+/// uses it to resolve an already-sealed streaming saga to `Committed` without a
+/// signing key.
+fn stream_settle_check_witness(
+    cell: &crate::context::actor::class_s::ClassSCell,
+    saga_id: &SagaId,
+    reply: tokio::sync::oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    let recorded = cell
+        .class_s
+        .xctx_committed_stream_outputs
+        .contains_key(saga_id);
+    let _ = reply.send(Ok(recorded));
+    Outcome::ok(())
+}
+
+/// [`SagaPhaseMessage::StreamCaptureAppend`] handler (ADR-061 seal phase). Runs
+/// on the LOCAL target (B) actor. Folds ONE emitted stream chunk into the
+/// durable `SagaId`-keyed Merkle frontier staged at Prepare-B, advancing the
+/// billable-chunk counter, then Class-S sync-persists **KEEP**.
+///
+/// The KEEP direction is normative (ADR-061 "Class-S composition is clean"): the
+/// per-chunk stream credit is Class-S **monotonic** — a durably-folded chunk must
+/// NOT un-record on a coalesce-persist failure (that would re-open a billing /
+/// manifest window). The push is order-dependent; the seal task delivers chunks
+/// in emission order.
+///
+/// Idempotent: a no-op if the saga already sealed (its `saga_pending` slot is
+/// gone, the committed witness is present) or was aborted (slot absent) — a late
+/// or re-delivered append after close never errors the seal task.
+async fn stream_capture_append(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    chunk: OutletStreamChunk,
+    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    // Idempotent no-op: only a live streaming slot accepts a fold. A sealed
+    // (slot cleared) or aborted (slot absent) saga silently drops the chunk so
+    // the off-mailbox seal task is never wedged by an error on a late chunk.
+    let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(prepared)) =
+        cell.class_s.saga_pending.get(saga_id)
+    else {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    };
+    let target_hex = hex_context_id(&prepared.target_context_id);
+
+    // KEEP: fold the leaf into the durable frontier + advance the billable
+    // counter under ONE fail-closed persist. `push` computes the leaf hash
+    // BEFORE mutating, so a (practically unreachable) JCS error leaves the
+    // frontier untouched and returns before any persist.
+    let result = cell
+        .commit_class_s_keep(deps, &target_hex, |mut view| {
+            let class_s = view.class_s_mut();
+            let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(prepared)) =
+                class_s.saga_pending.get_mut(saga_id)
+            else {
+                // Slot vanished between the peek and here (an interleaved seal /
+                // abort) — nothing to fold; a clean no-op.
+                return Ok(());
+            };
+            prepared.frontier.push(&chunk).map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "SCP-SAGA-13041: streaming-saga durable frontier push failed for saga '{}': {e}",
+                    saga_id.0
+                ))
+            })?;
+            // Keep the durable billable-chunk counter in step with the frontier so
+            // a restored prefix re-derives the same billed count on recovery.
+            prepared.billed_count = u32::try_from(prepared.frontier.billed_count()).unwrap_or(u32::MAX);
+            // Advance the DURABLE credit ledger alongside the counter: billed =
+            // cost_per_chunk × billable-Data-chunk count (ADR-061 seal phase;
+            // Class-S KEEP monotonic). The seal at stream-close settles
+            // `refund = reserved − billed` from THIS durable ledger with NO live
+            // pump — after a crash the in-memory `PumpEscrowGuard` is gone, so the
+            // durable ledger is the sole settlement source (AC3/AC7). The pump's
+            // credit ceiling guarantees `billed ≤ reserved`, so no over-charge.
+            prepared.billed = scp_protocol::economy::types::Amount::new(
+                prepared
+                    .cost_per_chunk
+                    .value()
+                    .saturating_mul(u64::from(prepared.billed_count)),
+            );
+            Ok(())
+        })
+        .await;
+
+    match result {
+        Ok(()) => {
+            let _ = reply.send(Ok(()));
+            Outcome::ok_mutated(())
+        }
+        Err(err) => {
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            // A persist failure KEEPS the in-memory fold (monotonic credit), so
+            // the actor must flag its state as diverged-from-durable.
+            Outcome::err_mutated(sketch)
+        }
+    }
+}
+
+/// [`SagaPhaseMessage::CommitBStreamSettle`] handler (ADR-061 seal phase). Runs
+/// on the LOCAL target (B) actor at stream-close. The streaming saga's SINGLE
+/// commit (AC8): it seals the durable frontier prefix ONCE over the bounded
+/// Merkle root — never a per-chunk 2PC.
+///
+/// On the FIRST settle: finalizes `stream_manifest_hash = frontier.root()` (the
+/// real 32-byte root, NEVER `[0u8; 32]`), signs the
+/// [`CrossContextOutletStreamReceipt`] (`SCP-XCTX-STREAM-RECEIPT-V1`) over the
+/// STAGED `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms` +
+/// the root + the `SagaId`-stable event id, durably captures the
+/// [`CommittedStreamingOutletInvocation`] witness keyed by `SagaId`, appends the
+/// B-side `OutletInvoked`, clears the staged slot, and Class-S sync-persists
+/// fail-closed. On a REPLAY (this `SagaId` already sealed) re-emits the STORED
+/// receipt + root verbatim — no re-invoke, no re-append, no re-sign.
+async fn commit_b_stream_settle(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    terminal_status: &StreamTerminalStatus,
+    cancel_ack_seq: Option<u64>,
+    target_signing_key: &SigningKeyBytes,
+    reply: CommitBStreamSettleReply,
+) -> Outcome<()> {
+    // Replay: re-emit the stored capture byte-for-byte; never re-seal / re-sign.
+    if let Some(committed) = cell.class_s.xctx_committed_stream_outputs.get(saga_id) {
+        return reemit_committed_stream_settle(committed, reply);
+    }
+
+    match commit_b_stream_first_settle(
+        cell,
+        deps,
+        saga_id,
+        terminal_status,
+        cancel_ack_seq,
+        target_signing_key,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let _ = reply.send(Ok(outcome));
+            Outcome::ok_mutated(())
+        }
+        Err((mutated, err)) => {
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            if mutated {
+                Outcome::err_mutated(sketch)
+            } else {
+                Outcome::err(sketch)
+            }
+        }
+    }
+}
+
+/// Re-emit a durably-captured streaming seal on a replay (ADR-061; §17.16.4):
+/// the stored receipt + sealed root are returned verbatim; the outlet is NOT
+/// re-invoked and nothing is re-signed.
+fn reemit_committed_stream_settle(
+    committed: &CommittedStreamingOutletInvocation,
+    reply: CommitBStreamSettleReply,
+) -> Outcome<()> {
+    match jcs_stream_receipt_bytes(&committed.receipt) {
+        Ok(receipt) => {
+            let _ = reply.send(Ok(CommitBStreamSettleOutcome {
+                receipt,
+                stream_manifest_hash: committed.stream_manifest_hash,
+                billed: committed.billed,
+                refund: committed.refund,
+                billed_count: committed.billed_count,
+                stream_chunk_count: committed.stream_chunk_count,
+                outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
+            }));
+            Outcome::ok(())
+        }
+        Err(err) => {
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            Outcome::err(sketch)
+        }
+    }
+}
+
+/// First (non-replay) streaming seal-close: seal the frontier root, sign the
+/// streaming receipt, durably capture the witness keyed by `SagaId`, append the
+/// B-side `OutletInvoked`, clear the staged slot, and Class-S persist fail-closed.
+///
+/// Mirrors [`commit_b_first_settle`]'s two-combinator decomposition (and its
+/// FLAG-COMMIT-B rationale): a capture combinator that RESTORES on persist
+/// failure, then an event-log append whose failure rolls the capture back +
+/// re-stages the slot + re-persists via `commit_class_s_keep`. `(mutated, err)`:
+/// `false` for the pre-append failures (no slot 13042; signing 13044), `true`
+/// once the `OutletInvoked` append has run.
+async fn commit_b_stream_first_settle(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    terminal_status: &StreamTerminalStatus,
+    cancel_ack_seq: Option<u64>,
+    target_signing_key: &SigningKeyBytes,
+) -> Result<CommitBStreamSettleOutcome, (bool, ContextError)> {
+    // Peek to derive the persist `context_id` and reject the no-slot case as
+    // `(false, 13042)` with NO persist (the authoritative move-out is inside `f`).
+    let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(peek)) =
+        cell.class_s.saga_pending.get(saga_id)
+    else {
+        return Err((
+            false,
+            ContextError::InvalidState(format!(
+                "SCP-SAGA-13042: streaming Commit-B settle for saga '{}' found no staged \
+                 cross-context streaming outlet-invocation prepared state",
+                saga_id.0
+            )),
+        ));
+    };
+    let target_hex = hex_context_id(&peek.target_context_id);
+
+    // (1) SEAL + CAPTURE + fail-closed persist with RESTORE-on-persist-failure.
+    let captured = cell.commit_class_s_restore(deps, &target_hex, |mut view| {
+        let saga_pending = &mut view.class_s_mut().saga_pending;
+        let removed = saga_pending.remove(saga_id);
+        let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(prepared)) = removed
+        else {
+            if let Some(other) = removed {
+                saga_pending.insert(saga_id.clone(), other);
+            }
+            return Err(ContextError::InvalidState(format!(
+                "SCP-SAGA-13042: streaming Commit-B settle for saga '{}' found no staged \
+                 cross-context streaming outlet-invocation prepared state",
+                saga_id.0
+            )));
+        };
+
+        // Seal the manifest root from the durable frontier prefix (the REAL
+        // 32-byte root — never `[0u8; 32]`) + finalize the §5.4.5 counts.
+        let stream_manifest_hash = prepared.frontier.root();
+        let billed_count = u32::try_from(prepared.frontier.billed_count()).unwrap_or(u32::MAX);
+        let stream_chunk_count = prepared.frontier.leaf_count();
+        let event_id = outlet_invoked_event_id(saga_id);
+
+        // Settle escrow from the DURABLE ledger (ADR-061 seal step 3; ADR-049
+        // §3a(b) decoupled release): reconstruct the pinned escrow from
+        // `(cost_per_chunk, reserved)` and accrue the durably-recorded billable
+        // chunks, then `settle_at_close` → `(billed, refund = reserved − billed,
+        // …)`. This is the SOLE settlement — the pump ran with `settlement_sink =
+        // None`, so no in-memory `PumpEscrowGuard` fires; a crash-recovery close
+        // over a truncated prefix settles at the prefix `billed_count`
+        // identically. The FSM applies `refund` against the invoker's hold once.
+        let mut escrow = crate::context::outlets::stream::StreamEscrow::from_reserved(
+            prepared.cost_per_chunk,
+            prepared.reserved,
+        );
+        for _ in 0..billed_count {
+            escrow.accrue_one_chunk();
+        }
+        let (billed, refund, _settled_count) = escrow.settle_at_close();
+
+        // Sign the streaming receipt over the STAGED provenance + the sealed root.
+        // A signing failure leaves state as found (re-insert the owned original).
+        let receipt =
+            match build_signed_stream_receipt(&prepared, stream_manifest_hash, &event_id, target_signing_key) {
+                Ok(r) => r,
+                Err(e) => {
+                    view.class_s_mut().saga_pending.insert(
+                        saga_id.clone(),
+                        SagaPreparedState::CrossContextStreamingOutletInvocation(prepared),
+                    );
+                    return Err(e);
+                }
+            };
+
+        let caller_did_str = prepared.caller_did.0.clone();
+        let target_context_id = prepared.target_context_id;
+        let caller_context_id = prepared.caller_context_id;
+        let outlet_registration_id = prepared.outlet_registration_id.clone();
+
+        // Durable capture keyed by SagaId (AC7 replay witness) — BEFORE the
+        // `OutletInvoked` append, so a persist failure leaves no orphan log entry.
+        view.class_s_mut().xctx_committed_stream_outputs.insert(
+            saga_id.clone(),
+            CommittedStreamingOutletInvocation {
+                receipt: receipt.clone(),
+                stream_manifest_hash,
+                billed,
+                refund,
+                billed_count,
+                stream_chunk_count,
+                outlet_invoked_event_id: event_id.clone(),
+            },
+        );
+
+        Ok(CommitBStreamCaptured {
+            prepared,
+            receipt,
+            stream_manifest_hash,
+            billed,
+            refund,
+            billed_count,
+            stream_chunk_count,
+            event_id,
+            caller_did_str,
+            target_context_id,
+            caller_context_id,
+            outlet_registration_id,
+        })
+    });
+
+    let captured = match captured.await {
+        Ok(c) => c,
+        Err(err) => return Err((false, err)),
+    };
+
+    commit_b_stream_settle_finalize(cell, deps, saga_id, &target_hex, terminal_status, cancel_ack_seq, captured)
+        .await
+}
+
+/// The data the streaming capture combinator produces for the post-persist
+/// event-log append + reply: the OWNED `prepared` (so the append-failure
+/// compensation re-stages the slot losslessly), the signed receipt + sealed root
+/// + counts + stable event id, and the `OutletInvoked` record fields.
+struct CommitBStreamCaptured {
+    prepared: CrossContextStreamingOutletInvocationPrepared,
+    receipt: CrossContextOutletStreamReceipt,
+    stream_manifest_hash: [u8; 32],
+    billed: scp_protocol::economy::types::Amount,
+    refund: scp_protocol::economy::types::Amount,
+    billed_count: u32,
+    stream_chunk_count: u64,
+    event_id: String,
+    caller_did_str: String,
+    target_context_id: [u8; 32],
+    caller_context_id: [u8; 32],
+    outlet_registration_id: String,
+}
+
+/// Post-capture half of [`commit_b_stream_first_settle`]: append the B-side
+/// `OutletInvoked` (streaming shape — real root, `chunks_billed`,
+/// `stream_chunk_count`, terminal status), and on append failure roll the capture
+/// back + re-stage the owned slot + re-persist via
+/// [`ClassSCell::commit_class_s_keep`]. Mirrors [`commit_b_settle_finalize`].
+#[allow(clippy::too_many_arguments)]
+async fn commit_b_stream_settle_finalize(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    target_hex: &str,
+    terminal_status: &StreamTerminalStatus,
+    cancel_ack_seq: Option<u64>,
+    captured: CommitBStreamCaptured,
+) -> Result<CommitBStreamSettleOutcome, (bool, ContextError)> {
+    let CommitBStreamCaptured {
+        prepared,
+        receipt,
+        stream_manifest_hash,
+        billed,
+        refund,
+        billed_count,
+        stream_chunk_count,
+        event_id,
+        caller_did_str,
+        target_context_id,
+        caller_context_id,
+        outlet_registration_id,
+    } = captured;
+
+    // Append `OutletInvoked` to the local (target) log (spec §6.2.5 dual event-log
+    // recording, target side). The streaming record carries the REAL manifest root
+    // + billable + chunk counts + terminal status (never the unary `output_hash`).
+    // CONVERGENT committer-assigned leaf timestamp: B's staged `recorded_timestamp_ms`
+    // (the receipt's `timestamp_ms`), reproduced byte-for-byte on replay.
+    let outlet_invoked_payload = serde_json::json!({
+        "saga_id": saga_id.0,
+        "outlet_invoked_event_id": event_id,
+        "caller_context_id": hex_context_id(&caller_context_id),
+        "outlet_registration_id": outlet_registration_id,
+        "chain_depth": receipt.chain_depth,
+        "timestamp_ms": receipt.timestamp_ms,
+        "stream_manifest_hash": hex::encode(stream_manifest_hash),
+        "chunks_billed": billed_count,
+        "stream_chunk_count": stream_chunk_count,
+        "stream_terminal_status": terminal_status,
+        "cancel_ack_seq": cancel_ack_seq,
+    });
+    let append_result = match serde_json::to_vec(&outlet_invoked_payload) {
+        Ok(bytes) => {
+            deps.event_log
+                .append_context_event_with_payload(
+                    &target_context_id,
+                    scp_event_log::EventType::OutletInvoked,
+                    &caller_did_str,
+                    scp_event_log::EventPayload { data: bytes },
+                    receipt.timestamp_ms / 1000,
+                )
+                .await
+        }
+        Err(e) => Err(ContextError::EventLogFailed(format!(
+            "SCP-SAGA-13043: streaming OutletInvoked payload serialization failed: {e}"
+        ))),
+    };
+
+    if let Err(append_err) = append_result {
+        // Append failed AFTER the capture+persist landed: roll the capture back +
+        // re-stage the owned slot + re-persist (KEEP on re-persist failure), so a
+        // retry re-runs the seal and appends exactly once (mirrors the unary path).
+        return match cell
+            .commit_class_s_keep(deps, target_hex, |mut view| {
+                let class_s = view.class_s_mut();
+                class_s.xctx_committed_stream_outputs.remove(saga_id);
+                class_s.saga_pending.insert(
+                    saga_id.clone(),
+                    SagaPreparedState::CrossContextStreamingOutletInvocation(prepared),
+                );
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => Err((false, append_err)),
+            Err(persist_err) => Err((true, persist_err)),
+        };
+    }
+
+    let receipt_bytes = jcs_stream_receipt_bytes(&receipt).map_err(|e| (true, e))?;
+    Ok(CommitBStreamSettleOutcome {
+        receipt: receipt_bytes,
+        stream_manifest_hash,
+        billed,
+        refund,
+        billed_count,
+        stream_chunk_count,
+        outlet_invoked_event_id: event_id,
+    })
+}
+
+/// Sign the [`CrossContextOutletStreamReceipt`] over the staged B-recorded
+/// provenance + the sealed `stream_manifest_hash` + the `SagaId`-stable event id,
+/// using the target's Active Signing Key (ADR-061 "Receipt (streaming)";
+/// §6.2.5). The root is carried directly — the streaming receipt attests the
+/// Merkle root, reproduced on replay from the durable capture, never from output
+/// bytes.
+fn build_signed_stream_receipt(
+    prepared: &CrossContextStreamingOutletInvocationPrepared,
+    stream_manifest_hash: [u8; 32],
+    event_id: &str,
+    target_signing_key: &SigningKeyBytes,
+) -> Result<CrossContextOutletStreamReceipt, ContextError> {
+    let signing_key = target_signing_key.to_signing_key();
+    CrossContextOutletStreamReceipt::sign(
+        &signing_key,
+        CrossContextOutletStreamReceiptFields {
+            caller_context_id: prepared.caller_context_id,
+            target_context_id: prepared.target_context_id,
+            caller_did: prepared.caller_did.0.clone(),
+            nonce: prepared.recorded_nonce,
+            outlet_registration_id: prepared.outlet_registration_id.clone(),
+            stream_manifest_hash,
+            outlet_invoked_event_id: event_id.to_owned(),
+            chain_depth: prepared.recorded_chain_depth,
+            timestamp_ms: prepared.recorded_timestamp_ms,
+        },
+    )
+    .map_err(|e| {
+        ContextError::CryptoFailed(format!(
+            "SCP-SAGA-13044: streaming Commit-B receipt signing failed: {e}"
+        ))
+    })
+}
+
+/// JCS-encode a [`CrossContextOutletStreamReceipt`] to the wire bytes the FSM
+/// forwards.
+fn jcs_stream_receipt_bytes(
+    receipt: &CrossContextOutletStreamReceipt,
+) -> Result<Vec<u8>, ContextError> {
+    scp_protocol::jcs::to_vec(receipt).map_err(|e| {
+        ContextError::CryptoFailed(format!(
+            "SCP-SAGA-13045: streaming Commit-B receipt serialization failed: {e}"
         ))
     })
 }

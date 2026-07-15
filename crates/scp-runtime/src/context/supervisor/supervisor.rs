@@ -248,6 +248,47 @@ pub enum SagaInput {
         /// cannot.
         _seal: CrossContextSagaSeal,
     },
+    /// Cross-context **streaming** outlet invocation — the streaming saga
+    /// (ADR-061 seal phase; spec §6.2.5). Structurally mirrors
+    /// [`Self::CrossContextOutletInvocation`] (same sealed construction
+    /// discipline, same `{caller, target}` participant set), but its FSM entry
+    /// ([`Supervisor::start_cross_context_streaming_outlet_invocation_saga`])
+    /// does NOT run the generic synchronous `run_saga` FSM: the Commit-transition
+    /// returns the `mpsc::Receiver` PROMPTLY, releases the per-participant-set
+    /// concurrency slot (ADR-049 §3a(b)), and reaches `Committed` ASYNC at
+    /// seal-close off the mailbox. This variant exists so the dedicated entry
+    /// can compute the participant-context-set reservation via
+    /// [`saga_participant_context_set`] with the SAME discipline as the unary
+    /// saga; it is never dispatched through [`Supervisor::run_saga`].
+    CrossContextStreamingOutletInvocation {
+        /// Calling context.
+        caller_context_id: [u8; 32],
+        /// Target context that hosts the streaming outlet registration.
+        target_context_id: [u8; 32],
+        /// Channel-authenticated calling identity (spec §6.2.4).
+        caller_did: DID,
+        /// Streaming outlet registration to invoke — a context-LOCAL identifier
+        /// indexing B's own outlet registry.
+        outlet_registration_id: String,
+        /// UCAN proof reference — an INDEX into B's own UCAN store, never the
+        /// proof bytes. `None` for an ungated outlet.
+        ucan_proof_id: Option<String>,
+        /// The invocation input — validated at Prepare-B against the target
+        /// outlet's registered schema specificity floor (spec §9.2.1).
+        input: serde_json::Value,
+        /// Caller-asserted chain depth — advisory; the `+1` base for B's
+        /// re-derived `recorded_chain_depth` (spec §6.2.4).
+        asserted_chain_depth: u8,
+        /// Caller-asserted 16-byte envelope nonce — checked against B's TTL
+        /// dedup cache, then staged on accept (spec §6.2.4).
+        asserted_nonce: [u8; 16],
+        /// Caller-asserted send-time (ms) — used ONLY for the §9.14 skew check.
+        asserted_timestamp_ms: u64,
+        /// Private construction seal — same discipline as the unary variant: the
+        /// streaming saga can only be started via
+        /// [`Supervisor::start_cross_context_streaming_outlet_invocation_saga`].
+        _seal: CrossContextSagaSeal,
+    },
     /// Test-only saga whose Prepare phases succeed and whose Commit phase
     /// ALWAYS fails, so the FSM runs all the way to Committing, exhausts the
     /// commit-retry budget, and lands in `NeedsRepair`. The sole production
@@ -7628,6 +7669,19 @@ impl Supervisor {
                         SagaPhase::B => self.dispatch_xctx_prepare_b(saga_id, ctx).await,
                     }
                 }
+                // Streaming saga (ADR-061): never driven through the generic
+                // synchronous `run_saga` FSM — its dedicated entry
+                // `start_cross_context_streaming_outlet_invocation_saga` runs
+                // Prepare-B + the async seal phase directly. Reaching here is a
+                // misuse (someone routed a streaming input through `start_saga`).
+                SagaInput::CrossContextStreamingOutletInvocation { .. } => Err(saga_reject!(
+                    13055,
+                    InvalidState,
+                    "saga Prepare{:?} — CrossContextStreamingOutletInvocation is not driven by the \
+                     generic run_saga FSM; call \
+                     start_cross_context_streaming_outlet_invocation_saga",
+                    phase
+                )),
                 // Test-only: Prepare always SUCCEEDS so the FSM advances to
                 // Committing (where the test variant's Commit then fails,
                 // driving NeedsRepair).
@@ -7829,6 +7883,16 @@ impl Supervisor {
                         ));
                     };
                     self.dispatch_xctx_commit(saga_id, ctx).await
+                }
+                // Streaming saga (ADR-061): not driven through the generic FSM
+                // Commit — the dedicated entry runs the async seal phase directly.
+                SagaInput::CrossContextStreamingOutletInvocation { .. } => {
+                    Err(ContextError::InvalidState(
+                        "SCP-SAGA-13056: saga Commit — CrossContextStreamingOutletInvocation is \
+                         not driven by the generic run_saga FSM; call \
+                         start_cross_context_streaming_outlet_invocation_saga"
+                            .to_owned(),
+                    ))
                 }
                 // Test-only: Commit ALWAYS fails so `commit_with_retry`
                 // exhausts its budget and the FSM transitions to NeedsRepair.
@@ -12865,6 +12929,7 @@ impl Supervisor {
             class_s: crate::context::actor::state::ClassSState {
                 saga_pending: HashMap::new(),
                 xctx_committed_outputs: HashMap::new(),
+                xctx_committed_stream_outputs: HashMap::new(),
                 xctx_committed_invocations: std::collections::HashSet::new(),
                 xctx_caller_reservations: std::collections::HashMap::new(),
                 xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
@@ -14036,6 +14101,18 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
             caller_did.to_string(),
             outlet_registration_id.clone(),
         ],
+        // Streaming saga (ADR-061): same caller-side provenance triple shape as
+        // the unary variant (target is in the gating set, not the journal record).
+        SagaInput::CrossContextStreamingOutletInvocation {
+            caller_context_id,
+            caller_did,
+            outlet_registration_id,
+            ..
+        } => vec![
+            hex::encode(caller_context_id),
+            caller_did.to_string(),
+            outlet_registration_id.clone(),
+        ],
         #[cfg(any(test, feature = "testing"))]
         SagaInput::TestForceNeedsRepair { context_id } => vec![hex::encode(context_id)],
     }
@@ -14082,6 +14159,17 @@ fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
             hex::encode(caller_context_id),
             hex::encode(target_context_id),
         ],
+        // Streaming saga (ADR-061): the same `{caller, target}` participant set —
+        // the reservation the dedicated entry acquires, then RELEASES at the
+        // Commit-transition (ADR-049 §3a(b)) while the seal pumps off-mailbox.
+        SagaInput::CrossContextStreamingOutletInvocation {
+            caller_context_id,
+            target_context_id,
+            ..
+        } => vec![
+            hex::encode(caller_context_id),
+            hex::encode(target_context_id),
+        ],
         #[cfg(any(test, feature = "testing"))]
         SagaInput::TestForceNeedsRepair { context_id } => vec![hex::encode(context_id)],
     };
@@ -14114,6 +14202,9 @@ fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
 const fn saga_input_is_secret_bearing(input: &SagaInput) -> bool {
     match input {
         SagaInput::CrossContextOutletInvocation { .. } => false,
+        // The streaming saga journals only public provenance + the manifest root
+        // (never chunk bytes) — no bearer material (ADR-061 "Receipt (streaming)").
+        SagaInput::CrossContextStreamingOutletInvocation { .. } => false,
         // The test-only NeedsRepair driver carries no bearer material.
         #[cfg(any(test, feature = "testing"))]
         SagaInput::TestForceNeedsRepair { .. } => false,
@@ -17481,6 +17572,7 @@ mod tests {
             routing: crate::context::actor::state::ContextRouting::Broadcast,
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
+            xctx_committed_stream_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: HashMap::new(),
             xctx_nonce_dedup: HashMap::new(),

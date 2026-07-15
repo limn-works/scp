@@ -2771,6 +2771,7 @@ pub fn build_snapshot_from_state(
         // survives an actor crash. See [`saga_pending_snapshot`].
         saga_pending: saga_pending_snapshot(state),
         xctx_committed_outputs: xctx_committed_outputs_snapshot(state),
+        xctx_committed_stream_outputs: xctx_committed_stream_outputs_snapshot(state),
         xctx_committed_invocations: xctx_committed_invocations_snapshot(state),
         // ADR-049 §9 Class S (spec §6.2.4): persist the caller-side durable
         // reservation reversal records so a `PreparingB`-window crash can reverse
@@ -2845,6 +2846,24 @@ pub(in crate::context) fn xctx_committed_outputs_snapshot(
     crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
 > {
     state.class_s.xctx_committed_outputs.clone()
+}
+
+/// Build the Class-S snapshot projection of the actor's COMMITTED cross-context
+/// **streaming** outlet-invocation captures (ADR-061 seal phase; spec §6.2.5
+/// streaming saga; ADR-049 §9). The streaming sibling of
+/// [`xctx_committed_outputs_snapshot`]. The live
+/// [`CommittedStreamingOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation)
+/// carries no §9.4.3 bearer bytes (public receipt + sealed root), so the snapshot
+/// stores it directly via `Clone`. Used at every snapshot builder so a crash
+/// between the seal-close capture and the next coalesced write cannot lose the
+/// durable witness (which would re-invoke the outlet on replay).
+pub(in crate::context) fn xctx_committed_stream_outputs_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<
+    crate::context::supervisor::saga_journal::SagaId,
+    crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
+> {
+    state.class_s.xctx_committed_stream_outputs.clone()
 }
 
 /// Build the Class-S snapshot projection of the actor's caller-side (A-owned)

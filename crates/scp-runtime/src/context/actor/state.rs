@@ -845,6 +845,29 @@ pub struct ClassSState {
     pub(crate) xctx_committed_outputs:
         HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation>,
 
+    /// Target-side (B-owned) durable, `SagaId`-keyed capture of COMMITTED
+    /// cross-context **streaming** outlet invocations (ADR-061 seal phase; spec
+    /// §6.2.5 streaming saga). The streaming sibling of
+    /// [`Self::xctx_committed_outputs`].
+    ///
+    /// The seal at stream-close inserts a
+    /// [`CommittedStreamingOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation)
+    /// here (the signed streaming receipt + sealed `stream_manifest_hash` +
+    /// billing/chunk counters + event id) BEFORE journaling `Committed`, so a
+    /// Commit replayed after a crash (§17.16.4) re-emits the IDENTICAL receipt and
+    /// re-acks the SAME `outlet_invoked_event_id` **without re-invoking the
+    /// outlet** (re-invoking a non-deterministic LLM would break §6.2.4
+    /// replay-determinism). No output bytes are stored — the streaming receipt
+    /// attests the root, and the root reproduces from the durable frontier prefix.
+    ///
+    /// **Class S** — same fail-closed discipline and same retention bound as
+    /// [`Self::xctx_committed_outputs`] (tied to saga-journal retention). Survives
+    /// same-node restore; dropped on cross-node export/import.
+    pub(crate) xctx_committed_stream_outputs: HashMap<
+        SagaId,
+        crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
+    >,
+
     /// Caller-side (A-owned) durable set of COMMITTED cross-context outlet
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
     /// §17.16.4 crash recovery: "A re-acks its `CrossContextOutletInvoked` append
@@ -984,6 +1007,11 @@ pub struct ClassSStateSnapshot {
     /// Mirror of [`ClassSState::xctx_committed_outputs`].
     pub(crate) xctx_committed_outputs:
         HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation>,
+    /// Mirror of [`ClassSState::xctx_committed_stream_outputs`].
+    pub(crate) xctx_committed_stream_outputs: HashMap<
+        SagaId,
+        crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
+    >,
     /// Mirror of [`ClassSState::xctx_committed_invocations`].
     pub(crate) xctx_committed_invocations: std::collections::HashSet<SagaId>,
     /// Mirror of [`ClassSState::xctx_caller_reservations`].
@@ -1025,6 +1053,7 @@ impl ClassSState {
             xctx_nonce_dedup_entries: self.xctx_nonce_dedup.entries(),
             xctx_nonce_dedup_ttl_secs: self.xctx_nonce_dedup.ttl_secs(),
             xctx_committed_outputs: self.xctx_committed_outputs.clone(),
+            xctx_committed_stream_outputs: self.xctx_committed_stream_outputs.clone(),
             xctx_committed_invocations: self.xctx_committed_invocations.clone(),
             xctx_caller_reservations: self.xctx_caller_reservations.clone(),
             caveat_counters: self.caveat_counters.clone(),
@@ -1046,6 +1075,7 @@ impl ClassSState {
             snap.xctx_nonce_dedup_ttl_secs,
         );
         self.xctx_committed_outputs = snap.xctx_committed_outputs;
+        self.xctx_committed_stream_outputs = snap.xctx_committed_stream_outputs;
         self.xctx_committed_invocations = snap.xctx_committed_invocations;
         self.xctx_caller_reservations = snap.xctx_caller_reservations;
         self.caveat_counters = snap.caveat_counters;
@@ -1527,6 +1557,7 @@ impl PerContextState {
                     crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
                 ),
                 xctx_committed_outputs: HashMap::new(),
+                xctx_committed_stream_outputs: HashMap::new(),
                 xctx_committed_invocations: std::collections::HashSet::new(),
                 xctx_caller_reservations: std::collections::HashMap::new(),
                 caveat_counters: HashMap::new(),
@@ -2748,6 +2779,7 @@ mod tests {
             saga_pending,
             xctx_nonce_dedup,
             xctx_committed_outputs,
+            xctx_committed_stream_outputs,
             xctx_committed_invocations,
             xctx_caller_reservations,
             caveat_counters,
@@ -2817,6 +2849,7 @@ mod tests {
         // No committed cross-context outlet invocations on a fresh context
         // (target-side durable output capture + caller-side commit witness).
         assert!(xctx_committed_outputs.is_empty());
+        assert!(xctx_committed_stream_outputs.is_empty());
         assert!(xctx_committed_invocations.is_empty());
         // No in-flight caller-side cross-context reservations on a fresh context.
         assert!(xctx_caller_reservations.is_empty());
@@ -2876,6 +2909,7 @@ mod tests {
                     saga_pending: _,
                     xctx_nonce_dedup: _,
                     xctx_committed_outputs: _,
+                    xctx_committed_stream_outputs: _,
                     xctx_committed_invocations: _,
                     xctx_caller_reservations: _,
                     caveat_counters: _,
@@ -3069,6 +3103,7 @@ mod tests {
                     recorded_chain_depth: 4,
                     frontier: stream_frontier,
                     reserved: Amount::new(5_000),
+                    cost_per_chunk: Amount::new(1_000),
                     billed: Amount::new(2_000),
                     billed_count: 2,
                     cancel_ack_ceiling: 1,

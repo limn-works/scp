@@ -337,7 +337,15 @@ pub struct CrossContextStreamingOutletInvocationPrepared {
     /// Total credit reserved at Prepare (the escrow cap). Refund at close is
     /// `reserved − billed`.
     pub reserved: Amount,
-    /// Credit billed so far (advances with the frontier's billable chunks).
+    /// The per-billable-`Data`-chunk price pinned at the Commit-transition
+    /// (ADR-061 seal phase). Held on the durable ledger so the seal at
+    /// stream-close can reconstruct the escrow (`StreamEscrow::from_reserved`)
+    /// and settle `refund = reserved − billed` with NO live pump — the pump is
+    /// gone after a crash, so escrow MUST settle from this durable ledger, not
+    /// the in-memory `PumpEscrowGuard`.
+    pub cost_per_chunk: Amount,
+    /// Credit billed so far (advances with the frontier's billable chunks;
+    /// `cost_per_chunk × frontier.billed_count()`). Class-S monotonic (KEEP).
     pub billed: Amount,
     /// The §5.4.5 billable-`Data`-chunk count captured alongside the ledger;
     /// the escrow cross-check verifies it against `frontier.billed_count()`.
@@ -450,6 +458,9 @@ pub struct CrossContextStreamingOutletInvocationSnapshot {
     pub frontier: MerkleFrontier,
     /// Total credit reserved at Prepare (the escrow cap).
     pub reserved: Amount,
+    /// The per-billable-`Data`-chunk price pinned at the Commit-transition; the
+    /// seal reconstructs the escrow from `(cost_per_chunk, reserved)` at close.
+    pub cost_per_chunk: Amount,
     /// Credit billed so far.
     pub billed: Amount,
     /// The §5.4.5 billable-`Data`-chunk count.
@@ -493,6 +504,7 @@ impl SagaPreparedStateSnapshot {
                         recorded_chain_depth: inner.recorded_chain_depth,
                         frontier: inner.frontier.clone(),
                         reserved: inner.reserved,
+                        cost_per_chunk: inner.cost_per_chunk,
                         billed: inner.billed,
                         billed_count: inner.billed_count,
                         cancel_ack_ceiling: inner.cancel_ack_ceiling,
@@ -536,6 +548,7 @@ impl SagaPreparedStateSnapshot {
                         recorded_chain_depth: snap.recorded_chain_depth,
                         frontier: snap.frontier,
                         reserved: snap.reserved,
+                        cost_per_chunk: snap.cost_per_chunk,
                         billed: snap.billed,
                         billed_count: snap.billed_count,
                         cancel_ack_ceiling: snap.cancel_ack_ceiling,
@@ -587,6 +600,63 @@ pub struct CommittedOutletInvocation {
     /// The `SagaId`-stable `OutletInvoked` event-log entry id (also carried on
     /// the receipt; stored explicitly so a replay re-acks the same id without
     /// re-deriving it).
+    pub outlet_invoked_event_id: String,
+}
+
+/// Durable, `SagaId`-keyed capture of a COMMITTED cross-context **streaming**
+/// outlet invocation, held on the TARGET (B) actor.
+///
+/// ADR-061 seal phase; spec §6.2.5 streaming saga — the streaming sibling of
+/// [`CommittedOutletInvocation`].
+///
+/// The seal phase reaches the `Committed` terminal at stream-close (not at the
+/// Commit-transition). At that instant the target durably captures — keyed by
+/// `SagaId` — the signed streaming receipt plus the sealed `stream_manifest_hash`
+/// and the billing/chunk counters, so a Commit replayed after a crash (§17.16.4)
+/// re-emits the IDENTICAL signed receipt and the SAME `outlet_invoked_event_id`
+/// **without re-invoking the outlet** (re-invoking a non-deterministic LLM would
+/// break §6.2.4 replay-determinism). Unlike the unary
+/// [`CommittedOutletInvocation`], no output bytes are captured — the streaming
+/// receipt attests the Merkle root, and the root reproduces from the durable
+/// `SagaId`-keyed frontier, never from carried output (ADR-061 "Receipt
+/// (streaming)").
+///
+/// **Class S** — held in
+/// [`PerContextState.xctx_committed_stream_outputs`](crate::context::actor::state::PerContextState::xctx_committed_stream_outputs)
+/// and synchronously persisted fail-closed (ADR-049 §9), the same discipline as
+/// [`CommittedOutletInvocation`]: a crash that rolled the capture back behind an
+/// acked seal-close would re-invoke the outlet on replay, breaking exactly-once.
+///
+/// **Not bearer-bearing.** The receipt and the manifest root are public protocol
+/// artifacts (the receipt is the signed streaming return-path response), so — like
+/// [`CommittedOutletInvocation`] — this type derives `Serialize`/`Clone` directly
+/// and rides the public [`ContextSnapshot`](crate::context::state::ContextSnapshot)
+/// surface without a separate mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedStreamingOutletInvocation {
+    /// The target's signed streaming receipt over the staged provenance + the
+    /// sealed `stream_manifest_hash` + event id. Re-emitted verbatim on a
+    /// replayed Commit so the signature preimage reproduces byte-for-byte.
+    pub receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt,
+    /// The sealed RFC-6962 Merkle root over the emitted chunk sequence — the
+    /// `frontier.root()` finalized at stream-close (also carried on the receipt;
+    /// stored explicitly so a replay re-emits it without re-deriving).
+    pub stream_manifest_hash: [u8; 32],
+    /// Credit billed at seal-close settled from the durable ledger
+    /// (`cost_per_chunk × billed_count`); stored so a replayed Commit re-emits the
+    /// IDENTICAL settlement without recomputing.
+    pub billed: Amount,
+    /// Escrow refund at seal-close = `reserved − billed`; stored so a replay
+    /// re-emits the same refund (the money already moved on the first settle).
+    pub refund: Amount,
+    /// The §5.4.5 billable-`Data`-chunk count sealed at close
+    /// (`frontier.billed_count()`), recorded into the B-side `OutletInvoked` event.
+    pub billed_count: u32,
+    /// Total chunks in the sealed manifest (`frontier.leaf_count()`), the §5.4.5
+    /// `stream_chunk_count` recorded into the B-side `OutletInvoked` event.
+    pub stream_chunk_count: u64,
+    /// The `SagaId`-stable `OutletInvoked` event-log entry id (also carried on the
+    /// receipt; stored explicitly so a replay re-acks the same id).
     pub outlet_invoked_event_id: String,
 }
 
@@ -865,6 +935,7 @@ mod tests {
                 recorded_chain_depth: 5,
                 frontier,
                 reserved: Amount::new(1_000),
+                cost_per_chunk: Amount::new(100),
                 billed: Amount::new(300),
                 billed_count: 3,
                 cancel_ack_ceiling: 2,
@@ -890,6 +961,7 @@ mod tests {
         assert_eq!(inner.recorded_nonce, [0x8Fu8; 16]);
         assert_eq!(inner.recorded_chain_depth, 5);
         assert_eq!(inner.reserved, Amount::new(1_000));
+        assert_eq!(inner.cost_per_chunk, Amount::new(100));
         assert_eq!(inner.billed, Amount::new(300));
         assert_eq!(inner.billed_count, 3);
         assert_eq!(inner.cancel_ack_ceiling, 2);
