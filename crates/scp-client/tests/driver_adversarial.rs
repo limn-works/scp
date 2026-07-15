@@ -933,11 +933,15 @@ fn misdirected_sender_key_distribution_is_rejected_without_mutation() {
         "a rejected misdirected distribution buffers no event"
     );
 
-    // Behavioural proof that NO wrong key was installed and Bob's receive path is not
-    // wedged: Alice (whose key Bob installed during `converged_pair`) sends an
-    // application message and Bob still decrypts it. The sender-key store is internal
-    // (the snapshot cannot observe it), so this end-to-end decrypt is what proves the
-    // misdirected seal neither installed nor corrupted a key.
+    // Bob's PEER sender-key store is internal — `StateSnapshot` does not capture it and
+    // there is no public observer — so we cannot directly read that no wrong key was
+    // installed. The evidence is instead two-fold: (a) the rejection surfaced as
+    // `ClientError::SenderKey(_)`, a failure at the HPKE-open step, which runs BEFORE
+    // any key-install step, so no key can have been adopted from the misdirected seal;
+    // and (b) this probe confirms the receive path is not wedged and Alice's existing
+    // sender key (installed during `converged_pair`) still decrypts. Together these are
+    // the rejection-POINT (open-before-install) plus a non-wedging probe — NOT a direct
+    // read of the store's contents.
     let honest = alice
         .send_message(CTX, b"honest after misdirection")
         .expect("Alice sends");
