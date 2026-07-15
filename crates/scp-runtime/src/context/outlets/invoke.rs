@@ -4927,6 +4927,11 @@ pub(crate) async fn run_streaming_saga_seal_task(
     descriptor: CrossContextVerificationDescriptor,
     output_schema: serde_json::Value,
     aggregate_schema: Option<serde_json::Value>,
+    // The RECEIVING context A's shared event-log provider (SCP-OUT-046 #135) —
+    // where the A-side `CrossContextOutletInvoked` dual-log leaf is recorded at
+    // seal-close, completing the atomic dual-log (B's `OutletInvoked` is
+    // recorded by the seal handler).
+    a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
 ) {
     use crate::context::actor::ContextCommand;
     use crate::context::actor::commands::SagaPhaseMessage;
@@ -5144,6 +5149,16 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 manifest_root = %hex::encode(outcome.stream_manifest_hash),
                 "streaming-saga seal task: sealed — Committing→Committed"
             );
+            // #135 — record the receiving-context (A) `CrossContextOutletInvoked`
+            // dual-log leaf, completing the atomic dual-log (B's `OutletInvoked`
+            // was recorded by the seal handler). Recorded BEFORE the settlement
+            // move below so it borrows the whole `outcome`. Uses the SEALED root
+            // from `outcome` (never a re-derivation) + the convergent
+            // timestamp/nonce/context-ids from the signed receipt, so every
+            // honest member's leaf is byte-identical. `reassembled` is no longer
+            // needed — B's durable frontier is the authoritative manifest.
+            record_streaming_saga_a_event(&a_event_log, &saga_id, &outcome).await;
+
             // Apply the ACTUAL budget movement (SCP-OUT-046): the seal handler
             // built the complete `StreamSettlement` from the durable ledger but
             // CANNOT dispatch to its own actor mailbox (re-entrant deadlock), so
@@ -5176,12 +5191,6 @@ pub(crate) async fn run_streaming_saga_seal_task(
                      recovery sweep will reconcile from the durable committed witness"
                 );
             }
-
-            // SCP-OUT-046 #135 seam: record the receiving-context A-side
-            // `CrossContextOutletInvoked` dual-log leaf over `reassembled` +
-            // `outcome.stream_manifest_hash` here (next slice). B's side is
-            // already recorded by the `CommitBStreamSettle` handler.
-            let _ = &reassembled;
         }
         Err(err) => {
             // The seal did not commit. Drop the ticket so its `Drop` reverses the
@@ -5197,6 +5206,92 @@ pub(crate) async fn run_streaming_saga_seal_task(
                  reversed, journal left Committing for crash recovery"
             );
         }
+    }
+}
+
+/// Record the receiving-context (A) `CrossContextOutletInvoked` dual-log leaf at
+/// a streaming-saga seal-close (SCP-OUT-046 #135; the streaming sibling of the
+/// unary saga's caller-side `cross_context_invoked_leaf`). Shared by the seal
+/// task AND the key-bearing crash-recovery truncated close (#136) so both record
+/// the identical A-side leaf.
+///
+/// The leaf is a commit-ordered CONVERGENT durable leaf (ADR-011 Amendment §6
+/// carve-out): every field is derived from the SIGNED streaming receipt
+/// (`outcome.receipt`) + the SEALED root (`outcome.stream_manifest_hash`) — never
+/// a re-derivation over a locally reassembled sequence and never a local clock —
+/// so every honest member reconstructs the byte-identical leaf. The convergent
+/// timestamp is `receipt.timestamp_ms / 1000` (B's staged `recorded_timestamp_ms`),
+/// the SAME instant B's `OutletInvoked` leaf hashes, so the two `nonce`-joined
+/// records date the one provenance edge identically (§6.2.4 "Dual event-log
+/// recording"; §7.3.1 / §9.9.3).
+///
+/// Best-effort append (mirrors `record_cross_context_a_event`): the atomic seal
+/// guarantee is the durable `xctx_committed_stream_outputs` witness + the journal,
+/// so a receiver-side recording fault surfaces to the audit log rather than
+/// un-committing the sealed saga. Never re-signs, never re-invokes.
+async fn record_streaming_saga_a_event(
+    a_event_log: &std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
+    saga_id: &crate::context::supervisor::saga_journal::SagaId,
+    outcome: &crate::context::actor::commands::CommitBStreamSettleOutcome,
+) {
+    let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt =
+        match serde_json::from_slice(&outcome.receipt) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "streaming-saga A-side record: sealed receipt could not be parsed for the \
+                     convergent timestamp/nonce — skipping CrossContextOutletInvoked"
+                );
+                return;
+            }
+        };
+    // The A-side leaf carries the SEALED manifest root (never the unary
+    // `output_hash`) + the streaming counters, joined to B's `OutletInvoked` by
+    // the shared `nonce`. The context id the leaf lands in is A
+    // (`receipt.caller_context_id`); it REFERENCES B (`receipt.target_context_id`).
+    let payload = serde_json::json!({
+        "saga_id": saga_id.0,
+        "target_context_id": hex::encode(receipt.target_context_id),
+        "nonce": hex::encode(receipt.nonce),
+        "outlet_registration_id": receipt.outlet_registration_id,
+        "outlet_invoked_event_id": receipt.outlet_invoked_event_id,
+        "stream_manifest_hash": hex::encode(outcome.stream_manifest_hash),
+        "chunks_billed": outcome.billed_count,
+        "stream_chunk_count": outcome.stream_chunk_count,
+        "receipt_len": outcome.receipt.len(),
+    });
+    let payload_bytes = match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::error!(
+                saga_id = %saga_id.0,
+                %err,
+                "streaming-saga A-side record: CrossContextOutletInvoked payload serialization \
+                 failed — skipping"
+            );
+            return;
+        }
+    };
+    if let Err(err) = a_event_log
+        .append_context_event_with_payload(
+            &receipt.caller_context_id,
+            scp_event_log::EventType::CrossContextOutletInvoked,
+            &receipt.caller_did,
+            scp_event_log::EventPayload {
+                data: payload_bytes,
+            },
+            receipt.timestamp_ms / 1000,
+        )
+        .await
+    {
+        tracing::error!(
+            saga_id = %saga_id.0,
+            %err,
+            "streaming-saga A-side record: CrossContextOutletInvoked append failed — the sealed \
+             witness remains the authoritative dual-record source"
+        );
     }
 }
 

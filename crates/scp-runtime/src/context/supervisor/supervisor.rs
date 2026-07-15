@@ -6386,6 +6386,19 @@ impl Supervisor {
             });
         }
 
+        // Resolve the RECEIVING context A's shared event-log provider up front
+        // (SCP-OUT-046 #135) — fail-closed WITHOUT reserving if it is missing,
+        // since the atomic dual-log's A-side leaf cannot be recorded without it
+        // (mirrors the best-effort bridge's early check).
+        let Some(a_event_log) = self.event_log_ref().cloned() else {
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13067,
+                message: "streaming saga: receiving-context event-log provider not configured"
+                    .to_owned(),
+            });
+        };
+
         // Resolve the channel-authenticated caller's ROLE in the caller context
         // (spec §6.2.4) — authoritative only in the context gate 1 just proved,
         // carried to Prepare-B so B enforces `allowed_source_roles` against the
@@ -6729,6 +6742,7 @@ impl Supervisor {
             descriptor,
             output_schema,
             aggregate_schema,
+            a_event_log,
         ));
 
         // AC1 — return the receiver PROMPTLY (the journal is `Committing`; the
