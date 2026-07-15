@@ -675,7 +675,7 @@ The pre-rotation key is the security backstop for the entire identity system —
 
    The fail-closed-no-fallback rule above and the recovery-authority-residence property are canonical and normative here. What is NOT settled here — the per-profile conformance *realization* of this rule (the per-profile floors, which of the item-4 methods conform on which profile, and the profile-specific selection ceremony of item 5) — is PROPOSED in RFC #2130 (pre-rotation recovery custody), to be validated at execution (tracked by #1729 / #1777). Items 4 (approved custody methods) and 5 (SDK presentation) below remain canonical; only their per-profile conformance filtering is the RFC #2130 realization.
 
-4. **Approved custody methods** (ordered by security, any one is sufficient):
+4. **Approved custody methods** (ordered by security; any one is sufficient **subject to the recovery-authority-residence requirement of item 3a** — a method whose recovery authority is reachable from operational custody does not satisfy item 3, regardless of its position in this list):
 
    | Method | Security level | Description |
    |--------|---------------|-------------|
