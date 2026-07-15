@@ -471,6 +471,7 @@ mod live_supervisor_send {
     use scp_clock::SystemClock;
     use crate::context::ContextHandle;
     use crate::context::actor::state::PerContextState;
+    use crate::context::supervisor::key_package_actor::KeyPackageCommand;
     use crate::context::builder::ContextTransportProvider;
     use crate::context::supervisor::{MessageSigner, Supervisor};
     use crate::crypto::mls::provider::MlsCryptoProvider;
@@ -687,35 +688,29 @@ mod live_supervisor_send {
             welcome.expect("actor emitted a WelcomeGenerated event for Bob")
         };
 
-        // Bob installs the joined group through the REAL spawn path (the legacy
-        // provider-level `join_from_welcome` is retired): Alice's Welcome is
-        // hand-sealed into a creator-signed §5.12.3 bundle addressed to Bob's
-        // #active, and `spawn_actor_from_welcome` opens + installs it into Bob's
-        // provider. Alice is a LIVE Supervisor here, so the group's committed
-        // `0xFF02` params/creator come from her `create_context`; the bundle
-        // carries the SAME `encrypted_params()` + `ALICE_DID`, so the §5.13.3
-        // binding verifies. After the join the group lives in Bob's provider, so
-        // it survives the supervisor drop.
+        // Bob confirms the join at the PROVIDER level (the real fused
+        // `ConfirmConsume` join → the joined `ScpMlsGroup`) and installs it into
+        // his provider via `install_joined_group`, KEEPING the crypto
+        // provider-resident. The full `spawn_actor_from_welcome` entrypoint moves
+        // the crypto ONE-WAY into a spawned actor (ADR-049 PR-7 C2), which would
+        // leave `bob` empty; this bootstrap needs Bob's group provider-resident so
+        // the receive relocation below can `take_crypto_state` it onto Bob's actor.
         let bob_pseudonym = [0x42u8; 32];
-        let bob_custody = InMemoryKeyCustody::new();
-        let bob_active_handle = bob_custody
-            .import_ed25519_signing_key(&Zeroizing::new(bob_active_key.to_bytes()))
+        let bob_deps = bob_sup
+            .build_actor_deps(&DID::from(BOB_DID))
             .await
-            .expect("import bob's #active seed into custody");
-        let req = crate::crypto::mls::two_party_test_support::seal_welcome_for_joiner(
-            &alice_bundle_key,
-            &DID::from(ALICE_DID),
-            ctx_id,
-            &encrypted_params(),
-            welcome_bytes,
-            bob_active_key.verifying_key().as_bytes(),
-            reservation_id,
-            bob_pseudonym,
-        );
-        bob_sup
-            .spawn_actor_from_welcome(DID::from(BOB_DID), &bob_custody, &bob_active_handle, req)
+            .expect("build bob's actor deps");
+        let joined_group = bob_deps
+            .key_package_store
+            .send(|reply| KeyPackageCommand::ConfirmConsume {
+                reservation_id,
+                welcome_bytes,
+                reply,
+            })
             .await
-            .expect("bob installs the joined group from alice's invitation");
+            .expect("bob confirms the join and receives the joined MLS group");
+        bob.install_joined_group(&ctx_bytes, joined_group)
+            .expect("install bob's joined group into his provider");
         drop(bob_sup);
 
         bob.generate_sender_key(&ctx_bytes)

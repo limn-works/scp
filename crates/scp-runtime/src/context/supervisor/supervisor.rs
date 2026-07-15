@@ -19995,10 +19995,27 @@ mod tests {
         let msg_a = seal_app(b"first-application-message"); // header sequence 0
         let msg_b = seal_app(b"second-application-message"); // header sequence 1
 
+        // Move Bob onto the actor seam and hand `decrypt_and_dispatch` his
+        // actor-owned crypto state: post-ADR-049 PR-7 the receive seam opens
+        // through the actor's `&mut ContextCryptoState` (a `None` means "no
+        // group"). App-data delivery never touches the provider's per-context
+        // crypto, so the emptied `bob_deps.crypto` is only read for `local_did`.
+        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        let bob_cs = match &mut bob_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c,
+            crate::context::actor::ContextModeState::Broadcast(_) => {
+                panic!("expected encrypted mode")
+            }
+        };
+
         // Deliver the LATER message (b, sequence 1) FIRST. Accepted; the registry
         // recv floor advances to exactly the surfaced receive_floor.
         let opened_b = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, None, ctx_str, &ctx_bytes, &msg_b,
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &msg_b,
         )
         .expect("first (in-order) delivery must succeed")
         .expect("an Application envelope must surface");
@@ -20013,7 +20030,11 @@ mod tests {
         // MLS ciphertext (so MLS decrypts it), but an older floor. The authoritative
         // registry recv gate MUST reject it fail-closed, and NO envelope surfaces.
         let reorder = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, None, ctx_str, &ctx_bytes, &msg_a,
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &msg_a,
         );
         // Pin the REASON: the rejection must be the registry recv-floor gate
         // (`FloorAdvanceError::RecvSequenceNotMonotonic`, whose Display is
@@ -20037,7 +20058,11 @@ mod tests {
 
         // A replay of the accepted message b is also rejected (no envelope).
         let replay = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, None, ctx_str, &ctx_bytes, &msg_b,
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &msg_b,
         );
         assert!(
             replay.is_err(),
@@ -20120,8 +20145,22 @@ mod tests {
             .seal(ALICE, &inner, &routing_id, 3600)
             .expect("alice seals at the rotated epoch");
 
+        // Hand Bob's actor-owned crypto state to the receive seam (it now opens
+        // through the actor's `&mut ContextCryptoState`); the rotated key Bob
+        // installed above is carried onto the actor by `take_into_actor`.
+        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        let bob_cs = match &mut bob_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c,
+            crate::context::actor::ContextModeState::Broadcast(_) => {
+                panic!("expected encrypted mode")
+            }
+        };
         let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, None, ctx_str, &ctx_bytes, &sealed,
+            &bob_deps,
+            Some(bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
         )
         .expect("a recv at the just-advanced epoch must be ACCEPTED (no stale over-reject)")
         .expect("an Application envelope must surface");
