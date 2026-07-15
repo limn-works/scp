@@ -30748,7 +30748,7 @@ mod streaming_saga_tests {
 
     use ed25519_dalek::SigningKey;
     use scp_did::DID;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use scp_protocol::context::ContextState;
     use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt;
     use scp_protocol::context::outlets::registry::{
