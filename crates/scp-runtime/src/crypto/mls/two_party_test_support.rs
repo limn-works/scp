@@ -11,15 +11,18 @@
 //!
 //! Alice is a BARE `MlsCryptoProvider` that hand-seals the bundle (no creator
 //! `Supervisor` needed); Bob is driven through a real joiner `Supervisor`. After
-//! the join, Alice distributes her sender key to Bob (setting Bob's sender-key
-//! high-water for Alice to epoch 1) — the exact behaviour the H9 receive-ceiling
-//! fixtures and the app-data / agent-binding pipeline fixtures depend on.
+//! the join, Bob PULLS Alice's sender key via the §9.16.2 request/response
+//! protocol (the provider PUSH drain is deleted post-ADR-049 PR-7) so Bob can
+//! decrypt Alice's application sends — the exact behaviour the H9
+//! receive-ceiling fixtures and the app-data / agent-binding pipeline fixtures
+//! depend on.
 //!
 //! The helper is SYNC (its callers are sync `#[test]` functions) and drives the
 //! async join on an internal current-thread runtime. After the join the joiner's
-//! MLS group lives in Bob's provider (`install_joined_group`), so the returned
-//! `Arc<MlsCryptoProvider>` pair `seal`/`open`/`export_crypto_state` even after
-//! the `Supervisor` and runtime are dropped.
+//! MLS group lives in Bob's provider (`install_joined_group`), so each returned
+//! `Arc<MlsCryptoProvider>` still owns its per-context crypto material and can be
+//! destructively `take_crypto_state`'d onto the actor seam (where the deleted
+//! steady-state twins now live) even after the `Supervisor` and runtime drop.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // `spawn_actor_from_welcome` returns a deliberately large state-building future;
@@ -375,28 +378,57 @@ pub fn stand_up_two_party(
                 .await
                 .expect("bob installs the joined group from alice's real invitation");
 
-            // Bob mints his own sender key (the install already seeded one at epoch
-            // 1; this rotates it to a fresh value, matching the old fixture), then
-            // Alice distributes HER sender key to Bob so Bob's sender-key high-water
-            // for Alice becomes epoch 1 (the H9 ceiling anchor) and Bob can decrypt
-            // Alice's application sends.
+            // Bob mints his own sender key (the install already seeded one; this
+            // rotates it to a fresh value, matching the old fixture), then Bob
+            // acquires Alice's sender key so he can decrypt her application sends.
             bob_crypto
                 .generate_sender_key(&ctx_bytes)
                 .expect("bob mints his sender key");
-            alice_crypto
-                .distribute_sender_key(&ctx_bytes, bob_did)
-                .expect("alice distributes her sender key to bob");
-            for (_target, msg) in alice_crypto
-                .drain_pending_sender_key_messages(&ctx_bytes)
-                .expect("drain alice's pending sender-key messages")
-            {
-                let (key, _epoch) = bob_crypto
-                    .process_incoming_sender_key(&ctx_bytes, alice_did, &msg)
-                    .expect("bob processes alice's distributed sender key");
-                // ADR-049 PR-6: install the authenticated key (decomposed
-                // process_incoming no longer installs).
-                bob_crypto.set_sender_key_unchecked(&ctx_bytes, alice_did, key);
-            }
+
+            // Bob PULLS Alice's sender key via the §9.16.2 request/response
+            // protocol. Post-ADR-049 PR-7 the provider PUSH `drain_pending_
+            // sender_key_messages` twin is DELETED; the pull path uses only the
+            // retained receive-side provider methods (`handle_sender_key_request`
+            // / `store_member_sender_key` / `set_sender_key_unchecked`) and keeps
+            // BOTH parties as providers so the golden `take_into_actor` seam can
+            // destructively move each into an actor exactly once.
+            let request = crate::crypto::sender_keys::key_protocol::request_sender_key(
+                &bob_custody,
+                &bob_handle,
+                bob_did,
+                alice_did,
+                0, // bob's initial sender-key epoch (not validated by the responder)
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("bob builds a signed sender-key request for alice's key");
+            let blocked = std::collections::HashSet::new();
+            let response_bytes = alice_crypto
+                .handle_sender_key_request(
+                    &ctx_bytes,
+                    &request.request_message,
+                    bob_signing_key().verifying_key().as_bytes(),
+                    &blocked,
+                )
+                .expect("alice accepts bob's sender-key request (H1 membership gate)")
+                .expect("alice returns a response for a non-blocked member");
+            let response: scp_protocol::crypto::sender_keys::SenderKeyResponse =
+                rmp_serde::from_slice(&response_bytes).expect("decode alice's SenderKeyResponse");
+            let ctx_id_hex = hex::encode(ctx_bytes);
+            let alice_key = crate::crypto::sender_keys::key_protocol::open_sender_key_response(
+                &bob_custody,
+                &request.wrapping_key_handle,
+                &ctx_id_hex,
+                &response,
+            )
+            .await
+            .expect("bob opens alice's HPKE-sealed sender key");
+            // ADR-049 PR-6: store returns the authenticated (key, epoch); install
+            // is a separate explicit `set_sender_key_unchecked`.
+            let (alice_key, _epoch) = bob_crypto
+                .store_member_sender_key(&ctx_bytes, alice_did, alice_key, response.epoch)
+                .expect("bob verifies + returns alice's pulled sender key");
+            bob_crypto.set_sender_key_unchecked(&ctx_bytes, alice_did, alice_key);
 
             // Drop the joiner supervisor; the installed group persists in
             // `bob_crypto` (a separate `Arc` clone of the same provider).

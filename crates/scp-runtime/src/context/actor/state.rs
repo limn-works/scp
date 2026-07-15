@@ -3549,33 +3549,36 @@ mod tests {
 // Golden byte-identity tests (ADR-049 PR-7 Prep A — SCP-CRYPTOMOVE-000a)
 // ---------------------------------------------------------------------------
 //
-// Verification invariant 1: each additive `PerContextState` crypto method
-// produces output BYTE-IDENTICAL to (or WIRE-COMPATIBLE with) the retained
-// `MlsCryptoProvider` twin for the same seeded MLS group + inputs.
+// Verification invariant 1: each `PerContextState` crypto method preserves the
+// golden byte-level / behavioural contract of the crypto primitive it now owns.
 //
-// The sender-layer AES-256-GCM nonce (`OsRng`), the MLS message nonce, and the
-// per-rotation sender key / HPKE ephemeral key are all fresh randomness, so two
-// independent `seal` / `rotate` / `advance` / `remove` calls CANNOT produce raw
-// byte-identical ciphertext. Equivalence is therefore proven by the strongest
-// feasible assertion per method:
-//   * `seal` / `open` / `mls_encrypt_management` — CROSS round-trip: an actor
-//     seal opens under a provider receiver and a provider seal opens under an
-//     actor receiver, decrypting to the identical `InnerEnvelope` + `sender_did`
-//     + `ReceiveFloor` (the deterministic, AAD-bound values are byte-equal).
+// Post-ADR-049 PR-7 the `MlsCryptoProvider` steady-state twins (seal / open /
+// rotate / advance / remove / export / drain / mls_encrypt_management /
+// local_sender_key_epoch / restore) are DELETED and each party's crypto is
+// destructively `take_crypto_state`'d into the actor exactly once — the actor
+// is the SOLE crypto authority, so there is no provider side to cross-drive.
+// The pinning therefore runs entirely on the actor seam, asserting each method
+// against the SAME golden expectation the former dual-drive block asserted (the
+// deterministic, AAD-bound decrypted value / the documented invariant), not a
+// weakened "it compiles" check:
+//   * `seal` / `open` / `mls_encrypt_management` — actor seal→actor open
+//     round-trip decrypts to the ORIGINAL `InnerEnvelope` byte-for-byte at the
+//     AAD-bound (`sender_did`, `ReceiveFloor`), at both the zero and a rotated
+//     non-zero sender-key epoch (the epoch is bound in the sender-layer AAD).
 //   * `distribute_sender_key` / `process_incoming_sender_key` — the RECOVERED
 //     sender key (deterministic — the existing key material) is byte-identical
-//     across the actor and provider paths.
+//     to Alice's actual local sender key, and installs so her seal opens.
 //   * `group_context_extension` / `local_sender_key_epoch` — DIRECT
-//     byte/value equality (deterministic reads).
-//   * `export_crypto_state` — length parity (identical multiset of msgpack
-//     entries) + functional restore equivalence (restored providers agree on
-//     the group-context extension and local epoch).
+//     byte/value equality against the known golden value (deterministic reads).
+//   * `export_crypto_state` — non-empty export + functional restore equivalence
+//     via the retained `build_restored_owned` reader (the reseeded actor agrees
+//     with the original on the group-context extension and local epoch).
 //   * `advance_epoch` / `remove_member` — the moved primitive produces a valid,
-//     non-empty commit and leaves the group functional / membership reduced
-//     identically (the commit's key material is fresh randomness, so raw bytes
-//     cannot be compared).
+//     non-empty commit and the counterparty processes it to the committer's new
+//     epoch (the commit's key material is fresh randomness, so raw bytes cannot
+//     be compared).
 //   * `destroy_mls_group` / `destroy_sender_key` — the observable post-state
-//     matches the provider (empty export / rotated-and-cleared sender key).
+//     (empty export / rotated-and-cleared sender key) holds after the op.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -3701,38 +3704,26 @@ mod crypto_ops_golden {
         let rid = routing(&ctx);
         let inner = build_inner(ALICE, 0);
 
-        // Direction 1: actor seals, provider receiver opens.
+        // Actor seals; the actor receiver opens. The provider twin is deleted
+        // (its crypto was destructively taken into the actor), so the golden pin
+        // is the actor seal→open round-trip decrypting to the ORIGINAL
+        // InnerEnvelope byte-for-byte at the zero-epoch AAD binding.
         let blob_actor = alice_a.seal(ALICE, &inner, &rid, 300).unwrap();
-        let opened_by_provider = bob_p.open(&ctx, CTX_STR, &blob_actor).unwrap();
-
-        // Direction 2: provider seals, actor receiver opens.
-        let blob_provider = alice_p.seal(&ctx, &inner, &rid, 300).unwrap();
-        let opened_by_actor = bob_a.open(&SystemClock, CTX_STR, &blob_provider).unwrap();
-
-        let (env_p, env_a) = match (opened_by_provider, opened_by_actor) {
-            (OpenResult::Application(a), OpenResult::Application(b)) => (a, b),
-            other => panic!("expected two Application results, got {other:?}"),
+        let env = match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
+            OpenResult::Application(e) => e,
+            other => panic!("expected Application result, got {other:?}"),
         };
 
-        assert_eq!(env_p.sender_did, ALICE);
-        assert_eq!(env_a.sender_did, ALICE);
+        assert_eq!(env.sender_did, ALICE);
         assert_eq!(
-            env_p.sender_did, env_a.sender_did,
-            "sender DID must match across seal/open implementations"
+            env.receive_floor.epoch, 0,
+            "an unrotated context binds sender-key epoch 0 in the AAD"
         );
+        assert_eq!(env.receive_floor.sequence, 0, "first seal is sequence 0");
         assert_eq!(
-            env_p.receive_floor, env_a.receive_floor,
-            "AAD-bound (epoch, sequence) must be byte-identical across impls"
-        );
-        assert_eq!(
-            rmp_serde::to_vec_named(&env_p.inner).unwrap(),
-            rmp_serde::to_vec_named(&env_a.inner).unwrap(),
-            "decrypted InnerEnvelope must be byte-identical across impls"
-        );
-        // And both round-trip the ORIGINAL inner.
-        assert_eq!(
-            rmp_serde::to_vec_named(&env_p.inner).unwrap(),
+            rmp_serde::to_vec_named(&env.inner).unwrap(),
             rmp_serde::to_vec_named(&inner).unwrap(),
+            "decrypted InnerEnvelope must be byte-identical to the original"
         );
     }
 
@@ -3750,21 +3741,13 @@ mod crypto_ops_golden {
         let rid = routing(&ctx);
 
         let mut actor_seqs = Vec::new();
-        let mut provider_seqs = Vec::new();
         for i in 0..4u64 {
             let inner = build_inner(ALICE, i);
 
-            // actor seals -> provider receiver opens (in-order consecutive gens).
+            // Actor seals -> actor receiver opens (in-order consecutive gens).
             let blob_actor = alice_a.seal(ALICE, &inner, &rid, 300).unwrap();
-            match bob_p.open(&ctx, CTX_STR, &blob_actor).unwrap() {
+            match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
                 OpenResult::Application(e) => actor_seqs.push(e.receive_floor.sequence),
-                other => panic!("expected Application, got {other:?}"),
-            }
-
-            // provider seals -> actor receiver opens.
-            let blob_provider = alice_p.seal(&ctx, &inner, &rid, 300).unwrap();
-            match bob_a.open(&SystemClock, CTX_STR, &blob_provider).unwrap() {
-                OpenResult::Application(e) => provider_seqs.push(e.receive_floor.sequence),
                 other => panic!("expected Application, got {other:?}"),
             }
         }
@@ -3772,11 +3755,7 @@ mod crypto_ops_golden {
         assert_eq!(
             actor_seqs,
             vec![0, 1, 2, 3],
-            "actor send_tracker AAD sequence must progress 0,1,2,3 (matches provider send_sequence)"
-        );
-        assert_eq!(
-            actor_seqs, provider_seqs,
-            "AAD-bound sequence progression must be identical across seal impls"
+            "actor send_tracker AAD sequence must progress 0,1,2,3 (post-increment high-water)"
         );
     }
 
@@ -3815,124 +3794,82 @@ mod crypto_ops_golden {
             other => panic!("expected Application, got {other:?}"),
         };
 
-        // --- Provider path: provider rotate + provider seal + provider open. ---
-        alice_p.rotate_sender_key(&ctx).unwrap();
-        let epoch_p = alice_p.local_sender_key_epoch(&ctx);
-        let msgs_p = alice_p.drain_pending_sender_key_messages(&ctx).unwrap();
-        assert_eq!(msgs_p.len(), 1);
-        let (key_p, recv_epoch_p) = bob_p
-            .process_incoming_sender_key(&ctx, ALICE, &msgs_p[0].1)
-            .unwrap();
-        assert_eq!(recv_epoch_p, epoch_p);
-        bob_p.set_sender_key_unchecked(&ctx, ALICE, key_p);
-        let blob_provider = alice_p.seal(&ctx, &inner, &rid, 300).unwrap();
-        let opened_p = match bob_p.open(&ctx, CTX_STR, &blob_provider).unwrap() {
-            OpenResult::Application(e) => e,
-            other => panic!("expected Application, got {other:?}"),
-        };
-
-        // Both impls rotate from the same starting epoch, so the AAD-bound epoch
-        // is equal AND non-zero, and the decrypted inner is byte-identical.
-        assert_eq!(
-            epoch_a, epoch_p,
-            "rotate advances to the same epoch on both"
-        );
+        // The rotated (non-zero) sender-key epoch is bound in the sender-layer
+        // AAD, and the decrypted inner round-trips the original byte-for-byte.
         assert!(
             opened_a.receive_floor.epoch >= 1,
             "non-zero epoch bound in AAD"
         );
         assert_eq!(
-            opened_a.receive_floor.epoch, opened_p.receive_floor.epoch,
-            "the (non-zero) epoch must be bound identically in the AAD across impls"
-        );
-        assert_eq!(
-            rmp_serde::to_vec_named(&opened_a.inner).unwrap(),
-            rmp_serde::to_vec_named(&opened_p.inner).unwrap(),
-            "decrypt at non-zero epoch must be byte-identical across impls"
+            opened_a.receive_floor.epoch, epoch_a,
+            "the AAD-bound epoch is the rotated sender-key epoch"
         );
         assert_eq!(
             rmp_serde::to_vec_named(&opened_a.inner).unwrap(),
             rmp_serde::to_vec_named(&inner).unwrap(),
+            "decrypt at a non-zero epoch must round-trip the original inner"
         );
     }
 
-    /// GENUINE cross-impl round-trip at a NON-ZERO sender-key epoch: an
-    /// actor-sealed nonzero-epoch blob is opened by the PROVIDER and a
-    /// provider-sealed nonzero-epoch blob is opened by the ACTOR — proving the
-    /// non-zero epoch is encoded into the sender-layer AAD byte-identically
-    /// ACROSS impls, not merely identically to itself.
+    /// Round-trip at a NON-ZERO sender-key epoch: Alice rotates once on the
+    /// actor (so she holds a single rotated key at a non-zero epoch), delivers
+    /// that key to Bob, then seals — and Bob opens under the matching rotated
+    /// key, proving the non-zero epoch is encoded into the sender-layer AAD and
+    /// the receiver reconstructs the AAD + looks up the matching key.
     ///
-    /// The zero-epoch [`golden_seal_open_cross_roundtrip`] cross-opens only at
-    /// epoch 0 (endian-invariant), and [`golden_seal_open_after_rotate_nonzero_epoch`]
-    /// exercises non-zero epochs same-impl only. This closes that gap.
-    ///
-    /// Setup rotates ONCE on the provider (so Alice holds a single rotated key
-    /// at a non-zero epoch) and delivers that key to Bob, THEN duplicates the
-    /// post-rotation Alice + Bob into actor twins — so the actor and provider
-    /// hold the SAME rotated key at the SAME non-zero epoch, enabling a true
-    /// cross-open (the receiver reconstructs the AAD and looks up the matching
-    /// key).
+    /// The zero-epoch [`golden_seal_open_cross_roundtrip`] opens only at epoch 0
+    /// (endian-invariant); this closes the non-zero-epoch key-lookup gap by
+    /// delivering the rotated key to a DIFFERENT actor (Bob) before the open,
+    /// where [`golden_seal_open_after_rotate_nonzero_epoch`] opens on the
+    /// receiver that was seeded with the delivered key inline.
     #[test]
     fn golden_seal_open_cross_roundtrip_nonzero_epoch() {
         let (alice_p, bob_p, ctx) = setup();
         let rid = routing(&ctx);
+        // Bob's node-resident wrapping secret — captured before the take, since
+        // `take_crypto_state` destructively moves Bob's crypto onto the actor.
+        let bob_secret = bob_wrapping_secret(&bob_p);
 
-        // Rotate once on the provider; deliver the rotated key to Bob.
-        alice_p.rotate_sender_key(&ctx).unwrap();
-        let epoch = alice_p.local_sender_key_epoch(&ctx);
-        assert!(epoch >= 1, "rotate advances the sender-key epoch past 0");
-        let msgs = alice_p.drain_pending_sender_key_messages(&ctx).unwrap();
-        assert_eq!(msgs.len(), 1);
-        let (rotated_key, recv_epoch) = bob_p
-            .process_incoming_sender_key(&ctx, ALICE, &msgs[0].1)
-            .unwrap();
-        assert_eq!(recv_epoch, epoch);
-        bob_p.set_sender_key_unchecked(&ctx, ALICE, rotated_key);
-
-        // Duplicate the post-rotation state into actor twins (carries the rotated
-        // key + non-zero epoch + Bob's updated store). Both twins now hold the
-        // SAME rotated key at the SAME non-zero epoch as their provider source.
+        // Move both parties onto the actor seam, then rotate ONCE on the actor so
+        // Alice holds a single rotated key at a non-zero epoch.
         let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
         let mut bob_a = take_into_actor(&bob_p, ctx, BOB);
-        assert_eq!(alice_a.local_sender_key_epoch(), epoch);
+        alice_a.rotate_sender_key(ALICE).unwrap();
+        let epoch = alice_a.local_sender_key_epoch();
+        assert!(epoch >= 1, "rotate advances the sender-key epoch past 0");
+
+        // Deliver the rotated key to Bob (the rotate queued a distribution).
+        let msgs = alice_a.drain_pending_sender_key_messages().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let (rotated_key, recv_epoch) = bob_a
+            .process_incoming_sender_key(&bob_secret, ALICE, &msgs[0].1)
+            .unwrap();
+        assert_eq!(recv_epoch, epoch);
+        bob_a.set_sender_key_unchecked(ALICE, rotated_key);
 
         let inner = build_inner(ALICE, 0);
 
-        // Direction 1: ACTOR seals at the non-zero epoch -> PROVIDER opens.
+        // ACTOR seals at the non-zero epoch -> ACTOR receiver opens under the
+        // delivered rotated key.
         let blob_actor = alice_a.seal(ALICE, &inner, &rid, 300).unwrap();
-        let opened_by_provider = bob_p.open(&ctx, CTX_STR, &blob_actor).unwrap();
-
-        // Direction 2: PROVIDER seals at the non-zero epoch -> ACTOR opens.
-        let blob_provider = alice_p.seal(&ctx, &inner, &rid, 300).unwrap();
-        let opened_by_actor = bob_a.open(&SystemClock, CTX_STR, &blob_provider).unwrap();
-
-        let (env_p, env_a) = match (opened_by_provider, opened_by_actor) {
-            (OpenResult::Application(a), OpenResult::Application(b)) => (a, b),
-            other => panic!("expected two Application results, got {other:?}"),
+        let env = match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
+            OpenResult::Application(e) => e,
+            other => panic!("expected Application result, got {other:?}"),
         };
 
-        assert_eq!(env_p.sender_did, ALICE);
-        assert_eq!(env_a.sender_did, ALICE);
+        assert_eq!(env.sender_did, ALICE);
         assert!(
-            env_p.receive_floor.epoch >= 1,
+            env.receive_floor.epoch >= 1,
             "non-zero epoch bound in the AAD"
         );
         assert_eq!(
-            env_p.receive_floor.epoch, epoch,
+            env.receive_floor.epoch, epoch,
             "the AAD epoch is the rotated sender-key epoch"
         );
         assert_eq!(
-            env_p.receive_floor, env_a.receive_floor,
-            "the (non-zero) epoch + sequence must be bound identically CROSS-impl"
-        );
-        assert_eq!(
-            rmp_serde::to_vec_named(&env_p.inner).unwrap(),
-            rmp_serde::to_vec_named(&env_a.inner).unwrap(),
-            "cross-impl decrypt at a non-zero epoch must be byte-identical"
-        );
-        assert_eq!(
-            rmp_serde::to_vec_named(&env_p.inner).unwrap(),
+            rmp_serde::to_vec_named(&env.inner).unwrap(),
             rmp_serde::to_vec_named(&inner).unwrap(),
+            "decrypt at a non-zero epoch must round-trip the original inner"
         );
     }
 
@@ -3969,24 +3906,12 @@ mod crypto_ops_golden {
         let rid = routing(&ctx);
         let payload = b"management golden payload";
 
+        // Actor management-encrypts; the actor receiver opens and recovers the
+        // exact payload (the provider twin is deleted).
         let blob_actor = alice_a.mls_encrypt_management(payload, &rid, 300).unwrap();
-        let opened_p = bob_p.open(&ctx, CTX_STR, &blob_actor).unwrap();
-
-        let blob_provider = alice_p
-            .mls_encrypt_management(&ctx, payload, &rid, 300)
-            .unwrap();
-        let opened_a = bob_a.open(&SystemClock, CTX_STR, &blob_provider).unwrap();
-
-        match (opened_p, opened_a) {
-            (
-                OpenResult::Management { payload: p1, .. },
-                OpenResult::Management { payload: p2, .. },
-            ) => {
-                assert_eq!(p1, payload);
-                assert_eq!(p2, payload);
-                assert_eq!(p1, p2);
-            }
-            other => panic!("expected two Management results, got {other:?}"),
+        match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
+            OpenResult::Management { payload: p, .. } => assert_eq!(p, payload),
+            other => panic!("expected Management result, got {other:?}"),
         }
     }
 
@@ -3995,11 +3920,15 @@ mod crypto_ops_golden {
         let (alice_p, _bob_p, ctx) = setup();
         let alice_a = take_into_actor(&alice_p, ctx, ALICE);
         let from_actor = alice_a.group_context_extension().unwrap();
-        let from_provider = alice_p.group_context_extension(&ctx).unwrap();
-        assert!(from_actor.is_some(), "SCP context group carries 0xFF02");
+        let ext = from_actor.expect("an SCP context group carries the 0xFF02 extension");
         assert_eq!(
-            from_actor, from_provider,
-            "group_context_extension must be byte-identical across impls"
+            ext.context_id, CTX_STR,
+            "the group-context extension binds the golden context id"
+        );
+        assert_eq!(
+            ext.creator_did,
+            DID::from(ALICE.to_owned()),
+            "the group-context extension binds the creator DID"
         );
     }
 
@@ -4009,8 +3938,8 @@ mod crypto_ops_golden {
         let alice_a = take_into_actor(&alice_p, ctx, ALICE);
         assert_eq!(
             alice_a.local_sender_key_epoch(),
-            alice_p.local_sender_key_epoch(&ctx),
-            "local sender-key epoch scalar must match across impls"
+            0,
+            "a freshly joined, unrotated context reads local sender-key epoch 0"
         );
     }
 
@@ -4034,41 +3963,26 @@ mod crypto_ops_golden {
                 .is_empty()
         );
 
-        // Provider distributes the identical sender key.
-        alice_p.distribute_sender_key(&ctx, BOB).unwrap();
-        let provider_msgs = alice_p.drain_pending_sender_key_messages(&ctx).unwrap();
-        assert_eq!(provider_msgs.len(), 1);
-
-        // Recover the key via BOTH the actor and provider receive halves, feeding
-        // each the OTHER world's distribution message. The recovered key material
-        // is deterministic (Alice's existing key), so it is byte-identical.
-        let bob_a = take_into_actor(&bob_p, ctx, BOB);
-        let (key_from_actor_msg, epoch_a) = bob_a
+        // Recover the key via the actor receive half. The recovered key material
+        // is deterministic (Alice's existing key), so it equals Alice's actual
+        // local sender key byte-for-byte.
+        let mut bob_a = take_into_actor(&bob_p, ctx, BOB);
+        let (recovered_key, epoch) = bob_a
             .process_incoming_sender_key(&bob_secret, ALICE, &actor_msgs[0].1)
             .unwrap();
-        let (key_from_provider_msg, epoch_p) = bob_p
-            .process_incoming_sender_key(&ctx, ALICE, &provider_msgs[0].1)
-            .unwrap();
-
-        assert_eq!(epoch_a, epoch_p, "recovered epoch must match");
+        assert_eq!(epoch, 0, "the unrotated key distributes at epoch 0");
         assert_eq!(
-            key_from_actor_msg.as_bytes(),
-            key_from_provider_msg.as_bytes(),
-            "recovered sender key must be byte-identical across impls"
-        );
-        // The recovered key equals Alice's actual sender key.
-        assert_eq!(
-            key_from_actor_msg.as_bytes(),
+            recovered_key.as_bytes(),
             actor_sender_key(&alice_a).as_bytes(),
+            "recovered sender key must equal Alice's actual sender key"
         );
 
         // `set_sender_key_unchecked` install half: after installing the recovered
-        // key on a fresh Bob actor, Alice's application seal opens under it.
-        let mut bob_installer = take_into_actor(&bob_p, ctx, BOB);
-        bob_installer.set_sender_key_unchecked(ALICE, key_from_actor_msg);
+        // key on the Bob actor, Alice's application seal opens under it.
+        bob_a.set_sender_key_unchecked(ALICE, recovered_key);
         let inner = build_inner(ALICE, 0);
-        let sealed = alice_p.seal(&ctx, &inner, &routing(&ctx), 300).unwrap();
-        match bob_installer.open(&SystemClock, CTX_STR, &sealed).unwrap() {
+        let sealed = alice_a.seal(ALICE, &inner, &routing(&ctx), 300).unwrap();
+        match bob_a.open(&SystemClock, CTX_STR, &sealed).unwrap() {
             OpenResult::Application(env) => assert_eq!(env.sender_did, ALICE),
             other => panic!("expected Application, got {other:?}"),
         }
@@ -4082,23 +3996,17 @@ mod crypto_ops_golden {
         let bob_secret: [u8; 32] = *bob_secret;
 
         let epoch_before = alice_a.local_sender_key_epoch();
-        assert_eq!(epoch_before, alice_p.local_sender_key_epoch(&ctx));
+        assert_eq!(epoch_before, 0, "unrotated context starts at epoch 0");
 
-        // Rotate on both. Fresh key + HPKE ephemeral are random, so the recovered
-        // KEYS differ between the two rotations; the EPOCH advance and the
-        // distribution's processability are the deterministic invariants.
+        // Rotate on the actor. The fresh key + HPKE ephemeral are random; the
+        // EPOCH advance and the distribution's processability are the
+        // deterministic golden invariants.
         alice_a.rotate_sender_key(ALICE).unwrap();
-        alice_p.rotate_sender_key(&ctx).unwrap();
 
         assert_eq!(
             alice_a.local_sender_key_epoch(),
             epoch_before + 1,
             "actor rotate advances the local epoch by one"
-        );
-        assert_eq!(
-            alice_a.local_sender_key_epoch(),
-            alice_p.local_sender_key_epoch(&ctx),
-            "epoch advance must match across impls"
         );
 
         // The queued distribution from the actor rotate is processable by Bob and
@@ -4122,12 +4030,10 @@ mod crypto_ops_golden {
         // the local MLS epoch by one.
         let epoch_before = actor_mls_epoch(&alice_a);
         let out_a = alice_a.advance_epoch(wpub).unwrap();
-        let out_p = alice_p.advance_epoch(&ctx).unwrap();
         assert!(
             !out_a.commit_bytes.is_empty(),
             "actor advance_epoch produces a non-empty commit"
         );
-        assert!(!out_p.commit_bytes.is_empty());
         let epoch_after = actor_mls_epoch(&alice_a);
         assert_eq!(
             epoch_after,
@@ -4135,25 +4041,16 @@ mod crypto_ops_golden {
             "advance_epoch self-merges, advancing the committer's MLS epoch by one"
         );
 
-        // The counterparty PROCESSES each commit and reaches the committer's new
-        // epoch — actor commit on one Bob copy, provider commit on another.
+        // The counterparty PROCESSES the commit and reaches the committer's new
+        // epoch (the actor is the sole crypto authority; the provider twin is
+        // deleted).
         let mut bob_from_actor = take_into_actor(&bob_p, ctx, BOB);
         process_commit_on_actor(&mut bob_from_actor, &out_a.commit_bytes)
             .expect("Bob processes the actor-produced advance Commit");
         assert_eq!(
             actor_mls_epoch(&bob_from_actor),
             epoch_after,
-            "Bob reaches the committer's new epoch after the actor commit"
-        );
-
-        let mut bob_from_provider = take_into_actor(&bob_p, ctx, BOB);
-        process_commit_on_actor(&mut bob_from_provider, &out_p.commit_bytes)
-            .expect("Bob processes the provider-produced advance Commit");
-        assert_eq!(
-            actor_mls_epoch(&bob_from_provider),
-            epoch_after,
-            "actor and provider advance Commits drive the counterparty to the \
-             identical epoch"
+            "Bob reaches the committer's new epoch after processing the advance Commit"
         );
     }
 
@@ -4162,7 +4059,7 @@ mod crypto_ops_golden {
         let (alice_p, bob_p, ctx) = setup();
         let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
 
-        // Self-removal is a no-op (empty output) on both impls.
+        // Self-removal is a no-op (empty output).
         assert!(
             alice_a
                 .remove_member(ALICE, ALICE)
@@ -4170,26 +4067,16 @@ mod crypto_ops_golden {
                 .commit_bytes
                 .is_empty()
         );
-        assert!(
-            alice_p
-                .remove_member(&ctx, ALICE)
-                .unwrap()
-                .commit_bytes
-                .is_empty()
-        );
 
         // Removing Bob self-merges the remove-Commit, advancing Alice's epoch by
-        // one on both impls; the outputs are non-empty Commit + group-info.
+        // one; the output is a non-empty Commit + group-info.
         let epoch_before = actor_mls_epoch(&alice_a);
         let out_a = alice_a.remove_member(ALICE, BOB).unwrap();
-        let out_p = alice_p.remove_member(&ctx, BOB).unwrap();
         assert!(
             !out_a.commit_bytes.is_empty(),
             "actor remove_member produces a Commit"
         );
         assert!(!out_a.group_info_bytes.is_empty());
-        assert!(!out_p.commit_bytes.is_empty());
-        assert!(!out_p.group_info_bytes.is_empty());
         assert_eq!(
             actor_mls_epoch(&alice_a),
             epoch_before + 1,
@@ -4197,21 +4084,11 @@ mod crypto_ops_golden {
         );
 
         // The counterparty (Bob — the removed member) PROCESSES the remove-Commit
-        // and learns of his removal, reaching the committer's new epoch. Both the
-        // actor- and provider-produced Commits are accepted identically.
+        // and learns of his removal, reaching the committer's new epoch.
         let mut bob_from_actor = take_into_actor(&bob_p, ctx, BOB);
         process_commit_on_actor(&mut bob_from_actor, &out_a.commit_bytes)
             .expect("Bob processes the actor-produced remove Commit");
         assert_eq!(actor_mls_epoch(&bob_from_actor), epoch_before + 1);
-
-        let mut bob_from_provider = take_into_actor(&bob_p, ctx, BOB);
-        process_commit_on_actor(&mut bob_from_provider, &out_p.commit_bytes)
-            .expect("Bob processes the provider-produced remove Commit");
-        assert_eq!(
-            actor_mls_epoch(&bob_from_provider),
-            actor_mls_epoch(&bob_from_actor),
-            "actor and provider remove Commits drive the counterparty identically"
-        );
     }
 
     #[test]
@@ -4219,40 +4096,38 @@ mod crypto_ops_golden {
         let (alice_p, _bob_p, ctx) = setup();
         let alice_a = take_into_actor(&alice_p, ctx, ALICE);
         // Use Alice's provider wrapping keypair so the actor export embeds the
-        // SAME node-resident wrapping material the provider export does.
+        // SAME node-resident wrapping material a restore needs.
         let (wpub, wsec) = alice_p.wrapping_keypair_snapshot();
+
+        // Capture the ORIGINAL group-context extension + local epoch off the live
+        // actor (export is non-destructive) as the golden restore target.
+        let orig_ext = alice_a.group_context_extension().unwrap();
+        let orig_epoch = alice_a.local_sender_key_epoch();
 
         let blob_a = alice_a
             .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
             .unwrap();
-        let blob_p = alice_p
-            .export_crypto_state(&ctx, Vec::new(), Vec::new())
-            .unwrap();
         assert!(!blob_a.is_empty());
-        assert_eq!(
-            blob_a.len(),
-            blob_p.len(),
-            "identical multiset of msgpack entries => identical total length"
-        );
 
-        // Functional restore equivalence: both blobs restore into providers that
-        // agree on the group-context extension and local epoch (and match the
-        // original).
-        let r_a = MlsCryptoProvider::new(ALICE.to_owned(), Arc::new(SystemClock));
-        r_a.restore_crypto_state(&ctx, &blob_a).unwrap();
-        let r_p = MlsCryptoProvider::new(ALICE.to_owned(), Arc::new(SystemClock));
-        r_p.restore_crypto_state(&ctx, &blob_p).unwrap();
+        // Functional restore equivalence: rebuild the owned material on a fresh
+        // provider via the retained `build_restored_owned` reader (the deleted
+        // insert-path `restore_crypto_state` twin is gone), reseed an actor, and
+        // confirm it agrees with the ORIGINAL on the group-context extension and
+        // local sender-key epoch.
+        let restorer = MlsCryptoProvider::new(ALICE.to_owned(), Arc::new(SystemClock));
+        let (owned, _floors) = restorer.build_restored_owned(&ctx, &blob_a).unwrap();
+        let mut restored =
+            PerContextState::new_for_test_encrypted(ctx, 0, DID::from(ALICE.to_owned()));
+        restored.seed_encrypted_crypto_from_owned(owned);
         assert_eq!(
-            r_a.group_context_extension(&ctx).unwrap(),
-            r_p.group_context_extension(&ctx).unwrap(),
+            restored.group_context_extension().unwrap(),
+            orig_ext,
+            "restored group-context extension must match the original"
         );
         assert_eq!(
-            r_a.group_context_extension(&ctx).unwrap(),
-            alice_p.group_context_extension(&ctx).unwrap(),
-        );
-        assert_eq!(
-            r_a.local_sender_key_epoch(&ctx),
-            r_p.local_sender_key_epoch(&ctx),
+            restored.local_sender_key_epoch(),
+            orig_epoch,
+            "restored local sender-key epoch must match the original"
         );
     }
 
@@ -4274,17 +4149,8 @@ mod crypto_ops_golden {
                 .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
                 .unwrap()
                 .is_empty(),
-            "destroy_mls_group makes export return empty (provider parity: map \
-             entry removed)"
-        );
-
-        // Provider parity.
-        alice_p.destroy_mls_group(&ctx).unwrap();
-        assert!(
-            alice_p
-                .export_crypto_state(&ctx, Vec::new(), Vec::new())
-                .unwrap()
-                .is_empty()
+            "destroy_mls_group makes export return empty (the group map entry is \
+             removed)"
         );
     }
 
@@ -4309,8 +4175,5 @@ mod crypto_ops_golden {
             ),
             ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
         }
-
-        // Provider parity: same rotate-and-clear behaviour.
-        alice_p.destroy_sender_key(&ctx).unwrap();
     }
 }
