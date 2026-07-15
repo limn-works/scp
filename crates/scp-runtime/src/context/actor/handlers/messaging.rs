@@ -189,7 +189,177 @@ pub(crate) async fn dispatch(
             signing_key,
             reply,
         } => handle_send_heartbeat(cell, deps, &context_id, &sender_did, &signing_key, reply).await,
+        #[cfg(feature = "testing")]
+        MessagingCommand::HandleSenderKeyRequest {
+            context_id,
+            request_bytes,
+            requester_public_key,
+            reply,
+        } => {
+            handle_handle_sender_key_request(
+                cell,
+                deps,
+                &context_id,
+                &request_bytes,
+                &requester_public_key,
+                reply,
+            )
+            .await
+        }
+        #[cfg(feature = "testing")]
+        MessagingCommand::LandSenderKeyResponse {
+            context_id,
+            sender_did,
+            sender_key,
+            epoch,
+            reply,
+        } => {
+            handle_land_sender_key_response(
+                cell,
+                deps,
+                &context_id,
+                &sender_did,
+                sender_key,
+                epoch,
+                reply,
+            )
+            .await
+        }
     }
+}
+
+/// Handle [`MessagingCommand::HandleSenderKeyRequest`] (actor-shape, test-only).
+///
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2 ANSWER half reached by
+/// `context_id`: drives the actor-owned
+/// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request)
+/// and returns the ephemeral-sealed `SenderKeyResponse` bytes straight back to
+/// the caller (the full-stack harness, which drives the requester side with its
+/// own custody — actor-loop request INITIATION is deferred #2049). Mirrors
+/// [`super::broadcast::handle_handle_broadcast_key_request`]. The answer seals to
+/// the requester's EPHEMERAL wrapping key, so it needs no signing key; only the
+/// Class-C crypto replay cache (`nonce_dedup`) is mutated on a successful answer,
+/// so a produced answer reports `ok_mutated` (an over-mark on the blocked
+/// `Ok(None)` case is a harmless extra coalesced persist; an error mutates
+/// nothing and reports `err`).
+#[cfg(feature = "testing")]
+async fn handle_handle_sender_key_request(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    request_bytes: &[u8],
+    requester_public_key: &[u8],
+    reply: oneshot::Sender<Result<Option<Vec<u8>>, ContextError>>,
+) -> Outcome<()> {
+    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+    let local_did = deps.crypto.local_did().to_owned();
+    let now_secs = deps.clock.now_secs();
+    // No per-context sender-key block list is resident on the actor (the
+    // blocking-flow wiring is deferred); the §9.16.6 Mitigation-1 membership gate
+    // on the MLS group tree is the live Sybil defense.
+    let blocked = std::collections::HashSet::new();
+
+    let mut view = cell.class_c_view();
+    let answer_fut = async {
+        // A `None` crypto state is a context with no MLS group (a broadcast
+        // context, which never reaches the §9.16.2 sender-key pull path) — fail
+        // closed, matching `decrypt_and_dispatch`'s "no MLS group" error.
+        let cs = view.mode_mut().crypto_mut().ok_or_else(|| {
+            ContextError::CryptoFailed(
+                "no MLS crypto state for sender-key request (context has no group)".to_string(),
+            )
+        })?;
+        cs.handle_sender_key_request(
+            &context_id_bytes,
+            &local_did,
+            now_secs,
+            request_bytes,
+            requester_public_key,
+            &blocked,
+        )
+    };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, answer_fut).await {
+        Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "handle_sender_key_request exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`MessagingCommand::LandSenderKeyResponse`] (actor-shape, test-only).
+///
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2 install-onto-ACTOR
+/// (GATE-BEFORE-INSTALL): GATES the authenticated `(sender_did, epoch)` against
+/// the authoritative Class-M floor registry
+/// (`check_and_advance_sender_epoch`, FAIL-CLOSED) and, only on success, installs
+/// the key onto the actor-owned `cs.sender_key_store` (a Class-C coalesced
+/// mutation). The gate runs before any cell borrow, so a regressing/poisoned
+/// epoch is rejected with the key NEVER reaching the store. The requester
+/// (harness) already HPKE-opened the ephemeral-sealed response with its own
+/// wrapping secret; the provider store is empty on a taken context, so the
+/// install MUST land on the actor.
+#[cfg(feature = "testing")]
+async fn handle_land_sender_key_response(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &str,
+    sender_key: scp_protocol::crypto::sender_keys::SenderKey,
+    epoch: u64,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+
+    // GATE first (FAIL-CLOSED, no cell borrow) — the Class-M registry enforces
+    // epoch monotonicity + the poisoning ceiling and persists the floor advance
+    // durably before we touch the store.
+    if let Err(e) = deps.supervisor.check_and_advance_sender_epoch(
+        &context_id_bytes,
+        sender_did,
+        epoch,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+    ) {
+        let e: ContextError = e.into();
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    // INSTALL onto the actor-owned store (Class-C coalesced).
+    let ctx_id_hex = hex::encode(context_id_bytes);
+    {
+        let mut view = cell.class_c_view();
+        // A `None` crypto state is a context with no MLS group (broadcast); the
+        // §9.16.2 pull-response install never applies there — fail closed.
+        let cs = match view.mode_mut().crypto_mut() {
+            Some(cs) => cs,
+            None => {
+                let err = ContextError::CryptoFailed(
+                    "no MLS crypto state for sender-key install (context has no group)".to_string(),
+                );
+                let sketch = outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                return Outcome::err(sketch);
+            }
+        };
+        cs.sender_key_store
+            .set_unchecked(&ctx_id_hex, sender_did, sender_key);
+    }
+
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
 }
 
 /// Handle [`MessagingCommand::SeedPeerPseudonym`] (actor-shape, test-only).

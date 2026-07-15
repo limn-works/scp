@@ -791,25 +791,33 @@ impl FullStackNode {
                 ContextError::CryptoFailed(format!("incumbent build sender-key request: {e}"))
             })?;
 
-            // 2. Joiner answers via the real provider path (H1 membership gate).
-            let blocked = std::collections::HashSet::new();
+            // 2. Joiner answers via the ACTOR answer path (ADR-049 PR-7): the
+            //    joiner's crypto is taken into its actor, so the emptied provider
+            //    can no longer answer — reach the actor-owned
+            //    `ContextCryptoState::handle_sender_key_request` (the same H1
+            //    §9.16.6 Mitigation-1 membership gate, now on the actor) by
+            //    `context_id` through the `HandleSenderKeyRequest` mailbox command.
             let response_bytes = self
-                .crypto
-                .provider
+                .manager
                 .handle_sender_key_request(
-                    context_id,
+                    joiner_handle.context_id(),
                     &request.request_message,
                     incumbent_signing.verifying_key().as_bytes(),
-                    &blocked,
-                )?
+                )
+                .await?
                 .ok_or_else(|| {
                     ContextError::CryptoFailed(
                         "joiner declined the incumbent's sender-key request".to_owned(),
                     )
                 })?;
 
-            // 3. Incumbent opens the ephemeral-sealed response and stores the
-            //    joiner's key in its own provider so it can decrypt the joiner.
+            // 3. Incumbent opens the ephemeral-sealed response with its own
+            //    custody (unchanged — the wrapping secret is node-resident), then
+            //    lands the joiner's key onto its OWN actor store via the
+            //    GATE-BEFORE-INSTALL `LandSenderKeyResponse` mailbox command
+            //    (ADR-049 PR-7): the incumbent's provider is likewise taken, so
+            //    the former direct `set_sender_key_unchecked` was a no-op on an
+            //    emptied context. The Class-M floor gate runs inside the handler.
             let response: SenderKeyResponse =
                 rmp_serde::from_slice(&response_bytes).map_err(|e| {
                     ContextError::CryptoFailed(format!("decode sender-key response: {e}"))
@@ -824,24 +832,15 @@ impl FullStackNode {
             .map_err(|e| {
                 ContextError::CryptoFailed(format!("incumbent open sender-key response: {e}"))
             })?;
-            // ADR-049 PR-6: `store_member_sender_key` verifies the context and
-            // RETURNS the authenticated `(key, epoch)` (it no longer installs),
-            // mirroring the push seam. The install is then an EXPLICIT, separate
-            // `set_sender_key_unchecked` — the same shape as production seam 2. In
-            // production the registry gate sits between the two; this
-            // incumbent-stores-joiner-key step is trusted welcome setup and the
-            // capability-reduced registry is not reachable from this harness, so
-            // it installs directly.
-            let (joiner_key, _epoch) = incumbent.crypto.provider.store_member_sender_key(
-                context_id,
-                &joiner_did,
-                joiner_key,
-                response.epoch,
-            )?;
             incumbent
-                .crypto
-                .provider
-                .set_sender_key_unchecked(context_id, &joiner_did, joiner_key);
+                .manager
+                .land_sender_key_response(
+                    joiner_handle.context_id(),
+                    &joiner_did,
+                    joiner_key,
+                    response.epoch,
+                )
+                .await?;
         }
         Ok(())
     }

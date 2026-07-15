@@ -13129,6 +13129,90 @@ impl Supervisor {
         })?
     }
 
+    /// Answers a §9.16.2 sender-key PULL request on the OWNED actor crypto state
+    /// via the actor mailbox — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
+    ///
+    /// The steady-state ANSWER half moved off the provider onto
+    /// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request);
+    /// a taken (actor-owned) context can no longer answer through the emptied
+    /// provider. This routes the answer to the actor by `context_id` and returns
+    /// the ephemeral-sealed response (`Some`) or `None` for a blocked requester.
+    /// The full-stack harness drives the requester side externally with its own
+    /// custody (actor-loop request INITIATION is deferred #2049).
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] on signature / freshness / replay /
+    ///   membership rejection of the request.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn handle_sender_key_request(
+        &self,
+        context_id: &str,
+        request_bytes: &[u8],
+        requester_public_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::HandleSenderKeyRequest {
+            context_id: context_id.to_owned(),
+            request_bytes: request_bytes.to_vec(),
+            requester_public_key: requester_public_key.to_vec(),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::handle_sender_key_request — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Lands a §9.16.2 pull-response sender key onto the OWNED actor sender-key
+    /// store via the actor mailbox — test-only (ADR-049 PR-7 /
+    /// SCP-CRYPTOMOVE-001).
+    ///
+    /// GATE-BEFORE-INSTALL: the actor handler gates the authenticated
+    /// `(sender_did, epoch)` against the Class-M floor registry
+    /// (`check_and_advance_sender_epoch`, FAIL-CLOSED) and then installs the key
+    /// onto `cs.sender_key_store`. The provider store is empty on a taken context,
+    /// so the install MUST land on the actor; the requester (harness) already
+    /// HPKE-opened the ephemeral-sealed response with its own wrapping secret.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] if the epoch fails the Class-M floor gate
+    ///   or no crypto state is resident.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn land_sender_key_response(
+        &self,
+        context_id: &str,
+        sender_did: &str,
+        sender_key: scp_protocol::crypto::sender_keys::SenderKey,
+        epoch: u64,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::LandSenderKeyResponse {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.to_owned(),
+            sender_key,
+            epoch,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::land_sender_key_response — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Grants a §7.2.2 Tier-2 capability (e.g. `"outlet_call:*"`) directly into
     /// a member's `role_state.member_capabilities` cache, bypassing the
     /// governance role-assignment round-trip — test-only.
