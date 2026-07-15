@@ -112,7 +112,15 @@ export interface CapabilityValidation {
   tokensValid: boolean;
   /** All signatures verify against the claimed DIDs. */
   signaturesValid: boolean;
-  /** Requested capabilities are within the context's ceiling. */
+  /**
+   * Requested capabilities are within the context's ceiling.
+   *
+   * Evaluated against `att[0]` only. A token with multiple `att` entries does
+   * not have all entries checked — only the first declared capability URI
+   * (`att[0].with`) is sent to the bridge. Full multi-att ceiling validation
+   * requires a single bridge call that validates all URIs while consuming the
+   * nonce only once; until that bridge op exists, only `att[0]` is checked.
+   */
   withinCeiling: boolean;
   /** Nonce validation passed (step 9: no reuse, not stale, valid format). */
   nonceValid: boolean;

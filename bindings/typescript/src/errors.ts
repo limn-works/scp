@@ -359,8 +359,10 @@ export function mapBridgeError(error: unknown): ScpError {
 
   const message = error instanceof Error ? error.message : String(error);
 
-  // Try to extract the bracketed error code: "[SCP-IDENT-1001]"
-  const codeMatch = /\[([A-Z]+-[A-Z]+-\d+)\]/.exec(message);
+  // Try to extract the bracketed error code: "[SCP-IDENT-1001]".
+  // Anchored at ^ so a code embedded mid-message (e.g. in advice text) is
+  // not mistakenly extracted as the primary code (Fix 4).
+  const codeMatch = /^\[([A-Z]+-[A-Z]+-\d+)\]/.exec(message);
   const code = codeMatch?.[1] ?? "SCP-UNKNOWN-0000";
 
   for (const [prefix, ErrorClass] of ERROR_PREFIX_MAP) {
