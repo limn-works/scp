@@ -11211,10 +11211,11 @@ impl Supervisor {
     /// The reserve allocates NO per-sender MLS send-sequence. Per §5.4.5 the
     /// pump's per-chunk cursor starts at `0` per `request_id` (`invoke.rs`
     /// "sequence starts at 0"), a DISTINCT counter from the message
-    /// send-sequence, so nothing here reads a `base_sequence`. The per-sender
-    /// send-sequence is allocated at the point of consumption by the
-    /// transport/FFI send path (the later FFI/transport wiring chunk) —
-    /// allocate-at-consumption — never pre-reserved at open, because a
+    /// send-sequence, so nothing here reads a `base_sequence`. This same-context
+    /// path allocates NO `base_sequence` at all: the per-sender send-sequence
+    /// anchor is reserved at the point of consumption only on the CROSS-context
+    /// send hop, where the reassembly gap-detector is load-bearing (SCP-OUT-044,
+    /// `invoke::forward_frame`) — never pre-reserved at open, because a
     /// rollback-in-place across the off-mailbox pump window would corrupt a
     /// DIFFERENT message's sequence.
     ///
@@ -11478,11 +11479,16 @@ impl Supervisor {
     /// the same-context [`open_outlet_stream`](Self::open_outlet_stream)), and
     /// records A's own `OutletInvoked` at close over its independently
     /// reassembled chunk sequence. Returns A's plaintext
-    /// `mpsc::Receiver<OutletStreamChunk>` PROMPTLY (the caller consumes chunks
-    /// as produced); re-encryption for A's OTHER members is the SDK delivery
-    /// seam (seal each still-operator-signed chunk under A's MLS group key over
-    /// the existing §9.8/§9.16 transport — no new relay primitive), NOT this
-    /// return type.
+    /// `mpsc::Receiver<ForwardedStreamFrame>` PROMPTLY (the caller consumes
+    /// frames as produced); each
+    /// [`ForwardedStreamFrame`](crate::context::outlets::invoke::ForwardedStreamFrame)
+    /// carries the per-sender MLS `base_sequence` anchor allocated at consumption
+    /// on the send hop (SCP-OUT-044) alongside the unmodified operator-signed
+    /// chunk, threading `(request_id, base_sequence)` to the SCP-OUT-045
+    /// gap-detector. Re-encryption for A's OTHER members is the SDK delivery
+    /// seam (seal each still-operator-signed `frame.chunk` under A's MLS group
+    /// key over the existing §9.7/§9.8/§9.16 transport — no new relay primitive),
+    /// NOT this return type.
     ///
     /// Zero-escrow (§5.4.5 "Cross-context economy"; ADR-061): a paid Action
     /// outlet (`cost.amount > 0`) — or a positive billed `cost_per_chunk` — is
@@ -11521,7 +11527,7 @@ impl Supervisor {
         caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
-        tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+        tokio::sync::mpsc::Receiver<crate::context::outlets::invoke::ForwardedStreamFrame>,
         crate::context::outlets::invoke::InvocationError,
     >
     where
@@ -29532,9 +29538,11 @@ mod open_outlet_stream_tests {
         let executor: Arc<dyn OutletExecutor> = Arc::new(FiniteStreamExecutor);
         let outlet_id: OutletId = "calculator".to_owned();
 
-        // The Ok variant is a PLAINTEXT `mpsc::Receiver<OutletStreamChunk>`.
+        // The Ok variant is a PLAINTEXT `mpsc::Receiver<ForwardedStreamFrame>`:
+        // each frame pairs the plaintext operator-signed chunk with the
+        // per-sender `base_sequence` anchor (SCP-OUT-044).
         let mut rx: tokio::sync::mpsc::Receiver<
-            scp_protocol::context::outlets::stream::OutletStreamChunk,
+            crate::context::outlets::invoke::ForwardedStreamFrame,
         > = supervisor
             .open_outlet_stream_cross_context(
                 a_ctx,
@@ -29553,11 +29561,24 @@ mod open_outlet_stream_tests {
             .expect("zero-cost cross-context open must be accepted");
 
         // Drain the plaintext chunks the bridge forwards to the shared-member
-        // invoker: two Data payloads followed by a terminal End.
+        // invoker: two Data payloads followed by a terminal End. Each frame also
+        // carries the per-sender `base_sequence` anchor (SCP-OUT-044); assert it
+        // is strictly `+1`-monotone across the whole forwarded stream to prove
+        // the anchor is threaded end-to-end through the supervisor path (AC4).
         let mut data = 0u32;
         let mut saw_end = false;
-        while let Some(chunk) = rx.recv().await {
-            match chunk.payload {
+        let mut expected_base_sequence = 1u64;
+        while let Some(frame) = rx.recv().await {
+            assert_eq!(
+                frame.base_sequence, expected_base_sequence,
+                "base_sequence is per-sender +1-monotone across the forwarded stream"
+            );
+            assert_eq!(
+                frame.chunk.request_id, [CTX_BYTE; 16],
+                "(request_id, base_sequence) anchor is threaded onto the forwarded frame"
+            );
+            expected_base_sequence += 1;
+            match frame.chunk.payload {
                 ChunkPayload::Data { .. } => data += 1,
                 ChunkPayload::End { .. } => {
                     saw_end = true;

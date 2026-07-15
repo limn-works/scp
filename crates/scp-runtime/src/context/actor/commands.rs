@@ -2295,7 +2295,8 @@ pub enum OutletsCommand {
     /// economic policy, gates on membership, and DEBITS the §5.4.5 open-time
     /// escrow hold (`cost_per_chunk × estimated_chunk_count`) under a
     /// fail-closed persist. The per-sender `base_sequence` is NOT allocated here
-    /// — the transport/FFI send path allocates it at consumption.
+    /// — the send path allocates it at consumption (the cross-context hop fills
+    /// this in `forward_frame` / `run_cross_context_bridge`, SCP-OUT-044).
     /// Replies with a `Send`
     /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
     /// the supervisor carries across the off-mailbox stream pump.
