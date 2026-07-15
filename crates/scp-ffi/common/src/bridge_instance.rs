@@ -336,26 +336,23 @@ pub struct CoreFields {
     /// See #311 for the unification design.
     did_resolver: OnceLock<Arc<IdentityBackedDidResolver>>,
 
-    /// In-memory DHT client backing the production DID resolver.
+    /// Shared DHT client backing the production DID resolver.
     ///
-    /// Retained on the instance so that `identity_create` can publish freshly
-    /// minted in-memory DID documents into the *same* `InMemoryDhtClient` the
-    /// resolver reads from. Without this, an in-memory identity's document is
-    /// only registered in the local identity registry and is never resolvable
-    /// via the resolver — so any code path that resolves the DID to verify a
-    /// signature (UCAN validation, governance vote verification) fails with
-    /// "unknown voter: cannot resolve public key for DID".
+    /// Retained on the instance so that `identity_create` publishes freshly
+    /// minted DID documents into the *same* [`FfiDhtClient`] the resolver reads
+    /// from. Without this, an identity's document is only registered in the local
+    /// identity registry and is never resolvable via the resolver — so any code
+    /// path that resolves the DID to verify a signature (UCAN validation,
+    /// governance vote verification) fails with "unknown voter: cannot resolve
+    /// public key for DID".
     ///
     /// Set by the same idempotent resolver-initialization path that calls
     /// [`set_did_resolver`]; the resolver and this client are the same `Arc`.
     /// `None` until the identity layer is first set up.
     ///
-    /// Mirrors the NAPI bridge's `publish_to_shared_dht_for` design,
-    /// but scoped per-instance (matching where the resolver itself is stored)
-    /// rather than process-global. The `InMemoryDhtClient` stores only signed,
-    /// public DID documents — it is a test/demo affordance for the in-memory
-    /// custody path; production uses real `did:dht`/`did:web` resolution.
-    dht_client: OnceLock<Arc<scp_dht::InMemoryDhtClient>>,
+    /// The shipped [`FfiDhtClient`] is the real Mainline `PkarrDhtClient`; the
+    /// in-memory arm exists only under `testing` (ADR-062 §Decision 1).
+    dht_client: OnceLock<Arc<crate::dht::FfiDhtClient>>,
 
     /// The DID-resolution cache shared with the production DID resolver.
     ///
@@ -2144,23 +2141,23 @@ impl CoreFields {
         }
     }
 
-    /// Returns the in-memory DHT client backing the DID resolver, if initialized.
+    /// Returns the shared DHT client backing the DID resolver, if initialized.
     ///
-    /// Used by `identity_create` (in-memory custody path) to publish freshly
-    /// minted DID documents into the same `InMemoryDhtClient` the resolver
-    /// reads from, so the DID is resolvable for signature verification.
+    /// Used by `identity_create` to publish freshly minted DID documents into
+    /// the same [`FfiDhtClient`] the resolver reads from, so the DID is
+    /// resolvable for signature verification.
     #[must_use]
-    pub fn dht_client(&self) -> Option<&Arc<scp_dht::InMemoryDhtClient>> {
+    pub fn dht_client(&self) -> Option<&Arc<crate::dht::FfiDhtClient>> {
         self.dht_client.get()
     }
 
-    /// Stores the in-memory DHT client backing the DID resolver.
+    /// Stores the shared DHT client backing the DID resolver.
     ///
     /// Called once during identity system setup, alongside [`set_did_resolver`],
-    /// with the SAME `InMemoryDhtClient` `Arc` the resolver was built over.
+    /// with the SAME [`FfiDhtClient`] `Arc` the resolver was built over.
     /// Subsequent calls are no-ops (`OnceLock` guarantees single
     /// initialization).
-    pub fn set_dht_client(&self, client: Arc<scp_dht::InMemoryDhtClient>) {
+    pub fn set_dht_client(&self, client: Arc<crate::dht::FfiDhtClient>) {
         if self.dht_client.set(client).is_err() {
             tracing::warn!("set_dht_client called but client already initialized — ignoring");
         }
@@ -2187,6 +2184,27 @@ impl CoreFields {
     pub fn set_resolver_cache(&self, cache: Arc<scp_identity::cache::DidCache>) {
         if self.resolver_cache.set(cache).is_err() {
             tracing::warn!("set_resolver_cache called but cache already initialized — ignoring");
+        }
+    }
+
+    /// Drops the DID resolver's cached document for `did` after a higher-sequence
+    /// re-publish (key rotation, agent-key add/rotate/remove, migration).
+    ///
+    /// The per-instance `DualLayerResolver` caches resolved documents with a
+    /// multi-day TTL and short-circuits on a cached hit without re-querying the
+    /// DHT. Without this invalidation a freshly rotated identity keeps resolving
+    /// to its pre-rotation document — and pre-rotation `#active` key — until the
+    /// TTL expires, defeating rotation's revocation purpose. The rotation
+    /// re-publish (higher BEP44 `seq`) has already landed in the shared DHT
+    /// client; this drops the resolver's stale copy so the next resolve reads the
+    /// fresh document. Best-effort: a no-op when no resolver cache is wired on
+    /// this instance.
+    ///
+    /// Shared by all three FFI bridges (`PyO3` wraps it in `block_on`; napi-rs
+    /// and `UniFFI` `.await` it) — the single implementation of the body.
+    pub async fn invalidate_resolver_cache(&self, did: &str) {
+        if let Some(cache) = self.resolver_cache() {
+            cache.remove(did).await;
         }
     }
 

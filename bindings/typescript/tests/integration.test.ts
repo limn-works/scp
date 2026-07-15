@@ -2046,10 +2046,20 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
     try {
       const idA = await a.identityCreate("in_memory");
       const idB = await b.identityCreate("in_memory");
-      // Ephemeral instances are strictly isolated — no shared identity store.
+      // Two fresh SCPs mint distinct identities.
       expect(idA.did).not.toBe(idB.did);
-      // And loading A's DID on B must fail (B never saw it).
-      await expect(b.identityLoad(idA.did)).rejects.toThrow();
+      // Isolation is over KEY MATERIAL / storage, not public documents. Ephemeral
+      // instances share NO custody or storage, but they DO share the process-wide
+      // DHT (#1144) — the in-memory test double for Mainline — so B can resolve
+      // A's PUBLIC DID document, exactly as any node resolves any published DID in
+      // a real deployment. That resolution yields an "external" handle carrying no
+      // key material: B cannot sign or act as A. (Before ADR-062 Slice 1,
+      // `identityLoad`'s DHT fallback used a throwaway empty client and could
+      // never resolve anything — the fallback is now wired to the shared client,
+      // so cross-instance public resolution actually works.)
+      const aSeenByB = await b.identityLoad(idA.did);
+      expect(aSeenByB.did).toBe(idA.did);
+      expect(aSeenByB.custodyType).toBe("external");
     } finally {
       await a.shutdown(1);
       await b.shutdown(1);

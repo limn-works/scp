@@ -388,7 +388,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: lifecycle_helpers::import_context now calls validate_and_sanitize_snapshot on velocity tracker, hard-rate-limit token bucket, and spending nonce tracker (lifecycle_helpers.rs:1476/1490, batch-2 wiring). No direct SDK call site \u2014 invoked transitively from import_context.",
+          "notes": "Internal: lifecycle_helpers::import_context now calls validate_and_sanitize_snapshot on velocity tracker, hard-rate-limit token bucket, and spending nonce tracker (lifecycle_helpers.rs:1476/1490, batch-2 wiring). No direct SDK call site — invoked transitively from import_context.",
           "exemptions": {
             "python": "internal wiring inside import_context, not a separate SDK operation",
             "typescript": "internal wiring inside import_context, not a separate SDK operation",
@@ -402,7 +402,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextSnapshot now serializes consequence_rules, velocity_tracker_snapshot, hard_rate_limit_snapshot, spending_nonce_state. No direct SDK call site \u2014 invoked transitively from export_context/snapshot_context.",
+          "notes": "Internal: ContextSnapshot now serializes consequence_rules, velocity_tracker_snapshot, hard_rate_limit_snapshot, spending_nonce_state. No direct SDK call site — invoked transitively from export_context/snapshot_context.",
           "exemptions": {
             "python": "internal wiring inside export_context, not a separate SDK operation",
             "typescript": "internal wiring inside export_context, not a separate SDK operation",
@@ -416,7 +416,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::restore_context rebuilds consequence_rules, velocity_tracker, hard_rate_limit, spending_nonce_tracker from snapshot. No direct SDK call site \u2014 invoked transitively from restore_context.",
+          "notes": "Internal: ContextManager::restore_context rebuilds consequence_rules, velocity_tracker, hard_rate_limit, spending_nonce_tracker from snapshot. No direct SDK call site — invoked transitively from restore_context.",
           "exemptions": {
             "python": "internal wiring inside restore_context, not a separate SDK operation",
             "typescript": "internal wiring inside restore_context, not a separate SDK operation",
@@ -430,7 +430,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.8): ContextExport carries an Ed25519 snapshot_signature over the full-JCS canonical_snapshot_hash = SHA-256(domain SCP-CONTEXT-EXPORT-V1: || scope_tag || JCS(snapshot)) \u2014 the entire RFC 8785 canonical snapshot, NOT a 7-field subset recipe (domain distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge that signs the export digest via KeyCustody::sign (custody-delegated through a per-bridge export-path signer helper; the private key never crosses the FFI boundary, ADR-006) across PyO3, NAPI, and UniFFI — the raw signing key is never exported. The native export envelope is MessagePack at version 4. No direct SDK call site \u2014 invoked transitively from context_export.",
+          "notes": "Internal (spec §23.16.8): ContextExport carries an Ed25519 snapshot_signature over the full-JCS canonical_snapshot_hash = SHA-256(domain SCP-CONTEXT-EXPORT-V1: || scope_tag || JCS(snapshot)) — the entire RFC 8785 canonical snapshot, NOT a 7-field subset recipe (domain distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge that signs the export digest via KeyCustody::sign (custody-delegated through a per-bridge export-path signer helper; the private key never crosses the FFI boundary, ADR-006) across PyO3, NAPI, and UniFFI — the raw signing key is never exported. The native export envelope is MessagePack at version 4. No direct SDK call site — invoked transitively from context_export.",
           "exemptions": {
             "python": "internal wiring inside context_export, not a separate SDK operation",
             "typescript": "internal wiring inside context_export, not a separate SDK operation",
@@ -444,7 +444,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI), failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site \u2014 invoked transitively from context_import.",
+          "notes": "Internal (spec §23.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI), failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site — invoked transitively from context_import.",
           "exemptions": {
             "python": "internal wiring inside context_import, not a separate SDK operation",
             "typescript": "internal wiring inside context_import, not a separate SDK operation",
@@ -548,7 +548,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "context_send / Context.send accepts an optional spending_ucan_jwt parameter that AND-composes the per-action UCAN with a spending UCAN authorizing the message cost (#1537, batch-2 wiring). PyO3 bridge wires it through send_message. NAPI bridge accepts the parameter and threads it to ContextManager::send_message. UniFFI bridge: regenerated Swift/Kotlin bindings expose spendingUcanJwt; the Rust UniFFI bridge source still passes None to ContextManager::send_message \u2014 drift to be reconciled before the spending UCAN path is enforced on UniFFI consumers."
+          "notes": "context_send / Context.send accepts an optional spending_ucan_jwt parameter that AND-composes the per-action UCAN with a spending UCAN authorizing the message cost (#1537, batch-2 wiring). PyO3 bridge wires it through send_message. NAPI bridge accepts the parameter and threads it to ContextManager::send_message. UniFFI bridge: regenerated Swift/Kotlin bindings expose spendingUcanJwt; the Rust UniFFI bridge source still passes None to ContextManager::send_message — drift to be reconciled before the spending UCAN path is enforced on UniFFI consumers."
         },
         {
           "name": "join_with_spending_ucan",
@@ -717,7 +717,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Capability-admission op (spec \u00a77.3.4.4, SCP-ACR-008): sibling of verify_participation_requirements. PyO3 (py_check_capability_requirements), NAPI (checkCapabilityRequirements), and UniFFI (check_capability_requirements) bridges take the JSON envelope (context_id, subject_did, requirements_json, agent_capabilities_json, challenge_verifications_json), validate_did(subject_did) at the boundary, and delegate to scp_protocol::trust::check_capability_requirements with the production IdentityDidPublicKeyResolver + fail-closed SystemClock so each ChallengeVerification is signature/subject/context/expiry bound. All four SDKs expose idiomatic wrappers (Python scp_sdk.check_capability_requirements, TypeScript SCP.checkCapabilityRequirements, Kotlin SCP.checkCapabilityRequirements, Swift free function checkCapabilityRequirements)."
+          "notes": "Capability-admission op (spec §7.3.4.4, SCP-ACR-008): sibling of verify_participation_requirements. PyO3 (py_check_capability_requirements), NAPI (checkCapabilityRequirements), and UniFFI (check_capability_requirements) bridges take the JSON envelope (context_id, subject_did, requirements_json, agent_capabilities_json, challenge_verifications_json), validate_did(subject_did) at the boundary, and delegate to scp_protocol::trust::check_capability_requirements with the production IdentityDidPublicKeyResolver + fail-closed SystemClock so each ChallengeVerification is signature/subject/context/expiry bound. All four SDKs expose idiomatic wrappers (Python scp_sdk.check_capability_requirements, TypeScript SCP.checkCapabilityRequirements, Kotlin SCP.checkCapabilityRequirements, Swift free function checkCapabilityRequirements)."
         },
         {
           "name": "participation_record",
@@ -749,12 +749,12 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::dispatch_consequences (scp-runtime/src/context/manager/governance.rs:70) is invoked transitively from send_message and execute_governance_action. No SDK-level wrapper exposes the dispatcher directly \u2014 consequence enforcement is automatic on send and governance dispatch.",
+          "notes": "Internal: ContextManager::dispatch_consequences (scp-runtime/src/context/manager/governance.rs:70) is invoked transitively from send_message and execute_governance_action. No SDK-level wrapper exposes the dispatcher directly — consequence enforcement is automatic on send and governance dispatch.",
           "exemptions": {
-            "python": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation",
-            "typescript": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation",
-            "kotlin": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation",
-            "swift": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation"
+            "python": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation",
+            "typescript": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation",
+            "kotlin": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation",
+            "swift": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation"
           }
         }
       ]
@@ -768,7 +768,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "ContextManager::standing_context (scp-runtime/src/context/manager/standing.rs:81) is the get-or-create operation for bilateral-persistent contact graph contexts (spec section 5.12.4, SCP-138). The submodule is internal \u2014 no FFI bridge or SDK wrapper currently exposes standing_context() to applications. The contact-graph API is a pending follow-up to wire end-to-end.",
+          "notes": "ContextManager::standing_context (scp-runtime/src/context/manager/standing.rs:81) is the get-or-create operation for bilateral-persistent contact graph contexts (spec section 5.12.4, SCP-138). The submodule is internal — no FFI bridge or SDK wrapper currently exposes standing_context() to applications. The contact-graph API is a pending follow-up to wire end-to-end.",
           "exemptions": {
             "python": "ContextManager submodule not yet exposed via PyO3 bridge",
             "typescript": "ContextManager submodule not yet exposed via NAPI bridge",
@@ -782,7 +782,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "ContextManager::standing_context_count (standing.rs:155). Internal query \u2014 no SDK exposure pending the contact-graph follow-up.",
+          "notes": "ContextManager::standing_context_count (standing.rs:155). Internal query — no SDK exposure pending the contact-graph follow-up.",
           "exemptions": {
             "python": "internal query, not yet exposed",
             "typescript": "internal query, not yet exposed",
@@ -796,7 +796,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "ContextManager::has_standing_context (standing.rs:160). Internal query \u2014 no SDK exposure pending the contact-graph follow-up.",
+          "notes": "ContextManager::has_standing_context (standing.rs:160). Internal query — no SDK exposure pending the contact-graph follow-up.",
           "exemptions": {
             "python": "internal query, not yet exposed",
             "typescript": "internal query, not yet exposed",
@@ -810,7 +810,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "ContextManager::register_standing_context (standing.rs:172). Used during startup to restore standing contexts from persisted state \u2014 invoked by SDK init flows when standing-context persistence lands.",
+          "notes": "ContextManager::register_standing_context (standing.rs:172). Used during startup to restore standing contexts from persisted state — invoked by SDK init flows when standing-context persistence lands.",
           "exemptions": {
             "python": "startup-only registration, not yet exposed",
             "typescript": "startup-only registration, not yet exposed",
@@ -1022,7 +1022,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RemoveMember variant (also known as MLS ejection) dispatched via execute_action / propose_action across all three bridges. Internal wiring (#1541, batch-2) calls remove_member_sender_key and rotate_sender_key on the crypto provider after a successful member ejection \u2014 see the Crypto domain rows."
+          "notes": "GovernanceAction::RemoveMember variant (also known as MLS ejection) dispatched via execute_action / propose_action across all three bridges. Internal wiring (#1541, batch-2) calls remove_member_sender_key and rotate_sender_key on the crypto provider after a successful member ejection — see the Crypto domain rows."
         },
         {
           "name": "execute_rotate_content_keys",
@@ -1363,6 +1363,25 @@
       ]
     },
     {
+      "domain": "DHT",
+      "operations": [
+        {
+          "name": "dht_backend",
+          "python": false,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "notes": "DID/DHT resolution backend (spec §17.17.3, §3.10.6). The single shipped DHT backend is the real Mainline **Pkarr** client (PkarrDhtClient, scp-dht production-dht) selected by construction in the FFI layer via scp_ffi_common::dht::FfiDhtClient / ClientDhtConfig::into_client (fail-closed). It is an internal provider selected below the SDK surface — the same Pkarr backend underlies every binding — not a per-SDK operation; the in-memory arm is a §17.17.3 nullifier compiled only under `testing` (ADR-062 §Decision 1).",
+          "exemptions": {
+            "python": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve).",
+            "typescript": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve).",
+            "kotlin": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve).",
+            "swift": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve)."
+          }
+        }
+      ]
+    },
+    {
       "domain": "UCAN",
       "operations": [
         {
@@ -1504,7 +1523,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::enforce_send_economy delegates to enforce_economy (scp-runtime/src/context/manager/economy.rs:242, F9 refactor) which calls evaluate_cost, records anti-spam velocity, and authorizes the spending UCAN. Invoked transitively from send_message \u2014 no separate SDK operation. Pipeline-wiring assertion enforce_send_economy_calls_enforce_economy in pipeline_wiring.rs.",
+          "notes": "Internal: ContextManager::enforce_send_economy delegates to enforce_economy (scp-runtime/src/context/manager/economy.rs:242, F9 refactor) which calls evaluate_cost, records anti-spam velocity, and authorizes the spending UCAN. Invoked transitively from send_message — no separate SDK operation. Pipeline-wiring assertion enforce_send_economy_calls_enforce_economy in pipeline_wiring.rs.",
           "exemptions": {
             "python": "internal pipeline wiring inside send_message; not a standalone SDK operation",
             "typescript": "internal pipeline wiring inside send_message; not a standalone SDK operation",
@@ -1518,7 +1537,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::enforce_join_economy delegates to enforce_economy with EnforceEconomyRequest. Invoked transitively from join_context \u2014 no separate SDK operation. Currently effective only on the PyO3 bridge because UniFFI and NAPI hard-code spending_ucan to None on the join path (drift documented in Messaging/join_with_spending_ucan).",
+          "notes": "Internal: ContextManager::enforce_join_economy delegates to enforce_economy with EnforceEconomyRequest. Invoked transitively from join_context — no separate SDK operation. Currently effective only on the PyO3 bridge because UniFFI and NAPI hard-code spending_ucan to None on the join path (drift documented in Messaging/join_with_spending_ucan).",
           "exemptions": {
             "python": "internal pipeline wiring inside join_context; not a standalone SDK operation",
             "typescript": "internal pipeline wiring inside join_context; not a standalone SDK operation",
@@ -2011,27 +2030,77 @@
     {
       "domain": "Lifecycle",
       "operations": [
-        {"name": "scp_new", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP(storage) constructor — the only entry point into the SDK. Storage selection is MANDATORY and fail-closed (spec §17.6): there is no zero-argument constructor and no default backend. Python scp_sdk.SCP(storage={...}), TypeScript new SCP({ storage: {...} }), Kotlin SCP(storage), Swift SCP(storage:) / SCP.withStorage(_:). The two selections are {type: in_memory} (development) and {type: sqlite, ...} (production). Statically-typed bridges (UniFFI typed StorageConfig, required Swift/Kotlin/TS argument) reject a missing selection at compile time; dynamically-typed bridges (PyO3 dict, NAPI JSON string) reject it at runtime with SCP-STORAGE-8000. Each constructor allocates a fresh BridgeInstance (PyBridgeInstance / NapiBridgeInstance / UniffiBridgeInstance) with its own registries, ContextManager, transport manager, and monotonic instance_id. Multiple instances in one process are supported — identities and relay connections do not leak across them. See ADR-048 §Decision 1 and spec §17.6. The pre-PR-4 `SCP.default()` accessor and underlying `DEFAULT_BRIDGE_INSTANCE` OnceLock were DELETED in PR 4 (re-scoped 2026-04-19): no deprecation window, no sunset scaffold."},
-        {"name": "scp_with_storage_in_memory", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.withStorage({type: \"in_memory\"}) — in-memory storage variant. Default for tests and ephemeral workflows. Symmetric with with_storage_sqlite below. PyO3 SCP(storage={\"type\": \"in_memory\"}), NAPI SCP.withStorage({type: \"in_memory\"}), Swift SCP.withStorage(.inMemory), Kotlin SCP.withStorage(StorageConfig.InMemory).",
-         "exemptions": {}},
-        {"name": "scp_instance_id", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "Monotonic u64 instance identifier assigned at SCP() construction. Exposed as a read-only property ON THE SCP CLASS ONLY. Every handle type (ContextHandle, Identity, UcanToken, MessageReceiver, ...) carries its owning SCP's instance_id as a Rust-internal field — this per-handle id is NOT host-visible (no per-handle instanceId getter/export on any bridge; see ADR-048 §Per-handle host-visible instanceId is NOT exposed). Every handle-accepting FFI function runs a runtime affinity check (SCP-PERM-3030 on mismatch) enforced by scripts/check-handle-affinity.sh. Python scp.instance_id, TypeScript scp.instanceId, Kotlin scp.instanceId, Swift scp.instanceId.",
-         "exemptions": {}},
-        {"name": "shutdown_timeout", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on a JoinSet up to the timeout, and forcibly cancels anything still running at the deadline. Async across all bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges."},
-        {"name": "suspend", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "Disconnects transport and marks BridgeInstance as suspended for mobile/desktop backgrounding. All three FFI bridges (PyO3 scp_suspend, NAPI scpSuspend, UniFFI scpSuspend) call BridgeInstance::suspend. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.suspend() is now the only entry point in every SDK: Python scp.suspend(), TypeScript scp.suspend(), Kotlin scp.suspend(), Swift scp.suspend()."},
-        {"name": "resume", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "ASYNC as of Phase 4 PR 3 (#1678, 2026-04-18) — BREAKING CHANGE. BridgeInstanceCore::resume is async fn; per-bridge overrides reconnect every pending relay URL and restore persisted contexts before returning. Reconnect failures surface as LifecycleError::ReconnectFailed { url, reason }. All three FFI bridges expose the async path: PyO3 releases the GIL and block_ons, NAPI returns a Promise, UniFFI generates Kotlin suspend fun / Swift async throws. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.resume() is now the only entry point in every SDK: Python async def resume(), TypeScript scp.resume(): Promise<void>, Kotlin scp.resume() (suspend fun), Swift func resume() async throws."},
-        {"name": "with_storage_sqlite", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.withStorage(Sqlite { path, key }) exposes the SQLCipher-backed SqliteStorage across all three bridges (#1491, #1260; Phase 4 PR 3, 2026-04-18). The StorageConfig::Sqlite key field is a SqliteKeyMaterial sum type accepting EITHER raw key material (Raw, 32-byte key validated at the FFI boundary) OR a passphrase (Passphrase, SQLCipher key derived via Argon2id with a persisted per-database salt sidecar). For sqlite, exactly ONE of key/passphrase must be supplied — both or neither is a ValidationError; both forms are wrapped in Zeroizing. PyO3 accepts Python bytes (key) or a str (passphrase); NAPI accepts a hex string OR Uint8Array (key) or a string (passphrase); UniFFI generates Swift StorageConfig.sqlite(path:key:) / SqliteKeyMaterial.raw|.passphrase and the Kotlin equivalents via #[derive(uniffi::Enum)]. SDK convenience constructors: Swift SCP.withStorage(sqliteDir:key:)/passphrase variant, Kotlin SCP.withSqlite(dir, key)/passphrase variant, Python SCP.with_storage({...}), TypeScript SCP.withStorage({...}). The Supervisor's mls_storage view, context-snapshot persistence, and event log all share a single rusqlite::Connection via the one Arc<SqliteStorage>.",
-         "exemptions": {}},
-        {"name": "add_relay_url", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "CoreFields::relay_url (Mutex<Option<String>>) replaced with relay_urls (Mutex<HashSet<String>>) in Phase 4 PR 3 (#1678, 2026-04-18). New accessors add_relay_url / remove_relay_url / pending_relay_urls; each per-bridge resume() iterates the HashSet and reconnects each URL. First reconnect failure surfaces as LifecycleError::ReconnectFailed { url, reason }; successfully-connected URLs remain in the pending set for retry.",
-         "exemptions": {},
-         "coverage_exemptions": {"kotlin": "Present in the UniFFI bridge as `addRelay` (generated from `crates/scp-ffi/uniffi/src/bridge.rs` \u2014 the `add_relay_url` export in TransportManager). The generated Kotlin file (`works.limn.scp.internal.uniffi.scp.TransportManager.addRelay`) is not git-tracked; verify via `cargo build -p scp-ffi-uniffi`. The generated file's backtick-quoted, @Throws-annotated override methods are not surfaced as clean function_declaration nodes by the tree-sitter-kotlin grammar the coverage extractor uses, so the symbol cannot be statically matched."}}
+        {
+          "name": "scp_new",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "SCP(storage) constructor — the only entry point into the SDK. Storage selection is MANDATORY and fail-closed (spec §17.6): there is no zero-argument constructor and no default backend. Python scp_sdk.SCP(storage={...}), TypeScript new SCP({ storage: {...} }), Kotlin SCP(storage), Swift SCP(storage:) / SCP.withStorage(_:). The two selections are {type: in_memory} (development) and {type: sqlite, ...} (production). Statically-typed bridges (UniFFI typed StorageConfig, required Swift/Kotlin/TS argument) reject a missing selection at compile time; dynamically-typed bridges (PyO3 dict, NAPI JSON string) reject it at runtime with SCP-STORAGE-8000. Each constructor allocates a fresh BridgeInstance (PyBridgeInstance / NapiBridgeInstance / UniffiBridgeInstance) with its own registries, ContextManager, transport manager, and monotonic instance_id. Multiple instances in one process are supported — identities and relay connections do not leak across them. See ADR-048 §Decision 1 and spec §17.6. The pre-PR-4 `SCP.default()` accessor and underlying `DEFAULT_BRIDGE_INSTANCE` OnceLock were DELETED in PR 4 (re-scoped 2026-04-19): no deprecation window, no sunset scaffold."
+        },
+        {
+          "name": "scp_with_storage_in_memory",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "SCP.withStorage({type: \"in_memory\"}) — in-memory storage variant. Default for tests and ephemeral workflows. Symmetric with with_storage_sqlite below. PyO3 SCP(storage={\"type\": \"in_memory\"}), NAPI SCP.withStorage({type: \"in_memory\"}), Swift SCP.withStorage(.inMemory), Kotlin SCP.withStorage(StorageConfig.InMemory).",
+          "exemptions": {}
+        },
+        {
+          "name": "scp_instance_id",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Monotonic u64 instance identifier assigned at SCP() construction. Exposed as a read-only property ON THE SCP CLASS ONLY. Every handle type (ContextHandle, Identity, UcanToken, MessageReceiver, ...) carries its owning SCP's instance_id as a Rust-internal field — this per-handle id is NOT host-visible (no per-handle instanceId getter/export on any bridge; see ADR-048 §Per-handle host-visible instanceId is NOT exposed). Every handle-accepting FFI function runs a runtime affinity check (SCP-PERM-3030 on mismatch) enforced by scripts/check-handle-affinity.sh. Python scp.instance_id, TypeScript scp.instanceId, Kotlin scp.instanceId, Swift scp.instanceId.",
+          "exemptions": {}
+        },
+        {
+          "name": "shutdown_timeout",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on a JoinSet up to the timeout, and forcibly cancels anything still running at the deadline. Async across all bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges."
+        },
+        {
+          "name": "suspend",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Disconnects transport and marks BridgeInstance as suspended for mobile/desktop backgrounding. All three FFI bridges (PyO3 scp_suspend, NAPI scpSuspend, UniFFI scpSuspend) call BridgeInstance::suspend. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.suspend() is now the only entry point in every SDK: Python scp.suspend(), TypeScript scp.suspend(), Kotlin scp.suspend(), Swift scp.suspend()."
+        },
+        {
+          "name": "resume",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "ASYNC as of Phase 4 PR 3 (#1678, 2026-04-18) — BREAKING CHANGE. BridgeInstanceCore::resume is async fn; per-bridge overrides reconnect every pending relay URL and restore persisted contexts before returning. Reconnect failures surface as LifecycleError::ReconnectFailed { url, reason }. All three FFI bridges expose the async path: PyO3 releases the GIL and block_ons, NAPI returns a Promise, UniFFI generates Kotlin suspend fun / Swift async throws. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.resume() is now the only entry point in every SDK: Python async def resume(), TypeScript scp.resume(): Promise<void>, Kotlin scp.resume() (suspend fun), Swift func resume() async throws."
+        },
+        {
+          "name": "with_storage_sqlite",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "SCP.withStorage(Sqlite { path, key }) exposes the SQLCipher-backed SqliteStorage across all three bridges (#1491, #1260; Phase 4 PR 3, 2026-04-18). The StorageConfig::Sqlite key field is a SqliteKeyMaterial sum type accepting EITHER raw key material (Raw, 32-byte key validated at the FFI boundary) OR a passphrase (Passphrase, SQLCipher key derived via Argon2id with a persisted per-database salt sidecar). For sqlite, exactly ONE of key/passphrase must be supplied — both or neither is a ValidationError; both forms are wrapped in Zeroizing. PyO3 accepts Python bytes (key) or a str (passphrase); NAPI accepts a hex string OR Uint8Array (key) or a string (passphrase); UniFFI generates Swift StorageConfig.sqlite(path:key:) / SqliteKeyMaterial.raw|.passphrase and the Kotlin equivalents via #[derive(uniffi::Enum)]. SDK convenience constructors: Swift SCP.withStorage(sqliteDir:key:)/passphrase variant, Kotlin SCP.withSqlite(dir, key)/passphrase variant, Python SCP.with_storage({...}), TypeScript SCP.withStorage({...}). The Supervisor's mls_storage view, context-snapshot persistence, and event log all share a single rusqlite::Connection via the one Arc<SqliteStorage>.",
+          "exemptions": {}
+        },
+        {
+          "name": "add_relay_url",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "CoreFields::relay_url (Mutex<Option<String>>) replaced with relay_urls (Mutex<HashSet<String>>) in Phase 4 PR 3 (#1678, 2026-04-18). New accessors add_relay_url / remove_relay_url / pending_relay_urls; each per-bridge resume() iterates the HashSet and reconnects each URL. First reconnect failure surfaces as LifecycleError::ReconnectFailed { url, reason }; successfully-connected URLs remain in the pending set for retry.",
+          "exemptions": {},
+          "coverage_exemptions": {
+            "kotlin": "Present in the UniFFI bridge as `addRelay` (generated from `crates/scp-ffi/uniffi/src/bridge.rs` — the `add_relay_url` export in TransportManager). The generated Kotlin file (`works.limn.scp.internal.uniffi.scp.TransportManager.addRelay`) is not git-tracked; verify via `cargo build -p scp-ffi-uniffi`. The generated file's backtick-quoted, @Throws-annotated override methods are not surfaced as clean function_declaration nodes by the tree-sitter-kotlin grammar the coverage extractor uses, so the symbol cannot be statically matched."
+          }
+        }
       ]
     }
   ],
@@ -2051,7 +2120,7 @@
       "evidence": {
         "pipeline_wiring_test": "governance_enforces_economic_policy",
         "code_sites": [
-          "crates/scp-runtime/src/context/messaging_helpers.rs:211 enforce_send_economy \u2192 economy_logic::enforce_economy",
+          "crates/scp-runtime/src/context/messaging_helpers.rs:211 enforce_send_economy → economy_logic::enforce_economy",
           "crates/scp-runtime/src/context/economy_logic.rs:313 enforce_economy definition"
         ]
       }
@@ -2070,8 +2139,8 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1324 import_context \u2192 validate_export_for_import",
-          "crates/scp-runtime/src/context/supervisor/supervisor.rs:3750 import_context \u2192 validate_export_for_import (public API boundary, verify-before-dispatch)"
+          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1324 import_context → validate_export_for_import",
+          "crates/scp-runtime/src/context/supervisor/supervisor.rs:3750 import_context → validate_export_for_import (public API boundary, verify-before-dispatch)"
         ]
       }
     },
@@ -2091,9 +2160,9 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-ffi/src/identity.rs PyScp::identity_create \u2192 ensure_did_resolver_initialized_on",
-          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create \u2192 ensure_did_resolver_initialized_on",
-          "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_create (in-memory arm) \u2192 ensure_did_resolver_initialized_on"
+          "crates/scp-ffi/src/identity.rs PyScp::identity_create → ensure_did_resolver_initialized_on",
+          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create → ensure_did_resolver_initialized_on",
+          "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_create (in-memory arm) → ensure_did_resolver_initialized_on"
         ]
       }
     }

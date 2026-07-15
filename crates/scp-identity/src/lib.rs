@@ -294,6 +294,12 @@ impl From<scp_dht::DhtError> for IdentityError {
             scp_dht::DhtError::DhtPublishFailed(msg) => Self::DhtPublishFailed(msg),
             scp_dht::DhtError::DhtResolveFailed(msg) => Self::DhtResolveFailed(msg),
             scp_dht::DhtError::Bep44SignatureInvalid(msg) => Self::Bep44SignatureInvalid(msg),
+            // `DhtMode::Disabled` refuses to publish (fail-closed); surface it
+            // as a publish failure so callers see the honest refusal, never a
+            // silent success (ADR-062 §Decision 1, A2).
+            scp_dht::DhtError::Disabled => Self::DhtPublishFailed(
+                "DHT layer disabled: publish refused (fail-closed)".to_owned(),
+            ),
         }
     }
 }

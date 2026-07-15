@@ -431,12 +431,11 @@ impl Scp {
         };
 
         let bi = &*self.inner;
-        ensure_did_resolver_initialized_on(bi);
+        ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
 
         match custody.as_str() {
             #[cfg(feature = "allow_in_memory_custody")]
             "in_memory" => {
-                use scp_identity::DidDht;
                 use scp_platform::testing::InMemoryKeyCustody;
 
                 // Deref through `Zeroizing<[u8; 32]>` so the wrapper
@@ -454,7 +453,7 @@ impl Scp {
                 ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let dht = DidDht::new();
+                let dht = crate::identity::shared_did_method()?;
                 let (scp_identity, document, pre_rotation_handle) = dht
                     .create(&*key_custody, pre_rotation_custody.as_ref())
                     .await
@@ -572,20 +571,19 @@ impl Scp {
         validate_custody_type(&custody).map_err(NapiError::from)?;
 
         let bi = &*self.inner;
-        ensure_did_resolver_initialized_on(bi);
+        ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
 
         match custody.as_str() {
             #[cfg(feature = "allow_in_memory_custody")]
             "in_memory" => {
                 use scp_platform::testing::InMemoryKeyCustody;
-                use scp_identity::DidDht;
 
                 let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
                     crate::identity::OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
                 ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let dht = DidDht::new();
+                let dht = crate::identity::shared_did_method()?;
                 let (scp_identity, document, pre_rotation_handle) = dht
                     .create_with_agent_key(&*key_custody, pre_rotation_custody.as_ref())
                     .await
@@ -710,12 +708,11 @@ impl Scp {
         // join-time pseudonym announcement) are the exception — they export the
         // raw seed into Rust (held in `Zeroizing`, wiped on drop), a surface
         // tracked for migration to `KeyCustody::sign`.
-        use scp_identity::DidDht;
 
         use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
 
         let bi_arc = Arc::clone(&self.inner);
-        ensure_did_resolver_initialized_on(&bi_arc);
+        ensure_did_resolver_initialized_on(&bi_arc).map_err(NapiError::from)?;
 
         // Promote the JS callbacks to threadsafe functions on the JS
         // thread (consuming the non-Send `Function`s). A malformed
@@ -727,7 +724,7 @@ impl Scp {
             let bi = &*bi_arc;
             let pre_rotation_custody =
                 Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-            let dht = DidDht::new();
+            let dht = crate::identity::shared_did_method()?;
             let (scp_identity, document, pre_rotation_handle) = dht
                 .create(&*key_custody, pre_rotation_custody.as_ref())
                 .await
@@ -780,7 +777,6 @@ impl Scp {
     #[napi(js_name = "identityLoad")]
     pub async fn identity_load(&self, did: String) -> napi::Result<crate::identity::NapiIdentity> {
         use crate::identity::NapiIdentityInner;
-        use scp_identity::DidDht;
 
         if !did.starts_with("did:dht:") {
             return Err(ScpNapiError::Identity {
@@ -824,7 +820,7 @@ impl Scp {
             return Ok(handle);
         }
 
-        let dht = DidDht::new();
+        let dht = crate::identity::shared_did_method()?;
         let document = dht
             .resolve(&did)
             .await
@@ -854,7 +850,6 @@ impl Scp {
         did: String,
     ) -> napi::Result<crate::identity::NapiDIDDocument> {
         use crate::identity::NapiVerificationMethod;
-        use scp_identity::DidDht;
 
         if !did.starts_with("did:dht:") {
             return Err(ScpNapiError::Identity {
@@ -872,7 +867,7 @@ impl Scp {
         let document = if let Some(doc) = local_doc {
             doc
         } else {
-            let dht = DidDht::new();
+            let dht = crate::identity::shared_did_method()?;
             dht.resolve(&did)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?
@@ -4754,7 +4749,7 @@ mod concurrency_cap_tests {
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-        let dht = scp_identity::DidDht::new();
+        let dht = scp_identity::DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
         let (identity, document, pre_rotation_handle) = rt
             .block_on(dht.create(&*custody, pre_rotation_custody.as_ref()))
             .unwrap();

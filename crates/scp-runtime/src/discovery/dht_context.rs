@@ -486,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_contexts_from_did_invalid_did() {
-        let did_dht = DidDht::new();
+        let did_dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let err = resolve_contexts_from_did("did:dht:zInvalidDid", &did_dht)
             .await

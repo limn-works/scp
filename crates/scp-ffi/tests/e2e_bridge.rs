@@ -104,7 +104,9 @@ fn create_test_identity(bi: &PyBridgeInstance) -> String {
 
     let pre_rotation_custody = Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
     let (identity, document, pre_rotation_handle) = rt.block_on(async {
-        let did_method = scp_identity::DidDht::new();
+        let did_method = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
         scp_identity::DidMethod::create(
             &did_method,
             custody.as_ref(),

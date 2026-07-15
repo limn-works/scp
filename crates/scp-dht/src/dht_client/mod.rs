@@ -12,8 +12,12 @@
 //!
 //! See ADR-003 in `.docs/adrs/phase-1.md` and §3.10 (DID Resolution Layers).
 
+// `HashMap`/`Mutex` back the testing-only `InMemoryDhtClient`; gate the imports
+// so a shipped (non-testing) build carries no unused-import warning.
+#[cfg(feature = "testing")]
 use std::collections::HashMap;
 
+#[cfg(feature = "testing")]
 use tokio::sync::Mutex;
 
 use crate::DhtError;
@@ -88,7 +92,15 @@ pub struct DhtRecord {
 /// sequence number less than or equal to the existing one is silently ignored
 /// (idempotent no-op).
 ///
-/// This implementation requires no network access and is suitable for unit tests.
+/// This implementation requires no network access and is suitable for unit
+/// tests. It is a **§17.17.3 resolve nullifier** — a publish reaches no peer
+/// and a resolve sees no peer's writes — and therefore MUST NOT ship on any
+/// production path. The type is compiled only under the `testing` feature
+/// (ADR-062 §Decision 1 / A5) — a **single** activation path (never a bare
+/// `#[cfg(test)]` disjunct, which is a second, cross-crate-invisible path that
+/// G1's feature-graph check cannot see), so a shipped graph cannot name it.
+/// This crate's own unit tests activate it via the `testing` dev-dependency.
+#[cfg(feature = "testing")]
 #[derive(Debug, Default)]
 pub struct InMemoryDhtClient {
     /// Map from public key bytes to (value, signature, sequence number).
@@ -96,6 +108,7 @@ pub struct InMemoryDhtClient {
 }
 
 /// A stored BEP44 item in the in-memory DHT.
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 struct StoredItem {
     value: Vec<u8>,
@@ -103,6 +116,7 @@ struct StoredItem {
     seq: u64,
 }
 
+#[cfg(feature = "testing")]
 impl InMemoryDhtClient {
     /// Creates a new empty in-memory DHT client.
     #[must_use]
@@ -121,6 +135,7 @@ impl InMemoryDhtClient {
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
+#[cfg(feature = "testing")]
 #[allow(clippy::manual_async_fn)]
 impl DhtClient for InMemoryDhtClient {
     fn publish(
@@ -170,6 +185,51 @@ impl DhtClient for InMemoryDhtClient {
             drop(items);
             Ok(record)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DisabledDhtClient — DHT layer turned off (unconditional, shippable)
+// ---------------------------------------------------------------------------
+
+/// A [`DhtClient`] with the DHT layer turned off.
+///
+/// DHT layer disabled — resolves nothing (`Ok(None)`, an honest not-found;
+/// never a fabricated document), and refuses to publish
+/// ([`DhtError::Disabled`], fail-closed — never a silent `Ok`). Used by
+/// `DhtMode::Disabled`; the `DualLayerResolver` composes the relay layer
+/// around it, so a `Disabled` node's resolution still runs (relay arm only).
+///
+/// Unlike [`InMemoryDhtClient`], this is **not** a nullifier: it never reports
+/// a false publish success and never returns a fabricated resolve — both harms
+/// §17.17.3 identifies. Publish fails loud; resolve is honestly empty. It is
+/// therefore compiled unconditionally and safe to ship.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DisabledDhtClient;
+
+// Trait uses RPITIT with explicit `+ Send` bound; async fn in trait does not
+// guarantee Send futures, so manual impl Future is required.
+#[allow(clippy::manual_async_fn)]
+impl DhtClient for DisabledDhtClient {
+    fn publish(
+        &self,
+        _public_key: &[u8; 32],
+        _signature: &[u8; 64],
+        _value: &[u8],
+        _seq: u64,
+    ) -> impl Future<Output = Result<(), DhtError>> + Send {
+        // Fail closed. Silently returning Ok here would be exactly the
+        // §17.17.3 "silent false success" nullifier this whole change removes.
+        async { Err(DhtError::Disabled) }
+    }
+
+    fn resolve(
+        &self,
+        _public_key: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
+        // Honest not-found: the DHT arm is off, so it contributes nothing to
+        // resolution. The DualLayerResolver's relay arm supplies any answer.
+        async { Ok(None) }
     }
 }
 

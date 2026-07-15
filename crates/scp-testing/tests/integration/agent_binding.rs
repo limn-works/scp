@@ -35,7 +35,7 @@ use scp_platform::traits::{KeyCustody, KeyType};
 async fn create_identity_with_agent_key(
     custody: &InMemoryKeyCustody,
 ) -> (ScpIdentity, scp_did::DidDocument) {
-    let did_dht = DidDht::new();
+    let did_dht = DidDht::with_client(std::sync::Arc::new(scp_dht::InMemoryDhtClient::new()));
     let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
     let (mut identity, mut doc, _pre_rotation_handle) = did_dht
         .create(custody, &pre_rotation_custody)

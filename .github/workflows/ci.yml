@@ -520,6 +520,17 @@ jobs:
           # context-export tests run here for real; the bare/production target
           # must compile and pass without the testing affordances.
           cargo test -p scp-ffi-napi --features server
+          # Run scp-ffi-common with DEFAULT features (no `testing`, no
+          # `allow_in_memory_custody`) so the DHT capability-injection ABSENCE
+          # tripwires — `ffi_dht_client_is_pkarr_only_in_shipped_build` and
+          # `disabled_node_resolution_returns_ok_none_for_unknown_did`, both
+          # `#[cfg(not(feature = "testing"))]` — actually EXECUTE in CI. The
+          # workspace nextest lane enables `scp-ffi-common/testing`, which
+          # compiles those tests OUT, so without this production-config lane the
+          # G1 in-memory-nullifier-absence tripwires would be latent (ADR-062
+          # Slice 1). ci.yml is not an enforcement file; this is an added
+          # positive test lane.
+          cargo test -p scp-ffi-common
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `allow_in_memory_custody`. This is the
@@ -659,7 +670,14 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features allow_in_memory_custody
+          # `testing` forwards `scp-dht/testing`, which compiles the in-memory
+          # DHT seam (`FfiDhtClient::InMemory`) the co-located multi-party tests
+          # rely on to resolve each participant's DID within one process. Without
+          # it the bridge would build the real Mainline Pkarr client for DID
+          # resolution, and same-process governance vote verification would
+          # fail-close to "unknown voter" (ADR-062 §Decision 1 gated the in-memory
+          # DHT nullifier behind `testing`; the functional test harness opts in).
+          maturin develop --release --features allow_in_memory_custody,testing
       - name: Run tests (including real FFI)
         run: |
           source .venv/bin/activate
@@ -684,7 +702,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build NAPI native addon
         run: |
-          cargo build -p scp-ffi-napi --release --features scp-ffi-napi/allow_in_memory_custody
+          # `scp-ffi-napi/testing` compiles the in-memory DHT seam
+          # (`FfiDhtClient::InMemory`) the co-located multi-party TypeScript tests
+          # rely on to resolve each participant's DID within one process. Without
+          # it the addon builds the real Mainline Pkarr client for DID resolution,
+          # and same-process resolution/governance flows would block on the network
+          # (test timeouts) or fail-close to "unknown voter" (ADR-062 §Decision 1
+          # gated the in-memory DHT nullifier behind `testing`).
+          cargo build -p scp-ffi-napi --release --features scp-ffi-napi/allow_in_memory_custody,scp-ffi-napi/testing
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
         run: bun install

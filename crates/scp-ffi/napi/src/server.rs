@@ -513,7 +513,6 @@ impl Drop for NapiNodeHandle {
 fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeIdentity> {
     use std::sync::Arc;
 
-    use scp_dht::InMemoryDhtClient;
     use scp_identity::DidCache;
     use scp_platform::traits::KeyCustody;
 
@@ -548,7 +547,15 @@ fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeI
             })
         });
 
-        let dht_client = Arc::new(InMemoryDhtClient::new());
+        // Publish through the process-shared DHT client (the one the resolver
+        // reads from) so a node serving this identity re-publishes into the same
+        // DHT the rest of the bridge resolves against. Fall back to a fail-closed
+        // production client if the resolver was never initialized — never an
+        // in-memory nullifier on a shipped path (ADR-062 §Decision 1).
+        let dht_client = match crate::runtime::shared_dht_client() {
+            Some(client) => Arc::clone(client),
+            None => Arc::new(crate::identity::build_ffi_dht_client()?),
+        };
         let cache = Arc::new(DidCache::new());
         let did_method = Arc::new(
             scp_ffi_common::server::ConcreteDidMethod::with_client_and_signer(

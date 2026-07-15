@@ -193,15 +193,25 @@ async fn terminate_unknown_slug_is_rejected() {
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
-fn install_seedable_resolver(bi: &Arc<UniffiBridgeInstance>) -> Arc<scp_dht::InMemoryDhtClient> {
-    let dht_client = Arc::new(scp_dht::InMemoryDhtClient::new());
+fn install_seedable_resolver(
+    bi: &Arc<UniffiBridgeInstance>,
+) -> Arc<scp_ffi_common::dht::FfiDhtClient> {
+    // ONE shared client backs BOTH the resolver AND the instance's `dht_client`
+    // slot (which `identity_create`'s mint/publish and `rotation_publish_client`
+    // read), so the seeded/created documents land where the resolver reads them.
+    let dht_client = Arc::new(scp_ffi_common::dht::FfiDhtClient::InMemory(
+        scp_dht::InMemoryDhtClient::new(),
+    ));
+    let cache = Arc::new(scp_identity::DidCache::new());
     let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
         Arc::new(scp_identity::resolver::NoOpRelayQuerier),
         Arc::clone(&dht_client),
-        Arc::new(scp_identity::DidCache::new()),
+        Arc::clone(&cache),
         Vec::new(),
     ));
     bi.set_did_resolver(resolver, tokio::runtime::Handle::current());
+    bi.core.set_dht_client(Arc::clone(&dht_client));
+    bi.core.set_resolver_cache(cache);
     dht_client
 }
 
@@ -216,7 +226,7 @@ fn install_seedable_resolver(bi: &Arc<UniffiBridgeInstance>) -> Arc<scp_dht::InM
 ))]
 async fn seed_owner_document_into_resolver(
     owner_identity: &crate::bridge::Identity,
-    dht_client: &Arc<scp_dht::InMemoryDhtClient>,
+    dht_client: &Arc<scp_ffi_common::dht::FfiDhtClient>,
 ) {
     use scp_dht::DhtClient as _;
 

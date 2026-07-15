@@ -712,7 +712,14 @@ pub type OutletHandler =
 // Global ContextManager instance
 // ---------------------------------------------------------------------------
 
-/// Global shared `InMemoryDhtClient` used by the DID resolver.
+/// Global shared [`FfiDhtClient`](scp_ffi_common::dht::FfiDhtClient) used by the
+/// DID resolver.
+///
+/// The shipped client is the real Mainline `PkarrDhtClient` (built fail-closed
+/// via [`ClientDhtConfig::into_client`](scp_ffi_common::dht::ClientDhtConfig::into_client));
+/// the in-memory arm exists only under the `testing` feature (ADR-062
+/// §Decision 1 / spec §17.17.3). It is never an in-memory nullifier on a
+/// shipped path.
 ///
 /// # Why this remains a process-global after the #1549 Phase 4 singleton purge
 ///
@@ -720,7 +727,7 @@ pub type OutletHandler =
 /// `NapiBridgeInstance` so that an `SCP` instance can be constructed, used,
 /// and dropped without leaking state into a second instance. `SHARED_DHT_CLIENT`
 /// intentionally stays process-global because the cross-identity Alice+Bob
-/// integration flows published and read from a single in-memory DHT:
+/// integration flows published and read from a single DHT:
 ///
 ///   1. `Alice.identity_create(...)` publishes a DID document into the DHT.
 ///   2. `Bob.ucan_validate(token_minted_by_alice)` must resolve Alice's DID
@@ -730,13 +737,9 @@ pub type OutletHandler =
 /// If this were per-bridge, Alice's document would land in her instance's DHT
 /// and Bob's resolver would see an empty DHT, and the test would spuriously
 /// report a missing DID document. That was the behaviour before #1144, and it
-/// broke every parity test that exercises multi-identity UCAN paths.
-///
-/// Production ecosystems do not share this constraint because they use real
-/// `did:dht` (Mainline DHT, bittorrent BEP44) or `did:web` resolvers backed by
-/// the public network, not an in-memory stub. The `InMemoryDhtClient` is a
-/// test/demo affordance; its process-global scope matches the scope of the
-/// network it is emulating, and it stores only signed, public DID documents.
+/// broke every parity test that exercises multi-identity UCAN paths. Under the
+/// `testing` in-memory arm the shared scope emulates the public network the
+/// shipped Pkarr client uses; both store only signed, public DID documents.
 ///
 /// # Ratchet justification
 ///
@@ -745,7 +748,7 @@ pub type OutletHandler =
 /// in the enforcement allowlist. See `scripts/check-no-bridge-globals.sh`.
 ///
 /// See issue #1144 (UCAN validation tests require shared DHT state).
-static SHARED_DHT_CLIENT: OnceLock<Arc<scp_dht::InMemoryDhtClient>> = OnceLock::new();
+static SHARED_DHT_CLIENT: OnceLock<Arc<scp_ffi_common::dht::FfiDhtClient>> = OnceLock::new();
 
 /// Returns the production DID resolver on the given bridge instance, if
 /// initialized.
@@ -760,20 +763,22 @@ pub fn did_resolver(
     bi.core.did_resolver()
 }
 
-/// Returns the shared `InMemoryDhtClient`, if initialized.
+/// Returns the shared [`FfiDhtClient`](scp_ffi_common::dht::FfiDhtClient), if
+/// initialized.
 ///
 /// Used by `identity_create` to publish DID documents so that the resolver
 /// can later find them during UCAN validation (#1144).
 #[must_use]
-pub fn shared_dht_client() -> Option<&'static Arc<scp_dht::InMemoryDhtClient>> {
+pub fn shared_dht_client() -> Option<&'static Arc<scp_ffi_common::dht::FfiDhtClient>> {
     SHARED_DHT_CLIENT.get()
 }
 
-/// Stores the shared `InMemoryDhtClient` for the DID resolver.
+/// Stores the shared [`FfiDhtClient`](scp_ffi_common::dht::FfiDhtClient) for the
+/// DID resolver.
 ///
-/// Called by `ensure_did_resolver_initialized` in `identity.rs`. Subsequent
+/// Called by `ensure_did_resolver_initialized_on` in `identity.rs`. Subsequent
 /// calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn init_shared_dht_client(client: Arc<scp_dht::InMemoryDhtClient>) {
+pub fn init_shared_dht_client(client: Arc<scp_ffi_common::dht::FfiDhtClient>) {
     let _ = SHARED_DHT_CLIENT.set(client);
 }
 

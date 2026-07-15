@@ -23,7 +23,6 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use zeroize::Zeroizing;
 
-use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::server::{
     self, ConcreteDidMethod, NodeIdentity, RunningNode, RunningRelay, ServerError,
 };
@@ -586,7 +585,16 @@ fn build_node_identity(bi: &crate::runtime::PyBridgeInstance, did: &str) -> PyRe
     crate::runtime::with_identity(bi, did, |entry| {
         let custody = Arc::clone(&entry.custody);
         let sign_fn = ConcreteDidMethod::make_sign_fn(custody);
-        let dht_client = Arc::new(InMemoryDhtClient::new());
+        // Publish through the instance's shared DHT client (the one the
+        // resolver reads from) so a node serving this identity re-publishes
+        // into the same DHT the rest of the bridge resolves against. Fall back
+        // to a fail-closed production client if the resolver was never
+        // initialized — never an in-memory nullifier on a shipped path
+        // (ADR-062 §Decision 1).
+        let dht_client = match crate::runtime::resolver_dht_client(bi) {
+            Some(client) => client,
+            None => Arc::new(crate::identity::build_ffi_dht_client()?),
+        };
         let cache = Arc::new(DidCache::new());
         let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
             dht_client, cache, sign_fn,

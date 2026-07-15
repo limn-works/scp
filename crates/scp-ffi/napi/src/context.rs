@@ -5513,7 +5513,9 @@ mod tests {
             OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
         ));
         let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
-        let dht = scp_identity::DidDht::new();
+        let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
         let (identity, document, pre_rotation_handle) = dht
             .create(&*custody, pre_rotation_custody.as_ref())
             .await
