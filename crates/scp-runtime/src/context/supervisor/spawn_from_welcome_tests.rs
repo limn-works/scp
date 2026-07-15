@@ -467,6 +467,29 @@ struct Joined {
     ctx_bytes: [u8; 32],
 }
 
+/// Destructively move a provider-resident context onto a throwaway actor
+/// [`PerContextState`](crate::context::actor::state::PerContextState) via the
+/// retained `take_crypto_state` + the production `seed_encrypted_crypto_from_owned`
+/// seed primitive. Post-ADR-049 PR-7 the steady-state crypto twins
+/// (`mls_encrypt_management` / `seal` / `open`) live on the actor, so the
+/// round-trip tests move each party onto the actor first. One-way: the provider
+/// loses the context, so take each party exactly once.
+fn take_into_actor(
+    crypto: &Arc<MlsCryptoProvider>,
+    ctx: &[u8; 32],
+) -> crate::context::actor::state::PerContextState {
+    let owned = crypto
+        .take_crypto_state(ctx)
+        .expect("take owned crypto material off the provider");
+    let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+        *ctx,
+        0,
+        DID::from(crypto.local_did().to_owned()),
+    );
+    state.seed_encrypted_crypto_from_owned(owned);
+    state
+}
+
 /// Runs the full reserve → creator-add → Welcome → `spawn_actor_from_welcome`
 /// ladder, returning the spawn result plus the pieces needed to assert on it.
 ///
@@ -707,15 +730,19 @@ async fn spawn_from_welcome_group_round_trips_both_directions() {
 
     let routing_id = scp_protocol::context::context_routing_id(&hex::encode(j.ctx_bytes));
 
+    // Move both parties onto the actor seam (the provider mls_encrypt_management
+    // / open twins are deleted post-ADR-049 PR-7). Management traffic is
+    // group-keyed (no sender key needed), so both actors round-trip directly.
+    let mut alice_actor = take_into_actor(&j.alice_crypto, &j.ctx_bytes);
+    let mut bob_actor = take_into_actor(&j.bob_crypto, &j.ctx_bytes);
+
     // Creator -> joiner: Alice encrypts, Bob's installed group decrypts.
     let from_alice = b"management-payload-from-alice";
-    let wrapped_alice = j
-        .alice_crypto
-        .mls_encrypt_management(&j.ctx_bytes, from_alice, &routing_id, 3600)
+    let wrapped_alice = alice_actor
+        .mls_encrypt_management(from_alice, &routing_id, 3600)
         .expect("alice encrypts a management message");
-    let opened_alice = j
-        .bob_crypto
-        .open(&j.ctx_bytes, &j.ctx_id, &wrapped_alice)
+    let opened_alice = bob_actor
+        .open(&scp_clock::SystemClock, &j.ctx_id, &wrapped_alice)
         .expect("bob opens alice's message");
     assert!(
         matches!(
@@ -735,13 +762,11 @@ async fn spawn_from_welcome_group_round_trips_both_directions() {
         "joiner send handle is live"
     );
     let from_bob = b"management-payload-from-bob";
-    let wrapped_bob = j
-        .bob_crypto
-        .mls_encrypt_management(&j.ctx_bytes, from_bob, &routing_id, 3600)
+    let wrapped_bob = bob_actor
+        .mls_encrypt_management(from_bob, &routing_id, 3600)
         .expect("bob encrypts a management message through the joined group");
-    let opened_bob = j
-        .alice_crypto
-        .open(&j.ctx_bytes, &j.ctx_id, &wrapped_bob)
+    let opened_bob = alice_actor
+        .open(&scp_clock::SystemClock, &j.ctx_id, &wrapped_bob)
         .expect("alice opens bob's message");
     assert!(
         matches!(
@@ -1688,14 +1713,18 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
         "a context actor handle is registered for the joiner"
     );
 
-    // The installed group is real: bob encrypts through it, alice decrypts.
+    // The installed group is real: bob encrypts through it, alice decrypts. Both
+    // parties move onto the actor seam (the provider mls_encrypt_management / open
+    // twins are deleted post-ADR-049 PR-7); management traffic is group-keyed.
     let routing_id = scp_protocol::context::context_routing_id(&hex::encode(ctx_bytes));
+    let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+    let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
     let from_bob = b"supervisor-seam-payload-from-bob";
-    let wrapped_bob = bob_crypto
-        .mls_encrypt_management(&ctx_bytes, from_bob, &routing_id, 3600)
+    let wrapped_bob = bob_actor
+        .mls_encrypt_management(from_bob, &routing_id, 3600)
         .expect("bob encrypts a management message through the installed group");
-    let opened = alice_crypto
-        .open(&ctx_bytes, &ctx_id, &wrapped_bob)
+    let opened = alice_actor
+        .open(&scp_clock::SystemClock, &ctx_id, &wrapped_bob)
         .expect("alice opens bob's message");
     assert!(
         matches!(
@@ -2347,14 +2376,18 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         "bob's joined MLS group is installed"
     );
 
-    // Bidirectional MLS traffic through the invitation-installed group.
+    // Bidirectional MLS traffic through the invitation-installed group. Both
+    // parties move onto the actor seam (the provider mls_encrypt_management / open
+    // twins are deleted post-ADR-049 PR-7); management traffic is group-keyed.
     let routing_id = scp_protocol::context::context_routing_id(&hex::encode(ctx_bytes));
+    let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+    let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
     let from_alice = b"invite-member-round-trip-from-alice";
-    let wrapped_alice = alice_crypto
-        .mls_encrypt_management(&ctx_bytes, from_alice, &routing_id, 3600)
+    let wrapped_alice = alice_actor
+        .mls_encrypt_management(from_alice, &routing_id, 3600)
         .expect("alice encrypts a management message");
-    let opened_alice = bob_crypto
-        .open(&ctx_bytes, &ctx_id, &wrapped_alice)
+    let opened_alice = bob_actor
+        .open(&scp_clock::SystemClock, &ctx_id, &wrapped_alice)
         .expect("bob opens alice's message");
     assert!(
         matches!(
@@ -2365,11 +2398,11 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
     );
 
     let from_bob = b"invite-member-round-trip-from-bob";
-    let wrapped_bob = bob_crypto
-        .mls_encrypt_management(&ctx_bytes, from_bob, &routing_id, 3600)
+    let wrapped_bob = bob_actor
+        .mls_encrypt_management(from_bob, &routing_id, 3600)
         .expect("bob encrypts a management message");
-    let opened_bob = alice_crypto
-        .open(&ctx_bytes, &ctx_id, &wrapped_bob)
+    let opened_bob = alice_actor
+        .open(&scp_clock::SystemClock, &ctx_id, &wrapped_bob)
         .expect("alice opens bob's message");
     assert!(
         matches!(
@@ -3299,17 +3332,20 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
         crate::envelope::inner::sign::create_inner_envelope_raw(&params, &bob_signing_key())
             .expect("bob builds a signed application inner envelope");
     let routing_id = scp_protocol::context::context_routing_id(&j.ctx_id);
-    let sealed = j
-        .bob_crypto
-        .seal(&j.ctx_bytes, &inner, &routing_id, 3600)
+    // Bob seals through his actor; Alice opens through hers (the provider seal /
+    // open twins are deleted post-ADR-049 PR-7). Alice's actor is taken AFTER the
+    // sender-key install above, so it carries Bob's pulled sender key.
+    let mut bob_actor = take_into_actor(&j.bob_crypto, &j.ctx_bytes);
+    let mut alice_actor = take_into_actor(&j.alice_crypto, &j.ctx_bytes);
+    let sealed = bob_actor
+        .seal(BOB_DID, &inner, &routing_id, 3600)
         .expect("bob seals the application message through the joined group");
 
     // Alice opens Bob's APPLICATION ciphertext — the direction + layer no
     // management-path test reaches. Fails closed on an epoch mismatch (MLS
     // decrypt) or a missing sender key (sender-key lookup).
-    let opened = j
-        .alice_crypto
-        .open(&j.ctx_bytes, &j.ctx_id, &sealed)
+    let opened = alice_actor
+        .open(&scp_clock::SystemClock, &j.ctx_id, &sealed)
         .expect("alice opens bob's application ciphertext (B→A application round-trip)");
     // ADR-049 §10 bans the panic family across the whole `context/` tree; the
     // panic-ban scanner reads this `#[cfg(test)]`-gated file standalone (the gate

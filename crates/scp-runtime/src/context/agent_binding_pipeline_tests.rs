@@ -76,7 +76,8 @@ use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::access_keys::{AccessKey, generate_access_key};
 use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
 
-use crate::context::messaging_helpers::{build_encrypted_envelope, verify_and_unwrap};
+use crate::context::actor::state::{ContextModeState, PerContextState};
+use crate::context::messaging_helpers::{build_encrypted_envelope_actor, verify_and_unwrap};
 use crate::context::supervisor::MessageSigner;
 use crate::crypto::mls::provider::MlsCryptoProvider;
 
@@ -203,9 +204,20 @@ fn build_send_blob(
         SigningKeyId::Agent => MessageSigner::Agent(signing_key),
     };
 
-    build_encrypted_envelope(
+    // Move Alice onto the actor seam (the provider `build_encrypted_envelope`
+    // seal twin is deleted post-ADR-049 PR-7) and drive the PRODUCTION actor
+    // app-data seal `build_encrypted_envelope_actor` — the exact seam
+    // `encrypt_and_send` bottoms out in.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_str);
+    let mut alice_state = take_into_actor_local(alice_provider, &ctx_bytes);
+    let crypto_state = match &mut alice_state.mode {
+        ContextModeState::Encrypted(c) => c,
+        ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+    };
+    build_encrypted_envelope_actor(
         &clock,
-        alice_provider,
+        crypto_state,
+        ALICE_DID,
         ctx_str,
         &sender,
         payload,
@@ -215,7 +227,23 @@ fn build_send_blob(
         None,
         MessageType::Content,
     )
-    .expect("build_encrypted_envelope")
+    .expect("build_encrypted_envelope_actor")
+}
+
+/// Destructively move a provider-resident context onto a throwaway actor
+/// [`PerContextState`] via the retained `take_crypto_state` + the production
+/// `seed_encrypted_crypto_from_owned` seed primitive. Post-ADR-049 PR-7 the
+/// steady-state crypto twins (`seal` / `open`) live on the actor, so these
+/// send/receive pipeline tests move each party onto the actor first. One-way:
+/// the provider loses the context, so take each party exactly once.
+fn take_into_actor_local(crypto: &MlsCryptoProvider, ctx: &[u8; 32]) -> PerContextState {
+    let owned = crypto
+        .take_crypto_state(ctx)
+        .expect("take owned crypto material off the provider");
+    let mut state =
+        PerContextState::new_for_test_encrypted(*ctx, 0, DID::from(crypto.local_did().to_owned()));
+    state.seed_encrypted_crypto_from_owned(owned);
+    state
 }
 
 /// Receive half: MLS-open the captured blob on Bob's provider, then drive the
@@ -228,7 +256,11 @@ fn receive_via_verify_and_unwrap(
     resolver: &KeyResolver,
     bob_access_key: &AccessKey,
 ) -> Result<Vec<u8>, ContextError> {
-    let opened = match bob_provider.open(ctx_bytes, ctx_str, blob)? {
+    // Move Bob onto the actor seam (the provider `open` twin is deleted
+    // post-ADR-049 PR-7); the taken material carries Alice's sender key so the
+    // application open resolves it.
+    let mut bob_state = take_into_actor_local(bob_provider, ctx_bytes);
+    let opened = match bob_state.open(&SystemClock, ctx_str, blob)? {
         scp_protocol::context::builder::OpenResult::Application(env) => *env,
         other => {
             return Err(ContextError::CryptoFailed(format!(
@@ -435,8 +467,10 @@ mod live_supervisor_send {
     use scp_protocol::context::{ContextError, context_id_bytes};
     use zeroize::Zeroizing;
 
-    use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver};
+    use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver, take_into_actor_local};
+    use scp_clock::SystemClock;
     use crate::context::ContextHandle;
+    use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextTransportProvider;
     use crate::context::supervisor::{MessageSigner, Supervisor};
     use crate::crypto::mls::provider::MlsCryptoProvider;
@@ -581,7 +615,7 @@ mod live_supervisor_send {
         ctx_id: &str,
         sent: &SentBuffer,
     ) -> (
-        Arc<MlsCryptoProvider>,
+        PerContextState,
         [u8; 32],
         scp_protocol::crypto::access_keys::AccessKey,
     ) {
@@ -687,13 +721,21 @@ mod live_supervisor_send {
         bob.generate_sender_key(&ctx_bytes)
             .expect("bob generates his sender key");
 
+        // Move Bob onto the actor seam for the receive path (the provider `open`
+        // twin is deleted post-ADR-049 PR-7); capture his node-resident wrapping
+        // secret first so the actor can HPKE-open Alice's sender-key
+        // distributions.
+        let (_bob_wpub, bob_wsec) = bob.wrapping_keypair_snapshot();
+        let bob_wsec: [u8; 32] = *bob_wsec;
+        let mut bob_actor = take_into_actor_local(&bob, &ctx_bytes);
+
         // Process the captured sender-key distribution: each blob is a sealed
         // management OuterEnvelope — open it, then feed the inner MLS payload to
         // `process_incoming_sender_key` (exactly the `Management` arm of
         // `FullStackNode::decrypt_message`).
         for (_routing_id, blob) in bootstrap_blobs {
-            match bob
-                .open(&ctx_bytes, ctx_id, &blob)
+            match bob_actor
+                .open(&SystemClock, ctx_id, &blob)
                 .expect("bob opens bootstrap blob")
             {
                 OpenResult::Management {
@@ -702,10 +744,10 @@ mod live_supervisor_send {
                 } => {
                     // ADR-049 PR-6: process returns (key, epoch) without
                     // installing; install unchecked (trusted bootstrap path).
-                    let (key, _epoch) = bob
-                        .process_incoming_sender_key(&ctx_bytes, &sender_did, &payload)
+                    let (key, _epoch) = bob_actor
+                        .process_incoming_sender_key(&bob_wsec, &sender_did, &payload)
                         .expect("bob processes Alice's sender key");
-                    bob.set_sender_key_unchecked(&ctx_bytes, &sender_did, key);
+                    bob_actor.set_sender_key_unchecked(&sender_did, key);
                 }
                 OpenResult::Control => {}
                 OpenResult::Application(_) => {
@@ -724,7 +766,7 @@ mod live_supervisor_send {
 
         let bob_access_key = bob_access_key_from_actor(sup, ctx_id).await;
 
-        (bob, bob_pseudonym, bob_access_key)
+        (bob_actor, bob_pseudonym, bob_access_key)
     }
 
     /// Drives the public `Supervisor::send_message` for `ctx_id` under
@@ -763,7 +805,7 @@ mod live_supervisor_send {
             .await
             .expect("create encrypted context");
 
-        let (bob, bob_pseudonym, bob_access_key) =
+        let (mut bob, bob_pseudonym, bob_access_key) =
             add_and_bootstrap_bob(&sup, &handle, ctx_id, &sent).await;
 
         // THE PUBLIC SEND. Persona chosen by `signing_key_id`; the signing key
@@ -796,10 +838,10 @@ mod live_supervisor_send {
             "ciphertext must differ from plaintext"
         );
 
-        // Open the captured wire blob on Bob's provider and read the persona
+        // Open the captured wire blob on Bob's actor and read the persona
         // straight off the recovered inner envelope.
         match bob
-            .open(&ctx_bytes, ctx_id, ciphertext)
+            .open(&SystemClock, ctx_id, ciphertext)
             .expect("bob opens the app blob")
         {
             OpenResult::Application(env) => {

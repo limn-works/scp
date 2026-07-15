@@ -79,10 +79,6 @@ use crate::context::state::{
     PseudonymAnnouncement, emit_event_into,
 };
 use crate::context::supervisor::MessageSigner;
-// Only the `#[cfg(test)]`-gated provider seal twin `build_encrypted_envelope`
-// still names this type (ADR-049 PR-7 SCP-CRYPTOMOVE-001); gate the import with it.
-#[cfg(test)]
-use crate::crypto::mls::provider::MlsCryptoProvider;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
 /// external subscribers (webhook dispatcher, SDK event streams).
@@ -97,87 +93,16 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
 
 // ---------------------------------------------------------------------------
-// 1. build_encrypted_envelope
+// 1. build_inner_wire (shared inner-envelope construction)
 // ---------------------------------------------------------------------------
-
-/// Builds the encrypted envelope bytes for the send path.
-///
-/// Pure helper — no per-context state. Identical to the legacy
-/// [`crate::context::messaging_helpers_legacy::build_encrypted_envelope_legacy`]
-/// body; carried here so the actor-shape send path does not have to
-/// import from the legacy module.
-///
-/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the production send seams
-/// (`send_message` / `send_checkpoint` / `send_heartbeat`) all seal through the
-/// actor's owned crypto state ([`build_encrypted_envelope_actor`]); this provider
-/// twin now serves only the send-path unit / pipeline tests that drive the seal
-/// helper directly. It is deleted when those test suites relocate onto the actor
-/// seam (C8 of the atomic crypto move).
-///
-/// # Routing
-///
-/// The outer envelope's cleartext `routing_id` is zeroed (`[0u8; 32]`) for
-/// application data: a single sealed blob fans out to N per-member pseudonym
-/// transport addresses, so no single per-recipient value belongs in the
-/// envelope, and embedding the relay-derivable `context_routing_id` would leak
-/// a correlator to the relay (§9.10.4). The receiver ignores this field for
-/// app-data, routing on the transport key instead.
 //
-// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): no production caller remains (every send
-// seam seals through the actor via `build_encrypted_envelope_actor`); only the
-// send-path unit / pipeline test suites still drive this provider twin directly,
-// so it is `#[cfg(test)]`-gated until those suites relocate onto the actor seam
-// (C8). The source-text pipeline_wiring assertion scans the raw file, so the
-// gate does not affect it.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub fn build_encrypted_envelope(
-    clock: &Arc<dyn Clock>,
-    crypto: &Arc<MlsCryptoProvider>,
-    context_id: &str,
-    sender_did: &DID,
-    payload: &[u8],
-    signer: MessageSigner<'_>,
-    recipients_data: &std::collections::HashMap<String, AccessKey>,
-    sequence: u64,
-    source_provenance: Option<&SourceContextInfo>,
-    message_type: MessageType,
-) -> Result<Vec<u8>, ContextError> {
-    // ADR-056: key the send-path crypto by the canonical digest (matches
-    // `state.context_id` and the MLS group keyed at creation), not a re-hash
-    // of the hex id.
-    let (inner, context_id_bytes) = build_inner_wire(
-        clock,
-        context_id,
-        sender_did,
-        payload,
-        signer,
-        recipients_data,
-        sequence,
-        source_provenance,
-        message_type,
-    )?;
-
-    // §9.10.4 privacy: the cleartext outer-envelope `routing_id` is zeroed for
-    // application data. One sealed blob is fanned out to N per-member pseudonym
-    // transport addresses (seal-once-send-to-all), so there is no single
-    // per-recipient value to embed here. Embedding the relay-derivable
-    // `context_routing_id(context_id)` would let a curious relay read it off
-    // every pseudonym-addressed app-data blob and re-correlate all senders,
-    // defeating the pseudonym scheme. The all-zero value is a RESERVED/forbidden
-    // pseudonym (§9.10.4), so it cannot collide with a real routing ID, and the
-    // receiver never reads this field for app-data (it routes on the transport
-    // key and MLS-decrypts `encrypted_blob`), so receive is unaffected.
-    // `create_outer_envelope` enforces `routing_id.len() == 32`, which a
-    // 32-byte zero sentinel satisfies.
-    let routing_id = [0u8; 32];
-    crypto.seal(
-        &context_id_bytes,
-        &inner,
-        &routing_id,
-        DEFAULT_BLOB_TTL_SECS,
-    )
-}
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001, C8): the `#[cfg(test)]` provider seal twin
+// `build_encrypted_envelope` is DELETED — its last callers (the send-path unit /
+// pipeline / agent-binding fixtures) now drive the production actor seal
+// `build_encrypted_envelope_actor` directly against an actor-owned
+// `ContextCryptoState`. The shared inner-envelope construction below
+// (`build_inner_wire`) is retained; the actor path bottoms out in it, so the
+// sealed wire stays byte-identical across the flip.
 
 /// Builds and signs the [`InnerEnvelope`] for an application-data send (access-key
 /// wrap → inner-envelope stamp+sign), returning it alongside the canonical
