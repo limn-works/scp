@@ -124,7 +124,220 @@ async fn cross_process_welcome_delivery() {
 }
 
 // ---------------------------------------------------------------------------
-// 1b. join_time_sender_key_distribution_uses_management_channel (H3)
+// 1a. welcome_joiner_application_data_round_trips_to_creator — the joiner→creator
+//     (2J landing) direction, over the REAL actor mailbox + transport.
+// ---------------------------------------------------------------------------
+
+/// A Welcome-joiner (Bob) sends a real application message the creator (Alice)
+/// decrypts — the joiner→creator direction the `cross_process_welcome_delivery`
+/// creator→joiner test does NOT cover. This is the "2J landing signal": pre-2J a
+/// Welcome-joiner had no live send handle at all; post-2J its spawned actor
+/// produces application ciphertext an incumbent opens end-to-end.
+///
+/// # Relocation provenance (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
+///
+/// This is the fullstack owner of the joiner→creator APPLICATION round-trip
+/// property that the runtime unit test
+/// `spawn_from_welcome_application_data_round_trips_joiner_to_creator` used to
+/// prove by driving `MlsCryptoProvider::seal` / `open` DIRECTLY on the provider.
+/// PR-7 moved the per-context seal/open crypto off the provider and onto the live
+/// actor, so the unit-level bare-provider fixture can no longer drive a real
+/// seal/open round-trip (its `take_into_actor` double-take panics once the crypto
+/// already lives on the actor). The full application round-trip therefore lives
+/// HERE, where the real actor mailbox + transport exist. The unit test is
+/// realigned to the unit-reachable invariants (spawned, registered, group
+/// installed at the joined epoch, and — its distinct §9.16.6 Mitigation-1 anchor —
+/// the actor ANSWERS an incumbent's sender-key PULL).
+///
+/// # The sender-key PULL this depends on
+///
+/// Application messages ride the per-sender key layer on top of the MLS group
+/// key. For Alice to open Bob's traffic she must hold Bob's sender key. A
+/// Welcome-joiner cannot PUSH its key (a push seals to each incumbent's stable
+/// `0xFF01` wrapping key, which openmls 0.8.1 does not expose from a joined group,
+/// ADR-057); incumbents PULL it (§9.16.2). That PULL runs inside
+/// `join_from_welcome` via the harness `incumbents_pull_joiner_sender_key` — the
+/// sanctioned stand-in for deferred #2049 request-initiation — so by the time Bob
+/// sends below, Alice already holds Bob's key. If the §9.16.6 Mitigation-1
+/// membership gate were reverted to the empty-`member_wrapping_keys` check, the
+/// PULL inside `join_from_welcome` would fail and this test would never reach the
+/// send.
+#[tokio::test]
+async fn welcome_joiner_application_data_round_trips_to_creator() {
+    let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
+    let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+    let context_id_str = "welcome-joiner-to-creator-ctx";
+    let context_id = scp_core::context::context_id_bytes(context_id_str);
+
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(alice_did);
+    let bob = network.create_node(bob_did);
+
+    // Stand up the shared group over the real reserve → invite → spawn join path.
+    // `join_from_welcome` PULLS Bob's sender key onto Alice (§9.16.2) as part of
+    // the join, so Alice can open Bob's application traffic below.
+    let alice_handle = alice
+        .create_context(context_id_str, invite_params())
+        .await
+        .unwrap();
+    alice.add_member(&alice_handle, bob_did).await.unwrap();
+    let bob_handle = bob
+        .join_from_welcome(context_id_str, &context_id)
+        .await
+        .unwrap();
+
+    // Bob seeds Alice's per-member pseudonym so his send fans out to a recipient
+    // routing id (§9.10.4); without it the send fails closed with
+    // `PseudonymRegistryEmpty`.
+    bob.manager
+        .seed_peer_pseudonym(context_id_str, DID::from(alice_did), [0x37u8; 32])
+        .await
+        .unwrap();
+
+    // Clear any transport residue captured on Bob during the join handshake, so
+    // the assertion below sees exactly the one application ciphertext Bob sends.
+    let _ = bob.take_sent_ciphertexts();
+
+    // Bob (the Welcome-joiner) sends an application message through the REAL
+    // Supervisor encrypt pipeline (MLS + his own sender key + §9.17 access-key
+    // wrap). His transport captures the single application ciphertext.
+    let plaintext = b"application data from the welcome-joiner (Bob) to the creator";
+    bob.send_message(&bob_handle, plaintext).await.unwrap();
+    let sent = bob.take_sent_ciphertexts();
+    assert_eq!(
+        sent.len(),
+        1,
+        "the joiner's send must produce exactly one application ciphertext"
+    );
+    let (_routing_id, ciphertext) = &sent[0];
+
+    // Alice opens Bob's message through the REAL actor receive path
+    // (`Supervisor::deliver_commit_blob` → the context actor's
+    // `decrypt_and_dispatch` → §9.17 unwrap), recovering Bob's exact plaintext —
+    // the joiner→creator application round-trip closed end-to-end.
+    let decrypted = alice
+        .decrypt_message(context_id_str, &context_id, ciphertext, bob_did)
+        .await
+        .unwrap();
+    assert_eq!(
+        decrypted.as_slice(),
+        plaintext.as_slice(),
+        "the creator must recover the joiner's exact application plaintext"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 1b. welcome_joiner_round_trips_application_traffic_in_both_directions — the
+//     bidirectional round-trip, over the REAL actor mailbox + transport.
+// ---------------------------------------------------------------------------
+
+/// A Welcome-joiner (Bob) and the creator (Alice) exchange real application
+/// traffic in BOTH directions within a single live context: Alice → Bob and
+/// Bob → Alice, each proven by exact-plaintext equality through the real actor
+/// receive path. This is the fullstack owner of the BIDIRECTIONAL round-trip
+/// property the runtime unit tests
+/// `spawn_from_welcome_group_round_trips_both_directions` and
+/// `invite_member_round_trip_stands_up_a_bidirectional_joiner` used to prove by
+/// driving `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the
+/// provider (both directions, group-keyed management).
+///
+/// # Why APPLICATION traffic (not the units' group-keyed management path)
+///
+/// ADR-049 PR-7 moved the seal/open crypto onto the live actor, and the actor
+/// receive path (`deliver_incoming`) classifies a group-keyed MANAGEMENT payload
+/// strictly as a `SenderKeyDistributionMessage`; an arbitrary management payload
+/// is rejected, and `deliver_commit_blob` returns `None` for every non-Application
+/// outcome. So a literal "arbitrary group-keyed management payload" round-trip is
+/// not observable through the public harness. The APPLICATION path is instead the
+/// STRICTLY STRONGER proof: an application message is MLS-group-encrypted and THEN
+/// sender-key-AEAD'd, so opening it exercises the same group-keyed MLS layer the
+/// units' management round-trip pinned, PLUS the per-sender key layer on top. A
+/// passing bidirectional application round-trip therefore subsumes the units'
+/// bidirectional management round-trip property.
+///
+/// The joiner→creator (Bob → Alice) leg is the 2J landing signal — pre-2J the
+/// joiner had no live send handle. It depends on the §9.16.2 sender-key PULL that
+/// `join_from_welcome` runs (via `incumbents_pull_joiner_sender_key`) to deliver
+/// Bob's key to Alice.
+#[tokio::test]
+async fn welcome_joiner_round_trips_application_traffic_in_both_directions() {
+    let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
+    let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+    let context_id_str = "welcome-joiner-bidirectional-ctx";
+    let context_id = scp_core::context::context_id_bytes(context_id_str);
+
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(alice_did);
+    let bob = network.create_node(bob_did);
+
+    let alice_handle = alice
+        .create_context(context_id_str, invite_params())
+        .await
+        .unwrap();
+    alice.add_member(&alice_handle, bob_did).await.unwrap();
+    let bob_handle = bob
+        .join_from_welcome(context_id_str, &context_id)
+        .await
+        .unwrap();
+
+    // Seed each party's per-member pseudonym for the other so both sends fan out
+    // to a recipient routing id (§9.10.4).
+    alice
+        .manager
+        .seed_peer_pseudonym(context_id_str, DID::from(bob_did), [0x42u8; 32])
+        .await
+        .unwrap();
+    bob.manager
+        .seed_peer_pseudonym(context_id_str, DID::from(alice_did), [0x37u8; 32])
+        .await
+        .unwrap();
+
+    // Direction 1 — creator → joiner: Alice sends, Bob's installed group + Alice's
+    // pulled sender key decrypt it.
+    let a_to_b = b"application from the creator to the welcome-joiner";
+    let _ = alice.take_sent_ciphertexts();
+    alice.send_message(&alice_handle, a_to_b).await.unwrap();
+    let alice_sent = alice.take_sent_ciphertexts();
+    assert_eq!(
+        alice_sent.len(),
+        1,
+        "Alice's send must produce exactly one application ciphertext"
+    );
+    let a_to_b_decrypted = bob
+        .decrypt_message(context_id_str, &context_id, &alice_sent[0].1, alice_did)
+        .await
+        .unwrap();
+    assert_eq!(
+        a_to_b_decrypted.as_slice(),
+        a_to_b.as_slice(),
+        "the joiner must recover the creator's exact plaintext (creator → joiner)"
+    );
+
+    // Direction 2 — joiner → creator (the 2J landing signal): Bob sends, Alice
+    // decrypts with Bob's pulled sender key.
+    let b_to_a = b"application from the welcome-joiner back to the creator";
+    let _ = bob.take_sent_ciphertexts();
+    bob.send_message(&bob_handle, b_to_a).await.unwrap();
+    let bob_sent = bob.take_sent_ciphertexts();
+    assert_eq!(
+        bob_sent.len(),
+        1,
+        "the joiner's send must produce exactly one application ciphertext"
+    );
+    let b_to_a_decrypted = alice
+        .decrypt_message(context_id_str, &context_id, &bob_sent[0].1, bob_did)
+        .await
+        .unwrap();
+    assert_eq!(
+        b_to_a_decrypted.as_slice(),
+        b_to_a.as_slice(),
+        "the creator must recover the joiner's exact plaintext (joiner → creator) — \
+         bidirectional application round-trip closed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 1c. join_time_sender_key_distribution_uses_management_channel (H3)
 // ---------------------------------------------------------------------------
 
 /// H3: join-time sender-key distribution MUST travel over the MLS management
