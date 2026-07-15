@@ -1,10 +1,11 @@
 //! Test-only, security-nullifier platform adapter implementations.
 //!
 //! This module provides in-memory versions of the platform traits whose
-//! in-memory arm is a **security nullifier** (spec §17.17.2,
-//! `SCP-CAPSEL-8010`) — an arm that voids a security or verifiability property
-//! the capability is responsible for, and which therefore MUST be provably
-//! absent from shipped production artifacts (`SCP-CAPSEL-8012`):
+//! in-memory arm is a **security nullifier** (spec §17.17.2
+//! durability-only-vs-nullifier classification) — an arm that voids a security
+//! or verifiability property the capability is responsible for, and which
+//! therefore MUST be provably absent from shipped production artifacts (spec
+//! §17.17 nullifier arms provably-absent):
 //!
 //! - [`InMemoryKeyCustody`] — stores private key material in unprotected heap
 //!   memory (nullifies key confidentiality vs. hardware custody).

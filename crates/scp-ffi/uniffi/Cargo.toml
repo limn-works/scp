@@ -67,10 +67,13 @@ rmp-serde = { workspace = true }
 # `software_platform` provides crypto primitives (Ed25519, X25519);
 # `encrypting` provides `EncryptingAdapter` for event log persistence (#484).
 # The `testing` feature is NOT enabled unconditionally because it exposes
-# `InMemoryKeyCustody` in production mobile builds. Instead, the bridge uses
-# `scp-ffi-common::bridge_runtime::BridgeInMemoryStorage` for the event log
-# backing store (#1447). The `allow_in_memory_custody` feature above adds
-# `scp-platform/testing` for dev/test/desktop builds only.
+# the `InMemoryKeyCustody` nullifier in production mobile builds. Instead, the
+# event-log backing store uses the durability-only
+# `scp_platform::in_memory::InMemoryStorage` adapter (ADR-062 §0), pulled via
+# `scp-ffi-common`'s `scp-platform/in-memory-storage` edge and wrapped by
+# `EncryptingAdapter` in `build_event_log_provider` (#1447 / #484). The
+# `allow_in_memory_custody` feature above adds `scp-platform/testing` for
+# dev/test/desktop builds only.
 scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "filesystem", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }

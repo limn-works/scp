@@ -1,8 +1,8 @@
 //! In-memory, durability-only platform adapter implementations.
 //!
 //! This module houses the two platform adapters whose in-memory arm is a
-//! **durability-only affordance** (spec §17.17.2, `SCP-CAPSEL-8010`), not a
-//! security nullifier:
+//! **durability-only affordance** (spec §17.17.2 durability-only-vs-nullifier
+//! classification), not a security nullifier:
 //!
 //! - [`InMemoryStorage`] — an in-memory [`Storage`](crate::traits::Storage)
 //!   backend. It may lose state on process restart but nullifies **no**
@@ -12,11 +12,11 @@
 //! - [`InMemoryPush`] — an in-memory [`Push`](crate::traits::Push) backend
 //!   that mints synthetic tokens and passes payloads through as wake signals.
 //!
-//! Because they destroy no guarantee, these arms are governed by
-//! `SCP-CAPSEL-8011`: they MAY be compiled into any build and selected
+//! Because they destroy no guarantee, spec §17.17 governs them as
+//! durability-only arms: they MAY be compiled into any build and selected
 //! **explicitly** (e.g. via `StorageConfig`), but MUST NOT be a default
-//! (`SCP-CAPSEL-8000`), a fallback from a failed production selection
-//! (`SCP-CAPSEL-8001`), or the sole reachable arm for their capability in a
+//! (selection is mandatory / no silent default), a fallback from a failed
+//! production selection, or the sole reachable arm for their capability in a
 //! shipped SDK. Each type is gated behind its own durability-only cargo
 //! feature (`in-memory-storage` / `in-memory-push`) so a crate may compile in
 //! the durable dev affordance **without** pulling in the test-only nullifier

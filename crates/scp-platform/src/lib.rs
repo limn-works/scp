@@ -50,11 +50,12 @@ pub mod filesystem;
 // Durability-only in-memory adapters (`InMemoryStorage`, `InMemoryPush`) —
 // each gated behind its own durability-only feature (`in-memory-storage` /
 // `in-memory-push`), NOT `testing`. These arms lose state but nullify no
-// security property (spec §17.17.2, `SCP-CAPSEL-8010`), so they are shippable
-// and selected explicitly (e.g. via `StorageConfig`), never a default or
-// fallback (`SCP-CAPSEL-8011`). Kept separate from the `testing`-gated
-// nullifier doubles so a build can compile the durable dev affordance without
-// pulling in `InMemoryKeyCustody`. See ADR-062 §0.
+// security property (spec §17.17.2 durability-only-vs-nullifier
+// classification), so they are shippable and selected explicitly (e.g. via
+// `StorageConfig`), never a default or fallback (spec §17.17 selection
+// mandatory / never-default / never-fallback). Kept separate from the
+// `testing`-gated nullifier doubles so a build can compile the durable dev
+// affordance without pulling in `InMemoryKeyCustody`. See ADR-062 §0.
 #[cfg(any(feature = "in-memory-storage", feature = "in-memory-push"))]
 pub mod in_memory;
 // Test-only nullifier doubles (`InMemoryKeyCustody`,
