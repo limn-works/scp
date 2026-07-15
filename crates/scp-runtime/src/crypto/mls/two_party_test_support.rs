@@ -53,7 +53,7 @@ use crate::context::invitation_helpers::{SnapshotRuntimeFacts, build_metadata_sn
 use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::supervisor::Supervisor;
 use crate::context::supervisor::WelcomeJoinRequest;
-use crate::context::supervisor::key_package_actor::ReservationId;
+use crate::context::supervisor::key_package_actor::{KeyPackageCommand, ReservationId};
 
 /// Alice's (creator) fixed bundle-signing key. The bootstrap resolver maps
 /// `alice_did` to its verifying key so the joiner can verify the creator-signed
@@ -71,10 +71,6 @@ pub fn alice_signing_key() -> SigningKey {
 fn bob_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB0; 32])
 }
-
-/// A REAL §9.10.4 local pseudonym (a distinctive non-`[0u8; 32]` constant). The
-/// spawn-from-Welcome entrypoint rejects `None` for the encrypted join surface.
-const PSEUDONYM: [u8; 32] = [0x5a; 32];
 
 /// Resolves `alice_did` / `bob_did` to their fixed verifying keys (all else
 /// `None`). The joiner verifies the creator (`alice`) signature; the seal
@@ -163,31 +159,6 @@ fn signed_bundle(
         .expect("signing hash");
     bundle.signature = signer.sign(&hash).to_bytes().to_vec();
     bundle
-}
-
-/// HPKE-seals a validly-signed bundle into a reshaped [`WelcomeJoinRequest`]
-/// addressed to `recipient_x25519`, with a real pseudonym.
-fn seal_join_request(
-    signer: &SigningKey,
-    creator_did: &DID,
-    context_id: &str,
-    params: &ContextParams,
-    welcome_bytes: Vec<u8>,
-    recipient_x25519: &[u8; 32],
-    reservation_id: ReservationId,
-) -> WelcomeJoinRequest {
-    let bundle = signed_bundle(signer, creator_did, context_id, params, welcome_bytes);
-    let wire = bundle.to_wire_bytes().expect("bundle serializes");
-    let (ct, enc) = hpke_seal_invitation(&wire, recipient_x25519, context_id, creator_did.as_ref())
-        .expect("HPKE seal");
-    WelcomeJoinRequest {
-        context_id: context_id.to_owned(),
-        creator_did: creator_did.clone(),
-        sealed_bundle_enc: enc,
-        sealed_bundle_ct: ct,
-        reservation_id,
-        local_pseudonym: Some(PSEUDONYM),
-    }
 }
 
 /// Parameterized seal for callers that already hold a LIVE creator `Supervisor`
@@ -304,7 +275,6 @@ pub fn stand_up_two_party(
         .build()
         .unwrap()
         .block_on(async move {
-            let alice = DID::from(alice_did);
             let bob = DID::from(bob_did);
 
             // Bob's joiner supervisor + a clone of his provider (holds the group
@@ -352,31 +322,37 @@ pub fn stand_up_two_party(
                 .expect("alice adds bob's reserved key package");
 
             // Bob's #active custody holds the SAME seed the resolver returns for
-            // `bob_did`, so the bundle sealed to that resolved #active opens.
+            // `bob_did` — used below to sign Bob's §9.16.2 sender-key pull request.
             let bob_custody = InMemoryKeyCustody::new();
             let bob_handle = bob_custody
                 .import_ed25519_signing_key(&Zeroizing::new(bob_signing_key().to_bytes()))
                 .await
                 .expect("import bob's #active seed into custody");
 
-            // Hand-seal the creator-signed §5.12.3 bundle to Bob's #active and
-            // install the joined group into Bob's provider via the real spawn path.
-            let bob_recipient =
-                ed25519_pubkey_to_x25519(bob_signing_key().verifying_key().as_bytes())
-                    .expect("map bob's #active ed25519 key to x25519");
-            let req = seal_join_request(
-                &alice_signing_key(),
-                &alice,
-                ctx_str,
-                &params,
-                add_output.welcome_bytes,
-                &bob_recipient,
-                reservation_id,
-            );
-            bob_sup
-                .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+            // Bob confirms the join at the PROVIDER level (the real fused
+            // `ConfirmConsume` join → the joined `ScpMlsGroup`) and installs it
+            // into his provider via `install_joined_group`, KEEPING the crypto
+            // provider-resident. The full `spawn_actor_from_welcome` entrypoint
+            // moves the crypto ONE-WAY into a spawned actor (ADR-049 PR-7 C2),
+            // which would leave `bob_crypto` empty; this fixture must return
+            // providers that still OWN their per-context crypto so consumers'
+            // `take_crypto_state` seam can move each into an actor exactly once.
+            let bob_deps = bob_sup
+                .build_actor_deps(&bob)
                 .await
-                .expect("bob installs the joined group from alice's real invitation");
+                .expect("build bob's actor deps");
+            let joined_group = bob_deps
+                .key_package_store
+                .send(|reply| KeyPackageCommand::ConfirmConsume {
+                    reservation_id,
+                    welcome_bytes: add_output.welcome_bytes,
+                    reply,
+                })
+                .await
+                .expect("bob confirms the join and receives the joined MLS group");
+            bob_crypto
+                .install_joined_group(&ctx_bytes, joined_group)
+                .expect("install bob's joined group into his provider");
 
             // Bob mints his own sender key (the install already seeded one; this
             // rotates it to a fresh value, matching the old fixture), then Bob

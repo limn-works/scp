@@ -791,7 +791,7 @@ mod live_supervisor_send {
             SigningKeyId::Agent => "ctx-live-supervisor-send-agent",
             SigningKeyId::Active => "ctx-live-supervisor-send-active",
         };
-        let ctx_bytes = context_id_bytes(ctx_id);
+        let _ctx_bytes = context_id_bytes(ctx_id);
         let sent: SentBuffer = Arc::new(Mutex::new(Vec::new()));
         let sup = alice_supervisor(Arc::clone(&sent));
 

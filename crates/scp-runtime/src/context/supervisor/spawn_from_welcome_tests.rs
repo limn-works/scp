@@ -888,7 +888,7 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     // and actually hits the reservation-journal anchor.
     let replay_ctx_id = ctx_hex(0x4a);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
     let alice_crypto = Arc::new(MlsCryptoProvider::new(
@@ -1009,9 +1009,9 @@ fn alice_welcome_for(
 async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0x66);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
@@ -1087,9 +1087,9 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
 async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
     let bob = DID::from(BOB_DID);
     let collide_id = ctx_hex(0x77);
-    let collide_bytes = context_id_to_bytes(&collide_id);
+    let _collide_bytes = context_id_to_bytes(&collide_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
 
     // Publish bob's wrapping key BEFORE `create_context` — which get-or-spawns
     // bob's KeyPackage store via `build_actor_deps` and freezes its
@@ -1255,7 +1255,7 @@ fn welcome_snapshot_crypto_durability_predicate_fails_closed_on_empty_or_error()
 async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0x9a);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
     let (sup, bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
@@ -1371,7 +1371,7 @@ impl ContextPersistence for RecordingPersistence {
 async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0x99);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
     let rec = RecordingPersistence::default();
 
@@ -1414,7 +1414,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     // --- Target: a SECOND, independent supervisor sharing the SAME store. It has
     //     NO live actor for `ctx_id`, so Precheck A `lookup` misses and only the
     //     durable Precheck D can catch the collision.
-    let (target_sup, target_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
+    let (target_sup, _target_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
     assert!(
         target_sup.lookup(&ctx_id).is_none(),
         "the target supervisor has no live actor for the id (only durable state exists)"
@@ -1538,9 +1538,9 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
 
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0xa5);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
 
     // Inject a fake key-package store for Bob whose `ConfirmConsume` handler
     // holds the reply channel open and sleeps far past `LIFECYCLE_TIMEOUT`
@@ -2031,9 +2031,9 @@ async fn join_group_without_scp_context_extension_is_refused() {
 async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0xd1);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
     let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
@@ -2103,9 +2103,9 @@ async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
 async fn tampered_ciphertext_fails_aead_open() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0xd2);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
     let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
@@ -2152,9 +2152,9 @@ async fn tampered_ciphertext_fails_aead_open() {
 async fn tampered_bundle_signature_is_rejected() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0xd3);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
     let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
@@ -2209,9 +2209,9 @@ async fn tampered_bundle_signature_is_rejected() {
 async fn structurally_inconsistent_bundle_is_rejected() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0xd4);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
     let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
@@ -2821,7 +2821,7 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     // Bob's joiner supervisor with a resolver that also resolves Mallory, so her
     // self-signed bundle passes the signature check and the rule-8 binding is the
     // sole reason for rejection.
-    let (sup, bob_crypto) = bob_supervisor_with_resolver(None, trio_resolver());
+    let (sup, _bob_crypto) = bob_supervisor_with_resolver(None, trio_resolver());
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
     // Alice creates the honest SCP group (its `0xFF02` extension commits

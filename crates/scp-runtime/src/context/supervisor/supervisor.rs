@@ -2595,8 +2595,12 @@ impl Supervisor {
     // Non-test callers land when `dispatch_lifecycle_direct` switches to
     // actor-shape (storage-foundation Step 5); until then this is reached
     // only from the supervisor + actor test fixtures.
+    // `pub(crate)` (widened from `pub(in crate::context)`): the shared two-party
+    // test fixture in `crate::crypto::mls::two_party_test_support` drives a
+    // provider-resident join (`ConfirmConsume` → `install_joined_group`) through
+    // Bob's `key_package_store` handle, reached via these deps.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(in crate::context) async fn build_actor_deps(
+    pub(crate) async fn build_actor_deps(
         self: &Arc<Self>,
         owning_did: &DID,
     ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
