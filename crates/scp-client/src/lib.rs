@@ -81,7 +81,7 @@ mod snapshot;
 mod storage;
 
 pub use client::{AddMemberOutput, ContextStatus, ReceiveOutput, ScpClient};
-pub use context::PerContextState;
+pub use context::{EVENT_BUFFER_CAP, PerContextState};
 pub use crypto_state::{
     ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound, SenderKeyDistribution,
 };

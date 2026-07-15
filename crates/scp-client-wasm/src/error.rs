@@ -60,6 +60,12 @@ pub const fn error_code(err: &ClientError) -> &'static str {
         ClientError::UnsupportedMembershipChange(_) => "SCP-CTX-2003",
         // A driver invariant violation (bad argument / missing pending state).
         ClientError::Driver(_) => "SCP-CTX-2004",
+        // A join was attempted with no retained pending key package (never
+        // generated, or already consumed by a prior join attempt — single-use per
+        // attempt). Distinct from the generic Driver code so a caller can tell an
+        // absent-pending-material join apart from other invariant violations and
+        // route it to the reconstruct-from-durable retry path.
+        ClientError::NoPendingJoinMaterial { .. } => "SCP-CTX-2005",
         // The injected Storage backend failed at the I/O level (a
         // get/put/delete/list_keys fault) — distinct from a corrupt-but-readable
         // blob. NOTE: 8001-8003 are already allocated by scp-kt-android's
@@ -145,6 +151,23 @@ mod tests {
     }
 
     #[test]
+    fn no_pending_join_material_gets_its_own_distinct_ctx_code() {
+        // The single-use-per-attempt join failure has a DISTINCT code from the
+        // generic Driver invariant violation, so a caller can route it to the
+        // reconstruct-from-durable retry path rather than treating it as a generic
+        // bad-argument fault.
+        let no_pending = ClientError::NoPendingJoinMaterial {
+            context_id: "ctx".to_owned(),
+        };
+        assert_eq!(error_code(&no_pending), "SCP-CTX-2005");
+        assert_ne!(
+            error_code(&no_pending),
+            error_code(&ClientError::Driver("d".to_owned())),
+            "absent-pending-material is distinct from a generic Driver violation"
+        );
+    }
+
+    #[test]
     fn storage_variants_map_to_distinct_stable_storage_codes() {
         // The four browser storage failure classes each get a distinct, stable
         // code in the SCP-STORAGE-8010+ sub-range (part of the public JS error
@@ -206,6 +229,9 @@ mod tests {
             ClientError::UnsupportedMembershipChange("c".to_owned()),
             ClientError::Codec("c".to_owned()),
             ClientError::Driver("d".to_owned()),
+            ClientError::NoPendingJoinMaterial {
+                context_id: "c".to_owned(),
+            },
             ClientError::StorageBackend("s".to_owned()),
             ClientError::StorageCorrupt("s".to_owned()),
             ClientError::StorageIdentityMismatch("s".to_owned()),

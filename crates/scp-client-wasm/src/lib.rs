@@ -401,7 +401,9 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2004]` if there is no pending join material,
+    /// Throws `[SCP-CTX-2005]` if there is no pending join material (route this
+    /// case to the reconstruct-from-durable retry path), `[SCP-CTX-2004]` on a
+    /// generic driver-invariant violation (bad argument),
     /// `[SCP-CTX-2002]` if already joined, `[SCP-VALID-7010]` if the event-log
     /// stream cannot be deserialized, or a `[SCP-CRYPTO-…]` error on Welcome /
     /// replay failure. A `[SCP-STORAGE-8010]` on the post-join snapshot write

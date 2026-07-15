@@ -50,6 +50,22 @@ pub enum ClientError {
     #[error("driver error: {0}")]
     Driver(String),
 
+    /// [`join_context_encrypted`](crate::ScpClient::join_context_encrypted) was
+    /// called for a context with no retained pending join material — either
+    /// [`generate_key_package_for_join`](crate::ScpClient::generate_key_package_for_join)
+    /// was never called for it, or a **prior join attempt already consumed it**
+    /// (the pending material is single-use per join attempt — see that method's
+    /// contract). Retrying after a failed join requires reconstructing the client
+    /// from durable storage (which restores the still-present pending blob) or
+    /// publishing a fresh `KeyPackage`; the live in-memory material is gone.
+    #[error(
+        "no pending key package for context '{context_id}'; call generate_key_package_for_join first"
+    )]
+    NoPendingJoinMaterial {
+        /// The id of the context with no pending join material.
+        context_id: String,
+    },
+
     /// The injected [`Storage`](crate::Storage) backend itself failed — a
     /// `get`/`put`/`delete`/`list_keys` returned an error (quota exhausted,
     /// transaction aborted, backend unavailable). Surfaced as `SCP-STORAGE-8010`.
