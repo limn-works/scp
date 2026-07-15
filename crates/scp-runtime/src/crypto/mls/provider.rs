@@ -2281,7 +2281,7 @@ mod tests {
     /// the flag. Restoring the Class-S fail-closed injection coverage requires
     /// re-homing that one-shot fault seam onto the actor rotate (a `state.rs`
     /// change, per the Prep-E carry-forward) and asserting it as an atomic-core
-    /// test (map C8 "Class-S rotation fail-closed via Prep-E arm_rotation_failure_once").
+    /// test (map C8 "Class-S rotation fail-closed via Prep-E `arm_rotation_failure_once`").
     #[test]
     fn rotate_sender_key_advances_epoch_on_actor() {
         let provider = make_provider();

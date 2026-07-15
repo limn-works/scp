@@ -2600,6 +2600,11 @@ impl Supervisor {
     // provider-resident join (`ConfirmConsume` → `install_joined_group`) through
     // Bob's `key_package_store` handle, reached via these deps.
     #[cfg_attr(not(test), allow(dead_code))]
+    // `redundant_pub_crate` is a false positive here: this method is defined in a
+    // private module but is genuinely reached crate-wide (the shared two-party
+    // test fixture in `crate::crypto::mls`), which `pub(in crate::context)` would
+    // wrongly forbid (E0624). `pub(crate)` is the minimal correct visibility.
+    #[allow(clippy::redundant_pub_crate)]
     pub(crate) async fn build_actor_deps(
         self: &Arc<Self>,
         owning_did: &DID,
@@ -19812,7 +19817,7 @@ mod tests {
             origin.export_sender_key_epochs(&ctx),
             origin.export_recv_sequence_floors(&ctx),
         )
-            .unwrap();
+        .unwrap();
 
         // Cold restart: fresh Supervisor, EMPTY registry (local=0), trusted_local.
         let fresh = supervisor_with_providers();

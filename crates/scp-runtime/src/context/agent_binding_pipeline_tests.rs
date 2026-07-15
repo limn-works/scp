@@ -4,18 +4,19 @@
 //! *live* scp-runtime message pipeline end to end — both halves of the wiring
 //! this story makes real:
 //!
-//! - **Send side (Part 2).** [`messaging_helpers::build_encrypted_envelope`] —
-//!   the exact function the live `Supervisor::send_message` →
+//! - **Send side (Part 2).** [`messaging_helpers::build_encrypted_envelope_actor`]
+//!   — the production actor app-data seal the live `Supervisor::send_message` →
 //!   `messaging_helpers::send_message` → `encrypt_and_send` chain bottoms out in
-//!   — now stamps the caller's chosen [`SigningKeyId`] into
+//!   — stamps the caller's chosen [`SigningKeyId`] into
 //!   `InnerEnvelope.signing_key_id` instead of hardcoding `#active`. The send
-//!   half here drives that helper directly with `SigningKeyId::Agent` /
-//!   `SigningKeyId::Active`.
+//!   half here drives that seam directly (against Alice's actor-owned
+//!   `ContextCryptoState`) with `SigningKeyId::Agent` / `SigningKeyId::Active`.
+//!   (ADR-049 PR-7 deleted the provider `build_encrypted_envelope` twin.)
 //! - **Receive side (Part 1).** [`messaging_helpers::verify_and_unwrap`] reads
 //!   `inner.signing_key_id` and resolves the matching verification method
 //!   (`#active` vs `#agent`) from the sender's DID document via the VM-aware
 //!   [`KeyResolver`]. The receive half is exercised by MLS-opening the produced
-//!   blob on the recipient's crypto provider and driving the *live*
+//!   blob on the recipient's actor-owned crypto state and driving the *live*
 //!   [`messaging_helpers::verify_and_unwrap`] receive helper — the exact code
 //!   path the actor's `deliver_incoming` invokes.
 //!
@@ -457,8 +458,8 @@ mod live_supervisor_send {
 
     use ed25519_dalek::SigningKey;
     use scp_did::{DID, SigningKeyId};
-    use scp_platform::KeyCustody;
-    use scp_platform::testing::InMemoryKeyCustody;
+    
+    
     use scp_protocol::context::builder::{ContextCreationError, OpenResult};
     use scp_protocol::context::governance::KeyResolver;
     use scp_protocol::context::membership::{ContextEvent, KeyPackage};
@@ -467,14 +468,16 @@ mod live_supervisor_send {
     use scp_protocol::context::{ContextError, context_id_bytes};
     use zeroize::Zeroizing;
 
-    use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver, take_into_actor_local};
-    use scp_clock::SystemClock;
+    use super::{
+        ALICE_DID, BOB_DID, alice_identity, document_backed_resolver, take_into_actor_local,
+    };
     use crate::context::ContextHandle;
     use crate::context::actor::state::PerContextState;
-    use crate::context::supervisor::key_package_actor::KeyPackageCommand;
     use crate::context::builder::ContextTransportProvider;
+    use crate::context::supervisor::key_package_actor::KeyPackageCommand;
     use crate::context::supervisor::{MessageSigner, Supervisor};
     use crate::crypto::mls::provider::MlsCryptoProvider;
+    use scp_clock::SystemClock;
 
     /// Shared buffer of `(routing_id, payload)` pairs the recording transport
     /// captures. Mirrors the `scp-testing` `CapturingTransport` (which lives in
@@ -630,7 +633,7 @@ mod live_supervisor_send {
         // commits only the creator DID, so any key the resolver maps to
         // `ALICE_DID` validly signs the bundle.
         let alice_bundle_key = SigningKey::from_bytes(&[0xA1; 32]);
-        let bob_active_key = SigningKey::from_bytes(&[0xB0; 32]);
+        let _bob_active_key = SigningKey::from_bytes(&[0xB0; 32]);
         let resolver: KeyResolver = {
             let alice = DID::from(ALICE_DID);
             let alice_vk = alice_bundle_key.verifying_key();

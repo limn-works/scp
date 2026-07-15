@@ -2,12 +2,13 @@
 //!
 //! [`stand_up_two_party`] stands up Alice (creator) and Bob (joiner) over the
 //! REAL end-to-end join path — Bob reserves a `KeyPackage` from his own
-//! `KeyPackageStoreActor`, Alice adds that KP and emits a Welcome, Alice signs
-//! and HPKE-seals a §5.12.3 [`InvitationBundle`], and Bob installs the joined
-//! group through [`Supervisor::spawn_actor_from_welcome`]. It replaces the
-//! legacy TEST-ONLY `MlsCryptoProvider::prepare_key_package_for_join` /
-//! `MlsCryptoProvider::join_from_welcome` shortcut the old fixtures used (those
-//! provider methods are being retired).
+//! `KeyPackageStoreActor`, Alice adds that KP and emits a Welcome, and Bob
+//! confirms the join at the PROVIDER level (the real fused `ConfirmConsume` join
+//! → the joined `ScpMlsGroup`) and installs it via `install_joined_group`. It
+//! deliberately does NOT drive the full [`Supervisor::spawn_actor_from_welcome`]
+//! entrypoint, which moves the joiner's crypto ONE-WAY into a spawned actor
+//! (ADR-049 PR-7 C2) — this fixture must return providers that still OWN their
+//! per-context crypto so consumers can `take_crypto_state` each onto an actor.
 //!
 //! Alice is a BARE `MlsCryptoProvider` that hand-seals the bundle (no creator
 //! `Supervisor` needed); Bob is driven through a real joiner `Supervisor`. After
@@ -32,16 +33,15 @@
 
 use std::sync::Arc;
 
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::SigningKey;
 use scp_did::DID;
 use scp_platform::KeyCustody;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling};
 use scp_protocol::context::{
-    ContextMode, ContextParams, InvitationBundle, InvitationKeyMaterial, ScpContextExtension,
+    ContextMode, ContextParams, ScpContextExtension,
 };
-use scp_protocol::crypto::envelope_seal::{ed25519_pubkey_to_x25519, hpke_seal_invitation};
 use zeroize::Zeroizing;
 
 use super::provider::MlsCryptoProvider;
@@ -49,11 +49,9 @@ use super::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter}
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
 };
-use crate::context::invitation_helpers::{SnapshotRuntimeFacts, build_metadata_snapshot};
 use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::supervisor::Supervisor;
-use crate::context::supervisor::WelcomeJoinRequest;
-use crate::context::supervisor::key_package_actor::{KeyPackageCommand, ReservationId};
+use crate::context::supervisor::key_package_actor::KeyPackageCommand;
 
 /// Alice's (creator) fixed bundle-signing key. The bootstrap resolver maps
 /// `alice_did` to its verifying key so the joiner can verify the creator-signed
@@ -126,93 +124,6 @@ fn honest_ext(context_id: &str, creator_did: &str, params: &ContextParams) -> Sc
     .expect("honest context extension serializes")
 }
 
-/// Builds a signed [`InvitationBundle`] (creator = `signer`) carrying `params`,
-/// `context_id`, and `welcome_bytes`, with a structural snapshot copied verbatim
-/// from `params`. The signature is over the §5.12.3.1 signing hash.
-fn signed_bundle(
-    signer: &SigningKey,
-    creator_did: &DID,
-    context_id: &str,
-    params: &ContextParams,
-    welcome_bytes: Vec<u8>,
-) -> InvitationBundle {
-    let facts = SnapshotRuntimeFacts {
-        member_count: Some(1),
-        creator_did: Some(creator_did.clone()),
-        ..SnapshotRuntimeFacts::default()
-    };
-    let mut bundle = InvitationBundle {
-        context_id: context_id.to_owned(),
-        creator_did: creator_did.clone(),
-        relay_urls: vec![],
-        welcome_message: welcome_bytes,
-        key_material: InvitationKeyMaterial {
-            context_metadata_key: [7u8; 32],
-            sender_key_seed: None,
-        },
-        context_params: params.clone(),
-        metadata_snapshot: build_metadata_snapshot(params, facts),
-        signature: vec![],
-    };
-    let hash = bundle
-        .invitation_bundle_signing_hash()
-        .expect("signing hash");
-    bundle.signature = signer.sign(&hash).to_bytes().to_vec();
-    bundle
-}
-
-/// Parameterized seal for callers that already hold a LIVE creator `Supervisor`
-/// (e.g. the agent-binding pipeline fixture, which drives `sup.send_message`).
-/// Signs a §5.12.3 [`InvitationBundle`] with `creator_signing_key`, seals it to
-/// `recipient_active_verifying_key` (an Ed25519 #active key, mapped to X25519
-/// here), and returns the reshaped [`WelcomeJoinRequest`]. The joiner's
-/// `Supervisor` must carry a resolver that maps `creator_did` to
-/// `creator_signing_key.verifying_key()` so the creator signature verifies.
-///
-/// # Panics
-///
-/// Panics if the Ed25519→X25519 mapping, bundle serialization, or HPKE seal
-/// fails — this is a test-only helper.
-// Gated to `feature = "testing"` to match its sole caller — the
-// `#[cfg(feature = "testing")]` agent-binding pipeline fixture. Under a plain
-// `cfg(test)` build (the provider-level fixtures) it has no caller, so gating it
-// alongside the caller avoids a dead-code warning while keeping the shared
-// `stand_up_two_party` path available to both.
-#[cfg(feature = "testing")]
-#[allow(clippy::too_many_arguments)]
-pub fn seal_welcome_for_joiner(
-    creator_signing_key: &SigningKey,
-    creator_did: &DID,
-    context_id: &str,
-    params: &ContextParams,
-    welcome_bytes: Vec<u8>,
-    recipient_active_verifying_key: &[u8; 32],
-    reservation_id: ReservationId,
-    local_pseudonym: [u8; 32],
-) -> WelcomeJoinRequest {
-    let recipient_x25519 = ed25519_pubkey_to_x25519(recipient_active_verifying_key)
-        .expect("map recipient's #active ed25519 key to x25519");
-    let bundle = signed_bundle(
-        creator_signing_key,
-        creator_did,
-        context_id,
-        params,
-        welcome_bytes,
-    );
-    let wire = bundle.to_wire_bytes().expect("bundle serializes");
-    let (ct, enc) =
-        hpke_seal_invitation(&wire, &recipient_x25519, context_id, creator_did.as_ref())
-            .expect("HPKE seal");
-    WelcomeJoinRequest {
-        context_id: context_id.to_owned(),
-        creator_did: creator_did.clone(),
-        sealed_bundle_enc: enc,
-        sealed_bundle_ct: ct,
-        reservation_id,
-        local_pseudonym: Some(local_pseudonym),
-    }
-}
-
 fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
     Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
         InMemoryStorage::new(),
@@ -250,10 +161,11 @@ pub fn bob_supervisor(
 }
 
 /// Stands up a two-party joined pair (Alice creator, Bob joiner) over the REAL
-/// reserve → creator-add → sign → HPKE-seal → `spawn_actor_from_welcome` path,
-/// then distributes Alice's sender key to Bob (Bob's sender-key high-water for
-/// Alice becomes epoch 1). Returns `(alice, bob, ctx_bytes)` where both
-/// providers `seal`/`open` the group keyed by `context_id_bytes(ctx_str)`.
+/// reserve → creator-add → `ConfirmConsume` → `install_joined_group` path, then
+/// has Bob PULL Alice's sender key via the §9.16.2 request/response protocol
+/// (Bob's sender-key high-water for Alice becomes epoch 1). Returns
+/// `(alice, bob, ctx_bytes)` where both providers still OWN the per-context
+/// crypto for the group keyed by `context_id_bytes(ctx_str)`.
 ///
 /// # Panics
 ///

@@ -3707,7 +3707,7 @@ mod crypto_ops_golden {
         // Actor seals; the actor receiver opens. The provider twin is deleted
         // (its crypto was destructively taken into the actor), so the golden pin
         // is the actor seal→open round-trip decrypting to the ORIGINAL
-        // InnerEnvelope byte-for-byte at the zero-epoch AAD binding.
+        // InnerEnvelope byte-for-byte at the base sender-key epoch (1).
         let blob_actor = alice_a.seal(ALICE, &inner, &rid, 300).unwrap();
         let env = match bob_a.open(&SystemClock, CTX_STR, &blob_actor).unwrap() {
             OpenResult::Application(e) => e,
@@ -3716,8 +3716,8 @@ mod crypto_ops_golden {
 
         assert_eq!(env.sender_did, ALICE);
         assert_eq!(
-            env.receive_floor.epoch, 0,
-            "an unrotated context binds sender-key epoch 0 in the AAD"
+            env.receive_floor.epoch, 1,
+            "an unrotated context binds the base sender-key epoch 1 in the AAD"
         );
         assert_eq!(env.receive_floor.sequence, 0, "first seal is sequence 0");
         assert_eq!(
@@ -3938,8 +3938,8 @@ mod crypto_ops_golden {
         let alice_a = take_into_actor(&alice_p, ctx, ALICE);
         assert_eq!(
             alice_a.local_sender_key_epoch(),
-            0,
-            "a freshly joined, unrotated context reads local sender-key epoch 0"
+            1,
+            "a freshly joined, unrotated context reads the base local sender-key epoch 1"
         );
     }
 
@@ -3970,7 +3970,10 @@ mod crypto_ops_golden {
         let (recovered_key, epoch) = bob_a
             .process_incoming_sender_key(&bob_secret, ALICE, &actor_msgs[0].1)
             .unwrap();
-        assert_eq!(epoch, 0, "the unrotated key distributes at epoch 0");
+        assert_eq!(
+            epoch, 1,
+            "the unrotated key distributes at the base epoch 1"
+        );
         assert_eq!(
             recovered_key.as_bytes(),
             actor_sender_key(&alice_a).as_bytes(),
@@ -3996,7 +3999,10 @@ mod crypto_ops_golden {
         let bob_secret: [u8; 32] = *bob_secret;
 
         let epoch_before = alice_a.local_sender_key_epoch();
-        assert_eq!(epoch_before, 0, "unrotated context starts at epoch 0");
+        assert_eq!(
+            epoch_before, 1,
+            "unrotated context starts at the base epoch 1"
+        );
 
         // Rotate on the actor. The fresh key + HPKE ephemeral are random; the
         // EPOCH advance and the distribution's processability are the
@@ -4114,8 +4120,8 @@ mod crypto_ops_golden {
         // insert-path `restore_crypto_state` twin is gone), reseed an actor, and
         // confirm it agrees with the ORIGINAL on the group-context extension and
         // local sender-key epoch.
-        let restorer = MlsCryptoProvider::new(ALICE.to_owned(), Arc::new(SystemClock));
-        let (owned, _floors) = restorer.build_restored_owned(&ctx, &blob_a).unwrap();
+        let reader_provider = MlsCryptoProvider::new(ALICE.to_owned(), Arc::new(SystemClock));
+        let (owned, _floors) = reader_provider.build_restored_owned(&ctx, &blob_a).unwrap();
         let mut restored =
             PerContextState::new_for_test_encrypted(ctx, 0, DID::from(ALICE.to_owned()));
         restored.seed_encrypted_crypto_from_owned(owned);
