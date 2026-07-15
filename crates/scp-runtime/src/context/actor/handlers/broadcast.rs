@@ -755,7 +755,7 @@ mod tests {
     /// so a test can assert that a rejected subscribe appends none.
     async fn build_deps() -> (ActorDeps, Arc<AtomicUsize>) {
         use crate::context::supervisor::supervisor::Supervisor;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
 
         let creator_vk = creator_key().verifying_key();
         let key_resolver: scp_protocol::context::governance::KeyResolver =

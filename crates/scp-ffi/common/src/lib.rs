@@ -100,7 +100,8 @@ pub use bridge_instance::{
     ShutdownError, ShutdownOutcome, TransportLockError, UNSET_INSTANCE_ID,
 };
 
-// Shared runtime helpers (key resolver, BridgeInMemoryStorage, event log provider).
+// Shared runtime helpers (key resolver, event log provider backed by the
+// durability-only `scp_platform::in_memory::InMemoryStorage`, ADR-062 §0).
 // Requires scp-core + scp-platform (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
 pub mod bridge_runtime;

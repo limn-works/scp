@@ -20,11 +20,27 @@ software_platform = [
     "dep:hkdf",
     "dep:uuid",
 ]
-# In-memory platform adapters for testing and development (ADR-006).
-# Separate from `software_platform` so that crates needing crypto primitives
-# (Ed25519, X25519) can enable `software_platform` without pulling in the
-# insecure in-memory implementations. See GitHub issue #88.
-testing = ["software_platform"]
+# Durability-only in-memory Storage adapter (`InMemoryStorage`, spec §17.6 /
+# §17.17.2). A durability-only affordance (`SCP-CAPSEL-8010`): it loses state
+# on restart but nullifies no security property, so it is shippable and
+# selected explicitly via `StorageConfig` — never a default/fallback
+# (`SCP-CAPSEL-8011`). Pulls no extra deps (uses std + the always-on tokio).
+# Deliberately independent of `testing`: a build may compile the durable dev
+# affordance WITHOUT the test-only nullifier doubles. See ADR-062 §0.
+in-memory-storage = []
+# Durability-only in-memory Push adapter (`InMemoryPush`). Same classification
+# as `in-memory-storage`; mints synthetic UUID push tokens, so it pulls
+# `dep:uuid`. See ADR-062 §0.
+in-memory-push = ["dep:uuid"]
+# Test-only nullifier platform doubles (`InMemoryKeyCustody`,
+# `InMemoryDeviceAttestation`, `InMemoryPreRotationCustody`) — security
+# nullifiers (`SCP-CAPSEL-8012`) gated separately from `software_platform` so
+# crates needing crypto primitives (Ed25519, X25519) can enable
+# `software_platform` without pulling in the insecure in-memory key storage.
+# Also implies the durability-only in-memory adapters so test/dev builds get
+# the full historical `testing::*` surface via `in_memory::*`. See GitHub
+# issue #88 and ADR-062 §0.
+testing = ["software_platform", "in-memory-storage", "in-memory-push"]
 # Apple storage adapter with SQLCipher encryption (spec section 17.6).
 # Same engine as `sqlite` but encryption key provided by caller (Apple Keychain).
 apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]

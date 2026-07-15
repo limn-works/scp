@@ -1790,7 +1790,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     use scp_core::store::ProtocolRepository;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     fn make_storage_lookup() -> StorageBridgeLookup<InMemoryStorage> {
         let storage = InMemoryStorage::new();

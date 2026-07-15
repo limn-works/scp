@@ -3804,7 +3804,7 @@ mod tests {
     use super::*;
     use crate::context::persistence::ContextPersistence;
     use scp_did::DID;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

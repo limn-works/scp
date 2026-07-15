@@ -729,7 +729,7 @@ mod tests {
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
     use scp_mls::credential::ScpCredential;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(format!("did:dht:z6Mk{name}"), None, SigningKeyId::Active).unwrap()

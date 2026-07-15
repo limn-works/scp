@@ -1260,7 +1260,7 @@ mod equivocation_dedup_tests {
     /// `actor::mod` test-deps assembly but threads the counting log so the
     /// dedup gate's append behavior is observable.
     async fn deps_with_counting_log(appends: Arc<AtomicUsize>) -> (ActorDeps, PerContextState) {
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestEquivDedup".to_owned(),

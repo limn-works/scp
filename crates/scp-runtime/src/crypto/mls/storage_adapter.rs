@@ -179,7 +179,7 @@ impl<S: Storage + 'static> OpenMlsStorageAdapter for SpawnBlockingStorageAdapter
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     fn new_adapter() -> Arc<dyn OpenMlsStorageAdapter> {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(

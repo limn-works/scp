@@ -131,7 +131,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use scp_protocol::context::params::{Capability, ContextParams, TemplateId};
     use scp_protocol::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 

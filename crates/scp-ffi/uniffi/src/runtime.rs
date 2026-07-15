@@ -319,7 +319,7 @@ pub struct UniffiBridgeInstance {
     /// [`DurableProviders::from_handle`](scp_core::context::supervisor::DurableProviders::from_handle)
     /// over the SAME backend the bridge chose for persistence + event log:
     /// - in-memory path: the un-swallowed
-    ///   [`scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle`]
+    ///   [`scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle`]
     ///   returned by `build_event_log_provider`;
     /// - `SQLCipher` path: the `Arc<SqliteStorage>` that also backs
     ///   `CoreFields::persistence` and the event-log repository.
@@ -1278,7 +1278,7 @@ impl Drop for UniffiBridgeInstance {
 /// crash-recovery replay. Binding the pair into one newtype whose only non-test
 /// constructor derives both halves from one handle makes that divergence a
 /// compile error.) The single chosen backend
-/// (`Arc<EncryptingAdapter<BridgeInMemoryStorage>>` for the dev/in-memory path,
+/// (`Arc<EncryptingAdapter<InMemoryStorage>>` for the dev/in-memory path,
 /// or `Arc<SqliteStorage>` for the durable path) feeds both halves.
 fn durable_providers_from_handle<S>(
     handle: Arc<S>,
@@ -1486,8 +1486,8 @@ fn key_resolver_for_core(core: &CoreFields) -> scp_core::context::governance::Ke
 #[must_use]
 pub fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
-    Arc<scp_ffi_common::bridge_runtime::BridgeInMemoryRepo>,
-    scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle,
+    Arc<scp_ffi_common::bridge_runtime::EventLogInMemoryRepo>,
+    scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle,
 ) {
     scp_ffi_common::bridge_runtime::build_event_log_provider()
 }

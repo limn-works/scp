@@ -278,7 +278,7 @@ pub fn test_supervisor(
 ) -> Arc<supervisor::Supervisor> {
     let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> = Arc::new(
         crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-            scp_platform::testing::InMemoryStorage::new(),
+            scp_platform::in_memory::InMemoryStorage::new(),
         )),
     );
     supervisor::Supervisor::with_providers(

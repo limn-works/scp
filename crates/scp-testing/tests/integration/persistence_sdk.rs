@@ -63,7 +63,7 @@ use scp_core::store::context::ProtocolRepositoryContextBridge;
 #[cfg(feature = "sqlite")]
 use scp_did::DID;
 #[cfg(feature = "sqlite")]
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 
 #[cfg(feature = "sqlite")]
 use scp_platform::sqlite::SqliteStorage;

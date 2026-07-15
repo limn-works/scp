@@ -29,8 +29,9 @@ use scp_identity::dht::SequenceStore;
 use scp_identity::{DidCache, DidDht, InMemorySequenceStore};
 use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode};
 use scp_platform::EncryptedStorage;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_transport::native::server::RelayServer;
 use scp_transport::startup;
 

@@ -892,7 +892,7 @@ mod tests {
     use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaJournal};
     use crate::context::supervisor::supervisor::SupervisorConfig;
     use arc_swap::ArcSwap;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use zeroize::Zeroizing;
 
     struct TestPersistence;

@@ -80,7 +80,7 @@ impl<S: Storage> ProtocolRepository<S> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use crate::store::ProtocolRepository;
     use scp_protocol::crypto::tofu::{ObservedKeys, create_tofu_record};

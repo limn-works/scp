@@ -4294,7 +4294,7 @@ mod pseudonym_routing_tests {
         event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
     ) -> crate::context::actor::deps::ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
         use std::sync::Arc;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(

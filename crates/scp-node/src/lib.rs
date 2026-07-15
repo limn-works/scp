@@ -1485,12 +1485,12 @@ impl<S: Storage> ApplicationNode<S> {
 /// Requires the `allow_unencrypted_storage` feature flag (or `#[cfg(test)]`).
 /// **Not for production use.**
 #[cfg(any(test, feature = "allow_unencrypted_storage"))]
-impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
+impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
     /// Creates an `ApplicationNode` with sensible development defaults.
     ///
     /// Auto-wires:
     /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
-    /// - [`InMemoryStorage`](scp_platform::testing::InMemoryStorage)
+    /// - [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage)
     /// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT network)
     /// - [`SelfSignedTlsProvider`] (self-signed TLS certificate for `localhost`)
     /// - Relay bound to `127.0.0.1:<port>`
@@ -1520,7 +1520,8 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
         use scp_dht::InMemoryDhtClient;
         use scp_identity::DidCache;
         use scp_identity::dht::DidDht;
-        use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+        use scp_platform::in_memory::InMemoryStorage;
+        use scp_platform::testing::InMemoryKeyCustody;
 
         type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
@@ -3553,7 +3554,8 @@ mod tests {
     use scp_dht::InMemoryDhtClient;
     use scp_identity::DidCache;
     use scp_identity::dht::DidDht;
-    use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+    use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::testing::InMemoryKeyCustody;
 
     /// The concrete `DidDht` type used in tests (with in-memory DHT and system clock).
     type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;

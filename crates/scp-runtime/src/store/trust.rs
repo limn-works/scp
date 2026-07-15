@@ -399,8 +399,8 @@ mod tests {
         }
     }
 
-    fn new_store() -> ProtocolRepository<scp_platform::testing::InMemoryStorage> {
-        ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new())
+    fn new_store() -> ProtocolRepository<scp_platform::in_memory::InMemoryStorage> {
+        ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new())
     }
 
     /// A [`Storage`] that injects faults on every read AND write operation, used

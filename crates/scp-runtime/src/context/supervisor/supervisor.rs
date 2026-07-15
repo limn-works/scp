@@ -14315,7 +14315,7 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
 mod tests {
     use super::*;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     // -----------------------------------------------------------------
     // DurableProviders same-backend behavioral proof (spec §17.6 / §17.16 /
@@ -28234,7 +28234,7 @@ mod open_outlet_stream_tests {
 
     use ed25519_dalek::SigningKey;
     use scp_did::DID;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use scp_protocol::context::ContextState;
     use scp_protocol::context::outlets::registry::{OutletRegistry, register_outlet};
     use scp_protocol::context::outlets::stream::{

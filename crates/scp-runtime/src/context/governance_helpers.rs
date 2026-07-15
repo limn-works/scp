@@ -6045,7 +6045,7 @@ mod commit_broadcast_retry_tests {
         persistence: Box<dyn ContextPersistence>,
     ) -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             ADMIN.to_owned(),

@@ -33,7 +33,7 @@ use scp_core::context::{
 };
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 
 #[cfg(feature = "filesystem")]
 use scp_platform::filesystem::FilesystemStorage;

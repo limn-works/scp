@@ -54,7 +54,7 @@ use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 use scp_did::DID;
 use scp_ffi_common::bridge_instance::CoreFields;
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 

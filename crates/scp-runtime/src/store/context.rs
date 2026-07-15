@@ -935,7 +935,7 @@ impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersist
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
 

@@ -139,7 +139,7 @@ fn supervisor_with_event_channel() -> (
     let mls_storage: Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
         Arc::new(
             scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                scp_platform::testing::InMemoryStorage::new(),
+                scp_platform::in_memory::InMemoryStorage::new(),
             )),
         );
     let supervisor = Supervisor::with_providers(

@@ -416,7 +416,8 @@ mod tests {
 
     use super::*;
     use scp_platform::encrypting_adapter::EncryptingAdapter;
-    use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+    use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::testing::InMemoryKeyCustody;
 
     /// A `did:dht` is always 32 verifying-key bytes z-base-32 encoded, so the
     /// `did:dht:z` prefix is the cheap structural check that creation produced a

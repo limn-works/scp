@@ -1055,9 +1055,9 @@ mod tests {
     use openmls_traits::storage::StorageProvider;
 
     /// Helper to create a test `ProtocolRepository` with `InMemoryStorage`.
-    fn test_store() -> Arc<ProtocolRepository<scp_platform::testing::InMemoryStorage>> {
+    fn test_store() -> Arc<ProtocolRepository<scp_platform::in_memory::InMemoryStorage>> {
         Arc::new(ProtocolRepository::new_for_testing(
-            scp_platform::testing::InMemoryStorage::new(),
+            scp_platform::in_memory::InMemoryStorage::new(),
         ))
     }
 

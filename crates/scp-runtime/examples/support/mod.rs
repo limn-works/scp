@@ -42,7 +42,7 @@ pub fn example_mls_storage()
 -> std::sync::Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
     std::sync::Arc::new(
         scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-            std::sync::Arc::new(scp_platform::testing::InMemoryStorage::new()),
+            std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
         ),
     )
 }

@@ -3527,7 +3527,7 @@ mod restore_reconcile_tests {
     use std::sync::{Arc, Mutex};
 
     use scp_did::DID;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use scp_protocol::context::broadcast::BroadcastContextSnapshot;
     use scp_protocol::context::params::{ContextMode, ContextParams};
     use scp_protocol::context::{ContextError, builder::ContextCreationError};
