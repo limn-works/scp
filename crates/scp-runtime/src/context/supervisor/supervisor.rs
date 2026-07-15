@@ -20371,6 +20371,91 @@ mod tests {
         );
     }
 
+    /// ADR-049 §9 / cryptographer HIGH-1 regression: a heartbeat send reports
+    /// `Outcome { mutated: true }`. `send_heartbeat` SEALS an encrypted
+    /// `Heartbeat` envelope, which advances the actor-owned MLS group's send
+    /// ratchet GENERATION — Class-C per-context crypto state that a
+    /// `mutated: false` would silently drop on a ≤50ms coalesce-window crash.
+    /// The handler previously returned `Outcome::ok(())`; this pins the
+    /// `ok_mutated` fix so a heartbeat-only generation advance is coalesced.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn send_heartbeat_handler_reports_mutated() {
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::commands::{MessagingCommand, SigningKeyBytes};
+        use scp_protocol::context::ContextState;
+        use scp_protocol::context::roles::Capability;
+
+        const ALICE: &str = "did:dht:z6MkAliceHeartbeatAliceHeartbeatAlice1";
+        const BOB: &str = "did:dht:z6MkBobHeartbeatBobHeartbeatBobHeartbe1";
+        let ctx_str = "heartbeat-mutated-regression";
+
+        // Real two-party join: Alice owns the joined MLS group + her sender key.
+        let (alice_crypto, _bob_crypto, ctx_bytes) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let alice_sup = supervisor_with_crypto(Arc::clone(&alice_crypto));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives async dispatch from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let alice_deps = rt
+            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .expect("build alice's actor deps");
+
+        // Move Alice's joined crypto onto the actor. Activate the context and seed
+        // Alice as a member with `messages:write` directly (mirroring the
+        // `writable_encrypted_state` fixture) so the heartbeat's require-active and
+        // send-authorization gates pass without a governance round-trip.
+        let mut alice_state = take_into_actor(&alice_crypto, &ctx_bytes);
+        alice_state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("transition test handle to Active");
+        alice_state
+            .membership
+            .add_member(DID::from(ALICE), "member".to_owned(), Vec::new());
+        alice_state.members.insert(DID::from(ALICE));
+        alice_state.role_state.members.insert(ALICE.to_owned());
+        alice_state.role_state.member_capabilities.insert(
+            ALICE.to_owned(),
+            std::collections::HashSet::from([Capability::MessagesWrite]),
+        );
+        let mut cell = ClassSCell::new(alice_state);
+
+        rt.block_on(async {
+            // Send a heartbeat as Alice. The encrypted seal advances the MLS
+            // generation even with no peers to fan out to (the seal precedes the
+            // empty-routing no-op), so the handler MUST report `mutated: true`.
+            let (htx, hrx) = tokio::sync::oneshot::channel();
+            let heartbeat = MessagingCommand::SendHeartbeat {
+                context_id: ctx_str.to_owned(),
+                sender_did: DID::from(ALICE),
+                signing_key: SigningKeyBytes::from_signing_key(
+                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+                ),
+                reply: htx,
+            };
+            let outcome = crate::context::actor::handlers::messaging::dispatch(
+                &mut cell,
+                &alice_deps,
+                heartbeat,
+            )
+            .await;
+            assert!(
+                outcome.result.is_ok(),
+                "a peerless heartbeat is a successful no-op send: {:?}",
+                outcome.result
+            );
+            assert!(
+                outcome.mutated,
+                "a heartbeat seals an MLS envelope and advances the send-ratchet \
+                 generation — the handler MUST report mutated (ADR-049 §9 HIGH-1)"
+            );
+            hrx.await.expect("heartbeat reply").expect("heartbeat ok");
+        });
+    }
+
     /// ADR-056 regression guard: `recovery_send_notification_direct` MUST
     /// resolve its MLS-keying bytes through the canonical
     /// [`context_id_to_bytes`](crate::context::state::context_id_to_bytes)

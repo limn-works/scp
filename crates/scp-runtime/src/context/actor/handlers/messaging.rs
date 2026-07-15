@@ -1139,11 +1139,17 @@ fn handle_compare_remote_checkpoint(
 /// per-call — the signing key is not actor-owned state. Routing the send
 /// through the actor serializes it with the context's other sends.
 ///
-/// Synchronous (the send body has no awaits); no `tokio::time::timeout`
-/// wrapper required. Forwards the `send_heartbeat` result verbatim:
-/// `Ok(())` on success, or the transport error if every fan-out send fails.
-/// The send does not mutate per-context state (it uses sequence `0` and
-/// touches no counters), so this reports [`Outcome::ok`] / [`Outcome::err`].
+/// Forwards the `send_heartbeat` result verbatim: `Ok(())` on success, or the
+/// transport error if every fan-out send fails. Although a heartbeat does not
+/// consume the application content SEQUENCE (it uses sequence `0`), sealing the
+/// encrypted `Heartbeat` envelope advances the actor-owned MLS group's
+/// send-ratchet GENERATION — per-context crypto state (Class-C, coalesced at the
+/// next snapshot) that a `mutated: false` would silently drop on a ≤50ms crash.
+/// This handler therefore reports [`Outcome::ok_mutated`] / [`Outcome::err_mutated`]
+/// (the seal runs BEFORE the fan-out, so even an empty-routing no-op and a
+/// post-seal transport failure have already advanced the generation), matching
+/// [`handle_send_message`] and `handle_build_local_checkpoint`. See ADR-049 §9
+/// (the MLS own-leaf send-generation residual, tracked in #2149).
 // `needless_pass_by_ref_mut`: the `&mut ClassSCell` is only read (`&*cell`), but
 // the `&mut` is load-bearing for Send — this async handler holds the cell borrow
 // across the `send_heartbeat` await, and `&mut ClassSCell` is Send whereas
@@ -1173,12 +1179,24 @@ async fn handle_send_heartbeat(
     match result {
         Ok(()) => {
             let _ = reply.send(Ok(()));
-            Outcome::ok(())
+            // The encrypted-context heartbeat SEALS an MLS `Heartbeat` envelope,
+            // advancing the actor-owned MLS group's send-ratchet generation
+            // (Class-C; coalesced with the next snapshot). Report `mutated` so the
+            // actor coalesces that advance — the seal in `encrypt_and_send` runs
+            // BEFORE the empty-routing no-op check, so even a peerless heartbeat
+            // has already advanced the generation. (A broadcast-context heartbeat
+            // seals nothing; over-marking `mutated` there is harmless — it only
+            // triggers a redundant coalesced snapshot of unchanged state.)
+            Outcome::ok_mutated(())
         }
         Err(e) => {
+            // A fan-out transport failure can occur AFTER the seal already advanced
+            // the generation, so report `mutated` on the error path too (the seal's
+            // ratchet advance must still be coalesced) — same disposition as
+            // `handle_send_message`'s `err_mutated` failure arm.
             let sketch = outcome_error_sketch(&e);
             let _ = reply.send(Err(e));
-            Outcome::err(sketch)
+            Outcome::err_mutated(sketch)
         }
     }
 }
