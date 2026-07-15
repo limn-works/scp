@@ -4216,7 +4216,10 @@ pub(crate) struct CrossContextVerificationDescriptor {
     /// the pinned `caveats_binding` today, pinning `request_id` explicitly makes
     /// the "never rebuilt from chunk-supplied values" invariant hold on its own
     /// terms — defense-in-depth against any future decoupling of the two
-    /// bindings, and matching the §5.4.5:570 rule literally.
+    /// bindings. §5.4.5:570 enumerates `operator_pk` / `context_id` /
+    /// `caveats_binding` as the pinned values; `request_id` is not in that list,
+    /// so this pin extends the rule's SPIRIT (never trust a delivery-time-
+    /// asserted value) to `request_id`, it does not implement the rule verbatim.
     pub(crate) expected_request_id: RequestId,
 }
 
