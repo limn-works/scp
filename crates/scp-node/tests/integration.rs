@@ -25,7 +25,8 @@ use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::DidDht;
 use scp_identity::{DidCache, DidMethod};
 use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_transport::native::protocol::{ClientMessage, RelayMessage};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 

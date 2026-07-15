@@ -67,7 +67,7 @@ async fn no_domain_mode_builder() {
 async fn failing_tls_falls_through_to_nat() {
     use std::sync::Arc;
 
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let did_method = Arc::new(helpers::make_test_dht(&custody));
@@ -117,7 +117,7 @@ async fn failing_tls_falls_through_to_nat() {
 async fn failing_nat_strategy() {
     use std::sync::Arc;
 
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let did_method = Arc::new(helpers::make_test_dht(&custody));

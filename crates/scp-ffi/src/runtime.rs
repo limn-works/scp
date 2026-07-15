@@ -80,8 +80,8 @@ pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_identity::ScpIdentity;
 use scp_platform::PlatformError;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::sqlite::SqliteStorage;
-use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::Storage;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -1130,8 +1130,9 @@ impl ContextPersistence for ArcContextPersistence {
 ///
 /// This is NOT a direct reuse of
 /// `scp-ffi-common::bridge_runtime::build_event_log_provider` — that common
-/// fn owns its own storage (creates a fresh `BridgeInMemoryStorage` +
-/// `ProtocolRepository` and returns both) so the NAPI / `UniFFI` bridges can
+/// fn owns its own storage (creates a fresh
+/// `scp_platform::in_memory::InMemoryStorage` + `ProtocolRepository` and
+/// returns both) so the NAPI / `UniFFI` bridges can
 /// keep the repository handle around for later queries. The `PyO3` bridge
 /// instead reads from `DEFAULT_BRIDGE_INSTANCE.storage_provider()` so the
 /// event log shares storage with every other per-context data sink

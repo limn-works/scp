@@ -149,7 +149,7 @@ pub async fn next_grant_monotonic_seq<S: Storage>(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     fn rid(byte: u8) -> [u8; 16] {
         [byte; 16]

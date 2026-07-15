@@ -59,9 +59,8 @@ use scp_mls::credential::ScpCredential;
 use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
 use scp_protocol::context::params::Capability as ParamCapability;
 
-use scp_platform::testing::{
-    InMemoryDeviceAttestation, InMemoryKeyCustody, InMemoryPush, InMemoryStorage,
-};
+use scp_platform::in_memory::{InMemoryPush, InMemoryStorage};
+use scp_platform::testing::{InMemoryDeviceAttestation, InMemoryKeyCustody};
 use scp_platform::traits::{DeviceAttestation, KeyCustody, KeyType, Push, Storage};
 
 // ---------------------------------------------------------------------------

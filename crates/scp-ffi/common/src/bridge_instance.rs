@@ -2831,7 +2831,7 @@ mod tests {
     /// defaults storage; tests supply this explicit dev affordance.
     fn test_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
-            scp_platform::testing::InMemoryStorage::new(),
+            scp_platform::in_memory::InMemoryStorage::new(),
         )))
     }
 

@@ -2641,7 +2641,8 @@ mod tests {
     use std::sync::Arc;
 
     use scp_did::DID;
-    use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+    use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
     use scp_protocol::context::ContextError;
     use scp_protocol::context::governance::KeyResolver;

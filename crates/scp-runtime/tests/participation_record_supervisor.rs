@@ -55,7 +55,7 @@ fn mock_key_resolver() -> scp_protocol::context::governance::KeyResolver {
 
 fn test_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
     Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
-        scp_platform::testing::InMemoryStorage::new(),
+        scp_platform::in_memory::InMemoryStorage::new(),
     )))
 }
 

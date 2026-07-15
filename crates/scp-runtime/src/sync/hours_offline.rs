@@ -2368,7 +2368,7 @@ mod tests {
     #[tokio::test]
     async fn drain_context_queue_returns_entries_in_order() {
         let store = crate::store::ProtocolRepository::new_for_testing(
-            scp_platform::testing::InMemoryStorage::new(),
+            scp_platform::in_memory::InMemoryStorage::new(),
         );
 
         // Enqueue 3 messages.
@@ -2399,7 +2399,7 @@ mod tests {
     #[tokio::test]
     async fn drain_context_queue_prunes_expired_before_drain() {
         let store = crate::store::ProtocolRepository::new_for_testing(
-            scp_platform::testing::InMemoryStorage::new(),
+            scp_platform::in_memory::InMemoryStorage::new(),
         );
 
         // Enqueue messages at different times.
@@ -2431,7 +2431,7 @@ mod tests {
     #[tokio::test]
     async fn drain_context_queue_uses_default_ttl_when_none() {
         let store = crate::store::ProtocolRepository::new_for_testing(
-            scp_platform::testing::InMemoryStorage::new(),
+            scp_platform::in_memory::InMemoryStorage::new(),
         );
 
         let now = 1_000_000u64;
@@ -2457,7 +2457,7 @@ mod tests {
     #[tokio::test]
     async fn drain_empty_queue_returns_empty() {
         let store = crate::store::ProtocolRepository::new_for_testing(
-            scp_platform::testing::InMemoryStorage::new(),
+            scp_platform::in_memory::InMemoryStorage::new(),
         );
 
         let result = ReconnectionCoordinator::drain_context_queue(

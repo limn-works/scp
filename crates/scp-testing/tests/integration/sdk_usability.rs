@@ -24,7 +24,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use scp_core::envelope::create_outer_envelope;
 use scp_node::{Node, ReachabilityTier};
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_testing::helpers;
 use scp_transport::native::protocol::{ClientMessage, RelayMessage};
 use scp_transport::native::server::{RelayConfig, RelayServer};

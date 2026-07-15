@@ -41,7 +41,7 @@ use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
 use scp_platform::PlatformError;
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::traits::Storage;
 
 // ---------------------------------------------------------------------------

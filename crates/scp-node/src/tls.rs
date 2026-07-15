@@ -938,7 +938,7 @@ pub fn generate_self_signed_multi(
 mod tests {
     use super::*;
     use scp_clock::Clock;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     // -- Self-signed generation --
 

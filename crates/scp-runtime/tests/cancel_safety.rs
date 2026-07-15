@@ -109,7 +109,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
 use scp_runtime::context::actor::{SendSequenceTracker, SequenceReservation};
 use scp_runtime::context::supervisor::{

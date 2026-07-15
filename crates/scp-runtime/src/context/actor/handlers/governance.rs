@@ -1327,7 +1327,7 @@ mod consequence_fail_closed_tests {
     /// non-convergent `MessageVelocity` evidence; the durable log stays empty).
     async fn build_fail_closed_deps() -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             ADMIN.to_owned(),

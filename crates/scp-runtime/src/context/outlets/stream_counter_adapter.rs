@@ -206,7 +206,7 @@ mod tests {
     use std::sync::Arc;
 
     use scp_did::DID;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use scp_protocol::trust::CaveatKind;
 
     use super::ActorClassSCaveatCounterAdapter;

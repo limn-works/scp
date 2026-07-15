@@ -19,7 +19,8 @@ use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
 use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
 use zeroize::Zeroizing;
@@ -281,7 +282,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 ///
 /// When `identity` is `None` (auto-generate):
 /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
-/// - [`InMemoryStorage`](scp_platform::testing::InMemoryStorage)
+/// - [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage)
 /// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT network)
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)

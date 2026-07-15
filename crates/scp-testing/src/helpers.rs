@@ -29,7 +29,8 @@ use scp_node::{
     DhtMode, IdentitySource, NatSlot, NatStrategy, NodeConfig, NodeError, Reach, ReachabilityTier,
     TlsProvider,
 };
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 
 /// The concrete `DidDht` type used in tests (in-memory DHT, system clock).
 pub type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;

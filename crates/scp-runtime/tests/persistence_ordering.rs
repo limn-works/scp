@@ -270,7 +270,7 @@ fn build_supervisor(persistence: RecordingPersistence) -> Arc<Supervisor> {
     let mls_storage: Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
         Arc::new(
             scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
-                scp_platform::testing::InMemoryStorage::new(),
+                scp_platform::in_memory::InMemoryStorage::new(),
             )),
         );
     Supervisor::with_providers(

@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_runtime::context::supervisor::{
     JournalEntry, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaJournal, SagaState,
     Supervisor, SupervisorConfig,

@@ -29,7 +29,8 @@ use zeroize::Zeroizing;
 use scp_did::DidDocument;
 use scp_identity::{DidDht, Identity, IdentityConfig};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::Storage;
 use scp_runtime::store::ProtocolRepository;
 

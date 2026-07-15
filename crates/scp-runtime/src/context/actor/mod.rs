@@ -1224,7 +1224,7 @@ mod tests {
     ) -> deps::ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_did::DID;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
         use std::sync::Arc;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
@@ -1924,7 +1924,7 @@ mod tests {
     ) -> deps::ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_did::DID;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
         use std::sync::Arc;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(

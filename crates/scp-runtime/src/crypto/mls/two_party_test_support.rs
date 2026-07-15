@@ -32,7 +32,8 @@ use std::sync::Arc;
 use ed25519_dalek::{Signer as _, SigningKey};
 use scp_did::DID;
 use scp_platform::KeyCustody;
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling};
 use scp_protocol::context::{

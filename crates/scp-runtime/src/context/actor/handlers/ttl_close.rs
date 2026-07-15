@@ -374,7 +374,7 @@ mod tests {
     /// real-handle `finalize_close` path can append its `ContextClosed` leaf.
     async fn build_deps() -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             ADMIN.to_owned(),

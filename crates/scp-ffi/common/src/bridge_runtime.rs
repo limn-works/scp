@@ -13,12 +13,11 @@
 //! - [`did_resolver_from`] — retrieves the DID resolver from a
 //!   [`CoreFields`]. All three bridges delegate to it from their thin
 //!   `did_resolver` wrapper.
-//! - [`BridgeInMemoryStorage`] — in-memory `Storage` impl for event log
-//!   persistence without pulling in `scp-platform/testing` (identical in
-//!   NAPI and `UniFFI`; `PyO3` uses `scp-platform::testing::InMemoryStorage`).
 //! - [`build_event_log_provider`] — constructs a persistent
-//!   `MerkleEventLogProvider` backed by `BridgeInMemoryStorage` (identical in
-//!   NAPI and `UniFFI`). Returns both the provider and the underlying
+//!   `MerkleEventLogProvider` backed by
+//!   `EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>` (the
+//!   durability-only in-memory storage adapter, ADR-062 §0; identical in NAPI
+//!   and `UniFFI`). Returns both the provider and the underlying
 //!   `ProtocolRepository` so callers can stash it on the per-bridge
 //!   concrete struct (alongside [`CoreFields`]).
 //! - [`UcanContextStateCore`] — shared UCAN validation state fields common to
@@ -26,16 +25,14 @@
 //!
 //! Gated behind the `resolvers` feature.
 
-use std::future::Future;
 use std::sync::Arc;
 
 use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::store::ProtocolRepository;
 use scp_core::store::context::ProtocolRepositoryEventLogBridge;
-use scp_platform::Storage;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
-use scp_platform::error::PlatformError;
+use scp_platform::in_memory::InMemoryStorage;
 use zeroize::Zeroizing;
 
 use crate::IdentityBackedDidResolver;
@@ -145,136 +142,24 @@ pub fn did_resolver_from(
 }
 
 // ---------------------------------------------------------------------------
-// BridgeInMemoryStorage — bridge-local Storage implementation
-//
-// This avoids pulling in `scp-platform/testing` (which also exposes
-// `InMemoryKeyCustody`) just for event log persistence. Production mobile
-// builds (iOS/Android) must not compile `InMemoryKeyCustody`.
-//
-// Identical in NAPI and UniFFI bridges. PyO3 uses
-// `scp_platform::testing::InMemoryStorage` instead (acceptable because the
-// PyO3 bridge always enables `allow_in_memory_custody`).
-// ---------------------------------------------------------------------------
-
-/// In-memory `Storage` implementation for event log persistence.
-///
-/// Identical in behavior to `scp_platform::testing::InMemoryStorage` but
-/// defined here so the `testing` feature is not required in production
-/// dependencies. Only used as the backing store for the
-/// `EncryptingAdapter`-wrapped `ProtocolRepository` that feeds the
-/// `MerkleEventLogProvider`.
-pub struct BridgeInMemoryStorage {
-    data: tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
-}
-
-impl BridgeInMemoryStorage {
-    /// Creates a new empty in-memory storage.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            data: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-impl Default for BridgeInMemoryStorage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[allow(clippy::manual_async_fn)]
-impl Storage for BridgeInMemoryStorage {
-    fn store(
-        &self,
-        key: &str,
-        data: &[u8],
-    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        let key = key.to_owned();
-        let data = data.to_vec();
-        async move {
-            self.data.lock().await.insert(key, data);
-            Ok(())
-        }
-    }
-
-    fn retrieve(
-        &self,
-        key: &str,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
-        let key = key.to_owned();
-        async move { Ok(self.data.lock().await.get(&key).cloned()) }
-    }
-
-    fn delete(&self, key: &str) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        let key = key.to_owned();
-        async move {
-            self.data.lock().await.remove(&key);
-            Ok(())
-        }
-    }
-
-    fn list_keys(
-        &self,
-        prefix: &str,
-    ) -> impl Future<Output = Result<Vec<String>, PlatformError>> + Send {
-        let prefix = prefix.to_owned();
-        async move {
-            let store = self.data.lock().await;
-            let mut keys: Vec<String> = store
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            drop(store);
-            keys.sort();
-            Ok(keys)
-        }
-    }
-
-    fn delete_prefix(
-        &self,
-        prefix: &str,
-    ) -> impl Future<Output = Result<u64, PlatformError>> + Send {
-        let prefix = prefix.to_owned();
-        async move {
-            let mut store = self.data.lock().await;
-            let keys_to_delete: Vec<String> = store
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            let count = keys_to_delete.len() as u64;
-            for key in keys_to_delete {
-                store.remove(&key);
-            }
-            drop(store);
-            Ok(count)
-        }
-    }
-
-    fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send {
-        let key = key.to_owned();
-        async move { Ok(self.data.lock().await.contains_key(&key)) }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Event log provider builder
 // ---------------------------------------------------------------------------
 
 /// Shared encrypted in-memory storage handle backing the event-log
 /// `ProtocolRepository`.
 ///
-/// This is the single `Storage` value the dev/in-memory path owns. The
+/// Backed by the durability-only [`InMemoryStorage`] adapter
+/// (`scp_platform::in_memory`, ADR-062 §0) — the shippable in-memory storage
+/// arm, selected explicitly for the dev/in-memory path (never a default or
+/// fallback). This is the single `Storage` value that path owns. The
 /// event-log `ProtocolRepository` is built *over* this `Arc`, and the same
 /// `Arc` is returned to the bridge so it can derive the supervisor's
 /// `mls_storage` (`OpenMLS`) view via `SpawnBlockingStorageAdapter`. ONE
 /// store therefore backs both the event log and `mls_storage` (spec §17.6 —
 /// in-memory is the dev affordance; one chosen backend, derived consumers).
-pub type BridgeInMemoryStorageHandle = Arc<EncryptingAdapter<BridgeInMemoryStorage>>;
+pub type EventLogInMemoryStorageHandle = Arc<EncryptingAdapter<InMemoryStorage>>;
 
-/// `ProtocolRepository` built over the shared [`BridgeInMemoryStorageHandle`].
+/// `ProtocolRepository` built over the shared [`EventLogInMemoryStorageHandle`].
 ///
 /// The repository is generic over the `Arc<EncryptingAdapter<...>>` (rather
 /// than an owned `EncryptingAdapter<...>`) so the underlying store can be
@@ -282,16 +167,16 @@ pub type BridgeInMemoryStorageHandle = Arc<EncryptingAdapter<BridgeInMemoryStora
 /// satisfies the sealed `EncryptedStorage` bound via the
 /// `impl<T: EncryptedStorage> EncryptedStorage for Arc<T>` blanket
 /// (`scp-platform`).
-pub type BridgeInMemoryRepo = ProtocolRepository<BridgeInMemoryStorageHandle>;
+pub type EventLogInMemoryRepo = ProtocolRepository<EventLogInMemoryStorageHandle>;
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
 /// storage.
 ///
-/// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
-/// AES-256-GCM key, wraps it in an `Arc`, builds a `ProtocolRepository` over
-/// that `Arc`, then builds a `ProtocolRepositoryEventLogBridge` that
-/// implements `EventLogPersistence`. The resulting `MerkleEventLogProvider`
-/// persists entries on each append.
+/// Creates an `EncryptingAdapter<InMemoryStorage>` with a random AES-256-GCM
+/// key, wraps it in an `Arc`, builds a `ProtocolRepository` over that `Arc`,
+/// then builds a `ProtocolRepositoryEventLogBridge` that implements
+/// `EventLogPersistence`. The resulting `MerkleEventLogProvider` persists
+/// entries on each append.
 ///
 /// Returns three handles to the SAME underlying store:
 /// 1. the event log provider (for `Supervisor`/`ContextManager`
@@ -299,30 +184,31 @@ pub type BridgeInMemoryRepo = ProtocolRepository<BridgeInMemoryStorageHandle>;
 /// 2. the `ProtocolRepository` (for trust store usage and per-bridge
 ///    storage; callers stash it on the per-bridge concrete struct, e.g.
 ///    `NapiBridgeInstance`, `UniffiBridgeInstance`),
-/// 3. the raw [`BridgeInMemoryStorageHandle`] — previously dropped. It is now
+/// 3. the raw [`EventLogInMemoryStorageHandle`] — previously dropped. It is now
 ///    retained so the bridge can wrap it via `SpawnBlockingStorageAdapter`
 ///    into the supervisor's required `mls_storage` consumer. Because all
 ///    three derive from one `Arc`, the event log, persistence, and `OpenMLS`
 ///    storage view read/write a single in-memory store (no split-brain;
 ///    spec §17.6).
 ///
-/// Uses [`BridgeInMemoryStorage`] instead of
-/// `scp_platform::testing::InMemoryStorage` so that the `testing` feature
-/// (which also exposes `InMemoryKeyCustody`) is not required in production
-/// mobile builds. See issue #484.
+/// Backed by the durability-only [`InMemoryStorage`]
+/// (`scp_platform::in_memory`) adapter — selected explicitly for this
+/// in-memory event-log path, so the `testing` feature (which also exposes the
+/// `InMemoryKeyCustody` nullifier) is not required in production mobile
+/// builds. See ADR-062 §0 and issue #484.
 ///
 /// This function is identical in the NAPI and `UniFFI` bridges.
 pub fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
-    Arc<BridgeInMemoryRepo>,
-    BridgeInMemoryStorageHandle,
+    Arc<EventLogInMemoryRepo>,
+    EventLogInMemoryStorageHandle,
 ) {
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
     // Wrap the encrypted store in an `Arc` first so the SAME store backs the
     // event-log `ProtocolRepository` AND the returned `mls_storage` handle.
-    let storage_handle: BridgeInMemoryStorageHandle =
-        Arc::new(EncryptingAdapter::new(BridgeInMemoryStorage::new(), key));
+    let storage_handle: EventLogInMemoryStorageHandle =
+        Arc::new(EncryptingAdapter::new(InMemoryStorage::new(), key));
     let store = Arc::new(ProtocolRepository::new(Arc::clone(&storage_handle)));
 
     let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(&store));
@@ -346,7 +232,7 @@ pub fn build_event_log_provider() -> (
 /// `Storage` matches the bridge's configured persistence backend.
 ///
 /// Before this variant existed, each bridge's `protocol_repository` was
-/// always `Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>`,
+/// always `Arc<ProtocolRepository<EncryptingAdapter<InMemoryStorage>>>`,
 /// even when the bridge was constructed with a `Sqlite` storage config.
 /// That meant the Merkle event log — which uses the protocol repository
 /// as its backing `EventLogPersistence` — silently ran against an ephemeral
@@ -360,13 +246,13 @@ pub fn build_event_log_provider() -> (
 /// `SQLCipher` database.
 pub enum ProtocolRepoVariant {
     /// Encrypted in-memory repository. Event log and trust aggregation are
-    /// backed by an `Arc<EncryptingAdapter<BridgeInMemoryStorage>>`
-    /// ([`BridgeInMemoryStorageHandle`]) with a random per-instance
+    /// backed by an `Arc<EncryptingAdapter<InMemoryStorage>>`
+    /// ([`EventLogInMemoryStorageHandle`]) with a random per-instance
     /// AES-256-GCM key. The store is held behind an `Arc` so the SAME
     /// encrypted backend feeds the event-log repository AND the supervisor's
     /// `mls_storage` view (spec §17.6 — one chosen backend, derived
     /// consumers). Data is lost when the instance drops.
-    InMemory(Arc<BridgeInMemoryRepo>),
+    InMemory(Arc<EventLogInMemoryRepo>),
     /// SQLCipher-backed repository. Event log and trust aggregation share the
     /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
     /// context snapshots, trust attestations, and event log entries all

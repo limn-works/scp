@@ -722,7 +722,7 @@ impl<S: Storage> ProtocolRepository<S> {
     clippy::cast_possible_truncation
 )]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
 

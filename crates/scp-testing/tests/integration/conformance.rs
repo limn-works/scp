@@ -57,7 +57,8 @@ use scp_core::sync::{
     OfflineTier, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS, classify_offline_duration,
 };
 use scp_did::DID;
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryPush};
+use scp_platform::in_memory::InMemoryPush;
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::{KeyCustody, KeyType, Push};
 
 // ---------------------------------------------------------------------------

@@ -34,7 +34,8 @@ use scp_dht::InMemoryDhtClient;
 use scp_identity::DidCache;
 use scp_identity::dht::DidDht;
 use scp_node::{ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, Reach};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 
 type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 

@@ -24,7 +24,7 @@ use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // `napi_check_handle!` macro can refer to it as `$crate::runtime::CoreFields`
 // without each caller importing the full `scp_ffi_common` path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
-use scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle;
+use scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle;
 use scp_ffi_common::error_codes as codes;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -225,7 +225,7 @@ pub struct NapiBridgeInstance {
     /// [`DurableProviders::from_handle`](scp_core::context::supervisor::DurableProviders::from_handle)
     /// over the single chosen `Storage` backend:
     /// - in-memory path → the un-swallowed
-    ///   `Arc<EncryptingAdapter<BridgeInMemoryStorage>>` handle (3rd element
+    ///   `Arc<EncryptingAdapter<InMemoryStorage>>` handle (3rd element
     ///   returned by `build_event_log_provider`);
     /// - `SQLite` path → the same `Arc<SqliteStorage>` that backs persistence
     ///   and the event log.
@@ -1006,7 +1006,7 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
 /// crash-recovery replay. Binding the pair into one newtype whose only non-test
 /// constructor derives both halves from one handle makes that divergence a
 /// compile error.) The single chosen backend
-/// (`Arc<EncryptingAdapter<BridgeInMemoryStorage>>` for the dev/in-memory path,
+/// (`Arc<EncryptingAdapter<InMemoryStorage>>` for the dev/in-memory path,
 /// or `Arc<SqliteStorage>` for the durable path) feeds both halves.
 fn durable_providers_from_handle<S>(
     handle: Arc<S>,
@@ -1243,7 +1243,7 @@ pub const fn protocol_repository(bi: &NapiBridgeInstance) -> &ProtocolRepoVarian
 /// Returns three handles to the SAME underlying store: the event log provider,
 /// the underlying `ProtocolRepository` (for registration in
 /// `NapiBridgeInstance`), and the raw
-/// [`BridgeInMemoryStorageHandle`](scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle)
+/// [`EventLogInMemoryStorageHandle`](scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle)
 /// — the un-swallowed in-memory storage handle the bridge wraps via
 /// `SpawnBlockingStorageAdapter` into the supervisor's required `mls_storage`
 /// consumer (spec §17.6 — one chosen backend, derived consumers).
@@ -1254,8 +1254,8 @@ pub const fn protocol_repository(bi: &NapiBridgeInstance) -> &ProtocolRepoVarian
 #[allow(dead_code)]
 pub(crate) fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
-    Arc<scp_ffi_common::bridge_runtime::BridgeInMemoryRepo>,
-    BridgeInMemoryStorageHandle,
+    Arc<scp_ffi_common::bridge_runtime::EventLogInMemoryRepo>,
+    EventLogInMemoryStorageHandle,
 ) {
     scp_ffi_common::bridge_runtime::build_event_log_provider()
 }
@@ -1356,9 +1356,12 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
 }
 
 // ---------------------------------------------------------------------------
-// BridgeInMemoryStorage — previously defined locally with identical code.
-// Consolidated in `scp-ffi-common::bridge_runtime` (#1447). Imported via
-// `use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage` at the top.
+// In-memory event-log storage — previously a bridge-local `Storage`
+// reimplementation. Now the durability-only
+// `scp_platform::in_memory::InMemoryStorage` adapter, wrapped by
+// `EncryptingAdapter` inside
+// `scp-ffi-common::bridge_runtime::build_event_log_provider` (ADR-062 §0,
+// #1447 / #484).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

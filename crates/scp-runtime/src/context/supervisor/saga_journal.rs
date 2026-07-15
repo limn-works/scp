@@ -843,7 +843,7 @@ fn current_timestamp_ms() -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     fn test_journal() -> ProtocolRepositorySagaJournal<InMemoryStorage> {
         ProtocolRepositorySagaJournal::new(Arc::new(InMemoryStorage::new()))

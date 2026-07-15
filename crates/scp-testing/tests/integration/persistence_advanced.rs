@@ -23,7 +23,7 @@ use std::collections::HashSet;
 
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 
 // ---------------------------------------------------------------------------

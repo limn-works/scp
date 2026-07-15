@@ -258,7 +258,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use scp_did::DID;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use scp_protocol::economy::types::{
         Amount, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
     };
