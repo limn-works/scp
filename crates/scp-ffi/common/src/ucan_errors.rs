@@ -131,10 +131,13 @@ mod tests {
     ///    literal instead of a `codes::` constant, the static regex sync test in
     ///    `trust.test.ts` passes but this test will catch a value mismatch.
     ///
-    /// 2. **Compile-time exhaustiveness guard** — if a new variant is added
-    ///    to `UcanError` without adding it here, the array literal will fail
-    ///    to compile, forcing a classification decision before the change can
-    ///    land.
+    /// 2. **Runtime coverage spot-list** — this array is NOT compiler-checked;
+    ///    a missing variant silently passes. The real exhaustiveness guarantee
+    ///    is the `match` in `ucan_error_code` (no `_ =>` arm), which the
+    ///    compiler enforces. This test exists solely to catch raw-literal drift:
+    ///    a match arm returning `"SCP-PERM-3009"` instead of `codes::PERM_3009`
+    ///    looks correct to the regex sync test in `trust.test.ts` but will
+    ///    produce a wrong value here.
     #[test]
     fn all_variants_route_to_perm_3001() {
         let variants: &[UcanError] = &[
