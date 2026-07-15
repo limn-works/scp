@@ -34,18 +34,24 @@
 //! 1. Event-log **leaf hashes + Merkle root** over a FIXED event sequence. Each
 //!    leaf is `SHA-256(0x00 ‖ rmp_serde(event))` (RFC 6962 domain separation over
 //!    the `MessagePack`-encoded `Event`); the root is the RFC 6962 Merkle root of
-//!    those leaves. Deterministic across targets because `rmp_serde` encodes every
-//!    field by name/tag with explicit `MessagePack` integer widths — the
-//!    serialized `u64` sequence/timestamp carry no native `usize`, and the
-//!    preimage has no float and no map iteration. This is the load-bearing §9.9.3
+//!    those leaves. Deterministic across targets because `rmp_serde::to_vec` emits
+//!    a **positional** `MessagePack` array with explicit integer widths (the `u64`
+//!    sequence/timestamp as big-endian `MessagePack` uints, the `[u8; 32]`
+//!    `prev_hash` as a fixed-length array) — so no native `usize` reaches the
+//!    preimage, and there is no float and no map iteration to order. NOTE: because
+//!    the encoding is positional (fields by index, not by name), a struct-field
+//!    REORDER silently changes the preimage; that change is caught by the committed
+//!    golden re-derivation this file forces. This is the load-bearing §9.9.3
 //!    convergence leg: the root alone masks compensating leaf-level bugs, so EACH
 //!    leaf hash is pinned too.
 //! 2. The **convergent-timestamp AAD** (`scp_mls::encode_convergent_timestamp_aad`)
 //!    over a fixed timestamp — the fixed 13-byte `SCPT ‖ version ‖ u64-BE` blob
 //!    (ADR-057 T3). Pure big-endian layout, no `usize` — target-independent.
 //! 3. The **credential encoding** (`ScpCredential::to_bytes`) from a fixed DID +
-//!    fixed `SigningKeyId` — `rmp_serde` is name-tagged and width-/endianness-
-//!    independent, and the credential carries no RNG-derived field.
+//!    fixed `SigningKeyId` — `rmp_serde::to_vec` emits a positional `MessagePack`
+//!    array with explicit integer widths, deterministic and width-/endianness-
+//!    independent; the credential carries no RNG-derived field (a struct-field
+//!    reorder would change the preimage and is guarded by the golden below).
 //! 4. **AEAD sender-layer roundtrip** for a FIXED key + message: assert
 //!    `decrypt(k, encrypt(k, m, …), …) == m`. We assert the ROUNDTRIP, not the
 //!    ciphertext bytes, precisely because the GCM nonce is random — the pipeline
@@ -64,6 +70,23 @@
 //! *encoding* determinism test, not a construction comparison: the same round-trip
 //! runs on native and wasm32, so a codec that diverges across targets is caught
 //! against the shared golden.
+//!
+//! **What each leg actually exercises (coverage honesty).** The **Commit** and
+//! **Welcome** legs round-trip a `PrivateMessage` / `Welcome` — an ENCRYPTED
+//! envelope — so they exercise only the OUTER framing codec (the length-prefixed
+//! ciphertext blobs, sender-data, epoch/content-type fields). The inner Commit
+//! body (proposal ordering, the `UpdatePath` nodes) rides ENCRYPTED inside that
+//! `PrivateMessage` ciphertext, so its TLS encoding is opaque to this round-trip
+//! and is NOT tested for cross-target determinism here (the `GroupContext` is not
+//! on this wire at all — it is the implicit AEAD context, never serialized into the
+//! frame). The **`KeyPackage`** leg is the one
+//! that reaches the deep codec surface: it round-trips a CLEARTEXT `LeafNode` with
+//! its nested TLS vectors (ciphersuite list, leaf/extension lists, the
+//! capabilities' proposal/credential-type vectors), so it DOES exercise
+//! nested-vector ordering and length-prefix determinism — exactly the `usize`/width
+//! and iteration-order surface a cross-target bug would hit. So nobody should
+//! over-read the Commit leg as proving Commit-BODY determinism; the `KeyPackage`
+//! leg carries the nested-structure guarantee.
 //!
 //! # Cross-target execution (transitive golden agreement)
 //!
@@ -141,7 +164,9 @@ const GOLDEN_MERKLE_ROOT_HEX: &str =
 const GOLDEN_CONVERGENT_TIMESTAMP_AAD_HEX: &str = "5343505401000000006553f100";
 
 /// GOLDEN: the `MessagePack` encoding of a fixed credential (fixed DID + Active
-/// key, no UCAN), hex-encoded. `rmp_serde` is name-tagged and target-independent.
+/// key, no UCAN), hex-encoded. `rmp_serde::to_vec` emits a positional array (the
+/// leading `0x93` is a 3-element `MessagePack` fixarray, NOT a name-keyed map),
+/// with explicit integer widths — target-independent.
 const GOLDEN_CREDENTIAL_HEX: &str = "93d9366469643a6468743a7a364d6b44657465726d696e69736d4b617446697874757265414141414141414141414141414141414141414141c0a723616374697665";
 
 // GOLDEN MLS wire blobs (captured once from a real add-member / key-package flow,
