@@ -1183,6 +1183,7 @@ pub async fn execute_restore_access(
 // execute_add_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 pub async fn execute_add_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -1247,6 +1248,39 @@ pub async fn execute_add_member(
     let welcome_bytes_out = add_output.welcome_bytes.clone();
     let commit_bytes_out = add_output.commit_bytes.clone();
     let commit_for_broadcast = add_output.commit_bytes.clone();
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) — join-time sender-key PUSH. Enqueue the
+    // inviter's CURRENT sender key for the newly-added member, mirroring the
+    // `join_context` add path (`lifecycle_helpers`, §9.16.2). The deleted provider
+    // `distribute_sender_key` used to do this on the invitation path; here we run
+    // its actor replacement on the actor-OWNED crypto: `distribute_sender_key`
+    // HPKE-seals the local sender key to the member's wrapping pubkey (extracted
+    // from the just-added KeyPackage's 0xFF01 leaf) and queues it onto
+    // `pending_distributions`; the async `drain_and_deliver_sender_keys` below
+    // MLS-wraps + delivers it over the management channel. Class-S — the enqueue
+    // touches the same actor crypto the add advanced, reached only through
+    // `rest_mut()` inside `commit_class_s_keep` (parity with the join add path).
+    // Best-effort disposition (M23, parity with the remove/revoke governance
+    // paths): a failure is warned and the add proceeds — the new member recovers
+    // the key via `SenderKeyRequest`. Gated on a non-empty Welcome so the
+    // `cfg(test)`/`testing` no-crypto pipeline (empty `AddMemberOutput`, no MLS
+    // group) skips it exactly as the broadcast + `WelcomeGenerated` emit below do.
+    let local_did = deps.crypto.local_did().to_owned();
+    if !welcome_bytes_out.is_empty()
+        && let Err(e) = cell
+            .commit_class_s_keep(deps, context_id, |mut v| {
+                v.rest_mut().distribute_sender_key(&local_did, did.as_ref())
+            })
+            .await
+    {
+        tracing::warn!(
+            context_id = %context_id,
+            member_did = %did,
+            error = %e,
+            "distribute_sender_key failed after member add — new member will \
+             recover via SenderKeyRequest"
+        );
+    }
 
     // The fallible role assignment + structural member insert run through the
     // field-granular Class-C role view (ADR-049 §9): `system_assign_role` mints +
@@ -1342,6 +1376,34 @@ pub async fn execute_add_member(
             context_id,
             failure,
         );
+    }
+
+    // ADR-049 PR-7: deliver the queued join-time sender-key distribution to the
+    // newly-added member over the MLS management channel (§9.16.2). Drains the
+    // actor-owned `pending_distributions` the `distribute_sender_key` above
+    // populated (same crypto state), MLS-wraps each entry, and sends it — the
+    // MLS-wrap is mandatory (see `drain_and_deliver_sender_keys`). Runs AFTER the
+    // best-effort persist (transport is async — ADR-049 Decision 7), matching the
+    // remove/revoke drain call sites. Best-effort: a per-target send failure is
+    // warned; the member recovers via `SenderKeyRequest`. `&mut` view scoped so
+    // `cell` is free afterward. No-op on the `cfg(test)` no-crypto pipeline (the
+    // queue is empty — `distribute_sender_key` was skipped above).
+    {
+        let mut view = cell.class_c_view();
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            view.mode_mut().crypto_mut(),
+            context_id,
+        )
+        .await
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                member_did = %did,
+                error = %e,
+                "failed to deliver join-time sender key after member add"
+            );
+        }
     }
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
