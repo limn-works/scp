@@ -38,7 +38,6 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use scp_did::{DID, SigningKeyId};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_platform::{KeyCustody, KeyHandle, KeyType};
-use scp_protocol::context::builder::OpenResult;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling};
 use scp_protocol::context::{
@@ -458,36 +457,18 @@ async fn reserve_bob_kp(
 }
 
 /// The joiner-side outcome of the shared bootstrap: everything a test needs to
-/// assert on the spawned joiner and drive MLS traffic through its group.
+/// assert on the spawned joiner and its installed group.
+///
+/// Post-ADR-049 PR-7 (SCP-CRYPTOMOVE-001) the steady-state crypto lives on the
+/// live actor, not the provider, so the tests assert reachable joiner state
+/// (registration, membership, installed epoch, pull-answer) through `sup` — they
+/// no longer take the bare provider crypto onto throwaway actor state. The full
+/// send/decrypt round-trips are owned by the fullstack suite (see
+/// `crates/scp-testing/tests/integration/welcome_delivery.rs`).
 struct Joined {
     sup: Arc<Supervisor>,
-    bob_crypto: Arc<MlsCryptoProvider>,
-    alice_crypto: Arc<MlsCryptoProvider>,
     ctx_id: String,
     ctx_bytes: [u8; 32],
-}
-
-/// Destructively move a provider-resident context onto a throwaway actor
-/// [`PerContextState`](crate::context::actor::state::PerContextState) via the
-/// retained `take_crypto_state` + the production `seed_encrypted_crypto_from_owned`
-/// seed primitive. Post-ADR-049 PR-7 the steady-state crypto twins
-/// (`mls_encrypt_management` / `seal` / `open`) live on the actor, so the
-/// round-trip tests move each party onto the actor first. One-way: the provider
-/// loses the context, so take each party exactly once.
-fn take_into_actor(
-    crypto: &Arc<MlsCryptoProvider>,
-    ctx: &[u8; 32],
-) -> crate::context::actor::state::PerContextState {
-    let owned = crypto
-        .take_crypto_state(ctx)
-        .expect("take owned crypto material off the provider");
-    let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
-        *ctx,
-        0,
-        DID::from(crypto.local_did().to_owned()),
-    );
-    state.seed_encrypted_crypto_from_owned(owned);
-    state
 }
 
 /// Runs the full reserve → creator-add → Welcome → `spawn_actor_from_welcome`
@@ -522,7 +503,10 @@ async fn run_join_with(
     let group_ctx_id = ctx_hex(seed);
     let group_ctx_bytes = context_id_to_bytes(&group_ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(persistence);
+    // `bob_crypto` (the joiner's provider) is emptied onto the live actor by the
+    // spawn below, so the realigned tests assert reachable joiner state through
+    // `sup`, not the provider — it is not retained in `Joined`.
+    let (sup, _bob_crypto) = bob_supervisor(persistence);
 
     // Bob reserves a real KP from his own store (private signer-state stays in
     // the actor; only the reservation id + public bytes come back). This also
@@ -579,8 +563,6 @@ async fn run_join_with(
         result,
         Joined {
             sup,
-            bob_crypto,
-            alice_crypto,
             ctx_id: request_ctx_id,
             ctx_bytes: request_ctx_bytes,
         },
@@ -717,64 +699,55 @@ async fn spawn_from_welcome_seeds_the_real_joined_group_epoch() {
 // Test B — bidirectional MLS round-trip through the entrypoint-installed group.
 // ---------------------------------------------------------------------------
 
-/// The entrypoint-installed group is BIDIRECTIONALLY functional: the creator
-/// encrypts a management message the joiner decrypts (creator → joiner), and the
-/// joiner encrypts a management message the creator decrypts (joiner → creator).
-/// The joiner-send direction is the landing signal — pre-2J the joiner had no
-/// send handle at all; here its group produces valid ciphertext the creator
-/// opens, and its actor is registered (`member_count` is `Some`).
+/// A Welcome-joined node comes up as a LIVE, send-capable participant whose
+/// joined group is installed at the correct absolute epoch — the unit-reachable
+/// landing state for BOTH traffic directions. Pre-2J the joiner had no send
+/// handle at all; here its actor is registered (`member_count` is `Some(2)`, the
+/// discriminator against the unregistered `None`), a send-gated `ContextHandle`
+/// exists, and the joined MLS group is installed at epoch 1 (the creator builds
+/// the group at epoch 0 and the add-Commit advances it to 1, so the Welcome is
+/// FOR epoch 1).
+///
+/// # Bidirectional round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
+///
+/// This test used to drive the bidirectional payload round-trip via
+/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the provider.
+/// PR-7 moved the seal/open crypto off the provider and onto the live actor, so
+/// the bare-provider `take_into_actor` seam would double-take an
+/// already-actor-resident context and panic — the round-trip is no longer
+/// expressible at the unit level. The full both-directions payload proof now
+/// lives at the fullstack integration test
+/// `welcome_joiner_round_trips_application_traffic_in_both_directions`
+/// (`crates/scp-testing/tests/integration/welcome_delivery.rs`), over the real
+/// actor mailbox + transport. This unit retains the unit-reachable, non-vacuous
+/// landing invariants (registered + installed at the joined epoch); the
+/// send-gate behavioral pin lives in
+/// [`spawn_from_welcome_joiner_is_active_and_send_capable`].
 #[tokio::test]
 async fn spawn_from_welcome_group_round_trips_both_directions() {
     let (result, j) = join_bob(0x22, None).await;
     result.expect("spawn_actor_from_welcome succeeds");
 
-    let routing_id = scp_protocol::context::context_routing_id(&hex::encode(j.ctx_bytes));
-
-    // Move both parties onto the actor seam (the provider mls_encrypt_management
-    // / open twins are deleted post-ADR-049 PR-7). Management traffic is
-    // group-keyed (no sender key needed), so both actors round-trip directly.
-    let mut alice_actor = take_into_actor(&j.alice_crypto, &j.ctx_bytes);
-    let mut bob_actor = take_into_actor(&j.bob_crypto, &j.ctx_bytes);
-
-    // Creator -> joiner: Alice encrypts, Bob's installed group decrypts.
-    let from_alice = b"management-payload-from-alice";
-    let wrapped_alice = alice_actor
-        .mls_encrypt_management(from_alice, &routing_id, 3600)
-        .expect("alice encrypts a management message");
-    let opened_alice = bob_actor
-        .open(&scp_clock::SystemClock, &j.ctx_id, &wrapped_alice)
-        .expect("bob opens alice's message");
-    assert!(
-        matches!(
-            &opened_alice,
-            OpenResult::Management { payload, .. } if payload.as_slice() == from_alice.as_slice()
-        ),
-        "joiner decrypts creator traffic through the installed group; \
-         expected Management({from_alice:?}), got {opened_alice:?}"
-    );
-
-    // Joiner -> creator: Bob encrypts through his installed group, Alice decrypts.
-    // Pre-2J this direction was impossible (the joiner had no send-capable group
-    // wired into an actor). Both the actor handle AND the group now exist.
+    // Live-actor discriminator: `Some(2)` (vs the unregistered `None`) — the
+    // joiner's send handle is live and its mailbox serves membership queries.
     assert_eq!(
         j.sup.member_count(&j.ctx_id).await,
         Some(2),
-        "joiner send handle is live"
+        "the joiner's actor is registered and serves its mailbox (send handle live)"
     );
-    let from_bob = b"management-payload-from-bob";
-    let wrapped_bob = bob_actor
-        .mls_encrypt_management(from_bob, &routing_id, 3600)
-        .expect("bob encrypts a management message through the joined group");
-    let opened_bob = alice_actor
-        .open(&scp_clock::SystemClock, &j.ctx_id, &wrapped_bob)
-        .expect("alice opens bob's message");
     assert!(
-        matches!(
-            &opened_bob,
-            OpenResult::Management { payload, .. } if payload.as_slice() == from_bob.as_slice()
-        ),
-        "creator decrypts joiner traffic — bidirectional round-trip closed; \
-         expected Management({from_bob:?}), got {opened_bob:?}"
+        j.sup.lookup(&j.ctx_id).is_some(),
+        "a context actor handle is registered for the joiner"
+    );
+
+    // The joined MLS group is installed at the joined group's REAL absolute epoch
+    // (1), not a `0` placeholder — the receive-capable seed for both directions.
+    // `local_mls_epoch` returns `Some(state.epoch.mls_epoch)`, so `Some(1)`
+    // discriminates against an absent group (`None`) AND a wrong seed.
+    assert_eq!(
+        j.sup.local_mls_epoch(&j.ctx_id).await,
+        Some(1),
+        "the joined MLS group is installed at the joined absolute epoch (1)"
     );
 }
 
@@ -1655,17 +1628,30 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
 /// The two PUBLIC bare-`DID` `Supervisor` bootstrap entrypoints compose into a
 /// working join: `reserve_key_package` reserves one of the joiner's own pooled
 /// `KeyPackages`, the creator builds a Welcome addressed to it, and
-/// `spawn_actor_from_welcome` fuses that Welcome into a live, send-capable
-/// actor. The joiner comes up registered (`member_count` is `Some(2)`, the
-/// live-actor discriminator) and the installed group is bidirectionally
-/// functional (bob encrypts through it, alice decrypts).
+/// `spawn_actor_from_welcome` fuses that Welcome into a live, send-capable actor.
+/// The joiner comes up registered (`member_count` is `Some(2)`, the live-actor
+/// discriminator) with its joined group installed at the joined absolute epoch
+/// (1) — the unit-reachable landing state proving these PUBLIC entrypoints
+/// compose into a live participant.
+///
+/// # Round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
+///
+/// This test used to additionally drive a bob→alice payload round-trip via
+/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the provider.
+/// PR-7 moved the seal/open crypto onto the live actor, so the bare-provider
+/// `take_into_actor` seam double-takes an already-actor-resident context and
+/// panics. The full round-trip over the real actor mailbox + transport lives at
+/// the fullstack tests `welcome_joiner_application_data_round_trips_to_creator`
+/// and `welcome_joiner_round_trips_application_traffic_in_both_directions`
+/// (`crates/scp-testing/tests/integration/welcome_delivery.rs`).
 #[tokio::test]
 async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0xb1);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    // The joiner's own supervisor. `bob_crypto` is retained by the fixture but
+    // unused here — the payload round-trip that drove it relocated to fullstack.
+    let (sup, _bob_crypto) = bob_supervisor(None);
 
     // Publish bob's wrapping key so his pooled KP declares `0xFF02` (valn0502).
     set_bob_wrapping(&sup, &bob).await;
@@ -1679,7 +1665,7 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
         .expect("reserve_key_package yields a reservation for the identity");
 
     // Alice (bare creator provider) adds the reserved KP → the real Welcome.
-    let (alice_crypto, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+    let (_alice_crypto, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
     // Spawn via the PUBLIC `Supervisor` entrypoint — the reservation feeds
     // straight in through the creator-signed, sealed bundle.
@@ -1716,26 +1702,15 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
         "a context actor handle is registered for the joiner"
     );
 
-    // The installed group is real: bob encrypts through it, alice decrypts. Both
-    // parties move onto the actor seam (the provider mls_encrypt_management / open
-    // twins are deleted post-ADR-049 PR-7); management traffic is group-keyed.
-    let routing_id = scp_protocol::context::context_routing_id(&hex::encode(ctx_bytes));
-    let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
-    let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
-    let from_bob = b"supervisor-seam-payload-from-bob";
-    let wrapped_bob = bob_actor
-        .mls_encrypt_management(from_bob, &routing_id, 3600)
-        .expect("bob encrypts a management message through the installed group");
-    let opened = alice_actor
-        .open(&scp_clock::SystemClock, &ctx_id, &wrapped_bob)
-        .expect("alice opens bob's message");
-    assert!(
-        matches!(
-            &opened,
-            OpenResult::Management { payload, .. } if payload.as_slice() == from_bob.as_slice()
-        ),
-        "creator decrypts joiner traffic through the installed group; \
-         expected Management({from_bob:?}), got {opened:?}"
+    // The joined MLS group is installed at the joined group's REAL absolute epoch
+    // (1) — the unit-reachable proof the reserve→spawn public entrypoints stood up
+    // a live, correctly-keyed context (`Some(1)` discriminates against an absent
+    // group `None` and a wrong seed). The full send/decrypt round-trip lives at
+    // fullstack (see the doc comment).
+    assert_eq!(
+        sup.local_mls_epoch(&ctx_id).await,
+        Some(1),
+        "the reserve->spawn join installs the joined group at the joined epoch (1)"
     );
 }
 
@@ -2287,22 +2262,37 @@ async fn structurally_inconsistent_bundle_is_rejected() {
 // up as a live, bidirectionally-functional member.
 // ---------------------------------------------------------------------------
 
-/// Alice creates an encrypted context, `invite_member` produces the signed,
+/// Alice creates an encrypted context, `invite_member` (the flagship creator-side
+/// path) runs the real in-actor governance MLS add and produces the signed,
 /// sealed invitation for Bob's reserved KeyPackage, and Bob's
 /// `spawn_actor_from_welcome` opens it (split custody), verifies the creator
-/// signature, and stands up a live actor whose installed group round-trips MLS
-/// traffic in BOTH directions. Bob's #active custody holds the SAME key
-/// `pair_resolver` returns for `BOB_DID`, so the invitation (sealed to that
-/// resolved #active) opens.
+/// signature, and stands up a live actor with the joined group installed at the
+/// joined absolute epoch (1). Two DISTINCT non-vacuous invariants this test alone
+/// pins: (i) the CREATOR's own `role_state` reflects Bob after the in-actor add
+/// (`alice_sup.member_count == Some(2)` — the split-brain the old off-mailbox add
+/// left behind is closed); (ii) the invited joiner comes up registered on its OWN
+/// supervisor. Bob's #active custody holds the SAME key `pair_resolver` returns
+/// for `BOB_DID`, so the invitation (sealed to that resolved #active) opens.
+///
+/// # Bidirectional round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
+///
+/// This test used to additionally drive a bidirectional payload round-trip via
+/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the
+/// providers. PR-7 moved the seal/open crypto onto the live actor, so the
+/// bare-provider `take_into_actor` seam double-takes an already-actor-resident
+/// context and panics. The full both-directions payload proof over the real actor
+/// mailbox + transport lives at the fullstack test
+/// `welcome_joiner_round_trips_application_traffic_in_both_directions`
+/// (`crates/scp-testing/tests/integration/welcome_delivery.rs`).
 #[tokio::test]
 async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
     let ctx_id = ctx_hex(0xd5);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
     let alice = DID::from(ALICE_DID);
     let bob = DID::from(BOB_DID);
 
-    // (a) Alice creates the encrypted context.
-    let (alice_sup, alice_crypto) = alice_supervisor();
+    // (a) Alice creates the encrypted context. `alice_crypto` is retained by the
+    //     fixture but unused here — the payload round-trip relocated to fullstack.
+    let (alice_sup, _alice_crypto) = alice_supervisor();
     alice_sup
         .create_context(
             ctx_id.clone(),
@@ -2314,8 +2304,9 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         .expect("alice creates the encrypted context");
 
     // (b) Bob reserves a KeyPackage from HIS OWN supervisor + store (declares
-    //     0xFF02 via `reserve_bob_kp`'s wrapping-key publish).
-    let (bob_sup, bob_crypto) = bob_supervisor(None);
+    //     0xFF02 via `reserve_bob_kp`'s wrapping-key publish). `bob_crypto` is
+    //     retained by the fixture but unused — the round-trip relocated to fullstack.
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
     // (c) Alice invites Bob: the add is routed through the context actor's
@@ -2368,51 +2359,24 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         .expect("bob joins from alice's real invitation");
     assert_eq!(handle.context_id(), ctx_id);
 
-    // (e) Bob is a live, registered member and his joined group is installed.
+    // (e) Bob is a live, registered member on HIS OWN supervisor, and his joined
+    //     group is installed at the joined absolute epoch (1) — the invitation
+    //     built the group at epoch 0 and the add-Commit advanced it to 1, so the
+    //     Welcome is FOR epoch 1. `Some(1)` discriminates against an absent group
+    //     (`None`) and a wrong seed.
     assert_eq!(
         bob_sup.member_count(&ctx_id).await,
         Some(2),
         "the invited joiner stands up a live, send-capable actor"
     );
     assert!(
-        bob_sup.local_mls_epoch(&ctx_id).await.is_some(),
-        "bob's joined MLS group is installed"
+        bob_sup.lookup(&ctx_id).is_some(),
+        "a context actor handle is registered for the invited joiner"
     );
-
-    // Bidirectional MLS traffic through the invitation-installed group. Both
-    // parties move onto the actor seam (the provider mls_encrypt_management / open
-    // twins are deleted post-ADR-049 PR-7); management traffic is group-keyed.
-    let routing_id = scp_protocol::context::context_routing_id(&hex::encode(ctx_bytes));
-    let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
-    let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
-    let from_alice = b"invite-member-round-trip-from-alice";
-    let wrapped_alice = alice_actor
-        .mls_encrypt_management(from_alice, &routing_id, 3600)
-        .expect("alice encrypts a management message");
-    let opened_alice = bob_actor
-        .open(&scp_clock::SystemClock, &ctx_id, &wrapped_alice)
-        .expect("bob opens alice's message");
-    assert!(
-        matches!(
-            &opened_alice,
-            OpenResult::Management { payload, .. } if payload.as_slice() == from_alice.as_slice()
-        ),
-        "bob decrypts alice's traffic through the invitation-installed group; got {opened_alice:?}"
-    );
-
-    let from_bob = b"invite-member-round-trip-from-bob";
-    let wrapped_bob = bob_actor
-        .mls_encrypt_management(from_bob, &routing_id, 3600)
-        .expect("bob encrypts a management message");
-    let opened_bob = alice_actor
-        .open(&scp_clock::SystemClock, &ctx_id, &wrapped_bob)
-        .expect("alice opens bob's message");
-    assert!(
-        matches!(
-            &opened_bob,
-            OpenResult::Management { payload, .. } if payload.as_slice() == from_bob.as_slice()
-        ),
-        "alice decrypts bob's traffic — bidirectional round-trip closed; got {opened_bob:?}"
+    assert_eq!(
+        bob_sup.local_mls_epoch(&ctx_id).await,
+        Some(1),
+        "bob's joined MLS group is installed at the joined absolute epoch (1)"
     );
 }
 
@@ -3088,11 +3052,11 @@ fn bob_supervisor_with_transport(transport: Box<dyn ContextTransportProvider>) -
 /// up is `Active` and SEND-CAPABLE through its actor command path — not merely
 /// crypto-capable.
 ///
-/// The existing round-trip tests
+/// The sibling landing-state tests
 /// ([`spawn_from_welcome_group_round_trips_both_directions`],
-/// [`invite_member_round_trip_stands_up_a_bidirectional_joiner`]) drive
-/// `mls_encrypt_management` DIRECTLY on the crypto provider, which BYPASSES the
-/// lifecycle send-gate: an application send routed through
+/// [`invite_member_round_trip_stands_up_a_bidirectional_joiner`]) assert only the
+/// reachable joiner state (registered, group installed at the joined epoch); they
+/// do NOT exercise the lifecycle send-gate. An application send routed through
 /// `Supervisor::send_message` (→ `MessagingCommand::SendMessage` →
 /// `state::require_active` in `messaging.rs`) is the ONLY path that exercises
 /// it. Step 3a of `spawn_actor_from_welcome` transitions the joiner's handle to
@@ -3200,71 +3164,69 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
 // Test §9(b)-app — a real B→A APPLICATION-DATA round-trip (coverage gap pin).
 // ---------------------------------------------------------------------------
 
-/// §9(b) APPLICATION-path pin: a Welcome-joiner (Bob) seals a real application
-/// message and the creator (Alice) opens it.
+/// §9.16.6 Mitigation-1 pin (unit-reachable half of the B→A application path):
+/// a Welcome-joiner's live ACTOR ANSWERS an incumbent's §9.16.2 sender-key PULL,
+/// reading membership from the joined MLS group tree — NOT the empty
+/// `member_wrapping_keys` cache.
 ///
-/// # Why this test exists (the coverage gap that shipped a bug green)
+/// # The regression this pins (the coverage gap that shipped a bug green)
 ///
-/// The existing bidirectional round-trip tests
-/// ([`spawn_from_welcome_group_round_trips_both_directions`],
-/// [`invite_member_round_trip_stands_up_a_bidirectional_joiner`]) drive
-/// [`MlsCryptoProvider::mls_encrypt_management`] / [`MlsCryptoProvider::open`],
-/// which travels the MANAGEMENT path: MLS-encrypt only, decoded as
-/// [`OpenResult::Management`]. That path NEVER touches the per-sender key layer.
-/// Application messages ride an extra AEAD layer keyed by the sender's sender
-/// key (distributed out-of-band via HPKE), decoded as [`OpenResult::Application`].
+/// Application messages ride a per-sender AEAD layer on top of the MLS group key,
+/// so for the creator (Alice) to open a joiner's (Bob's) application traffic she
+/// must first hold Bob's sender key. A Welcome-joiner cannot PUSH its key (a push
+/// seals to each incumbent's STABLE `0xFF01` wrapping key, which openmls 0.8.1
+/// does not expose from a joined group, ADR-057), so incumbents PULL it (§9.16.2).
+/// The pull answer originally gated membership on the `member_wrapping_keys` cache
+/// — EMPTY for a joiner — and rejected every incumbent's request as "from a
+/// non-member", leaving the joiner RECEIVE-ONLY. The fix reads membership from the
+/// joiner's MLS group tree (§9.16.6 Mitigation 1).
 ///
-/// Because no test exercised the B→A *application* direction, a real defect
-/// shipped green: a Welcome-joiner was RECEIVE-ONLY. The joiner cannot proactively
-/// PUSH its sender key to incumbents (a push seals to each incumbent's STABLE
-/// `0xFF01` wrapping key, which openmls 0.8.1 does not expose from a joined group,
-/// ADR-057), so incumbents must PULL it (§9.16.2). But the pull answer,
-/// [`MlsCryptoProvider::handle_sender_key_request`], gated membership on the
-/// `member_wrapping_keys` cache — which is EMPTY for a joiner — and so rejected
-/// every incumbent's request as "from a non-member". The fix reads membership from
-/// the joiner's MLS group tree instead (§9.16.6 Mitigation 1). This test drives the
-/// real PULL round trip end-to-end and then the FULL application pipeline: `seal`
-/// (sender-key AEAD → MLS application encrypt → outer envelope) on Bob and `open`
-/// (MLS decrypt → sender-key AEAD decrypt → deserialize) on Alice.
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) moved the answer onto the live actor: the
+/// pull is answered by `Supervisor::handle_sender_key_request` (the `context/`
+/// actor's `ContextCryptoState::handle_sender_key_request`), the SAME H1 gate now
+/// on the actor. This test drives that ACTOR answer directly — the unit-reachable
+/// non-vacuity anchor.
+///
+/// # Full application round-trip relocated to fullstack (ADR-049 PR-7)
+///
+/// The remaining half — Bob SEALS an application message and Alice OPENS it (the
+/// `seal` → `open` application pipeline) — used to run here by taking both parties'
+/// crypto onto throwaway actor state via `take_into_actor`. PR-7 made the crypto
+/// already-actor-resident after spawn, so that seam double-takes and panics. The
+/// end-to-end B→A application seal/open round-trip (with payload equality) now
+/// lives at the fullstack test `welcome_joiner_application_data_round_trips_to_creator`
+/// (`crates/scp-testing/tests/integration/welcome_delivery.rs`), whose join path
+/// runs this very PULL via `incumbents_pull_joiner_sender_key`.
 ///
 /// # Non-vacuity
 ///
-/// The round trip fails CLOSED — not silently — if the fix is reverted:
-/// - If `handle_sender_key_request` is reverted to the `member_wrapping_keys`
-///   gate, Bob returns `Err("sender key request from non-member")` and the
-///   `expect` on Bob's response panics — Alice never obtains Bob's key.
-/// - Even past that, if Alice's opened key is wrong or unstored, `open` returns
-///   `Err(CryptoFailed("sender key lookup failed"))` at step 2 of the Application
-///   arm, or the recovered plaintext mismatches.
-/// - If Bob's joined group is at the wrong epoch relative to Alice, the MLS
-///   decrypt at step 1 fails before the sender-key layer is even reached.
-///
-/// A passing management-path round-trip does NOT imply a passing application-path
-/// round-trip — that gap is exactly what this test pins.
+/// If the H1 gate is reverted to the `member_wrapping_keys` check, Bob's actor
+/// declines (returns `Ok(None)` / `Err`) and the `expect`s below fail — this test
+/// cannot pass on the old, buggy gate. The `sender_did == BOB_DID` assertion
+/// further proves the answer carries BOB's key (not an empty/echoed response).
 #[tokio::test]
 async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
     // Bob joins Alice's real SCP context group via the Welcome path.
     let (result, j) = join_bob(0x40, None).await;
     result.expect("spawn_actor_from_welcome succeeds");
 
-    // Alice (the incumbent) PULLS Bob's sender key via the §9.16.2 request/
-    // response protocol — the spec's canonical new-member mechanism, and the only
-    // one openmls 0.8.1 supports for a joiner (a joiner cannot push; ADR-057).
-    // Alice issues a signed `SenderKeyRequest` carrying a FRESH EPHEMERAL wrapping
-    // key; Bob answers via `handle_sender_key_request`; Alice opens the response
-    // with her ephemeral secret and stores Bob's key. Application messages ride
-    // the sender-key layer, so without this Alice cannot decrypt Bob's traffic.
-    //
-    // NON-VACUITY ANCHOR: `handle_sender_key_request` is exactly where the H1
-    // membership gate lives. Bob's `member_wrapping_keys` is empty (a joiner never
-    // caches incumbents' stable keys), so if the gate is reverted to the cache
-    // check Bob returns `Err("sender key request from non-member")` and the first
-    // `expect` below panics — this test cannot pass on the old, buggy gate.
+    // Landing state: the joiner is registered and its joined group is installed at
+    // the joined absolute epoch (1) — the prerequisites for answering a pull.
+    assert_eq!(
+        j.sup.member_count(&j.ctx_id).await,
+        Some(2),
+        "the joiner's actor is registered and serves its mailbox"
+    );
+    assert_eq!(
+        j.sup.local_mls_epoch(&j.ctx_id).await,
+        Some(1),
+        "the joined MLS group is installed at the joined absolute epoch (1)"
+    );
+
+    // Alice (the incumbent) builds a signed §9.16.2 `SenderKeyRequest` carrying a
+    // FRESH EPHEMERAL wrapping key (generated INSIDE `request_sender_key`).
     let alice_signing = alice_signing_key();
     let custody = InMemoryKeyCustody::new();
-    // Alice's #active signing key, for the request signature. The EPHEMERAL
-    // wrapping keypair is generated INSIDE `request_sender_key` (custody-held),
-    // and its handle comes back as `request.wrapping_key_handle`.
     let alice_signing_handle = custody.import_ed25519_key(&alice_signing.to_bytes()).await;
     let request = crate::crypto::sender_keys::key_protocol::request_sender_key(
         &custody,
@@ -3277,102 +3239,29 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
     .await
     .expect("alice builds a signed sender-key request for bob's key");
 
-    let blocked = std::collections::HashSet::new();
+    // Bob's LIVE ACTOR answers via `Supervisor::handle_sender_key_request` (ADR-049
+    // PR-7): the H1 §9.16.6 Mitigation-1 membership gate now runs on the actor's
+    // OWNED crypto state, reading Bob's MLS group tree (Alice is a member) rather
+    // than his empty `member_wrapping_keys` cache. A reverted gate returns `None` /
+    // `Err` here and the `expect`s fail.
     let response_bytes = j
-        .bob_crypto
+        .sup
         .handle_sender_key_request(
-            &j.ctx_bytes,
+            &j.ctx_id,
             &request.request_message,
             alice_signing.verifying_key().as_bytes(),
-            &blocked,
         )
+        .await
         .expect(
-            "bob ACCEPTS alice's sender-key request — the H1 gate reads bob's MLS group \
-             membership, not his empty member_wrapping_keys cache (§9.16.6 Mitigation 1)",
+            "bob's actor ACCEPTS alice's sender-key request — the H1 gate reads bob's MLS \
+             group membership, not his empty member_wrapping_keys cache (§9.16.6 Mitigation 1)",
         )
-        .expect("bob returns a response for a non-blocked member");
+        .expect("bob's actor returns a response for a member requester");
 
     let response: scp_protocol::crypto::sender_keys::SenderKeyResponse =
         rmp_serde::from_slice(&response_bytes).expect("decode bob's SenderKeyResponse");
     assert_eq!(
         response.sender_did, BOB_DID,
-        "the response carries bob's sender key"
-    );
-    let ctx_id_hex = hex::encode(j.ctx_bytes);
-    let bob_key = crate::crypto::sender_keys::key_protocol::open_sender_key_response(
-        &custody,
-        &request.wrapping_key_handle,
-        &ctx_id_hex,
-        &response,
-    )
-    .await
-    .expect("alice opens bob's HPKE-sealed sender key with her ephemeral secret");
-    // ADR-049 PR-6: store returns the authenticated (key, epoch); install is a
-    // separate explicit set_sender_key_unchecked (mirrors production seam 2).
-    let (bob_key, _epoch) = j
-        .alice_crypto
-        .store_member_sender_key(&j.ctx_bytes, BOB_DID, bob_key, response.epoch)
-        .expect("alice verifies + returns bob's pulled sender key");
-    j.alice_crypto
-        .set_sender_key_unchecked(&j.ctx_bytes, BOB_DID, bob_key);
-
-    // Bob seals a REAL application message through the full send pipeline.
-    let payload = b"application-data-from-the-welcome-joiner-\xc2\xa79b";
-    let params = crate::envelope::inner::InnerEnvelopeParams {
-        version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-        context_id: &j.ctx_id,
-        sender_did: BOB_DID,
-        epoch: 0,
-        generation: 0,
-        sequence: 0,
-        timestamp: 1_700_000_000,
-        message_type: crate::envelope::inner::MessageType::Content,
-        payload,
-        provenance: None,
-        signing_key_id: SigningKeyId::Active,
-    };
-    let inner =
-        crate::envelope::inner::sign::create_inner_envelope_raw(&params, &bob_signing_key())
-            .expect("bob builds a signed application inner envelope");
-    let routing_id = scp_protocol::context::context_routing_id(&j.ctx_id);
-    // Bob seals through his actor; Alice opens through hers (the provider seal /
-    // open twins are deleted post-ADR-049 PR-7). Alice's actor is taken AFTER the
-    // sender-key install above, so it carries Bob's pulled sender key.
-    let mut bob_actor = take_into_actor(&j.bob_crypto, &j.ctx_bytes);
-    let mut alice_actor = take_into_actor(&j.alice_crypto, &j.ctx_bytes);
-    let sealed = bob_actor
-        .seal(BOB_DID, &inner, &routing_id, 3600)
-        .expect("bob seals the application message through the joined group");
-
-    // Alice opens Bob's APPLICATION ciphertext — the direction + layer no
-    // management-path test reaches. Fails closed on an epoch mismatch (MLS
-    // decrypt) or a missing sender key (sender-key lookup).
-    let opened = alice_actor
-        .open(&scp_clock::SystemClock, &j.ctx_id, &sealed)
-        .expect("alice opens bob's application ciphertext (B→A application round-trip)");
-    // ADR-049 §10 bans the panic family across the whole `context/` tree; the
-    // panic-ban scanner reads this `#[cfg(test)]`-gated file standalone (the gate
-    // sits on the parent `mod` in supervisor/mod.rs), so a bare `panic!` here is
-    // flagged. Assert the variant instead — a test assertion the gate accepts —
-    // then destructure the now-proven `Application` payload.
-    assert!(
-        matches!(opened, OpenResult::Application(_)),
-        "expected OpenResult::Application from a sealed app message, got {opened:?}",
-    );
-    let OpenResult::Application(env) = opened else {
-        // Unreachable: the assertion above already failed the test otherwise.
-        return;
-    };
-    let env = *env;
-    assert_eq!(
-        env.sender_did, BOB_DID,
-        "the opened application message is attributed to the joiner (bob)"
-    );
-    let recovered = scp_protocol::envelope::padding::strip_padding(&env.inner.payload)
-        .expect("strip bucket padding from the opened application payload");
-    assert_eq!(
-        recovered.as_slice(),
-        payload.as_slice(),
-        "alice recovers bob's exact application plaintext — B→A application round-trip closed"
+        "the response carries bob's sender key (not an empty/echoed answer)"
     );
 }
