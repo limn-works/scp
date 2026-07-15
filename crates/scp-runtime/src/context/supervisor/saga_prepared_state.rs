@@ -1048,4 +1048,70 @@ mod tests {
         assert_eq!(inner.frontier.billed_count(), expected_billed);
         assert_eq!(inner.frontier.leaf_count(), expected_leaves);
     }
+
+    /// SCP-OUT-046 AC4: the durable `SagaId`-keyed capture is the O(log n)
+    /// RFC-6962 [`MerkleFrontier`] + credit ledger — a replay SNAPSHOT, NOT a
+    /// full-payload buffer. This is the load-bearing memory property: the durable
+    /// per-`SagaId` state MUST NOT grow O(n) in the chunk count, or a long stream
+    /// would let the invoker exhaust the target's Class-S storage.
+    ///
+    /// Proof: fold two very different chunk counts (64 and 4096, both powers of two
+    /// so the frontier holds exactly ONE perfect-subtree peak) and serialize the
+    /// durable `MerkleFrontier`. The two serialized captures are the SAME size up
+    /// to the few digits by which the `leaf_count`/`billed_count` integers widen —
+    /// the per-chunk payloads are NOT retained. A full-payload buffer over 4096
+    /// chunks would be orders of magnitude larger (>128 KiB of chunk hashes alone);
+    /// the durable capture stays a few hundred bytes regardless of chunk count.
+    #[test]
+    fn streaming_frontier_capture_memory_is_sublinear_in_chunk_count() {
+        use scp_protocol::context::outlets::stream::{
+            ChunkPayload, MerkleFrontier, OutletStreamChunk,
+        };
+
+        fn fold_n(n: u64) -> MerkleFrontier {
+            let mut frontier = MerkleFrontier::new();
+            for seq in 0..n {
+                frontier
+                    .push(&OutletStreamChunk {
+                        request_id: [0x11u8; 16],
+                        sequence: seq,
+                        payload: ChunkPayload::Data {
+                            value: serde_json::json!({ "seq": seq }),
+                        },
+                        sig: [0x22u8; 64],
+                    })
+                    .expect("valid chunk hashes");
+            }
+            frontier
+        }
+
+        let small = fold_n(64);
+        let large = fold_n(4096);
+
+        // Both fold EVERY chunk (nothing dropped) — the capture is complete.
+        assert_eq!(small.leaf_count(), 64);
+        assert_eq!(large.leaf_count(), 4096);
+
+        let small_bytes = serde_json::to_vec(&small).expect("serialize small frontier");
+        let large_bytes = serde_json::to_vec(&large).expect("serialize large frontier");
+
+        // A 64× increase in chunk count adds only the handful of digits by which the
+        // `leaf_count`/`billed_count` integers widen — NOT 64× the bytes. Both
+        // powers of two hold exactly one peak, so the peak set is identical in size.
+        assert!(
+            large_bytes.len() <= small_bytes.len() + 8,
+            "durable frontier capture must be O(log n): 64 chunks serialized to {} bytes, \
+             4096 chunks to {} bytes — a payload buffer, not a frontier",
+            small_bytes.len(),
+            large_bytes.len(),
+        );
+
+        // Absolute bound: the capture stays tiny regardless of chunk count. A
+        // full-payload buffer of even the 4096 chunk *hashes* would be >128 KiB.
+        assert!(
+            large_bytes.len() < 512,
+            "the 4096-chunk durable capture is {} bytes — memory does not grow O(n)",
+            large_bytes.len(),
+        );
+    }
 }
