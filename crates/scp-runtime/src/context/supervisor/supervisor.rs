@@ -30896,7 +30896,6 @@ mod streaming_saga_tests {
     /// modelling a mid-stream crash: the seal task forwards + durably captures the
     /// prefix, then wedges, so the journal stays `Committing` and no seal witness is
     /// written — the truncated-close recovery surface is what seals it (AC7).
-    #[allow(dead_code)]
     struct PrefixThenBlockExecutor {
         data_chunks: u32,
         invoked: Arc<AtomicUsize>,
@@ -31535,5 +31534,260 @@ mod streaming_saga_tests {
         );
 
         drop(invoked);
+    }
+
+    /// COMMIT 2 — AC7: mid-stream crash seals the durable prefix and closes
+    /// truncated, never re-invoking the outlet.
+    ///
+    /// The executor emits 5 `Data` chunks then wedges (no terminal), modelling a
+    /// crash: the off-mailbox seal forwards + durably captures the prefix, then
+    /// blocks — the journal stays `Committing` and no seal witness is written.
+    ///
+    /// - KEYLESS path (`replay_unresolved_sagas`): witness absent ⇒ the autonomous
+    ///   sweep marks the saga `NeedsRepair` and HOLDS the escrow (the runtime has no
+    ///   signing key to seal a truncated prefix).
+    /// - KEY-BEARING path (`recover_streaming_saga_truncated_close`): given B's
+    ///   Active Signing Key it seals the RESTORED durable prefix — the receipt root
+    ///   is the manifest over the sealed prefix (NOT the full stream), the escrow
+    ///   settles at the prefix `billed_count`, and the outlet exec fn is invoked
+    ///   EXACTLY once (no re-invoke on the replayed close).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_truncated_close_ac7() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let supervisor =
+            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        spawn_ss_pair(&supervisor).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x47; 16]);
+        let executor = Arc::new(PrefixThenBlockExecutor {
+            data_chunks: 5,
+            invoked: Arc::clone(&invoked),
+        });
+        let target_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+
+        let mut handle = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0xA7u8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                executor,
+                Some(binding),
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                params,
+            )
+            .await
+            .expect("the paid streaming saga starts");
+
+        let saga_id = handle.saga_id.clone();
+        let target_hex = hex::encode(SS_TARGET);
+        let actor = supervisor
+            .lookup(&target_hex)
+            .expect("target actor resident");
+
+        // Drain the forwarded prefix. The executor emits 5 Data chunks then wedges,
+        // so the 6th recv times out — the seal has forwarded + captured the prefix
+        // and is blocked (no terminal).
+        let mut received: Vec<_> = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_secs(1), handle.receiver.recv()).await
+        {
+            assert!(
+                matches!(frame.chunk.payload, ChunkPayload::Data { .. }),
+                "the wedged executor emits only Data chunks (no terminal)"
+            );
+            received.push(frame.chunk.clone());
+        }
+        assert_eq!(
+            received.len(),
+            5,
+            "the executor forwarded exactly its 5-chunk prefix before wedging"
+        );
+
+        // Settle barrier: force a few B-actor mailbox round-trips so any in-flight
+        // durable StreamCaptureAppend for the last forwarded chunk lands before we
+        // recover (the fold is FIFO on the same mailbox the roundtrip uses).
+        for _ in 0..25 {
+            let sid = saga_id.clone();
+            let _ = actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
+                        saga_id: sid,
+                        reply,
+                    })
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The journal is still Committing (the wedged seal never sealed) and no
+        // witness exists yet.
+        assert_eq!(
+            ss_saga_state(&journal, &saga_id).await,
+            Some(SagaState::Committing),
+            "a wedged seal leaves the journal Committing (no seal-close)"
+        );
+        let witness_before = {
+            let sid = saga_id.clone();
+            actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
+                        saga_id: sid,
+                        reply,
+                    })
+                })
+                .await
+                .expect("witness check")
+        };
+        assert!(
+            !witness_before,
+            "no seal witness before recovery (truncated)"
+        );
+
+        // The escrow is HELD during the crash window (reserved, not settled).
+        let held = ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await;
+        assert_eq!(
+            held,
+            Amount::new(SS_GRANTED - SS_RESERVED),
+            "the escrow reservation is HELD across the crash (not auto-refunded)"
+        );
+
+        // KEYLESS recovery — the autonomous sweep finds the Committing streaming
+        // entry, sees the witness absent, and marks NeedsRepair (escrow HELD; the
+        // runtime holds no signing key to seal the prefix).
+        supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("keyless recovery sweep runs");
+        assert_eq!(
+            ss_saga_state(&journal, &saga_id).await,
+            Some(SagaState::NeedsRepair),
+            "AC7 (keyless): witness-absent truncated saga is marked NeedsRepair"
+        );
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_RESERVED),
+            "AC7 (keyless): the escrow is HELD for the key-bearing close (never auto-voided)"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "keyless recovery never re-invokes the outlet"
+        );
+
+        // KEY-BEARING recovery — seal the RESTORED durable prefix with B's Active
+        // Signing Key. NEVER re-opens the stream / re-invokes the executor.
+        supervisor
+            .recover_streaming_saga_truncated_close(
+                saga_id.clone(),
+                SS_TARGET,
+                SigningKeyBytes::from_signing_key(&target_signing),
+            )
+            .await
+            .expect("AC7 (key-bearing): the truncated close seals the durable prefix");
+
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "AC7: the outlet exec fn is invoked EXACTLY once — the truncated close \
+             re-emits the sealed prefix, it does NOT re-invoke"
+        );
+
+        // The witness is now present and the journal resolved.
+        let witness_after = {
+            let sid = saga_id.clone();
+            actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
+                        saga_id: sid,
+                        reply,
+                    })
+                })
+                .await
+                .expect("witness check")
+        };
+        assert!(
+            witness_after,
+            "the key-bearing close durably sealed the prefix"
+        );
+        assert_eq!(
+            ss_saga_state(&journal, &saga_id).await,
+            None,
+            "the key-bearing close resolves the saga (Committed)"
+        );
+
+        // Fetch the sealed receipt via a replayed CommitBStreamSettle and verify it
+        // attests the manifest over the durable PREFIX (never the full stream).
+        let outcome = {
+            let sid = saga_id.clone();
+            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
+                        saga_id: sid,
+                        terminal_status:
+                            scp_protocol::context::outlets::stream::StreamTerminalStatus::Error(
+                                "replay".to_owned(),
+                            ),
+                        cancel_ack_seq: None,
+                        target_signing_key: target_key_bytes,
+                        reply,
+                    })
+                })
+                .await
+                .expect("replayed truncated close returns the stored receipt")
+        };
+        assert!(
+            outcome.settlement.is_none(),
+            "a replayed truncated close must not re-move money"
+        );
+        let k = outcome.billed_count as usize;
+        assert!(
+            (1..=5).contains(&k),
+            "the sealed prefix bills a strict, non-empty subset of the 5-chunk prefix (got {k})"
+        );
+        let prefix_root =
+            compute_chunk_manifest_root(&received[..k]).expect("prefix manifest root");
+        assert_ne!(
+            prefix_root, [0u8; 32],
+            "AC7: the truncated manifest root is non-zero"
+        );
+        assert_eq!(
+            outcome.stream_manifest_hash, prefix_root,
+            "AC7: the truncated-close receipt root == manifest over the sealed durable PREFIX"
+        );
+        let receipt: CrossContextOutletStreamReceipt =
+            serde_json::from_slice(&outcome.receipt).expect("receipt JCS parses");
+        receipt
+            .verify(&target_signing.verifying_key())
+            .expect("AC7: the truncated-close receipt verifies under B's Active Signing Key");
+
+        // The escrow settled at the prefix billed_count (refund credited).
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_COST * k as u64),
+            "AC7: the escrow settles at the prefix billed_count (refund = reserved − billed)"
+        );
+
+        drop(recording);
     }
 }
