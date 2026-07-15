@@ -14895,6 +14895,47 @@ mod tests {
         )
     }
 
+    /// Export a provider-resident context through the relocated actor
+    /// [`PerContextState::export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state)
+    /// seam — the provider `export_crypto_state` twin is deleted post-ADR-049
+    /// PR-7. Sources the node-resident wrapping keypair from the provider exactly
+    /// as the production actor-export caller does. DESTRUCTIVE: the one-way
+    /// `take_crypto_state` empties the source provider for `ctx`, so capture
+    /// anything else you need off it first.
+    /// Destructively move a provider-resident context onto a throwaway actor
+    /// [`PerContextState`](crate::context::actor::state::PerContextState) via the
+    /// retained `take_crypto_state` + the production
+    /// `seed_encrypted_crypto_from_owned` seed primitive. Post-ADR-049 PR-7 the
+    /// steady-state crypto twins (`seal` / `rotate_sender_key` / `drain_pending_
+    /// sender_key_messages` / …) live on the actor, so tests that drive them move
+    /// the party onto the actor first. One-way: the provider loses the context.
+    fn take_into_actor(
+        crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        ctx: &[u8; 32],
+    ) -> crate::context::actor::state::PerContextState {
+        let owned = crypto
+            .take_crypto_state(ctx)
+            .expect("take owned crypto material off the provider");
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            *ctx,
+            0,
+            DID::from(crypto.local_did().to_owned()),
+        );
+        state.seed_encrypted_crypto_from_owned(owned);
+        state
+    }
+
+    fn actor_export(
+        crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        ctx: &[u8; 32],
+        sender_key_epochs: Vec<(String, u64)>,
+        recv_sequence_floors: Vec<(String, scp_protocol::context::builder::ReceiveFloor)>,
+    ) -> Result<Vec<u8>, ContextError> {
+        let (wpub, wsec) = crypto.wrapping_keypair_snapshot();
+        let state = take_into_actor(crypto, ctx);
+        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
+    }
+
     /// Build a `Supervisor` around an EXISTING crypto provider `Arc` — used by the
     /// two-party seam-level e2e tests to wrap Bob's post-join `bob_crypto` (which
     /// holds the joined group) in a fresh supervisor so `build_actor_deps` yields
@@ -19444,13 +19485,13 @@ mod tests {
         // Capture the live crypto state INCLUDING the registry floor (=5) into
         // the persisted snapshot, exactly as `build_snapshot_for_persist` does
         // (floors sourced from the authoritative registry).
-        snap.mls_crypto_state = crypto
-            .export_crypto_state(
-                &ctx_id_bytes,
-                sup.export_sender_key_epochs(&ctx_id_bytes),
-                sup.export_recv_sequence_floors(&ctx_id_bytes),
-            )
-            .unwrap();
+        snap.mls_crypto_state = actor_export(
+            &crypto,
+            &ctx_id_bytes,
+            sup.export_sender_key_epochs(&ctx_id_bytes),
+            sup.export_recv_sequence_floors(&ctx_id_bytes),
+        )
+        .unwrap();
         assert!(
             !snap.mls_crypto_state.is_empty(),
             "snapshot must carry crypto state so the floor guard runs on respawn"
@@ -19554,13 +19595,13 @@ mod tests {
             .unwrap();
 
         // Persist the durable blob, floors sourced FROM the registry (the G2 path).
-        let blob = origin_crypto
-            .export_crypto_state(
-                &ctx,
-                origin.export_sender_key_epochs(&ctx),
-                origin.export_recv_sequence_floors(&ctx),
-            )
-            .unwrap();
+        let blob = actor_export(
+            &origin_crypto,
+            &ctx,
+            origin.export_sender_key_epochs(&ctx),
+            origin.export_recv_sequence_floors(&ctx),
+        )
+        .unwrap();
         assert!(
             !blob.is_empty(),
             "keyed context must export a non-empty blob"
@@ -19671,13 +19712,13 @@ mod tests {
         exporter
             .check_and_advance_sender_epoch(&ctx, sender, 2, MAX_EPOCH_ADVANCE)
             .unwrap();
-        let blob = exporter_crypto
-            .export_crypto_state(
-                &ctx,
-                exporter.export_sender_key_epochs(&ctx),
-                exporter.export_recv_sequence_floors(&ctx),
-            )
-            .unwrap();
+        let blob = actor_export(
+            &exporter_crypto,
+            &ctx,
+            exporter.export_sender_key_epochs(&ctx),
+            exporter.export_recv_sequence_floors(&ctx),
+        )
+        .unwrap();
 
         // Importer's LIVE registry floor for `sender` is HIGHER (=9).
         let importer = supervisor_with_providers();
@@ -19717,13 +19758,11 @@ mod tests {
         );
 
         // Provider rolled back: the just-restored group was destroyed on the Err
-        // path, so the importer's provider holds NO crypto state for `ctx`
-        // (`export_crypto_state` returns an empty blob for an absent context).
+        // path, so the importer's provider holds NO crypto state for `ctx`. Probe
+        // via the retained `context_crypto_present` (the serializing
+        // `export_crypto_state` twin is deleted post-ADR-049 PR-7).
         assert!(
-            importer_crypto
-                .export_crypto_state(&ctx, Vec::new(), Vec::new())
-                .unwrap()
-                .is_empty(),
+            !importer_crypto.context_crypto_present(&ctx),
             "the restored crypto must be rolled back (group destroyed) on rejection"
         );
     }
@@ -19763,12 +19802,12 @@ mod tests {
                 high,
             )
             .unwrap();
-        let blob = origin_crypto
-            .export_crypto_state(
-                &ctx,
-                origin.export_sender_key_epochs(&ctx),
-                origin.export_recv_sequence_floors(&ctx),
-            )
+        let blob = actor_export(
+            &origin_crypto,
+            &ctx,
+            origin.export_sender_key_epochs(&ctx),
+            origin.export_recv_sequence_floors(&ctx),
+        )
             .unwrap();
 
         // Cold restart: fresh Supervisor, EMPTY registry (local=0), trusted_local.
@@ -19837,13 +19876,13 @@ mod tests {
                 MAX_EPOCH_ADVANCE,
             )
             .unwrap();
-        let blob = exporter_crypto
-            .export_crypto_state(
-                &ctx,
-                exporter.export_sender_key_epochs(&ctx),
-                exporter.export_recv_sequence_floors(&ctx),
-            )
-            .unwrap();
+        let blob = actor_export(
+            &exporter_crypto,
+            &ctx,
+            exporter.export_sender_key_epochs(&ctx),
+            exporter.export_recv_sequence_floors(&ctx),
+        )
+        .unwrap();
 
         // Importer live: epoch 5 (< blob's 9 → epoch axis PASSES), recv rf(4, 0)
         // (> blob's rf(2,0) → recv axis REGRESSES under RejectRegression).
@@ -19918,9 +19957,13 @@ mod tests {
             .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
             .expect("build bob's actor deps");
 
+        // Move Alice onto the actor seam (the provider `seal` twin is deleted
+        // post-ADR-049 PR-7); she seals from her actor-owned crypto.
+        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+
         // Alice seals an Application envelope; the sender-layer header carries her
         // current (epoch, send_sequence). First seal → sequence 0, second → 1.
-        let seal_app = |payload: &[u8]| -> Vec<u8> {
+        let mut seal_app = |payload: &[u8]| -> Vec<u8> {
             let params = InnerEnvelopeParams {
                 version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
                 context_id: ctx_str,
@@ -19940,8 +19983,8 @@ mod tests {
             )
             .expect("alice signs her inner application envelope");
             let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-            alice_crypto
-                .seal(&ctx_bytes, &inner, &routing_id, 3600)
+            alice_actor
+                .seal(ALICE, &inner, &routing_id, 3600)
                 .expect("alice seals the application message")
         };
 
@@ -20018,14 +20061,14 @@ mod tests {
         let (alice_crypto, bob_crypto, ctx_bytes) =
             crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
-        // Alice rotates her sender key (epoch 1 → 2) and redistributes it to Bob,
-        // who installs it — exactly what the live key-distribution flow does.
-        alice_crypto.rotate_sender_key(&ctx_bytes).unwrap();
-        alice_crypto.distribute_sender_key(&ctx_bytes, ALICE).ok();
-        for (_t, msg) in alice_crypto
-            .drain_pending_sender_key_messages(&ctx_bytes)
-            .unwrap()
-        {
+        // Move Alice onto the actor seam (the provider rotate/drain twins are
+        // deleted post-ADR-049 PR-7). Alice rotates her sender key (epoch 1 → 2)
+        // and redistributes it to Bob, who installs it via the retained
+        // receive-side provider methods — exactly what the live flow does.
+        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+        alice_actor.rotate_sender_key(ALICE).unwrap();
+        alice_actor.distribute_sender_key(ALICE, ALICE).ok();
+        for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
             if let Ok((key, _epoch)) =
                 bob_crypto.process_incoming_sender_key(&ctx_bytes, ALICE, &msg)
             {
@@ -20069,8 +20112,8 @@ mod tests {
         )
         .expect("alice signs her inner envelope");
         let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-        let sealed = alice_crypto
-            .seal(&ctx_bytes, &inner, &routing_id, 3600)
+        let sealed = alice_actor
+            .seal(ALICE, &inner, &routing_id, 3600)
             .expect("alice seals at the rotated epoch");
 
         let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
