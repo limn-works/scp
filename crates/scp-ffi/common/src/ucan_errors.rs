@@ -103,25 +103,6 @@ pub const fn ucan_error_code(err: &UcanError) -> &'static str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn every_mapped_variant_currently_routes_to_perm_3001() {
-        // Spot-check one per classification bucket. The exhaustive
-        // match in `ucan_error_code` is the primary guard — this test
-        // is a secondary belt-and-braces check that the current
-        // classification is coherent.
-        for err in [
-            UcanError::MalformedToken("bad".to_owned()),
-            UcanError::SignatureInvalid,
-            UcanError::TokenExpired,
-            UcanError::NonceReused("nonce".to_owned()),
-            UcanError::CapabilityNotGranted("cap".to_owned()),
-            UcanError::CaveatTimeBoxViolation("time-box".to_owned()),
-            UcanError::TokenRevoked("cid".to_owned()),
-        ] {
-            assert_eq!(ucan_error_code(&err), codes::PERM_3001);
-        }
-    }
-
     /// Exhaustive coverage: one instance of every `UcanError` variant is
     /// passed to `ucan_error_code` and asserted to equal `PERM_3001`.
     ///
