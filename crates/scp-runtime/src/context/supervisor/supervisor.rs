@@ -20234,23 +20234,37 @@ mod tests {
             "test precondition: digest must differ from SHA-256(hex(digest))"
         );
 
-        // Seed MLS group + sender key under the DIGEST — the slot the
-        // registered-actor handler (and the chokepoint) key on.
-        let crypto = sup
-            .crypto_ref()
-            .expect("test supervisor has crypto")
-            .clone();
-        crypto
-            .create_mls_group(&digest)
-            .expect("create_mls_group under the digest");
-        crypto
-            .generate_sender_key(&digest)
-            .expect("generate_sender_key under the digest");
-
-        // Sanity: NO crypto state exists under the raw SHA-256(id) key, so a
-        // direct-path seal that (wrongly) keyed off the raw primitive would
-        // fail at the seal step.
-        assert_ne!(raw_bytes, digest);
+        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the per-context MLS crypto is now
+        // OWNED by the context actor, so `recovery_send_notification_direct` no
+        // longer seals through the supervisor-scoped provider — it respawns the
+        // target actor from its persisted Active snapshot and seals through the
+        // actor's owned `ContextCryptoState`. Stand up a REAL context under the
+        // 64-hex id via the production create path (`finalize_create` durably
+        // persists the initial Active snapshot, and the created group commits its
+        // `scp_context_params` `0xFF02` extension under the DIGEST via the ADR-056
+        // chokepoint) so the direct path's `respawn_from_snapshot` finds state and
+        // stands the actor back up with a sealable owned crypto state. Because the
+        // group's crypto is keyed under the digest, a respawn/restore that
+        // (wrongly) resolved the id through the raw `SHA-256(hex(digest))`
+        // primitive would key a slot with no crypto and fail the seal with
+        // `CryptoFailed` — which is exactly what the `TransportFailed`-not-
+        // `CryptoFailed` assertion below rejects.
+        let creator = DID::from(
+            sup.crypto_ref()
+                .expect("test supervisor has crypto")
+                .local_did()
+                .to_owned(),
+        );
+        let created = sup
+            .create_context(
+                context_id.clone(),
+                scp_protocol::context::ContextParams::default(),
+                creator,
+                None,
+            )
+            .await
+            .expect("create the real 64-hex context under the digest");
+        assert_eq!(created.context_id(), context_id);
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
         let result = sup

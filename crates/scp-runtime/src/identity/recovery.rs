@@ -2095,25 +2095,28 @@ mod tests {
         }
     }
 
-    /// Seeds the MLS group for an identity-scoped recovery pseudo-context
-    /// directly in the supervisor's crypto provider.
+    /// Stands up a live registered context actor for the identity-scoped
+    /// recovery pseudo-context so PSK-rotation notifications can seal.
     ///
     /// PSK rotation (spec §9.12 step 6) seals its recovery notification
-    /// against a synthetic `identity-private-state` context that is never
-    /// registered as a per-context actor and never flows through
-    /// `create_context`. The real `MlsCryptoProvider` that backs
-    /// [`test_context_manager`] still requires an existing MLS group for
-    /// that id before [`MlsCryptoProvider::seal`] will succeed, so tests
-    /// exercising `rotate_psk` (directly or through `execute_recovery`)
-    /// must establish the group up front — exactly as the production
-    /// create-context path does for ordinary contexts.
-    fn seed_identity_private_state_group(manager: &Arc<crate::context::supervisor::Supervisor>) {
-        let context_id_bytes = crate::context::state::context_id_to_bytes("identity-private-state");
-        manager
-            .crypto_ref()
-            .expect("crypto provider attached to test supervisor")
-            .create_mls_group(&context_id_bytes)
-            .expect("failed to seed identity-private-state MLS group");
+    /// against a synthetic `identity-private-state` context. Pre-PR-7 the
+    /// per-context MLS crypto was provider-resident, so seeding an MLS group
+    /// directly on the supervisor's shared `MlsCryptoProvider` sufficed for
+    /// [`MlsCryptoProvider::seal`] to succeed. ADR-049 PR-7
+    /// (SCP-CRYPTOMOVE-001) moved that crypto state onto the per-context
+    /// actor by a one-way take, and `dispatch_recovery_send_notification`
+    /// routes through [`Supervisor::dispatch_trust_recovery_command`], which
+    /// mailbox-dispatches to a registered actor when one exists (and only
+    /// falls through to the non-64-hex-rejecting supervisor-direct path when
+    /// none is). So the notification now seals through the actor's OWNED
+    /// `ContextCryptoState` — which requires a registered actor for the id,
+    /// created here exactly as `create_context` does for any context. This is
+    /// the actor-model equivalent of the retired provider-group seed.
+    async fn seed_identity_private_state_group(
+        manager: &Arc<crate::context::supervisor::Supervisor>,
+    ) {
+        let owner = did("did:dht:zRecoveryIdentityPrivateStateOwner");
+        setup_context(manager, "identity-private-state", &owner).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2221,7 +2224,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_succeeds() {
         let manager = test_context_manager();
-        seed_identity_private_state_group(&manager);
+        seed_identity_private_state_group(&manager).await;
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
@@ -2237,7 +2240,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_excludes_compromised_device() {
         let manager = test_context_manager();
-        seed_identity_private_state_group(&manager);
+        seed_identity_private_state_group(&manager).await;
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
@@ -2317,7 +2320,7 @@ mod tests {
         setup_context_with_members(&manager, context_id, &alice, &[&bob]).await;
         // ActiveSigning recovery rotates the PSK, which seals against the
         // synthetic identity-private-state context — seed its MLS group.
-        seed_identity_private_state_group(&manager);
+        seed_identity_private_state_group(&manager).await;
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
@@ -2360,7 +2363,7 @@ mod tests {
         setup_context_with_members(&manager, context_id, &alice, &[&bob, &carol]).await;
         // IdentityKey recovery rotates the PSK, which seals against the
         // synthetic identity-private-state context — seed its MLS group.
-        seed_identity_private_state_group(&manager);
+        seed_identity_private_state_group(&manager).await;
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
