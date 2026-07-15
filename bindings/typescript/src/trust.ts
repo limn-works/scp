@@ -209,13 +209,25 @@ export interface TrustEvaluation {
   capabilityValidation: CapabilityValidation;
   /** Layer 2: Behavioral validation (verified facts), or `null` if unavailable. */
   behavioralRecord: BehavioralRecord | null;
-  /** Layer 3: Attestation authenticity (verified signatures). */
+  /**
+   * Layer 3: Attestation authenticity (verified signatures).
+   * Always `[]` in this facade; reserved for future implementation.
+   */
   attestations: readonly Attestation[];
-  /** Layer 4: Endorsements from other participants. */
+  /**
+   * Layer 4: Endorsements from other participants.
+   * Always `[]` in this facade; reserved for future implementation.
+   */
   endorsements: readonly Endorsement[];
-  /** Layer 4: Challenge results. */
+  /**
+   * Layer 4: Challenge results.
+   * Always `[]` in this facade; reserved for future implementation.
+   */
   challengeResults: readonly ChallengeResult[];
-  /** Layer 4: Consequence rules defined by the context, or `null`. */
+  /**
+   * Layer 4: Consequence rules defined by the context, or `null`.
+   * Always `null` in this facade; reserved for future implementation.
+   */
   consequenceStructure: readonly Record<string, unknown>[] | null;
 }
 
@@ -478,12 +490,16 @@ export const __PASSED_BEFORE: Readonly<Record<UcanFailureCategory, ReadonlySet<s
  * exhaustive match in `ucan_errors.rs`). All other codes are genuine faults and
  * propagate.
  *
- * **Exported for lockstep test coupling** — `tests/trust.test.ts` imports this
- * constant so the test assertion is coupled to the runtime regex, not a
- * duplicate literal. If this value changes, the test will fail loudly.
- *
  * Must stay in sync with `_PIPELINE_ABSORBED_CODES` in the Python SDK
  * (`trust.py`) and with `ucan_errors.rs::ucan_error_code`.
+ *
+ * When the PERM-3007 (expiry) / PERM-3008 (revocation) code split lands,
+ * this will need to become a set of prefixes rather than a single string.
+ *
+ * @internal — exported for lockstep test coupling only (see trust.test.ts).
+ * `tests/trust.test.ts` imports this constant so the test assertion is coupled
+ * to the runtime value, not a duplicate literal. If this value changes, the
+ * test fails loudly.
  */
 export const PIPELINE_ABSORBED_CODE_PREFIX = "[SCP-PERM-3001]";
 
