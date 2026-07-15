@@ -62,11 +62,25 @@ mod wasm_impl {
         /// Signs `data` with the key identified by `key_id`, returning the
         /// signature bytes. The private key never leaves JS/WebCrypto.
         ///
+        /// `data` is passed **by value** (an owned `Vec<u8>`), so wasm-bindgen
+        /// marshals it as a JS-owned `Uint8Array` copy detached from wasm linear
+        /// memory — NOT a `subarray` view into it (which `&[u8]` would produce).
+        /// This matches [`storage::JsStorage::set`](crate::storage)'s owned-copy
+        /// discipline and is load-bearing for the same reason: a synchronous-facade
+        /// or async-`WebCrypto` implementation that *retains* the buffer past the
+        /// call (queues it, awaits `SubtleCrypto.sign`, or logs it) is sound with an
+        /// owned `Vec<u8>`, but with a `&[u8]` view would alias wasm memory that
+        /// later allocations reuse — corrupting the bytes it later signs. Handing
+        /// over an owned copy makes the contract sound for any embedder, not only
+        /// one that copies before returning.
+        ///
         /// SEAM: declared for the future custody slice (ADR-057 component 3);
         /// no driver call site in this slice (the MLS key is held in `scp-mls`
-        /// — see module docs).
+        /// — see module docs). Frozen to `Vec<u8>` NOW so that slice wires it
+        /// without a signature change and does not inherit the view-aliasing
+        /// footgun.
         #[wasm_bindgen(method, catch, js_name = "sign")]
-        fn sign(this: &JsKeyCustody, key_id: &str, data: &[u8]) -> Result<Vec<u8>, JsValue>;
+        fn sign(this: &JsKeyCustody, key_id: &str, data: Vec<u8>) -> Result<Vec<u8>, JsValue>;
 
         /// Returns the raw public key bytes for `key_id`. Throws if absent.
         ///
@@ -91,12 +105,17 @@ mod wasm_impl {
         /// Performs X25519 DH agreement against `peer_public`, returning the
         /// 32-byte shared secret.
         ///
+        /// `peer_public` is passed **by value** (an owned `Vec<u8>`) for the same
+        /// owned-copy-detached-from-wasm-memory reason as [`JsKeyCustody::sign`] —
+        /// a retaining async-`WebCrypto` (`SubtleCrypto.deriveBits`) facade is sound
+        /// with `Vec<u8>` where a `&[u8]` view would alias reused wasm memory.
+        ///
         /// SEAM: see [`JsKeyCustody::sign`].
         #[wasm_bindgen(method, catch, js_name = "dhAgree")]
         fn dh_agree(
             this: &JsKeyCustody,
             key_id: &str,
-            peer_public: &[u8],
+            peer_public: Vec<u8>,
         ) -> Result<Vec<u8>, JsValue>;
     }
 
