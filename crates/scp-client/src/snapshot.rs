@@ -79,7 +79,7 @@ use scp_mls::ScpMlsGroup;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::crypto::sender_keys::{SenderKey, SenderKeyStore};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::context::PerContextState;
 use crate::crypto_state::ContextCryptoState;
@@ -97,7 +97,15 @@ use crate::error::ClientError;
 /// to a variant-aware [`BufferedEvent`] (the driver now also buffers a sender's
 /// own `MessageSent` local history — ADR-011 / ADR-057 T3). Pre-release: no
 /// migration, a v1 blob is rejected as an unknown version.
-pub const SNAPSHOT_FORMAT_VERSION: u16 = 2;
+///
+/// **v3** persists the §9.16.1 stable wrapping keypair (`wrapping_public` +
+/// zeroized `wrapping_secret`) and the member-wrapping-key **directory**
+/// (`member_wrapping_keys`, which replaced the bare `members` DID list — ADR-057
+/// sender-key distribution INVARIANT 1/5). Without the persisted secret a
+/// reopened tab could not HPKE-open the next distribution; without the directory
+/// it could not seal on the next add/rotate. Pre-release: no migration, a v2 blob
+/// is rejected as an unknown version.
+pub const SNAPSHOT_FORMAT_VERSION: u16 = 3;
 
 /// A buffered, decrypted-but-undrained context event, in serializable form.
 ///
@@ -176,8 +184,19 @@ pub struct ContextSnapshot {
     /// buffers `MessageSent` (a sender's own history) and `MessageReceived`, so
     /// [`BufferedEvent`]'s two variants are its complete representation.
     buffered_events: Vec<BufferedEvent>,
-    /// The membership set (member DIDs).
-    members: Vec<String>,
+    /// This participant's §9.16.1 stable wrapping public key (X25519). Persisted
+    /// so a reopened tab republishes/uses the same key peers seal to.
+    wrapping_public: [u8; 32],
+    /// This participant's §9.16.1 stable wrapping secret key (X25519). Persisted
+    /// so a reopened tab can HPKE-open the next distribution sealed to it.
+    /// Zeroized after reconstruction. Depends on the backend's authenticated
+    /// encryption at rest (see the module security note).
+    wrapping_secret: [u8; 32],
+    /// The member-wrapping-key **directory**: `(did, scp_wrapping_key)` pairs. This
+    /// IS the membership set (ADR-057 sender-key distribution INVARIANT 1) — it
+    /// replaced the bare `members` DID list — so a reopened tab can seal sender
+    /// keys to every member on the next add/rotate.
+    member_wrapping_keys: Vec<(String, [u8; 32])>,
     /// Per-member next-outgoing message sequence numbers: `(did, sequence)`.
     member_sequence_numbers: Vec<(String, u64)>,
     /// The §9.9.3 checkpoint: the event-log Merkle root at snapshot time. On
@@ -215,7 +234,12 @@ impl std::fmt::Debug for ContextSnapshot {
                 "buffered_events",
                 &format_args!("[{} events, REDACTED]", self.buffered_events.len()),
             )
-            .field("members", &self.members)
+            .field("wrapping_public", &hex_root(&self.wrapping_public))
+            .field("wrapping_secret", &"[REDACTED]")
+            .field(
+                "member_wrapping_keys",
+                &format_args!("[{} members]", self.member_wrapping_keys.len()),
+            )
             .field("member_sequence_numbers", &self.member_sequence_numbers)
             .field("event_log_root", &hex_root(&self.event_log_root))
             .finish()
@@ -311,7 +335,9 @@ impl ContextSnapshot {
             recv_sequence_tracker,
             events: state.events(),
             buffered_events,
-            members: state.members.clone(),
+            wrapping_public: crypto.wrapping_public,
+            wrapping_secret: *crypto.wrapping_secret,
+            member_wrapping_keys: crypto.wrapping_keys_snapshot(),
             member_sequence_numbers,
             event_log_root: state.event_log_root(),
         })
@@ -374,6 +400,16 @@ impl ContextSnapshot {
         let local_sender_key =
             std::mem::replace(&mut self.local_sender_key, SenderKey::from_bytes([0u8; 32]));
 
+        // Rebuild the member-wrapping-key directory (the authoritative member set).
+        let member_wrapping_keys: HashMap<String, [u8; 32]> =
+            std::mem::take(&mut self.member_wrapping_keys)
+                .into_iter()
+                .collect();
+
+        // Move the wrapping secret out, leaving a zeroed placeholder that is wiped
+        // when the snapshot drops.
+        let wrapping_secret = std::mem::take(&mut self.wrapping_secret);
+
         let crypto = ContextCryptoState {
             mls_group,
             local_sender_key,
@@ -381,6 +417,9 @@ impl ContextSnapshot {
             sender_key_epoch: self.sender_key_epoch,
             sender_key_store,
             recv_sequence_tracker,
+            wrapping_public: self.wrapping_public,
+            wrapping_secret: Zeroizing::new(wrapping_secret),
+            member_wrapping_keys,
         };
 
         // Rebuild the event log by replaying the persisted stream through the
@@ -436,7 +475,6 @@ impl ContextSnapshot {
         let state = PerContextState {
             crypto,
             event_log,
-            members: std::mem::take(&mut self.members),
             member_sequence_numbers,
             event_buffer,
             // A restored context IS the last durable state — nothing has diverged,
@@ -494,6 +532,7 @@ impl ContextSnapshot {
     fn zeroize_secrets(&mut self) {
         self.mls_state.zeroize();
         self.local_sender_key.zeroize();
+        self.wrapping_secret.zeroize();
         for (_, key) in &mut self.sender_key_entries {
             key.zeroize();
         }
@@ -573,7 +612,7 @@ mod tests {
 
         assert_eq!(restored.event_log_root(), original_root);
         assert_eq!(restored.event_log_leaf_count(), original_count);
-        assert_eq!(restored.members, vec![CREATOR.to_owned()]);
+        assert_eq!(restored.member_dids(), vec![CREATOR.to_owned()]);
     }
 
     #[test]

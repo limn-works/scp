@@ -2163,32 +2163,38 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/outlets/invoke.rs",
         "crates/scp-runtime/src/context/outlets/mod.rs",
         "crates/scp-runtime/src/context/supervisor/supervisor.rs",
-        "crates/scp-protocol/src/context/outlets/schema.rs"
+        "crates/scp-protocol/src/context/outlets/registry.rs"
       ],
-      "description": "Implement the BEST-EFFORT cross-context stream transport (the *outlet stream* mode crossing the \u00a76.2 boundary, per \u00a76.2.5) \u2014 NOT the transactional streaming saga (that is the seal-phase story SCP-OUT-046). A net-new shared-member bridge `invoke_outlet_cross_context` (a free function in `crates/scp-runtime/src/context/outlets/invoke.rs`, reached via a ContextManager/supervisor method in supervisor.rs \u2014 the runtime outlet code lives under `context/outlets/*.rs`; there is NO `context/manager/outlets.rs`) forwards chunks between contexts, re-encrypting each chunk per-recipient (source encrypts for target, bridge decrypts, bridge re-encrypts for the source-invoker's context). No bridge-level buffering \u2014 chunks flow through as produced, subject to credit (SCP-OUT-036 AC: 'bridge does not buffer'). `chain_depth` is fixed at open and inherited by every forwarded chunk. Add `aggregate_schema: Option<JSONSchema>` to OutletSchema (backward-compatible via Option, \u00a75.4.1 registration wire format): per-chunk Data.value is validated against `output_schema`; End.aggregate is validated against `aggregate_schema` when present, else falls back to `output_schema` (\u00a75.4.5 ChunkPayload). Each context records its OWN local `OutletInvoked` event carrying the same manifest-derived `stream_manifest_hash` \u2014 a BEST-EFFORT (non-atomic) dual recording; the ATOMIC all-or-nothing dual-log guarantee, the signed receipt, and escrow settlement are what the streaming SAGA (SCP-OUT-046) uniquely adds over this mode per ADR-061, and are OUT OF SCOPE here.",
+      "description": "Implement the BEST-EFFORT cross-context stream transport (the *outlet stream* mode crossing the \u00a76.2 boundary, per \u00a76.2.5) \u2014 NOT the transactional streaming saga (that is the seal-phase story SCP-OUT-046). A net-new shared-member bridge `invoke_outlet_cross_context` (a free function in `crates/scp-runtime/src/context/outlets/invoke.rs`, reached via a ContextManager/supervisor method in supervisor.rs \u2014 the runtime outlet code lives under `context/outlets/*.rs`; there is NO `context/manager/outlets.rs`) forwards chunks across the boundary. The runtime function returns PLAINTEXT OutletStreamChunks in-process to the shared-member invoker (a member of BOTH contexts, §6.2.0 — mirroring the same-context invoke_outlet; the invoker's own event log records only stream_manifest_hash, the streaming parity of the unary saga's output_hash-only log). Re-encryption is the DELIVERY SEAM, not the return type: delivery to A's OTHER members seals each still-operator-signed chunk under A's MLS group key as an A-context application message over the existing §9.7/§9.8/§9.16 MLS transport (no new relay primitive, §6.2.0); A's group key is the per-recipient mechanism, and the operator's SCP-OUTLET-CHUNK-SIG-V1 signature is preserved end-to-end (never re-signed). No bridge-level buffering \u2014 chunks flow through as produced, subject to credit (SCP-OUT-036 AC: 'bridge does not buffer'). `chain_depth` is fixed at open and inherited by every forwarded chunk. Add `aggregate_schema: Option<serde_json::Value>` to OutletSchema (registry.rs; backward-compatible via Option, \u00a75.4.1 registration wire format): per-chunk Data.value is validated against `output_schema`; End.aggregate is validated against `aggregate_schema` when present, else falls back to `output_schema` (\u00a75.4.5 ChunkPayload). Each context records its OWN local `OutletInvoked` event carrying the same manifest-derived `stream_manifest_hash` \u2014 a BEST-EFFORT (non-atomic) dual recording; the ATOMIC all-or-nothing dual-log guarantee, the signed receipt, and escrow settlement are what the streaming SAGA (SCP-OUT-046) uniquely adds over this mode per ADR-061, and are OUT OF SCOPE here. This best-effort bridge is ZERO-ESCROW (Query outlets and zero-cost Action only; the invoker's credit grants propagate end-to-end as backpressure — credit is flow-control, not payment — with NO caller-side escrow settlement, which ADR-061 makes saga-unique); a best-effort cross-context open of a paid Action outlet (cost.amount > 0) is REJECTED, and a metered paid stream MUST use the streaming saga (§6.2.4, §6.2.5).",
       "acceptanceCriteria": [
-        "OutletSchema struct has an aggregate_schema: Option<JSONSchema> field \u2014 grep -n 'aggregate_schema' crates/scp-protocol/src/context/outlets/schema.rs returns a line declaring the Option field (Option preserves backward compat with the SCP-OUT-002 registration wire format)",
-        "A net-new free function invoke_outlet_cross_context in crates/scp-runtime/src/context/outlets/invoke.rs returns Result<tokio::sync::mpsc::Receiver<OutletStreamChunk>, InvocationError> whose chunks are re-encrypted for the invoker's context \u2014 grep -n 'fn invoke_outlet_cross_context' crates/scp-runtime/src/context/outlets/invoke.rs returns the declaration",
+        "OutletSchema struct has an aggregate_schema: Option<serde_json::Value> field \u2014 grep -n 'aggregate_schema' crates/scp-protocol/src/context/outlets/registry.rs returns a line declaring the Option field (Option preserves backward compat with the SCP-OUT-002 registration wire format)",
+        "A net-new free function invoke_outlet_cross_context in crates/scp-runtime/src/context/outlets/invoke.rs returns Result<tokio::sync::mpsc::Receiver<OutletStreamChunk>, InvocationError> yielding PLAINTEXT OutletStreamChunks in-process to the shared-member invoker (mirroring the same-context invoke_outlet return; the invoker is a member of both contexts, \u00a76.2.0) \u2014 NOT re-encrypted chunks, and NOT a sealed/ciphertext type (a code test asserts the Ok variant is mpsc::Receiver<OutletStreamChunk>, a plaintext chunk type). Re-encryption for A's other members is the delivery seam (the seal-for-A AC below), not this return type \u2014 grep -n 'fn invoke_outlet_cross_context' crates/scp-runtime/src/context/outlets/invoke.rs returns the declaration",
         "The bridge does not buffer: it forwards each chunk as produced (no Vec<OutletStreamChunk> accumulation of the whole stream in the bridge loop) \u2014 a code test asserts chunk-N is delivered to the receiver before chunk-(N+1) is requested from the source",
-        "Every forwarded OutletStreamChunk carries chain_depth equal to the OutletStreamOpen.chain_depth (chunks do not recompute or check it) \u2014 regression test over a 3-hop-depth open",
+        "The bridge's onward A-leg OutletStreamOpen inherits chain_depth from the incoming B-side OutletStreamOpen.chain_depth (chain_depth is a field of OutletStreamOpen \u2014 struct at crates/scp-protocol/src/context/outlets/stream.rs:215 \u2014 NOT of OutletStreamChunk, which carries only request_id, sequence, payload, sig; chunks do not carry, recompute, or check it) \u2014 regression test: a bridge opened from a B-side open with chain_depth == 3 produces an A-leg OutletStreamOpen whose chain_depth == 3, and no forwarded chunk mutates it",
         "Per-chunk Data.value validation uses output_schema; a Data chunk whose value violates output_schema produces Error { code: 'SCP-OUTLET-6140', terminal: true }",
         "End.aggregate validation uses aggregate_schema when present, else output_schema \u2014 test: an End.aggregate satisfying aggregate_schema but violating output_schema is ACCEPTED when aggregate_schema is present",
         "Each context's event log records its own OutletInvoked with an identical stream_manifest_hash (best-effort, non-atomic dual recording; the atomic guarantee is SCP-OUT-046). The receiving context records its OutletInvoked by re-deriving the manifest over its independently-reassembled chunk sequence through the verified-append boundary append_outlet_invoked_verified (crates/scp-runtime/src/context/builder.rs), which refuses any chunks_billed / manifest-root mismatch at log-insert time as EventLogError::ChunksBilledMismatch per \u00a75.4.5:566 (the 'refused at log-insert time, not accepted-and-flagged' wire-rejection rule) \u2014 grep -n 'append_outlet_invoked_verified' crates/scp-runtime/src/context/outlets/invoke.rs returns the cross-context receiver-side recording call site. Test (accept): cross-context 10-chunk stream A \u2192 B completes and both event logs record the same 32-byte stream_manifest_hash. Test (reject): a cross-context recording whose OutletInvokedEvent carries a chunks_billed that disagrees with the independently-reassembled chunk sequence is refused at log-insert (surfaces EventLogError::ChunksBilledMismatch), not accepted-and-flagged.",
         "Test: mid-stream bridge failure produces Error { code: 'SCP-OUTLET-6160', terminal: true }",
         "Test: End.aggregate violating aggregate_schema produces Error { code: 'SCP-OUTLET-6140', terminal: true }",
+        "Seal-for-A (delivery seam): a chunk delivered to A's OTHER members is an A-context MLS application message — the bridge seals each still-operator-signed OutletStreamChunk under A's MLS group key over the existing §9.7/§9.8/§9.16 transport (no new relay primitive), and A's event log records only the 32-byte stream_manifest_hash, never chunk plaintext. Test: seal one OutletStreamChunk as an A-context application message and assert (a) a non-A-member (holding no A group key) CANNOT decrypt it, and (b) an A member decrypts it and recovers the original OutletStreamChunk with B's operator SCP-OUTLET-CHUNK-SIG-V1 signature intact and verifying (verify_chunk_signature) against B's pinned context_id — the operator signature is preserved end-to-end, never re-signed by the bridge.",
+        "Verification source at the crossing (§6.2.4:276 analog): the receiving context verifies each operator chunk signature against the operator_pk, the operating context B's context_id, and the caveats_binding PINNED in the governed outlet-interface descriptor / at stream-open (§6.2.0.1) — never against operator_pk / context_id / caveats_binding supplied by the bridge at delivery time. Test (reject): a forwarded chunk whose operator signature verifies against bridge-supplied context_id/operator_pk but NOT against the pinned-descriptor values is REJECTED as a §5.4.5 chunk-signature-verification failure, not accepted.",
+        "Zero-escrow economy (ADR-061): a best-effort cross-context open (invoke_outlet_cross_context) of a paid Action outlet is REJECTED with InvocationError and no receiver is produced — the best-effort bridge is zero-escrow and performs no caller-side escrow settlement (saga-unique per ADR-061). The gate rejects on BOTH the registered cost.amount AND the runtime per-chunk billing value (cost_per_chunk) supplied at open — §5.4.5 (Per chunk) fixes cost.amount as the per-chunk accrual unit so the two must agree, and the gate rejects if EITHER is positive (closing a split-source bypass where a zero registered cost is presented with a positive cost_per_chunk, or the reverse). Test: opening invoke_outlet_cross_context against an outlet whose registered cost.amount > 0 returns Err(InvocationError); opening with a positive cost_per_chunk against a zero-registered-cost outlet also returns Err(InvocationError); opening against a Query outlet or a zero-cost (cost == None || cost.amount == 0) Action outlet with cost_per_chunk == 0 succeeds. A metered paid cross-context stream must use the streaming saga (SCP-OUT-046).",
         "cargo test --workspace succeeds"
       ],
       "actionItems": [
-        "Add aggregate_schema: Option<JSONSchema> to OutletSchema (schema.rs)",
-        "Implement the net-new invoke_outlet_cross_context bridge loop in context/outlets/invoke.rs (per-recipient re-encrypt, no buffering)",
+        "Add aggregate_schema: Option<serde_json::Value> to OutletSchema (registry.rs)",
+        "Implement the net-new invoke_outlet_cross_context bridge loop in context/outlets/invoke.rs (returns PLAINTEXT chunks to the shared-member invoker; per-recipient re-encrypt is the A-context MLS seal at the delivery seam, not the return type; no buffering)",
+        "Seal each forwarded chunk as an A-context MLS application message under A's group key at the delivery seam (existing \u00a79.7/\u00a79.8/\u00a79.16 transport, no new relay primitive); A's log records only stream_manifest_hash",
+        "Verify each operator chunk signature against the pinned outlet-interface descriptor (operator_pk / B context_id / caveats_binding), never bridge-supplied values",
+        "Reject a paid Action (cost.amount > 0) best-effort cross-context open (zero-escrow; metered paid streams use the SCP-OUT-046 streaming saga)",
         "Expose the bridge via a ContextManager/supervisor method (supervisor.rs)",
         "Wire per-chunk output_schema and End.aggregate aggregate_schema validation",
-        "Add the three integration tests (10-chunk A\u2192B, mid-stream failure, aggregate-schema violation)"
+        "Add the integration tests (10-chunk A\u2192B, mid-stream failure, aggregate-schema violation, seal-for-A MLS message, reject paid-Action best-effort open, verify-against-pinned-descriptor)"
       ],
       "blockedBy": [
         "SCP-OUT-015",
@@ -2202,12 +2208,32 @@
           "section": "### 6.2.5 Outlet Invocation Modes (delivery \u00d7 envelope)"
         },
         {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "### 6.2.0 Outlet Interface Transport"
+        },
+        {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.4.5 Progressive Output (Streaming)"
         },
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.4.1 Outlet Registration Wire Format"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.7 Group Key Management \u2014 MLS Integration"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.8 Message Security"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.16 Sender-Side Key Layer (Blocking)"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "### 6.2.4 Cross-Context Outlet Invocation Saga"
         },
         {
           "file": ".docs/adrs/ADR-061-outlet-invocation-modes.md",

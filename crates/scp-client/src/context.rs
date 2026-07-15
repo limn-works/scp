@@ -34,13 +34,6 @@ pub struct PerContextState {
     /// convergence property the MVP test asserts is a property of THIS log
     /// being driven by shared append logic on both members.
     pub event_log: EventLog,
-    /// Membership set: member DIDs in the context.
-    ///
-    /// Insertion-ordered is not required for convergence (the event log carries
-    /// order); a `Vec` keeps the set small and cheap for the MVP. Membership is
-    /// authoritative at the driver level for "who is in the context"; the MLS
-    /// tree is authoritative for who can derive keys.
-    pub members: Vec<String>,
     /// Per-member next-outgoing message sequence number, keyed by member DID.
     ///
     /// This is ENCRYPTION state (the next sequence each sender will stamp), not
@@ -67,42 +60,54 @@ impl PerContextState {
     /// initial member (sequence 0).
     #[must_use]
     pub fn new(context_id: &str, creator_did: &str, crypto: ContextCryptoState) -> Self {
-        let mut member_sequence_numbers = HashMap::new();
-        member_sequence_numbers.insert(creator_did.to_owned(), 0);
-        Self {
+        let mut state = Self {
             crypto,
             event_log: EventLog::new(context_id.to_owned()),
-            members: vec![creator_did.to_owned()],
-            member_sequence_numbers,
+            member_sequence_numbers: HashMap::new(),
             event_buffer: VecDeque::new(),
             poisoned: false,
-        }
+        };
+        // The creator is the sole initial member; record it in the wrapping-key
+        // directory (the authoritative member set) with its own wrapping key.
+        let creator_wrapping_key = state.crypto.wrapping_public;
+        state.add_member_record(creator_did, creator_wrapping_key);
+        state
     }
 
     /// Creates fresh per-context state with an EMPTY event log and EMPTY
     /// membership, for a joiner that will replay the adder's stream and adopt
-    /// the adder's membership snapshot.
+    /// the adder's membership snapshot (directory of wrapping keys).
     #[must_use]
     pub fn new_empty(context_id: &str, crypto: ContextCryptoState) -> Self {
         Self {
             crypto,
             event_log: EventLog::new(context_id.to_owned()),
-            members: Vec::new(),
             member_sequence_numbers: HashMap::new(),
             event_buffer: VecDeque::new(),
             poisoned: false,
         }
     }
 
-    /// Records a member in the context's membership set and seeds their
-    /// outgoing-sequence counter. A no-op if the member is already present.
-    pub fn add_member_record(&mut self, member_did: &str) {
-        if !self.members.iter().any(|m| m == member_did) {
-            self.members.push(member_did.to_owned());
-        }
+    /// Records a member in the context's wrapping-key directory (the
+    /// authoritative member set — ADR-057 sender-key distribution INVARIANT 1)
+    /// with the wrapping key a peer needs to HPKE-seal a sender key to it, and
+    /// seeds their outgoing-sequence counter. Re-recording updates the wrapping
+    /// key (e.g. a rotation) and leaves the sequence counter intact.
+    pub fn add_member_record(&mut self, member_did: &str, wrapping_key: [u8; 32]) {
+        self.crypto
+            .record_member_wrapping_key(member_did, wrapping_key);
         self.member_sequence_numbers
             .entry(member_did.to_owned())
             .or_insert(0);
+    }
+
+    /// Returns the member DIDs of this context, sorted (the wrapping-key directory
+    /// keys — the authoritative member set).
+    #[must_use]
+    pub fn member_dids(&self) -> Vec<String> {
+        let mut dids: Vec<String> = self.crypto.member_wrapping_keys.keys().cloned().collect();
+        dids.sort();
+        dids
     }
 
     /// Returns and post-increments this member's next outgoing sequence number.

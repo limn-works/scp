@@ -2671,6 +2671,16 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         } => ContextError::PermissionDenied(format!(
             "SCP-OUTLET-6130: outlet {outlet_id} handler panicked (execution.handler-panic): {panic_message}"
         )),
+        // §5.4.5 "Cross-context economy" (ADR-061): a best-effort cross-context
+        // open of a PAID Action outlet is rejected zero-escrow. This is an
+        // open-time Economic-class rejection (`SCP-OUTLET-6150`) — NOT a
+        // Transport fault — directing the caller to the streaming saga
+        // (SCP-OUT-046) for a metered paid cross-context stream.
+        InvocationError::CrossContextPaidActionUnsupported { outlet_id } => {
+            ContextError::PermissionDenied(format!(
+                "SCP-OUTLET-6150: outlet {outlet_id} is a paid Action outlet; the best-effort cross-context bridge is zero-escrow — use the streaming saga (SCP-OUT-046) for a metered paid cross-context stream"
+            ))
+        }
     }
 }
 

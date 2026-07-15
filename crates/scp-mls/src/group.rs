@@ -731,6 +731,65 @@ pub fn key_package_in_did(
     Ok(scp_cred.did)
 }
 
+/// Extracts the `scp_wrapping_key` X25519 public key published in a
+/// fully-validated `KeyPackage`'s leaf extension (§9.16.1).
+///
+/// This is the adder-side counterpart of the recovery
+/// [`decrypt_with_membership_changes`](crate::encrypt::decrypt_with_membership_changes)
+/// performs for bystanders: it lets the member creating an add read the joiner's
+/// stable wrapping public key straight off the wire-delivered `KeyPackage`, so it
+/// can HPKE-seal its own sender key to the new member (ADR-057 sender-key
+/// distribution). Validation is identical to [`key_package_in_did`] — the leaf
+/// signature, key-package signature, protocol version, and (hardened) `Lifetime`
+/// are all checked — so a key package this function reads a wrapping key from is
+/// one [`add_member`] will also accept.
+///
+/// FAIL-CLOSED (ADR-057 INVARIANT 3): a `KeyPackage` whose leaf carries no
+/// `scp_wrapping_key` extension is rejected with [`MlsError::ExtensionError`],
+/// mirroring the pre-merge fail-closed in `decrypt_with_membership_changes`. A
+/// member no peer can HPKE-seal a sender key to must not be admitted.
+///
+/// # Arguments
+///
+/// * `key_package` - The wire-delivered key package to authenticate and read.
+/// * `protocol_version` - The MLS protocol version to validate against.
+/// * `clock` - The injected hardened [`Clock`] the accepted `Lifetime` is
+///   re-validated against (ADR-057 §Prereq-1).
+///
+/// # Errors
+///
+/// Returns [`MlsError::AddMemberFailed`] if the key package fails validation,
+/// [`MlsError::KeyPackageLifetimeInvalid`] if the accepted `Lifetime` fails the
+/// hardened-clock re-validation, or [`MlsError::ExtensionError`] if the leaf
+/// carries no (or a malformed) `scp_wrapping_key` extension.
+pub fn key_package_in_wrapping_key(
+    key_package: &KeyPackageIn,
+    protocol_version: ProtocolVersion,
+    clock: &dyn Clock,
+) -> Result<[u8; 32], MlsError> {
+    let provider = InMemoryMlsProvider::default();
+    let verified = key_package
+        .clone()
+        .validate(provider.crypto(), protocol_version)
+        .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
+
+    // SECURITY (ADR-057 §Prereq-1): mirror the hardened-clock re-validation
+    // `add_member` / `key_package_in_did` perform, so this accepts exactly the
+    // key packages the add path accepts.
+    validate_key_package_lifetime(verified.life_time(), clock)?;
+
+    crate::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())?.ok_or_else(
+        || {
+            MlsError::ExtensionError(
+                "KeyPackage leaf carries no scp_wrapping_key extension; a member no peer \
+                 can HPKE-seal a sender key to must not be admitted (§9.16.1, ADR-057 \
+                 sender-key distribution INVARIANT 3)"
+                    .to_owned(),
+            )
+        },
+    )
+}
+
 /// The result of removing a member from an MLS group.
 ///
 /// Contains the Commit message that must be distributed to remaining members
@@ -1117,10 +1176,24 @@ pub fn join_group_from_bytes(
         ));
     };
 
-    // max_past_epochs(2) must match create_group's MlsGroupCreateConfig to
-    // ensure joining members also retain past epoch message secrets during
-    // the 30-second grace window. See create_group() and issue #324.
-    let join_config = MlsGroupJoinConfig::builder().max_past_epochs(2).build();
+    // The join config must MIRROR create_group's MlsGroupCreateConfig, or a
+    // member that joined via Welcome would build subtly different group state
+    // from the creator's:
+    // - `max_past_epochs(2)` — retain past-epoch message secrets during the
+    //   30-second grace window (mirrors create_group);
+    // - `use_ratchet_tree_extension(true)` — embed the ratchet tree in every
+    //   Welcome THIS member later produces when it adds a member. Without it a
+    //   joined member's Welcome omits the tree and the new joiner fails with
+    //   "No ratchet tree available to build initial tree" (openmls does not
+    //   inherit this flag from the group a Welcome was joined from; it is a
+    //   property of the local join config). The creator sets it in
+    //   create_group, so mirroring it here keeps every member — creator or
+    //   Welcome-joined — able to add further members (§9.16.1 in-tab
+    //   distribution requires every member to be an eligible adder/bystander).
+    let join_config = MlsGroupJoinConfig::builder()
+        .max_past_epochs(2)
+        .use_ratchet_tree_extension(true)
+        .build();
 
     let staged_welcome = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
         .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
