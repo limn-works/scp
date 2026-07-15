@@ -314,6 +314,14 @@ impl FullStackNode {
         context_id: &str,
         params: ContextParams,
     ) -> Result<ContextHandle, ContextCreationError> {
+        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the receive path now decrypts through
+        // the context ACTOR's `deliver_incoming`, whose Phase-1 local-member lookup
+        // matches the context membership against the supervisor-wide `local_dids`
+        // registry. The deleted provider `open` twin required no such registry, so
+        // the harness never registered its own DID; in production the FFI bridge
+        // registers each identity via `identity_add`. Mirror that here (idempotent,
+        // supervisor-wide) so this node can identify itself as the local member.
+        let _ = self.manager.register_local_did(self.did.clone()).await;
         self.manager
             .create_context(context_id.to_owned(), params, self.did.clone(), None)
             .await
@@ -511,6 +519,15 @@ impl FullStackNode {
         context_id_str: &str,
         context_id: &[u8; 32],
     ) -> Result<ContextHandle, ContextError> {
+        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the receive path decrypts through the
+        // context ACTOR's `deliver_incoming`, whose Phase-1 local-member lookup
+        // matches the context membership against the supervisor-wide `local_dids`
+        // registry (the deleted provider `open` twin needed no such registry). In
+        // production the FFI bridge registers each identity via `identity_add`;
+        // mirror that here (idempotent) so this joiner can identify itself as the
+        // local member when it opens incumbent traffic.
+        let _ = self.manager.register_local_did(self.did.clone()).await;
+
         // 1. Take the sealed invitation (bundle + reservation id) the creator
         //    deposited.
         let PendingJoin {
