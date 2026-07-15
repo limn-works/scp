@@ -76,6 +76,13 @@ use crate::context::supervisor::saga_journal::SagaId;
 ///
 /// **Non-derives.** No `Clone`, `Debug`, `Display`, `Serialize`,
 /// `Deserialize` — see module-level documentation for rationale.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "The streaming variant carries the durable Merkle frontier + the \
+              SCP-OUT-046 settlement ledger; the large variant is the NORMAL \
+              durable-state case (not an error path), and boxing a hot durable \
+              slot to equalize with the unary variant is negative value."
+)]
 pub enum SagaPreparedState {
     /// Cross-context outlet invocation. The UCAN proof bytes are NOT carried
     /// here — only the proof's identifier — to keep the prepared-state non-
@@ -353,6 +360,33 @@ pub struct CrossContextStreamingOutletInvocationPrepared {
     /// The `CancelAckTracker` ceiling that bounds a truncated close (the
     /// cancel-ack billing boundary; `u64::MAX` when the stream has no cancel).
     pub cancel_ack_ceiling: u64,
+    /// The stream `request_id` (SCP-OUT-046 settlement ledger) — the key the
+    /// close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// receipt + event-log provenance anchor to. Staged at Prepare-B so the
+    /// seal (and crash recovery) settle against the SAME id the pump billed.
+    pub request_id: [u8; 16],
+    /// The §5.4.5 MED-HIGH economic policy snapshotted at acceptance
+    /// (SCP-OUT-046 settlement ledger). Stored as the raw
+    /// [`EconomicPolicy`](scp_protocol::economy::types::EconomicPolicy) (the
+    /// `EconomicPolicySnapshot` wrapper is not `Serialize`) so the seal captures
+    /// the billed `PaymentReceipt` for service rendered even if B is torn down
+    /// mid-stream. `None` for zero-cost / Query streams.
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+    /// The §7.3.8 worst-case cumulative-counter amount RESERVED at the open-time
+    /// final gate (SCP-OUT-046 settlement ledger). The seal releases the UNSPENT
+    /// portion (`reserved − billed_count × cost_per_chunk`) back to the counter
+    /// at close. `0` when no cap / no store / `cost_per_chunk == 0`. Staged
+    /// post-open via [`SagaPhaseMessage::StreamStageCounterReserve`](crate::context::actor::commands::SagaPhaseMessage::StreamStageCounterReserve).
+    pub amount_cumulative_reserved: u64,
+    /// The invoker-declared `estimated_chunk_count` (SCP-OUT-046 settlement
+    /// ledger; diagnostics / event field only — the release reconciles by
+    /// AMOUNT). Staged post-open alongside `amount_cumulative_reserved`.
+    pub reserved_chunks: u32,
+    /// The opening UCAN CID (SCP-OUT-046 settlement ledger) — the durable
+    /// `AmountCumulative` counter's key, so the close-time release targets the
+    /// same counter the open reserved. Empty when no counter reservation.
+    /// Staged post-open alongside `amount_cumulative_reserved`.
+    pub ucan_cid: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +426,12 @@ pub struct CrossContextStreamingOutletInvocationPrepared {
 /// visibility. A future saga type would add its own branch here under the
 /// same discipline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Mirrors SagaPreparedState — the streaming snapshot carries the \
+              durable frontier + SCP-OUT-046 settlement ledger; the large \
+              variant is the normal durable-snapshot case."
+)]
 pub enum SagaPreparedStateSnapshot {
     /// Mirror of [`SagaPreparedState::CrossContextOutletInvocation`].
     CrossContextOutletInvocation(CrossContextOutletInvocationSnapshot),
@@ -467,6 +507,17 @@ pub struct CrossContextStreamingOutletInvocationSnapshot {
     pub billed_count: u32,
     /// The cancel-ack billing ceiling.
     pub cancel_ack_ceiling: u64,
+    /// The stream `request_id` (SCP-OUT-046 settlement ledger).
+    pub request_id: [u8; 16],
+    /// The acceptance-time economic policy (raw, `Serialize`) — `None` for
+    /// zero-cost / Query streams.
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+    /// The §7.3.8 worst-case cumulative-counter amount reserved at open.
+    pub amount_cumulative_reserved: u64,
+    /// The invoker-declared `estimated_chunk_count` (diagnostics only).
+    pub reserved_chunks: u32,
+    /// The opening UCAN CID — the cumulative counter's key.
+    pub ucan_cid: String,
 }
 
 impl SagaPreparedStateSnapshot {
@@ -508,6 +559,11 @@ impl SagaPreparedStateSnapshot {
                         billed: inner.billed,
                         billed_count: inner.billed_count,
                         cancel_ack_ceiling: inner.cancel_ack_ceiling,
+                        request_id: inner.request_id,
+                        economic_policy: inner.economic_policy.clone(),
+                        amount_cumulative_reserved: inner.amount_cumulative_reserved,
+                        reserved_chunks: inner.reserved_chunks,
+                        ucan_cid: inner.ucan_cid.clone(),
                     },
                 )
             }
@@ -552,6 +608,11 @@ impl SagaPreparedStateSnapshot {
                         billed: snap.billed,
                         billed_count: snap.billed_count,
                         cancel_ack_ceiling: snap.cancel_ack_ceiling,
+                        request_id: snap.request_id,
+                        economic_policy: snap.economic_policy,
+                        amount_cumulative_reserved: snap.amount_cumulative_reserved,
+                        reserved_chunks: snap.reserved_chunks,
+                        ucan_cid: snap.ucan_cid,
                     },
                 )
             }
@@ -939,6 +1000,14 @@ mod tests {
                 billed: Amount::new(300),
                 billed_count: 3,
                 cancel_ack_ceiling: 2,
+                request_id: [0x7Au8; 16],
+                // Query / zero-cost stream — no policy snapshot. The
+                // `Option<EconomicPolicy>` field round-trips as `None`;
+                // `EconomicPolicy`'s own `Serialize` is proven by its derive.
+                economic_policy: None,
+                amount_cumulative_reserved: 900,
+                reserved_chunks: 9,
+                ucan_cid: "bafy-stream-ucan".to_owned(),
             },
         );
 
@@ -965,6 +1034,13 @@ mod tests {
         assert_eq!(inner.billed, Amount::new(300));
         assert_eq!(inner.billed_count, 3);
         assert_eq!(inner.cancel_ack_ceiling, 2);
+        // SCP-OUT-046 settlement-ledger fields survive the snapshot (durable
+        // for crash-recovery settlement).
+        assert_eq!(inner.request_id, [0x7Au8; 16]);
+        assert_eq!(inner.economic_policy, None);
+        assert_eq!(inner.amount_cumulative_reserved, 900);
+        assert_eq!(inner.reserved_chunks, 9);
+        assert_eq!(inner.ucan_cid, "bafy-stream-ucan");
         // The AC7 durable-prefix reproducibility witness: the frontier's
         // root and counters survive the snapshot byte-for-byte.
         assert_eq!(inner.frontier.root(), expected_root);

@@ -6518,6 +6518,15 @@ impl Supervisor {
             caller_source_role: caller_source_role.clone(),
             reserved: phase1.reservation.reserved_escrow,
             cost_per_chunk: phase1.params.cost_per_chunk,
+            request_id: phase1.params.request_id,
+            // Raw policy (the `EconomicPolicySnapshot` wrapper is not
+            // `Serialize`) — staged durably so the seal captures the billed
+            // receipt even if B is torn down mid-stream (SCP-OUT-046).
+            economic_policy: phase1
+                .params
+                .economic_policy_snapshot
+                .as_ref()
+                .map(|snap| snap.policy.clone()),
         };
         let prepare_saga_id = saga_id.clone();
         let prepare_outcome = target_actor
@@ -6659,6 +6668,42 @@ impl Supervisor {
             });
         };
 
+        // Stage the §7.3.8 cumulative-counter reserve durably (SCP-OUT-046): it
+        // is computed inside `open_stream_session`'s final gate, so it is folded
+        // into the durable prepared slot NOW (post-open) so the seal — and crash
+        // recovery — release the unspent counter at close from durable state. A
+        // stage failure is best-effort (the seal then releases nothing —
+        // conservative, the counter stays more-consumed, never an under-charge).
+        let counter_reserve = handle.counter_reserve().clone();
+        let settlement_generation = econ_reservation.generation;
+        if counter_reserve.amount_cumulative_reserved > 0 {
+            let stage_saga_id = saga_id.clone();
+            let stage_amount = counter_reserve.amount_cumulative_reserved;
+            let stage_chunks = counter_reserve.reserved_chunks;
+            let stage_ucan = counter_reserve.ucan_cid.clone();
+            if let Err(err) = target_actor
+                .send(move |reply| {
+                    crate::context::actor::ContextCommand::SagaPhase(
+                        SagaPhaseMessage::StreamStageCounterReserve {
+                            saga_id: stage_saga_id,
+                            amount_cumulative_reserved: stage_amount,
+                            reserved_chunks: stage_chunks,
+                            ucan_cid: stage_ucan,
+                            reply,
+                        },
+                    )
+                })
+                .await
+            {
+                tracing::warn!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "streaming saga: durable counter-reserve stage failed — the seal will \
+                     release no cumulative counter (conservative; never an under-charge)"
+                );
+            }
+        }
+
         // AC2 — release the per-participant-context-set concurrency slot at the
         // Commit-transition (the seal pumps off-mailbox). The escrow stays
         // RESERVED (AC3): it settles from the durable ledger at seal-close.
@@ -6677,6 +6722,7 @@ impl Supervisor {
             target_hex,
             saga_id.clone(),
             SigningKeyBytes::from_signing_key(signing_keys.target),
+            settlement_generation,
             inner_rx,
             outer_tx,
             escrow_ticket,

@@ -818,6 +818,15 @@ pub struct StreamSessionHandle {
     /// Pinned `request_id` (used by `apply_outlet_cancel` to validate
     /// the inbound message).
     request_id: RequestId,
+    /// The §7.3.8 cumulative-counter reserve committed at the open-time final
+    /// gate (SCP-OUT-046). Surfaced on the handle so the streaming-saga driver
+    /// can stage it durably into the `SagaId`-keyed prepared state (the pump
+    /// runs `settlement_sink = None`, so the seal — not the pump — releases the
+    /// unspent counter reserve at close, and crash recovery must settle from the
+    /// durable staged copy). The same-context best-effort open
+    /// ([`Supervisor::open_outlet_stream`](crate::context::supervisor::Supervisor::open_outlet_stream))
+    /// ignores this field — its pump owns close-time release.
+    counter_reserve: CounterReserveSettlement,
 }
 
 /// Summary of the per-stream settlement, published exactly once when
@@ -860,6 +869,14 @@ impl StreamSessionHandle {
     /// Detaches the chunk receiver. Returns `None` if already taken.
     pub const fn receiver(&mut self) -> Option<mpsc::Receiver<OutletStreamChunk>> {
         self.receiver.take()
+    }
+
+    /// The §7.3.8 cumulative-counter reserve committed at open (SCP-OUT-046).
+    /// The streaming-saga driver reads it at the Commit-transition to stage the
+    /// release-at-close ledger durably; see the field doc.
+    #[must_use]
+    pub(in crate::context) const fn counter_reserve(&self) -> &CounterReserveSettlement {
+        &self.counter_reserve
     }
 
     /// Detaches the close summary future. Resolves when the pump emits
@@ -2425,7 +2442,7 @@ where
             input_hash,
             start: pump_start,
             economic_policy_snapshot,
-            counter_reserve,
+            counter_reserve: counter_reserve.clone(),
         },
         pump_permit,
     );
@@ -2438,6 +2455,9 @@ where
         terminate_wake,
         summary_rx: Some(summary_rx),
         request_id,
+        // SCP-OUT-046 — surfaced so the streaming-saga driver stages the
+        // release-at-close counter reserve durably (settlement_sink = None).
+        counter_reserve,
     })
 }
 
@@ -3626,6 +3646,7 @@ mod tests {
             terminate_wake: Arc::new(Notify::new()),
             summary_rx: None,
             request_id: [0x77; 16],
+            counter_reserve: CounterReserveSettlement::zero(),
         };
 
         // The grant content is irrelevant — the gate fires before the
@@ -3927,6 +3948,7 @@ mod tests {
             terminate_wake: Arc::clone(&terminate_wake),
             summary_rx: None,
             request_id,
+            counter_reserve: CounterReserveSettlement::zero(),
         };
 
         handle
@@ -4055,6 +4077,7 @@ mod tests {
             terminate_wake: Arc::clone(&terminate_wake),
             summary_rx: None,
             request_id,
+            counter_reserve: CounterReserveSettlement::zero(),
         };
 
         // Drive the stream to pump exit: the first terminate arms the
@@ -4101,6 +4124,7 @@ mod tests {
             terminate_wake,
             summary_rx: None,
             request_id,
+            counter_reserve: CounterReserveSettlement::zero(),
         };
 
         // First call wins.
@@ -4174,6 +4198,7 @@ mod tests {
                 terminate_wake: Arc::clone(&terminate_wake),
                 summary_rx: None,
                 request_id,
+                counter_reserve: CounterReserveSettlement::zero(),
             };
 
             // Pass a deliberately-misleading message_override to prove
@@ -4299,6 +4324,7 @@ mod tests {
             terminate_wake,
             summary_rx: None,
             request_id,
+            counter_reserve: CounterReserveSettlement::zero(),
         };
         (handle, outer_rx, summary_rx, pump_join, inner_tx)
     }
@@ -4895,6 +4921,7 @@ mod tests {
             terminate_wake,
             summary_rx: None,
             request_id,
+            counter_reserve: CounterReserveSettlement::zero(),
         };
         CapturingPump {
             handle,

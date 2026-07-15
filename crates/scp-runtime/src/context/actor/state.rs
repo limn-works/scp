@@ -3107,6 +3107,11 @@ mod tests {
                     billed: Amount::new(2_000),
                     billed_count: 2,
                     cancel_ack_ceiling: 1,
+                    request_id: [0xA1u8; 16],
+                    economic_policy: None,
+                    amount_cumulative_reserved: 4_000,
+                    reserved_chunks: 4,
+                    ucan_cid: "lossless-stream-ucan-cid".to_owned(),
                 },
             ),
         );

@@ -4916,6 +4916,11 @@ pub(crate) async fn run_streaming_saga_seal_task(
     target_context_hex: String,
     saga_id: crate::context::supervisor::saga_journal::SagaId,
     target_signing_key: crate::context::actor::commands::SigningKeyBytes,
+    // The reservation's spawn-generation (SCP-OUT-046) — passed to
+    // `settle_outlet_stream_via_actor` so the close-time settlement is dropped
+    // if B respawned between reserve and seal (the same confused-deputy guard
+    // the same-context settlement sink holds).
+    settlement_generation: u64,
     mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
     outer_tx: mpsc::Sender<ForwardedStreamFrame>,
     escrow_ticket: crate::context::outlets::dispatch::StreamEscrowTicket,
@@ -5139,6 +5144,27 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 manifest_root = %hex::encode(outcome.stream_manifest_hash),
                 "streaming-saga seal task: sealed — Committing→Committed"
             );
+            // Apply the ACTUAL budget movement (SCP-OUT-046): the seal handler
+            // built the complete `StreamSettlement` from the durable ledger but
+            // CANNOT dispatch to its own actor mailbox (re-entrant deadlock), so
+            // the off-mailbox seal task applies it here — the escrow refund is
+            // credited, the billed `PaymentReceipt` captured, and the §7.3.8
+            // cumulative counter released by exactly the billed spend. `None` on
+            // a replay (the money already moved). A zero-cost / Query stream
+            // still settles (refund = billed = 0; no payment fabricated).
+            if let Some(settlement) = outcome.settlement
+                && let Err(err) = supervisor
+                    .settle_outlet_stream_via_actor(*settlement, settlement_generation)
+                    .await
+            {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "streaming-saga seal task: close-time escrow settlement failed — the \
+                     crash-recovery sweep reconciles the durable reserve"
+                );
+            }
+
             // Resolve the journal to `Committed` so crash recovery does not
             // redrive a completed saga. Non-secret (the streaming saga journals
             // public metadata only).

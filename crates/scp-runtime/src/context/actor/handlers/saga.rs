@@ -201,7 +201,8 @@ pub(crate) async fn dispatch(
         stream @ (SagaPhaseMessage::PrepareBStreaming { .. }
         | SagaPhaseMessage::StreamCaptureAppend { .. }
         | SagaPhaseMessage::CommitBStreamSettle { .. }
-        | SagaPhaseMessage::StreamSettleCheckWitness { .. }) => {
+        | SagaPhaseMessage::StreamSettleCheckWitness { .. }
+        | SagaPhaseMessage::StreamStageCounterReserve { .. }) => {
             dispatch_stream_phase(cell, deps, stream).await
         }
         // Commit (split) / Abort / divergence-marker arms (slice 4).
@@ -215,6 +216,7 @@ pub(crate) async fn dispatch(
 /// the LOCAL target (B) actor: `PrepareBStreaming` stages the durable slot,
 /// `StreamCaptureAppend` folds each chunk, `CommitBStreamSettle` seals at close,
 /// and `StreamSettleCheckWitness` is the read-only recovery witness check.
+#[allow(clippy::too_many_lines)]
 async fn dispatch_stream_phase(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -239,6 +241,8 @@ async fn dispatch_stream_phase(
                 caller_source_role,
                 reserved,
                 cost_per_chunk,
+                request_id,
+                economic_policy,
             } = *fields;
             let req = PrepareBRequest {
                 saga_id,
@@ -253,7 +257,35 @@ async fn dispatch_stream_phase(
                 asserted_timestamp_ms,
                 caller_source_role,
             };
-            prepare_b_streaming(cell, deps, req, reserved, cost_per_chunk, reply).await
+            prepare_b_streaming(
+                cell,
+                deps,
+                req,
+                reserved,
+                cost_per_chunk,
+                request_id,
+                economic_policy,
+                reply,
+            )
+            .await
+        }
+        SagaPhaseMessage::StreamStageCounterReserve {
+            saga_id,
+            amount_cumulative_reserved,
+            reserved_chunks,
+            ucan_cid,
+            reply,
+        } => {
+            stream_stage_counter_reserve(
+                cell,
+                deps,
+                &saga_id,
+                amount_cumulative_reserved,
+                reserved_chunks,
+                ucan_cid,
+                reply,
+            )
+            .await
         }
         SagaPhaseMessage::StreamCaptureAppend {
             saga_id,
@@ -382,6 +414,9 @@ async fn dispatch_prepare_phase(
         SagaPhaseMessage::StreamSettleCheckWitness { reply, .. } => {
             misrouted(reply, "StreamSettleCheckWitness")
         }
+        SagaPhaseMessage::StreamStageCounterReserve { reply, .. } => {
+            misrouted(reply, "StreamStageCounterReserve")
+        }
     }
 }
 
@@ -491,6 +526,9 @@ async fn dispatch_commit_phase(
         SagaPhaseMessage::PrepareB { reply, .. } => misrouted(reply, "PrepareB"),
         SagaPhaseMessage::PrepareBStreaming { reply, .. } => {
             misrouted(reply, "PrepareBStreaming")
+        }
+        SagaPhaseMessage::StreamStageCounterReserve { reply, .. } => {
+            misrouted(reply, "StreamStageCounterReserve")
         }
     }
 }
@@ -2099,12 +2137,15 @@ fn jcs_receipt_bytes(receipt: &CrossContextOutletReceipt) -> Result<Vec<u8>, Con
 /// unary eight-field projection. Same keep-nonce/restore-slot Class-S split as
 /// [`prepare_b`]. The staged frontier is the durable, `SagaId`-keyed capture the
 /// off-mailbox seal task folds chunks into and seals at close.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_b_streaming(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     req: PrepareBRequest,
     reserved: scp_protocol::economy::types::Amount,
     cost_per_chunk: scp_protocol::economy::types::Amount,
+    request_id: [u8; 16],
+    economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
     reply: tokio::sync::oneshot::Sender<Result<PrepareBOutcome, ContextError>>,
 ) -> Outcome<()> {
     // Identical read-only §6.2.4 validation gate as the unary Prepare-B.
@@ -2149,6 +2190,17 @@ async fn prepare_b_streaming(
         billed: scp_protocol::economy::types::Amount::new(0),
         billed_count: 0,
         cancel_ack_ceiling: u64::MAX,
+        request_id,
+        economic_policy,
+        // The §7.3.8 cumulative-counter reserve is computed inside
+        // `open_stream_session`'s final gate (post-Prepare-B), so it is staged
+        // here as the zero/empty ledger and folded in at the Commit-transition
+        // via `StreamStageCounterReserve`. A crash before that fold settles with
+        // NO counter release — conservative (the counter stays more-consumed),
+        // never an under-charge.
+        amount_cumulative_reserved: 0,
+        reserved_chunks: 0,
+        ucan_cid: String::new(),
     };
 
     let target_hex = hex_context_id(&req.target_context_id);
@@ -2298,6 +2350,63 @@ async fn stream_capture_append(
     }
 }
 
+/// [`SagaPhaseMessage::StreamStageCounterReserve`] handler (ADR-061 seal phase;
+/// SCP-OUT-046). Runs on the LOCAL target (B) actor. Folds the §7.3.8
+/// cumulative-counter reserve (computed inside `open_stream_session`'s final
+/// gate, post-Prepare-B) into the durable streaming prepared slot, then Class-S
+/// sync-persists **KEEP** — the counter release is a durable settlement input
+/// the seal (and crash recovery) read to build the close-time
+/// [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement).
+///
+/// Idempotent no-op if the saga already sealed (slot cleared) or aborted (slot
+/// absent) — a late fold after close never errors the driver.
+async fn stream_stage_counter_reserve(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    saga_id: &SagaId,
+    amount_cumulative_reserved: u64,
+    reserved_chunks: u32,
+    ucan_cid: String,
+    reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(prepared)) =
+        cell.class_s.saga_pending.get(saga_id)
+    else {
+        // Sealed / aborted — nothing to fold; a clean no-op.
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    };
+    let target_hex = hex_context_id(&prepared.target_context_id);
+
+    let result = cell
+        .commit_class_s_keep(deps, &target_hex, |mut view| {
+            let class_s = view.class_s_mut();
+            let Some(SagaPreparedState::CrossContextStreamingOutletInvocation(prepared)) =
+                class_s.saga_pending.get_mut(saga_id)
+            else {
+                // Slot vanished between the peek and here — a clean no-op.
+                return Ok(());
+            };
+            prepared.amount_cumulative_reserved = amount_cumulative_reserved;
+            prepared.reserved_chunks = reserved_chunks;
+            prepared.ucan_cid.clone_from(&ucan_cid);
+            Ok(())
+        })
+        .await;
+
+    match result {
+        Ok(()) => {
+            let _ = reply.send(Ok(()));
+            Outcome::ok_mutated(())
+        }
+        Err(err) => {
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            Outcome::err_mutated(sketch)
+        }
+    }
+}
+
 /// [`SagaPhaseMessage::CommitBStreamSettle`] handler (ADR-061 seal phase). Runs
 /// on the LOCAL target (B) actor at stream-close. The streaming saga's SINGLE
 /// commit (AC8): it seals the durable frontier prefix ONCE over the bounded
@@ -2369,6 +2478,9 @@ fn reemit_committed_stream_settle(
                 billed_count: committed.billed_count,
                 stream_chunk_count: committed.stream_chunk_count,
                 outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
+                // REPLAY: the money already moved on the first settle — the seal
+                // task must NOT re-apply it (idempotent seal-close).
+                settlement: None,
             }));
             Outcome::ok(())
         }
@@ -2390,6 +2502,7 @@ fn reemit_committed_stream_settle(
 /// re-stages the slot + re-persists via `commit_class_s_keep`. `(mutated, err)`:
 /// `false` for the pre-append failures (no slot 13042; signing 13044), `true`
 /// once the `OutletInvoked` append has run.
+#[allow(clippy::too_many_lines)]
 async fn commit_b_stream_first_settle(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -2473,6 +2586,31 @@ async fn commit_b_stream_first_settle(
         let caller_context_id = prepared.caller_context_id;
         let outlet_registration_id = prepared.outlet_registration_id.clone();
 
+        // Build the complete close-time settlement from the DURABLE ledger
+        // (SCP-OUT-046): escrow refund (`reserved − billed`) + billed capture +
+        // §7.3.8 cumulative-counter release, all from the staged fields. The
+        // off-mailbox seal task APPLIES it via `settle_outlet_stream_via_actor`
+        // (the actor cannot dispatch to its own mailbox — re-entrant deadlock).
+        // Crash recovery builds the IDENTICAL settlement from the same durable
+        // prefix, so normal close and recovery settle identically.
+        let settlement = crate::context::outlets::invoke::StreamSettlement {
+            context_id: hex_context_id(&target_context_id),
+            invoker_did: prepared.caller_did.clone(),
+            reserved: prepared.reserved,
+            billed_amount: billed,
+            refund_amount: refund,
+            billed_count,
+            request_id: prepared.request_id,
+            outlet_id: prepared.outlet_registration_id.clone(),
+            economic_policy_snapshot: prepared.economic_policy.clone().map(|policy| {
+                crate::context::outlets::invoke::EconomicPolicySnapshot { policy }
+            }),
+            amount_cumulative_reserved: prepared.amount_cumulative_reserved,
+            reserved_chunks: prepared.reserved_chunks,
+            ucan_cid: prepared.ucan_cid.clone(),
+            cost_per_chunk: prepared.cost_per_chunk,
+        };
+
         // Durable capture keyed by SagaId (AC7 replay witness) — BEFORE the
         // `OutletInvoked` append, so a persist failure leaves no orphan log entry.
         view.class_s_mut().xctx_committed_stream_outputs.insert(
@@ -2501,6 +2639,7 @@ async fn commit_b_stream_first_settle(
             target_context_id,
             caller_context_id,
             outlet_registration_id,
+            settlement,
         })
     });
 
@@ -2530,6 +2669,9 @@ struct CommitBStreamCaptured {
     target_context_id: [u8; 32],
     caller_context_id: [u8; 32],
     outlet_registration_id: String,
+    /// The complete close-time settlement built from the durable ledger
+    /// (SCP-OUT-046) — the off-mailbox seal task applies it.
+    settlement: crate::context::outlets::invoke::StreamSettlement,
 }
 
 /// Post-capture half of [`commit_b_stream_first_settle`]: append the B-side
@@ -2560,6 +2702,7 @@ async fn commit_b_stream_settle_finalize(
         target_context_id,
         caller_context_id,
         outlet_registration_id,
+        settlement,
     } = captured;
 
     // Append `OutletInvoked` to the local (target) log (spec §6.2.5 dual event-log
@@ -2627,6 +2770,9 @@ async fn commit_b_stream_settle_finalize(
         billed_count,
         stream_chunk_count,
         outlet_invoked_event_id: event_id,
+        // The FIRST seal returns the complete settlement for the off-mailbox
+        // seal task to APPLY (escrow refund + billed capture + counter release).
+        settlement: Some(Box::new(settlement)),
     })
 }
 

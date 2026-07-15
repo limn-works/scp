@@ -3112,6 +3112,16 @@ pub struct CommitBStreamSettleOutcome {
     pub stream_chunk_count: u64,
     /// The `SagaId`-stable `OutletInvoked` event-log entry id.
     pub outlet_invoked_event_id: String,
+    /// The complete close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// built by the handler from the DURABLE ledger (SCP-OUT-046): the escrow
+    /// refund + billed capture + §7.3.8 cumulative-counter release. `Some` on the
+    /// FIRST seal — the off-mailbox seal task applies it via
+    /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)
+    /// (the actor handler CANNOT dispatch to its own mailbox — re-entrant
+    /// deadlock — so the money movement runs off-mailbox). `None` on a REPLAY
+    /// (the money already moved on the first settle; the seal task must NOT
+    /// re-apply it). Boxed to keep the outcome small.
+    pub settlement: Option<Box<crate::context::outlets::invoke::StreamSettlement>>,
 }
 
 /// Reply-channel type alias for [`SagaPhaseMessage::CommitBStreamSettle`].
@@ -3157,6 +3167,15 @@ pub struct PrepareBStreamingFields {
     /// The per-billable-`Data`-chunk price pinned at reservation; staged so the
     /// seal reconstructs the escrow from `(cost_per_chunk, reserved)`.
     pub cost_per_chunk: scp_protocol::economy::types::Amount,
+    /// The stream `request_id` (SCP-OUT-046 settlement ledger) — staged so the
+    /// seal's [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// receipt + event provenance anchor to the id the pump billed.
+    pub request_id: [u8; 16],
+    /// The acceptance-time economic policy (raw, `Serialize`; the
+    /// `EconomicPolicySnapshot` wrapper is not) — `None` for zero-cost / Query
+    /// streams. Staged so the seal captures the billed `PaymentReceipt` for
+    /// service rendered even if B is torn down mid-stream (SCP-OUT-046).
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
 }
 
 /// See [`ContextCommand::SagaPhase`]. The per-phase messages the supervisor
@@ -3507,6 +3526,31 @@ pub enum SagaPhaseMessage {
         saga_id: crate::context::supervisor::saga_journal::SagaId,
         /// Oneshot reply: `true` iff the streaming seal is durably captured.
         reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+    /// Stage the §7.3.8 cumulative-counter reserve into the durable streaming
+    /// prepared slot (ADR-061 seal phase; SCP-OUT-046). Runs on the LOCAL target
+    /// (B) actor. Sent by the streaming-saga driver at the Commit-transition,
+    /// AFTER `open_stream_session` commits the counter CAS (the reserved amount is
+    /// computed inside the open's final gate, so it is not known at Prepare-B).
+    ///
+    /// Folds `amount_cumulative_reserved` / `reserved_chunks` / `ucan_cid` into
+    /// the staged
+    /// [`CrossContextStreamingOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextStreamingOutletInvocationPrepared)
+    /// slot, then Class-S sync-persists **KEEP** (the counter release is a
+    /// durable settlement input the seal + crash recovery read). Idempotent no-op
+    /// if the saga already sealed / aborted (slot gone).
+    StreamStageCounterReserve {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The §7.3.8 worst-case cumulative amount reserved at open.
+        amount_cumulative_reserved: u64,
+        /// The invoker-declared `estimated_chunk_count` (diagnostics only).
+        reserved_chunks: u32,
+        /// The opening UCAN CID — the cumulative counter's key.
+        ucan_cid: String,
+        /// Oneshot reply — `Ok(())` once durably folded (or on the idempotent
+        /// no-op path).
+        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 }
 
