@@ -3092,24 +3092,95 @@ pub fn decrypt_and_dispatch(
             payload,
         } => {
             tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
-            // ADR-049 PR-6 (read-authority switch): GATE-BEFORE-INSTALL. The
-            // provider only HPKE-opens + DID-authenticates the key; the
-            // authoritative Class-M registry enforces epoch monotonicity + the
-            // poisoning ceiling, FAIL-CLOSED, BEFORE the key is installed. A
-            // regressing/poisoned remote epoch is rejected with the key NEVER
-            // reaching the sender-key store (D1 close, fail-safe ordering).
-            let (sender_key, epoch) =
-                deps.crypto
-                    .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
-            deps.supervisor.check_and_advance_sender_epoch(
-                context_id_bytes,
-                &sender_did,
-                epoch,
-                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-            )?;
-            deps.crypto
-                .set_sender_key_unchecked(context_id_bytes, &sender_did, sender_key);
-            Ok(None)
+            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2: a management payload is a
+            // `SenderKeyDistributionMessage`. Branch on its variant — a PULL
+            // REQUEST is ANSWERED on the actor's OWNED crypto state (the answer
+            // HPKE-seals to the requester's EPHEMERAL wrapping key, so no signing
+            // key is needed — a clean receive-side answer); a RESPONSE is the
+            // push-distribution install path.
+            let dist =
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+                    &payload,
+                )
+                .map_err(|e| {
+                    ContextError::CryptoFailed(format!("distribution message decode: {e}"))
+                })?;
+            match dist {
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyRequest(
+                    request,
+                ) => {
+                    // The request's Ed25519 signature is by the requester
+                    // (== MLS-authenticated `sender_did`) over its ephemeral
+                    // wrapping key. MLS already authenticated `sender_did`; the
+                    // request signature additionally binds the ephemeral key, so
+                    // resolve the requester's Active verification key to check it.
+                    let requester_pk =
+                        (deps.key_resolver)(&DID(sender_did.clone()), SigningKeyId::Active)
+                            .ok_or_else(|| {
+                                ContextError::CryptoFailed(format!(
+                                    "cannot resolve requester public key for {sender_did}"
+                                ))
+                            })?;
+                    // The actor answer takes the request as bytes (byte-identical
+                    // to the retained oracle); re-serialize the parsed request.
+                    let request_bytes = rmp_serde::to_vec_named(&request).map_err(|e| {
+                        ContextError::CryptoFailed(format!("request re-serialization: {e}"))
+                    })?;
+                    // No per-context sender-key block list is resident on the actor
+                    // (the blocking-flow wiring is deferred); the §9.16.6
+                    // Mitigation-1 membership gate on the MLS group tree is the live
+                    // Sybil defense.
+                    let blocked = std::collections::HashSet::new();
+                    let now_secs = deps.clock.now_secs();
+                    if let Some(sealed) = cs.handle_sender_key_request(
+                        context_id_bytes,
+                        deps.crypto.local_did(),
+                        now_secs,
+                        &request_bytes,
+                        requester_pk.as_bytes(),
+                        &blocked,
+                    )? {
+                        // Queue the ephemeral-sealed answer for MLS-wrap + transmit
+                        // by `drain_and_deliver_sender_keys` after the Class-C view
+                        // drops (in `handle_deliver_incoming`). A blocked requester
+                        // returns `None` (§9.16.2 silent drop) — nothing queued.
+                        cs.pending_distributions.push((sender_did.clone(), sealed));
+                    }
+                    Ok(None)
+                }
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(
+                    _,
+                ) => {
+                    // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
+                    // fix. `process_incoming_sender_key` HPKE-opens with the
+                    // NODE-RESIDENT wrapping secret (unaffected by the crypto move)
+                    // and returns the authenticated `(key, epoch)`; the
+                    // authoritative Class-M registry gates epoch monotonicity + the
+                    // poisoning ceiling FAIL-CLOSED BEFORE install; the install then
+                    // writes to the ACTOR's OWNED `cs.sender_key_store`. The provider
+                    // store is EMPTY on a taken (actor-owned) context, so the former
+                    // `deps.crypto.set_sender_key_unchecked` was a silent no-op — the
+                    // latent bug this fixes (D1 close, fail-safe ordering preserved).
+                    let (sender_key, epoch) = deps.crypto.process_incoming_sender_key(
+                        context_id_bytes,
+                        &sender_did,
+                        &payload,
+                    )?;
+                    deps.supervisor.check_and_advance_sender_epoch(
+                        context_id_bytes,
+                        &sender_did,
+                        epoch,
+                        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+                    )?;
+                    let ctx_id_hex = hex::encode(context_id_bytes);
+                    cs.sender_key_store
+                        .set_unchecked(&ctx_id_hex, &sender_did, sender_key);
+                    Ok(None)
+                }
+                other => Err(ContextError::CryptoFailed(format!(
+                    "unexpected sender-key distribution variant on the receive path: {other:?}"
+                ))),
+            }
         }
     }
 }

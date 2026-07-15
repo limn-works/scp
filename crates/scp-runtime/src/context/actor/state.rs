@@ -1877,6 +1877,166 @@ impl ContextCryptoState {
             .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))
     }
 
+    /// Answers a §9.16.2 sender-key PULL request (the ANSWER half), moved from
+    /// the retained golden oracle
+    /// [`MlsCryptoProvider::handle_sender_key_request`]. Node-resident inputs
+    /// (`local_did`, `now_secs`, `blocked_dids`) and the raw `context_id` digest
+    /// enter as METHOD PARAMETERS — never stored on [`ContextCryptoState`] (there
+    /// is no clock field on the actor).
+    ///
+    /// # Persistence class — Class-C (COALESCED), NOT Class-S (§9 / §10)
+    ///
+    /// This method mutates exactly ONE field: `nonce_dedup.record` — the
+    /// per-context CRYPTO replay cache, reached in production through the SAME
+    /// field-granular `ClassCMut::mode_mut().crypto_mut()` Class-C seam that
+    /// [`Self::open`] uses. It is emphatically NOT the Class-S cross-context
+    /// [`ClassSState::xctx_nonce_dedup`](crate::context::actor::state::ClassSState::xctx_nonce_dedup)
+    /// and MUST NOT be routed through a Class-S combinator. Coalescing is sound
+    /// here: a still-fresh replayed request that survives a lost coalescing
+    /// window is re-answered by re-sealing the SAME sender key to the SAME
+    /// ephemeral `wrapping_pubkey` carried in the request — an idempotent
+    /// re-answer with no authentication break — so a crash that rolls back the
+    /// last window cannot open a re-spend / re-grant window (the Class-S
+    /// fail-closed rationale does not apply, per spec §9.16).
+    ///
+    /// Answering needs NO signing key: the response is HPKE-sealed to the fresh
+    /// EPHEMERAL `request.wrapping_pubkey`, so this is a clean receive-side move
+    /// — not new signed-request protocol.
+    ///
+    /// Returns `Some(serialized_response)` for a member requester, or `None`
+    /// when the requester is blocked (silently dropped, §9.16.2).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] on request deserialization, signature
+    /// verification, freshness, nonce-replay, a mode/group mismatch, or a
+    /// non-member requester (§9.16.6 Mitigation 1), or HPKE / serialization
+    /// failure.
+    pub(crate) fn handle_sender_key_request(
+        &mut self,
+        context_id: &[u8; 32],
+        local_did: &str,
+        now_secs: u64,
+        request_bytes: &[u8],
+        requester_public_key: &[u8],
+        blocked_dids: &std::collections::HashSet<String>,
+    ) -> Result<Option<Vec<u8>>, ContextError> {
+        let ctx_id_hex = hex::encode(context_id);
+
+        // Deserialize the request.
+        let request: scp_protocol::crypto::sender_keys::SenderKeyRequest =
+            rmp_serde::from_slice(request_bytes)
+                .map_err(|e| ContextError::CryptoFailed(format!("request deserialization: {e}")))?;
+
+        // Verify the request signature.
+        let valid = scp_protocol::crypto::sender_keys::verify_sender_key_request(
+            &request,
+            requester_public_key,
+        )
+        .map_err(|e| ContextError::CryptoFailed(format!("signature verification: {e}")))?;
+        if !valid {
+            return Err(ContextError::CryptoFailed(
+                "sender key request signature verification failed".to_string(),
+            ));
+        }
+
+        // Timestamp freshness.
+        scp_protocol::crypto::sender_keys::validate_sender_key_request_freshness(
+            &request, now_secs,
+        )
+        .map_err(|e| ContextError::CryptoFailed(format!("freshness check: {e}")))?;
+
+        // Nonce replay protection.
+        if self.nonce_dedup.is_replayed(&request.nonce, now_secs) {
+            return Err(ContextError::CryptoFailed(
+                "replayed sender key request".to_string(),
+            ));
+        }
+
+        // H1: Membership check — requester must be a CURRENT MLS group member,
+        // per spec §9.16.6 Mitigation 1 ("handle_sender_key_request MUST verify
+        // that the requester's DID is a current member of the context").
+        //
+        // Membership is read authoritatively from the MLS group tree — the same
+        // DID-match over `members()` that `remove_member` uses — NOT from
+        // `member_wrapping_keys`. That map only records members whose STABLE
+        // wrapping key this node happens to have cached (populated on the
+        // incumbent/adder side in `add_member_from_bytes`, from the added
+        // `KeyPackage`'s own leaf). A Welcome-joiner's map starts empty
+        // (`install_joined_group`), so gating on it would make the joiner reject
+        // every incumbent's key request and be permanently RECEIVE-ONLY. The
+        // pull protocol (§9.16.2) seals the response to the fresh EPHEMERAL
+        // `request.wrapping_pubkey` carried in the request, so the responder
+        // never needs the requester's stable key to answer — only proof that the
+        // requester is a member, which the group tree provides directly.
+        let mls_group = self.mls_group.as_ref().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let members = mls_group
+            .members()
+            .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+        let mut requester_is_member = false;
+        for member in &members {
+            if let Ok(basic_cred) =
+                openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                && let Ok(scp_cred) =
+                    scp_mls::credential::ScpCredential::from_bytes(basic_cred.identity())
+                && scp_cred.did == request.requester_did
+            {
+                requester_is_member = true;
+                break;
+            }
+        }
+        if !requester_is_member {
+            return Err(ContextError::CryptoFailed(
+                "sender key request from non-member".to_string(),
+            ));
+        }
+
+        // H1: Blocked DID check — a blocked requester is silently dropped
+        // (§9.16.2: no response, so it cannot obtain the key). Ok(None) rather
+        // than an error so an expected blocked request never fails the enclosing
+        // receive path.
+        if blocked_dids.contains(&request.requester_did) {
+            return Ok(None);
+        }
+
+        // HPKE-seal our sender key to the requester's ephemeral wrapping pubkey.
+        let sender_key = self.sender_key.as_ref().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let (sealed_vec, ephemeral_pub) =
+            crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+                sender_key.as_bytes(),
+                &request.wrapping_pubkey,
+                &ctx_id_hex,
+                local_did,
+                self.sender_key_epoch,
+            )
+            .map_err(|e| ContextError::CryptoFailed(format!("HPKE seal failed: {e}")))?;
+
+        let sealed: [u8; 48] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+            ContextError::CryptoFailed(format!("HPKE seal produced {} bytes, expected 48", v.len()))
+        })?;
+
+        let response = SenderKeyResponse {
+            sender_did: local_did.to_owned(),
+            epoch: self.sender_key_epoch,
+            hpke_sealed_key: sealed,
+            ephemeral_pubkey: ephemeral_pub,
+            request_nonce: request.nonce,
+        };
+
+        let message = rmp_serde::to_vec_named(&response)
+            .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))?;
+
+        // Record nonce only after successful processing (so a request that fails
+        // for another reason cannot poison the dedup cache).
+        self.nonce_dedup.record(request.nonce, now_secs);
+
+        Ok(Some(message))
+    }
+
     /// Disposes ALL per-context crypto material, matching the disposal hygiene
     /// the deleted `MlsCryptoProvider` gave by dropping its whole `contexts` map
     /// entry (ADR-049 PR-7 / SCP-CRYPTOMOVE-001 H4).
@@ -4181,5 +4341,127 @@ mod crypto_ops_golden {
             ),
             ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
         }
+    }
+
+    /// Byte-identity golden ORACLE test for the §9.16.2 sender-key ANSWER half
+    /// (ADR-049 PR-7): the actor
+    /// [`ContextCryptoState::handle_sender_key_request`] and the retained
+    /// provider oracle [`MlsCryptoProvider::handle_sender_key_request`] recover
+    /// the IDENTICAL sender key (and echo identical response metadata) for a
+    /// member requester.
+    ///
+    /// The sealed ciphertext is HPKE-randomised (a fresh ephemeral per answer),
+    /// so the deterministic golden — as in
+    /// [`golden_distribute_and_process_recover_identical_key`] — is the
+    /// RECOVERED key plus the response `sender_did` / `epoch` / echoed nonce. The
+    /// oracle is driven BEFORE the destructive `take_into_actor` (which moves
+    /// Alice's crypto — including its nonce-dedup cache — onto the actor); the
+    /// actor is then driven with a SECOND, fresh-nonce request (a replay of the
+    /// first would be rejected by the moved dedup cache).
+    #[test]
+    fn golden_handle_sender_key_request_actor_matches_oracle() {
+        use ed25519_dalek::Signer as _;
+        use scp_clock::Clock as _;
+
+        let (alice_p, _bob_p, ctx) = setup();
+        let ctx_hex = hex::encode(ctx);
+        let blocked: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Bob's request-signing key (arbitrary; its public half is passed as the
+        // `requester_public_key`). BOB is a real group member, so the §9.16.6
+        // Mitigation-1 membership gate passes on the group tree regardless.
+        let bob_req_sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let bob_req_pk = bob_req_sk.verifying_key();
+
+        // Build a signed SenderKeyRequest for Alice's key, sealing to a fresh
+        // ephemeral X25519 wrapping keypair. Returns (request_bytes, secret).
+        let build_request = |nonce: [u8; 16]| -> (Vec<u8>, [u8; 32]) {
+            let (wrapping_pub, wrapping_secret) =
+                scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+            let timestamp = SystemClock.now_secs();
+            let hash = scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
+                BOB, ALICE, 1, &wrapping_pub, &nonce, timestamp,
+            )
+            .unwrap();
+            let signature: [u8; 64] = bob_req_sk.sign(&hash).to_bytes();
+            let request = scp_protocol::crypto::sender_keys::SenderKeyRequest {
+                requester_did: BOB.to_owned(),
+                sender_did: ALICE.to_owned(),
+                epoch: 1,
+                wrapping_pubkey: wrapping_pub,
+                nonce,
+                timestamp,
+                signature,
+            };
+            (rmp_serde::to_vec_named(&request).unwrap(), wrapping_secret)
+        };
+
+        // 1. ORACLE (provider), BEFORE the destructive take.
+        let (req1_bytes, secret1) = build_request([1u8; 16]);
+        let resp_oracle_bytes = alice_p
+            .handle_sender_key_request(&ctx, &req1_bytes, bob_req_pk.as_bytes(), &blocked)
+            .expect("oracle answers a member request")
+            .expect("member requester receives a response");
+        let resp_oracle: SenderKeyResponse = rmp_serde::from_slice(&resp_oracle_bytes).unwrap();
+        let key_oracle = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
+            &resp_oracle.hpke_sealed_key,
+            &resp_oracle.ephemeral_pubkey,
+            &secret1,
+            &ctx_hex,
+            &resp_oracle.sender_did,
+            resp_oracle.epoch,
+        )
+        .unwrap();
+
+        // 2. ACTOR, after the take, with a fresh-nonce request.
+        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (req2_bytes, secret2) = build_request([2u8; 16]);
+        let resp_actor_bytes = {
+            let crypto = match &mut alice_a.mode {
+                ContextModeState::Encrypted(c) => c.as_mut(),
+                ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+            };
+            crypto
+                .handle_sender_key_request(
+                    &ctx,
+                    ALICE,
+                    SystemClock.now_secs(),
+                    &req2_bytes,
+                    bob_req_pk.as_bytes(),
+                    &blocked,
+                )
+                .expect("actor answers a member request")
+                .expect("member requester receives a response")
+        };
+        let resp_actor: SenderKeyResponse = rmp_serde::from_slice(&resp_actor_bytes).unwrap();
+        let key_actor = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
+            &resp_actor.hpke_sealed_key,
+            &resp_actor.ephemeral_pubkey,
+            &secret2,
+            &ctx_hex,
+            &resp_actor.sender_did,
+            resp_actor.epoch,
+        )
+        .unwrap();
+
+        // Byte-identity of the recovered material + response metadata.
+        assert_eq!(
+            key_actor.as_bytes(),
+            key_oracle.as_bytes(),
+            "actor and oracle recover the identical sender key"
+        );
+        assert_eq!(
+            key_actor.as_bytes(),
+            actor_sender_key(&alice_a).as_bytes(),
+            "the recovered key is Alice's actual local sender key"
+        );
+        assert_eq!(resp_actor.sender_did, resp_oracle.sender_did);
+        assert_eq!(resp_actor.sender_did, ALICE);
+        assert_eq!(resp_actor.epoch, resp_oracle.epoch);
+        assert_eq!(resp_actor.epoch, 1);
+        assert_eq!(
+            resp_actor.request_nonce, [2u8; 16],
+            "response echoes the request nonce"
+        );
     }
 }

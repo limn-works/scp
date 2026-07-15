@@ -1620,13 +1620,22 @@ impl MlsCryptoProvider {
     /// Returns `Some(serialized_response)` if the requester should receive
     /// a key, or `None` if the request was silently dropped (e.g., blocked).
     ///
-    /// The default implementation returns an error indicating the provider
-    /// does not support sender key request handling.
+    /// # ADR-049 PR-7 — retained golden ORACLE only
+    ///
+    /// The steady-state ANSWER half of §9.16.2 was MOVED onto the actor
+    /// ([`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request));
+    /// this provider copy is RETAINED under `#[cfg(any(test, feature =
+    /// "testing"))]` solely as the byte-identity golden oracle (and for
+    /// provider-level two-party test fixtures). Production is zero-grep clean of
+    /// this method — a taken (actor-owned) context answers on the actor, not
+    /// here. Keep this body byte-for-byte in step with the actor method so the
+    /// `crypto_ops_golden` oracle comparison stays meaningful.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if signature verification,
     /// HPKE encryption, or serialization fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn handle_sender_key_request(
         &self,
         context_id: &[u8; 32],
@@ -1712,11 +1721,11 @@ impl MlsCryptoProvider {
             ));
         }
 
-        // H1: Blocked DID check — requester must not be blocked.
+        // H1: Blocked DID check — a blocked requester is silently dropped
+        // (§9.16.2: no response). `Ok(None)` mirrors the actor method (and the
+        // §9.16 free function) so the byte-identity oracle stays in step.
         if blocked_dids.contains(&request.requester_did) {
-            return Err(ContextError::CryptoFailed(
-                "sender key request from blocked member".to_string(),
-            ));
+            return Ok(None);
         }
 
         // HPKE-seal our sender key to the requester's wrapping pubkey.

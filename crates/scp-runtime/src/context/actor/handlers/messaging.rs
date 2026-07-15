@@ -573,6 +573,26 @@ async fn handle_deliver_incoming(
         // `view` drops here, releasing the `&mut cell` borrow.
     };
 
+    // ADR-049 PR-7 §9.16.2 answer transmit: a PULL request handled inside
+    // `decrypt_and_dispatch` enqueued its ephemeral-sealed answer on the actor's
+    // `pending_distributions`. The deliver view has dropped; re-acquire the
+    // Class-C crypto view and MLS-wrap + transport-send the queued answer(s)
+    // through the existing drain path (reused verbatim from the join / rotate
+    // transmit). A no-op when nothing was queued (the ordinary case). The drain
+    // is best-effort by construction (per-recipient send failures are logged, the
+    // requester recovers via a fresh request), so its `Result` — which cannot
+    // actually error for the actor's in-memory `std::mem::take` drain — is not
+    // allowed to fail the just-completed delivery ack.
+    {
+        let mut view = cell.class_c_view();
+        let _ = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            view.mode_mut().crypto_mut(),
+            context_id,
+        )
+        .await;
+    }
+
     // Fail-closed persist of an applied downward-auth mutation (ADR-049 §9,
     // keep-direction): the mutation (suspension or `AssignRole` demotion) is
     // already in memory; committing the obligation's token makes it durable before

@@ -451,6 +451,62 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Answer a §9.16.2 sender-key PULL request on the actor's OWNED crypto
+    /// state (ADR-049 PR-7 / SCP-CRYPTOMOVE-001). The steady-state ANSWER half
+    /// moved off the provider onto
+    /// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request);
+    /// a taken (actor-owned) context can no longer answer through the emptied
+    /// provider, so this mailbox entry lets the full-stack harness reach the
+    /// actor answer by `context_id` (the requester side is driven externally with
+    /// the harness's own custody — actor-loop request INITIATION is deferred
+    /// #2049). Mirrors [`BroadcastCommand::HandleBroadcastKeyRequest`].
+    ///
+    /// The answer HPKE-seals to the EPHEMERAL wrapping key carried in the
+    /// request, so it needs NO signing key — a clean receive-side answer. Only
+    /// mutates the Class-C crypto replay cache (`nonce_dedup`), so the handler
+    /// reports `ok_mutated`.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    HandleSenderKeyRequest {
+        /// Context identifier string.
+        context_id: String,
+        /// The serialized [`SenderKeyRequest`](scp_protocol::crypto::sender_keys::SenderKeyRequest).
+        request_bytes: Vec<u8>,
+        /// The requester's Ed25519 verification key bytes (the responder verifies
+        /// the request signature against it).
+        requester_public_key: Vec<u8>,
+        /// Oneshot reply channel. `Ok(Some(sealed_response))` for a member
+        /// requester, `Ok(None)` when the requester is blocked.
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, ContextError>>,
+    },
+
+    /// Land a §9.16.2 pull-response sender key onto the actor's OWNED sender-key
+    /// store (ADR-049 PR-7 / SCP-CRYPTOMOVE-001). The requester (harness)
+    /// already HPKE-opened the ephemeral-sealed response with its own wrapping
+    /// secret; this mailbox entry GATES the authenticated `(sender_did, epoch)`
+    /// against the authoritative Class-M floor registry
+    /// (`check_and_advance_sender_epoch`, FAIL-CLOSED) and then installs the key
+    /// onto `cs.sender_key_store` — gate-before-install. The provider store is
+    /// empty on a taken context, so the install MUST land on the actor.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    LandSenderKeyResponse {
+        /// Context identifier string.
+        context_id: String,
+        /// The sender whose key this is (the key's owner / responder).
+        sender_did: String,
+        /// The authenticated sender key recovered by the requester.
+        sender_key: scp_protocol::crypto::sender_keys::SenderKey,
+        /// The key's epoch (gated for monotonicity + the poisoning ceiling).
+        epoch: u64,
+        /// Oneshot reply channel. `Ok(())` once gated + installed.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
     /// Record that a received envelope triggered degraded-mode (spec
     /// §13.6) for a context. Emits a `DegradedMode` event into the
     /// per-context receive buffer (and the supervisor's optional event
