@@ -52,8 +52,7 @@ const PROVIDER_SRC: &str =
 // `PerContextState` here, so the seal-internal envelope-pipeline assertions scan
 // this source (the moved code), not `PROVIDER_SRC`. This is a repoint to the new
 // home of the same seal/open pipeline, not a weakening.
-const STATE_SRC: &str =
-    include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
+const STATE_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
 
 // Supervisor dispatch source — owns `dispatch_lifecycle_direct`, whose
 // bootstrap arms (Create / Import / Restore) moved to the actor-shape

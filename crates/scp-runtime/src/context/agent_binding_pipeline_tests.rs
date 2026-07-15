@@ -459,8 +459,7 @@ mod live_supervisor_send {
 
     use ed25519_dalek::SigningKey;
     use scp_did::{DID, SigningKeyId};
-    
-    
+
     use scp_protocol::context::builder::{ContextCreationError, OpenResult};
     use scp_protocol::context::governance::KeyResolver;
     use scp_protocol::context::membership::{ContextEvent, KeyPackage};

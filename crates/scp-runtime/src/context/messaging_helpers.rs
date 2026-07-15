@@ -3098,13 +3098,10 @@ pub fn decrypt_and_dispatch(
             // HPKE-seals to the requester's EPHEMERAL wrapping key, so no signing
             // key is needed — a clean receive-side answer); a RESPONSE is the
             // push-distribution install path.
-            let dist =
-                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
-                    &payload,
-                )
-                .map_err(|e| {
-                    ContextError::CryptoFailed(format!("distribution message decode: {e}"))
-                })?;
+            let dist = scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+                &payload,
+            )
+            .map_err(|e| ContextError::CryptoFailed(format!("distribution message decode: {e}")))?;
             match dist {
                 scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyRequest(
                     request,
@@ -3148,9 +3145,7 @@ pub fn decrypt_and_dispatch(
                     }
                     Ok(None)
                 }
-                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(
-                    _,
-                ) => {
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(_) => {
                     // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
                     // fix. `process_incoming_sender_key` HPKE-opens with the
                     // NODE-RESIDENT wrapping secret (unaffected by the crypto move)

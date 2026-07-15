@@ -2184,9 +2184,7 @@ mod tests {
     /// Borrow the Encrypted-mode crypto sub-state of an actor `PerContextState`
     /// (panics on Broadcast) — the actor-seam analogue of the provider's
     /// `with_context` closure, for tests that inspect the live MLS group / stores.
-    fn actor_crypto(
-        state: &PerContextState,
-    ) -> &crate::context::actor::ContextCryptoState {
+    fn actor_crypto(state: &PerContextState) -> &crate::context::actor::ContextCryptoState {
         match &state.mode {
             crate::context::actor::ContextModeState::Encrypted(crypto) => crypto,
             crate::context::actor::ContextModeState::Broadcast(_) => {
@@ -2724,7 +2722,10 @@ mod tests {
         actor.remove_member(alice_did, bob_did).unwrap();
 
         {
-            let group = actor_crypto(&actor).mls_group.as_ref().expect("group present");
+            let group = actor_crypto(&actor)
+                .mls_group
+                .as_ref()
+                .expect("group present");
             assert_eq!(group.epoch().unwrap(), 2);
             let members = group.members().unwrap();
             assert_eq!(members.len(), 1, "only Alice should remain");
@@ -3145,11 +3146,8 @@ mod tests {
         // of a context the provider never created — its
         // `export_crypto_state` returns an empty blob (Ok, not an error).
         let unknown_ctx = [0xFFu8; 32];
-        let state = PerContextState::new_for_test_encrypted(
-            unknown_ctx,
-            0,
-            DID::from(TEST_DID.to_owned()),
-        );
+        let state =
+            PerContextState::new_for_test_encrypted(unknown_ctx, 0, DID::from(TEST_DID.to_owned()));
         let (wpub, wsec) = make_provider().wrapping_keypair();
         let exported = state
             .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
@@ -3597,8 +3595,13 @@ mod tests {
 
         // Export with the authoritative floor (epoch 5) as the param, through the
         // relocated actor export seam.
-        let exported =
-            actor_export(&provider, &ctx_id, vec![(bob_did.to_owned(), 5)], Vec::new()).unwrap();
+        let exported = actor_export(
+            &provider,
+            &ctx_id,
+            vec![(bob_did.to_owned(), 5)],
+            Vec::new(),
+        )
+        .unwrap();
         assert!(!exported.is_empty());
 
         // Restart: fresh provider, rebuild the owned material via the retained
@@ -3641,8 +3644,13 @@ mod tests {
 
         // Carol has NO key material (removed), but her floor (9) is retained in
         // the registry and exported as a param.
-        let exported =
-            actor_export(&provider, &ctx_id, vec![(carol_did.to_owned(), 9)], Vec::new()).unwrap();
+        let exported = actor_export(
+            &provider,
+            &ctx_id,
+            vec![(carol_did.to_owned(), 9)],
+            Vec::new(),
+        )
+        .unwrap();
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, restored) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
@@ -3848,9 +3856,7 @@ mod tests {
             restored.sender_epochs
         );
         // `ctx_id_hex` keys the reinstalled material.
-        assert!(
-            owned.sender_key_store.get(&ctx_id_hex, bob_did).is_some()
-        );
+        assert!(owned.sender_key_store.get(&ctx_id_hex, bob_did).is_some());
     }
 
     #[test]
@@ -4094,8 +4100,12 @@ mod tests {
         // at the MLS layer for an unrelated (forward-secrecy) reason.
         let inner1 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let inner2 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
-        let sealed_neg = alice_actor.seal(&alice_did, &inner1, &routing_id, 300).unwrap();
-        let sealed_pos = alice_actor.seal(&alice_did, &inner2, &routing_id, 300).unwrap();
+        let sealed_neg = alice_actor
+            .seal(&alice_did, &inner1, &routing_id, 300)
+            .unwrap();
+        let sealed_pos = alice_actor
+            .seal(&alice_did, &inner2, &routing_id, 300)
+            .unwrap();
 
         // Negative: opening with the hex-of-bytes string supplies a
         // `context_id_str` of `hex(ctx_id)` instead of the raw `TEST_CTX_STR`
@@ -4115,10 +4125,12 @@ mod tests {
         // dedicated guard-rejection path is covered by
         // `open_rejects_context_id_str_that_does_not_resolve_to_context_id`.
         let hex_ctx = hex::encode(ctx_id);
-        bob_actor.open(&SystemClock, &hex_ctx, &sealed_neg).expect_err(
-            "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
+        bob_actor
+            .open(&SystemClock, &hex_ctx, &sealed_neg)
+            .expect_err(
+                "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
              under the RAW context_id string, so the rebuilt AAD does not authenticate",
-        );
+            );
 
         // Positive: opening the second blob with the RAW context_id string
         // (the spec value) succeeds, proving the AAD binds the raw string.

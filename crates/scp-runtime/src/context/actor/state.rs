@@ -4370,8 +4370,8 @@ mod crypto_ops_golden {
         // Bob's request-signing key (arbitrary; its public half is passed as the
         // `requester_public_key`). BOB is a real group member, so the §9.16.6
         // Mitigation-1 membership gate passes on the group tree regardless.
-        let bob_req_sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        let bob_req_pk = bob_req_sk.verifying_key();
+        let bob_request_signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let bob_verifying_key = bob_request_signing_key.verifying_key();
 
         // Build a signed SenderKeyRequest for Alice's key, sealing to a fresh
         // ephemeral X25519 wrapping keypair. Returns (request_bytes, secret).
@@ -4379,11 +4379,17 @@ mod crypto_ops_golden {
             let (wrapping_pub, wrapping_secret) =
                 scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
             let timestamp = SystemClock.now_secs();
-            let hash = scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
-                BOB, ALICE, 1, &wrapping_pub, &nonce, timestamp,
-            )
-            .unwrap();
-            let signature: [u8; 64] = bob_req_sk.sign(&hash).to_bytes();
+            let hash =
+                scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
+                    BOB,
+                    ALICE,
+                    1,
+                    &wrapping_pub,
+                    &nonce,
+                    timestamp,
+                )
+                .unwrap();
+            let signature: [u8; 64] = bob_request_signing_key.sign(&hash).to_bytes();
             let request = scp_protocol::crypto::sender_keys::SenderKeyRequest {
                 requester_did: BOB.to_owned(),
                 sender_did: ALICE.to_owned(),
@@ -4399,7 +4405,7 @@ mod crypto_ops_golden {
         // 1. ORACLE (provider), BEFORE the destructive take.
         let (req1_bytes, secret1) = build_request([1u8; 16]);
         let resp_oracle_bytes = alice_p
-            .handle_sender_key_request(&ctx, &req1_bytes, bob_req_pk.as_bytes(), &blocked)
+            .handle_sender_key_request(&ctx, &req1_bytes, bob_verifying_key.as_bytes(), &blocked)
             .expect("oracle answers a member request")
             .expect("member requester receives a response");
         let resp_oracle: SenderKeyResponse = rmp_serde::from_slice(&resp_oracle_bytes).unwrap();
@@ -4427,7 +4433,7 @@ mod crypto_ops_golden {
                     ALICE,
                     SystemClock.now_secs(),
                     &req2_bytes,
-                    bob_req_pk.as_bytes(),
+                    bob_verifying_key.as_bytes(),
                     &blocked,
                 )
                 .expect("actor answers a member request")

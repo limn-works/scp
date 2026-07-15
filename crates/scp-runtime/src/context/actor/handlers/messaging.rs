@@ -343,16 +343,13 @@ async fn handle_land_sender_key_response(
         let mut view = cell.class_c_view();
         // A `None` crypto state is a context with no MLS group (broadcast); the
         // §9.16.2 pull-response install never applies there — fail closed.
-        let cs = match view.mode_mut().crypto_mut() {
-            Some(cs) => cs,
-            None => {
-                let err = ContextError::CryptoFailed(
-                    "no MLS crypto state for sender-key install (context has no group)".to_string(),
-                );
-                let sketch = outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                return Outcome::err(sketch);
-            }
+        let Some(cs) = view.mode_mut().crypto_mut() else {
+            let err = ContextError::CryptoFailed(
+                "no MLS crypto state for sender-key install (context has no group)".to_string(),
+            );
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Outcome::err(sketch);
         };
         cs.sender_key_store
             .set_unchecked(&ctx_id_hex, sender_did, sender_key);

@@ -39,9 +39,7 @@ use scp_platform::KeyCustody;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling};
-use scp_protocol::context::{
-    ContextMode, ContextParams, ScpContextExtension,
-};
+use scp_protocol::context::{ContextMode, ContextParams, ScpContextExtension};
 use zeroize::Zeroizing;
 
 use super::provider::MlsCryptoProvider;
