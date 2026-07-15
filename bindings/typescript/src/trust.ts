@@ -315,6 +315,24 @@ export type UcanFailureCategory =
   | "unknown";
 
 /**
+ * Decodes a base64url-encoded segment to a UTF-8 string.
+ * Works in Node.js/Bun (Buffer) and browser (atob + TextDecoder).
+ */
+function __decodeBase64UrlToUtf8(segment: string): string {
+  // Normalise base64url → standard base64 before decoding.
+  const b64 = segment.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+  const normalized = b64 + pad;
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(normalized, "base64").toString("utf8");
+  }
+  // Browser / edge runtime fallback.
+  const binary = globalThis.atob(normalized);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+/**
  * Returns the first capability URI from att[0].with, or null if absent or malformed.
  *
  * Reading the unverified payload is safe: `scp.ucanValidate` performs the
@@ -335,7 +353,7 @@ export function __extractFirstCapabilityUri(token: string): string | null {
   try {
     const payloadSegment = token.split(".")[1];
     if (payloadSegment === undefined) return null;
-    const rawPayload = JSON.parse(Buffer.from(payloadSegment, "base64url").toString("utf8")) as {
+    const rawPayload = JSON.parse(__decodeBase64UrlToUtf8(payloadSegment)) as {
       att?: readonly { with?: string }[];
     };
     const att = Array.isArray(rawPayload?.att) ? rawPayload.att : [];
