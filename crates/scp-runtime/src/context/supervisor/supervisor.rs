@@ -1240,6 +1240,29 @@ struct OutletStreamPhase1 {
     pump_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
+/// The prompt return of
+/// [`Supervisor::start_cross_context_streaming_outlet_invocation_saga`]
+/// (SCP-OUT-046 #134, ADR-061 seal phase). Handed to the caller at the
+/// Commit-transition — BEFORE the stream drains — so the caller consumes frames
+/// as B produces them (AC1), while the off-mailbox seal task pumps the durable
+/// frontier capture + the seal-close asynchronously (AC6: the journal is
+/// `Committing` here; `Committed` is reached inside the seal task at close).
+///
+/// `receiver` yields A's plaintext
+/// [`ForwardedStreamFrame`](crate::context::outlets::invoke::ForwardedStreamFrame)s
+/// (the unmodified operator-signed chunk + its per-sender `base_sequence` anchor,
+/// SCP-OUT-044). Re-encryption for A's OTHER members is the SDK delivery seam
+/// (seal each still-operator-signed `frame.chunk` under A's MLS group key), NOT
+/// this return type — mirroring the best-effort
+/// [`open_outlet_stream_cross_context`](Supervisor::open_outlet_stream_cross_context).
+pub struct StreamingSagaHandle {
+    /// The durable saga id — the operator-repair handle a crash-recovery
+    /// resolution keys on, and the id the seal task seals under.
+    pub saga_id: SagaId,
+    /// A's plaintext forwarded-frame receiver, returned promptly (AC1).
+    pub receiver: tokio::sync::mpsc::Receiver<crate::context::outlets::invoke::ForwardedStreamFrame>,
+}
+
 // ---------------------------------------------------------------------------
 // MessageSigner (ADR-039)
 // ---------------------------------------------------------------------------
@@ -6266,6 +6289,437 @@ impl Supervisor {
             .map_err(|run_err| Self::lift_run_saga_error(saga_id, run_err))
     }
 
+    /// The streaming-saga FSM driver (SCP-OUT-046 #134; ADR-061 seal phase).
+    ///
+    /// The streaming sibling of
+    /// [`Self::start_cross_context_outlet_invocation_saga`]: it runs the SAME
+    /// authorize-before-reserve gates + the SAME `{caller, target}` per-set
+    /// reservation (ADR-049 §3a), but it does NOT drive the generic synchronous
+    /// [`Self::run_saga`] FSM (which holds its reservation to a terminal). A
+    /// streaming saga has no Prepare-A (the invoker pays via B's stream escrow,
+    /// §5.4.5 "Cross-context economy" — NOT a caller-side reservation), so this
+    /// driver runs Prepare-B (streaming) → the Commit-transition, then returns a
+    /// [`StreamingSagaHandle`] PROMPTLY (AC1) while an off-mailbox seal task
+    /// ([`run_streaming_saga_seal_task`](crate::context::outlets::invoke::run_streaming_saga_seal_task))
+    /// pumps the durable frontier capture + the seal-close.
+    ///
+    /// At the Commit-transition it: opens B's pump via the shared
+    /// [`Self::open_outlet_stream_phase1`] helper in SAGA MODE (`settlement_sink =
+    /// None` AND `invoked_event_sink = None` — the seal settles from the durable
+    /// ledger and records B's `OutletInvoked` itself, so the pump must do
+    /// NEITHER, else B double-records); RELEASES the concurrency slot (AC2 —
+    /// `drop(reservation)`) while the escrow stays reserved (AC3); journals
+    /// `Committing` (AC6); and spawns the seal task, which reaches `Committed`
+    /// asynchronously at stream-close.
+    ///
+    /// `caller_context_id` is the RECEIVING context A (the invoker's context);
+    /// `target_context_id` is the OPERATING context B (which hosts the streaming
+    /// outlet registration). `signing_keys.target` signs the SCP-OUT-043
+    /// streaming receipt at seal-close.
+    ///
+    /// # Errors
+    ///
+    /// [`SagaError::Aborted`] for an authorize-before-reserve rejection, a
+    /// Prepare-B policy reject, or a B-side open rejection (neither side
+    /// committed; the staged slot + journal are rolled back); [`SagaError::Busy`]
+    /// when the `{caller, target}` set overlaps an in-flight saga.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn start_cross_context_streaming_outlet_invocation_saga<E>(
+        self: &Arc<Self>,
+        caller_context_id: [u8; 32],
+        target_context_id: [u8; 32],
+        caller_did: DID,
+        outlet_registration_id: String,
+        ucan_proof_id: Option<String>,
+        registry: &scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &scp_protocol::context::outlets::OutletId,
+        input: serde_json::Value,
+        asserted_chain_depth: u8,
+        asserted_nonce: [u8; 16],
+        asserted_timestamp_ms: u64,
+        timeout_ms: Option<u32>,
+        executor: Arc<E>,
+        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
+        signing_keys: SagaSigningKeys<'_>,
+        params: crate::context::outlets::dispatch::OpenStreamParams,
+    ) -> Result<StreamingSagaHandle, SagaError>
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
+    {
+        use crate::context::actor::commands::{
+            PrepareBOutcome, PrepareBStreamingFields, SagaPhaseMessage, SigningKeyBytes,
+        };
+
+        let caller_hex = hex::encode(caller_context_id);
+        let target_hex = hex::encode(target_context_id);
+
+        // Authorize-before-reserve gate 1 (caller axis): the initiator MUST be a
+        // member of the caller context it names (parity with the unary saga
+        // gate; code `SCP-SAGA-13050`).
+        if !self.is_member(&caller_hex, caller_did.as_ref()).await {
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13050,
+                message: format!(
+                    "cross-context streaming saga initiator '{caller_did}' is not a member of \
+                     caller context '{caller_hex}' — not authorized to initiate over it"
+                ),
+            });
+        }
+
+        // Authorize-before-reserve gate 2 (target axis): the caller context MUST
+        // hold a bidirectionally-approved interface to the target for this outlet
+        // (code `SCP-SAGA-13062`). Reject WITHOUT reserving so a caller cannot
+        // wedge a victim target's saga slot before any target-side check ran.
+        if !self
+            .has_established_outlet_interface(&caller_hex, &target_hex, &outlet_registration_id)
+            .await
+        {
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13062,
+                message: format!(
+                    "cross-context streaming saga from caller context '{caller_hex}' to target \
+                     context '{target_hex}' has no established interface for outlet \
+                     '{outlet_registration_id}' — not authorized to invoke"
+                ),
+            });
+        }
+
+        // Resolve the channel-authenticated caller's ROLE in the caller context
+        // (spec §6.2.4) — authoritative only in the context gate 1 just proved,
+        // carried to Prepare-B so B enforces `allowed_source_roles` against the
+        // real role, never an envelope-asserted one.
+        let caller_source_role = self
+            .member_role(&caller_hex, caller_did.as_ref())
+            .await
+            .map(|assignment| assignment.role_name);
+
+        // Per-participant-context-set reservation (ADR-049 §3a) over the SAME
+        // `{caller, target}` set as the unary saga. Released at the
+        // Commit-transition below (AC2) while the seal pumps off-mailbox.
+        let context_set = vec![caller_hex.clone(), target_hex.clone()];
+        let reservation =
+            self.try_reserve_context_set(&context_set)
+                .map_err(|r| SagaError::Busy {
+                    message: format!(
+                        "participant context set overlaps an in-flight saga at context {}",
+                        r.contended_context
+                    ),
+                    contended_context: r.contended_context,
+                })?;
+
+        // Mint the durable saga id (the operator-repair handle a crash-recovery
+        // resolution keys on; the id the seal seals under).
+        let saga_id = SagaId::new();
+        let participants = vec![caller_hex.clone(), target_hex.clone()];
+
+        // Journal `Initiated`. A journal-write failure before any staging is a
+        // clean abort (drop the reservation; nothing else was staged).
+        if let Err(err) = self
+            .append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await
+        {
+            drop(reservation);
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13067,
+                message: format!("streaming saga Initiated journal append failed: {err}"),
+            });
+        }
+
+        // Phase-1 (SAGA MODE) — reserve the invoker's stream escrow IN the
+        // operating context B + source B's authoritative caps/timing. The escrow
+        // debit is guarded by `phase1.escrow_ticket`: every abort path below drops
+        // it so its `Drop` reverses the hold. `caveat_binding` is borrowed so the
+        // returned §7.3.8 check outlives `open_stream_session`.
+        let phase1 = match self
+            .open_outlet_stream_phase1(&target_hex, &caller_did, caveat_binding.as_ref(), params)
+            .await
+        {
+            Ok(p) => p,
+            Err(rejection) => {
+                drop(reservation);
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, false)
+                    .await;
+                return Err(SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13067,
+                    message: format!(
+                        "streaming saga B-side escrow reserve rejected: {}",
+                        rejection.to_invocation_error()
+                    ),
+                });
+            }
+        };
+
+        // Pin the §5.4.5 verification descriptor + validation schemas from the
+        // governed registration / open — NEVER from delivery-time chunk input.
+        // (Sourced from `phase1.params`, whose `operator_signer` / `identity` /
+        // `request_id` are unchanged by Phase-1.)
+        let Some(registration) = registry.get(outlet_id) else {
+            drop(phase1.escrow_ticket);
+            drop(reservation);
+            let _ = self
+                .saga_journal
+                .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, false)
+                .await;
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13067,
+                message: format!(
+                    "streaming saga: outlet '{outlet_id}' not found in the target registry"
+                ),
+            });
+        };
+        let descriptor = crate::context::outlets::invoke::CrossContextVerificationDescriptor {
+            operator_pk: *phase1.params.operator_signer.verifying_key(),
+            operating_context_id: target_hex.clone(),
+            outlet_id: outlet_id.clone(),
+            caveats_binding: phase1.params.identity.caveats_binding,
+            expected_request_id: phase1.params.request_id,
+        };
+        let output_schema = registration.schema.output_schema.clone();
+        let aggregate_schema = registration.schema.aggregate_schema.clone();
+
+        // Prepare-B (streaming): re-run the §6.2.4 validation gate ON the target
+        // actor + stage the durable `SagaId`-keyed prepared slot (empty frontier +
+        // the pinned escrow ledger `reserved` / `cost_per_chunk`). `reserved` is
+        // the ACTUAL debited hold from Phase-1 (decision 2), so the seal settles
+        // `reserved − billed` from the same durable ledger.
+        let Some(target_actor) = self.lookup(&target_hex) else {
+            drop(phase1.escrow_ticket);
+            drop(reservation);
+            let _ = self
+                .saga_journal
+                .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, false)
+                .await;
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13053,
+                message: format!(
+                    "streaming saga Prepare-B — target context '{target_hex}' is not a \
+                     co-resident actor (cross-node child-bridge transport is future work)"
+                ),
+            });
+        };
+        let prepare_fields = PrepareBStreamingFields {
+            caller_context_id,
+            target_context_id,
+            caller_did: caller_did.clone(),
+            outlet_registration_id: outlet_registration_id.clone(),
+            ucan_proof_id: ucan_proof_id.clone(),
+            input: input.clone(),
+            asserted_chain_depth,
+            asserted_nonce,
+            asserted_timestamp_ms,
+            caller_source_role: caller_source_role.clone(),
+            reserved: phase1.reservation.reserved_escrow,
+            cost_per_chunk: phase1.params.cost_per_chunk,
+        };
+        let prepare_saga_id = saga_id.clone();
+        let prepare_outcome = target_actor
+            .send(move |reply| {
+                crate::context::actor::ContextCommand::SagaPhase(
+                    SagaPhaseMessage::PrepareBStreaming {
+                        saga_id: prepare_saga_id,
+                        fields: Box::new(prepare_fields),
+                        reply,
+                    },
+                )
+            })
+            .await;
+        match prepare_outcome {
+            Ok(PrepareBOutcome::Prepared(_)) => {}
+            Ok(PrepareBOutcome::Rejected(reject)) => {
+                // A §6.2.4 policy reject — the slot was NOT staged, so no Abort is
+                // needed; just resolve the journal + reverse the hold.
+                drop(phase1.escrow_ticket);
+                drop(reservation);
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, false)
+                    .await;
+                return Err(SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: reject.code.unwrap_or(13067),
+                    message: reject.error.to_string(),
+                });
+            }
+            Err(err) => {
+                drop(phase1.escrow_ticket);
+                drop(reservation);
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, false)
+                    .await;
+                let (reason, code) = match &err {
+                    ContextError::ActorBusy(_) => (SagaAbortReason::ParticipantUnavailable, 13068),
+                    _ => (SagaAbortReason::Rejected, 13067),
+                };
+                return Err(SagaError::Aborted {
+                    reason,
+                    code,
+                    message: format!("streaming saga Prepare-B failed: {err}"),
+                });
+            }
+        }
+
+        // Journal `PreparingB`, then `Committing` (AC6 — reached BEFORE the
+        // receiver is returned). A journal failure after the slot is staged must
+        // clear it (Abort) so crash recovery does not seal a never-opened stream.
+        if let Err(err) = self
+            .append_journal(&saga_id, SagaState::PreparingB, &participants, 1, &[])
+            .await
+        {
+            self.abort_staged_streaming_saga(&saga_id, &target_hex).await;
+            drop(phase1.escrow_ticket);
+            drop(reservation);
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13067,
+                message: format!("streaming saga PreparingB journal append failed: {err}"),
+            });
+        }
+        if let Err(err) = self
+            .append_journal(&saga_id, SagaState::Committing, &participants, 2, &[])
+            .await
+        {
+            self.abort_staged_streaming_saga(&saga_id, &target_hex).await;
+            drop(phase1.escrow_ticket);
+            drop(reservation);
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13067,
+                message: format!("streaming saga Committing journal append failed: {err}"),
+            });
+        }
+
+        // Commit-transition — Phase-2 open of B's pump. SAGA MODE: `None` for
+        // BOTH the settlement sink and the durable `OutletInvoked` sink (the seal
+        // owns settlement + B's `OutletInvoked`); `None` for the three test-capture
+        // sinks (mirrors the best-effort bridge).
+        let OutletStreamPhase1 {
+            reservation: econ_reservation,
+            escrow_ticket,
+            params,
+            caveat_post_input_check,
+            counter_reservation,
+            admission,
+            origin_admission,
+            pump_semaphore,
+        } = phase1;
+        let open_result = crate::context::outlets::dispatch::open_stream_session(
+            &econ_reservation.handle,
+            registry,
+            &econ_reservation.role_state,
+            outlet_id,
+            input,
+            &caller_did,
+            timeout_ms,
+            executor,
+            None,
+            None,
+            None,
+            None,
+            params,
+            admission,
+            origin_admission,
+            pump_semaphore,
+            caveat_post_input_check,
+            counter_reservation,
+        )
+        .await;
+        let mut handle = match open_result {
+            Ok(h) => h,
+            Err(rejection) => {
+                self.abort_staged_streaming_saga(&saga_id, &target_hex).await;
+                drop(escrow_ticket);
+                drop(reservation);
+                return Err(SagaError::Aborted {
+                    reason: SagaAbortReason::Rejected,
+                    code: 13067,
+                    message: format!(
+                        "streaming saga B-side stream open rejected: {}",
+                        rejection.to_invocation_error()
+                    ),
+                });
+            }
+        };
+        let Some(inner_rx) = handle.receiver() else {
+            self.abort_staged_streaming_saga(&saga_id, &target_hex).await;
+            drop(escrow_ticket);
+            drop(reservation);
+            return Err(SagaError::Aborted {
+                reason: SagaAbortReason::Rejected,
+                code: 13067,
+                message: "streaming saga: B-side stream handle yielded no receiver".to_owned(),
+            });
+        };
+
+        // AC2 — release the per-participant-context-set concurrency slot at the
+        // Commit-transition (the seal pumps off-mailbox). The escrow stays
+        // RESERVED (AC3): it settles from the durable ledger at seal-close.
+        drop(reservation);
+
+        // Bounded (=1) outer channel so forward-N precedes request-N+1: the seal
+        // task cannot pull chunk N+1 until chunk N is accepted by A's invoker.
+        let (outer_tx, outer_rx) = tokio::sync::mpsc::channel(1);
+
+        // Spawn the OFF-MAILBOX seal task (moves the escrow guard + B's inner
+        // receiver + the pinned descriptor/schemas). It forwards each chunk,
+        // durably folds it into B's frontier (StreamCaptureAppend), and seals at
+        // close (CommitBStreamSettle).
+        tokio::spawn(crate::context::outlets::invoke::run_streaming_saga_seal_task(
+            Arc::clone(self),
+            target_hex,
+            saga_id.clone(),
+            SigningKeyBytes::from_signing_key(signing_keys.target),
+            inner_rx,
+            outer_tx,
+            escrow_ticket,
+            descriptor,
+            output_schema,
+            aggregate_schema,
+        ));
+
+        // AC1 — return the receiver PROMPTLY (the journal is `Committing`; the
+        // seal reaches `Committed` at stream-close, off the mailbox).
+        Ok(StreamingSagaHandle {
+            saga_id,
+            receiver: outer_rx,
+        })
+    }
+
+    /// Roll back a streaming saga whose durable Prepare-B slot was staged but
+    /// whose Commit-transition then aborted (SCP-OUT-046 #134): clear B's staged
+    /// `saga_pending` slot via [`SagaPhaseMessage::Abort`] (target side ⇒
+    /// `reservation: None`) and resolve the journal to `Aborted`. Best-effort —
+    /// a missing actor / failed write leaves the slot for the crash-recovery
+    /// sweep, which clears an unresolved `Committing`/`PreparingB` saga with no
+    /// committed witness.
+    async fn abort_staged_streaming_saga(&self, saga_id: &SagaId, target_hex: &str) {
+        use crate::context::actor::commands::SagaPhaseMessage;
+        if let Some(actor) = self.lookup(target_hex) {
+            let abort_saga_id = saga_id.clone();
+            let _ = actor
+                .send(move |reply| {
+                    crate::context::actor::ContextCommand::SagaPhase(SagaPhaseMessage::Abort {
+                        saga_id: abort_saga_id,
+                        reservation: None,
+                        reply,
+                    })
+                })
+                .await;
+        }
+        let _ = self
+            .saga_journal
+            .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, false)
+            .await;
+    }
+
     /// Lift the private [`RunSagaError`] (the FSM's internal [`ContextError`] +
     /// the `needs_repair` flag) into the typed terminal [`SagaError`] the
     /// cross-context entry point returns (ADR-049 §3a):
@@ -9156,6 +9610,37 @@ impl Supervisor {
             .map_err(|e| {
                 ContextError::InvalidState(format!(
                     "saga journal append failed for state {state:?}: {e}"
+                ))
+            })
+    }
+
+    /// Resolve a streaming-saga journal entry to `Committed` (SCP-OUT-046 #134).
+    ///
+    /// Called by the off-mailbox seal task
+    /// ([`run_streaming_saga_seal_task`](crate::context::outlets::invoke::run_streaming_saga_seal_task))
+    /// once [`SagaPhaseMessage::CommitBStreamSettle`](crate::context::actor::commands::SagaPhaseMessage::CommitBStreamSettle)
+    /// has durably sealed the stream, so the autonomous crash-recovery sweep does
+    /// not redrive a completed saga. `secret_bearing = false`: the streaming saga
+    /// journals public metadata only (the manifest root + provenance, never chunk
+    /// bytes or bearer material — [`saga_input_is_secret_bearing`] returns
+    /// `false` for its input).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::InvalidState`] wrapping the [`JournalError`] if the
+    /// durable `mark_resolved` write fails; the caller logs and defers to the
+    /// crash-recovery sweep (the durable committed witness on B's actor is the
+    /// authoritative resolution regardless).
+    pub(in crate::context) async fn resolve_saga_committed(
+        &self,
+        saga_id: &SagaId,
+    ) -> Result<(), ContextError> {
+        self.saga_journal
+            .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
+            .await
+            .map_err(|e| {
+                ContextError::InvalidState(format!(
+                    "streaming-saga journal mark_resolved(Committed) failed: {e}"
                 ))
             })
     }
