@@ -30782,6 +30782,8 @@ mod streaming_saga_tests {
     const SS_NOW: u64 = 1_700_000_000;
     const SS_CALLER: [u8; 32] = [0x51u8; 32];
     const SS_TARGET: [u8; 32] = [0x52u8; 32];
+    /// A third context (the target of the overlapping saga S2 in the AC2 test).
+    const SS_THIRD: [u8; 32] = [0x53u8; 32];
     const SS_OUTLET: &str = "calculator-v1";
     const SS_UCAN_CID: &str = "cid-scp-out-046-streaming-saga";
     const SS_COST: u64 = 10;
@@ -31002,34 +31004,14 @@ mod streaming_saga_tests {
         )
     }
 
-    /// Caller (A) state: `ss_invoker` is a member holding `OutletInterface` +
-    /// `OutletCallAll` and an established (both-approved) A→B interface for
-    /// `SS_OUTLET`, so the driver's authorize-before-reserve gates pass.
-    fn ss_caller_state() -> PerContextState {
-        let mut st = PerContextState::new_for_test_encrypted(SS_CALLER, SS_NOW, DID(ss_creator()));
-        st.handle
-            .transition_to(&ContextState::Active)
-            .expect("active");
-        st.role_state.creator_did = ss_creator();
-        st.membership
-            .add_member(ss_invoker(), "member".to_owned(), Vec::new());
-        st.role_state.members.insert(ss_invoker().0);
-        let mut caps = std::collections::HashSet::new();
-        caps.insert(Capability::OutletInterface);
-        caps.insert(Capability::OutletCallAll);
-        st.role_state
-            .member_capabilities
-            .insert(ss_invoker().0, caps);
-        st.role_state
-            .set_ceiling(CapabilityCeiling::new([
-                Capability::OutletInterface,
-                Capability::OutletCallAll,
-            ]))
-            .expect("well-formed built-in ceiling");
+    /// Push an established (both-approved) outbound `source → target` interface for
+    /// `SS_OUTLET` onto a state's governance, so the driver's target-axis
+    /// authorize-before-reserve gate passes for a saga with that caller/target.
+    fn ss_push_interface(st: &mut PerContextState, source: [u8; 32], target: [u8; 32]) {
         st.governance.outlet_interfaces.push(
             scp_protocol::context::outlets::interface::OutletInterface {
-                source_context: hex::encode(SS_CALLER),
-                target_context: hex::encode(SS_TARGET),
+                source_context: hex::encode(source),
+                target_context: hex::encode(target),
                 outlet_id: SS_OUTLET.to_owned(),
                 rate_limit: None,
                 inbound_rate_limit: None,
@@ -31040,18 +31022,10 @@ mod streaming_saga_tests {
                 inbound_policy: None,
             },
         );
-        st
     }
 
-    /// Target (B) state: a registered PAID streaming outlet, `ss_invoker` granted
-    /// the outlet capabilities + a budget covering the paid stream, and the hosting
-    /// economic policy set (payee for the close-time capture).
-    fn ss_target_state() -> PerContextState {
-        let mut st = PerContextState::new_for_test_encrypted(SS_TARGET, SS_NOW, DID(ss_creator()));
-        st.handle
-            .transition_to(&ContextState::Active)
-            .expect("active");
-        st.role_state.creator_did = ss_creator();
+    /// Grant `ss_invoker` the outlet capabilities + ceiling on a caller/target state.
+    fn ss_grant_outlet_caps(st: &mut PerContextState) {
         st.membership
             .add_member(ss_invoker(), "member".to_owned(), Vec::new());
         st.role_state.members.insert(ss_invoker().0);
@@ -31067,6 +31041,32 @@ mod streaming_saga_tests {
                 Capability::OutletCallAll,
             ]))
             .expect("well-formed built-in ceiling");
+    }
+
+    /// Caller (A) state: `ss_invoker` is a member holding `OutletInterface` +
+    /// `OutletCallAll` and an established (both-approved) `caller → target` interface
+    /// for `SS_OUTLET`, so the driver's authorize-before-reserve gates pass.
+    fn ss_caller_state_for(caller_id: [u8; 32], target_id: [u8; 32]) -> PerContextState {
+        let mut st = PerContextState::new_for_test_encrypted(caller_id, SS_NOW, DID(ss_creator()));
+        st.handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        st.role_state.creator_did = ss_creator();
+        ss_grant_outlet_caps(&mut st);
+        ss_push_interface(&mut st, caller_id, target_id);
+        st
+    }
+
+    /// Target (B) state: a registered PAID streaming outlet, `ss_invoker` granted
+    /// the outlet capabilities + a budget covering the paid stream, and the hosting
+    /// economic policy set (payee for the close-time capture).
+    fn ss_paid_target_state(ctx_id: [u8; 32]) -> PerContextState {
+        let mut st = PerContextState::new_for_test_encrypted(ctx_id, SS_NOW, DID(ss_creator()));
+        st.handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        st.role_state.creator_did = ss_creator();
+        ss_grant_outlet_caps(&mut st);
         st.governance.registered_outlets.push(OutletRegistration {
             outlet_id: SS_OUTLET.to_owned(),
             kind: OutletKind::Action,
@@ -31158,11 +31158,20 @@ mod streaming_saga_tests {
         registry
     }
 
-    /// `OpenStreamParams` (with a matching operator signer) targeting B, plus the
-    /// §7.3.8 invocation-caveat binding — the streaming sibling of the same-context
-    /// `open_outlet_stream` params, rebased onto `SS_TARGET` with a positive
-    /// `cost_per_chunk`.
+    /// `OpenStreamParams` (with a matching operator signer) targeting `SS_TARGET`,
+    /// plus the §7.3.8 invocation-caveat binding.
     fn ss_stream_params(request_id: RequestId) -> (OpenStreamParams, InvocationCaveatBinding) {
+        ss_stream_params_for(SS_TARGET, request_id)
+    }
+
+    /// `OpenStreamParams` (with a matching operator signer) targeting `target_id`,
+    /// plus the §7.3.8 invocation-caveat binding — the streaming sibling of the
+    /// same-context `open_outlet_stream` params, rebased onto `target_id` with a
+    /// positive `cost_per_chunk`.
+    fn ss_stream_params_for(
+        target_id: [u8; 32],
+        request_id: RequestId,
+    ) -> (OpenStreamParams, InvocationCaveatBinding) {
         let mut caveats = InvocationCaveats::empty();
         caveats.amount_max_cumulative = Some(Amount::new(100_000));
         let caveats_jcs = caveats.to_canonical_json_bytes().expect("jcs");
@@ -31174,7 +31183,7 @@ mod streaming_saga_tests {
             &caveats_jcs,
         );
         let identity = StreamIdentity {
-            context_id: hex::encode(SS_TARGET),
+            context_id: hex::encode(target_id),
             outlet_id: SS_OUTLET.to_owned(),
             stream_epoch: 1,
             caveats_binding,
@@ -31219,23 +31228,31 @@ mod streaming_saga_tests {
         (params, binding)
     }
 
+    /// Spawn one context actor with `state` under a per-context owner DID.
+    async fn spawn_ss_actor(supervisor: &Arc<Supervisor>, owner: &str, state: PerContextState) {
+        let deps = supervisor
+            .build_actor_deps(&DID(owner.to_owned()))
+            .await
+            .expect("actor deps");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn actor");
+    }
+
     async fn spawn_ss_pair(supervisor: &Arc<Supervisor>) {
-        let caller_deps = supervisor
-            .build_actor_deps(&DID("did:example:ss-caller-owner".to_owned()))
-            .await
-            .expect("caller deps");
-        supervisor
-            .spawn_actor_with_state(ss_caller_state(), caller_deps, None)
-            .await
-            .expect("spawn caller actor");
-        let target_deps = supervisor
-            .build_actor_deps(&DID("did:example:ss-target-owner".to_owned()))
-            .await
-            .expect("target deps");
-        supervisor
-            .spawn_actor_with_state(ss_target_state(), target_deps, None)
-            .await
-            .expect("spawn target actor");
+        spawn_ss_actor(
+            supervisor,
+            "did:example:ss-caller-owner",
+            ss_caller_state_for(SS_CALLER, SS_TARGET),
+        )
+        .await;
+        spawn_ss_actor(
+            supervisor,
+            "did:example:ss-target-owner",
+            ss_paid_target_state(SS_TARGET),
+        )
+        .await;
     }
 
     /// The latest journaled state for `saga_id` while it is unresolved, or `None`
@@ -31786,6 +31803,181 @@ mod streaming_saga_tests {
             ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
             Amount::new(SS_GRANTED - SS_COST * k as u64),
             "AC7: the escrow settles at the prefix billed_count (refund = reserved − billed)"
+        );
+
+        drop(recording);
+    }
+
+    /// COMMIT 3 — AC2: the Commit-transition RELEASES the per-participant-context-set
+    /// concurrency slot once the pump is triggered (ADR-049 §3a amendment (b)).
+    ///
+    /// S1 spans `{A, B}`; S2 spans the OVERLAPPING `{B, C}`. Once S1's Commit-
+    /// transition returns its receiver and its seal is pumping off-mailbox (its
+    /// `{A, B}` reservation dropped), S2 must be able to Prepare + Commit over
+    /// `{B, C}` — it reserves B without a `SagaBusy`/`ActorBusy` wedge, proving the
+    /// slot is released at Commit (not held until the seal reaches Committed).
+    ///
+    /// This proof requires two REAL, co-resident streaming sagas driven through
+    /// spawned actors (`start_cross_context_streaming_outlet_invocation_saga` +
+    /// off-mailbox seal). It lives here (not in the `actor_saga_concurrent.rs`
+    /// integration file, whose gate-named primitive tests it complements) because
+    /// actor residency (`spawn_actor_with_state`) is `pub(in crate::context)` — an
+    /// external integration test cannot make a context resident, so it cannot hold
+    /// S1's seal "still pumping" while S2 commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_commit_releases_slot_overlap_runs() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let supervisor =
+            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+
+        // Spawn all three participant actors. B (`SS_TARGET`) doubles as S1's target
+        // AND S2's caller: it carries the registered paid outlet (target role) and an
+        // established B→C interface (caller role).
+        spawn_ss_actor(
+            &supervisor,
+            "did:example:ss-a-owner",
+            ss_caller_state_for(SS_CALLER, SS_TARGET),
+        )
+        .await;
+        let mut b_state = ss_paid_target_state(SS_TARGET);
+        ss_push_interface(&mut b_state, SS_TARGET, SS_THIRD);
+        spawn_ss_actor(&supervisor, "did:example:ss-b-owner", b_state).await;
+        spawn_ss_actor(
+            &supervisor,
+            "did:example:ss-c-owner",
+            ss_paid_target_state(SS_THIRD),
+        )
+        .await;
+
+        let registry = ss_registry();
+        let target_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+
+        // S1 over {A, B} — a prefix-then-wedge executor keeps its seal pumping
+        // off-mailbox after the Commit-transition, so the {A, B} slot is under test.
+        let (s1_params, s1_binding) = ss_stream_params_for(SS_TARGET, [0x21; 16]);
+        let s1_executor = Arc::new(PrefixThenBlockExecutor {
+            data_chunks: 3,
+            invoked: Arc::clone(&invoked),
+        });
+        let mut s1 = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x21u8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                s1_executor,
+                Some(s1_binding),
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                s1_params,
+            )
+            .await
+            .expect("S1 starts over the A-B participant set");
+
+        // S1 is past its Commit-transition and pumping: its receiver yields chunk 0,
+        // which means the {A, B} reservation was already dropped.
+        let s1_first = tokio::time::timeout(Duration::from_secs(5), s1.receiver.recv())
+            .await
+            .expect("S1 chunk 0 within 5s")
+            .expect("S1 chunk 0 present");
+        assert!(
+            matches!(s1_first.chunk.payload, ChunkPayload::Data { .. }),
+            "S1 is pumping (receiver returned; reservation released at Commit)"
+        );
+        assert_eq!(
+            ss_saga_state(&journal, &s1.saga_id).await,
+            Some(SagaState::Committing),
+            "S1's seal is still pumping (Committing) — its A-B slot released, not held"
+        );
+
+        // S2 over the OVERLAPPING {B, C} — B is shared with S1. Because S1 released
+        // {A, B} at its Commit-transition, S2 reserves {B, C} and drives to a
+        // terminal without any SagaBusy/ActorBusy wedge.
+        let (s2_params, s2_binding) = ss_stream_params_for(SS_THIRD, [0x22; 16]);
+        let s2_executor = Arc::new(FiniteChunkExecutor {
+            data_chunks: 3,
+            invoked: Arc::clone(&invoked),
+        });
+        let s2_result = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_TARGET,
+                SS_THIRD,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 3, "b": 4 }),
+                1,
+                [0x22u8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                s2_executor,
+                Some(s2_binding),
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                s2_params,
+            )
+            .await;
+
+        let mut s2 = match s2_result {
+            Ok(handle) => handle,
+            Err(super::SagaError::Busy {
+                contended_context, ..
+            }) => panic!(
+                "AC2: S2 over overlapping {{B, C}} was wedged SagaBusy on '{contended_context}' — \
+                 S1 did NOT release its slot at the Commit-transition"
+            ),
+            Err(other) => panic!("AC2: S2 must Prepare+Commit, got {other:?}"),
+        };
+
+        // S2 actually Prepared + Committed: it is pumping its own stream (chunk 0
+        // delivered), and its journal reached Committing over {B, C}.
+        let s2_first = tokio::time::timeout(Duration::from_secs(5), s2.receiver.recv())
+            .await
+            .expect("S2 chunk 0 within 5s")
+            .expect("S2 chunk 0 present");
+        assert!(
+            matches!(s2_first.chunk.payload, ChunkPayload::Data { .. }),
+            "AC2: S2 Prepared + Committed over the overlapping set and is pumping"
+        );
+
+        // Drain S2 to close so its seal resolves — proving a full overlapping-set
+        // saga completes while S1's seal is still pumping off-mailbox.
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_secs(5), s2.receiver.recv()).await
+        {
+            if matches!(
+                frame.chunk.payload,
+                ChunkPayload::End { .. } | ChunkPayload::Error { .. }
+            ) {
+                break;
+            }
+        }
+        ss_await_resolved(&journal, &s2.saga_id, Duration::from_secs(5)).await;
+        assert_eq!(
+            ss_saga_state(&journal, &s2.saga_id).await,
+            None,
+            "AC2: the overlapping S2 committed to completion (resolved) with no wedge"
         );
 
         drop(recording);
