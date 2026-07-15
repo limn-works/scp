@@ -1175,13 +1175,15 @@ fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
         ),
         "decrypt_and_dispatch must gate the recv floor on the authoritative registry"
     );
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the KeyResponse install moved off the
+    // emptied provider (`deps.crypto.set_sender_key_unchecked`, a no-op on a taken
+    // context) onto the actor-owned store (`cs.sender_key_store.set_unchecked`).
+    // Track the moved install token; the gate-before-install property is unchanged.
     assert!(
-        fn_body_contains(
-            MANAGER_SRC,
-            "decrypt_and_dispatch",
-            "set_sender_key_unchecked"
-        ),
-        "the remote-epoch seam must install via set_sender_key_unchecked AFTER gating"
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "sender_key_store")
+            && fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "set_unchecked"),
+        "the remote-epoch seam must install onto the actor sender_key_store via \
+         set_unchecked AFTER gating"
     );
     // P1 (white-hat): the remote-epoch seam-2 D1 gate — the registry epoch gate
     // — must be present AND must precede the key install (gate-BEFORE-install =
@@ -1200,12 +1202,14 @@ fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
         let gate = body
             .find("check_and_advance_sender_epoch")
             .expect("seam-2 gate present");
+        // PR-7: the install is now `cs.sender_key_store.set_unchecked` (actor store).
         let install = body
-            .find("set_sender_key_unchecked")
-            .expect("seam-2 install present");
+            .find("sender_key_store")
+            .expect("seam-2 actor-store install present");
         assert!(
             gate < install,
-            "the seam-2 registry epoch gate must PRECEDE set_sender_key_unchecked (gate-before-install)"
+            "the seam-2 registry epoch gate must PRECEDE the actor sender_key_store \
+             install (gate-before-install)"
         );
     }
     assert!(
@@ -1260,6 +1264,53 @@ fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
         ),
         "the restore guard must merge blob floors INTO the registry sink"
     );
+}
+
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2 — the steady-state sender-key ANSWER
+// half moved off the provider onto the actor. These ADDITIVE structural
+// assertions pin the new INBOUND answer wiring so a regression cannot silently
+// route a received PULL request back through the emptied provider (a no-op on a
+// taken context) or drop the enqueued ephemeral-sealed answer before transmit.
+#[test]
+fn adr049_pr7_sender_key_answer_is_actor_native_and_enqueued_for_transmit() {
+    // A1 — `decrypt_and_dispatch` ANSWERS a received §9.16.2 PULL request on the
+    // actor's OWNED crypto state (`cs.handle_sender_key_request`), NOT through the
+    // provider. The answer HPKE-seals to the requester's ephemeral wrapping key,
+    // so it needs no signing key — a clean receive-side answer.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "decrypt_and_dispatch",
+            "handle_sender_key_request"
+        ),
+        "decrypt_and_dispatch must answer a received sender-key PULL request on the \
+         actor's owned crypto state (cs.handle_sender_key_request)"
+    );
+    // A2 — the ephemeral-sealed answer is ENQUEUED onto the actor's
+    // `pending_distributions` for the existing MLS-wrap + transport drain (a blocked
+    // requester returns None → nothing enqueued, §9.16.2 silent drop).
+    assert!(
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "pending_distributions"),
+        "decrypt_and_dispatch must enqueue the ephemeral-sealed answer onto the \
+         actor's pending_distributions for transmit"
+    );
+    // A3 — the actor answer method (moved off the provider) records its nonce-dedup
+    // replay entry on the Class-C crypto cache (`nonce_dedup.record`), NOT the
+    // Class-S cross-context `xctx_nonce_dedup` (coalesced persist is sound: a
+    // still-fresh replay re-seals the SAME key to the SAME ephemeral pubkey).
+    {
+        let body = extract_fn_body(STATE_SRC, "handle_sender_key_request")
+            .expect("actor ContextCryptoState::handle_sender_key_request body must exist");
+        assert!(
+            body.contains("nonce_dedup.record"),
+            "the actor answer must record its replay nonce on the Class-C crypto \
+             nonce_dedup cache"
+        );
+        assert!(
+            !body.contains("xctx_nonce_dedup"),
+            "the actor answer must NOT touch the Class-S cross-context xctx_nonce_dedup"
+        );
+    }
 }
 
 // Timer level (ADR-049 Decision-1 / finding A3 — APPROVED enforcement
