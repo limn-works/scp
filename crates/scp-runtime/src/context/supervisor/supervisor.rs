@@ -13263,6 +13263,61 @@ impl Supervisor {
         })?
     }
 
+    /// READ-ONLY inner-envelope inspection on the OWNED actor crypto state via
+    /// the actor mailbox — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
+    ///
+    /// Decrypts a captured outer-envelope blob through the context actor and
+    /// returns the raw decrypted
+    /// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope) WITHOUT
+    /// unwrapping the §9.17 access-key content layer, so a test can read the
+    /// wire-level `message_type` / `sequence` (e.g. assert a sent heartbeat is
+    /// tagged `MessageType::Heartbeat` and carries sequence `0`, and that a
+    /// heartbeat does NOT advance the per-sender application sequence — §9.9.2).
+    /// This is the actor twin of the deleted provider `open` inspection twin;
+    /// the taken (actor-owned) context can no longer be opened through the
+    /// emptied provider.
+    ///
+    /// # Non-mutating receive-state invariant (§9)
+    ///
+    /// The actor handler drives ONLY
+    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open)
+    /// — a PURE decrypt that surfaces `env.receive_floor` but runs NONE of the
+    /// receive-side anti-replay enforcement (`check_and_advance_recv_sequence`,
+    /// the Class-M floor registry, `nonce_dedup`, epoch advance) that lives at
+    /// the messaging seam. The only state change is the MLS decryption-ratchet
+    /// advance intrinsic to any decrypt. Inspecting a blob therefore never
+    /// consumes an anti-replay slot, so the same wire bytes remain re-openable by
+    /// the real receive path.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] if the blob decodes to a Control /
+    ///   Management result rather than an application envelope, or on any MLS /
+    ///   sender-key / decode failure.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn inspect_incoming_inner(
+        &self,
+        context_id: &str,
+        envelope_bytes: Vec<u8>,
+    ) -> Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::InspectIncomingInner {
+            context_id: context_id.to_owned(),
+            envelope_bytes,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::inspect_incoming_inner — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Grants a §7.2.2 Tier-2 capability (e.g. `"outlet_call:*"`) directly into
     /// a member's `role_state.member_capabilities` cache, bypassing the
     /// governance role-assignment round-trip — test-only.

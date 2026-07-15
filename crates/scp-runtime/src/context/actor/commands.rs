@@ -507,6 +507,47 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// READ-ONLY inner-envelope inspection: decrypt a received outer-envelope
+    /// blob on the actor's OWNED crypto state and return the raw decrypted
+    /// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope)
+    /// (`message_type` / `sequence` / `payload`) WITHOUT unwrapping the §9.17
+    /// access-key content layer — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
+    ///
+    /// This is the actor twin of the deleted provider `open` inspection twin: it
+    /// lets the full-stack harness assert on the wire-level inner header (e.g. a
+    /// sent heartbeat is tagged `MessageType::Heartbeat` and carries sequence
+    /// `0`, and that a heartbeat does NOT advance the per-sender application
+    /// sequence — §9.9.2).
+    ///
+    /// # Non-mutating receive-state invariant (§9)
+    ///
+    /// The handler drives ONLY
+    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open),
+    /// which performs a PURE decrypt + surfaces `env.receive_floor` — it does
+    /// NOT run the authoritative anti-replay gate
+    /// (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
+    /// mutate `nonce_dedup`, or change the epoch. Those live at the messaging
+    /// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+    /// which this inspection deliberately skips. The sole state change is the
+    /// unavoidable MLS decryption-ratchet advance inherent to any decrypt (the
+    /// deleted provider inspection twin was likewise non-mutating in exactly this
+    /// sense); the handler reports `ok_mutated` so that ratchet advance persists.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    InspectIncomingInner {
+        /// Context identifier string.
+        context_id: String,
+        /// The serialized [`OuterEnvelope`](scp_protocol::envelope::outer::OuterEnvelope)
+        /// (captured ciphertext) to decrypt for inspection.
+        envelope_bytes: Vec<u8>,
+        /// Oneshot reply channel carrying the raw decrypted inner envelope. Errors
+        /// if the blob decodes to a Control / Management result rather than an
+        /// application envelope, or on any MLS / sender-key / decode failure.
+        reply: oneshot::Sender<Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError>>,
+    },
+
     /// Record that a received envelope triggered degraded-mode (spec
     /// §13.6) for a context. Emits a `DegradedMode` event into the
     /// per-context receive buffer (and the supervisor's optional event

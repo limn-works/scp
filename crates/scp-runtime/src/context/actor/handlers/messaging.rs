@@ -225,7 +225,96 @@ pub(crate) async fn dispatch(
             )
             .await
         }
+        #[cfg(feature = "testing")]
+        MessagingCommand::InspectIncomingInner {
+            context_id,
+            envelope_bytes,
+            reply,
+        } => handle_inspect_incoming_inner(cell, deps, &context_id, &envelope_bytes, reply),
     }
+}
+
+/// Handle [`MessagingCommand::InspectIncomingInner`] (actor-shape, test-only).
+///
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) READ-ONLY inner-envelope inspection: the
+/// actor twin of the deleted provider `open` inspection twin. Drives ONLY
+/// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open)
+/// on the actor's OWNED crypto state and returns the raw decrypted
+/// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope) so the harness
+/// can read the wire-level `message_type` / `sequence` (§9.9.2 heartbeat AC2/AC3).
+///
+/// # Non-mutating receive-state invariant (§9)
+///
+/// This is the whole point of the surface. `cs.open` performs a PURE decrypt and
+/// surfaces `env.receive_floor`; it does NOT run the authoritative anti-replay
+/// gate (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
+/// mutate `nonce_dedup`, or change the epoch — all of which live at the messaging
+/// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+/// which this inspection deliberately does NOT invoke. The ONLY state change is
+/// the MLS decryption-ratchet advance intrinsic to decrypting a message (the
+/// deleted provider inspection twin was non-mutating in exactly this same sense);
+/// a successful open therefore reports `ok_mutated` so the coalesced Class-C
+/// persist captures that ratchet advance. Control / Management results (which
+/// carry no application inner header) and any decrypt failure return an error and
+/// mutate nothing beyond that same intrinsic ratchet step, so they report
+/// `ok_mutated` on a decoded-but-non-application open and `err` on a decrypt
+/// failure.
+#[cfg(feature = "testing")]
+fn handle_inspect_incoming_inner(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    envelope_bytes: &[u8],
+    reply: oneshot::Sender<Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError>>,
+) -> Outcome<()> {
+    use scp_protocol::context::builder::OpenResult;
+
+    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+
+    let mut view = cell.class_c_view();
+    // A `None` crypto state is a context with no MLS group (a broadcast context,
+    // which never carries an MLS-wrapped inner envelope) — fail closed, matching
+    // `decrypt_and_dispatch`'s "no MLS group" error.
+    let Some(cs) = view.mode_mut().crypto_mut() else {
+        let err = ContextError::CryptoFailed(
+            "no MLS crypto state for inner-envelope inspection (context has no group)".to_string(),
+        );
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
+
+    // PURE decrypt: `cs.open` decrypts (outer → MLS → sender-key → inner) and
+    // surfaces `env.receive_floor`, but runs NONE of the receive-side anti-replay
+    // enforcement (that is at the messaging seam, which this path skips). No floor
+    // advance, no `nonce_dedup` mutation, no Class-M registry write, no epoch
+    // change — only the intrinsic MLS decryption-ratchet advance.
+    let (outcome, reply_result) =
+        match cs.open(&*deps.clock, &context_id_bytes, context_id, envelope_bytes) {
+            Ok(OpenResult::Application(env)) => (Outcome::ok_mutated(()), Ok(env.inner)),
+            Ok(OpenResult::Control) => {
+                let err = ContextError::CryptoFailed(
+                    "open_inner_envelope: blob decoded to Control, not an application envelope"
+                        .to_string(),
+                );
+                (Outcome::ok_mutated(()), Err(err))
+            }
+            Ok(OpenResult::Management { .. }) => {
+                let err = ContextError::CryptoFailed(
+                    "open_inner_envelope: blob decoded to Management, not an application envelope"
+                        .to_string(),
+                );
+                (Outcome::ok_mutated(()), Err(err))
+            }
+            Err(e) => {
+                let sketch = outcome_error_sketch(&e);
+                let _ = reply.send(Err(e));
+                return Outcome::err(sketch);
+            }
+        };
+
+    let _ = reply.send(reply_result);
+    outcome
 }
 
 /// Handle [`MessagingCommand::HandleSenderKeyRequest`] (actor-shape, test-only).

@@ -987,35 +987,40 @@ impl FullStackNode {
     /// `sequence` / `payload` (e.g. assert a sent heartbeat is tagged
     /// `MessageType::Heartbeat` and carries sequence `0`, §9.9.2).
     ///
-    /// # Blocked on an actor inspection command (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
+    /// # Read-only actor inspection (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
     ///
-    /// This inspection needs the RAW decrypted `InnerEnvelope` (its
-    /// `message_type` and `sequence`), which the deleted provider `open` twin
-    /// used to surface. The only public receive path now is
-    /// [`Supervisor::deliver_commit_blob`](scp_core::context::Supervisor::deliver_commit_blob),
-    /// which returns the access-key-UNWRAPPED plaintext for an application
-    /// message and collapses Control / Heartbeat / Management to `None` — it does
-    /// NOT expose the inner header. Restoring this requires a NEW read-only actor
-    /// command (e.g. `MessagingCommand::InspectIncoming` returning the
-    /// `OpenedEnvelope`'s `inner`), which is out of this harness's scope. Until
-    /// that lands, this method fails closed rather than fabricate an inner header.
+    /// The crypto state is actor-owned (one-way take), so this routes through the
+    /// context actor via
+    /// [`Supervisor::inspect_incoming_inner`](scp_core::context::Supervisor::inspect_incoming_inner)
+    /// — the actor twin of the deleted provider `open` inspection twin. The actor
+    /// handler decrypts through the OWNED crypto state and returns the RAW inner
+    /// envelope.
+    ///
+    /// This inspection is NON-MUTATING on receive state by construction: the
+    /// handler drives only the pure `ContextCryptoState::open` decrypt, NOT the
+    /// messaging-seam anti-replay path (`check_and_advance_recv_sequence`, the
+    /// Class-M floor registry, `nonce_dedup`, epoch advance). It therefore never
+    /// consumes an application sequence or anti-replay slot — which is exactly
+    /// what lets a test open the same three captured blobs and assert that the
+    /// heartbeat between two messages did NOT advance the application sequence
+    /// (§9.9.2). The only state change is the MLS decryption-ratchet advance
+    /// intrinsic to any decrypt (the deleted provider twin was non-mutating in
+    /// this same sense).
     ///
     /// # Errors
     ///
-    /// Always returns [`ContextError::CryptoFailed`] pending the actor
-    /// inner-envelope inspection command described above.
-    pub fn open_inner_envelope(
+    /// Propagates [`ContextError`] if any decryption or verification step fails,
+    /// or if the blob decodes to a control / management result rather than an
+    /// application envelope.
+    pub async fn open_inner_envelope(
         &self,
-        _context_id_str: &str,
+        context_id_str: &str,
         _context_id: &[u8; 32],
-        _ciphertext: &[u8],
+        ciphertext: &[u8],
     ) -> Result<scp_core::envelope::inner::InnerEnvelope, ContextError> {
-        Err(ContextError::CryptoFailed(
-            "open_inner_envelope: raw inner-envelope inspection requires a read-only \
-             actor command (deleted provider `open` twin, ADR-049 PR-7); \
-             deliver_commit_blob does not surface the inner header"
-                .to_owned(),
-        ))
+        self.manager
+            .inspect_incoming_inner(context_id_str, ciphertext.to_vec())
+            .await
     }
 
     /// Takes all captured application ciphertexts sent by this node and clears
