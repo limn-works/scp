@@ -56,6 +56,15 @@ const PROVIDER_SRC: &str =
 const SUPERVISOR_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
 
+// Outlet invocation source — owns the SCP-OUT-046 off-mailbox streaming-saga
+// seal task (`run_streaming_saga_seal_task`). The `ac8_*` structural assertion
+// below pins the ADR-061 "commit once over the bounded root" invariant: the
+// per-chunk pump loop folds each chunk via `StreamCaptureAppend` but issues NO
+// per-chunk two-phase commit — the single `CommitBStreamSettle` fires once at
+// stream-close, outside the loop.
+const OUTLETS_INVOKE_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/outlets/invoke.rs");
+
 // FFI bridge sources. PR #1606 / C4 wired all 3 of these to
 // `ContextManager::invoke_outlet_with_economy` so per-invocation pricing,
 // spending UCAN, velocity tracking, budget enforcement, and the hard
@@ -3150,6 +3159,104 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
         "UniFFI enforce_caller_principal_binding must check the per-instance \
          identity_custody_registry AND is_member (authenticated-principal \
          binding, ADR-049 §3a:94)"
+    );
+}
+
+// ===========================================================================
+// SCP-OUT-046 streaming saga — AC8 (commit once, no per-chunk 2PC)
+// ===========================================================================
+
+/// AC8 (SCP-OUT-046; ADR-061) — the streaming-saga seal COMMITS ONCE over the
+/// bounded Merkle root; it performs NO per-chunk two-phase commit. Structural
+/// guard on the off-mailbox seal task `run_streaming_saga_seal_task`:
+///
+/// - the per-chunk pump loop (`while let Some(chunk) = inner_rx.recv().await`)
+///   folds each forwarded chunk into B's durable frontier via
+///   `StreamCaptureAppend` — an O(log n) durable capture, NOT a commit;
+/// - the loop body contains NEITHER `CommitBStreamSettle` NOR `PrepareBStreaming`
+///   (no per-chunk commit, no per-chunk prepare);
+/// - the SINGLE `CommitBStreamSettle` fires exactly once in the whole task, at
+///   stream-close, OUTSIDE the loop.
+///
+/// This is the rejected-alternative tripwire (ADR-061: per-chunk 2PC is
+/// forbidden). Additive assertion — does not weaken any existing pipeline check.
+#[test]
+fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
+    // Bound the seal-task function body: from its `fn` to the next item
+    // (`record_streaming_saga_a_event`, which immediately follows it).
+    let fn_start = OUTLETS_INVOKE_SRC
+        .find("pub(crate) async fn run_streaming_saga_seal_task")
+        .expect("run_streaming_saga_seal_task must exist in invoke.rs");
+    let after_fn = &OUTLETS_INVOKE_SRC[fn_start..];
+    let fn_len = after_fn
+        .find("async fn record_streaming_saga_a_event")
+        .expect("record_streaming_saga_a_event follows the seal task");
+    // Strip `//` line comments (doc/rationale references to the message names are
+    // not code) before matching — mirrors the gating gate's comment-stripping, so
+    // the guard asserts on the actual dispatch code, not prose.
+    let seal_fn_owned: String = after_fn[..fn_len]
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let seal_fn = seal_fn_owned.as_str();
+
+    // (1) Exactly ONE CommitBStreamSettle dispatch in the whole seal task —
+    // commit once over the bounded root (AC8). More than one is a per-chunk 2PC.
+    let commit_count = seal_fn.matches("SagaPhaseMessage::CommitBStreamSettle").count();
+    assert_eq!(
+        commit_count, 1,
+        "AC8: the seal task must issue CommitBStreamSettle EXACTLY once (commit once over \
+         the bounded root); found {commit_count} — a per-chunk two-phase-commit regression"
+    );
+
+    // (2) Per-chunk capture is present, and Prepare-B is NOT the seal task's job.
+    assert!(
+        seal_fn.contains("StreamCaptureAppend"),
+        "AC8: the seal task must fold each forwarded chunk via StreamCaptureAppend"
+    );
+    assert!(
+        !seal_fn.contains("PrepareBStreaming"),
+        "AC8: the seal task must NOT run Prepare-B (Prepare-B is the driver's one-time job)"
+    );
+
+    // (3) Extract the per-chunk pump loop body via brace matching and assert the
+    // per-chunk fold is inside it but NEITHER commit NOR prepare is (the single
+    // commit fires at stream-close, outside the loop). In-string format
+    // placeholders (`{SLUG_…}`) are balanced, so they net-zero the depth count.
+    let loop_start = seal_fn
+        .find("while let Some(chunk) = inner_rx.recv().await")
+        .expect("the seal task must have a per-chunk pump loop");
+    let open_rel = seal_fn[loop_start..]
+        .find('{')
+        .expect("the pump loop opens a block");
+    let body_start = loop_start + open_rel + 1;
+    let bytes = seal_fn.as_bytes();
+    let mut depth = 1usize;
+    let mut i = body_start;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    assert_eq!(depth, 0, "AC8: pump loop body braces must balance");
+    let loop_body = &seal_fn[body_start..i - 1];
+
+    assert!(
+        loop_body.contains("StreamCaptureAppend"),
+        "AC8: the per-chunk pump loop must fold each chunk via StreamCaptureAppend"
+    );
+    assert!(
+        !loop_body.contains("CommitBStreamSettle"),
+        "AC8: the per-chunk pump loop body must NOT commit per chunk — the single \
+         CommitBStreamSettle fires once at stream-close, OUTSIDE the loop"
+    );
+    assert!(
+        !loop_body.contains("PrepareBStreaming"),
+        "AC8: the per-chunk pump loop body must NOT run Prepare-B per chunk"
     );
 }
 
