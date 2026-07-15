@@ -589,8 +589,10 @@ impl ScpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Driver`] if there is no pending join material for
-    /// the context, [`ClientError::ContextAlreadyExists`] if already joined,
+    /// Returns [`ClientError::NoPendingJoinMaterial`] if there is no pending join
+    /// material for the context (never generated, or consumed by a prior attempt —
+    /// single-use per attempt; see the in-body contract note),
+    /// [`ClientError::ContextAlreadyExists`] if already joined,
     /// [`ClientError::Mls`] / [`ClientError::EventLog`] on Welcome processing,
     /// replay failure (a replay stream that does not chain cleanly is rejected),
     /// or a sender-key seal failure, or [`ClientError::StorageBackend`] if
@@ -609,11 +611,29 @@ impl ScpClient {
         if self.contexts.contains_key(context_id) {
             return Err(ClientError::ContextAlreadyExists(context_id.to_owned()));
         }
+        // CONTRACT — pending join material is single-use PER ATTEMPT (consume, not
+        // preserve-on-failure). The in-memory pending is removed HERE, *before* the
+        // fallible `join_group_from_bytes` below, so a failed join on a bad/rejected
+        // Welcome burns the live in-memory material — a second in-tab attempt gets
+        // `NoPendingJoinMaterial`, NOT a silent retry. This is deliberate and
+        // fail-closed, for two compounding reasons:
+        //   1. `join_group_from_bytes` takes `provider` + `signer` BY VALUE
+        //      (`scp-mls` `group.rs`), so a rejected join drops them; and openmls may
+        //      have partially mutated the provider's key store before failing, so the
+        //      live provider is in an INDETERMINATE state after any attempt and is
+        //      unsafe to reuse in-memory (a KeyPackage init key is single-use by MLS
+        //      design — RFC 9420).
+        //   2. The safe retry source is the PRISTINE durable pending blob, which is
+        //      deleted only AFTER a successful join (below). A failed join leaves it
+        //      intact, so reconstructing the client via `ScpClient::new` over the same
+        //      storage restores fresh pending material and lets the join be retried
+        //      (ADR-057 T2 recovery model; Snapshot v3 "a join interrupted by a tab
+        //      close resumes with the SAME key"). Reusing the half-consumed live
+        //      provider instead would risk retrying against a corrupted key store.
         let pending = self.pending_joins.remove(context_id).ok_or_else(|| {
-            ClientError::Driver(format!(
-                "no pending key package for context '{context_id}'; call \
-                 generate_key_package_for_join first"
-            ))
+            ClientError::NoPendingJoinMaterial {
+                context_id: context_id.to_owned(),
+            }
         })?;
 
         // Adopt the wrapping keypair this join published in its KeyPackage leaf, so

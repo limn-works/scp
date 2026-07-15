@@ -66,6 +66,16 @@ fn client_for(did: &str, now_secs: u64) -> ScpClient {
     ScpClient::new(signer, storage, clock).expect("construct fresh client")
 }
 
+/// Builds a client for `did` over a CALLER-SUPPLIED storage handle. When the
+/// store already holds this identity's snapshots or pending-join blobs, the
+/// constructor restores them (ADR-057 T2) — the reconstruct-from-durable recovery
+/// path a failed join relies on.
+fn client_for_with_storage(did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> ScpClient {
+    let signer = Arc::new(LocalSigner::active(did));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
+    ScpClient::new(signer, storage, clock).expect("construct/restore client")
+}
+
 /// A snapshot of the full observable per-context driver state, used to assert
 /// that a fail-closed path left EVERYTHING unchanged (not just returned an
 /// error). Captures every axis a divergence bug could move.
@@ -521,13 +531,13 @@ fn successful_join_consumes_pending_material_no_reuse() {
     // Driver error, NOT a silent success reusing stale key material.
     bob.close_context(CTX).expect("Bob closes CTX");
     match bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys) {
-        Err(ClientError::Driver(msg)) => assert!(
-            msg.contains("no pending key package"),
-            "the join must report absent pending material, got: {msg}"
+        Err(ClientError::NoPendingJoinMaterial { context_id }) => assert_eq!(
+            context_id, CTX,
+            "the join reports absent pending material for the named context"
         ),
         other => panic!(
-            "expected a no-pending-material Driver error (material was consumed \
-             and not left dangling), got {other:?}"
+            "expected NoPendingJoinMaterial (material was consumed and not left \
+             dangling), got {other:?}"
         ),
     }
 }
@@ -562,11 +572,11 @@ fn close_context_clears_pending_join_material() {
     // A join now finds no pending material — the abandoned private key material was
     // cleared by close, not left dangling to be replayed.
     match carol.join_context_encrypted(CTX_JOIN, &[], &[], &[]) {
-        Err(ClientError::Driver(msg)) => assert!(
-            msg.contains("no pending key package"),
-            "close must have cleared the pending material, got: {msg}"
+        Err(ClientError::NoPendingJoinMaterial { context_id }) => assert_eq!(
+            context_id, CTX_JOIN,
+            "close must have cleared the pending material for the named context"
         ),
-        other => panic!("expected a no-pending-material Driver error after close, got {other:?}"),
+        other => panic!("expected NoPendingJoinMaterial after close, got {other:?}"),
     }
 }
 
@@ -646,5 +656,296 @@ fn malformed_or_truncated_ciphertext_leaves_replay_floor_intact() {
             .application,
         "an honest message still decrypts — the malformed inputs left the replay \
          floor and receive path intact"
+    );
+}
+
+// ===========================================================================
+// 11. Malformed / foreign KeyPackage → add_member is rejected without mutation
+// ===========================================================================
+
+#[test]
+fn malformed_key_package_add_member_is_rejected_without_mutation() {
+    // The ADDER-SIDE dual of the out-of-order-replay test (5): hostile INPUT to
+    // `add_member`, not to `receive`/`join`. A garbage or wrong-wire-type
+    // KeyPackage must be rejected at the `KeyPackageIn` deserialize boundary —
+    // which `add_member` runs BEFORE it takes the mutable context borrow — so the
+    // adder's full state (epoch, membership, leaf count, root, per-leaf hashes) is
+    // left byte-for-byte identical. A half-applied add (epoch advanced, or a phantom
+    // MemberJoined leaf appended) under a rejected KeyPackage would be a §9.9.3
+    // divergence bug even though an error was returned.
+    let base = SystemClock.now_secs();
+    let mut alice = client_for(ALICE_DID, base);
+    let mut bob = client_for(BOB_DID, base + 100);
+    alice.create_context(CTX).expect("Alice creates");
+
+    // Establish a richer two-member state so the no-mutation assertion covers a
+    // populated log/membership, not just a fresh context.
+    let bob_kp = bob
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
+    bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+        .expect("Bob joins");
+
+    let before = StateSnapshot::capture(&alice, CTX);
+
+    // (a) Pure garbage — not a decodable MLS/TLS wire object at all.
+    let garbage = vec![0xABu8; 40];
+    let err = alice
+        .add_member(CTX, &garbage)
+        .expect_err("a garbage KeyPackage must be rejected");
+    assert!(
+        matches!(err, ClientError::Codec(_) | ClientError::Mls(_)),
+        "a non-decodable KeyPackage fails at the codec/MLS boundary, got: {err:?}"
+    );
+    assert_eq!(
+        StateSnapshot::capture(&alice, CTX),
+        before,
+        "a rejected garbage KeyPackage must leave the adder's epoch, membership, \
+         leaf count, root, and leaf hashes UNCHANGED"
+    );
+
+    // (b) A VALID MLS wire object of the WRONG TYPE: the add's own Welcome bytes
+    // are a well-formed `MlsMessage`, but `KeyPackageIn` deserialization rejects
+    // them (a Welcome is not a KeyPackage). This exercises the "foreign / wrong
+    // wire object" adder input distinct from raw garbage.
+    let err = alice
+        .add_member(CTX, &add.welcome)
+        .expect_err("a foreign (wrong-type) MLS object must be rejected as a KeyPackage");
+    assert!(
+        matches!(err, ClientError::Codec(_) | ClientError::Mls(_)),
+        "a wrong-type MLS wire object fails the KeyPackage deserialize, got: {err:?}"
+    );
+    assert_eq!(
+        StateSnapshot::capture(&alice, CTX),
+        before,
+        "a rejected wrong-type KeyPackage must leave the adder's state UNCHANGED"
+    );
+
+    // (c) An empty buffer (degenerate truncation).
+    assert!(
+        alice.add_member(CTX, &[]).is_err(),
+        "an empty KeyPackage is rejected"
+    );
+    assert_eq!(
+        StateSnapshot::capture(&alice, CTX),
+        before,
+        "a rejected empty KeyPackage must leave the adder's state UNCHANGED"
+    );
+}
+
+// ===========================================================================
+// 12. Malformed / foreign Welcome → join leaves NO half-built context
+// ===========================================================================
+
+#[test]
+fn malformed_welcome_join_leaves_no_half_built_context() {
+    // The joiner-side input dual: a bad/foreign Welcome handed to
+    // `join_context_encrypted` must fail closed with Bob holding NO context at all —
+    // no partially-built MLS group, no partially-replayed event log, no membership
+    // directory. A half-built context would be worse than none: it could emit
+    // ciphertext / leaves no peer shares.
+    let base = SystemClock.now_secs();
+    let mut alice = client_for(ALICE_DID, base);
+    let mut bob = client_for(BOB_DID, base + 100);
+    alice.create_context(CTX).expect("Alice creates");
+
+    let bob_kp = bob
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package");
+    // A real add so the transported event log + wrapping keys are genuine; ONLY the
+    // Welcome is hostile, isolating the Welcome-processing failure.
+    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
+
+    let garbage_welcome = vec![0xEEu8; 48];
+    let err = bob
+        .join_context_encrypted(CTX, &garbage_welcome, &add.event_log, &add.wrapping_keys)
+        .expect_err("a malformed Welcome must be rejected");
+    assert!(
+        matches!(err, ClientError::Mls(_)),
+        "a non-decodable Welcome fails at the MLS Welcome-processing layer, got: {err:?}"
+    );
+
+    // Fail-closed: Bob holds NO half-built context.
+    assert_eq!(
+        bob.member_dids(CTX),
+        None,
+        "a rejected Welcome must leave Bob holding NO context"
+    );
+    assert_eq!(bob.event_log_root(CTX), None);
+    assert_eq!(bob.event_log_leaf_count(CTX), None);
+    assert_eq!(bob.event_log_leaf_hashes(CTX), None);
+}
+
+// ===========================================================================
+// 13. A failed join CONSUMES the in-memory pending material (single-use per
+//     attempt); recovery is via reconstruct-from-durable, not in-memory reuse
+// ===========================================================================
+
+#[test]
+fn failed_join_consumes_pending_and_recovers_only_via_reconstruct() {
+    // CONTRACT PIN for the single-use-per-attempt join contract documented on
+    // `join_context_encrypted` (see its in-body note; ADR-057 T2 / Snapshot v3). Two
+    // properties: (1) a failed join on a bad Welcome BURNS the in-memory pending, so a
+    // second in-tab attempt — even with a GOOD Welcome — gets `NoPendingJoinMaterial`,
+    // not a silent retry; and (2) recovery is via the PRISTINE durable pending blob a
+    // failed join never deletes: reconstructing the client over the same storage
+    // restores it and the join then succeeds.
+    let base = SystemClock.now_secs();
+    let mut alice = client_for(ALICE_DID, base);
+    // Bob over a SHARED storage handle so a reconstructed client can restore the
+    // durable pending blob the failed join leaves intact.
+    let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let mut bob = client_for_with_storage(BOB_DID, Arc::clone(&bob_storage), base + 100);
+
+    alice.create_context(CTX).expect("Alice creates");
+    let bob_kp = bob
+        .generate_key_package_for_join(CTX)
+        .expect("Bob key package"); // persists the durable pending blob
+    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob"); // a GOOD Welcome
+
+    // First attempt: a BAD Welcome (real event log + wrapping keys). It fails at
+    // Welcome processing AFTER the in-memory pending was removed.
+    let garbage_welcome = vec![0xEEu8; 48];
+    let err = bob
+        .join_context_encrypted(CTX, &garbage_welcome, &add.event_log, &add.wrapping_keys)
+        .expect_err("the bad Welcome must be rejected");
+    assert!(
+        matches!(err, ClientError::Mls(_)),
+        "bad Welcome, got: {err:?}"
+    );
+    assert_eq!(
+        bob.member_dids(CTX),
+        None,
+        "the failed join left no half-built context"
+    );
+
+    // Second in-tab attempt with the GOOD Welcome: the in-memory pending was CONSUMED
+    // by the first attempt, so this reports absent pending material — NOT a retry.
+    match bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys) {
+        Err(ClientError::NoPendingJoinMaterial { context_id }) => assert_eq!(
+            context_id, CTX,
+            "the failed join burned the in-memory pending material (single-use per \
+             attempt)"
+        ),
+        other => panic!(
+            "expected NoPendingJoinMaterial on the second in-tab attempt (the first \
+             attempt consumed the live pending material), got {other:?}"
+        ),
+    }
+
+    // RECOVERY — the documented path: a fresh client over Bob's SAME storage restores
+    // the still-durable pending blob (the failed join never deleted it) and the join
+    // now SUCCEEDS with the good Welcome. This proves the burned prekey was not
+    // permanently lost — reconstruct-from-durable is the retry seam.
+    drop(bob);
+    let mut bob2 = client_for_with_storage(BOB_DID, Arc::clone(&bob_storage), base + 150);
+    // The reconstructed client is not yet a member; the pending material was restored.
+    assert_eq!(
+        bob2.member_dids(CTX),
+        None,
+        "the reconstructed client has not joined yet"
+    );
+    bob2.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+        .expect("reconstruct-from-durable restores pending material; the join succeeds");
+    let mut members = bob2.member_dids(CTX).expect("bob2 is now a member");
+    members.sort();
+    assert_eq!(
+        members,
+        vec![ALICE_DID.to_owned(), BOB_DID.to_owned()],
+        "the recovered join converged Bob into the two-member context"
+    );
+    assert_eq!(
+        bob2.event_log_root(CTX),
+        alice.event_log_root(CTX),
+        "the recovered join replayed Alice's log to the same Merkle root"
+    );
+}
+
+// ===========================================================================
+// 14. A misdirected sender-key distribution (sealed to another member) is
+//     rejected without mutation
+// ===========================================================================
+
+#[test]
+fn misdirected_sender_key_distribution_is_rejected_without_mutation() {
+    // A §9.16 sender-key distribution is HPKE-sealed to ONE member's stable wrapping
+    // key; `target_did` is only an in-tab delivery hint. Delivering a distribution
+    // sealed for Carol to the WRONG member (Bob) must fail closed at the HPKE-open
+    // step (Bob's wrapping secret cannot open a seal made for Carol's key) and leave
+    // NO OBSERVABLE state change — no installed sender key, no leaf, no buffered
+    // event, no epoch/membership/root move. (The rejection happens AFTER the outer
+    // MLS frame is decrypted, so Bob's inbound MLS ratchet advances in memory; that
+    // is internal, un-persisted, and not part of the convergent/observable state the
+    // snapshot captures — the point under test is that the misdirected seal installs
+    // no key and forks no log.)
+    let (mut alice, mut bob) = converged_pair();
+
+    // Alice adds Carol; Bob (bystander) processes the add-Commit so he reaches the
+    // post-add epoch at which Alice's distributions were sealed.
+    let mut carol = client_for(CAROL_DID, SystemClock.now_secs() + 200);
+    let carol_kp = carol
+        .generate_key_package_for_join(CTX)
+        .expect("Carol key package");
+    let add_carol = alice.add_member(CTX, &carol_kp).expect("Alice adds Carol");
+    carol
+        .join_context_encrypted(
+            CTX,
+            &add_carol.welcome,
+            &add_carol.event_log,
+            &add_carol.wrapping_keys,
+        )
+        .expect("Carol joins");
+    bob.receive_message(CTX, &add_carol.commit)
+        .expect("Bob processes the add-Carol Commit");
+    let _ = bob.drain_events(CTX); // clear any buffered events from the commit processing
+
+    // Alice's own add-seal targets Carol (sealed to Carol's wrapping key).
+    assert_eq!(add_carol.sender_key_distributions.len(), 1);
+    let alice_to_carol = &add_carol.sender_key_distributions[0];
+    assert_eq!(
+        alice_to_carol.target_did, CAROL_DID,
+        "Alice's add-seal is addressed to Carol"
+    );
+
+    // Snapshot Bob's post-Commit state, then MISDIRECT Alice→Carol's seal to Bob.
+    let before = StateSnapshot::capture(&bob, CTX);
+    let err = bob
+        .receive_message(CTX, &alice_to_carol.ciphertext)
+        .expect_err("a distribution sealed to Carol must not open under Bob's key");
+    // The outer MLS frame decrypts (Bob is at the sealing epoch), so the rejection is
+    // specifically the inner HPKE-open failing under Bob's wrapping secret — a
+    // sender-key-layer error, NOT an MLS-layer one. Asserting the precise variant
+    // proves the misdirection was caught at the intended layer (a vague MLS error
+    // could mean Bob simply couldn't decrypt the frame, making the test vacuous).
+    assert!(
+        matches!(err, ClientError::SenderKey(_)),
+        "the misdirected seal fails at the HPKE-open (sender-key) layer, got: {err:?}"
+    );
+    assert_eq!(
+        StateSnapshot::capture(&bob, CTX),
+        before,
+        "a rejected misdirected distribution must leave epoch, membership, leaf \
+         count, root, and leaf hashes UNCHANGED"
+    );
+    assert!(
+        bob.drain_events(CTX).expect("drain").is_empty(),
+        "a rejected misdirected distribution buffers no event"
+    );
+
+    // Behavioural proof that NO wrong key was installed and Bob's receive path is not
+    // wedged: Alice (whose key Bob installed during `converged_pair`) sends an
+    // application message and Bob still decrypts it. The sender-key store is internal
+    // (the snapshot cannot observe it), so this end-to-end decrypt is what proves the
+    // misdirected seal neither installed nor corrupted a key.
+    let honest = alice
+        .send_message(CTX, b"honest after misdirection")
+        .expect("Alice sends");
+    assert!(
+        bob.receive_message(CTX, &honest)
+            .expect("Bob still decrypts Alice's message")
+            .application,
+        "the misdirected distribution installed no key and did not wedge Bob's \
+         receive path"
     );
 }
