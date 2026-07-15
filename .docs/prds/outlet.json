@@ -2163,7 +2163,7 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/outlets/invoke.rs",
         "crates/scp-runtime/src/context/outlets/mod.rs",

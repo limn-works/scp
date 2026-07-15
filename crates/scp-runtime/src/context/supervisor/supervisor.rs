@@ -11467,6 +11467,82 @@ impl Supervisor {
         }
     }
 
+    /// Best-effort cross-context re-encrypting streaming bridge entry
+    /// (SCP-OUT-036).
+    ///
+    /// Resolves the RECEIVING context A's shared event-log provider and drives
+    /// [`invoke_outlet_cross_context`](crate::context::outlets::invoke::invoke_outlet_cross_context),
+    /// which opens the outlet stream in the OPERATING context B, forwards each
+    /// operator-signed chunk to the shared-member invoker IN-PROCESS as
+    /// PLAINTEXT (§6.2.0 — the invoker is a member of BOTH contexts, mirroring
+    /// the same-context [`open_outlet_stream`](Self::open_outlet_stream)), and
+    /// records A's own `OutletInvoked` at close over its independently
+    /// reassembled chunk sequence. Returns A's plaintext
+    /// `mpsc::Receiver<OutletStreamChunk>` PROMPTLY (the caller consumes chunks
+    /// as produced); re-encryption for A's OTHER members is the SDK delivery
+    /// seam (seal each still-operator-signed chunk under A's MLS group key over
+    /// the existing §9.8/§9.16 transport — no new relay primitive), NOT this
+    /// return type.
+    ///
+    /// Zero-escrow (§5.4.5 "Cross-context economy"; ADR-061): a paid Action
+    /// outlet (`cost.amount > 0`) is rejected and no receiver is produced; a
+    /// metered paid cross-context stream MUST use the streaming saga
+    /// (SCP-OUT-046). B's `OutletInvoked` is recorded by the internal durable
+    /// sink `open_outlet_stream` wires — never double-recorded here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvocationError`](crate::context::outlets::invoke::InvocationError)
+    /// when A's event-log provider is not configured, when the outlet is a paid
+    /// Action outlet, or when the B-side open is rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_outlet_stream_cross_context<E>(
+        self: &Arc<Self>,
+        receiving_context_id: &str,
+        operating_context_id: &str,
+        registry: &scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &scp_protocol::context::outlets::OutletId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        timeout_ms: Option<u32>,
+        executor: Arc<E>,
+        incoming_open: &scp_protocol::context::outlets::stream::OutletStreamOpen,
+        params: crate::context::outlets::dispatch::OpenStreamParams,
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+        crate::context::outlets::invoke::InvocationError,
+    >
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
+    {
+        // Resolve A's SHARED event-log provider (the off-mailbox durable log —
+        // no per-context lock, ADR-049-safe). A missing provider fails the open
+        // closed: the bridge cannot record A's `OutletInvoked` without it.
+        let a_event_log = self.event_log_ref().cloned().ok_or_else(|| {
+            crate::context::outlets::invoke::InvocationError::ExecutionFailed {
+                message:
+                    "cross-context bridge: receiving-context event-log provider not configured"
+                        .to_owned(),
+            }
+        })?;
+
+        crate::context::outlets::invoke::invoke_outlet_cross_context(
+            self,
+            a_event_log,
+            receiving_context_id,
+            operating_context_id,
+            registry,
+            outlet_id,
+            input,
+            invoker_did,
+            timeout_ms,
+            executor,
+            incoming_open,
+            params,
+        )
+        .await
+    }
+
     // AXIS: bridge-external (ADR-049 §5 placement invariant). `create_context`
     // and its join-side peers `reserve_key_package` / `spawn_actor_from_welcome`
     // (below) are node-level bootstraps called by the trusted FFI/bridge
@@ -29197,5 +29273,280 @@ mod open_outlet_stream_tests {
 
         // Keep the first stream's admission slot occupied through the assertion.
         drop(first);
+    }
+
+    // =====================================================================
+    // SCP-OUT-036 — best-effort cross-context bridge, through the real
+    // `Supervisor::open_outlet_stream_cross_context` entry.
+    // =====================================================================
+
+    /// Builds `OpenStreamParams` + a matching incoming B-side `OutletStreamOpen`
+    /// for a cross-context open against the spawned `ctx_key()` context.
+    fn xctx_open_inputs(
+        cost_per_chunk: Amount,
+        chain_depth: u8,
+    ) -> (
+        crate::context::outlets::dispatch::OpenStreamParams,
+        scp_protocol::context::outlets::stream::OutletStreamOpen,
+        crate::context::outlets_helpers::InvocationCaveatBinding,
+    ) {
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        let request_id: RequestId = [CTX_BYTE; 16];
+        let caveats_jcs = caveats.to_canonical_json_bytes().expect("jcs");
+        let caveats_binding = compute_caveats_binding(
+            UCAN_CID.as_bytes(),
+            &request_id,
+            &invoker().0,
+            DECLARED_ESTIMATE,
+            &caveats_jcs,
+        );
+        let identity = StreamIdentity {
+            context_id: ctx_key(),
+            outlet_id: "calculator".to_owned(),
+            stream_epoch: 1,
+            caveats_binding,
+        };
+        let invoker_key = SigningKey::from_bytes(&[0x24; 32]);
+        let invoker_pk = invoker_key.verifying_key();
+        let operator_signer: Arc<dyn StreamSigner> =
+            Arc::new(InProcessStreamSigner::new(invoker_key));
+        let params = OpenStreamParams {
+            identity,
+            caps: AdmissionCaps {
+                per_invoker: 10,
+                per_origin_invoker: 10,
+                per_outlet: 10,
+            },
+            invoker_did: invoker().0,
+            origin_invoker_did: invoker().0,
+            cost_per_chunk,
+            available_balance: Amount::new(1_000_000),
+            reserved_escrow: Amount::new(0),
+            declared_estimated_chunk_count: Some(DECLARED_ESTIMATE),
+            credit_window: 32,
+            caveats: caveats.clone(),
+            invoker_pk,
+            operator_signer,
+            stream_credit_stall_secs: 999,
+            stream_cancel_ack_secs: 999,
+            stream_ucan_recheck_secs: 999,
+            ucan_cid: UCAN_CID.to_owned(),
+            request_id,
+            revocation_checker: Arc::new(
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+            ),
+            economic_policy_snapshot: None,
+        };
+        let incoming_open = scp_protocol::context::outlets::stream::OutletStreamOpen {
+            request_id,
+            outlet_id: "calculator".to_owned(),
+            input: serde_json::json!({ "a": 1, "b": 2 }),
+            invoker_did: invoker(),
+            ucan: vec![0x01],
+            caveats_binding,
+            chain_depth,
+            credit_window: 32,
+            estimated_chunk_count: DECLARED_ESTIMATE,
+            session_id: None,
+            timeout_ms: 5_000,
+        };
+        let binding = crate::context::outlets_helpers::InvocationCaveatBinding {
+            caveats,
+            ucan_cid: UCAN_CID.to_owned(),
+        };
+        (params, incoming_open, binding)
+    }
+
+    /// AC12 (through the real supervisor entry): a best-effort cross-context
+    /// open of a PAID Action outlet (`cost.amount > 0`) is rejected zero-escrow
+    /// and NO receiver is produced.
+    #[tokio::test]
+    async fn open_outlet_stream_cross_context_rejects_paid_action() {
+        use crate::context::outlets::invoke::InvocationError;
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let supervisor = build_supervisor(&captured);
+        let role_state = authorizing_role_state();
+
+        // Register a PAID Action outlet (cost.amount > 0).
+        let mut paid = registration();
+        paid.cost = Some(scp_protocol::context::outlets::registry::OutletCost {
+            amount: Amount::new(10),
+            currency: "USD".to_owned(),
+            payee: DID::from("did:dht:z6MkPayee"),
+            cost_formula: None,
+        });
+        let mut registry = OutletRegistry::new();
+        register_outlet(&mut registry, &role_state, paid, &invoker().0)
+            .expect("register paid outlet");
+
+        let (params, incoming_open, _binding) = xctx_open_inputs(Amount::new(10), 1);
+        let executor: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
+        let outlet_id: OutletId = "calculator".to_owned();
+
+        let result = supervisor
+            .open_outlet_stream_cross_context(
+                "ctx-a-036-reject",
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                executor,
+                &incoming_open,
+                params,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(InvocationError::CrossContextPaidActionUnsupported { .. })
+            ),
+            "a paid Action best-effort cross-context open must be rejected zero-escrow; \
+             got {result:?}"
+        );
+    }
+
+    /// AC2 (through the real supervisor entry): a zero-cost cross-context open
+    /// returns a PLAINTEXT `mpsc::Receiver<OutletStreamChunk>` and forwards the
+    /// operator-signed chunks to the shared-member invoker in-process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_outlet_stream_cross_context_returns_plaintext_receiver() {
+        /// Emits two Data chunks then an explicit terminal `End` carrying a
+        /// valid object aggregate (so the crossing's schema check passes on the
+        /// happy path — the framework's default null aggregate is exercised as a
+        /// violation by AC5/AC9 instead).
+        struct FiniteStreamExecutor;
+        #[async_trait::async_trait]
+        impl OutletExecutor for FiniteStreamExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut crate::context::outlets::invoke::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), crate::context::outlets::invoke::OutletExecutorError> {
+                for i in 0..2u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "result": i }),
+                        })
+                        .await;
+                }
+                let _ = tx
+                    .send(ChunkPayload::End {
+                        aggregate: serde_json::json!({ "result": 2 }),
+                        provenance: scp_protocol::provenance::DataProvenance {
+                            source_context: ctx_key(),
+                            source_type: scp_protocol::provenance::SourceType::Persistent,
+                            counterparties: Vec::new(),
+                            purpose: None,
+                            discovery_method: scp_protocol::provenance::DiscoveryMethod::OutOfBand,
+                            age: std::time::Duration::from_secs(0),
+                            memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                            chain_depth: 0,
+                            chain_path: None,
+                            payment_amount: None,
+                            payment_adapter: None,
+                            payment_receipt_id: None,
+                        },
+                        execution_time_ms: 1,
+                    })
+                    .await;
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let supervisor = build_supervisor(&captured);
+
+        // Spawn a live actor for the OPERATING context B (`ctx_key()`).
+        let role_state = authorizing_role_state();
+        let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key(),
+            scp_protocol::context::ContextParams::default(),
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        state.role_state = role_state.clone();
+        state
+            .membership
+            .add_member(invoker(), "owner".to_owned(), Vec::new());
+        state
+            .governance
+            .budget_tracker
+            .grant(&invoker(), Amount::new(1_000_000));
+        state.governance.economic_policy = Some(policy());
+        let deps = supervisor
+            .build_actor_deps(&invoker())
+            .await
+            .expect("build_actor_deps");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn_actor_with_state");
+
+        // Register a ZERO-COST Action outlet (cost None ⇒ zero-escrow accept).
+        let mut registry = OutletRegistry::new();
+        register_outlet(&mut registry, &role_state, registration(), &invoker().0)
+            .expect("register zero-cost outlet");
+
+        // Initialise the RECEIVING context A's event log so the bridge's A-side
+        // recording succeeds against the shared provider.
+        let a_ctx = "ctx-a-036-accept";
+        supervisor
+            .event_log_ref()
+            .expect("event log provider")
+            .init_event_log(&crate::context::state::context_id_to_bytes(a_ctx))
+            .await
+            .expect("init A event log");
+
+        let (params, incoming_open, _binding) = xctx_open_inputs(Amount::new(0), 2);
+        let executor: Arc<dyn OutletExecutor> = Arc::new(FiniteStreamExecutor);
+        let outlet_id: OutletId = "calculator".to_owned();
+
+        // The Ok variant is a PLAINTEXT `mpsc::Receiver<OutletStreamChunk>`.
+        let mut rx: tokio::sync::mpsc::Receiver<
+            scp_protocol::context::outlets::stream::OutletStreamChunk,
+        > = supervisor
+            .open_outlet_stream_cross_context(
+                a_ctx,
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                executor,
+                &incoming_open,
+                params,
+            )
+            .await
+            .expect("zero-cost cross-context open must be accepted");
+
+        // Drain the plaintext chunks the bridge forwards to the shared-member
+        // invoker: two Data payloads followed by a terminal End.
+        let mut data = 0u32;
+        let mut saw_end = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk.payload {
+                ChunkPayload::Data { .. } => data += 1,
+                ChunkPayload::End { .. } => {
+                    saw_end = true;
+                    break;
+                }
+                ChunkPayload::Progress { .. } => {}
+                ChunkPayload::Error { code, terminal, .. } => panic!(
+                    "unexpected terminal error on the happy path: {code} (terminal={terminal})"
+                ),
+            }
+        }
+        assert_eq!(data, 2, "both Data chunks forwarded in plaintext");
+        assert!(saw_end, "the stream closes with a plaintext terminal End");
     }
 }
