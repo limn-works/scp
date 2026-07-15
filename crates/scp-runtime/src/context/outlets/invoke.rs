@@ -3116,7 +3116,8 @@ pub fn invocation_error_to_terminal_payload(err: &InvocationError) -> ChunkPaylo
     use scp_protocol::context::outlets::error_codes::{
         CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_INPUT_VIOLATION,
         CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_DENIED,
-        SLUG_INPUT_SCHEMA_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION, SLUG_QUERY_VIOLATION,
+        SLUG_ECONOMIC_BUDGET_EXCEEDED, SLUG_INPUT_SCHEMA_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION,
+        SLUG_QUERY_VIOLATION,
     };
     // The slug is included in the resulting Error chunk's `message`
     // field so the receiver-side SDK can reverse-lookup against the
@@ -3166,14 +3167,19 @@ pub fn invocation_error_to_terminal_payload(err: &InvocationError) -> ChunkPaylo
         // Exhaustiveness-only arm. `CrossContextPaidActionUnsupported` is an
         // OPEN-TIME economic rejection returned as `Err(InvocationError)`
         // before any stream/receiver exists (§5.4.5 "Cross-context economy"),
-        // so it never legitimately reaches terminal-chunk conversion. It is an
-        // Economic-class rejection (`SCP-OUTLET-6150`) — explicitly NOT a
-        // Transport fault (`SCP-OUTLET-6160`), which is the mid-stream
-        // bridge-failure code. Mapped here solely to keep this match total.
-        InvocationError::CrossContextPaidActionUnsupported { .. } => (
-            CODE_ECONOMIC_FAULT,
-            "economic.cross-context-paid-action-unsupported",
-        ),
+        // so it never legitimately reaches terminal-chunk conversion — the
+        // cross-context bridge propagates it as a `Result::Err`, never as a
+        // terminal chunk. It is an Economic-class rejection (`SCP-OUTLET-6150`)
+        // — explicitly NOT a Transport fault (`SCP-OUTLET-6160`), which is the
+        // mid-stream bridge-failure code. Because this arm is dead for terminal
+        // conversion, it reuses the REGISTERED `SLUG_ECONOMIC_BUDGET_EXCEEDED`
+        // slug (which round-trips `slug_to_class` to the Economic class) rather
+        // than an unregistered bespoke literal — the real rejection detail is
+        // carried by `{err}` in the message. Mapped here solely to keep the
+        // match total.
+        InvocationError::CrossContextPaidActionUnsupported { .. } => {
+            (CODE_ECONOMIC_FAULT, SLUG_ECONOMIC_BUDGET_EXCEEDED)
+        }
     };
     ChunkPayload::Error {
         code: code.to_owned(),
@@ -4200,6 +4206,18 @@ pub(crate) struct CrossContextVerificationDescriptor {
     /// The 32-byte `caveats_binding` pinned at stream-open, committed into
     /// each chunk-signature preimage.
     pub(crate) caveats_binding: [u8; 32],
+    /// The 16-byte `request_id` pinned at stream-open — the ONLY `request_id`
+    /// whose chunks this crossing forwards (§5.4.5 "Verification source at the
+    /// crossing"). The per-chunk preimage commits `request_id`, so the
+    /// verification MUST fix it from the governed open — NOT trust the
+    /// `request_id` a delivered chunk asserts. Although `caveats_binding`
+    /// already commits `request_id` (§5.4.5 binding preimage) and so a chunk
+    /// signed for a different stream would fail signature verification against
+    /// the pinned `caveats_binding` today, pinning `request_id` explicitly makes
+    /// the "never rebuilt from chunk-supplied values" invariant hold on its own
+    /// terms — defense-in-depth against any future decoupling of the two
+    /// bindings, and matching the §5.4.5:570 rule literally.
+    pub(crate) expected_request_id: RequestId,
 }
 
 /// Verifies one forwarded chunk's operator signature against the PINNED
@@ -4213,6 +4231,14 @@ pub(crate) fn verify_forwarded_chunk(
     descriptor: &CrossContextVerificationDescriptor,
     chunk: &OutletStreamChunk,
 ) -> bool {
+    // Pin `request_id` from the governed open — never trust the value the
+    // delivered chunk asserts (§5.4.5 "Verification source at the crossing").
+    // A chunk asserting a DIFFERENT `request_id` (even a valid operator
+    // signature for another same-outlet stream) is rejected here, so the
+    // crossing forwards exactly the stream that was opened.
+    if chunk.request_id != descriptor.expected_request_id {
+        return false;
+    }
     verify_chunk_signature(
         chunk,
         &descriptor.operator_pk,
@@ -4237,22 +4263,49 @@ pub(crate) fn verify_forwarded_chunk(
 /// (§5.4.2 query-cost floor), so this is equivalent to "paid Action" while
 /// remaining faithful to the spec's cost-only formulation.
 ///
+/// # Split-source hardening (gate the value actually BILLED)
+///
+/// The zero-escrow invariant must hold on the field that DRIVES billing, not
+/// only on the registration's declared `cost`. The B-side reserve /
+/// pump bill `cost_per_chunk` (the §19.5 per-billable-chunk pricing unit),
+/// which is a SEPARATE caller-supplied field from `registration.cost`. If the
+/// gate inspected only `registration.cost` and a caller presented
+/// `registration.cost.amount == 0` together with `cost_per_chunk > 0`, the
+/// open would pass the "zero-escrow" gate while the pump billed every chunk —
+/// a paid stream smuggled through the best-effort (settlement-free) path. So
+/// this gate rejects when EITHER the registered cost OR the billed
+/// `cost_per_chunk` is positive, and (since both must be zero to proceed) the
+/// two can no longer diverge: the value gated is exactly the value billed. The
+/// authoritative per-billable-chunk unit for a registered outlet is
+/// `registration.cost.amount` (§19.5); a `cost_per_chunk` that disagrees with a
+/// zero registered cost is a caller inflating its own bill and is refused.
+///
 /// # Errors
 ///
-/// Returns [`InvocationError::CrossContextPaidActionUnsupported`] for a paid
-/// outlet; `Ok(())` otherwise.
+/// Returns [`InvocationError::CrossContextPaidActionUnsupported`] when the
+/// registered cost OR the billed `cost_per_chunk` is positive; `Ok(())`
+/// otherwise (both zero — the only shape the zero-escrow bridge serves).
 pub(crate) fn cross_context_economy_gate(
     registration: &OutletRegistration,
+    cost_per_chunk: scp_protocol::economy::types::Amount,
 ) -> Result<(), InvocationError> {
-    let paid = registration
+    let registered_paid = registration
         .cost
         .as_ref()
         .is_some_and(|cost| cost.amount.value() > 0);
-    if paid {
+    // Gate on the value that actually drives billing, not only the declared
+    // registration cost — a zero registered cost with a positive
+    // `cost_per_chunk` would otherwise pass the gate while the pump bills.
+    let billed_paid = cost_per_chunk.value() > 0;
+    if registered_paid || billed_paid {
         return Err(InvocationError::CrossContextPaidActionUnsupported {
             outlet_id: registration.outlet_id.clone(),
         });
     }
+    // Reaching here means `registration.cost.amount == 0` AND
+    // `cost_per_chunk == 0`: the gated value and the billed value are both zero,
+    // so they cannot diverge (the split-source bypass is closed).
+    //
     // A positive cost implies `OutletKind::Action` by the §5.4.2 registration
     // floor; assert the invariant so a future registration path that broke it
     // would surface here rather than silently admitting a paid Query.
@@ -4284,6 +4337,12 @@ pub(crate) type BridgeFaultProbe = Box<dyn Fn(&OutletStreamChunk) -> Option<Stri
 /// A's manifest commits to exactly the sequence A forwarded. The write-through
 /// snapshot is updated only AFTER a successful forward (§6.2.5) — it is a
 /// replay snapshot, never a forwarding buffer.
+///
+/// Returns `true` iff the terminal was DELIVERED to A's invoker (the outer
+/// channel accepted it). `false` means A stopped consuming before the terminal
+/// landed — the caller MUST NOT synthesize a further terminal onto a closed
+/// channel.
+#[must_use]
 async fn forward_bridge_terminal(
     outer_tx: &mpsc::Sender<OutletStreamChunk>,
     reassembled: &mut Vec<OutletStreamChunk>,
@@ -4291,7 +4350,7 @@ async fn forward_bridge_terminal(
     request_id: RequestId,
     sequence: u64,
     payload: ChunkPayload,
-) {
+) -> bool {
     let chunk = OutletStreamChunk {
         request_id,
         sequence,
@@ -4302,10 +4361,11 @@ async fn forward_bridge_terminal(
         // A's invoker stopped consuming before the terminal landed — record
         // what was already delivered; the terminal summary keeps its prior
         // (default) status.
-        return;
+        return false;
     }
     terminal.observe(&chunk.payload);
     reassembled.push(chunk);
+    true
 }
 
 /// Records the receiving context A's own `OutletInvoked` event at stream close
@@ -4417,6 +4477,26 @@ pub(crate) fn build_onward_a_leg_open(
     incoming_open.clone()
 }
 
+/// Absolute ceiling on the number of chunks the cross-context bridge RETAINS in
+/// its §6.2.5 write-through replay snapshot (`reassembled`) for a single stream.
+///
+/// The snapshot must hold the full chunk sequence to re-derive A's manifest root
+/// at close, so it grows with stream length. For a zero-cost / Query best-effort
+/// stream (`cost_per_chunk == 0` ⇒ `max_billable == None`) there is NO economic
+/// bound on the chunk count, and `Progress` chunks are NEVER billed — so a
+/// hostile or buggy operating context B could otherwise flood the bridge task
+/// with unbilled chunks and drive A's process to OOM (the outer `mpsc(1)`
+/// bounds only the in-flight forward, not the retained snapshot). This absolute
+/// ceiling bounds the retained snapshot regardless of chunk type; on breach the
+/// bridge forwards a transport-fault terminal (`SCP-OUTLET-6160`) and stops.
+///
+/// The value (`1 << 20` = 1,048,576) is chosen to sit far above any legitimate
+/// best-effort stream while bounding the per-stream retained memory to a finite
+/// envelope. It is a SAFE default the review did not pin numerically; a paid,
+/// unbounded-length metered stream is the streaming saga's domain (SCP-OUT-046),
+/// not this best-effort bridge.
+pub(crate) const MAX_CROSS_CONTEXT_STREAM_CHUNKS: usize = 1 << 20;
+
 /// The off-mailbox bridge task body (SCP-OUT-036).
 ///
 /// Consumes B's plaintext operator-signed chunks (`inner_rx`), verifies each
@@ -4435,11 +4515,33 @@ pub(crate) fn build_onward_a_leg_open(
 /// `governing_chain_depth` is the A-leg open's inherited `chain_depth` (§5.4.5
 /// "`chain_depth` … governs the whole stream"); it is carried here for the
 /// bridge's diagnostics — it is a property of the open, never of a chunk.
+///
+/// `max_retained_chunks` bounds the retained `reassembled` snapshot (see
+/// [`MAX_CROSS_CONTEXT_STREAM_CHUNKS`]) — production passes that const; the tests
+/// pass a small value to exercise the cap.
+///
+/// # Terminal guarantee (§5.4.5)
+///
+/// A's stream ALWAYS closes on a terminal chunk. Beyond the operator's own
+/// terminal (`End` / `Error { terminal }`) and the three synthesized fault
+/// terminals (sig reject, bridge fault, schema violation), the loop guards two
+/// more paths that would otherwise truncate A after a non-terminal `Data`:
+/// - the operating context B drops its sender WITHOUT a terminal chunk (e.g. an
+///   operator-signer failure at the terminal chunk collapses the pump's
+///   producer to `None`) — synthesized as a `SCP-OUTLET-6160` transport fault;
+/// - the retained snapshot reaches `max_retained_chunks` (an unbilled-chunk
+///   flood `DoS`) — also a `SCP-OUTLET-6160` transport fault.
+///
+/// The post-loop synthesis fires only when NO terminal was delivered AND the
+/// outer channel is still open (A is still consuming), so A never receives two
+/// terminals and never sees a synthesized terminal on a channel it abandoned.
 #[allow(clippy::too_many_arguments)]
 // One cohesive forward-loop over shared `reassembled` / `terminal` /
-// `execution_time_ms` state with three break-and-record exits (sig reject,
-// bridge fault, schema violation); splitting it would thread that mutable state
-// and the break signal through a helper, obscuring the §5.4.5 ordering.
+// `execution_time_ms` / `delivered_terminal` / `outer_open` state with several
+// break-and-record exits (chunk-cap, sig reject, bridge fault, schema violation,
+// operator terminal, consumer-gone) plus a post-loop terminal-guarantee
+// synthesis; splitting it would thread that mutable state and the break signal
+// through a helper, obscuring the §5.4.5 ordering.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_cross_context_bridge(
     mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
@@ -4455,6 +4557,7 @@ pub(crate) async fn run_cross_context_bridge(
     input_hash: String,
     governing_chain_depth: u8,
     timestamp_secs: u64,
+    max_retained_chunks: usize,
     fault_probe: Option<BridgeFaultProbe>,
 ) {
     tracing::debug!(
@@ -4466,12 +4569,49 @@ pub(crate) async fn run_cross_context_bridge(
     let mut reassembled: Vec<OutletStreamChunk> = Vec::new();
     let mut terminal = StreamTerminalSummary::default();
     let mut execution_time_ms: u64 = 0;
+    // Terminal-guarantee bookkeeping: `delivered_terminal` becomes true once a
+    // terminal chunk (operator-authored or synthesized) is DELIVERED to A;
+    // `outer_open` becomes false once A stops consuming. The post-loop synthesis
+    // fires iff `!delivered_terminal && outer_open`.
+    let mut delivered_terminal = false;
+    let mut outer_open = true;
 
     while let Some(chunk) = inner_rx.recv().await {
+        // (FIX 4) Bound the retained write-through snapshot: a hostile B flooding
+        // unbilled `Progress` chunks cannot grow `reassembled` past the cap and
+        // OOM the bridge task. On breach, forward a §5.4.5 transport-fault
+        // terminal and stop rather than retaining another chunk.
+        if reassembled.len() >= max_retained_chunks {
+            let payload = ChunkPayload::Error {
+                code: CODE_TRANSPORT_FAULT.to_owned(),
+                message: format!(
+                    "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: cross-context stream exceeded \
+                     the retained-chunk ceiling ({max_retained_chunks}) — terminating (§5.4.5)"
+                ),
+                terminal: true,
+            };
+            let next_seq = reassembled
+                .last()
+                .map_or(chunk.sequence, |c| c.sequence.saturating_add(1));
+            delivered_terminal = forward_bridge_terminal(
+                &outer_tx,
+                &mut reassembled,
+                &mut terminal,
+                request_id,
+                next_seq,
+                payload,
+            )
+            .await;
+            outer_open = delivered_terminal;
+            break;
+        }
+
         // (AC11) Verify the operator signature against the PINNED descriptor —
         // NEVER against bridge-supplied values (§5.4.5 "Verification source at
-        // the crossing"). A mismatch is a §5.4.5 chunk-signature-verification
-        // failure: emit an Authorization-class terminal and stop.
+        // the crossing"). A mismatch (bad signature OR a chunk asserting a
+        // `request_id` other than the pinned one) is a §5.4.5
+        // chunk-signature-verification failure: emit an Authorization-class
+        // terminal and stop.
         if !verify_forwarded_chunk(&descriptor, &chunk) {
             let payload = ChunkPayload::Error {
                 code: CODE_AUTHORIZATION_DENIED.to_owned(),
@@ -4481,7 +4621,7 @@ pub(crate) async fn run_cross_context_bridge(
                 ),
                 terminal: true,
             };
-            forward_bridge_terminal(
+            delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut reassembled,
                 &mut terminal,
@@ -4490,6 +4630,7 @@ pub(crate) async fn run_cross_context_bridge(
                 payload,
             )
             .await;
+            outer_open = delivered_terminal;
             break;
         }
 
@@ -4502,7 +4643,7 @@ pub(crate) async fn run_cross_context_bridge(
                 message: format!("{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: {detail}"),
                 terminal: true,
             };
-            forward_bridge_terminal(
+            delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut reassembled,
                 &mut terminal,
@@ -4511,6 +4652,7 @@ pub(crate) async fn run_cross_context_bridge(
                 payload,
             )
             .await;
+            outer_open = delivered_terminal;
             break;
         }
 
@@ -4538,7 +4680,7 @@ pub(crate) async fn run_cross_context_bridge(
                 message: format!("{SLUG_OUTPUT_SCHEMA_VIOLATION}: {message}"),
                 terminal: true,
             };
-            forward_bridge_terminal(
+            delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut reassembled,
                 &mut terminal,
@@ -4547,6 +4689,7 @@ pub(crate) async fn run_cross_context_bridge(
                 payload,
             )
             .await;
+            outer_open = delivered_terminal;
             break;
         }
 
@@ -4567,13 +4710,44 @@ pub(crate) async fn run_cross_context_bridge(
         if outer_tx.send(chunk.clone()).await.is_err() {
             // A's invoker stopped consuming — stop forwarding and record what
             // was already delivered.
+            outer_open = false;
             break;
         }
         terminal.observe(&chunk.payload);
         reassembled.push(chunk);
         if is_terminal {
+            delivered_terminal = true;
             break;
         }
+    }
+
+    // (FIX 3) Terminal guarantee: if the loop ended WITHOUT delivering any
+    // terminal — B's pump dropped its sender without emitting one (e.g. an
+    // operator-signer failure collapsed `try_build_signed_chunk` to `None` at
+    // the terminal chunk) — and A is still consuming, synthesize a
+    // transport-fault terminal so A never truncates after a non-terminal `Data`
+    // while recording a default `Error` terminal.
+    if !delivered_terminal && outer_open {
+        let payload = ChunkPayload::Error {
+            code: CODE_TRANSPORT_FAULT.to_owned(),
+            message: format!(
+                "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: operating context closed the \
+                 stream without a terminal chunk (§5.4.5)"
+            ),
+            terminal: true,
+        };
+        let next_seq = reassembled
+            .last()
+            .map_or(0, |c| c.sequence.saturating_add(1));
+        let _ = forward_bridge_terminal(
+            &outer_tx,
+            &mut reassembled,
+            &mut terminal,
+            request_id,
+            next_seq,
+            payload,
+        )
+        .await;
     }
 
     // (AC7) A-side recording through the verified-append boundary.
@@ -4616,15 +4790,34 @@ pub(crate) async fn run_cross_context_bridge(
 /// [`Supervisor::open_outlet_stream_cross_context`](crate::context::supervisor::Supervisor::open_outlet_stream_cross_context)
 /// — no FFI export (SCP-OUT-047).
 ///
+/// # §7.3.8 value-caveat enforcement
+///
+/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`]
+/// (`effective_caveats` + `ucan_cid`) bound to the invocation UCAN. It is
+/// threaded verbatim into `open_outlet_stream`, where it drives the §7.3.8
+/// post-input hook AND the durable cross-invocation counter reservation
+/// (`max_calls` / `amount_max_cumulative` / `rate_window` CAS). When it is
+/// `Some`, a single-use (`max_calls: 1`) or amount-capped delegation is
+/// enforced ACROSS opens — a second cross-context open on an exhausted counter
+/// is rejected. When it is `None`, no §7.3.8 value-caveat gate runs (parity
+/// with the non-streaming free path); the caller (FFI / SCP-OUT-047) supplies
+/// `Some` for a UCAN carrying value caveats. Note that `params.caveats` /
+/// `params.ucan_cid` alone bound only the per-stream chunk ceiling
+/// (estimate coercion + `max_billable`) — they do NOT run the value-caveat
+/// gate; that runs iff `caveat_binding` is `Some`.
+///
 /// # Errors
 ///
 /// Returns [`InvocationError`]:
 /// - [`OutletNotFound`](InvocationError::OutletNotFound) — the outlet is not in
 ///   B's registry.
 /// - [`CrossContextPaidActionUnsupported`](InvocationError::CrossContextPaidActionUnsupported)
-///   — a paid Action outlet (zero-escrow rejection).
+///   — a paid Action outlet OR a positive billed `cost_per_chunk` (zero-escrow
+///   rejection on the value actually billed).
 /// - the mapped B-side open rejection
-///   ([`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)).
+///   ([`OpenStreamRejection::to_invocation_error`](crate::context::outlets::dispatch::OpenStreamRejection::to_invocation_error)),
+///   including a §7.3.8 counter-CAS rejection when `caveat_binding`'s cap is
+///   exhausted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn invoke_outlet_cross_context<E>(
     supervisor: &std::sync::Arc<crate::context::supervisor::Supervisor>,
@@ -4638,6 +4831,12 @@ pub(crate) async fn invoke_outlet_cross_context<E>(
     timeout_ms: Option<u32>,
     executor: std::sync::Arc<E>,
     incoming_open: &scp_protocol::context::outlets::stream::OutletStreamOpen,
+    // §7.3.8 validated-narrowed value-caveat binding (`effective_caveats` +
+    // `ucan_cid`). `Some` ⇒ the durable value-caveat counter CAS runs at the
+    // B-side open; `None` ⇒ no value-caveat gate (parity with the non-streaming
+    // free path). Distinct from `params.identity.caveats_binding`, the 32-byte
+    // `[u8; 32]` chunk-signature binding.
+    caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
     params: crate::context::outlets::dispatch::OpenStreamParams,
 ) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>
 where
@@ -4652,9 +4851,12 @@ where
             outlet_id: outlet_id.clone(),
         })?;
 
-    // (AC12) Zero-escrow economy gate — reject a paid Action outlet before any
-    // stream / receiver is created.
-    cross_context_economy_gate(registration)?;
+    // (AC12) Zero-escrow economy gate — reject a paid Action outlet OR a
+    // positive billed `cost_per_chunk` before any stream / receiver is created.
+    // Gating on the billed value (not only the declared registration cost)
+    // closes the split-source bypass where `registration.cost == 0` but
+    // `cost_per_chunk > 0` would pass the gate while the pump bills.
+    cross_context_economy_gate(registration, params.cost_per_chunk)?;
 
     // (AC4) Build the onward A-leg open — it inherits `chain_depth` verbatim
     // from the incoming B-side open (never incremented by this forwarder). The
@@ -4663,19 +4865,22 @@ where
     let a_leg_open = build_onward_a_leg_open(incoming_open);
     let governing_chain_depth = a_leg_open.chain_depth;
 
+    let request_id = params.request_id;
     // Pin the §5.4.5 verification descriptor + validation schemas from the
     // governed registration / stream-open — the operator key from B's pinned
-    // stream signer, the operating context id (B), the outlet id, and the
-    // `caveats_binding` pinned at open.
+    // stream signer, the operating context id (B), the outlet id, the
+    // `caveats_binding` pinned at open, and the `request_id` pinned at open
+    // (the only stream this crossing forwards; never trust chunk-asserted
+    // `request_id`).
     let descriptor = CrossContextVerificationDescriptor {
         operator_pk: *params.operator_signer.verifying_key(),
         operating_context_id: operating_context_id.to_owned(),
         outlet_id: outlet_id.clone(),
         caveats_binding: params.identity.caveats_binding,
+        expected_request_id: request_id,
     };
     let output_schema = registration.schema.output_schema.clone();
     let aggregate_schema = registration.schema.aggregate_schema.clone();
-    let request_id = params.request_id;
     // A's event log records only the manifest hash + input hash, never chunk
     // plaintext (the streaming parity of the unary saga's `output_hash`-only
     // caller log, §6.2.4). Compute the input hash before `input` is moved.
@@ -4685,8 +4890,13 @@ where
     // Query / zero-cost), sources admission caps + timing policy from B's
     // `ContextParams`, wires B's durable `OutletInvoked` sink internally, and
     // spawns the off-mailbox pump. A best-effort open passes `None` for the
-    // test-capture sinks and caveat-binding hook; the §7.3.8 caveat ceiling is
-    // still enforced through `params.caveats` / `params.ucan_cid`.
+    // three test-capture sinks (invoked-event / misdeclaration / handler-panic)
+    // but THREADS the real `caveat_binding` so the §7.3.8 post-input hook + the
+    // durable cross-invocation counter CAS (`max_calls` / `amount_max_cumulative`
+    // / `rate_window`) run for this open — matching what the same-context
+    // production open does. `params.caveats` / `params.ucan_cid` bound only the
+    // per-stream chunk ceiling; the value-caveat gate runs iff `caveat_binding`
+    // is `Some` (supplied by the FFI caller / SCP-OUT-047).
     let mut handle = supervisor
         .open_outlet_stream(
             operating_context_id,
@@ -4699,7 +4909,7 @@ where
             None,
             None,
             None,
-            None,
+            caveat_binding,
             params,
         )
         .await
@@ -4741,6 +4951,7 @@ where
         input_hash,
         governing_chain_depth,
         timestamp_secs,
+        MAX_CROSS_CONTEXT_STREAM_CHUNKS,
         None,
     ));
 
@@ -6772,6 +6983,7 @@ mod tests {
                 operating_context_id: B_CTX.to_owned(),
                 outlet_id: OUTLET.to_owned(),
                 caveats_binding: CB,
+                expected_request_id: RID,
             }
         }
 
@@ -6878,6 +7090,7 @@ mod tests {
                 "input-hash".to_owned(),
                 3,
                 0,
+                MAX_CROSS_CONTEXT_STREAM_CHUNKS,
                 fault_probe,
             ));
             let producer = tokio::spawn(async move {
@@ -6948,6 +7161,7 @@ mod tests {
                     None,
                     Arc::new(NoopExecutor),
                     incoming_open,
+                    None,
                     params,
                 )
                 .await;
@@ -7018,6 +7232,7 @@ mod tests {
                 "input-hash".to_owned(),
                 3,
                 0,
+                MAX_CROSS_CONTEXT_STREAM_CHUNKS,
                 None,
             ));
 
@@ -7064,10 +7279,24 @@ mod tests {
             }
             producer.await.expect("producer");
             bridge.await.expect("bridge");
-            assert_eq!(received.len(), 6, "all six Data chunks forwarded");
-            for (i, chunk) in received.iter().enumerate() {
-                assert_eq!(chunk.sequence, i as u64, "delivered strictly in order");
+            // The six Data chunks are forwarded in order; because the producer
+            // drops its sender WITHOUT emitting a terminal, the bridge now
+            // synthesizes a terminal transport-fault (§5.4.5 terminal guarantee)
+            // as the final chunk — so A never truncates after a non-terminal
+            // Data.
+            assert_eq!(
+                received.len(),
+                7,
+                "six Data chunks + one synthesized terminal transport-fault"
+            );
+            for (i, chunk) in received.iter().take(6).enumerate() {
+                assert_eq!(chunk.sequence, i as u64, "Data delivered strictly in order");
+                assert!(
+                    matches!(chunk.payload, ChunkPayload::Data { .. }),
+                    "the first six forwarded chunks are Data payloads"
+                );
             }
+            assert_terminal_error(received.last().unwrap(), CODE_TRANSPORT_FAULT);
         }
 
         // ---- AC4: A-leg open inherits chain_depth; chunks never carry it.
@@ -7267,6 +7496,10 @@ mod tests {
                 operating_context_id: b_ctx_id,
                 outlet_id: OUTLET.to_owned(),
                 caveats_binding: CB,
+                // `invoke_outlet` mints its own fresh `request_id`; pin the
+                // descriptor to the stream B actually produced (all chunks share
+                // it) so the §5.4.5 crossing verification accepts B's chunks.
+                expected_request_id: b_chunks[0].request_id,
             };
             let (received, a_log, a_bytes) = drive_bridge(
                 b_chunks.clone(),
@@ -7509,9 +7742,11 @@ mod tests {
 
         #[test]
         fn ac12_paid_action_rejected_query_and_zero_cost_accepted() {
+            use scp_protocol::economy::types::Amount;
             // Paid Action (cost.amount > 0) → rejected, no receiver ever built.
+            // (`cost_per_chunk` matches the registered cost here.)
             let paid = registration_with_cost(OutletKind::Action, 10);
-            let err = cross_context_economy_gate(&paid)
+            let err = cross_context_economy_gate(&paid, Amount::new(10))
                 .expect_err("a paid Action must be rejected zero-escrow");
             assert!(
                 matches!(
@@ -7521,12 +7756,232 @@ mod tests {
                 "got {err:?}"
             );
 
-            // Zero-cost Action → accepted.
-            cross_context_economy_gate(&registration_with_cost(OutletKind::Action, 0))
-                .expect("zero-cost Action proceeds");
-            // Query (no cost) → accepted.
-            cross_context_economy_gate(&registration_with_cost(OutletKind::Query, 0))
-                .expect("Query proceeds");
+            // Zero-cost Action + zero cost_per_chunk → accepted.
+            cross_context_economy_gate(
+                &registration_with_cost(OutletKind::Action, 0),
+                Amount::new(0),
+            )
+            .expect("zero-cost Action proceeds");
+            // Query (no cost) + zero cost_per_chunk → accepted.
+            cross_context_economy_gate(
+                &registration_with_cost(OutletKind::Query, 0),
+                Amount::new(0),
+            )
+            .expect("Query proceeds");
+        }
+
+        /// FIX 2 — split-source / paid-best-effort bypass. A registration with
+        /// `cost == 0` but a positive BILLED `cost_per_chunk` is REJECTED (not
+        /// silently billed): the gate is enforced on the value that actually
+        /// drives billing, not only the declared registration cost. The
+        /// symmetric case (registered cost > 0 but `cost_per_chunk == 0`) is
+        /// likewise rejected — either positive value trips the zero-escrow gate.
+        #[test]
+        fn fix2_zero_registered_cost_with_positive_cost_per_chunk_rejected() {
+            use scp_protocol::economy::types::Amount;
+
+            // Zero registered cost, positive billed cost_per_chunk → REJECTED.
+            let zero_cost = registration_with_cost(OutletKind::Action, 0);
+            let err = cross_context_economy_gate(&zero_cost, Amount::new(7)).expect_err(
+                "a zero registered cost with a positive cost_per_chunk must be rejected",
+            );
+            assert!(
+                matches!(
+                    err,
+                    InvocationError::CrossContextPaidActionUnsupported { .. }
+                ),
+                "the billed value drives the zero-escrow gate; got {err:?}"
+            );
+
+            // Positive registered cost, zero cost_per_chunk → also REJECTED
+            // (paid registration cannot be smuggled through as zero-escrow).
+            let paid = registration_with_cost(OutletKind::Action, 5);
+            assert!(
+                matches!(
+                    cross_context_economy_gate(&paid, Amount::new(0)),
+                    Err(InvocationError::CrossContextPaidActionUnsupported { .. })
+                ),
+                "a positive registered cost is rejected regardless of cost_per_chunk"
+            );
+
+            // Both zero → the only accepted shape.
+            cross_context_economy_gate(&zero_cost, Amount::new(0))
+                .expect("both zero is the only accepted zero-escrow shape");
+        }
+
+        // ---- FIX 3: terminal-less truncation — B drops its sender with no
+        //             terminal → A's last chunk is a synthesized 6160.
+
+        #[tokio::test]
+        async fn fix3_data_only_without_terminal_synthesizes_transport_fault() {
+            let op = operator_key();
+            // A Data-only sequence whose producer drops the inner sender with NO
+            // terminal chunk — models B's pump collapsing at the terminal chunk
+            // (`try_build_signed_chunk` → `None` on an operator-signer failure).
+            let chunks = vec![
+                sign_chunk(
+                    &op,
+                    B_CTX,
+                    OUTLET,
+                    &CB,
+                    0,
+                    ChunkPayload::Data {
+                        value: serde_json::json!({ "result": 0 }),
+                    },
+                ),
+                sign_chunk(
+                    &op,
+                    B_CTX,
+                    OUTLET,
+                    &CB,
+                    1,
+                    ChunkPayload::Data {
+                        value: serde_json::json!({ "result": 1 }),
+                    },
+                ),
+            ];
+            let (received, _a_log, _a_bytes) = drive_bridge(
+                chunks,
+                pinned_descriptor(&op),
+                permissive_schema(),
+                None,
+                None,
+            )
+            .await;
+            // A never truncates after a non-terminal Data: the two Data chunks
+            // are followed by a SYNTHESIZED terminal transport-fault at the next
+            // sequence (§5.4.5 terminal guarantee).
+            assert_eq!(received.len(), 3, "two Data + one synthesized terminal");
+            assert!(matches!(received[0].payload, ChunkPayload::Data { .. }));
+            assert!(matches!(received[1].payload, ChunkPayload::Data { .. }));
+            assert_terminal_error(received.last().unwrap(), CODE_TRANSPORT_FAULT);
+            assert_eq!(
+                received.last().unwrap().sequence,
+                2,
+                "the synthesized terminal is at last_delivered_sequence + 1"
+            );
+        }
+
+        // ---- FIX 4: unbounded reassembly — an unbilled Progress flood is
+        //             terminated at the retained-chunk cap with a 6160.
+
+        #[tokio::test]
+        async fn fix4_overlong_stream_terminated_with_transport_fault() {
+            // A deliberately small retained-chunk cap so the test exercises the
+            // ceiling without emitting a million chunks.
+            const CAP: usize = 3;
+            let op = operator_key();
+            let (a_log, _a_bytes) = fresh_a_log().await;
+            let a_dyn: Arc<dyn ContextEventLogProvider> = a_log.clone();
+            let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(1);
+            let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(1);
+            let bridge = tokio::spawn(run_cross_context_bridge(
+                inner_rx,
+                outer_tx,
+                pinned_descriptor(&op),
+                permissive_schema(),
+                None,
+                a_dyn,
+                A_CTX.to_owned(),
+                DID::from(INVOKER),
+                RID,
+                OUTLET.to_owned(),
+                "input-hash".to_owned(),
+                3,
+                0,
+                CAP,
+                None,
+            ));
+
+            // Flood the bridge with UNBILLED Progress chunks (never terminal),
+            // far past the cap — the pre-fix bridge would retain all of them.
+            let producer = {
+                let op = op.clone();
+                tokio::spawn(async move {
+                    for seq in 0..1_000u64 {
+                        let chunk = sign_chunk(
+                            &op,
+                            B_CTX,
+                            OUTLET,
+                            &CB,
+                            seq,
+                            ChunkPayload::Progress { pct: 0, note: None },
+                        );
+                        if inner_tx.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            };
+
+            let mut received = Vec::new();
+            while let Some(chunk) = outer_rx.recv().await {
+                received.push(chunk);
+            }
+            let _ = producer.await;
+            bridge.await.expect("bridge");
+
+            // The retained snapshot never grew unboundedly: the stream is
+            // terminated with a transport-fault once the cap is reached.
+            assert!(
+                received.len() <= CAP + 1,
+                "retained chunks + terminal are bounded by the cap; got {}",
+                received.len()
+            );
+            assert_terminal_error(received.last().unwrap(), CODE_TRANSPORT_FAULT);
+        }
+
+        // ---- FIX 5: cross-stream replay — a chunk validly signed for a
+        //             DIFFERENT request_id is rejected at the crossing.
+
+        #[tokio::test]
+        async fn fix5_chunk_with_foreign_request_id_rejected() {
+            // A chunk VALIDLY signed by B's operator for a DIFFERENT stream
+            // (request_id RID2) — same outlet, same caveats_binding, same
+            // operator key — i.e. a genuine chunk from another same-outlet stream.
+            const RID2: RequestId = [0xCD; 16];
+            let op = operator_key();
+            let payload = ChunkPayload::Data {
+                value: serde_json::json!({ "result": 1 }),
+            };
+            let preimage = compute_chunk_sig_preimage(B_CTX, OUTLET, &RID2, 0, &CB, &payload)
+                .expect("preimage");
+            let sig = op.sign(&preimage).to_bytes();
+            let foreign = OutletStreamChunk {
+                request_id: RID2,
+                sequence: 0,
+                payload,
+                sig,
+            };
+
+            // Its operator signature IS valid for its own stream (RID2)...
+            assert!(
+                scp_protocol::context::outlets::stream::verify_chunk_signature(
+                    &foreign,
+                    &op.verifying_key(),
+                    B_CTX,
+                    OUTLET,
+                    &CB,
+                ),
+                "the chunk carries a valid operator signature for its own stream (RID2)"
+            );
+            // ...but the crossing pins request_id RID, so verification REJECTS it
+            // — the rejection is due to the foreign request_id, not a bad sig.
+            assert!(
+                !verify_forwarded_chunk(&pinned_descriptor(&op), &foreign),
+                "a chunk asserting a request_id other than the pinned one must NOT verify"
+            );
+
+            // End-to-end: the bridge emits the AC11 Authorization-class terminal.
+            let (received, _a_log, _a_bytes) = drive_bridge(
+                vec![foreign],
+                pinned_descriptor(&op),
+                permissive_schema(),
+                None,
+                None,
+            )
+            .await;
+            assert_terminal_error(received.last().unwrap(), CODE_AUTHORIZATION_DENIED);
         }
     }
 

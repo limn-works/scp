@@ -11485,16 +11485,27 @@ impl Supervisor {
     /// return type.
     ///
     /// Zero-escrow (§5.4.5 "Cross-context economy"; ADR-061): a paid Action
-    /// outlet (`cost.amount > 0`) is rejected and no receiver is produced; a
-    /// metered paid cross-context stream MUST use the streaming saga
-    /// (SCP-OUT-046). B's `OutletInvoked` is recorded by the internal durable
-    /// sink `open_outlet_stream` wires — never double-recorded here.
+    /// outlet (`cost.amount > 0`) — or a positive billed `cost_per_chunk` — is
+    /// rejected and no receiver is produced; a metered paid cross-context stream
+    /// MUST use the streaming saga (SCP-OUT-046). B's `OutletInvoked` is recorded
+    /// by the internal durable sink `open_outlet_stream` wires — never
+    /// double-recorded here.
+    ///
+    /// `caveat_binding` is the validated-narrowed §7.3.8 value-caveat binding
+    /// (`effective_caveats` + `ucan_cid`) threaded into `open_outlet_stream` so
+    /// the durable cross-invocation counter CAS (`max_calls` /
+    /// `amount_max_cumulative` / `rate_window`) is enforced for this open. It is
+    /// `Some` when the invocation UCAN carries value caveats (supplied by the FFI
+    /// caller / SCP-OUT-047) and `None` otherwise (no value-caveat gate). It is
+    /// distinct from `params.identity.caveats_binding`, the 32-byte
+    /// chunk-signature binding.
     ///
     /// # Errors
     ///
     /// Returns [`InvocationError`](crate::context::outlets::invoke::InvocationError)
     /// when A's event-log provider is not configured, when the outlet is a paid
-    /// Action outlet, or when the B-side open is rejected.
+    /// Action outlet (or `cost_per_chunk > 0`), when a §7.3.8 counter cap in
+    /// `caveat_binding` is exhausted, or when the B-side open is rejected.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_outlet_stream_cross_context<E>(
         self: &Arc<Self>,
@@ -11507,6 +11518,7 @@ impl Supervisor {
         timeout_ms: Option<u32>,
         executor: Arc<E>,
         incoming_open: &scp_protocol::context::outlets::stream::OutletStreamOpen,
+        caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
         tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
@@ -11538,6 +11550,7 @@ impl Supervisor {
             timeout_ms,
             executor,
             incoming_open,
+            caveat_binding,
             params,
         )
         .await
@@ -29280,19 +29293,21 @@ mod open_outlet_stream_tests {
     // `Supervisor::open_outlet_stream_cross_context` entry.
     // =====================================================================
 
-    /// Builds `OpenStreamParams` + a matching incoming B-side `OutletStreamOpen`
-    /// for a cross-context open against the spawned `ctx_key()` context.
+    /// Builds `OpenStreamParams`, a matching incoming B-side `OutletStreamOpen`,
+    /// and the matching §7.3.8 [`InvocationCaveatBinding`] for a cross-context
+    /// open against the spawned `ctx_key()` context. `caveats` are the effective
+    /// value caveats bound to the invocation UCAN — they drive both the pinned
+    /// `caveats_binding` and the returned binding, so the two agree at open.
     fn xctx_open_inputs(
         cost_per_chunk: Amount,
         chain_depth: u8,
+        caveats: InvocationCaveats,
+        request_id: RequestId,
     ) -> (
         crate::context::outlets::dispatch::OpenStreamParams,
         scp_protocol::context::outlets::stream::OutletStreamOpen,
         crate::context::outlets_helpers::InvocationCaveatBinding,
     ) {
-        let mut caveats = InvocationCaveats::empty();
-        caveats.amount_max_cumulative = Some(Amount::new(1_000));
-        let request_id: RequestId = [CTX_BYTE; 16];
         let caveats_jcs = caveats.to_canonical_json_bytes().expect("jcs");
         let caveats_binding = compute_caveats_binding(
             UCAN_CID.as_bytes(),
@@ -29381,7 +29396,10 @@ mod open_outlet_stream_tests {
         register_outlet(&mut registry, &role_state, paid, &invoker().0)
             .expect("register paid outlet");
 
-        let (params, incoming_open, _binding) = xctx_open_inputs(Amount::new(10), 1);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        let (params, incoming_open, binding) =
+            xctx_open_inputs(Amount::new(10), 1, caveats, [CTX_BYTE; 16]);
         let executor: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
         let outlet_id: OutletId = "calculator".to_owned();
 
@@ -29396,6 +29414,7 @@ mod open_outlet_stream_tests {
                 None,
                 executor,
                 &incoming_open,
+                Some(binding),
                 params,
             )
             .await;
@@ -29506,7 +29525,10 @@ mod open_outlet_stream_tests {
             .await
             .expect("init A event log");
 
-        let (params, incoming_open, _binding) = xctx_open_inputs(Amount::new(0), 2);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_cumulative = Some(Amount::new(1_000));
+        let (params, incoming_open, binding) =
+            xctx_open_inputs(Amount::new(0), 2, caveats, [CTX_BYTE; 16]);
         let executor: Arc<dyn OutletExecutor> = Arc::new(FiniteStreamExecutor);
         let outlet_id: OutletId = "calculator".to_owned();
 
@@ -29524,6 +29546,7 @@ mod open_outlet_stream_tests {
                 None,
                 executor,
                 &incoming_open,
+                Some(binding),
                 params,
             )
             .await
@@ -29548,5 +29571,138 @@ mod open_outlet_stream_tests {
         }
         assert_eq!(data, 2, "both Data chunks forwarded in plaintext");
         assert!(saw_end, "the stream closes with a plaintext terminal End");
+    }
+
+    /// FIX 1 — durable §7.3.8 counter CAS across cross-context opens. A
+    /// single-open-per-window `rate_window { max: 1 }` value-caveat binding
+    /// admits the FIRST cross-context open and REJECTS the SECOND on the same
+    /// context + UCAN. This proves the binding is THREADED to
+    /// `open_outlet_stream` (not discarded): the durable cross-invocation counter
+    /// reserve runs on the best-effort cross-context path, so a rate-capped
+    /// delegation cannot open unbounded cross-context streams (the per-invoker
+    /// DoS the finding described).
+    ///
+    /// `rate_window` (not `max_calls`) is the counter exercised here because for
+    /// a zero-cost stream `max_calls` ALSO caps the per-stream estimated chunk
+    /// count (`estimated_chunk_count <= min(credit_window, max_calls)`), which
+    /// would reject the FIRST open on the estimate bound before the durable
+    /// cross-open CAS is reached; `rate_window` gates purely on open-count across
+    /// invocations and leaves the estimate bound untouched, isolating the
+    /// durable counter under test. Both route through the SAME
+    /// `commit_counter_reservation` CAS the finding is about.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_outlet_stream_cross_context_enforces_durable_counter() {
+        use crate::context::outlets::invoke::InvocationError;
+        use scp_protocol::trust::caveats::RateWindow;
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let supervisor = build_supervisor(&captured);
+
+        // Spawn a live actor for the OPERATING context B (`ctx_key()`) — the
+        // durable caveat-counter store routes the CAS onto B's Class-S state.
+        let role_state = authorizing_role_state();
+        let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key(),
+            scp_protocol::context::ContextParams::default(),
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("active");
+        state.role_state = role_state.clone();
+        state
+            .membership
+            .add_member(invoker(), "owner".to_owned(), Vec::new());
+        state
+            .governance
+            .budget_tracker
+            .grant(&invoker(), Amount::new(1_000_000));
+        state.governance.economic_policy = Some(policy());
+        let deps = supervisor
+            .build_actor_deps(&invoker())
+            .await
+            .expect("build_actor_deps");
+        supervisor
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn_actor_with_state");
+
+        // Zero-cost Action outlet (zero-escrow accept).
+        let mut registry = OutletRegistry::new();
+        register_outlet(&mut registry, &role_state, registration(), &invoker().0)
+            .expect("register zero-cost outlet");
+
+        let a_ctx = "ctx-a-036-maxcalls";
+        supervisor
+            .event_log_ref()
+            .expect("event log provider")
+            .init_event_log(&crate::context::state::context_id_to_bytes(a_ctx))
+            .await
+            .expect("init A event log");
+
+        // One open per window: `rate_window { max: 1 }`.
+        let mut caveats = InvocationCaveats::empty();
+        caveats.rate_window = Some(RateWindow {
+            max: 1,
+            window_secs: 3600,
+        });
+        let outlet_id: OutletId = "calculator".to_owned();
+
+        // FIRST open (request_id = [0x01; 16]) — the durable counter goes 0 → 1.
+        let (params1, incoming1, binding1) =
+            xctx_open_inputs(Amount::new(0), 2, caveats.clone(), [0x01; 16]);
+        let exec1: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
+        let first = supervisor
+            .open_outlet_stream_cross_context(
+                a_ctx,
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                exec1,
+                &incoming1,
+                Some(binding1),
+                params1,
+            )
+            .await;
+        assert!(
+            first.is_ok(),
+            "the FIRST single-use cross-context open must be admitted; got {:?}",
+            first.err()
+        );
+
+        // SECOND open — a DISTINCT request_id (a fresh stream, not a duplicate)
+        // under the SAME UCAN: the durable `rate_window` counter (keyed on
+        // context + ucan_cid, NOT request_id) is already at its cap for the
+        // window, so the open is REJECTED by the counter CAS — proving the
+        // binding is enforced.
+        let (params2, incoming2, binding2) =
+            xctx_open_inputs(Amount::new(0), 2, caveats, [0x02; 16]);
+        let exec2: Arc<dyn OutletExecutor> = Arc::new(BlockingStreamExecutor);
+        let second = supervisor
+            .open_outlet_stream_cross_context(
+                a_ctx,
+                &ctx_key(),
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &invoker(),
+                None,
+                exec2,
+                &incoming2,
+                Some(binding2),
+                params2,
+            )
+            .await;
+        assert!(
+            matches!(second, Err(InvocationError::CaveatViolation { .. })),
+            "the SECOND cross-context open under a rate_window:1 binding must be rejected \
+             by the durable counter CAS; got {second:?}"
+        );
+
+        drop(first);
     }
 }
