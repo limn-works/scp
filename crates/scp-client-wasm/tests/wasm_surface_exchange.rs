@@ -493,4 +493,64 @@ mod wasm_tests {
         assert_eq!(store.get("scp-client/ctx/a").unwrap(), None);
         assert_eq!(store.list_keys("scp-client/ctx/").unwrap().len(), 1);
     }
+
+    #[wasm_bindgen_test]
+    fn retaining_js_store_survives_wasm_memory_reuse() {
+        // Regression pin for the `set(value: Vec<u8>)` owned-copy fix (1af0deb72).
+        // `makeMapStore.set(k, v)` RETAINS the passed value with NO defensive copy —
+        // exactly the embedder shape the fix must be sound for. Because `set` takes
+        // an owned `Vec<u8>`, wasm-bindgen marshals a JS-owned `Uint8Array` copy
+        // detached from wasm linear memory, so a retained value stays intact even as
+        // wasm reuses that memory for later allocations. If `set` took `&[u8]`, the
+        // JS map would instead hold a `subarray` VIEW into wasm memory; the churn
+        // below would overwrite the region and silently corrupt every stored blob.
+        // The existing round-trip test above has no memory reuse, so it only smoke-
+        // covers the copy; THIS test forces the aliasing hazard and asserts intact
+        // reads — pinning the fix through the public `Storage` contract (a future
+        // regression of the extern back to `&[u8]` would flip these asserts).
+        let store = JsStorageAdapter::new(make_map_store());
+
+        // Distinct, self-describing blobs so a corrupted read is unambiguous.
+        let blob_a = vec![0xA1u8; 96];
+        let blob_b = vec![0xB2u8; 512];
+        let blob_c: Vec<u8> = (0..256u32).map(|i| (i % 251) as u8).collect();
+        store.put("scp-client/blob/a", blob_a.clone()).unwrap();
+        store.put("scp-client/blob/b", blob_b.clone()).unwrap();
+        store.put("scp-client/blob/c", blob_c.clone()).unwrap();
+
+        // Churn (1): marshal many small throwaway values through the SAME `set` path
+        // so the allocator reuses the freed regions the earlier blobs occupied — this
+        // catches an in-place OVERWRITE of a retained view (corruption without a grow).
+        for i in 0..64u32 {
+            let filler = vec![(i & 0xff) as u8; 4096];
+            store.put(&format!("scp-client/churn/{i}"), filler).unwrap();
+        }
+        // Churn (2): force wasm `memory.grow` with ONE large value through `set`. A
+        // grow REALLOCATES linear memory and DETACHES every `Uint8Array` that viewed
+        // the old buffer — so a `&[u8]`-view regression would read the earlier blobs
+        // back detached/empty here DETERMINISTICALLY (not just probabilistically),
+        // while the owned-copy store, holding independent JS buffers, is unaffected.
+        // 32 MiB dwarfs the default wasm initial memory, guaranteeing the grow.
+        store
+            .put("scp-client/churn/grow", vec![0xD4u8; 32 * 1024 * 1024])
+            .unwrap();
+
+        // Every original blob reads back byte-for-byte — the retaining store held an
+        // owned copy, never a view into reused wasm memory.
+        assert_eq!(
+            store.get("scp-client/blob/a").unwrap(),
+            Some(blob_a),
+            "blob A intact after wasm memory churn (owned copy, not a view)"
+        );
+        assert_eq!(
+            store.get("scp-client/blob/b").unwrap(),
+            Some(blob_b),
+            "blob B intact after wasm memory churn"
+        );
+        assert_eq!(
+            store.get("scp-client/blob/c").unwrap(),
+            Some(blob_c),
+            "blob C intact after wasm memory churn"
+        );
+    }
 }
