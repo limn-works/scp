@@ -1193,6 +1193,53 @@ pub struct SagaSigningKeys<'a> {
     pub caller: &'a ed25519_dalek::SigningKey,
 }
 
+/// The Phase-1 (pre-pump) outputs of an outlet-stream open, shared by
+/// [`Supervisor::open_outlet_stream`] (same-context best-effort) and the
+/// SCP-OUT-046 cross-context streaming-saga producer. Extracting the reserve →
+/// escrow-ticket → §7.3.8 caveat-hook → `ContextParams` caps/timing →
+/// admission/semaphore prologue keeps that money path in ONE place
+/// (orchestrator decision 1: a behavior-preserving EXTRACT, never duplicated).
+///
+/// Deliberately SINK-AGNOSTIC: the helper builds NEITHER the close-time
+/// `settlement_sink` NOR the durable `OutletInvoked` sink. Each caller supplies
+/// both, because the streaming saga needs BOTH OFF — `settlement_sink = None`
+/// so the saga settles from its durable Class-S ledger at seal-close, AND no
+/// durable `OutletInvoked` sink because the saga's seal records B's
+/// `OutletInvoked` itself (installing the pump's sink too would DOUBLE-record
+/// the B-side leaf, SCP-OUT-046 AC5). The same-context caller installs both.
+///
+/// The §7.3.8 post-input check is `'static` (built by
+/// [`build_stream_post_input_hook`](crate::context::outlets_helpers::build_stream_post_input_hook),
+/// which clones the effective caveats + counter-store `Arc` into the closure
+/// rather than borrowing the binding), so this struct carries no lifetime — the
+/// caller need not keep `caveat_binding` alive past the helper call.
+struct OutletStreamPhase1 {
+    /// The in-actor economy reservation — context/role snapshots, spawn
+    /// generation, the debited `reserved_escrow`, and the acceptance-time policy.
+    reservation: crate::context::outlets_helpers::StreamEconomyReservation,
+    /// The armed open-failure escrow guard. On a successful open the caller
+    /// `consume`s it (the pump's close-time settlement then owns the refund); on
+    /// a rejection the caller drops it so its `Drop` reverses the debited hold.
+    escrow_ticket: crate::context::outlets::dispatch::StreamEscrowTicket,
+    /// `params` with the manager-debited escrow hold, the acceptance-time
+    /// economic-policy snapshot, and the authoritative `ContextParams` admission
+    /// caps + timing/window policy all filled in.
+    params: crate::context::outlets::dispatch::OpenStreamParams,
+    /// The §7.3.8 synchronous post-input check (a `'static` closure over the
+    /// cloned effective caveats + counter store), or `None` for an unbound /
+    /// ungated open.
+    caveat_post_input_check: Option<crate::context::outlets::invoke::CaveatPostInputCheck<'static>>,
+    /// The durable §7.3.8 counter reservation committed at the pump's final open
+    /// gate, or `None` when the effective caveats carry no counter-bearing cap.
+    counter_reservation: Option<crate::context::outlets::dispatch::StreamCounterReservation>,
+    /// Per-context admission tracker (per-invoker + per-outlet).
+    admission: Arc<std::sync::RwLock<StreamAdmissionTracker>>,
+    /// Operator-scoped per-origin-invoker admission tracker.
+    origin_admission: Arc<std::sync::RwLock<OriginAdmissionTracker>>,
+    /// Node-level concurrent-pump semaphore.
+    pump_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
 // ---------------------------------------------------------------------------
 // MessageSigner (ADR-039)
 // ---------------------------------------------------------------------------
@@ -11308,7 +11355,7 @@ impl Supervisor {
         >,
         handler_panic_sink: Option<Arc<dyn crate::context::outlets::invoke::HandlerPanicSink>>,
         caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
-        mut params: crate::context::outlets::dispatch::OpenStreamParams,
+        params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
         crate::context::outlets::dispatch::OpenStreamRejection,
@@ -11316,6 +11363,127 @@ impl Supervisor {
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
     {
+        use crate::context::outlets::dispatch;
+
+        // Phase 1 — the shared, sink-agnostic pre-pump prologue (reserve →
+        // escrow guard → §7.3.8 hook → `ContextParams` caps/timing →
+        // admission/semaphore). `caveat_binding` is borrowed (not moved) so it
+        // outlives the returned post-input check through `open_stream_session`
+        // below. This same-context production open supplies BOTH sinks itself
+        // (settlement + durable `OutletInvoked`); the SCP-OUT-046 streaming saga
+        // passes neither (see [`OutletStreamPhase1`]).
+        let OutletStreamPhase1 {
+            reservation,
+            escrow_ticket,
+            params,
+            caveat_post_input_check,
+            counter_reservation,
+            admission,
+            origin_admission,
+            pump_semaphore,
+        } = self
+            .open_outlet_stream_phase1(context_id, invoker_did, caveat_binding.as_ref(), params)
+            .await?;
+
+        // Close-time settlement sink, holding the reservation's spawn-generation
+        // (the confused-deputy guard compares it to the live actor's generation
+        // at settle time, dropping a settlement aimed at a respawned instance).
+        let settlement_sink: Arc<dyn crate::context::outlets::invoke::StreamSettlementSink> =
+            Arc::new(
+                crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink::new(
+                    Arc::clone(self),
+                    reservation.generation,
+                ),
+            );
+
+        // §5.4.5 / SCP-OUT-035 — the durable close-event sink, wired INTERNALLY
+        // here (not by the FFI caller, which passes `None`) so the "ONE event
+        // per stream at close" record is persisted in production and the full
+        // §5.4.5:566 wire-rejection fires at the real log-insert boundary. A
+        // caller-supplied `invoked_event_sink` (tests capturing the event) takes
+        // precedence; otherwise the durable production sink is used.
+        let durable_invoked_sink: Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink> =
+            Arc::new(
+                crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink::new(
+                    Arc::clone(self),
+                    crate::context::state::context_id_to_bytes(context_id),
+                    invoker_did.as_ref().to_owned(),
+                ),
+            );
+        let invoked_event_sink = invoked_event_sink.or(Some(durable_invoked_sink));
+
+        // Phase 2 — hand the executor + seams to the off-mailbox pump.
+        let open_result = dispatch::open_stream_session(
+            &reservation.handle,
+            registry,
+            &reservation.role_state,
+            outlet_id,
+            input,
+            invoker_did,
+            timeout_ms,
+            executor,
+            misdeclaration_sink,
+            handler_panic_sink,
+            invoked_event_sink,
+            Some(settlement_sink),
+            params,
+            admission,
+            origin_admission,
+            pump_semaphore,
+            caveat_post_input_check,
+            counter_reservation,
+        )
+        .await;
+
+        match open_result {
+            Ok(handle) => {
+                // Pump spawned `Ok` — the close-time settlement now owns the
+                // unspent-escrow refund, so the open-path guard must NOT refund.
+                escrow_ticket.consume();
+                Ok(handle)
+            }
+            Err(rejection) => {
+                // The pump never spawned; drop the ticket so its `Drop` reverses
+                // the reserve's debited hold (the sole refund path on failure —
+                // the settlement sink never fires).
+                drop(escrow_ticket);
+                Err(rejection)
+            }
+        }
+    }
+
+    /// Phase-1 (pre-pump) prologue shared by [`Self::open_outlet_stream`] and
+    /// the SCP-OUT-046 cross-context streaming-saga producer: the in-actor
+    /// economy reserve, the armed open-failure escrow guard, the actor-owned
+    /// §7.3.8 counter store + post-input hook, and the authoritative
+    /// `ContextParams` admission-caps / timing sourcing + admission/semaphore
+    /// handles. Returns an [`OutletStreamPhase1`] the caller finishes with its
+    /// OWN sink choice — the helper is deliberately sink-agnostic (see the
+    /// struct doc for why the streaming saga needs both sinks OFF).
+    ///
+    /// Behavior is identical to the inline prologue it replaced: the escrow
+    /// ticket is armed immediately after the debit so EVERY fallible step below
+    /// (the §7.3.8 hook `?`, the vanished-context early return) drops it and
+    /// reverses the hold; on success the ticket is handed back for the caller to
+    /// `consume`. The only reordering is that the two sink constructions moved
+    /// OUT to the caller (both are pure `Arc::new` allocations with no side
+    /// effects and no dependency on the caps read, so their relocation past the
+    /// vanished-context early return is unobservable).
+    ///
+    /// # Errors
+    ///
+    /// The reserve's [`ContextError`] reverse-mapped to the open-time
+    /// [`OpenStreamRejection`](crate::context::outlets::dispatch::OpenStreamRejection)
+    /// taxonomy; a §7.3.8 hook build rejection; or the transport-fault admission
+    /// slug when the hosting context vanished between the reserve and the
+    /// authoritative caps read.
+    async fn open_outlet_stream_phase1(
+        self: &Arc<Self>,
+        context_id: &str,
+        invoker_did: &DID,
+        caveat_binding: Option<&crate::context::outlets_helpers::InvocationCaveatBinding>,
+        mut params: crate::context::outlets::dispatch::OpenStreamParams,
+    ) -> Result<OutletStreamPhase1, crate::context::outlets::dispatch::OpenStreamRejection> {
         use crate::context::outlets::dispatch;
         use scp_protocol::context::outlets::error_codes;
 
@@ -11422,33 +11590,6 @@ impl Supervisor {
             None => (None, None),
         };
 
-        // Close-time settlement sink, holding the reservation's spawn-generation
-        // (the confused-deputy guard compares it to the live actor's generation
-        // at settle time, dropping a settlement aimed at a respawned instance).
-        let settlement_sink: Arc<dyn crate::context::outlets::invoke::StreamSettlementSink> =
-            Arc::new(
-                crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink::new(
-                    Arc::clone(self),
-                    reservation.generation,
-                ),
-            );
-
-        // §5.4.5 / SCP-OUT-035 — the durable close-event sink, wired INTERNALLY
-        // here (not by the FFI caller, which passes `None`) so the "ONE event
-        // per stream at close" record is persisted in production and the full
-        // §5.4.5:566 wire-rejection fires at the real log-insert boundary. A
-        // caller-supplied `invoked_event_sink` (tests capturing the event) takes
-        // precedence; otherwise the durable production sink is used.
-        let durable_invoked_sink: Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink> =
-            Arc::new(
-                crate::context::outlets::stream_settlement_adapter::ActorOutletInvokedEventSink::new(
-                    Arc::clone(self),
-                    crate::context::state::context_id_to_bytes(context_id),
-                    invoker_did.as_ref().to_owned(),
-                ),
-            );
-        let invoked_event_sink = invoked_event_sink.or(Some(durable_invoked_sink));
-
         // §5.4.5 / §9.18.B — the three-tier concurrent-stream admission caps
         // are AUTHORITATIVE from the hosting context's live `ContextParams`,
         // NOT from the caller-supplied `params.caps`. Sourcing them here (the
@@ -11492,44 +11633,16 @@ impl Supervisor {
         let origin_admission = self.outlet_stream_origin_admission();
         let pump_semaphore = self.outlet_stream_pump_semaphore();
 
-        // Phase 2 — hand the executor + seams to the off-mailbox pump.
-        let open_result = dispatch::open_stream_session(
-            &reservation.handle,
-            registry,
-            &reservation.role_state,
-            outlet_id,
-            input,
-            invoker_did,
-            timeout_ms,
-            executor,
-            misdeclaration_sink,
-            handler_panic_sink,
-            invoked_event_sink,
-            Some(settlement_sink),
+        Ok(OutletStreamPhase1 {
+            reservation,
+            escrow_ticket,
             params,
+            caveat_post_input_check,
+            counter_reservation,
             admission,
             origin_admission,
             pump_semaphore,
-            caveat_post_input_check,
-            counter_reservation,
-        )
-        .await;
-
-        match open_result {
-            Ok(handle) => {
-                // Pump spawned `Ok` — the close-time settlement now owns the
-                // unspent-escrow refund, so the open-path guard must NOT refund.
-                escrow_ticket.consume();
-                Ok(handle)
-            }
-            Err(rejection) => {
-                // The pump never spawned; drop the ticket so its `Drop` reverses
-                // the reserve's debited hold (the sole refund path on failure —
-                // the settlement sink never fires).
-                drop(escrow_ticket);
-                Err(rejection)
-            }
-        }
+        })
     }
 
     /// Best-effort cross-context re-encrypting streaming bridge entry
