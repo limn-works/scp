@@ -818,6 +818,7 @@ SCP.Trust.evaluate(
                               // not "all declared capabilities are within ceiling."
                               // See att[0]-only limitation in trust.py / trust.ts
                               // (__extractFirstCapabilityUri / _extract_first_capability_uri).
+                              // Tracked as SCP-302.
     nonceValid: Bool,
     notRevoked: Bool,
     timeBoundsValid: Bool

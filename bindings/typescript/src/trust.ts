@@ -120,6 +120,7 @@ export interface CapabilityValidation {
    * (`att[0].with`) is sent to the bridge. Full multi-att ceiling validation
    * requires a single bridge call that validates all URIs while consuming the
    * nonce only once; until that bridge op exists, only `att[0]` is checked.
+   * Tracked as SCP-302.
    */
   withinCeiling: boolean;
   /** Nonce validation passed (step 9: no reuse, not stale, valid format). */
@@ -361,7 +362,8 @@ function __decodeBase64UrlToUtf8(segment: string): string {
  * {@link evaluateLayer1} validates only the **first** element (`att[0].with`).
  * Full multi-att validation (checking every `att[i]` entry) requires a single
  * `ucanValidate` call that verifies all URIs while consuming the nonce only
- * once; until that bridge op exists, only att[0] is checked.
+ * once; until that bridge op exists, only att[0] is checked. Tracked as
+ * SCP-302.
  *
  * @returns The first declared capability URI (non-empty string from
  *   `att[0].with`), or `null` if the token is malformed or declares no valid
@@ -590,7 +592,7 @@ async function validateOneCapUri(
  * is sent to `scp.ucanValidate`. Full multi-att validation (checking every
  * `att[i]` entry) requires a single bridge call that validates all URIs
  * while consuming the nonce only once; until that bridge op exists, only
- * att[0] is checked here.
+ * att[0] is checked here. Tracked as SCP-302.
  *
  * A malformed token or one that declares no capabilities is fail-closed
  * (all-false) and never reaches the bridge. Fail-fast across tokens applies:
