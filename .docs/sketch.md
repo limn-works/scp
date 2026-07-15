@@ -810,7 +810,14 @@ SCP.Trust.evaluate(
   capabilityValidation: {
     tokensValid: Bool,
     signaturesValid: Bool,
-    withinCeiling: Bool,
+    withinCeiling: Bool,      // Evaluated against att[0] only. Multi-att whole-token
+                              // validation (checking every att[i] against the ceiling while
+                              // consuming the nonce once) requires a dedicated bridge op
+                              // that does not yet exist. Until that op lands, callers must
+                              // treat a true result here as "att[0] is within ceiling" —
+                              // not "all declared capabilities are within ceiling."
+                              // See att[0]-only limitation in trust.py / trust.ts
+                              // (__extractFirstCapabilityUri / _extract_first_capability_uri).
     nonceValid: Bool,
     notRevoked: Bool,
     timeBoundsValid: Bool
