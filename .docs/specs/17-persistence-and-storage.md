@@ -429,7 +429,7 @@ Storage selection is the **first and canonical instance** of the general capabil
 
 ### In-Memory Storage Is Dev/Test-Only
 
-In-memory storage — `InMemoryStorage`, the FFI-layer `BridgeInMemoryStorage`, and `EncryptingAdapter<InMemoryStorage>` — is a development and test affordance only. It MUST NOT be used as a production system-of-record.
+In-memory storage — `InMemoryStorage` and `EncryptingAdapter<InMemoryStorage>` — is a development and test affordance only. It MUST NOT be used as a production system-of-record.
 
 In-memory storage loses all state on process restart. For SCP, that state includes MLS group state, identity keys, the event log, and provenance records. Losing it on restart contradicts the durability and provenance tenets directly: a restarted node would silently lose its cryptographic membership, its append-only audit trail, and its identity. Production deployments MUST use a durable, encrypted backend — `SqliteStorage` (SQLCipher) is the default.
 

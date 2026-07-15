@@ -25,8 +25,14 @@ testing = ["resolvers", "scp-did/testing"]
 # stack.
 custody = ["dep:scp-platform"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
-# Requires scp-transport (relay), scp-node (application node), scp-platform
-# (in-memory testing backends), and tokio.
+# Requires scp-transport (relay), scp-node (application node), scp-platform, and
+# tokio. Storage uses the durability-only in-memory-storage feature of
+# scp-platform (ADR-062 Slice 0). NOTE: server.rs's dev-relay
+# auto-generate-identity path still uses scp_platform::testing::InMemoryKeyCustody;
+# this feature does NOT enable scp-platform's testing feature — that custody
+# nullifier is supplied transitively via dep:scp-node (a hard dep here) until
+# ADR-062 Slice 6 (SCP-CAPINJECT-006) retypes those phantoms to a real
+# FileKeyCustody.
 server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:scp-dht", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
