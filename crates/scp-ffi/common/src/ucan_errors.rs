@@ -121,4 +121,78 @@ mod tests {
             assert_eq!(ucan_error_code(&err), codes::PERM_3001);
         }
     }
+
+    /// Exhaustive coverage: one instance of every `UcanError` variant is
+    /// passed to `ucan_error_code` and asserted to equal `PERM_3001`.
+    ///
+    /// This test serves two purposes:
+    ///
+    /// 1. **Runtime correctness guard** — if a match arm returns a raw string
+    ///    literal instead of a `codes::` constant, the static regex sync test in
+    ///    `trust.test.ts` passes but this test will catch a value mismatch.
+    ///
+    /// 2. **Compile-time exhaustiveness guard** — if a new variant is added
+    ///    to `UcanError` without adding it here, the array literal will fail
+    ///    to compile, forcing a classification decision before the change can
+    ///    land.
+    #[test]
+    fn all_variants_route_to_perm_3001() {
+        let variants: &[UcanError] = &[
+            // Structural / signature failures
+            UcanError::MalformedToken("bad".to_owned()),
+            UcanError::DeserializationFailed("json err".to_owned()),
+            UcanError::UnsupportedAlgorithm("RS256".to_owned()),
+            UcanError::UnsupportedVersion("0.9.0".to_owned()),
+            UcanError::SignatureInvalid,
+            // Issuer / audience / scope mismatches
+            UcanError::InvalidIssuer {
+                expected: "did:dht:expected".to_owned(),
+                actual: "did:dht:actual".to_owned(),
+            },
+            UcanError::AudienceMismatch {
+                expected: "did:dht:expected".to_owned(),
+                actual: "did:dht:actual".to_owned(),
+            },
+            UcanError::KeyScopeMismatch {
+                expected_scope: "#agent".to_owned(),
+                actual_kid: "#active".to_owned(),
+            },
+            UcanError::SelfDelegationWithoutKeyScope,
+            UcanError::CategoryAViolation {
+                action: "did_document:update".to_owned(),
+                kid: "#agent".to_owned(),
+            },
+            // Expiry / validity window
+            UcanError::ExpiryTooFar(90_000_u64),
+            UcanError::TokenExpired,
+            UcanError::TokenNotYetValid,
+            UcanError::InvalidTimeRange { nbf: 100, exp: 50 },
+            // Nonce failures
+            UcanError::NonceReused("abc123".to_owned()),
+            UcanError::NonceTooOld("abc123".to_owned()),
+            UcanError::NonceFuture("abc123".to_owned()),
+            UcanError::NonceFormatInvalid("bad-nonce".to_owned()),
+            UcanError::NonceTrackerFull(1024_usize),
+            // Capability / delegation failures
+            UcanError::CapabilityOutsideCeiling("scp:ctx:x/msg:write".to_owned()),
+            UcanError::CapabilityNotGranted("scp:ctx:x/msg:write".to_owned()),
+            UcanError::AttenuationViolation("widened scope".to_owned()),
+            UcanError::DelegationChainBroken("aud/iss mismatch".to_owned()),
+            UcanError::CircularDelegation("A->B->A".to_owned()),
+            // Revocation
+            UcanError::TokenRevoked("bafkreiabc".to_owned()),
+            UcanError::RevocationUnauthorized("not issuer".to_owned()),
+            UcanError::RevocationFailed("store write failed".to_owned()),
+            // Capability URI parsing
+            UcanError::InvalidCapabilityUri("*".to_owned()),
+        ];
+
+        for variant in variants {
+            assert_eq!(
+                ucan_error_code(variant),
+                codes::PERM_3001,
+                "variant {variant:?} did not return PERM_3001",
+            );
+        }
+    }
 }

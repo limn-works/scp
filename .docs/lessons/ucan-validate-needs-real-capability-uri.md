@@ -26,6 +26,7 @@ await scp.ucanValidate(handle, token, capUri);
 cap_uri = _extract_first_capability_uri(token)  # reads att[0]["with"]; returns str | None
 if cap_uri is None:
     # fail-closed: no valid capabilities declared
+    _set_all_false(cap_validation)
     break
 await asyncio.to_thread(instance.ucan_validate, context_id, token, cap_uri)
 ```

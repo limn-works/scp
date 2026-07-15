@@ -296,6 +296,67 @@ def test_extract_python_symbols_class_method() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 3b: _extract_python_symbols excludes private symbols (leading underscore)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_python_symbols_excludes_private_function() -> None:
+    """_extract_python_symbols does NOT include names starting with '_'."""
+    try:
+        import tree_sitter_python as tspython
+        from tree_sitter import Language, Parser
+    except ImportError:
+        pytest.skip("tree-sitter-python not installed")
+
+    parser = Parser(Language(tspython.language()))
+    source = b"def _private_helper(): pass"
+    tree = parser.parse(source)
+    symbols = _extract_python_symbols(tree.root_node)
+    assert "_private_helper" not in symbols, (
+        f"Private function '_private_helper' must not appear in extracted symbols; got: {symbols}"
+    )
+
+
+def test_extract_python_symbols_excludes_private_class() -> None:
+    """_extract_python_symbols does NOT include class names starting with '_'."""
+    try:
+        import tree_sitter_python as tspython
+        from tree_sitter import Language, Parser
+    except ImportError:
+        pytest.skip("tree-sitter-python not installed")
+
+    parser = Parser(Language(tspython.language()))
+    source = b"class _PrivateImpl:\n    pass\n"
+    tree = parser.parse(source)
+    symbols = _extract_python_symbols(tree.root_node)
+    assert "_PrivateImpl" not in symbols, (
+        f"Private class '_PrivateImpl' must not appear in extracted symbols; got: {symbols}"
+    )
+
+
+def test_extract_python_symbols_excludes_private_method() -> None:
+    """_extract_python_symbols does NOT include method names starting with '_'."""
+    try:
+        import tree_sitter_python as tspython
+        from tree_sitter import Language, Parser
+    except ImportError:
+        pytest.skip("tree-sitter-python not installed")
+
+    parser = Parser(Language(tspython.language()))
+    source = b"class Pub:\n    def _private_method(self): pass\n"
+    tree = parser.parse(source)
+    symbols = _extract_python_symbols(tree.root_node)
+    assert "_private_method" not in symbols, (
+        f"Private method '_private_method' must not appear in extracted symbols; got: {symbols}"
+    )
+    assert "Pub._private_method" not in symbols, (
+        f"Dotted form 'Pub._private_method' must not appear in extracted symbols; got: {symbols}"
+    )
+    # The public class itself should still be present.
+    assert "Pub" in symbols, f"Expected 'Pub' in symbols, got: {symbols}"
+
+
+# ---------------------------------------------------------------------------
 # Test 5: Gate passes when a true entry has a valid coverage_exemption and
 #          at least one other SDK is statically verified.
 #
