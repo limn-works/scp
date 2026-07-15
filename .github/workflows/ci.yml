@@ -384,8 +384,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # Pin wasm-pack to a specific version for reproducibility (via the same
+      # taiki-e/install-action the nextest job uses), instead of the unpinned
+      # `curl … | sh` installer that always pulls latest.
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
       # Runs the `#[wasm_bindgen_test]` cases under Node — the real wasm32
       # execution the `wasm-protocol` build gate only compiles. Covers the
       # cross-target determinism KAT wasm entries, the error-mapping `JsValue`
