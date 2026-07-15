@@ -25,8 +25,8 @@
 //! [`crate::crypto::agent_binding_tests`] is a *component-level* test: it
 //! hand-calls `create_inner_envelope` / `verify_inner_signature` /
 //! governance-engine internals in isolation. This module instead drives the two
-//! live messaging helpers this story wires (`build_encrypted_envelope` and
-//! `verify_and_unwrap`) over a real two-party MLS group, with a
+//! live messaging helpers this story wires (`build_encrypted_envelope_actor`
+//! and `verify_and_unwrap`) over a real two-party MLS group, with a
 //! **document-derived** resolver built from a real
 //! [`DidDocument::new_with_agent_key`] — so an `#agent`-signed message is
 //! produced through the real seal path AND verified through the real receive
@@ -48,17 +48,18 @@
 //!    `deliver_commit_blob` cannot decrypt a peer's application blob. This
 //!    module drives the very same receive helper (`verify_and_unwrap`) the
 //!    actor's `deliver_incoming` calls, after a real MLS `open()` on the
-//!    recipient provider — exercising the identical VM-aware resolution logic.
+//!    recipient's actor-owned `ContextCryptoState` (taken from the provider-
+//!    resident fixture group) — exercising the identical VM-aware resolution.
 //! 2. **Send: peer fan-out needs the full add-member flow.**
 //!    `Supervisor::send_message` only fans out to members the actor added (and
 //!    whose access keys it distributed) through the governance add-member path;
 //!    there is no public `Supervisor` API to seed a peer's membership + access
 //!    key. That bootstrap exists only in the `scp-testing` `FullStackNode`
 //!    harness, which cannot reach the `pub(crate)` `verify_and_unwrap`. This
-//!    module therefore drives `build_encrypted_envelope` directly — the exact
-//!    function the Supervisor send path delegates the `signing_key_id` stamp to
-//!    (verified by reading the `send_message → encrypt_and_send →
-//!    build_encrypted_envelope` chain).
+//!    module therefore drives `build_encrypted_envelope_actor` directly — the
+//!    exact production seam the Supervisor send path delegates the
+//!    `signing_key_id` stamp to (verified by reading the `send_message →
+//!    encrypt_and_send → build_encrypted_envelope_actor` chain).
 //!
 //! Both helpers are `pub(crate)`, so this test must live in-crate rather than in
 //! `crates/scp-runtime/tests/`.
@@ -136,9 +137,9 @@ fn document_backed_resolver(
 // ---------------------------------------------------------------------------
 
 /// Sets up a real two-party MLS group keyed by `context_id_bytes(ctx_str)` —
-/// the same key `build_encrypted_envelope` derives from the context-id string —
-/// returning Alice's provider (the sender) and Bob's provider (used to MLS-open
-/// the produced blob on the receive side).
+/// the same key `build_encrypted_envelope_actor` derives from the context-id
+/// string — returning Alice's provider (the sender) and Bob's provider (each
+/// moved onto an actor to seal/open the produced blob on the receive side).
 fn setup_two_party(ctx_str: &str) -> (Arc<MlsCryptoProvider>, Arc<MlsCryptoProvider>, [u8; 32]) {
     // Stand up the joined pair over the REAL reserve → creator-add → sign →
     // HPKE-seal → spawn-from-Welcome path (the legacy provider-level prepare/join
