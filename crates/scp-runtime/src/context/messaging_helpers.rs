@@ -204,14 +204,18 @@ fn build_inner_wire(
 /// local identity the provider used.
 #[allow(clippy::too_many_arguments)]
 // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): widened from module-private so the relocated
-// app-data send-path tests (crypto/mls/provider.rs + agent_binding_pipeline_tests)
-// can drive the PRODUCTION actor app-data seal — the one that zeroes the outer
-// `routing_id` (§9.10.4) — after the deleted provider twin
-// `build_encrypted_envelope` is removed. `pub` (not `pub(crate)`) inside this
-// already-`pub(crate)` module: the module gate caps the effective visibility to
-// the crate, and `clippy::redundant_pub_crate` rejects the redundant `pub(crate)`.
-// `encrypt_and_send` already calls it; the widening adds no new production caller.
-pub fn build_encrypted_envelope_actor(
+// app-data send-path callers (crypto/mls/provider.rs `encrypt_and_send`, plus the
+// agent_binding_pipeline_tests) can drive the PRODUCTION actor app-data seal — the
+// one that zeroes the outer `routing_id` (§9.10.4) — after the deleted provider
+// twin `build_encrypted_envelope` is removed. `pub(crate)` is the minimal correct
+// visibility: callers span `crypto/mls/provider.rs` and `context/`, so a
+// `pub(super)` / `pub(in crate::context)` cap would wrongly forbid the crypto/mls
+// caller (E0624). It is a purely internal crate seam with no FFI/SDK surface, so it
+// carries no cross-layer bridge-export requirement. `redundant_pub_crate` is a
+// false positive here for the same reason as `Supervisor::build_actor_deps`: the
+// enclosing module is `pub(crate)`, but the item is genuinely reached crate-wide.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn build_encrypted_envelope_actor(
     clock: &Arc<dyn Clock>,
     crypto_state: &mut crate::context::actor::state::ContextCryptoState,
     local_did: &str,

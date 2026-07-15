@@ -78,7 +78,7 @@ use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::access_keys::{AccessKey, generate_access_key};
 use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
 
-use crate::context::actor::state::{ContextModeState, PerContextState};
+use crate::context::actor::state::PerContextState;
 use crate::context::messaging_helpers::{build_encrypted_envelope_actor, verify_and_unwrap};
 use crate::context::supervisor::MessageSigner;
 use crate::crypto::mls::provider::MlsCryptoProvider;
@@ -212,10 +212,13 @@ fn build_send_blob(
     // `encrypt_and_send` bottoms out in.
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_str);
     let mut alice_state = take_into_actor_local(alice_provider, &ctx_bytes);
-    let crypto_state = match &mut alice_state.mode {
-        ContextModeState::Encrypted(c) => c,
-        ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
-    };
+    // Extract the encrypted-mode crypto sub-state via the `crypto_mut()` method
+    // accessor (not a `panic!`/`unreachable!` macro): the actor send-path tests
+    // always drive an encrypted context, so the broadcast case is unreachable.
+    let crypto_state = alice_state
+        .mode
+        .crypto_mut()
+        .expect("agent-binding pipeline test uses encrypted mode");
     build_encrypted_envelope_actor(
         &clock,
         crypto_state,
