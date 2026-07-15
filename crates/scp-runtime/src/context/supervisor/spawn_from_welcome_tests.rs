@@ -1257,7 +1257,7 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
     let ctx_id = ctx_hex(0x9a);
     let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
-    let (sup, bob_crypto) = bob_supervisor(None);
+    let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
@@ -1276,9 +1276,12 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
         reservation_id,
     );
 
-    // Arm the one-shot seam: the step-3b durability check reads the live export
-    // FIRST, so the seam fires there → the export reads non-durable.
-    bob_crypto.arm_export_failure_once();
+    // Arm the one-shot seam: ADR-049 PR-7 relocated `export_crypto_state` onto the
+    // seeded actor, so the step-3b durability check reads `state.export_crypto_state`.
+    // The supervisor-resident seam forces THAT actor-export read to be treated as
+    // non-durable (the former provider `arm_export_failure_once` no longer sits on
+    // this path).
+    sup.arm_welcome_export_failure_once();
 
     let err = sup
         .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)

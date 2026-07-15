@@ -1310,6 +1310,24 @@ pub struct Supervisor {
     /// `send_modify` call (zero overhead, no behavior change).
     #[cfg(feature = "testing")]
     pub(in crate::context::supervisor) kp_watchdog_processed_tx: tokio::sync::watch::Sender<u64>,
+    /// One-shot test seam: when set, the NEXT spawn-from-Welcome step-3b crypto
+    /// durability check (ADR-049 PR-7 / SCP-CRYPTOMOVE-001) treats the ACTOR
+    /// [`PerContextState::export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state)
+    /// as NON-durable and clears the flag.
+    ///
+    /// The crypto move relocated `export_crypto_state` off the provider onto the
+    /// seeded actor `state`, and the spawn durability check now reads
+    /// `state.export_crypto_state(...)`; the former provider `arm_export_failure_once`
+    /// seam no longer sits on that path. This supervisor-resident seam lets the
+    /// spawn-from-Welcome durability fail-closed branch be driven end-to-end (the
+    /// real actor export always yields a durable blob for a just-installed group,
+    /// so the branch is otherwise structurally unreachable). Armed pre-spawn via
+    /// [`Self::arm_welcome_export_failure_once`]; consulted (and cleared) inside
+    /// `spawn_actor_from_welcome`. Gated so production builds carry neither the
+    /// field nor the branch.
+    #[cfg(any(test, feature = "testing"))]
+    pub(in crate::context::supervisor) force_welcome_export_failure_once:
+        std::sync::atomic::AtomicBool,
     /// Supervisor-level divergence repair journal (spec §6.2.4 "Dual event-log
     /// recording"): the fallback witnesses recorded when a `NeedsRepair` side is
     /// UNREACHABLE and its signed [`SagaDivergenceRepairRecord`] could not be
@@ -1734,6 +1752,8 @@ impl Supervisor {
             // current value.
             #[cfg(feature = "testing")]
             kp_watchdog_processed_tx: tokio::sync::watch::channel(0u64).0,
+            #[cfg(any(test, feature = "testing"))]
+            force_welcome_export_failure_once: std::sync::atomic::AtomicBool::new(false),
             saga_repair_records: DashMap::new(),
             // ADR-049 commit 12 — providers lifted from
             // ContextManager. Populated by `with_providers`.
@@ -1767,6 +1787,20 @@ impl Supervisor {
                 OriginAdmissionTracker::new(),
             )),
         }
+    }
+
+    /// Arms the one-shot [`Self::force_welcome_export_failure_once`] seam: the
+    /// NEXT spawn-from-Welcome step-3b crypto durability check treats the actor
+    /// export as NON-durable and clears the flag (ADR-049 PR-7 /
+    /// SCP-CRYPTOMOVE-001).
+    ///
+    /// Test-only (see the field docs) — drives the spawn-from-Welcome
+    /// crypto-durability fail-closed branch, which the real actor export cannot
+    /// otherwise reach (an installed group always exports a durable blob).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn arm_welcome_export_failure_once(&self) {
+        self.force_welcome_export_failure_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test-only constructor used by saga + spawn unit tests that never
@@ -12540,15 +12574,31 @@ impl Supervisor {
                     // RETAINED `deps.crypto.wrapping_keypair()` accessor.
                     let (welcome_wrapping_public, welcome_wrapping_secret) =
                         deps.crypto.wrapping_keypair();
-                    if !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
-                        &state.export_crypto_state(
-                            deps.supervisor.export_sender_key_epochs(&context_id_bytes),
-                            deps.supervisor
-                                .export_recv_sequence_floors(&context_id_bytes),
-                            welcome_wrapping_public,
-                            &*welcome_wrapping_secret,
-                        ),
-                    ) {
+                    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the crypto move relocated
+                    // `export_crypto_state` onto the actor `state`, so the former
+                    // provider `arm_export_failure_once` seam no longer sits on
+                    // this path. The supervisor-resident one-shot seam
+                    // (`force_welcome_export_failure_once`, armed pre-spawn by the
+                    // durability test) forces THIS actor-export read to be treated
+                    // as non-durable. Production builds compile it to a constant
+                    // `false` (the field and the branch are gated away).
+                    #[cfg(any(test, feature = "testing"))]
+                    let forced_non_durable = self
+                        .force_welcome_export_failure_once
+                        .swap(false, std::sync::atomic::Ordering::SeqCst);
+                    #[cfg(not(any(test, feature = "testing")))]
+                    let forced_non_durable = false;
+                    if forced_non_durable
+                        || !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
+                            &state.export_crypto_state(
+                                deps.supervisor.export_sender_key_epochs(&context_id_bytes),
+                                deps.supervisor
+                                    .export_recv_sequence_floors(&context_id_bytes),
+                                welcome_wrapping_public,
+                                &*welcome_wrapping_secret,
+                            ),
+                        )
+                    {
                         let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
                         return Err(ContextError::PersistenceFailed(format!(
                             "spawn-from-Welcome: the joined group for '{context_id}' produces no \

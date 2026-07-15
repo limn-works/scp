@@ -521,18 +521,6 @@ pub struct MlsCryptoProvider {
     /// Lock-free [`DashSet`] — the prior `std::sync::Mutex<HashSet>`
     /// wrapper was removed in ADR-049 commit 12c.9f.
     taken_context_ids: DashSet<[u8; 32]>,
-    /// One-shot test seam: when set, the NEXT [`Self::export_crypto_state`]
-    /// call returns [`ContextError::CryptoFailed`] and resets the flag.
-    ///
-    /// This exists solely to drive the spawn-from-Welcome entrypoint's
-    /// crypto-durability fail-closed branch end-to-end: the real provider always
-    /// exports a NON-EMPTY blob for a just-installed group, so that branch is
-    /// otherwise structurally unreachable through the full entrypoint. Gated
-    /// behind `#[cfg(any(test, feature = "testing"))]` so the production build
-    /// carries neither the field nor the branch. One-shot (fires once, then
-    /// clears itself) so a post-rollback export read still behaves normally.
-    #[cfg(any(test, feature = "testing"))]
-    force_export_failure: std::sync::atomic::AtomicBool,
     /// One-shot test seam: when set, the NEXT [`Self::rotate_sender_key`]
     /// call returns [`ContextError::CryptoFailed`] and resets the flag.
     ///
@@ -617,23 +605,8 @@ impl MlsCryptoProvider {
             }),
             taken_context_ids: DashSet::new(),
             #[cfg(any(test, feature = "testing"))]
-            force_export_failure: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(any(test, feature = "testing"))]
             force_rotation_failure: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    /// Arms the one-shot [`Self::force_export_failure`] seam: the NEXT
-    /// [`Self::export_crypto_state`] call returns
-    /// [`ContextError::CryptoFailed`] and clears the flag.
-    ///
-    /// Test-only (see the field docs) — used to induce the spawn-from-Welcome
-    /// crypto-durability fail-closed branch, which the real provider cannot
-    /// otherwise reach (an installed group always exports a non-empty blob).
-    #[cfg(any(test, feature = "testing"))]
-    pub fn arm_export_failure_once(&self) {
-        self.force_export_failure
-            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Arms the one-shot [`Self::force_rotation_failure`] seam: the NEXT
