@@ -21,9 +21,10 @@ use scp_protocol::context::membership::ContextEvent;
 use crate::crypto_state::ContextCryptoState;
 
 /// Maximum events held in the pull-based receive buffer before the oldest is
-/// dropped (FIFO overflow). Mirrors the deleted bridge's `WASM_EVENT_BUFFER_CAP`
-/// and the native `PyO3` channel capacity, so a slow drainer cannot grow memory
-/// without bound.
+/// dropped (FIFO overflow).
+///
+/// Mirrors the deleted bridge's `WASM_EVENT_BUFFER_CAP` and the native `PyO3`
+/// channel capacity, so a slow drainer cannot grow memory without bound.
 pub const EVENT_BUFFER_CAP: usize = 1000;
 
 /// Participant state for a single context.
