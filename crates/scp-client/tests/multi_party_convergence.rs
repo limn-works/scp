@@ -30,7 +30,10 @@
 
 use std::sync::Arc;
 
-use scp_client::{ClientError, ContextStatus, LocalSigner, MemoryStorage, ScpClient, Storage};
+use scp_client::{
+    ClientError, ContextStatus, LocalSigner, MemoryStorage, ScpClient, SenderKeyDistribution,
+    Storage,
+};
 use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
@@ -59,26 +62,47 @@ fn client_for(did: &str, now_secs: u64) -> ScpClient {
     ScpClient::new(signer, storage, clock).expect("construct fresh client")
 }
 
-/// Hands every pair of clients the other's sender key, out-of-band (the MISSING
-/// SEAM the crate root documents — there is no in-tab distribution path yet).
-fn exchange_sender_keys(clients: &mut [(&str, &mut ScpClient)]) {
-    let keys: Vec<(String, [u8; 32])> = clients
-        .iter()
-        .map(|(did, c)| {
-            (
-                (*did).to_owned(),
-                c.local_sender_key_bytes(CTX).expect("local sender key"),
-            )
-        })
-        .collect();
-    for (did, client) in clients.iter_mut() {
-        for (peer_did, key) in &keys {
-            if peer_did != did {
-                client
-                    .install_sender_key(CTX, peer_did, *key)
-                    .expect("install peer sender key");
-            }
+/// Routes each in-tab sender-key distribution to its target client over the dumb
+/// pipe and asserts the install is a no-op receive (no application payload, no
+/// cascade). This is the real §9.16.1/§9.16.2 distribution path — there is no
+/// out-of-band exchange (`install_sender_key` / `local_sender_key_bytes` no longer
+/// exist on `ScpClient`).
+fn deliver3(
+    dists: &[SenderKeyDistribution],
+    alice: &mut ScpClient,
+    bob: &mut ScpClient,
+    carol: &mut ScpClient,
+) {
+    for d in dists {
+        let out = match d.target_did.as_str() {
+            ALICE_DID => alice.receive_message(CTX, &d.ciphertext),
+            BOB_DID => bob.receive_message(CTX, &d.ciphertext),
+            CAROL_DID => carol.receive_message(CTX, &d.ciphertext),
+            other => panic!("unexpected distribution target {other}"),
         }
+        .expect("install distribution");
+        assert!(
+            !out.application,
+            "a sender-key distribution is not an application message"
+        );
+        assert!(
+            out.sender_key_distributions.is_empty(),
+            "installing a distribution triggers no further distribution"
+        );
+    }
+}
+
+/// Two-client variant of [`deliver3`].
+fn deliver2(dists: &[SenderKeyDistribution], alice: &mut ScpClient, bob: &mut ScpClient) {
+    for d in dists {
+        let out = match d.target_did.as_str() {
+            ALICE_DID => alice.receive_message(CTX, &d.ciphertext),
+            BOB_DID => bob.receive_message(CTX, &d.ciphertext),
+            other => panic!("unexpected distribution target {other}"),
+        }
+        .expect("install distribution");
+        assert!(!out.application);
+        assert!(out.sender_key_distributions.is_empty());
     }
 }
 
@@ -96,13 +120,27 @@ fn three_party_add_commit_converges_across_all_members() {
     // --- Alice creates the context. ---
     alice.create_context(CTX).expect("Alice creates");
 
-    // --- Alice adds Bob. Bob joins via the Welcome + replay. ---
+    // --- Alice adds Bob. Bob joins via the Welcome + replay. The add seals
+    // Alice's sender key to Bob; the join seals Bob's key to Alice — route both. ---
     let bob_kp = bob
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
     let add_bob = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
-    bob.join_context_encrypted(CTX, &add_bob.welcome, &add_bob.event_log, &add_bob.members)
+    let bob_join_dists = bob
+        .join_context_encrypted(
+            CTX,
+            &add_bob.welcome,
+            &add_bob.event_log,
+            &add_bob.wrapping_keys,
+        )
         .expect("Bob joins");
+    deliver3(
+        &add_bob.sender_key_distributions,
+        &mut alice,
+        &mut bob,
+        &mut carol,
+    );
+    deliver3(&bob_join_dists, &mut alice, &mut bob, &mut carol);
 
     assert_eq!(
         bob.event_log_root(CTX),
@@ -119,30 +157,54 @@ fn three_party_add_commit_converges_across_all_members() {
     let add_carol = alice.add_member(CTX, &carol_kp).expect("Alice adds Carol");
 
     // Carol joins from the Welcome, replaying Alice's full log (which now
-    // includes both MemberJoined leaves).
-    carol
+    // includes both MemberJoined leaves). The join seals Carol's key to every
+    // existing member (Alice + Bob).
+    let carol_join_dists = carol
         .join_context_encrypted(
             CTX,
             &add_carol.welcome,
             &add_carol.event_log,
-            &add_carol.members,
+            &add_carol.wrapping_keys,
         )
         .expect("Carol joins");
 
     // Bob (existing member) processes Alice's add-Carol Commit. The convergent
     // committer timestamp is bound into the Commit's authenticated AAD (ADR-057
     //), so Bob recovers it from the verified frame — no separate value is
-    // transported. `receive_message` returns `false` (no application payload),
-    // but its side effect — appending the convergent MemberJoined leaf and
-    // recording Carol — is what makes Bob converge. Pre-fix, this arm dropped the
-    // add: Bob stayed at 2 leaves with Carol missing and his root diverged from
-    // Alice's and Carol's.
-    let was_application = bob
+    // transported. `application` is `false` (no application payload), but its side
+    // effects — appending the convergent MemberJoined leaf, recording Carol, AND
+    // sealing Bob's OWN sender key to Carol (the bystander re-distribution,
+    // INVARIANT 2) — are what make Bob converge and let Carol decrypt Bob.
+    let bob_recv = bob
         .receive_message(CTX, &add_carol.commit)
         .expect("Bob processes the add-Carol commit");
     assert!(
-        !was_application,
+        !bob_recv.application,
         "an add-Commit carries no application payload"
+    );
+    assert_eq!(
+        bob_recv.sender_key_distributions.len(),
+        1,
+        "the bystander seals its own key to the newly-added member (INVARIANT 2)"
+    );
+    assert_eq!(bob_recv.sender_key_distributions[0].target_did, CAROL_DID);
+
+    // Every member is now at the post-add MLS epoch (Alice via the add, Carol via
+    // the Welcome, Bob via the Commit), so the epoch-N distributions all decrypt.
+    // (A distribution is an MLS application frame bound to the epoch it was sealed
+    // at; deliver only AFTER the recipient reached that epoch.)
+    deliver3(
+        &add_carol.sender_key_distributions,
+        &mut alice,
+        &mut bob,
+        &mut carol,
+    );
+    deliver3(&carol_join_dists, &mut alice, &mut bob, &mut carol);
+    deliver3(
+        &bob_recv.sender_key_distributions,
+        &mut alice,
+        &mut bob,
+        &mut carol,
     );
 
     // === All three members converge: identical leaf count, identical leaf
@@ -204,19 +266,46 @@ fn three_party_add_commit_converges_across_all_members() {
     );
     assert_eq!(carol_members, expected, "Carol sees all three members");
 
-    // A subsequent application message must NOT perturb any member's convergent
-    // log: `MessageSent` is excluded from the Merkle log (ADR-011), so every
-    // member's leaf count and root are unchanged after a send + its receives.
-    exchange_sender_keys(&mut [
-        (ALICE_DID, &mut alice),
-        (BOB_DID, &mut bob),
-        (CAROL_DID, &mut carol),
-    ]);
+    // === In-tab distribution is now complete: every member holds every peer's
+    // §9.16 sender key, delivered ONLY over the wrapping-key extension mesh above
+    // (no out-of-band exchange). A message Alice sends therefore decrypts under
+    // the distributed key at BOTH Bob and Carol. ===
     let ct = alice
         .send_message(CTX, b"post-convergence chatter")
         .expect("Alice sends");
-    bob.receive_message(CTX, &ct).expect("Bob receives");
-    carol.receive_message(CTX, &ct).expect("Carol receives");
+    let bob_msg = bob.receive_message(CTX, &ct).expect("Bob receives");
+    assert!(
+        bob_msg.application,
+        "Bob decrypts Alice under the distributed sender key"
+    );
+    let carol_msg = carol.receive_message(CTX, &ct).expect("Carol receives");
+    assert!(
+        carol_msg.application,
+        "Carol decrypts Alice under the distributed sender key"
+    );
+    // Both recipients recovered Alice's exact plaintext via the pull buffers.
+    for (who, client) in [("Bob", &mut bob), ("Carol", &mut carol)] {
+        let drained = client.drain_events(CTX).expect("drain");
+        assert_eq!(
+            drained.len(),
+            1,
+            "{who} buffered exactly one received message"
+        );
+        match &drained[0] {
+            ContextEvent::MessageReceived {
+                sender_did,
+                payload,
+            } => {
+                assert_eq!(sender_did.0, ALICE_DID);
+                assert_eq!(payload.as_slice(), b"post-convergence chatter");
+            }
+            other => panic!("{who}: expected MessageReceived, got {other:?}"),
+        }
+    }
+
+    // A subsequent application message must NOT perturb any member's convergent
+    // log: `MessageSent` is excluded from the Merkle log (ADR-011), so every
+    // member's leaf count and root are unchanged after a send + its receives.
     assert_eq!(
         alice.event_log_leaf_count(CTX),
         Some(3),
@@ -242,6 +331,7 @@ fn three_party_add_commit_converges_across_all_members() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end three-party scenario, read top-to-bottom
 fn reciprocal_send_does_not_perturb_the_convergent_log() {
     // Distinct clocks across all three members. A reciprocal Bob → Alice/Carol
     // send must NOT change any member's convergent Merkle log: `MessageSent` is
@@ -260,23 +350,52 @@ fn reciprocal_send_does_not_perturb_the_convergent_log() {
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
     let add_bob = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
-    bob.join_context_encrypted(CTX, &add_bob.welcome, &add_bob.event_log, &add_bob.members)
+    let bob_join_dists = bob
+        .join_context_encrypted(
+            CTX,
+            &add_bob.welcome,
+            &add_bob.event_log,
+            &add_bob.wrapping_keys,
+        )
         .expect("Bob joins");
+    deliver3(
+        &add_bob.sender_key_distributions,
+        &mut alice,
+        &mut bob,
+        &mut carol,
+    );
+    deliver3(&bob_join_dists, &mut alice, &mut bob, &mut carol);
 
     let carol_kp = carol
         .generate_key_package_for_join(CTX)
         .expect("Carol key package");
     let add_carol = alice.add_member(CTX, &carol_kp).expect("Alice adds Carol");
-    carol
+    let carol_join_dists = carol
         .join_context_encrypted(
             CTX,
             &add_carol.welcome,
             &add_carol.event_log,
-            &add_carol.members,
+            &add_carol.wrapping_keys,
         )
         .expect("Carol joins");
-    bob.receive_message(CTX, &add_carol.commit)
+    let bob_recv = bob
+        .receive_message(CTX, &add_carol.commit)
         .expect("Bob processes the add-Carol commit");
+    // Deliver only after every member reached the post-add epoch (see the sibling
+    // test for why: a distribution is bound to the epoch it was sealed at).
+    deliver3(
+        &add_carol.sender_key_distributions,
+        &mut alice,
+        &mut bob,
+        &mut carol,
+    );
+    deliver3(&carol_join_dists, &mut alice, &mut bob, &mut carol);
+    deliver3(
+        &bob_recv.sender_key_distributions,
+        &mut alice,
+        &mut bob,
+        &mut carol,
+    );
 
     // All three converge on the membership log before any application message:
     // [ContextCreated, MemberJoined(Bob), MemberJoined(Carol)] = 3 leaves.
@@ -285,27 +404,23 @@ fn reciprocal_send_does_not_perturb_the_convergent_log() {
     assert_eq!(alice_root, carol.event_log_root(CTX).expect("carol root"));
     assert_eq!(alice.event_log_leaf_count(CTX), Some(3));
 
-    // Out-of-band sender-key exchange among all three.
-    exchange_sender_keys(&mut [
-        (ALICE_DID, &mut alice),
-        (BOB_DID, &mut bob),
-        (CAROL_DID, &mut carol),
-    ]);
-
-    // --- BOB sends (plain-encrypted; no AAD, no leaf). ---
+    // --- BOB sends (plain-encrypted; no AAD, no leaf). Every member holds Bob's
+    // sender key via the in-tab distribution mesh above. ---
     let plaintext = b"hello from Bob, not a convergent leaf";
     let bob_ciphertext = bob.send_message(CTX, plaintext).expect("Bob sends");
 
     assert!(
         alice
             .receive_message(CTX, &bob_ciphertext)
-            .expect("Alice receives Bob's message"),
+            .expect("Alice receives Bob's message")
+            .application,
         "an application message"
     );
     assert!(
         carol
             .receive_message(CTX, &bob_ciphertext)
-            .expect("Carol receives Bob's message"),
+            .expect("Carol receives Bob's message")
+            .application,
         "an application message"
     );
 
@@ -376,8 +491,8 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     use openmls::prelude::{BasicCredential, KeyPackageIn};
     use scp_did::SigningKeyId;
     use scp_mls::group::{
-        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
-        remove_member,
+        add_member, add_member_with_convergent_timestamp, create_group,
+        generate_key_package_with_wrapping_key, remove_member,
     };
     use scp_mls::{ScpCredential, SignatureKeyPair};
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
@@ -405,7 +520,11 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         .welcome
         .tls_serialize_detached()
         .expect("welcome bytes");
-    bob.join_context_encrypted(CTX, &bob_welcome, &[], &[ALICE_DID.to_owned()])
+    // Alice is a RAW scp-mls group (not a client), so there is no wrapping-key
+    // directory to transport — Bob joins with an empty directory. This test drives
+    // the remove-rejection path, not sender-key distribution, so Bob never needs
+    // Alice's sender key.
+    bob.join_context_encrypted(CTX, &bob_welcome, &[], &[])
         .expect("Bob joins Alice's raw group");
 
     // Alice (raw group) adds Carol — a raw `scp-mls` member that exists only so
@@ -413,8 +532,12 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // ScpClient so Bob and Alice share the post-add epoch and Bob records Carol.
     let carol_cred = ScpCredential::new(CAROL_DID.to_owned(), None, SigningKeyId::Active)
         .expect("carol credential");
+    // Carol's KeyPackage must publish a wrapping key, or Bob's add-Carol receive
+    // is rejected pre-merge (ADR-057 sender-key distribution INVARIANT 3) before it
+    // can reach the remove scenario.
     let (carol_bundle, _carol_signer, _carol_provider): (_, SignatureKeyPair, _) =
-        generate_key_package(&carol_cred, &SystemClock).expect("carol key package");
+        generate_key_package_with_wrapping_key(&carol_cred, Some(&[0xCC_u8; 32]), &SystemClock)
+            .expect("carol key package");
     let carol_kp_in = KeyPackageIn::tls_deserialize(
         &mut &*carol_bundle
             .key_package()
@@ -539,9 +662,11 @@ fn tampered_ciphertext_is_rejected_and_stamps_no_leaf() {
         .generate_key_package_for_join(CTX)
         .expect("bob key package");
     let add = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
-    bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.members)
+    let bob_join_dists = bob
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("bob joins");
-    exchange_sender_keys(&mut [(ALICE_DID, &mut alice), (BOB_DID, &mut bob)]);
+    deliver2(&add.sender_key_distributions, &mut alice, &mut bob);
+    deliver2(&bob_join_dists, &mut alice, &mut bob);
 
     let bob_leaf_before = bob.event_log_leaf_count(CTX);
     let bob_root_before = bob.event_log_root(CTX);

@@ -76,7 +76,7 @@ pub use group::{
     add_member_with_convergent_timestamp, create_group, create_group_with_context,
     create_group_with_wrapping_key, destroy_group, generate_key_package,
     generate_key_package_with_context_params, generate_key_package_with_wrapping_key, join_group,
-    key_package_in_did, remove_member,
+    key_package_in_did, key_package_in_wrapping_key, remove_member,
 };
 pub use lifetime::{
     KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,

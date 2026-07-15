@@ -105,8 +105,10 @@ fn two_party_message_exchange_end_to_end() {
 
     // --- Bob joins from the Welcome and replays Alice's full prior log, so his
     // log reconstructs byte-identically (§7.3.1 context-state import). In a
-    // two-member group Alice's Commit has no existing recipient to process. ---
-    bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.members)
+    // two-member group Alice's Commit has no existing recipient to process. The
+    // join returns Bob's sender-key distributions (Bob → each existing member). ---
+    let bob_distributions = bob
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("Bob joins from the Welcome");
 
     assert_eq!(
@@ -120,16 +122,31 @@ fn two_party_message_exchange_end_to_end() {
         "after replay, Bob's root equals Alice's (full-log convergence)"
     );
 
-    // --- Out-of-band sender-key exchange (the MISSING SEAM documented in the
-    // crate root): the driver has no in-tab sender-key distribution path, so the
-    // harness hands each side the other's sender key directly. ---
-    let alice_sk = alice.local_sender_key_bytes(CTX).expect("alice sender key");
-    let bob_sk = bob.local_sender_key_bytes(CTX).expect("bob sender key");
-    bob.install_sender_key(CTX, ALICE_DID, alice_sk)
-        .expect("Bob installs Alice's sender key");
-    alice
-        .install_sender_key(CTX, BOB_DID, bob_sk)
-        .expect("Alice installs Bob's sender key");
+    // --- In-tab sender-key distribution (§9.16.1/§9.16.2): NO out-of-band
+    // exchange. Alice's add sealed her key to Bob; Bob's join sealed his key to
+    // Alice. Route each distribution over the dumb pipe to its target's
+    // receive_message, which HPKE-opens and installs it. ---
+    assert_eq!(add.sender_key_distributions.len(), 1, "Alice → Bob");
+    assert_eq!(add.sender_key_distributions[0].target_did, BOB_DID);
+    let bob_install = bob
+        .receive_message(CTX, &add.sender_key_distributions[0].ciphertext)
+        .expect("Bob installs Alice's sender key from the distribution");
+    assert!(
+        !bob_install.application,
+        "a sender-key distribution is not an application message"
+    );
+    assert!(
+        bob_install.sender_key_distributions.is_empty(),
+        "installing a key triggers no further distribution"
+    );
+
+    assert_eq!(bob_distributions.len(), 1, "Bob → Alice");
+    assert_eq!(bob_distributions[0].target_did, ALICE_DID);
+    let alice_install = alice
+        .receive_message(CTX, &bob_distributions[0].ciphertext)
+        .expect("Alice installs Bob's sender key from the distribution");
+    assert!(!alice_install.application);
+    assert!(alice_install.sender_key_distributions.is_empty());
 
     // === The convergent membership log is now settled: both members hold
     // [ContextCreated, MemberJoined] (2 leaves) with equal roots. Capture that
@@ -165,10 +182,13 @@ fn two_party_message_exchange_end_to_end() {
 
     // --- Bob receives + decrypts. This buffers a MessageReceived (local history),
     // NOT a convergent leaf, so Bob's event log is likewise unchanged. ---
-    let was_application = bob
+    let received = bob
         .receive_message(CTX, &ciphertext)
         .expect("Bob receives the message");
-    assert!(was_application, "Alice's send is an application message");
+    assert!(
+        received.application,
+        "Alice's send is an application message"
+    );
 
     assert_eq!(
         bob.event_log_leaf_count(CTX),

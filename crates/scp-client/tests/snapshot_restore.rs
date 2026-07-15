@@ -60,17 +60,23 @@ fn converged_pair(bob_storage: Arc<dyn Storage>) -> (ScpClient, ScpClient) {
         .generate_key_package_for_join(CTX)
         .expect("bob key package");
     let add = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
-    bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.members)
+    let bob_join_dists = bob
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("bob joins");
 
-    // Out-of-band sender-key exchange (the ADR-057 MISSING SEAM).
-    let alice_sk = alice.local_sender_key_bytes(CTX).expect("alice sk");
-    let bob_sk = bob.local_sender_key_bytes(CTX).expect("bob sk");
-    bob.install_sender_key(CTX, ALICE_DID, alice_sk)
-        .expect("bob installs alice sk");
-    alice
-        .install_sender_key(CTX, BOB_DID, bob_sk)
-        .expect("alice installs bob sk");
+    // In-tab §9.16 distribution: Alice's add sealed her key to Bob; Bob's join
+    // sealed his key to Alice. Route each to its target's receive_message.
+    for d in &add.sender_key_distributions {
+        assert_eq!(d.target_did, BOB_DID);
+        bob.receive_message(CTX, &d.ciphertext)
+            .expect("bob installs alice's key");
+    }
+    for d in &bob_join_dists {
+        assert_eq!(d.target_did, ALICE_DID);
+        alice
+            .receive_message(CTX, &d.ciphertext)
+            .expect("alice installs bob's key");
+    }
 
     (alice, bob)
 }
@@ -86,8 +92,8 @@ fn restore_resumes_a_converged_context_from_storage() {
     let pre = alice
         .send_message(CTX, b"before restore")
         .expect("alice sends");
-    let was_app = bob.receive_message(CTX, &pre).expect("bob receives");
-    assert!(was_app);
+    let received = bob.receive_message(CTX, &pre).expect("bob receives");
+    assert!(received.application);
 
     let expected_root = bob.event_log_root(CTX).expect("bob root");
     let expected_leaves = bob.event_log_leaf_count(CTX).expect("bob leaves");
@@ -149,8 +155,8 @@ fn restore_resumes_a_converged_context_from_storage() {
     let send2 = alice
         .send_message(CTX, b"after restore")
         .expect("alice sends 2");
-    let was_app = bob2.receive_message(CTX, &send2).expect("bob2 receives");
-    assert!(was_app);
+    let received = bob2.receive_message(CTX, &send2).expect("bob2 receives");
+    assert!(received.application);
     let events = bob2.drain_events(CTX).expect("bob2 drains");
     assert_eq!(events.len(), 1);
     match &events[0] {
@@ -169,10 +175,10 @@ fn restore_resumes_a_converged_context_from_storage() {
     let send3 = bob2
         .send_message(CTX, b"from restored bob")
         .expect("bob2 sends");
-    let was_app = alice
+    let received = alice
         .receive_message(CTX, &send3)
         .expect("alice receives from restored bob");
-    assert!(was_app);
+    assert!(received.application);
     // Alice's buffer now holds her own two sends (`before restore`, `after
     // restore`) as local `MessageSent` history plus Bob's `MessageReceived`, in
     // FIFO order — a send buffers the sender's own history (ADR-011: it is not a
@@ -289,7 +295,7 @@ fn pending_join_completes_after_restore() {
 
     // The reopened tab restores the pending material and joins with it.
     let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(150));
-    bob2.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.members)
+    bob2.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("restored bob completes the join");
 
     let mut members = bob2.member_dids(CTX).expect("members");

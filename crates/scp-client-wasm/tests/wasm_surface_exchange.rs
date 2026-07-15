@@ -48,7 +48,7 @@
 use std::sync::Arc;
 
 use scp_client::{LocalSigner, MemoryStorage, Signer, Storage};
-use scp_client_wasm::WasmScpClient;
+use scp_client_wasm::{WasmScpClient, WasmSenderKeyDistribution};
 use scp_clock::{Clock, SystemClock, TestClock};
 
 const CTX: &str = "ctx-adr057-slice3-wasm-surface";
@@ -78,27 +78,34 @@ fn client_for(did: &str, now_secs: u64) -> WasmScpClient {
     WasmScpClient::from_parts(signer, storage, clock).expect("construct fresh surface client")
 }
 
-/// Performs the out-of-band §9.16 sender-key handoff through the exposed
-/// `localSenderKeyBytes` / `installSenderKey` methods. The driver has no in-tab
-/// distribution path (ADR-057 MISSING SEAM), so each side hands the other its
-/// sender key directly.
-fn exchange_sender_keys(alice: &mut WasmScpClient, bob: &mut WasmScpClient) {
-    let alice_sk = alice
-        .local_sender_key_bytes(CTX.to_owned())
-        .expect("alice sender key");
-    let bob_sk = bob
-        .local_sender_key_bytes(CTX.to_owned())
-        .expect("bob sender key");
-    assert_eq!(
-        alice_sk.len(),
-        32,
-        "sender key is 32 bytes over the surface"
-    );
-    bob.install_sender_key(CTX.to_owned(), ALICE_DID.to_owned(), alice_sk)
-        .expect("Bob installs Alice's sender key");
-    alice
-        .install_sender_key(CTX.to_owned(), BOB_DID.to_owned(), bob_sk)
-        .expect("Alice installs Bob's sender key");
+/// Routes each in-tab §9.16 sender-key distribution to its target client through
+/// the exposed `receiveMessage` surface (§9.16.1/§9.16.2). There is no out-of-band
+/// hand-off — `localSenderKeyBytes` / `installSenderKey` no longer exist on the
+/// surface. Asserts each install is a no-op receive (not an application message).
+fn deliver(
+    dists: Vec<WasmSenderKeyDistribution>,
+    alice: &mut WasmScpClient,
+    bob: &mut WasmScpClient,
+) {
+    for d in dists {
+        let target = d.target_did();
+        let out = if target == ALICE_DID {
+            alice.receive_message(CTX.to_owned(), d.ciphertext())
+        } else if target == BOB_DID {
+            bob.receive_message(CTX.to_owned(), d.ciphertext())
+        } else {
+            panic!("unexpected distribution target {target}");
+        }
+        .expect("install distribution through the surface");
+        assert!(
+            !out.application(),
+            "a sender-key distribution is not an application message"
+        );
+        assert!(
+            out.sender_key_distributions().is_empty(),
+            "installing a distribution triggers no further distribution"
+        );
+    }
 }
 
 /// Asserts the §9.9.3 convergence property through the surface: both members'
@@ -124,6 +131,7 @@ fn assert_convergence(alice: &WasmScpClient, bob: &WasmScpClient) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end two-party surface scenario, read top-to-bottom
 fn two_party_exchange_through_wasm_surface() {
     // Deliberately different local clocks: convergence must depend only on the
     // convergent timestamp that travels with each message, not on the members'
@@ -175,14 +183,16 @@ fn two_party_exchange_through_wasm_surface() {
     );
     assert_eq!(alice.event_log_leaf_count(CTX.to_owned()), Some(2));
 
-    // --- Bob joins from the Welcome + replays Alice's serialized log. ---
-    bob.join_context_encrypted(
-        CTX.to_owned(),
-        add.welcome(),
-        add.event_log(),
-        add.members(),
-    )
-    .expect("Bob joins from the Welcome");
+    // --- Bob joins from the Welcome + replays Alice's serialized log. The join
+    // returns Bob's sender-key distributions (Bob → each existing member). ---
+    let bob_join_dists = bob
+        .join_context_encrypted(
+            CTX.to_owned(),
+            add.welcome(),
+            add.event_log(),
+            add.wrapping_keys(),
+        )
+        .expect("Bob joins from the Welcome");
 
     assert_eq!(
         bob.event_log_leaf_count(CTX.to_owned()),
@@ -195,8 +205,10 @@ fn two_party_exchange_through_wasm_surface() {
         "after replay, Bob's root equals Alice's (full-log convergence)"
     );
 
-    // --- Out-of-band sender-key exchange (ADR-057 MISSING SEAM). ---
-    exchange_sender_keys(&mut alice, &mut bob);
+    // --- In-tab §9.16 distribution through the surface: route Alice's add-seal
+    // (Alice → Bob) and Bob's join-seals (Bob → Alice). NO out-of-band exchange. ---
+    deliver(add.sender_key_distributions(), &mut alice, &mut bob);
+    deliver(bob_join_dists, &mut alice, &mut bob);
 
     // --- Alice sends an application message → ciphertext bytes (Uint8Array). ---
     let plaintext = b"hello from Alice through the wasm-bindgen surface".to_vec();
@@ -212,10 +224,13 @@ fn two_party_exchange_through_wasm_surface() {
 
     // --- Bob receives + decrypts a plain application message (no AAD), then
     // drains. ---
-    let was_application = bob
+    let received = bob
         .receive_message(CTX.to_owned(), ciphertext)
         .expect("Bob receives the message");
-    assert!(was_application, "Alice's send is an application message");
+    assert!(
+        received.application(),
+        "Alice's send is an application message"
+    );
 
     let events = bob.drain_events(CTX.to_owned()).expect("Bob drains events");
     assert_eq!(events.len(), 1, "exactly one received event is buffered");
@@ -280,14 +295,16 @@ fn restore_through_wasm_surface() {
     let add = alice
         .add_member(CTX.to_owned(), bob_kp)
         .expect("alice adds bob");
-    bob.join_context_encrypted(
-        CTX.to_owned(),
-        add.welcome(),
-        add.event_log(),
-        add.members(),
-    )
-    .expect("bob joins");
-    exchange_sender_keys(&mut alice, &mut bob);
+    let bob_join_dists = bob
+        .join_context_encrypted(
+            CTX.to_owned(),
+            add.welcome(),
+            add.event_log(),
+            add.wrapping_keys(),
+        )
+        .expect("bob joins");
+    deliver(add.sender_key_distributions(), &mut alice, &mut bob);
+    deliver(bob_join_dists, &mut alice, &mut bob);
 
     let expected_root = bob.event_log_root(CTX.to_owned());
     drop(bob); // The tab closes.
@@ -313,10 +330,10 @@ fn restore_through_wasm_surface() {
     let ciphertext = alice
         .send_message(CTX.to_owned(), b"after restore".to_vec())
         .expect("alice sends");
-    let was_app = bob2
+    let received = bob2
         .receive_message(CTX.to_owned(), ciphertext)
         .expect("bob2 receives");
-    assert!(was_app);
+    assert!(received.application());
     let events = bob2.drain_events(CTX.to_owned()).expect("bob2 drains");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].payload(), b"after restore");
@@ -386,10 +403,11 @@ fn context_status_reports_live_and_absent_through_the_surface() {
 #[test]
 #[allow(clippy::type_complexity)] // the explicit fn-pointer type IS the assertion
 fn convergent_timestamp_forgery_seam_is_gone_by_construction() {
+    use scp_client_wasm::WasmReceiveOutput;
     use wasm_bindgen::JsValue;
 
     // `receiveMessage` accepts only the ciphertext — no timestamp to forge.
-    let _: fn(&mut WasmScpClient, String, Vec<u8>) -> Result<bool, JsValue> =
+    let _: fn(&mut WasmScpClient, String, Vec<u8>) -> Result<WasmReceiveOutput, JsValue> =
         WasmScpClient::receive_message;
     // `sendMessage` returns the ciphertext bytes directly — the convergent
     // timestamp rides inside the authenticated AAD, not a separate return value.
