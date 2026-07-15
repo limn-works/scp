@@ -698,7 +698,8 @@ pub struct CommittedStreamingOutletInvocation {
     /// The target's signed streaming receipt over the staged provenance + the
     /// sealed `stream_manifest_hash` + event id. Re-emitted verbatim on a
     /// replayed Commit so the signature preimage reproduces byte-for-byte.
-    pub receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt,
+    pub receipt:
+        scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt,
     /// The sealed RFC-6962 Merkle root over the emitted chunk sequence — the
     /// `frontier.root()` finalized at stream-close (also carried on the receipt;
     /// stored explicitly so a replay re-emits it without re-deriving).

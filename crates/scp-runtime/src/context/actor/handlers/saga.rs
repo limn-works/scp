@@ -387,9 +387,7 @@ async fn dispatch_prepare_phase(
         }
         // Streaming seal-phase Prepare-B routes to `dispatch_stream_phase`; it is
         // statically unreachable here (mis-route → typed error, never panic).
-        SagaPhaseMessage::PrepareBStreaming { reply, .. } => {
-            misrouted(reply, "PrepareBStreaming")
-        }
+        SagaPhaseMessage::PrepareBStreaming { reply, .. } => misrouted(reply, "PrepareBStreaming"),
         // Commit-side phases are matched in `dispatch` and never routed here.
         // The `dispatch` router partitions Prepare vs Commit before calling
         // this helper, so these arms are statically unreachable; return a typed
@@ -524,9 +522,7 @@ async fn dispatch_commit_phase(
         // shape (NEVER panic — ADR-049 §10 handler panic ban).
         SagaPhaseMessage::PrepareA { reply, .. } => misrouted(reply, "PrepareA"),
         SagaPhaseMessage::PrepareB { reply, .. } => misrouted(reply, "PrepareB"),
-        SagaPhaseMessage::PrepareBStreaming { reply, .. } => {
-            misrouted(reply, "PrepareBStreaming")
-        }
+        SagaPhaseMessage::PrepareBStreaming { reply, .. } => misrouted(reply, "PrepareBStreaming"),
         SagaPhaseMessage::StreamStageCounterReserve { reply, .. } => {
             misrouted(reply, "StreamStageCounterReserve")
         }
@@ -2578,17 +2574,21 @@ async fn commit_b_stream_first_settle(
 
         // Sign the streaming receipt over the STAGED provenance + the sealed root.
         // A signing failure leaves state as found (re-insert the owned original).
-        let receipt =
-            match build_signed_stream_receipt(&prepared, stream_manifest_hash, &event_id, target_signing_key) {
-                Ok(r) => r,
-                Err(e) => {
-                    view.class_s_mut().saga_pending.insert(
-                        saga_id.clone(),
-                        SagaPreparedState::CrossContextStreamingOutletInvocation(prepared),
-                    );
-                    return Err(e);
-                }
-            };
+        let receipt = match build_signed_stream_receipt(
+            &prepared,
+            stream_manifest_hash,
+            &event_id,
+            target_signing_key,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                view.class_s_mut().saga_pending.insert(
+                    saga_id.clone(),
+                    SagaPreparedState::CrossContextStreamingOutletInvocation(prepared),
+                );
+                return Err(e);
+            }
+        };
 
         let caller_did_str = prepared.caller_did.0.clone();
         let target_context_id = prepared.target_context_id;
@@ -2611,9 +2611,10 @@ async fn commit_b_stream_first_settle(
             billed_count,
             request_id: prepared.request_id,
             outlet_id: prepared.outlet_registration_id.clone(),
-            economic_policy_snapshot: prepared.economic_policy.clone().map(|policy| {
-                crate::context::outlets::invoke::EconomicPolicySnapshot { policy }
-            }),
+            economic_policy_snapshot: prepared
+                .economic_policy
+                .clone()
+                .map(|policy| crate::context::outlets::invoke::EconomicPolicySnapshot { policy }),
             amount_cumulative_reserved: prepared.amount_cumulative_reserved,
             reserved_chunks: prepared.reserved_chunks,
             ucan_cid: prepared.ucan_cid.clone(),

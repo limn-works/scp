@@ -3203,7 +3203,9 @@ fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
 
     // (1) Exactly ONE CommitBStreamSettle dispatch in the whole seal task —
     // commit once over the bounded root (AC8). More than one is a per-chunk 2PC.
-    let commit_count = seal_fn.matches("SagaPhaseMessage::CommitBStreamSettle").count();
+    let commit_count = seal_fn
+        .matches("SagaPhaseMessage::CommitBStreamSettle")
+        .count();
     assert_eq!(
         commit_count, 1,
         "AC8: the seal task must issue CommitBStreamSettle EXACTLY once (commit once over \

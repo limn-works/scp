@@ -1260,7 +1260,8 @@ pub struct StreamingSagaHandle {
     /// resolution keys on, and the id the seal task seals under.
     pub saga_id: SagaId,
     /// A's plaintext forwarded-frame receiver, returned promptly (AC1).
-    pub receiver: tokio::sync::mpsc::Receiver<crate::context::outlets::invoke::ForwardedStreamFrame>,
+    pub receiver:
+        tokio::sync::mpsc::Receiver<crate::context::outlets::invoke::ForwardedStreamFrame>,
 }
 
 // ---------------------------------------------------------------------------
@@ -6596,7 +6597,8 @@ impl Supervisor {
             .append_journal(&saga_id, SagaState::PreparingB, &participants, 1, &[])
             .await
         {
-            self.abort_staged_streaming_saga(&saga_id, &target_hex).await;
+            self.abort_staged_streaming_saga(&saga_id, &target_hex)
+                .await;
             drop(phase1.escrow_ticket);
             drop(reservation);
             return Err(SagaError::Aborted {
@@ -6609,7 +6611,8 @@ impl Supervisor {
             .append_journal(&saga_id, SagaState::Committing, &participants, 2, &[])
             .await
         {
-            self.abort_staged_streaming_saga(&saga_id, &target_hex).await;
+            self.abort_staged_streaming_saga(&saga_id, &target_hex)
+                .await;
             drop(phase1.escrow_ticket);
             drop(reservation);
             return Err(SagaError::Aborted {
@@ -6657,7 +6660,8 @@ impl Supervisor {
         let mut handle = match open_result {
             Ok(h) => h,
             Err(rejection) => {
-                self.abort_staged_streaming_saga(&saga_id, &target_hex).await;
+                self.abort_staged_streaming_saga(&saga_id, &target_hex)
+                    .await;
                 drop(escrow_ticket);
                 drop(reservation);
                 return Err(SagaError::Aborted {
@@ -6671,7 +6675,8 @@ impl Supervisor {
             }
         };
         let Some(inner_rx) = handle.receiver() else {
-            self.abort_staged_streaming_saga(&saga_id, &target_hex).await;
+            self.abort_staged_streaming_saga(&saga_id, &target_hex)
+                .await;
             drop(escrow_ticket);
             drop(reservation);
             return Err(SagaError::Aborted {
@@ -6730,20 +6735,22 @@ impl Supervisor {
         // receiver + the pinned descriptor/schemas). It forwards each chunk,
         // durably folds it into B's frontier (StreamCaptureAppend), and seals at
         // close (CommitBStreamSettle).
-        tokio::spawn(crate::context::outlets::invoke::run_streaming_saga_seal_task(
-            Arc::clone(self),
-            target_hex,
-            saga_id.clone(),
-            SigningKeyBytes::from_signing_key(signing_keys.target),
-            settlement_generation,
-            inner_rx,
-            outer_tx,
-            escrow_ticket,
-            descriptor,
-            output_schema,
-            aggregate_schema,
-            a_event_log,
-        ));
+        tokio::spawn(
+            crate::context::outlets::invoke::run_streaming_saga_seal_task(
+                Arc::clone(self),
+                target_hex,
+                saga_id.clone(),
+                SigningKeyBytes::from_signing_key(signing_keys.target),
+                settlement_generation,
+                inner_rx,
+                outer_tx,
+                escrow_ticket,
+                descriptor,
+                output_schema,
+                aggregate_schema,
+                a_event_log,
+            ),
+        );
 
         // AC1 — return the receiver PROMPTLY (the journal is `Committing`; the
         // seal reaches `Committed` at stream-close, off the mailbox).
@@ -7746,9 +7753,8 @@ impl Supervisor {
         if !entry.evidence.is_empty() || entry.participants.len() != 2 {
             return None;
         }
-        let is_raw_digest_hex = |s: &String| {
-            s.len() == RAW_DIGEST_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
-        };
+        let is_raw_digest_hex =
+            |s: &String| s.len() == RAW_DIGEST_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit());
         if is_raw_digest_hex(&entry.participants[0]) && is_raw_digest_hex(&entry.participants[1]) {
             Some(entry.participants[1].clone())
         } else {
