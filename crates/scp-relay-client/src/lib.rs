@@ -12,8 +12,8 @@
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full wire format
 //! specification, and ADR-057 for the shared-crate rationale.
 
-pub mod error;
-pub mod protocol;
+mod error;
+mod protocol;
 
 pub use error::{RelayProtocolError, code};
 pub use protocol::{

@@ -463,8 +463,8 @@ pub enum RelayMessage {
     /// Error response with a numeric code and human-readable message.
     ///
     /// The `msg` field is for logging only -- clients MUST NOT parse it.
-    /// Use [`code::is_client_error`](super::error::code::is_client_error) and
-    /// [`code::is_server_error`](super::error::code::is_server_error) to
+    /// Use [`code::is_client_error`](crate::code::is_client_error) and
+    /// [`code::is_server_error`](crate::code::is_server_error) to
     /// determine retry strategy.
     #[serde(rename = "ERR")]
     Err {
