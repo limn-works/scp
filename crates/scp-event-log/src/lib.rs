@@ -228,11 +228,11 @@ pub enum EventType {
     // -------------------------------------------------------------------
     /// Provenance metadata was attached to data leaving a source context.
     ///
-    /// Payload: SHA-256 hash of JSON-serialized provenance record (32 bytes).
+    /// Payload: SHA-256 hash of positional-MessagePack-serialized provenance record (32 bytes, §24.3.3).
     ProvenanceAttached,
     /// Provenance metadata was received in a target context.
     ///
-    /// Payload: SHA-256 hash of JSON-serialized provenance record (32 bytes).
+    /// Payload: SHA-256 hash of positional-MessagePack-serialized provenance record (32 bytes, §24.3.3).
     ProvenanceReceived,
 
     // -------------------------------------------------------------------
