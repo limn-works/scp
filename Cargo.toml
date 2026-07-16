@@ -118,6 +118,45 @@ too_many_arguments = "deny"
 # sync-bridge enforcement.
 await_holding_lock = "deny"
 
+# ── Dev/test profile ────────────────────────────────────────────────────────
+# Dev/test builds emit line-tables-only debug info instead of the cargo default
+# full DWARF (`debug = 2`). Every compiled artifact keeps its line table (so
+# panic/backtrace frames still resolve to `file:line:col` — what tests and CI
+# need) but drops the bulky variable/type DWARF that only an interactive
+# debugger consumes.
+#
+# MEASURED on this 24-member workspace, two clean from-scratch builds of
+# `cargo build --workspace --all-targets` with the CI feature set, isolated
+# CARGO_TARGET_DIRs, identical unit graphs (572 rlibs / 887 fingerprints each,
+# macOS/aarch64, rustc 1.97.1):
+#
+#     debug = 2 (cargo default) ... 25.65 GB target/   (deps 16.5 GB)
+#     debug = "line-tables-only" .. 18.95 GB target/   (deps 11.4 GB)
+#     ------------------------------------------------------------------
+#     saved ....................... 6.70 GB per clean pass = 26% total,
+#                                   31% of debug/deps, 38% of rlib bytes
+#
+# That is one target dir, one feature combination. The cost scales with every
+# additional feature-hash rebuild and every worktree sharing the build cache.
+#
+# TRADE-OFF (the honest one): `file:line:col` is preserved exactly, but a
+# backtrace frame loses its DWARF-derived crate-qualified name and falls back
+# to the linkage symbol — `deep at src/main.rs:4:5` instead of
+# `bt_probe[hash]::deep at src/main.rs:4:5`. Local variables are not
+# inspectable in lldb/gdb. Anyone who needs either can override
+# per-invocation: `RUSTFLAGS="-C debuginfo=2" cargo test ...`.
+#
+# NOT load-bearing for the `[profile.release]` guarantee below: this key sets
+# debug-info VERBOSITY only. It does not touch `debug-assertions`, codegen, or
+# behavior — dev/test builds keep `debug-assertions = true`, so the openmls
+# `debug_assert!` still fires under `cargo test` exactly as before. The `fuzz/`
+# crate is a standalone non-member with its own `[profile.release]` and is
+# unaffected.
+#
+# `test` and `bench` inherit `dev`, so `cargo test`/`cargo nextest` are covered.
+[profile.dev]
+debug = "line-tables-only"
+
 # ── Release profile ─────────────────────────────────────────────────────────
 # `debug-assertions = false` is the cargo release DEFAULT — this line changes no
 # behavior; it makes an otherwise-implicit invariant EXPLICIT and greppable.
