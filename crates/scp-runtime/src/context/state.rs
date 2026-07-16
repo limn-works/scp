@@ -1711,36 +1711,14 @@ pub(crate) struct TtlState {
     pub(crate) extension: Option<TtlExtension>,
 }
 
-/// Wire format for pseudonym announcements sent as MLS application messages.
-///
-/// When a member joins or creates a context with a pre-derived pseudonym,
-/// they announce it to other members via this structure serialized with
-/// `MessagePack`. Recipients store the mapping in their pseudonym registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PseudonymAnnouncement {
-    /// Magic prefix to distinguish from regular application messages.
-    pub tag: String,
-    /// The announcing member's DID.
-    pub member_did: String,
-    /// The 32-byte pseudonym routing ID.
-    #[serde(with = "serde_bytes")]
-    pub pseudonym: [u8; 32],
-}
-
-/// Magic tag used to identify pseudonym announcement messages in the MLS
-/// application message stream. Prefixed with `\0` to avoid collision with
-/// user-generated content (which is always valid UTF-8 and will never start
-/// with a null byte when deserialized from `MessagePack`).
-pub(crate) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1";
-
 /// Wire wrapper for a consistency-checkpoint exchange message (§9.9.3, §23.7).
 ///
 /// Carries the canonical signed [`ConsistencyCheckpoint`] behind a magic tag
 /// so the receive path can positively identify it. Although the inner envelope
 /// already discriminates checkpoints via
 /// [`MessageType::ConsistencyCheckpoint`](scp_protocol::envelope::inner::MessageType::ConsistencyCheckpoint),
-/// the tag is a defense-in-depth guard mirroring [`PseudonymAnnouncement`]:
+/// the tag is a defense-in-depth guard mirroring
+/// [`PseudonymAnnouncement`](scp_protocol::context::pseudonym::PseudonymAnnouncement):
 /// it makes a payload that fails to deserialize as a tagged checkpoint a
 /// hard error rather than a silently mis-routed application message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1754,8 +1732,9 @@ pub(crate) struct CheckpointMessage {
 
 /// Magic tag identifying consistency-checkpoint messages in the MLS application
 /// message stream. Prefixed with `\0` for the same reason as
-/// [`PSEUDONYM_ANNOUNCEMENT_TAG`]: user content is valid UTF-8 and never starts
-/// with a null byte when `MessagePack`-decoded, so the tag cannot collide.
+/// [`PSEUDONYM_ANNOUNCEMENT_TAG`](scp_protocol::context::pseudonym::PSEUDONYM_ANNOUNCEMENT_TAG):
+/// user content is valid UTF-8 and never starts with a null byte when
+/// `MessagePack`-decoded, so the tag cannot collide.
 pub(crate) const CHECKPOINT_PAYLOAD_TAG: &str = "\0scp:checkpoint:v1";
 
 // ADR-049 Phase 2A finalization keystone (commit 12 phase 2A finalization
