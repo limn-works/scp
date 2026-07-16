@@ -31972,6 +31972,242 @@ mod streaming_saga_tests {
         drop(recording);
     }
 
+    /// SCP-OUT-046 CRITICAL — the settlement-atomicity gap AC7 misses: a crash /
+    /// eviction AFTER the durable witness is inserted (seal-close landed) but
+    /// BEFORE the off-mailbox money move runs. The witness signals "sealed", but
+    /// the escrow refund + §7.3.8 counter release never happened. Keyless crash
+    /// recovery MUST complete the settlement (money ops need no signing key) and
+    /// the money must move EXACTLY once — a second recovery is a no-op.
+    ///
+    /// Reproduces the window precisely: drive a prefix, then dispatch
+    /// `CommitBStreamSettle` DIRECTLY to the target actor (the seal HANDLER inserts
+    /// the `settled = false` witness + returns the settlement) WITHOUT applying the
+    /// settlement — exactly the state the off-mailbox seal task leaves if it dies
+    /// between the seal handler's reply and `settle_outlet_stream_via_actor`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_crash_after_witness_before_settle_recovers_exactly_once() {
+        use crate::context::actor::commands::StreamSettleApplication;
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let supervisor =
+            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        spawn_ss_pair(&supervisor).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x46; 16]);
+        let executor = Arc::new(PrefixThenBlockExecutor {
+            data_chunks: 5,
+            invoked: Arc::clone(&invoked),
+        });
+        let target_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+
+        let mut handle = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x46u8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                executor,
+                Some(binding),
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                params,
+            )
+            .await
+            .expect("the paid streaming saga starts");
+
+        let saga_id = handle.saga_id.clone();
+        let target_hex = hex::encode(SS_TARGET);
+        let actor = supervisor
+            .lookup(&target_hex)
+            .expect("target actor resident");
+
+        // Drain the 5-chunk prefix (the executor wedges before a terminal).
+        let mut received: Vec<_> = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_secs(1), handle.receiver.recv()).await
+        {
+            received.push(frame.chunk.clone());
+        }
+        assert_eq!(received.len(), 5, "the 5-chunk prefix forwarded");
+
+        // Settle barrier — force the in-flight durable StreamCaptureAppend folds to
+        // land before we seal (same FIFO mailbox).
+        for _ in 0..25 {
+            let sid = saga_id.clone();
+            let _ = actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
+                        saga_id: sid,
+                        reply,
+                    })
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Simulate the crash window: dispatch the seal HANDLER directly so the
+        // witness is inserted (settled=false) and the settlement is returned — but
+        // DO NOT apply it (the seal task "died" before settle_outlet_stream_via_actor).
+        let outcome = {
+            let sid = saga_id.clone();
+            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
+                        saga_id: sid,
+                        terminal_status:
+                            scp_protocol::context::outlets::stream::StreamTerminalStatus::Error(
+                                "crash-window seal".to_owned(),
+                            ),
+                        cancel_ack_seq: None,
+                        target_signing_key: target_key_bytes,
+                        reply,
+                    })
+                })
+                .await
+                .expect("the seal handler inserts the witness + returns the settlement")
+        };
+        let k = outcome.billed_count as usize;
+        assert!((1..=5).contains(&k), "sealed a non-empty prefix (got {k})");
+        let rebuilt = outcome
+            .settlement
+            .as_deref()
+            .expect("the FIRST seal returns Some(settlement) — the money has NOT moved")
+            .clone();
+
+        // Money has NOT moved: the escrow is still FULLY held and no PaymentReceipt
+        // was captured — this is the stranded-window state the CRITICAL flags.
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_RESERVED),
+            "the escrow is fully HELD in the seal→settle window (no refund yet)"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            0,
+            "no capture in the window"
+        );
+
+        // A witness-bearing settle against the WRONG generation DEFERS entirely
+        // (no capture, no owned-state touch) and leaves the witness unsettled —
+        // this is the eviction/respawn path; recovery (not this call) completes it.
+        let deferred: StreamSettleApplication = supervisor
+            .settle_outlet_stream_via_actor(
+                rebuilt.clone(),
+                outcome.generation.wrapping_add(1),
+                Some(saga_id.clone()),
+            )
+            .await
+            .expect("the settle dispatch succeeds");
+        assert!(
+            !deferred.applied,
+            "a generation-mismatch witness-bearing settle DEFERS (applied=false)"
+        );
+        assert!(
+            deferred.receipt.is_none(),
+            "the deferred settle captures NOTHING (no double-bill on recovery)"
+        );
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_RESERVED),
+            "the deferred settle moved no money (escrow still fully held)"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            0,
+            "deferral captured nothing"
+        );
+
+        // KEYLESS recovery: the sweep finds the Committing entry, sees the witness
+        // PRESENT but UNSETTLED, and COMPLETES the money move against B's current
+        // generation — no signing key needed.
+        supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("keyless recovery sweep runs");
+
+        assert_eq!(
+            ss_saga_state(&journal, &saga_id).await,
+            None,
+            "recovery completed the settlement and resolved Committed"
+        );
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_COST * k as u64),
+            "CRITICAL: recovery credited the reserved−billed refund (money moves exactly once)"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            1,
+            "CRITICAL: recovery captured the billed PaymentReceipt exactly once"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "recovery never re-invokes the outlet"
+        );
+
+        // The witness is now SETTLED — a re-read returns settled=true and NO
+        // rebuilt settlement, so recovery would move NO further money (the flag is
+        // the double-refund guard).
+        let status = {
+            let sid = saga_id.clone();
+            actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
+                        saga_id: sid,
+                        reply,
+                    })
+                })
+                .await
+                .expect("witness re-check")
+        };
+        assert!(
+            status.present && status.settled,
+            "witness present + settled"
+        );
+        assert!(
+            status.settlement.is_none(),
+            "a settled witness rebuilds NO settlement — recovery moves no money"
+        );
+
+        // A SECOND recovery sweep is a no-op — the money never moves twice.
+        supervisor
+            .replay_unresolved_sagas(&super::RestoredContexts::new(Vec::new()))
+            .await
+            .expect("second recovery sweep runs");
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_COST * k as u64),
+            "CRITICAL: a second recovery does NOT double-refund"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            1,
+            "CRITICAL: a second recovery does NOT double-capture"
+        );
+
+        drop(recording);
+    }
+
     /// COMMIT 3 — AC2: the Commit-transition RELEASES the per-participant-context-set
     /// concurrency slot once the pump is triggered (ADR-049 §3a amendment (b)).
     ///

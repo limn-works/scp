@@ -1095,6 +1095,78 @@ mod tests {
         assert_eq!(inner.frontier.leaf_count(), expected_leaves);
     }
 
+    /// SCP-OUT-046 CRITICAL: the committed-streaming witness — including the new
+    /// `settled` flag and the full settlement-rebuild field set — survives serde
+    /// round-trip byte-for-byte. The witness rides the public `ContextSnapshot`
+    /// (Class-S fail-closed), so these fields MUST persist across a crash for
+    /// keyless recovery to rebuild the `StreamSettlement` and read `settled`.
+    #[test]
+    fn committed_streaming_witness_round_trips_with_settled_and_settlement_fields() {
+        use scp_protocol::context::outlets::cross_context_saga::{
+            CrossContextOutletStreamReceipt, CrossContextOutletStreamReceiptFields,
+        };
+        use scp_protocol::economy::types::Amount;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let receipt = CrossContextOutletStreamReceipt::sign(
+            &signing_key,
+            CrossContextOutletStreamReceiptFields {
+                caller_context_id: [0x3Au8; 32],
+                target_context_id: [0x4Bu8; 32],
+                caller_did: "did:example:alice".to_owned(),
+                nonce: [0x8Fu8; 16],
+                outlet_registration_id: "llm-stream-v1".to_owned(),
+                stream_manifest_hash: [0x55u8; 32],
+                outlet_invoked_event_id: "evt-1".to_owned(),
+                chain_depth: 5,
+                timestamp_ms: 1_700_222_333_444,
+            },
+        )
+        .expect("receipt signs");
+
+        let witness = CommittedStreamingOutletInvocation {
+            receipt,
+            stream_manifest_hash: [0x55u8; 32],
+            billed: Amount::new(30),
+            refund: Amount::new(170),
+            billed_count: 3,
+            stream_chunk_count: 4,
+            outlet_invoked_event_id: "evt-1".to_owned(),
+            settled: false,
+            target_context_id: [0x4Bu8; 32],
+            invoker_did: alice(),
+            reserved: Amount::new(200),
+            request_id: [0x7Au8; 16],
+            outlet_registration_id: "llm-stream-v1".to_owned(),
+            economic_policy: None,
+            amount_cumulative_reserved: 900,
+            reserved_chunks: 9,
+            ucan_cid: "bafy-stream-ucan".to_owned(),
+            cost_per_chunk: Amount::new(10),
+        };
+
+        let bytes = serde_json::to_vec(&witness).expect("serialize witness");
+        let back: CommittedStreamingOutletInvocation =
+            serde_json::from_slice(&bytes).expect("deserialize witness");
+        assert_eq!(witness, back);
+        // The load-bearing fields for the CRITICAL fix survive verbatim.
+        assert!(!back.settled, "settled flag survives (false at seal)");
+        assert_eq!(back.reserved, Amount::new(200));
+        assert_eq!(back.request_id, [0x7Au8; 16]);
+        assert_eq!(back.amount_cumulative_reserved, 900);
+        assert_eq!(back.ucan_cid, "bafy-stream-ucan");
+        assert_eq!(back.cost_per_chunk, Amount::new(10));
+        assert_eq!(back.target_context_id, [0x4Bu8; 32]);
+
+        // Flip `settled` and confirm it round-trips as `true`.
+        let mut settled_witness = witness;
+        settled_witness.settled = true;
+        let bytes = serde_json::to_vec(&settled_witness).expect("serialize settled witness");
+        let back: CommittedStreamingOutletInvocation =
+            serde_json::from_slice(&bytes).expect("deserialize settled witness");
+        assert!(back.settled, "settled=true survives round-trip");
+    }
+
     /// SCP-OUT-046 AC4: the durable `SagaId`-keyed capture is the O(log n)
     /// RFC-6962 [`MerkleFrontier`] + credit ledger — a replay SNAPSHOT, NOT a
     /// full-payload buffer. This is the load-bearing memory property: the durable
