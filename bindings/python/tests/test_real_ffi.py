@@ -229,12 +229,11 @@ class TestIdentity:
         # PyO3 reference bridge) before touching the registry. A non-empty but
         # syntactically invalid DID raises a ValidationError rather than
         # silently no-op'ing. Mirrors the petname malformed-owner tests.
-        # identity_remove is wrapped → typed SDK ValidationError.
-        # identity_remove_if_present is not wrapped → native bridge exception.
+        # Both are wrapped with _coded_bridge_error → typed SDK ValidationError.
         bad = "not-a-did"
         with pytest.raises(ValidationError):
             await scp.identity_remove(bad)
-        with pytest.raises(_scp_core.ValidationError):
+        with pytest.raises(ValidationError):
             await scp.identity_remove_if_present(bad)
 
     async def test_create_with_agent_key(self, scp: SCP):

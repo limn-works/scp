@@ -912,7 +912,12 @@ class SCP:
         the DID was not in the registry. Delegates to
         ``_scp_core.SCP.identity_remove_if_present``.
         """
-        return await asyncio.to_thread(self._native.identity_remove_if_present, did)
+        from scp_sdk.errors import _coded_bridge_error
+
+        try:
+            return await asyncio.to_thread(self._native.identity_remove_if_present, did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def identity_renew_attestation(self, did: str, attestation_id: str) -> Any:
         """Renew an identity link attestation (§3.5.2).
