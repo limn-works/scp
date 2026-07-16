@@ -17,7 +17,7 @@ import XCTest
 ///     `invokeOutletCrossContext` (source-active + UTF-8 input), and
 ///   - end-to-end argument forwarding through the real UniFFI bridge.
 ///
-/// The suite links the Rust binary built with `allow_in_memory_custody`, so
+/// The suite links the Rust binary built with `testing`, so
 /// contexts and outlet registration run against the real engine.
 final class OutletSagaTests: XCTestCase {
     // Implicitly unwrapped because XCTest `setUp` initializes it before any

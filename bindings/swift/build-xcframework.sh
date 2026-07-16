@@ -81,11 +81,11 @@ done
 if [ "$DEV_MODE" = true ]; then
     ALL_TARGETS=("$TARGET_MACOS_ARM")
     log_mode="dev (macOS arm64 only)"
-    # Dev builds enable in-memory custody and the testing feature for the
-    # cross-bridge parity harness (ADR-046). Production builds
-    # (iOS XCFramework, Android .aar) MUST NOT enable either feature.
+    # Dev builds enable the testing feature (which now gates the in-memory
+    # custody arm) for the cross-bridge parity harness (ADR-046). Production
+    # builds (iOS XCFramework, Android .aar) MUST NOT enable it.
     # See GitHub issue #88.
-    EXTRA_FEATURES="--features allow_in_memory_custody,testing"
+    EXTRA_FEATURES="--features testing"
 else
     EXTRA_FEATURES=""
     ALL_TARGETS=(

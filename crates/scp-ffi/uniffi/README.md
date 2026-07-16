@@ -84,6 +84,8 @@ functions are defined via proc-macros.
 
 ## Feature flags
 
-`allow_in_memory_custody` -- gates the `"in_memory"` path in `identity_create`.
-Stores keys in unprotected heap memory. Suitable for testing and desktop; must
-NOT be enabled in production mobile builds.
+`testing` -- gates the `"in_memory"` custody path in `identity_create` (via the
+folded-in `scp-platform/testing`), storing keys in unprotected heap memory
+(ADR-062 §Decision 6). Also compiles the in-memory DHT/attestation/pre-rotation
+nullifier doubles. Test/desktop harness only; must NOT be enabled in production
+mobile builds — the G1 shipped-feature-graph gate proves it never ships.

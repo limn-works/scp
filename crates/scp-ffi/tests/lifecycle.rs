@@ -10,7 +10,7 @@
 //! Run with:
 //! ```sh
 //! DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))") \
-//!   cargo test -p scp-ffi --test lifecycle --features allow_in_memory_custody
+//!   cargo test -p scp-ffi --test lifecycle --features testing
 //! ```
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]

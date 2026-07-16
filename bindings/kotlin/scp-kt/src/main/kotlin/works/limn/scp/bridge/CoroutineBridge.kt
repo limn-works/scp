@@ -128,7 +128,7 @@ interface IdentityBindings {
      *   `"platform"` (Secure Enclave / Android Keystore), or `"software"`.
      * @return Opaque identity handle for use in subsequent operations.
      * @throws BridgeException with `SCP-IDENT-1008` if `"in_memory"` is requested
-     *   but the `allow_in_memory_custody` feature is not enabled, or with
+     *   but the `testing` feature is not enabled, or with
      *   `SCP-IDENT-1003` if `"platform"`/`"software"` is requested without a
      *   wired `KeyCustodyProvider`.
      */

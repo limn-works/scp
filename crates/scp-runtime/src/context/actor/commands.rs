@@ -384,10 +384,10 @@ pub enum MessagingCommand {
     /// the Tier-2 cache.
     ///
     /// Gated behind the dedicated `outlet-capability-test-grant` feature —
-    /// NOT `testing`. `testing` leaks into every `allow_in_memory_custody`
-    /// bridge build (`scp-ffi → dep:scp-testing → scp-core{testing} →
+    /// NOT `testing`. The `testing` feature leaks into every bridge test build
+    /// (`scp-ffi/testing → dep:scp-testing → scp-core/testing →
     /// scp-runtime/testing`), which would compile this authority-escalation
-    /// primitive into a custody-escape-hatch build; the dedicated feature is
+    /// primitive into a test-harness build; the dedicated feature is
     /// enabled ONLY by the outlet-stream live-flow test. It has ZERO FFI/SDK
     /// exports (only that test calls it), but the dedicated gate keeps the
     /// primitive out of every non-test binary.
@@ -437,7 +437,7 @@ pub enum MessagingCommand {
     /// Python/TS bidirectional tripwires still pass on the *production*
     /// distribution path. Safe to carry until then: `testing`-gated, no FFI
     /// wrapper, reachable only by in-process `Arc<Supervisor>` callers (the
-    /// full-stack harness), even in the `allow_in_memory_custody` build the
+    /// full-stack harness), even in the `testing` build the
     /// tripwires use.
     #[cfg(feature = "testing")]
     TestInstallAccessKey {

@@ -696,14 +696,22 @@ class SCP:
     async def identity_attest_device(self, identity_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.identity_attest_device``.
 
-        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge was
-        not built with the ``allow_in_memory_custody`` feature.
+        On a shipped build this fails closed: no production device-attestation
+        backend is wired yet (Apple App Attest / Google Play Integrity are
+        hardware/platform-backed and are intentionally deferred with hardware
+        keychain custody until an e2e-driven integration lands; spec §9:187).
+        Raises :class:`~scp_sdk.errors.IdentityError` (``SCP-IDENT-1015``). See
+        #2171.
         """
         from scp_sdk.errors import IdentityError
 
         if not hasattr(self._native, "identity_attest_device"):
             raise IdentityError(
-                "Device attestation requires the 'allow_in_memory_custody' feature",
+                "device attestation unavailable: no production device-attestation "
+                "backend is wired yet — Apple App Attest / Google Play Integrity are "
+                "hardware/platform-backed and are intentionally deferred (with hardware "
+                "keychain custody) until an e2e-driven integration lands (spec §9:187). "
+                "See #2171.",
                 "SCP-IDENT-1015",
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
@@ -932,15 +940,23 @@ class SCP:
 
         ADR-048 §1: pure helper exposed as a module-level free function.
 
-        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge was
-        not built with the ``allow_in_memory_custody`` feature.
+        On a shipped build this fails closed: no production device-attestation
+        backend is wired yet (Apple App Attest / Google Play Integrity are
+        hardware/platform-backed and are intentionally deferred with hardware
+        keychain custody until an e2e-driven integration lands; spec §9:187).
+        Raises :class:`~scp_sdk.errors.IdentityError` (``SCP-IDENT-1016``). See
+        #2171.
         """
         from scp_sdk.errors import IdentityError
 
         mod = _native_mod()
         if not hasattr(mod, "identity_verify_device_attestation"):
             raise IdentityError(
-                "Device attestation verification requires the 'allow_in_memory_custody' feature",
+                "device attestation verification unavailable: no production "
+                "device-attestation backend is wired yet — Apple App Attest / Google "
+                "Play Integrity are hardware/platform-backed and are intentionally "
+                "deferred (with hardware keychain custody) until an e2e-driven "
+                "integration lands (spec §9:187). See #2171.",
                 "SCP-IDENT-1016",
             )
         return await asyncio.to_thread(mod.identity_verify_device_attestation, did, token_base64)

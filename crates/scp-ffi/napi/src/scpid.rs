@@ -233,12 +233,13 @@ mod tests {
 
     // In-memory-custody-only helpers — used solely by the feature-gated
     // `scpid_sign` tests that register an identity via the in-memory backend.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     use scp_dht::InMemoryDhtClient;
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     use scp_identity::resolver::DualLayerResolver;
+    #[cfg(feature = "testing")]
     use scp_identity::{DidCache, NoOpRelayQuerier};
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     use std::sync::Arc;
 
     fn test_bi() -> NapiBridgeInstance {
@@ -279,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn parse_signing_key_id_valid() {
         assert_eq!(
             parse_signing_key_id("#active").unwrap(),
@@ -289,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn parse_signing_key_id_invalid() {
         assert!(parse_signing_key_id("active").is_err());
         assert!(parse_signing_key_id("#owner").is_err());
@@ -384,7 +385,7 @@ mod tests {
     /// type used by the bridge function). Proves that the resolver impl
     /// works end-to-end for SCPID verification.
     #[tokio::test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn sign_verify_roundtrip_via_identity_backed_resolver() {
         use scp_identity::DidMethod;
 

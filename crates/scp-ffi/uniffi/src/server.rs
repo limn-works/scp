@@ -628,7 +628,7 @@ pub(crate) async fn relay_start_local_on(
 /// - The identity does not retain a `ScpIdentity` (external/load-only handles)
 /// - The identity does not retain a `DidDocument`
 /// - The identity has no custody provider (no signing capability)
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 #[allow(clippy::type_complexity)]
 fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity, ScpError> {
     use scp_ffi_common::server::ConcreteDidMethod;
@@ -708,12 +708,12 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
     })
 }
 
-/// Fallback for builds without `allow_in_memory_custody`: always returns an
+/// Fallback for builds without `testing`: always returns an
 /// error because node identity portability requires custody access.
-#[cfg(not(feature = "allow_in_memory_custody"))]
+#[cfg(not(feature = "testing"))]
 fn build_node_identity_from_uniffi(_id: &Identity) -> Result<server::NodeIdentity, ScpError> {
     Err(ScpError::Identity {
-        msg: "node identity portability requires the \"allow_in_memory_custody\" \
+        msg: "node identity portability requires the \"testing\" \
               feature — production mobile builds should use platform custody \
               with IdentitySource::Persisted on NodeConfig directly"
             .to_owned(),
@@ -985,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn node_in_memory_with_identity_uses_provided_did() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let identity = rt()
@@ -1013,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn node_local_with_identity_uses_provided_did() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let identity = rt()

@@ -4,7 +4,7 @@
 //! classes so TypeScript tests can prove real encrypt-decrypt roundtrips
 //! through the entire protocol stack (MLS + sender keys + `ContextManager`).
 //!
-//! Feature-gated behind `allow_in_memory_custody` -- never compiled into
+//! Feature-gated behind `testing` -- never compiled into
 //! production builds.
 
 use scp_ffi_common::error_codes as codes;
@@ -34,7 +34,7 @@ use crate::runtime::NapiBridgeInstance;
 //
 // A module-local `OnceLock<Mutex<Option<FullStackNetwork>>>` is simpler
 // AND sufficient: fullstack nodes are feature-gated behind
-// `allow_in_memory_custody`, only ever reached from the test harness,
+// `testing`, only ever reached from the test harness,
 // and the `KeyExchange` they share is unrelated to bridge-instance
 // lifecycle (no handle-affinity, no shutdown hooks). Resetting the
 // network between runs still works via `fullstack_reset_network`.

@@ -126,7 +126,7 @@ ALLOWLIST=(
     # NETWORK: function-local `static NETWORK: OnceLock<Mutex<Option<FullStackNetwork>>>`
     # in crates/scp-ffi/napi/src/testing.rs — process-global by necessity for the
     # cross-test-file full-stack harness. The `testing` module is feature-gated
-    # behind `allow_in_memory_custody` in lib.rs (`#[cfg(feature = "allow_in_memory_custody")] pub mod testing;`)
+    # behind `testing` in lib.rs (`#[cfg(feature = "testing")] pub mod testing;`)
     # and is never compiled into production builds. See the doc-comment on the
     # declaration itself for the full rationale (PR #1699 review follow-up).
     NETWORK

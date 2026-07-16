@@ -686,9 +686,9 @@ mod tests {
     /// `did:dht:` prefix using the real `scp-core` identity stack.
     ///
     /// Conformance: identity bridge must produce a valid, self-certifying DID.
-    /// Requires the `allow_in_memory_custody` feature.
+    /// Requires the `testing` feature.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn identity_create_in_memory_produces_did_dht_prefix() {
         let rt = runtime();
         let result = rt.block_on(scp_test().identity_create("in_memory".to_owned(), None));
@@ -701,12 +701,12 @@ mod tests {
     }
 
     /// Verifies that `identity_create("in_memory")` is rejected when the
-    /// `allow_in_memory_custody` feature is NOT enabled, returning
+    /// `testing` feature is NOT enabled, returning
     /// `ScpError::Identity` with code `SCP-IDENT-1008`.
     ///
     /// See GitHub issue #88 — acceptance criterion 2.
     #[test]
-    #[cfg(not(feature = "allow_in_memory_custody"))]
+    #[cfg(not(feature = "testing"))]
     fn identity_create_in_memory_rejected_without_feature() {
         let rt = runtime();
         let result = rt.block_on(scp_test().identity_create("in_memory".to_owned(), None));
@@ -719,9 +719,7 @@ mod tests {
                 );
             }
             Ok(_) => {
-                panic!(
-                    "identity_create(\"in_memory\") should fail without allow_in_memory_custody feature"
-                );
+                panic!("identity_create(\"in_memory\") should fail without testing feature");
             }
             Err(other) => {
                 panic!("expected ScpError::Identity with SCP-IDENT-1008, got: {other:?}");
@@ -733,9 +731,9 @@ mod tests {
     /// with a non-empty context ID.
     ///
     /// Conformance: context bridge must produce an active handle on creation.
-    /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
+    /// Requires the `testing` feature (needs in-memory identity).
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_create_returns_active_context() {
         let rt = runtime();
         let scp = scp_test();
@@ -782,9 +780,9 @@ mod tests {
     ///
     /// Conformance: subscribe bridge must accept a callback interface and
     /// signal completion without panicking.
-    /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
+    /// Requires the `testing` feature (needs in-memory identity).
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_subscribe_accepts_mock_listener() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -851,9 +849,9 @@ mod tests {
     ///
     /// Skipped outside nextest — see the in-body note on `HANDLE_COUNT` process
     /// isolation.
-    /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
+    /// Requires the `testing` feature (needs in-memory identity).
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn handle_count_tracks_live_opaque_objects() {
         // HANDLE_COUNT is a process-global counter. These relative-delta assertions are
         // only sound when this test has the process to itself — i.e. under nextest's

@@ -163,7 +163,7 @@ impl Scp {
     /// wraps [`UniffiBridgeInstance::new_uniffi`] (the internal in-memory
     /// builder) — an explicit dev/test selection, NOT a silent default
     /// (spec §17.6).
-    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_in_memory_for_test() -> Arc<Self> {
         increment_handle_count();

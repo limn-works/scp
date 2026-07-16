@@ -86,18 +86,31 @@ pub const IDENT_1013: &str = "SCP-IDENT-1013";
 /// length wrong for the declared key type, or decoded bytes that fail
 /// curve-point validation.
 pub const IDENT_1014: &str = "SCP-IDENT-1014";
-/// Device attestation feature unavailable.
+/// Device attestation unavailable — no production backend wired yet.
 ///
-/// Surfaced by the Python SDK shim when the `PyO3` extension was built
-/// without the `allow_in_memory_custody` feature: the `identity_attest_device`
-/// method is not exposed on the native bridge.
+/// Surfaced by the shipped (no-`testing`) device-attestation *attest* surface
+/// on every bridge — the `PyO3` `identity_attest_device` method, the NAPI
+/// `identity_attest_device` method, the `UniFFI` `identity_attest_device_impl`
+/// (dispatched from `Scp::identity_attest_device`), and the Python SDK shim.
+/// Each resolves the identity against its instance registry, then fails closed:
+/// no production device-attestation backend is wired yet. Apple App Attest /
+/// Google Play Integrity are hardware/platform-backed and are intentionally
+/// deferred (with hardware keychain custody) until an e2e-driven integration
+/// lands. Per spec §9:187 device attestation is an optional trust signal whose
+/// absence is expected and non-penalizing, so this is an honest-absent error,
+/// not a silently-valid attestation. See ADR-025 and #2171.
 pub const IDENT_1015: &str = "SCP-IDENT-1015";
-/// Device attestation verification feature unavailable.
+/// Device attestation verification unavailable — no production backend wired yet.
 ///
-/// Surfaced by the Python SDK shim when the `PyO3` extension was built
-/// without the `allow_in_memory_custody` feature: the
-/// `identity_verify_device_attestation` method is not exposed on the
-/// native bridge.
+/// Surfaced by the shipped (no-`testing`) device-attestation *verify* surface
+/// on every bridge — the `PyO3` `identity_verify_device_attestation` free
+/// `#[pyfunction]`, the NAPI `identity_verify_device_attestation` method, the
+/// `UniFFI` `identity_verify_device_attestation_impl` (dispatched from the
+/// `identity_verify_device_attestation` free fn), and the Python SDK shim.
+/// Each fails closed: no production device-attestation backend is wired yet
+/// (App Attest / Play Integrity are hardware/platform-backed and intentionally
+/// deferred with hardware keychain custody). Returns this honest-absent error
+/// rather than a silently-valid result (spec §9:187). See ADR-025 and #2171.
 pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// Operation requires retained signing custody, which this identity/handle
 /// lacks.
@@ -237,6 +250,22 @@ pub const IDENT_1057: &str = "SCP-IDENT-1057";
 /// registry-miss code) so SDK consumers can tell a DHT-init failure apart from
 /// an identity that was never registered on this bridge.
 pub const IDENT_1058: &str = "SCP-IDENT-1058";
+
+/// No production pre-rotation custody backend is available (FAIL CLOSED).
+///
+/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) and `scp-node`
+/// when a production identity-creation path is invoked on a shipped (no-`testing`)
+/// build. Every identity commits a pre-rotation commitment at creation (spec
+/// §9.7.4.1 §3 — mandatory), which requires a `PreRotationCustody` backend; the
+/// only implementation that exists today is the in-memory test nullifier
+/// (`InMemoryPreRotationCustody`), now gated to the test harness only (ADR-062
+/// §Decision 6). Rather than silently mint the nullifier (which would ship a
+/// false durability guarantee — CLAUDE.md builder tenet "No dev/test-only
+/// stand-ins in production"), creation fails closed with this typed code. Maps
+/// from [`scp_identity::IdentityError::NoPreRotationBackend`]. A real, persistent
+/// pre-rotation backend is tracked by #1729 / RFC #2130; non-committing creation
+/// (Option A) is out of scope (Discussion #1553).
+pub const IDENT_1059: &str = "SCP-IDENT-1059";
 
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)

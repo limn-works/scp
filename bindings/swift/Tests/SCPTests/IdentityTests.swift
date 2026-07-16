@@ -7,7 +7,7 @@ import XCTest
 // UniFFI bridge, dropping the retained in-memory identity state for a DID.
 // These exercise the full create -> remove lifecycle against a real
 // `SCP()` instance (the test suite links the Rust binary built with
-// `allow_in_memory_custody`).
+// `testing`).
 final class IdentityTests: XCTestCase {
     // Implicitly unwrapped because XCTest `setUp` initializes it before any
     // test method runs — the XCTest lifecycle guarantees non-nil.

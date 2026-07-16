@@ -240,13 +240,13 @@ pub struct UniffiBridgeInstance {
     /// default that the earlier `OnceLock` path backed).
     ///
     /// Typed to [`UniffiKeyCustody`](crate::bridge::UniffiKeyCustody) — an
-    /// enum over the callback (production) and in-memory (`allow_in_memory_custody`,
+    /// enum over the callback (production) and in-memory (`testing`,
     /// dev/desktop) backends — so the registry, the accessor, and the
     /// `scpid_sign` / `identity_create_link_attestation` / `identity_remove*`
     /// ops that read it exist in BARE production builds (matching the `PyO3` and
     /// napi bridges, whose registries are likewise custody-enum-typed). The
     /// previous in-memory-typed field forced those production ops behind the
-    /// `allow_in_memory_custody` gate, silently dropping them from the released
+    /// `testing` gate, silently dropping them from the released
     /// Swift/Kotlin SDKs.
     ///
     /// Cleared on shutdown — dropping the `Arc<UniffiKeyCustody>` values

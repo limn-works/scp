@@ -120,7 +120,7 @@ impl CrossContextSagaSeal {
 /// forge a token to call replay without a real restore. A dedicated-feature-
 /// gated `Self::for_test` (behind the `saga-witness-test-mint` cargo feature,
 /// which NO crate's non-dev `[dependencies]` enables — not even `testing`, so it
-/// cannot reach any production / `allow_in_memory_custody` build) exists ONLY for
+/// cannot reach any production or bridge-`testing` build) exists ONLY for
 /// the saga-FSM integration suites in `crates/scp-runtime/tests/`, which drive
 /// replay in isolation over a harness with no persistence provider to restore
 /// from. The `ids` payload doubles as the public restored-id result returned by
@@ -153,8 +153,8 @@ impl RestoredContexts {
     ///
     /// Gated behind the dedicated `saga-witness-test-mint` cargo feature, which
     /// NO crate's non-dev `[dependencies]` enables — in particular it is NOT
-    /// implied by `testing`, so it cannot leak into an `allow_in_memory_custody`
-    /// build via the `scp-ffi → dep:scp-testing → scp-core{testing} →
+    /// implied by `testing`, so it cannot leak into a bridge `testing`
+    /// build via the `scp-ffi/testing → dep:scp-testing → scp-core/testing →
     /// scp-runtime/testing` chain. It is enabled only by the `required-features`
     /// of the two `actor_saga_*` integration test targets. A production caller
     /// therefore physically cannot forge the restore-ran witness, preserving the
@@ -14268,7 +14268,7 @@ impl Supervisor {
     /// then because it is `testing`-gated (never in a production build), has no
     /// FFI wrapper, and is reachable only by in-process `Arc<Supervisor>` callers
     /// (the full-stack harness), so no untrusted or cross-process caller can drive
-    /// it even in the `allow_in_memory_custody` build the tripwires use.
+    /// it even in the `testing` build the tripwires use.
     ///
     /// # Errors
     ///
@@ -14348,8 +14348,8 @@ impl Supervisor {
     /// `authorizing_role_state` does. This is an AUTHORITY-ESCALATION primitive,
     /// so it is gated behind the dedicated `outlet-capability-test-grant`
     /// feature — deliberately NOT `testing`, which leaks into every
-    /// `allow_in_memory_custody` bridge build and would compile the primitive
-    /// into a custody-escape-hatch binary. The dedicated feature is enabled ONLY
+    /// bridge test build and would compile the primitive
+    /// into a test-harness binary. The dedicated feature is enabled ONLY
     /// by the outlet-stream live-flow test, and the seam has ZERO FFI/SDK
     /// exports (only that test calls it).
     ///

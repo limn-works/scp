@@ -1201,7 +1201,7 @@ mod tests {
     // This test verifies the registry correctly distinguishes different DIDs.
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[test]
     fn identity_registry_returns_correct_identity_for_different_dids() {
         use std::sync::Arc;
@@ -1322,7 +1322,7 @@ mod tests {
         runtime::remove_identity(&bi, &did_b);
     }
 
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[test]
     fn remove_identity_cleans_up_registry() {
         use std::sync::Arc;
@@ -1383,7 +1383,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[test]
     fn remove_identity_if_present_returns_correct_bool() {
         use std::sync::Arc;

@@ -123,6 +123,9 @@ check-bridge-symmetry.sh, bridge-aliases.json, ffi-export-allowlist.json,
 check-call-invariants.py, call-invariants-baseline.json,
 check-pure-helpers.sh, pure-helpers-allowlist.txt,
 bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
+check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
+feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
+features only, ZERO nullifier exceptions),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 If a check fails, fix the code. The only legitimate modifications are:
@@ -226,7 +229,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 - Verify against the PUSHED REMOTE branch (`git show origin/branch:file`), never the local working directory. Local state may be on a different branch.
 - For type deletions: `grep -c "struct TypeName" <file>` must return 0.
 - For imports: `grep -c "scp_protocol::module" <file>` must return >0.
-- Run the exact CI clippy command with ALL features before pushing: `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings`
+- Run the exact CI clippy command with ALL features before pushing: `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing -- -D warnings`
 - If a cherry-pick resolves to "nothing to commit," the changes DID NOT LAND. Investigate.
 - Never say "done" without showing verification output.
 

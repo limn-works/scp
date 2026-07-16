@@ -733,7 +733,7 @@ public extension SCP {
     ///
     /// `testingSeed` is a testing-only parameter for the ADR-046
     /// cross-bridge parity harness; pass `nil` from production callers
-    /// (the `allow_in_memory_custody` in-memory path uses OS RNG when
+    /// (the `testing` in-memory path uses OS RNG when
     /// `testingSeed` is `nil`). A non-`nil` `testingSeed` is only valid
     /// for `custody == "in_memory"`; other custody types reject it with
     /// `SCP-VALID-7009`.

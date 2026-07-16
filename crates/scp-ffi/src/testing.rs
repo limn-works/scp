@@ -20,7 +20,7 @@
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice E (#1549).
 //!
-//! Feature-gated behind `allow_in_memory_custody` -- never compiled into
+//! Feature-gated behind `testing` -- never compiled into
 //! production builds.
 
 use std::collections::HashMap;
@@ -640,7 +640,7 @@ mod handle_affinity_tests {
     /// The fix adds `pyscp_check_handle!` as the first statement; this
     /// test would regress if a future refactor removes it.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn fullstack_helpers_reject_cross_instance_node() {
         // Two separate bridge instances with distinct ids. `new_py()`
         // assigns monotonic, process-unique ids so the instances have
@@ -768,7 +768,7 @@ mod handle_affinity_tests {
     /// affinity check runs BEFORE any of that). A deliberate mismatch
     /// sanity-checks that the test is actually testing what it claims.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn fullstack_helpers_accept_same_instance_node() {
         let bi_arc = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
         let bi = &*bi_arc;

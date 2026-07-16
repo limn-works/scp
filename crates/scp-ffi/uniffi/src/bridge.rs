@@ -35,7 +35,10 @@ use scp_clock::Clock;
 // The DHT client the UniFFI bridge runs over is the SHARED
 // `scp_ffi_common::dht::FfiDhtClient` enum (ADR-062 §Decision 1): the real
 // Mainline Pkarr client in a shipped build, with an in-memory test-double arm
-// compiled only under `testing`. `DhtClient` is the publish/resolve trait.
+// compiled only under `testing`. `DhtClient` is the publish/resolve trait —
+// only named by the testing-gated DID-document publish helper (production
+// create fails closed before publishing, ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 use scp_dht::DhtClient;
 // `InMemoryDhtClient` is the §17.17.3 DHT nullifier. Since the cfg-gated DHT
 // construction is now hoisted into `scp_ffi_common::dht::build_ffi_dht_client`,
@@ -44,14 +47,19 @@ use scp_dht::DhtClient;
 #[cfg(test)]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
+// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` are named only by the
+// testing-gated DID-resolver-init and DHT-signer helpers (production create
+// fails closed before resolver init — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
+#[cfg(feature = "testing")]
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 use scp_did::DidDocument as CoreDidDocument;
 use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
@@ -128,13 +136,13 @@ type OutletHandlerMap = std::collections::HashMap<
 /// Wrapper for [`InMemoryKeyCustody`] that implements [`Debug`] with a
 /// redacted representation, preventing key material from appearing in logs.
 ///
-/// Only available when the `allow_in_memory_custody` feature is enabled.
+/// Only available when the `testing` feature is enabled.
 /// Production mobile builds (iOS/Android) MUST NOT enable this feature.
 /// See GitHub issue #88 and ADR-006.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) InMemoryKeyCustody);
 
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("InMemoryKeyCustody([redacted])")
@@ -155,7 +163,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// forwarded so the in-memory backend's real implementations (used by
 /// `migrate_identity`) are preserved rather than silently falling back to the
 /// `Unsupported` defaults.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 impl KeyCustody for OpaqueInMemoryKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         self.0.generate_keypair(key_type).await
@@ -241,6 +249,10 @@ impl KeyCustody for OpaqueInMemoryKeyCustody {
 /// `remove_agent_key`, `identity_migrate` in-memory arm,
 /// `identity_migrate` callback arm, `identity_create_with_custody`,
 /// `identity_create_with_agent_key`) delegate here.
+// Only reached from the testing-gated identity create/rotate/migrate paths
+// (production create fails closed before any custody signing — ADR-062
+// §Decision 6).
+#[cfg(feature = "testing")]
 async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle) -> Option<String> {
     custody
         .public_key(key)
@@ -266,6 +278,24 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpError> {
     })
 }
 
+/// Fail-closed error for a production identity-creation / rotation / migration
+/// path when no real pre-rotation custody backend is available (ADR-062
+/// §Decision 6).
+///
+/// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
+/// §3 — mandatory), which requires a `PreRotationCustody` backend. The only
+/// implementation is the test-harness `InMemoryPreRotationCustody` nullifier, so
+/// a shipped (no-`testing`) build returns this typed [`codes::IDENT_1059`] error
+/// rather than silently minting the nullifier. Mirrors the `PyO3` reference
+/// bridge's `no_pre_rotation_backend` helper.
+#[cfg(not(feature = "testing"))]
+fn no_pre_rotation_backend() -> ScpError {
+    ScpError::Identity {
+        msg: IdentityError::NoPreRotationBackend.to_string(),
+        code: codes::IDENT_1059.to_owned(),
+    }
+}
+
 /// Selects the DHT client that key-rotation / agent-key / migration operations
 /// should publish their UPDATED DID document into, **failing closed**.
 ///
@@ -284,6 +314,10 @@ pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpError> {
 /// somehow absent, a typed error is strictly better than fabricating a throwaway
 /// client (and, in a shipped build, the in-memory arm does not even exist).
 /// Mirrors the `PyO3` bridge's `rotation_publish_client`.
+///
+/// Only reached from the testing-gated identity create/rotate/migrate paths
+/// (production create fails closed first — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 fn rotation_publish_client(
     bi: &crate::runtime::UniffiBridgeInstance,
 ) -> Result<Arc<FfiDhtClient>, ScpError> {
@@ -303,7 +337,7 @@ fn rotation_publish_client(
 ///
 /// Generic over the custody backend so it works for both production callback
 /// custody ([`UniffiKeyCustody::Callback`], Secure Enclave / Android Keystore)
-/// and — in `allow_in_memory_custody` builds — the in-memory dev custody
+/// and — in `testing` builds — the in-memory dev custody
 /// ([`OpaqueInMemoryKeyCustody`] and [`UniffiKeyCustody::InMemory`]). Private
 /// key material never crosses the FFI boundary (ADR-006): the closure only
 /// returns signature bytes.
@@ -319,6 +353,9 @@ fn rotation_publish_client(
 /// client the resolver reads from — NOT a fresh per-call client, which would let
 /// the re-published document land somewhere the resolver never sees, silently
 /// defeating rotation's revocation purpose.
+// Only reached from the testing-gated identity rotate/agent-key/migrate paths
+// (production create fails closed first — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer<C: KeyCustody + Send + Sync + 'static>(
     custody: &Arc<C>,
@@ -366,6 +403,10 @@ fn make_dht_with_signer<C: KeyCustody + Send + Sync + 'static>(
 ///
 /// Mirrors the `PyO3` bridge's `publish_to_resolver_dht_for` and the NAPI
 /// bridge's `publish_to_shared_dht_for`.
+///
+/// Only reached from the testing-gated identity-create paths (production create
+/// fails closed before publishing — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
     bi: &crate::runtime::UniffiBridgeInstance,
     identity: &ScpIdentity,
@@ -431,7 +472,7 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
 /// unaddressable with no surfaced error.
 ///
 /// Custody resolution order: platform/software callback custody first, then
-/// (only in `allow_in_memory_custody` builds) the retained in-memory custody.
+/// (only in `testing` builds) the retained in-memory custody.
 /// Failures carry the cross-bridge contract codes: missing key material →
 /// `IDENT_1054`, derivation failure → `IDENT_1055`, custody unavailable in
 /// this build → `IDENT_1056`, wrong public-key length → `IDENT_1057`.
@@ -461,7 +502,7 @@ async fn derive_member_pseudonym_required(
                 code: codes::IDENT_1055.to_owned(),
             })?
     } else {
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         {
             let imc = identity
                 .in_memory_custody
@@ -480,7 +521,7 @@ async fn derive_member_pseudonym_required(
                     code: codes::IDENT_1055.to_owned(),
                 })?
         }
-        #[cfg(not(feature = "allow_in_memory_custody"))]
+        #[cfg(not(feature = "testing"))]
         {
             return Err(ScpError::Identity {
                 msg: "pseudonym derivation requires custody — not available in \
@@ -507,7 +548,7 @@ async fn derive_member_pseudonym_required(
 /// the HOW so the create, join, and import paths cannot drift apart (matching
 /// the NAPI bridge's `announce_pseudonym_best_effort`). It runs over the
 /// retained callback custody (OS-keychain/HSM, production), falling back to the
-/// `allow_in_memory_custody`-gated in-memory custody only in test builds. Best
+/// `testing`-gated in-memory custody only in test builds. Best
 /// effort: a sign-only custody that cannot export raw signing bytes simply
 /// skips, and peers recover on the announcer's next explicit announcement. Never
 /// panics — a missing key or a dropped reply is swallowed.
@@ -523,7 +564,7 @@ async fn announce_pseudonym_best_effort(
                 .await
                 .ok()
         } else {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             {
                 if let Some(ref custody) = identity.in_memory_custody {
                     custody
@@ -535,7 +576,7 @@ async fn announce_pseudonym_best_effort(
                     None
                 }
             }
-            #[cfg(not(feature = "allow_in_memory_custody"))]
+            #[cfg(not(feature = "testing"))]
             {
                 None
             }
@@ -570,7 +611,7 @@ async fn announce_pseudonym_best_effort(
 ///
 /// Resolution order mirrors [`derive_member_pseudonym_required`] and
 /// [`announce_pseudonym_best_effort`]: production callback custody (Secure
-/// Enclave / Android Keystore) first, then — only in `allow_in_memory_custody`
+/// Enclave / Android Keystore) first, then — only in `testing`
 /// builds — the retained in-memory custody. Returns `None` for an
 /// externally-loaded DID-string-only handle (no retained key material), so the
 /// caller can fail closed with the appropriate cross-bridge error code.
@@ -582,7 +623,7 @@ fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>
     if let Some(ref cb) = identity.callback_custody {
         return Some(Arc::new(UniffiKeyCustody::Callback(Arc::clone(cb))));
     }
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     {
         if let Some(ref imc) = identity.in_memory_custody {
             return Some(Arc::new(UniffiKeyCustody::InMemory(Arc::clone(imc))));
@@ -598,7 +639,7 @@ fn resolve_identity_custody(identity: &Identity) -> Option<Arc<UniffiKeyCustody>
 /// Resolution order mirrors [`resolve_identity_custody`] (and the handle's own
 /// `resolve_uniffi_signing_key` / `sign_export_snapshot_via_custody`): the
 /// `ContextHandle`'s production callback custody (Secure Enclave / Android
-/// Keystore) first, then — only in `allow_in_memory_custody` builds — the
+/// Keystore) first, then — only in `testing` builds — the
 /// retained in-memory custody. Returns `None` for an externally-loaded handle
 /// that retains no custody (all custody fields `None`), so the caller fails
 /// closed with [`codes::IDENT_1017`].
@@ -612,7 +653,7 @@ fn resolve_context_custody(handle: &ContextHandle) -> Option<Arc<UniffiKeyCustod
     if let Some(ref cc) = handle.callback_custody {
         return Some(Arc::new(UniffiKeyCustody::Callback(Arc::clone(cc))));
     }
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     {
         if let Some(ref imc) = handle.in_memory_custody {
             return Some(Arc::new(UniffiKeyCustody::InMemory(Arc::clone(imc))));
@@ -885,7 +926,7 @@ impl CallbackKeyCustody {
 // `identity_remove*`) can re-derive public keys and re-sign without the caller
 // re-passing an `Identity` handle. Production identities are
 // callback-custody-backed (Secure Enclave / Android Keystore via the injected
-// `KeyCustodyProvider`); only dev/desktop builds with `allow_in_memory_custody`
+// `KeyCustodyProvider`); only dev/desktop builds with `testing`
 // use `InMemoryKeyCustody`.
 //
 // `KeyCustody` uses RPITIT (return-position `impl Trait` in trait) and is NOT
@@ -896,7 +937,7 @@ impl CallbackKeyCustody {
 //
 // The variants hold `Arc<…>` so registration shares the SAME custody instance
 // the `Identity` handle already retains (no second key store, no divergence).
-// The `InMemory` variant — and its match arms — are `allow_in_memory_custody`-
+// The `InMemory` variant — and its match arms — are `testing`-
 // gated; production builds carry only `Callback`. See ADR-006.
 // ---------------------------------------------------------------------------
 
@@ -904,14 +945,14 @@ impl CallbackKeyCustody {
 /// identity custody registry.
 ///
 /// Production identities route to [`Self::Callback`] (an injected
-/// `KeyCustodyProvider`); dev/desktop builds with `allow_in_memory_custody`
+/// `KeyCustodyProvider`); dev/desktop builds with `testing`
 /// also carry [`Self::InMemory`]. Private key material never crosses the FFI
 /// boundary (ADR-006) — only public keys and signatures are returned.
 pub(crate) enum UniffiKeyCustody {
     /// Test/development in-memory custody. Keys are lost on process exit.
-    /// Available only when `allow_in_memory_custody` is enabled. Production
+    /// Available only when `testing` is enabled. Production
     /// mobile builds MUST NOT enable this feature (ADR-006).
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     InMemory(Arc<OpaqueInMemoryKeyCustody>),
     /// Production callback custody backed by the injected
     /// [`KeyCustodyProvider`](crate::KeyCustodyProvider) (Secure Enclave /
@@ -922,7 +963,7 @@ pub(crate) enum UniffiKeyCustody {
 impl fmt::Debug for UniffiKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(_) => f.write_str("UniffiKeyCustody::InMemory([redacted])"),
             Self::Callback(_) => f.write_str("UniffiKeyCustody::Callback([platform])"),
         }
@@ -932,7 +973,7 @@ impl fmt::Debug for UniffiKeyCustody {
 impl KeyCustody for UniffiKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_keypair(key_type).await,
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
         }
@@ -940,7 +981,7 @@ impl KeyCustody for UniffiKeyCustody {
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.sign(key, data).await,
             Self::Callback(kc) => kc.sign(key, data).await,
         }
@@ -948,7 +989,7 @@ impl KeyCustody for UniffiKeyCustody {
 
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.public_key(key).await,
             Self::Callback(kc) => kc.public_key(key).await,
         }
@@ -956,7 +997,7 @@ impl KeyCustody for UniffiKeyCustody {
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.destroy_key(key).await,
             Self::Callback(kc) => kc.destroy_key(key).await,
         }
@@ -968,7 +1009,7 @@ impl KeyCustody for UniffiKeyCustody {
         peer_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.dh_agree(key, peer_public).await,
             Self::Callback(kc) => kc.dh_agree(key, peer_public).await,
         }
@@ -980,7 +1021,7 @@ impl KeyCustody for UniffiKeyCustody {
         context_id: &[u8],
     ) -> Result<PseudonymKeypair, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.derive_pseudonym(key, context_id).await,
             Self::Callback(kc) => kc.derive_pseudonym(key, context_id).await,
         }
@@ -993,7 +1034,7 @@ impl KeyCustody for UniffiKeyCustody {
         pseudonym_epoch: u64,
     ) -> Result<PseudonymKeypair, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
                 kc.0.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
                     .await
@@ -1011,7 +1052,7 @@ impl KeyCustody for UniffiKeyCustody {
         peer_x25519_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
                 kc.0.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
@@ -1025,7 +1066,7 @@ impl KeyCustody for UniffiKeyCustody {
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.custody_type(key),
             Self::Callback(kc) => kc.custody_type(key),
         }
@@ -1035,7 +1076,7 @@ impl KeyCustody for UniffiKeyCustody {
         &self,
     ) -> Result<zeroize::Zeroizing<[u8; 32]>, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_ephemeral_ed25519_seed().await,
             Self::Callback(kc) => kc.generate_ephemeral_ed25519_seed().await,
         }
@@ -1046,7 +1087,7 @@ impl KeyCustody for UniffiKeyCustody {
         seed: &zeroize::Zeroizing<[u8; 32]>,
     ) -> Result<KeyHandle, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.import_ed25519_signing_key(seed).await,
             Self::Callback(kc) => kc.import_ed25519_signing_key(seed).await,
         }
@@ -2472,7 +2513,7 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for ReconnectReport {
 ///
 /// - **In-memory custody** (dev/desktop): retained `InMemoryKeyCustody`
 ///   with key material in heap memory. Only available when the
-///   `allow_in_memory_custody` feature is enabled.
+///   `testing` feature is enabled.
 /// - **Platform/Software custody** (production mobile): retained
 ///   `CallbackKeyCustody` adapter wrapping the injected
 ///   [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private
@@ -2503,9 +2544,9 @@ pub struct Identity {
     /// Retained `InMemoryKeyCustody` for in-memory custody paths.
     ///
     /// Key material lives here. Dropping this destroys all private keys.
-    /// Only available when `allow_in_memory_custody` is enabled.
+    /// Only available when `testing` is enabled.
     #[allow(dead_code)]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
     /// Retained [`CallbackKeyCustody`] for platform/software custody paths.
     ///
@@ -2533,7 +2574,13 @@ pub struct Identity {
     /// `remove_agent_key`, migrate) can reach the per-instance shared DHT
     /// client and resolver cache. Mirrors the NAPI bridge's `bi` field.
     ///
+    /// Only READ by the mutable identity methods, which all fail closed on a
+    /// shipped (no-`testing`) build before consulting it (ADR-062 §Decision 6),
+    /// so it is written-but-unread there — hence the conditional `dead_code`
+    /// allowance. It remains a production field (written by `identity_load`).
+    ///
     /// Rust-internal field — NOT exposed through `#[uniffi::export]`.
+    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
     pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// JSON-serialized `scp_did::DidRotationEvent` produced when this
     /// handle was minted by [`Scp::identity_migrate`]. SDK callers MUST
@@ -2542,7 +2589,7 @@ pub struct Identity {
     /// `rotate_key`, agent-key ops, or external load — those do not
     /// change the DID, so no `DidRotationEvent` is constructed.
     pub(crate) rotation_event_json: Option<String>,
-    /// Opaque handle into [`pre_rotation_custody`](Self::pre_rotation_custody)
+    /// Opaque handle into the pre-rotation custody (`pre_rotation_custody`)
     /// for the pre-rotation key whose SHA-256 hash equals the
     /// `pre_rotation_commitment` retained on `core_id`.
     ///
@@ -2560,13 +2607,20 @@ pub struct Identity {
     /// Cold-storage custody for the pre-rotation key referenced by
     /// [`pre_rotation_handle`](Self::pre_rotation_handle).
     ///
+    /// TEST-HARNESS ONLY (`#[cfg(feature = "testing")]`, ADR-062 §Decision 6):
+    /// the sole `PreRotationCustody` implementation is the in-memory
+    /// `InMemoryPreRotationCustody` nullifier, which the `testing` feature
+    /// severs from every production line. On a shipped (no-`testing`) build the
+    /// create funnels fail closed with [`codes::IDENT_1059`] BEFORE any
+    /// `Identity` is constructed, so no production handle ever carries this
+    /// field — hence it is gated out of the bare build entirely.
+    ///
     /// The same `Arc` is preserved across all migrations of this identity
-    /// (per ADR-003 §4b). Production custody migration is a follow-up
-    /// workstream; the in-memory testing backend is sufficient for the
-    /// dev/desktop and parity-test paths exercised today.
+    /// (per ADR-003 §4b).
     ///
     /// Rust-internal field — NOT exposed through `#[uniffi::export]`.
     #[allow(dead_code)]
+    #[cfg(feature = "testing")]
     pub(crate) pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
@@ -2640,121 +2694,137 @@ impl Identity {
     /// or if no custody provider is available.
     ///
     /// See SCP-214 acceptance criterion 9.
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // Phase D (#1695): lifecycle gate deleted along with
-        // `DEFAULT_BRIDGE_INSTANCE`. The handle's own custody `Arc` keeps
-        // the signing key material alive; DID resolver state is now owned
-        // per-`Scp` (via `UniffiBridgeInstance`) and no longer process-wide.
-        let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
-            msg: "key rotation requires retained crypto state — this identity \
+        // FAIL CLOSED on a shipped build (ADR-062 §Decision 6, IDENT_1059): the
+        // rebuilt handle carries the test-harness-only `pre_rotation_custody`
+        // field, which the `testing` feature severs from production. No identity
+        // can be created in a bare build (every create funnel fails closed
+        // first), so this rotation path is unreachable; it declines with a typed
+        // error rather than referencing the severed nullifier. See PyO3
+        // `identity_rotate_key`.
+        #[cfg(not(feature = "testing"))]
+        {
+            let _ = &self;
+            Err::<Arc<Self>, ScpError>(no_pre_rotation_backend())
+        }
+        #[cfg(feature = "testing")]
+        {
+            // Phase D (#1695): lifecycle gate deleted along with
+            // `DEFAULT_BRIDGE_INSTANCE`. The handle's own custody `Arc` keeps
+            // the signing key material alive; DID resolver state is now owned
+            // per-`Scp` (via `UniffiBridgeInstance`) and no longer process-wide.
+            let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
+                msg: "key rotation requires retained crypto state — this identity \
                       was loaded without key material (use identity_create or \
                       identity_create_with_custody)"
-                .to_owned(),
-            code: codes::IDENT_1002.to_owned(),
-        })?;
+                    .to_owned(),
+                code: codes::IDENT_1002.to_owned(),
+            })?;
 
-        // Dispatch to the correct custody path.
-        if let Some(ref callback) = self.callback_custody {
-            // Platform/software custody: rotate via CallbackKeyCustody.
-            // `rotate` -> `rotate_active_key` -> `publish_document`, which
-            // requires a signing function bound to the identity custody.
-            // `DidDht::new()` (sign_fn: None) would surface
-            // "no signing function configured"; mirror the in-memory branch.
-            let publish_client = rotation_publish_client(&self.bi)?;
-            let dht = make_dht_with_signer(callback, publish_client);
-            // Bootstrap the BEP44 sequence past the shared DHT's current record
-            // so the rotated document strictly overwrites it — a lower-or-equal
-            // seq is a silent no-op (BEP44 monotonicity). Mirrors PyO3/NAPI.
-            dht.initialize_sequence(&core_id.did)
-                .await
-                .map_err(ScpError::from)?;
-            let (new_identity, new_document) = dht
-                .rotate(core_id, callback.as_ref())
-                .await
-                .map_err(ScpError::from)?;
+            // Dispatch to the correct custody path.
+            if let Some(ref callback) = self.callback_custody {
+                // Platform/software custody: rotate via CallbackKeyCustody.
+                // `rotate` -> `rotate_active_key` -> `publish_document`, which
+                // requires a signing function bound to the identity custody.
+                // `DidDht::new()` (sign_fn: None) would surface
+                // "no signing function configured"; mirror the in-memory branch.
+                let publish_client = rotation_publish_client(&self.bi)?;
+                let dht = make_dht_with_signer(callback, publish_client);
+                // Bootstrap the BEP44 sequence past the shared DHT's current record
+                // so the rotated document strictly overwrites it — a lower-or-equal
+                // seq is a silent no-op (BEP44 monotonicity). Mirrors PyO3/NAPI.
+                dht.initialize_sequence(&core_id.did)
+                    .await
+                    .map_err(ScpError::from)?;
+                let (new_identity, new_document) = dht
+                    .rotate(core_id, callback.as_ref())
+                    .await
+                    .map_err(ScpError::from)?;
 
-            let verifying_key_hex =
-                snapshot_verifying_key_hex(callback.as_ref(), &new_identity.identity_key).await;
+                let verifying_key_hex =
+                    snapshot_verifying_key_hex(callback.as_ref(), &new_identity.identity_key).await;
 
-            // Drop the resolver's stale cached document so the next resolve
-            // serves the rotated `#active` key and rejects the retired one
-            // (AC[6]). The rotated document already landed at a higher BEP44
-            // `seq` in the shared DHT client via `dht.rotate` above.
-            invalidate_resolver_cache(&self.bi, &new_identity.did).await;
+                // Drop the resolver's stale cached document so the next resolve
+                // serves the rotated `#active` key and rejects the retired one
+                // (AC[6]). The rotated document already landed at a higher BEP44
+                // `seq` in the shared DHT client via `dht.rotate` above.
+                invalidate_resolver_cache(&self.bi, &new_identity.did).await;
 
-            let handle = Arc::new(Self {
-                did: new_identity.did.clone(),
-                custody_type: self.custody_type.clone(),
-                core_id: Some(new_identity),
-                core_document: Some(new_document),
-                #[cfg(feature = "allow_in_memory_custody")]
-                in_memory_custody: None,
-                callback_custody: self.callback_custody.clone(),
-                verifying_key_hex,
-                instance_id: self.instance_id,
-                bi: Arc::clone(&self.bi),
-                rotation_event_json: None,
-                // `rotate` (active-signing-key rotation) does NOT mint a new
-                // pre-rotation commitment, so the per-identity pre-rotation
-                // custody and handle are preserved verbatim. Only
-                // `migrate_identity` (DID rotation) consumes the existing
-                // pre-rotation handle and produces a fresh one.
-                pre_rotation_handle: self.pre_rotation_handle,
-                pre_rotation_custody: Arc::clone(&self.pre_rotation_custody),
-            });
-            increment_handle_count();
-            return Ok(handle);
-        }
+                let handle = Arc::new(Self {
+                    did: new_identity.did.clone(),
+                    custody_type: self.custody_type.clone(),
+                    core_id: Some(new_identity),
+                    core_document: Some(new_document),
+                    #[cfg(feature = "testing")]
+                    in_memory_custody: None,
+                    callback_custody: self.callback_custody.clone(),
+                    verifying_key_hex,
+                    instance_id: self.instance_id,
+                    bi: Arc::clone(&self.bi),
+                    rotation_event_json: None,
+                    // `rotate` (active-signing-key rotation) does NOT mint a new
+                    // pre-rotation commitment, so the per-identity pre-rotation
+                    // custody and handle are preserved verbatim. Only
+                    // `migrate_identity` (DID rotation) consumes the existing
+                    // pre-rotation handle and produces a fresh one.
+                    pre_rotation_handle: self.pre_rotation_handle,
+                    pre_rotation_custody: Arc::clone(&self.pre_rotation_custody),
+                });
+                increment_handle_count();
+                return Ok(handle);
+            }
 
-        #[cfg(feature = "allow_in_memory_custody")]
-        if let Some(ref custody) = self.in_memory_custody {
-            let publish_client = rotation_publish_client(&self.bi)?;
-            let dht = make_dht_with_signer(custody, publish_client);
-            // Bootstrap the BEP44 sequence past the shared DHT's current record
-            // so the rotated document strictly overwrites it (see callback arm).
-            dht.initialize_sequence(&core_id.did)
-                .await
-                .map_err(ScpError::from)?;
-            let (new_identity, new_document) = dht
-                .rotate(core_id, &custody.0)
-                .await
-                .map_err(ScpError::from)?;
+            #[cfg(feature = "testing")]
+            if let Some(ref custody) = self.in_memory_custody {
+                let publish_client = rotation_publish_client(&self.bi)?;
+                let dht = make_dht_with_signer(custody, publish_client);
+                // Bootstrap the BEP44 sequence past the shared DHT's current record
+                // so the rotated document strictly overwrites it (see callback arm).
+                dht.initialize_sequence(&core_id.did)
+                    .await
+                    .map_err(ScpError::from)?;
+                let (new_identity, new_document) = dht
+                    .rotate(core_id, &custody.0)
+                    .await
+                    .map_err(ScpError::from)?;
 
-            let verifying_key_hex =
-                snapshot_verifying_key_hex(&custody.0, &new_identity.identity_key).await;
+                let verifying_key_hex =
+                    snapshot_verifying_key_hex(&custody.0, &new_identity.identity_key).await;
 
-            // Drop the resolver's stale cached document so the next resolve
-            // serves the rotated `#active` key and rejects the retired one
-            // (AC[6]); see the callback-custody branch above.
-            invalidate_resolver_cache(&self.bi, &new_identity.did).await;
+                // Drop the resolver's stale cached document so the next resolve
+                // serves the rotated `#active` key and rejects the retired one
+                // (AC[6]); see the callback-custody branch above.
+                invalidate_resolver_cache(&self.bi, &new_identity.did).await;
 
-            let handle = Arc::new(Self {
-                did: new_identity.did.clone(),
-                custody_type: CustodyMethod::InMemory,
-                core_id: Some(new_identity),
-                core_document: Some(new_document),
-                in_memory_custody: self.in_memory_custody.clone(),
-                callback_custody: None,
-                verifying_key_hex,
-                instance_id: self.instance_id,
-                bi: Arc::clone(&self.bi),
-                rotation_event_json: None,
-                // See note above: active-key rotation preserves the
-                // pre-rotation custody and handle.
-                pre_rotation_handle: self.pre_rotation_handle,
-                pre_rotation_custody: Arc::clone(&self.pre_rotation_custody),
-            });
-            increment_handle_count();
-            return Ok(handle);
-        }
+                let handle = Arc::new(Self {
+                    did: new_identity.did.clone(),
+                    custody_type: CustodyMethod::InMemory,
+                    core_id: Some(new_identity),
+                    core_document: Some(new_document),
+                    in_memory_custody: self.in_memory_custody.clone(),
+                    callback_custody: None,
+                    verifying_key_hex,
+                    instance_id: self.instance_id,
+                    bi: Arc::clone(&self.bi),
+                    rotation_event_json: None,
+                    // See note above: active-key rotation preserves the
+                    // pre-rotation custody and handle.
+                    pre_rotation_handle: self.pre_rotation_handle,
+                    pre_rotation_custody: Arc::clone(&self.pre_rotation_custody),
+                });
+                increment_handle_count();
+                return Ok(handle);
+            }
 
-        Err(ScpError::Identity {
-            msg: "key rotation requires a custody provider — use \
+            Err(ScpError::Identity {
+                msg: "key rotation requires a custody provider — use \
                       identity_create_with_custody() for platform custody or \
                       identity_create(\"in_memory\") for dev/test"
-                .to_owned(),
-            code: codes::IDENT_1002.to_owned(),
-        })
+                    .to_owned(),
+                code: codes::IDENT_1002.to_owned(),
+            })
+        }
     }
 
     /// Returns whether this identity has an agent signing key (`#agent` VM).
@@ -2815,95 +2885,108 @@ impl Identity {
     /// - Key generation or DHT publishing fails
     ///
     /// See ADR-039 acceptance criterion 4.
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn add_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // Phase D (#1695): lifecycle gate deleted — handle's own custody
-        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
-        let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
-            msg: "cannot add agent key to an external/loaded identity \
+        // FAIL CLOSED on a shipped build (ADR-062 §Decision 6, IDENT_1059): the
+        // rebuilt handle carries the test-harness-only `pre_rotation_custody`
+        // field. No identity can exist in a bare build (creates fail closed), so
+        // this path is unreachable; decline with a typed error. See rotate_key.
+        #[cfg(not(feature = "testing"))]
+        {
+            let _ = &self;
+            Err::<Arc<Self>, ScpError>(no_pre_rotation_backend())
+        }
+        #[cfg(feature = "testing")]
+        {
+            // Phase D (#1695): lifecycle gate deleted — handle's own custody
+            // `Arc` keeps state alive; DID resolver is per-`Scp` now.
+            let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
+                msg: "cannot add agent key to an external/loaded identity \
                       without core state — use identity_create first"
-                .to_owned(),
-            code: codes::IDENT_1005.to_owned(),
-        })?;
-        let core_doc = self
-            .core_document
-            .as_ref()
-            .ok_or_else(|| ScpError::Identity {
-                msg: "cannot add agent key without a retained DID document".to_owned(),
+                    .to_owned(),
                 code: codes::IDENT_1005.to_owned(),
             })?;
-        // Resolve custody (callback custody first, in-memory only in dev
-        // builds). Externally-loaded identities with no custody fail closed.
-        let custody = resolve_identity_custody(&self).ok_or_else(|| ScpError::Identity {
-            msg: "cannot add agent key without retained key custody \
+            let core_doc = self
+                .core_document
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "cannot add agent key without a retained DID document".to_owned(),
+                    code: codes::IDENT_1005.to_owned(),
+                })?;
+            // Resolve custody (callback custody first, in-memory only in dev
+            // builds). Externally-loaded identities with no custody fail closed.
+            let custody = resolve_identity_custody(&self).ok_or_else(|| ScpError::Identity {
+                msg: "cannot add agent key without retained key custody \
                       (DHT publish requires a signing key)"
-                .to_owned(),
-            code: codes::IDENT_1008.to_owned(),
-        })?;
+                    .to_owned(),
+                code: codes::IDENT_1008.to_owned(),
+            })?;
 
-        // Clone what we need for the spawned task.
-        let identity_clone = core_id.clone();
-        let doc_clone = core_doc.clone();
-        let did = self.did.clone();
-        let custody_type = self.custody_type.clone();
-        // Carry forward whichever custody the original handle held so the
-        // rebuilt handle keeps working for subsequent ops over the SAME
-        // custody (callback in production, in-memory in dev builds).
-        #[cfg(feature = "allow_in_memory_custody")]
-        let in_memory_custody = self.in_memory_custody.clone();
-        let callback_custody = self.callback_custody.clone();
-        let instance_id = self.instance_id;
-        let bi = Arc::clone(&self.bi);
-        // Agent-key operations don't change the pre-rotation commitment
-        // — preserve the existing handle and custody.
-        let pre_rotation_handle = self.pre_rotation_handle;
-        let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
-        let publish_client = rotation_publish_client(&self.bi)?;
-        let dht = make_dht_with_signer(&custody, publish_client);
+            // Clone what we need for the spawned task.
+            let identity_clone = core_id.clone();
+            let doc_clone = core_doc.clone();
+            let did = self.did.clone();
+            let custody_type = self.custody_type.clone();
+            // Carry forward whichever custody the original handle held so the
+            // rebuilt handle keeps working for subsequent ops over the SAME
+            // custody (callback in production, in-memory in dev builds).
+            #[cfg(feature = "testing")]
+            let in_memory_custody = self.in_memory_custody.clone();
+            let callback_custody = self.callback_custody.clone();
+            let instance_id = self.instance_id;
+            let bi = Arc::clone(&self.bi);
+            // Agent-key operations don't change the pre-rotation commitment
+            // — preserve the existing handle and custody.
+            let pre_rotation_handle = self.pre_rotation_handle;
+            let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
+            let publish_client = rotation_publish_client(&self.bi)?;
+            let dht = make_dht_with_signer(&custody, publish_client);
 
-        runtime()
-            .spawn(async move {
-                // Bootstrap the BEP44 sequence past the shared DHT's current
-                // record so the agent-key-bearing document strictly overwrites
-                // it (see rotate_key). Mirrors PyO3/NAPI.
-                dht.initialize_sequence(&did)
-                    .await
-                    .map_err(ScpError::from)?;
-                let (updated_identity, updated_doc) = dht
-                    .add_agent_key(&identity_clone, &doc_clone, &*custody)
-                    .await
-                    .map_err(ScpError::from)?;
+            runtime()
+                .spawn(async move {
+                    // Bootstrap the BEP44 sequence past the shared DHT's current
+                    // record so the agent-key-bearing document strictly overwrites
+                    // it (see rotate_key). Mirrors PyO3/NAPI.
+                    dht.initialize_sequence(&did)
+                        .await
+                        .map_err(ScpError::from)?;
+                    let (updated_identity, updated_doc) = dht
+                        .add_agent_key(&identity_clone, &doc_clone, &*custody)
+                        .await
+                        .map_err(ScpError::from)?;
 
-                let verifying_key_hex =
-                    snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
+                    let verifying_key_hex =
+                        snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
 
-                // Drop the resolver's stale cached document so the next resolve
-                // serves the new agent key (AC[6]). The updated document already
-                // landed at a higher BEP44 `seq` in the shared DHT client above.
-                invalidate_resolver_cache(&bi, &updated_identity.did).await;
+                    // Drop the resolver's stale cached document so the next resolve
+                    // serves the new agent key (AC[6]). The updated document already
+                    // landed at a higher BEP44 `seq` in the shared DHT client above.
+                    invalidate_resolver_cache(&bi, &updated_identity.did).await;
 
-                let handle = Arc::new(Self {
-                    did,
-                    custody_type,
-                    core_id: Some(updated_identity),
-                    core_document: Some(updated_doc),
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    in_memory_custody,
-                    callback_custody,
-                    verifying_key_hex,
-                    instance_id,
-                    bi,
-                    rotation_event_json: None,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                });
-                increment_handle_count();
-                Ok(handle)
-            })
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("tokio task join error during add_agent_key: {e}"),
-                code: codes::IDENT_1007.to_owned(),
-            })?
+                    let handle = Arc::new(Self {
+                        did,
+                        custody_type,
+                        core_id: Some(updated_identity),
+                        core_document: Some(updated_doc),
+                        #[cfg(feature = "testing")]
+                        in_memory_custody,
+                        callback_custody,
+                        verifying_key_hex,
+                        instance_id,
+                        bi,
+                        rotation_event_json: None,
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    });
+                    increment_handle_count();
+                    Ok(handle)
+                })
+                .await
+                .map_err(|e| ScpError::Identity {
+                    msg: format!("tokio task join error during add_agent_key: {e}"),
+                    code: codes::IDENT_1007.to_owned(),
+                })?
+        }
     }
 
     /// Removes the agent signing key from this identity (ADR-039).
@@ -2920,96 +3003,109 @@ impl Identity {
     /// - DHT publishing fails
     ///
     /// See ADR-039 acceptance criterion 4.
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn remove_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // Phase D (#1695): lifecycle gate deleted — handle's own custody
-        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
-        let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
-            msg: "cannot remove agent key from an external/loaded identity \
+        // FAIL CLOSED on a shipped build (ADR-062 §Decision 6, IDENT_1059): the
+        // rebuilt handle carries the test-harness-only `pre_rotation_custody`
+        // field. No identity can exist in a bare build (creates fail closed), so
+        // this path is unreachable; decline with a typed error. See rotate_key.
+        #[cfg(not(feature = "testing"))]
+        {
+            let _ = &self;
+            Err::<Arc<Self>, ScpError>(no_pre_rotation_backend())
+        }
+        #[cfg(feature = "testing")]
+        {
+            // Phase D (#1695): lifecycle gate deleted — handle's own custody
+            // `Arc` keeps state alive; DID resolver is per-`Scp` now.
+            let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
+                msg: "cannot remove agent key from an external/loaded identity \
                       without core state"
-                .to_owned(),
-            code: codes::IDENT_1005.to_owned(),
-        })?;
-        let core_doc = self
-            .core_document
-            .as_ref()
-            .ok_or_else(|| ScpError::Identity {
-                msg: "cannot remove agent key without a retained DID document".to_owned(),
+                    .to_owned(),
                 code: codes::IDENT_1005.to_owned(),
             })?;
-        // Resolve custody (callback custody first, in-memory only in dev
-        // builds). Externally-loaded identities with no custody fail closed.
-        let custody = resolve_identity_custody(&self).ok_or_else(|| ScpError::Identity {
-            msg: "cannot remove agent key without retained key custody \
+            let core_doc = self
+                .core_document
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "cannot remove agent key without a retained DID document".to_owned(),
+                    code: codes::IDENT_1005.to_owned(),
+                })?;
+            // Resolve custody (callback custody first, in-memory only in dev
+            // builds). Externally-loaded identities with no custody fail closed.
+            let custody = resolve_identity_custody(&self).ok_or_else(|| ScpError::Identity {
+                msg: "cannot remove agent key without retained key custody \
                       (needed for DHT publish signing)"
-                .to_owned(),
-            code: codes::IDENT_1008.to_owned(),
-        })?;
+                    .to_owned(),
+                code: codes::IDENT_1008.to_owned(),
+            })?;
 
-        // Clone what we need for the spawned task.
-        let identity_clone = core_id.clone();
-        let doc_clone = core_doc.clone();
-        let did = self.did.clone();
-        let custody_type = self.custody_type.clone();
-        // Carry forward whichever custody the original handle held so the
-        // rebuilt handle keeps working for subsequent ops over the SAME
-        // custody (callback in production, in-memory in dev builds).
-        #[cfg(feature = "allow_in_memory_custody")]
-        let in_memory_custody = self.in_memory_custody.clone();
-        let callback_custody = self.callback_custody.clone();
-        let instance_id = self.instance_id;
-        let bi = Arc::clone(&self.bi);
-        // Agent-key operations don't change the pre-rotation commitment
-        // — preserve the existing handle and custody.
-        let pre_rotation_handle = self.pre_rotation_handle;
-        let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
-        let publish_client = rotation_publish_client(&self.bi)?;
-        let dht = make_dht_with_signer(&custody, publish_client);
+            // Clone what we need for the spawned task.
+            let identity_clone = core_id.clone();
+            let doc_clone = core_doc.clone();
+            let did = self.did.clone();
+            let custody_type = self.custody_type.clone();
+            // Carry forward whichever custody the original handle held so the
+            // rebuilt handle keeps working for subsequent ops over the SAME
+            // custody (callback in production, in-memory in dev builds).
+            #[cfg(feature = "testing")]
+            let in_memory_custody = self.in_memory_custody.clone();
+            let callback_custody = self.callback_custody.clone();
+            let instance_id = self.instance_id;
+            let bi = Arc::clone(&self.bi);
+            // Agent-key operations don't change the pre-rotation commitment
+            // — preserve the existing handle and custody.
+            let pre_rotation_handle = self.pre_rotation_handle;
+            let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
+            let publish_client = rotation_publish_client(&self.bi)?;
+            let dht = make_dht_with_signer(&custody, publish_client);
 
-        runtime()
-            .spawn(async move {
-                // Bootstrap the BEP44 sequence past the shared DHT's current
-                // record so the agent-key-removed document strictly overwrites
-                // it (see rotate_key). Mirrors PyO3/NAPI.
-                dht.initialize_sequence(&did)
-                    .await
-                    .map_err(ScpError::from)?;
-                let (updated_identity, updated_doc) = dht
-                    .remove_agent_key(&identity_clone, &doc_clone)
-                    .await
-                    .map_err(ScpError::from)?;
+            runtime()
+                .spawn(async move {
+                    // Bootstrap the BEP44 sequence past the shared DHT's current
+                    // record so the agent-key-removed document strictly overwrites
+                    // it (see rotate_key). Mirrors PyO3/NAPI.
+                    dht.initialize_sequence(&did)
+                        .await
+                        .map_err(ScpError::from)?;
+                    let (updated_identity, updated_doc) = dht
+                        .remove_agent_key(&identity_clone, &doc_clone)
+                        .await
+                        .map_err(ScpError::from)?;
 
-                let verifying_key_hex =
-                    snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
+                    let verifying_key_hex =
+                        snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
 
-                // Drop the resolver's stale cached document so the next resolve
-                // stops serving the removed agent key (AC[6]). The updated
-                // document already landed at a higher BEP44 `seq` in the shared
-                // DHT client above.
-                invalidate_resolver_cache(&bi, &updated_identity.did).await;
+                    // Drop the resolver's stale cached document so the next resolve
+                    // stops serving the removed agent key (AC[6]). The updated
+                    // document already landed at a higher BEP44 `seq` in the shared
+                    // DHT client above.
+                    invalidate_resolver_cache(&bi, &updated_identity.did).await;
 
-                let handle = Arc::new(Self {
-                    did,
-                    custody_type,
-                    core_id: Some(updated_identity),
-                    core_document: Some(updated_doc),
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    in_memory_custody,
-                    callback_custody,
-                    verifying_key_hex,
-                    instance_id,
-                    bi,
-                    rotation_event_json: None,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                });
-                increment_handle_count();
-                Ok(handle)
-            })
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("tokio task join error during remove_agent_key: {e}"),
-                code: codes::IDENT_1007.to_owned(),
-            })?
+                    let handle = Arc::new(Self {
+                        did,
+                        custody_type,
+                        core_id: Some(updated_identity),
+                        core_document: Some(updated_doc),
+                        #[cfg(feature = "testing")]
+                        in_memory_custody,
+                        callback_custody,
+                        verifying_key_hex,
+                        instance_id,
+                        bi,
+                        rotation_event_json: None,
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    });
+                    increment_handle_count();
+                    Ok(handle)
+                })
+                .await
+                .map_err(|e| ScpError::Identity {
+                    msg: format!("tokio task join error during remove_agent_key: {e}"),
+                    code: codes::IDENT_1007.to_owned(),
+                })?
+        }
     }
 
     /// Rotates the agent signing key for this identity (ADR-039).
@@ -3026,96 +3122,109 @@ impl Identity {
     /// - Key generation or DHT publishing fails
     ///
     /// See ADR-039 acceptance criterion 4.
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn rotate_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // Phase D (#1695): lifecycle gate deleted — handle's own custody
-        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
-        let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
-            msg: "cannot rotate agent key on an external/loaded identity \
+        // FAIL CLOSED on a shipped build (ADR-062 §Decision 6, IDENT_1059): the
+        // rebuilt handle carries the test-harness-only `pre_rotation_custody`
+        // field. No identity can exist in a bare build (creates fail closed), so
+        // this path is unreachable; decline with a typed error. See rotate_key.
+        #[cfg(not(feature = "testing"))]
+        {
+            let _ = &self;
+            Err::<Arc<Self>, ScpError>(no_pre_rotation_backend())
+        }
+        #[cfg(feature = "testing")]
+        {
+            // Phase D (#1695): lifecycle gate deleted — handle's own custody
+            // `Arc` keeps state alive; DID resolver is per-`Scp` now.
+            let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
+                msg: "cannot rotate agent key on an external/loaded identity \
                       without core state"
-                .to_owned(),
-            code: codes::IDENT_1005.to_owned(),
-        })?;
-        let core_doc = self
-            .core_document
-            .as_ref()
-            .ok_or_else(|| ScpError::Identity {
-                msg: "cannot rotate agent key without a retained DID document".to_owned(),
+                    .to_owned(),
                 code: codes::IDENT_1005.to_owned(),
             })?;
-        // Resolve custody (callback custody first, in-memory only in dev
-        // builds). Externally-loaded identities with no custody fail closed.
-        let custody = resolve_identity_custody(&self).ok_or_else(|| ScpError::Identity {
-            msg: "cannot rotate agent key without retained key custody \
+            let core_doc = self
+                .core_document
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "cannot rotate agent key without a retained DID document".to_owned(),
+                    code: codes::IDENT_1005.to_owned(),
+                })?;
+            // Resolve custody (callback custody first, in-memory only in dev
+            // builds). Externally-loaded identities with no custody fail closed.
+            let custody = resolve_identity_custody(&self).ok_or_else(|| ScpError::Identity {
+                msg: "cannot rotate agent key without retained key custody \
                       (key generation + DHT publish require custody)"
-                .to_owned(),
-            code: codes::IDENT_1008.to_owned(),
-        })?;
+                    .to_owned(),
+                code: codes::IDENT_1008.to_owned(),
+            })?;
 
-        // Clone what we need for the spawned task.
-        let identity_clone = core_id.clone();
-        let doc_clone = core_doc.clone();
-        let did = self.did.clone();
-        let custody_type = self.custody_type.clone();
-        // Carry forward whichever custody the original handle held so the
-        // rebuilt handle keeps working for subsequent ops over the SAME
-        // custody (callback in production, in-memory in dev builds).
-        #[cfg(feature = "allow_in_memory_custody")]
-        let in_memory_custody = self.in_memory_custody.clone();
-        let callback_custody = self.callback_custody.clone();
-        let instance_id = self.instance_id;
-        let bi = Arc::clone(&self.bi);
-        // Agent-key rotation doesn't change the pre-rotation commitment
-        // — preserve the existing handle and custody.
-        let pre_rotation_handle = self.pre_rotation_handle;
-        let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
-        let publish_client = rotation_publish_client(&self.bi)?;
-        let dht = make_dht_with_signer(&custody, publish_client);
+            // Clone what we need for the spawned task.
+            let identity_clone = core_id.clone();
+            let doc_clone = core_doc.clone();
+            let did = self.did.clone();
+            let custody_type = self.custody_type.clone();
+            // Carry forward whichever custody the original handle held so the
+            // rebuilt handle keeps working for subsequent ops over the SAME
+            // custody (callback in production, in-memory in dev builds).
+            #[cfg(feature = "testing")]
+            let in_memory_custody = self.in_memory_custody.clone();
+            let callback_custody = self.callback_custody.clone();
+            let instance_id = self.instance_id;
+            let bi = Arc::clone(&self.bi);
+            // Agent-key rotation doesn't change the pre-rotation commitment
+            // — preserve the existing handle and custody.
+            let pre_rotation_handle = self.pre_rotation_handle;
+            let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
+            let publish_client = rotation_publish_client(&self.bi)?;
+            let dht = make_dht_with_signer(&custody, publish_client);
 
-        runtime()
-            .spawn(async move {
-                // Bootstrap the BEP44 sequence past the shared DHT's current
-                // record so the rotated-agent-key document strictly overwrites
-                // it (see rotate_key). Mirrors PyO3/NAPI.
-                dht.initialize_sequence(&did)
-                    .await
-                    .map_err(ScpError::from)?;
-                let (updated_identity, updated_doc) = dht
-                    .rotate_agent_key(&identity_clone, &doc_clone, &*custody)
-                    .await
-                    .map_err(ScpError::from)?;
+            runtime()
+                .spawn(async move {
+                    // Bootstrap the BEP44 sequence past the shared DHT's current
+                    // record so the rotated-agent-key document strictly overwrites
+                    // it (see rotate_key). Mirrors PyO3/NAPI.
+                    dht.initialize_sequence(&did)
+                        .await
+                        .map_err(ScpError::from)?;
+                    let (updated_identity, updated_doc) = dht
+                        .rotate_agent_key(&identity_clone, &doc_clone, &*custody)
+                        .await
+                        .map_err(ScpError::from)?;
 
-                let verifying_key_hex =
-                    snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
+                    let verifying_key_hex =
+                        snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
 
-                // Drop the resolver's stale cached document so the next resolve
-                // rejects the retired agent key (AC[6]). The updated document
-                // already landed at a higher BEP44 `seq` in the shared DHT
-                // client above.
-                invalidate_resolver_cache(&bi, &updated_identity.did).await;
+                    // Drop the resolver's stale cached document so the next resolve
+                    // rejects the retired agent key (AC[6]). The updated document
+                    // already landed at a higher BEP44 `seq` in the shared DHT
+                    // client above.
+                    invalidate_resolver_cache(&bi, &updated_identity.did).await;
 
-                let handle = Arc::new(Self {
-                    did,
-                    custody_type,
-                    core_id: Some(updated_identity),
-                    core_document: Some(updated_doc),
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    in_memory_custody,
-                    callback_custody,
-                    verifying_key_hex,
-                    instance_id,
-                    bi,
-                    rotation_event_json: None,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                });
-                increment_handle_count();
-                Ok(handle)
-            })
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("tokio task join error during rotate_agent_key: {e}"),
-                code: codes::IDENT_1007.to_owned(),
-            })?
+                    let handle = Arc::new(Self {
+                        did,
+                        custody_type,
+                        core_id: Some(updated_identity),
+                        core_document: Some(updated_doc),
+                        #[cfg(feature = "testing")]
+                        in_memory_custody,
+                        callback_custody,
+                        verifying_key_hex,
+                        instance_id,
+                        bi,
+                        rotation_event_json: None,
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    });
+                    increment_handle_count();
+                    Ok(handle)
+                })
+                .await
+                .map_err(|e| ScpError::Identity {
+                    msg: format!("tokio task join error during rotate_agent_key: {e}"),
+                    code: codes::IDENT_1007.to_owned(),
+                })?
+        }
     }
 }
 
@@ -3151,9 +3260,9 @@ pub struct ContextHandle {
     ///
     /// Set during `context_create` from the creating identity's custody.
     /// Used by `ucan_mint` to produce real Ed25519 signatures.
-    /// Only available when `allow_in_memory_custody` is enabled.
+    /// Only available when `testing` is enabled.
     #[allow(dead_code)]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
     /// Retained [`CallbackKeyCustody`] for platform custody contexts.
     #[allow(dead_code)]
@@ -3757,7 +3866,7 @@ fn spawn_suppression_scoring_task(
 // methods.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 async fn identity_attest_device_impl(identity: Arc<Identity>) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -3790,19 +3899,35 @@ async fn identity_attest_device_impl(identity: Arc<Identity>) -> Result<String, 
         })?
 }
 
-#[cfg(not(feature = "allow_in_memory_custody"))]
+#[cfg(not(feature = "testing"))]
 #[allow(clippy::unused_async)]
-async fn identity_attest_device_impl(_identity: Arc<Identity>) -> Result<String, ScpError> {
+async fn identity_attest_device_impl(identity: Arc<Identity>) -> Result<String, ScpError> {
+    // Resolve retained identity state first (mirrors the testing arm): an
+    // externally-loaded handle with no `core_id` surfaces the standard
+    // not-registered identity error, while a live identity then fails closed
+    // with the typed honest-absent IDENT_1015 rather than a silently-valid
+    // token.
+    let _core_id = identity
+        .core_id
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "device attestation requires retained identity state — the identity \
+              was externally loaded via identity_load"
+                .to_owned(),
+            code: codes::IDENT_1007.to_owned(),
+        })?;
     Err(ScpError::Identity {
-        msg: "device attestation requires in-memory custody — the in_memory custody \
-                  path is not available in this build. Enable the \
-                  \"allow_in_memory_custody\" feature for dev/desktop use."
+        msg: "device attestation unavailable: no production device-attestation \
+                  backend is wired yet — Apple App Attest / Google Play Integrity \
+                  are hardware/platform-backed and are intentionally deferred (with \
+                  hardware keychain custody) until an e2e-driven integration lands \
+                  (spec §9:187). See #2171."
             .to_owned(),
-        code: codes::IDENT_1010.to_owned(),
+        code: codes::IDENT_1015.to_owned(),
     })
 }
 
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 async fn identity_verify_device_attestation_impl(
     _did: String,
     token_base64: String,
@@ -3838,18 +3963,24 @@ async fn identity_verify_device_attestation_impl(
         })?
 }
 
-#[cfg(not(feature = "allow_in_memory_custody"))]
+#[cfg(not(feature = "testing"))]
 #[allow(clippy::unused_async)]
 async fn identity_verify_device_attestation_impl(
     _did: String,
     _token_base64: String,
 ) -> Result<bool, ScpError> {
+    // Free function (no `Arc<Identity>` handle / no receiver), so — like the
+    // PyO3 shipped verify free fn — there is no per-instance state to resolve;
+    // ADR-048 §1 imposes no lookup. Fail closed with the typed honest-absent
+    // IDENT_1016 rather than a silently-valid `true`.
     Err(ScpError::Identity {
-        msg: "device attestation verification requires in-memory custody — the in_memory \
-                  custody path is not available in this build. Enable the \
-                  \"allow_in_memory_custody\" feature for dev/desktop use."
+        msg: "device attestation verification unavailable: no production \
+                  device-attestation backend is wired yet — Apple App Attest / \
+                  Google Play Integrity are hardware/platform-backed and are \
+                  intentionally deferred (with hardware keychain custody) until an \
+                  e2e-driven integration lands (spec §9:187). See #2171."
             .to_owned(),
-        code: codes::IDENT_1010.to_owned(),
+        code: codes::IDENT_1016.to_owned(),
     })
 }
 
@@ -3895,7 +4026,7 @@ fn identity_link_attestation_registry(
 /// Typed over [`UniffiKeyCustody`] so the registry — and the production
 /// identity ops that read it (`scpid_sign`, `identity_create_link_attestation`,
 /// `identity_remove*`) — exist in bare production builds, not only when
-/// `allow_in_memory_custody` is enabled.
+/// `testing` is enabled.
 pub(crate) fn identity_custody_registry(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
 ) -> &dashmap::DashMap<String, (Arc<UniffiKeyCustody>, scp_platform::KeyHandle)> {
@@ -3982,7 +4113,7 @@ async fn identity_create_link_attestation_impl(
         })?;
     // Resolve the retained custody to a `UniffiKeyCustody` enum: production
     // identities are callback-custody-backed (Secure Enclave / Android
-    // Keystore), while dev/desktop `allow_in_memory_custody` builds may also
+    // Keystore), while dev/desktop `testing` builds may also
     // carry in-memory custody. Fails closed when neither is present (an
     // externally-loaded DID-string-only handle cannot self-sign an attestation).
     let custody = resolve_identity_custody(&identity).ok_or_else(|| ScpError::Identity {
@@ -5335,7 +5466,7 @@ async fn ucan_mint_impl(
     runtime()
         .spawn(async move {
             // Resolve the retained key custody (callback first, then in-memory
-            // in allow_in_memory_custody builds) and the signing key from the
+            // in testing builds) and the signing key from the
             // context handle. Externally-loaded handles retain no custody and
             // fail closed with SCP-IDENT-1017.
             let custody = resolve_context_custody(&handle).ok_or_else(|| ScpError::Identity {
@@ -5417,7 +5548,7 @@ async fn ucan_delegate_impl(
             use scp_core::crypto::ucan::validate::parse_ucan;
 
             // Resolve the retained key custody (callback first, then in-memory
-            // in allow_in_memory_custody builds) and the signing key from the
+            // in testing builds) and the signing key from the
             // context handle. Externally-loaded handles retain no custody and
             // fail closed with SCP-IDENT-1017.
             let custody = resolve_context_custody(&handle).ok_or_else(|| ScpError::Identity {
@@ -5526,7 +5657,7 @@ async fn event_log_checkpoint_impl(
     runtime()
         .spawn(async move {
             // Resolve the retained key custody (callback first, then in-memory in
-            // allow_in_memory_custody builds) from the signing identity.
+            // testing builds) from the signing identity.
             // Externally-loaded identities retain no custody and fail closed with
             // SCP-IDENT-1017.
             let custody =
@@ -5651,7 +5782,7 @@ async fn event_log_checkpoint_by_did_impl(
     runtime()
         .spawn(async move {
             // Resolve the retained key custody (callback first, then in-memory in
-            // allow_in_memory_custody builds) from the signing identity.
+            // testing builds) from the signing identity.
             // Externally-loaded identities retain no custody and fail closed with
             // SCP-IDENT-1017.
             let custody =
@@ -5775,7 +5906,7 @@ async fn resolve_identity_signing_key(
             });
     }
 
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     if let Some(ref imc) = identity.in_memory_custody {
         return imc
             .0
@@ -5813,7 +5944,7 @@ async fn resolve_uniffi_signing_key(
             });
     }
 
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     if let Some(ref imc) = handle.in_memory_custody {
         return imc
             .0
@@ -5994,7 +6125,7 @@ async fn sign_export_snapshot_via_custody(
                 code: codes::CTX_2040.to_owned(),
             })?
     } else {
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         {
             if let Some(ref imc) = handle.in_memory_custody {
                 imc.0
@@ -6015,7 +6146,7 @@ async fn sign_export_snapshot_via_custody(
                 });
             }
         }
-        #[cfg(not(feature = "allow_in_memory_custody"))]
+        #[cfg(not(feature = "testing"))]
         {
             return Err(ScpError::Context {
                 msg: "no custody provider on context handle — context export \
@@ -6099,7 +6230,7 @@ async fn resolve_uniffi_creator_verifying_key(
 ///
 /// Reads the per-instance identity custody registry (now typed over
 /// [`UniffiKeyCustody`], so this resolves in BARE production builds over
-/// callback custody, not only in `allow_in_memory_custody` builds) and exports
+/// callback custody, not only in `testing` builds) and exports
 /// the `#active` public key via the resolved custody enum. Returns `None` when
 /// `did` is not registered locally or when the custody key cannot be exported,
 /// so resolution falls through to the DID resolver. The returned key is the
@@ -6356,7 +6487,22 @@ fn bridge_params_to_core(
 /// Parses a custody type string into a `CustodyMethod`.
 pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpError> {
     match custody {
+        // `"in_memory"` custody is a dev/test affordance gated on the `testing`
+        // feature. The only backing key custody is the `InMemoryKeyCustody`
+        // nullifier, which the `testing` feature severs from production
+        // (ADR-062 §Decision 6). A shipped build REJECTS the string at the
+        // boundary with a helpful "not available in this build" error rather
+        // than admitting it and failing deeper. Mirrors PyO3 `parse_custody_inner`.
+        #[cfg(feature = "testing")]
         "in_memory" => Ok(CustodyMethod::InMemory),
+        #[cfg(not(feature = "testing"))]
+        "in_memory" => Err(ScpError::Identity {
+            msg: "\"in_memory\" custody is not available in this build — enable the \
+                  \"testing\" feature for dev/desktop use. Production mobile builds must \
+                  use \"platform\" custody (Secure Enclave / Android Keystore)."
+                .to_owned(),
+            code: codes::IDENT_1008.to_owned(),
+        }),
         "platform" => Ok(CustodyMethod::Platform),
         "software" => Ok(CustodyMethod::Software),
         // VALID_7005 ("invalid field value") matches the semantic: an
@@ -8526,7 +8672,7 @@ pub(crate) fn scpid_sign_impl(
 
     // Resolve the retained custody: production identities sign through the
     // injected callback custody (Secure Enclave / Android Keystore); dev/desktop
-    // `allow_in_memory_custody` builds may also carry in-memory custody. Fails
+    // `testing` builds may also carry in-memory custody. Fails
     // closed for externally-loaded DID-string-only handles, which have no key
     // material to sign with.
     let custody = resolve_identity_custody(&identity).ok_or_else(|| ScpError::Identity {
@@ -9044,6 +9190,10 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
 /// any process-wide slot. Invoked lazily on first use by the
 /// [`crate::scp::Scp`] identity methods to keep "init on first use"
 /// semantics scoped to the owning instance.
+///
+/// Only reached from the testing-gated identity-create paths (production create
+/// fails closed before resolver init — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 fn ensure_did_resolver_initialized_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: tokio::runtime::Handle,
@@ -9110,6 +9260,10 @@ fn ensure_did_resolver_initialized_on(
 ///
 /// Delegates to the shared [`BridgeInstanceCore::invalidate_resolver_cache`]
 /// (the single implementation of the invalidation body, shared across bridges).
+///
+/// Only reached from the testing-gated identity rotate/agent-key/migrate paths
+/// (production create fails closed first — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 async fn invalidate_resolver_cache(bi: &crate::runtime::UniffiBridgeInstance, did: &str) {
     bi.core.invalidate_resolver_cache(did).await;
 }
@@ -9177,28 +9331,28 @@ impl Scp {
                 match custody_method {
                     CustodyMethod::InMemory => {
                         // Gate: `"in_memory"` custody is only available when the
-                        // `allow_in_memory_custody` feature is enabled. Production
+                        // `testing` feature is enabled. Production
                         // mobile builds MUST NOT enable this feature. See #88.
-                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        #[cfg(not(feature = "testing"))]
                         {
                             let _ = &bi;
                             // Mirrors PyO3 `parse_custody_with_seed`
-                            // (cfg(not(allow_in_memory_custody))):
+                            // (cfg(not(testing))):
                             // `testing_seed` is a parity-harness affordance
-                            // gated on the `allow_in_memory_custody` feature,
+                            // gated on the `testing` feature,
                             // so surface it as SCP-VALID-7008 ahead of the
                             // generic custody-unavailable error.
                             if testing_seed_bytes.is_some() {
                                 return Err(ScpError::Validation {
                                     msg: "`testing_seed` parameter requires the \
-                                          allow_in_memory_custody feature"
+                                          testing feature"
                                         .to_owned(),
                                     code: codes::VALID_7008.to_owned(),
                                 });
                             }
                             Err(ScpError::Identity {
                                 msg: "\"in_memory\" custody is not available in this build \
-                                      — enable the \"allow_in_memory_custody\" feature for \
+                                      — enable the \"testing\" feature for \
                                       dev/desktop use. Production mobile builds must use \
                                       \"platform\" custody (Secure Enclave / Android Keystore)."
                                     .to_owned(),
@@ -9206,7 +9360,7 @@ impl Scp {
                             })
                         }
 
-                        #[cfg(feature = "allow_in_memory_custody")]
+                        #[cfg(feature = "testing")]
                         {
                             // Wire to real scp-core using InMemoryKeyCustody.
                             // The `testing` feature is available in dev/test/desktop
@@ -9362,69 +9516,95 @@ impl Scp {
 
         runtime()
             .spawn(async move {
+                // Bind the injected platform custody up-front (matches PyO3
+                // `identity_create_with_custody`, which constructs the callback
+                // custody before the pre-rotation fail-closed check).
                 let callback_custody = Arc::new(CallbackKeyCustody::new(provider));
 
-                // Initialize the production DID resolver + shared DHT client on
-                // this instance BEFORE minting so `create` and the freshly-
-                // minted-document publish below run against the SAME client the
-                // resolver reads from (matching PyO3/NAPI behavior).
-                ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
-                let dht = DidDht::with_client(rotation_publish_client(&bi)?);
-                // Mint a fresh per-identity pre-rotation custody (ADR-003 §4b).
-                // Production callback custody integration is a follow-up
-                // workstream; in-memory custody is used here so the
-                // commitment invariant holds for tests and dev/desktop builds.
-                let pre_rotation_custody =
-                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let (identity, document, pre_rotation_handle) = dht
-                    .create(callback_custody.as_ref(), pre_rotation_custody.as_ref())
-                    .await
-                    .map_err(ScpError::from)?;
+                // FAIL CLOSED on a shipped build (ADR-062 §Decision 6,
+                // IDENT_1059): every create commits a mandatory pre-rotation
+                // commitment (spec §9.7.4.1 §3), which requires a
+                // `PreRotationCustody` backend. The only implementation is the
+                // test-harness `InMemoryPreRotationCustody` nullifier, which the
+                // `testing` feature severs from production — so a shipped build
+                // declines with a typed error rather than minting the nullifier.
+                // Mirrors PyO3 `identity_create_with_custody`.
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = (&bi, &callback_custody);
+                    Err::<Arc<Identity>, ScpError>(no_pre_rotation_backend())
+                }
+                #[cfg(feature = "testing")]
+                {
+                    // Initialize the production DID resolver + shared DHT client on
+                    // this instance BEFORE minting so `create` and the freshly-
+                    // minted-document publish below run against the SAME client the
+                    // resolver reads from (matching PyO3/NAPI behavior).
+                    ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
+                    let dht = DidDht::with_client(rotation_publish_client(&bi)?);
+                    // Mint a fresh per-identity pre-rotation custody (ADR-003 §4b).
+                    // Production callback custody integration is a follow-up
+                    // workstream; in-memory custody is used here so the
+                    // commitment invariant holds for tests and dev/desktop builds.
+                    let pre_rotation_custody =
+                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                    let (identity, document, pre_rotation_handle) = dht
+                        .create(callback_custody.as_ref(), pre_rotation_custody.as_ref())
+                        .await
+                        .map_err(ScpError::from)?;
 
-                // Snapshot the #0 (identity) verifying key for ADR-046 parity.
-                let verifying_key_hex =
-                    snapshot_verifying_key_hex(callback_custody.as_ref(), &identity.identity_key)
-                        .await;
-
-                // Register the freshly created callback-custody identity in the
-                // per-instance custody registry, keyed by DID, so the production
-                // identity ops (`scpid_sign`, `identity_create_link_attestation`,
-                // `identity_remove_if_present`, local-custody verifying-key
-                // resolution) work over callback custody — matching the
-                // in-memory creation paths and the PyO3/napi bridges, whose
-                // identity creation registers a bundled entry. Done before
-                // `identity` and `callback_custody` are moved into the handle so
-                // the DID and active signing key are still available.
-                register_identity_custody(
-                    &bi,
-                    &identity.did,
-                    &Arc::new(UniffiKeyCustody::Callback(Arc::clone(&callback_custody))),
-                    identity.active_signing_key,
-                )?;
-
-                // Publish the freshly minted document into the shared resolver
-                // DHT client so the DID is resolvable by UCAN validation /
-                // governance vote verification (mirrors PyO3/NAPI). Best-effort.
-                publish_to_resolver_dht_for(&bi, &identity, &document, callback_custody.as_ref())
+                    // Snapshot the #0 (identity) verifying key for ADR-046 parity.
+                    let verifying_key_hex = snapshot_verifying_key_hex(
+                        callback_custody.as_ref(),
+                        &identity.identity_key,
+                    )
                     .await;
 
-                let handle = Arc::new(Identity {
-                    did: identity.did.clone(),
-                    custody_type: CustodyMethod::Platform,
-                    core_id: Some(identity),
-                    core_document: Some(document),
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    in_memory_custody: None,
-                    callback_custody: Some(callback_custody),
-                    verifying_key_hex,
-                    instance_id: bi.core.instance_id(),
-                    bi: Arc::clone(&bi),
-                    rotation_event_json: None,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                });
-                increment_handle_count();
-                Ok(handle)
+                    // Register the freshly created callback-custody identity in the
+                    // per-instance custody registry, keyed by DID, so the production
+                    // identity ops (`scpid_sign`, `identity_create_link_attestation`,
+                    // `identity_remove_if_present`, local-custody verifying-key
+                    // resolution) work over callback custody — matching the
+                    // in-memory creation paths and the PyO3/napi bridges, whose
+                    // identity creation registers a bundled entry. Done before
+                    // `identity` and `callback_custody` are moved into the handle so
+                    // the DID and active signing key are still available.
+                    register_identity_custody(
+                        &bi,
+                        &identity.did,
+                        &Arc::new(UniffiKeyCustody::Callback(Arc::clone(&callback_custody))),
+                        identity.active_signing_key,
+                    )?;
+
+                    // Publish the freshly minted document into the shared resolver
+                    // DHT client so the DID is resolvable by UCAN validation /
+                    // governance vote verification (mirrors PyO3/NAPI). Best-effort.
+                    publish_to_resolver_dht_for(
+                        &bi,
+                        &identity,
+                        &document,
+                        callback_custody.as_ref(),
+                    )
+                    .await;
+
+                    let handle = Arc::new(Identity {
+                        did: identity.did.clone(),
+                        custody_type: CustodyMethod::Platform,
+                        core_id: Some(identity),
+                        core_document: Some(document),
+                        #[cfg(feature = "testing")]
+                        in_memory_custody: None,
+                        callback_custody: Some(callback_custody),
+                        verifying_key_hex,
+                        instance_id: bi.core.instance_id(),
+                        bi: Arc::clone(&bi),
+                        rotation_event_json: None,
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    });
+                    increment_handle_count();
+                    Ok(handle)
+                }
             })
             .await
             .map_err(|e| ScpError::Identity {
@@ -9455,11 +9635,20 @@ impl Scp {
                 // require the KeyCustodyProvider callback interface to be wired.
                 // No live key material, so `verifying_key_hex` is `None`.
                 //
-                // Pre-rotation state is unused on externally loaded handles —
-                // `identity_migrate` rejects this path before the handle is
-                // consulted (`core_id` is `None`, surface as IDENT_1009). The
-                // empty in-memory custody is a placeholder so the field is
-                // populated; it never receives a key.
+                // identity_load is a LOAD, not a create: it commits no
+                // pre-rotation commitment, so it does NOT fail closed on a
+                // shipped build (ADR-062 §Decision 6 governs create paths, not
+                // load). The External handle carries no live key material and
+                // does no crypto (`core_id`/`core_document`/`verifying_key_hex`
+                // are all `None`) — an honest, inert DID-string reference.
+                //
+                // The test-harness-only `pre_rotation_custody` field is a
+                // placeholder that never receives a key; it exists only when the
+                // `testing` feature is enabled. In a bare build the struct has no
+                // such field, so both the placeholder mint and its field-init are
+                // gated out — `identity_migrate` rejects this handle before the
+                // field would ever be consulted (`core_id` is `None`, IDENT_1009).
+                #[cfg(feature = "testing")]
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let handle = Arc::new(Identity {
@@ -9467,7 +9656,7 @@ impl Scp {
                     custody_type: CustodyMethod::External,
                     core_id: None,
                     core_document: None,
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    #[cfg(feature = "testing")]
                     in_memory_custody: None,
                     callback_custody: None,
                     verifying_key_hex: None,
@@ -9475,6 +9664,7 @@ impl Scp {
                     bi: Arc::clone(&bi),
                     rotation_event_json: None,
                     pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                    #[cfg(feature = "testing")]
                     pre_rotation_custody,
                 });
                 increment_handle_count();
@@ -9678,7 +9868,7 @@ impl Scp {
                 bi.init_context_manager_with_did(&identity.did);
 
                 // Extract key custody and signing key from the identity.
-                #[cfg(feature = "allow_in_memory_custody")]
+                #[cfg(feature = "testing")]
                 let in_memory_custody = identity.in_memory_custody.clone();
                 let callback_custody = identity.callback_custody.clone();
                 let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
@@ -9765,7 +9955,7 @@ impl Scp {
                     context_id,
                     state: tokio::sync::Mutex::new(ContextState::Active),
                     creator_did: identity.did.clone(),
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    #[cfg(feature = "testing")]
                     in_memory_custody,
                     callback_custody,
                     signing_key,
@@ -10175,7 +10365,7 @@ impl Scp {
                 // runtime commit), then record the context in the known-contexts
                 // discovery registry. Both steps are infallible and idempotent, so
                 // they are safe after the irreversible commit and need no rollback.
-                #[cfg(feature = "allow_in_memory_custody")]
+                #[cfg(feature = "testing")]
                 let in_memory_custody = identity.in_memory_custody.clone();
                 let callback_custody = identity.callback_custody.clone();
                 let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
@@ -10184,7 +10374,7 @@ impl Scp {
                     context_id: context_id.clone(),
                     state: tokio::sync::Mutex::new(ContextState::Active),
                     creator_did: creator_did.clone(),
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    #[cfg(feature = "testing")]
                     in_memory_custody,
                     callback_custody,
                     signing_key,
@@ -10828,7 +11018,7 @@ impl Scp {
                             code: codes::CRYPTO_4001.to_owned(),
                         })?;
                     } else {
-                        #[cfg(feature = "allow_in_memory_custody")]
+                        #[cfg(feature = "testing")]
                         if let Some(ref imc) = handle.in_memory_custody {
                             scp_core::envelope::create_inner_envelope(
                                 &params,
@@ -12063,7 +12253,7 @@ impl Scp {
                         })?
                         .map_err(ScpError::from)?;
                 } else {
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    #[cfg(feature = "testing")]
                     {
                         let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
                             ScpError::Identity {
@@ -12095,7 +12285,7 @@ impl Scp {
                             })?
                             .map_err(ScpError::from)?;
                     }
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    #[cfg(not(feature = "testing"))]
                     {
                         let _ = (signing_key_handle, payload, did);
                         return Err(ScpError::Identity {
@@ -12237,7 +12427,7 @@ impl Scp {
                         })?
                         .map_err(ScpError::from)?
                 } else {
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    #[cfg(feature = "testing")]
                     {
                         let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
                             ScpError::Identity {
@@ -12269,7 +12459,7 @@ impl Scp {
                             })?
                             .map_err(ScpError::from)?
                     }
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    #[cfg(not(feature = "testing"))]
                     {
                         let _ = (content, signing_key_handle, did);
                         return Err(ScpError::Identity {
@@ -12434,7 +12624,7 @@ impl Scp {
                             })?
                             .map_err(ScpError::from)?
                     } else {
-                        #[cfg(feature = "allow_in_memory_custody")]
+                        #[cfg(feature = "testing")]
                         {
                             let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
                                 ScpError::Identity {
@@ -12467,7 +12657,7 @@ impl Scp {
                                 })?
                                 .map_err(ScpError::from)?
                         }
-                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        #[cfg(not(feature = "testing"))]
                         {
                             let _ = (content, signing_key_handle, &did);
                             return Err(ScpError::Identity {
@@ -16686,278 +16876,306 @@ impl Scp {
     ///
     /// Rejects any `Identity` whose `instance_id` does not match this
     /// `SCP`'s.
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn identity_migrate(
         &self,
         identity: Arc<Identity>,
     ) -> Result<Arc<Identity>, ScpError> {
+        // Handle-affinity check (ADR-048): reject any `Identity` minted by a
+        // different `SCP` instance before any migration logic runs. Enforced on
+        // every build — testing or bare — and kept as the FIRST statement in the
+        // body (matching the pre-Slice-6 ordering the handle-affinity gate
+        // requires). Mismatched-instance handle use returns SCP-PERM-3030.
         self.inner
             .core
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
-        let core_id = identity
-            .core_id
-            .as_ref()
-            .ok_or_else(|| ScpError::Identity {
-                msg: "identity migration requires retained crypto state — this identity \
+        // FAIL CLOSED on a shipped build (ADR-062 §Decision 6, IDENT_1059):
+        // migration reveals the committed pre-rotation key from
+        // `pre_rotation_custody` (the test-harness-only nullifier the `testing`
+        // feature severs from production) and re-mints a fresh one. No identity
+        // can exist in a bare build (creates fail closed), so this path is
+        // unreachable; it declines with a typed error. Mirrors PyO3
+        // `identity_migrate`.
+        #[cfg(not(feature = "testing"))]
+        {
+            Err::<Arc<Identity>, ScpError>(no_pre_rotation_backend())
+        }
+        #[cfg(feature = "testing")]
+        {
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: "identity migration requires retained crypto state — this identity \
                       was loaded without key material (use identity_create or \
                       identity_create_with_custody)"
-                    .to_owned(),
-                code: codes::IDENT_1009.to_owned(),
-            })?;
-        let core_document = identity
-            .core_document
-            .as_ref()
-            .ok_or_else(|| ScpError::Identity {
-                msg: "identity migration requires a retained DID document".to_owned(),
-                code: codes::IDENT_1009.to_owned(),
-            })?;
-
-        // We need a custody provider to generate new keys.
-        #[cfg(feature = "allow_in_memory_custody")]
-        let in_memory = identity.in_memory_custody.as_ref();
-
-        let old_did = identity.did.clone();
-        let old_identity = core_id.clone();
-        let old_document = core_document.clone();
-        let custody_type = identity.custody_type.clone();
-        let instance_id = identity.instance_id;
-
-        // Pre-rotation key state. The pre-rotation handle points into the
-        // cold-storage custody; revealing it must yield a public key whose
-        // SHA-256 matches the committed value (spec §9.7.4.1 §6 / ADR-003
-        // §4b). The custody `Arc` is preserved across migrations; only the
-        // handle changes per rotation.
-        let pre_rotation_handle = identity.pre_rotation_handle;
-        let pre_rotation_custody = Arc::clone(&identity.pre_rotation_custody);
-
-        #[cfg(feature = "allow_in_memory_custody")]
-        let custody_arc = in_memory.map(Arc::clone);
-        let callback_custody = identity.callback_custody.as_ref().map(Arc::clone);
-        let bi = Arc::clone(&self.inner);
-
-        runtime()
-            .spawn(async move {
-                // Determine which custody to use for key generation.
-                #[cfg(feature = "allow_in_memory_custody")]
-                if let Some(ref kc) = custody_arc {
-                    // Spec §9.7.4.1 / §9.12 / ADR-003 §4b: the pre-rotation
-                    // key whose hash equals the committed value lives in
-                    // a separate `PreRotationCustody` instance from
-                    // creation. Generating a fresh key here would break
-                    // `verify_migration`'s SHA-256(revealed) == commitment
-                    // invariant.
-                    let rotated_at = scp_clock::SystemClock.now_secs();
-
-                    // `migrate_identity` calls `publish_document` for the old
-                    // and new DID documents — both BEP44 puts require a
-                    // signing function bound to the identity custody, published
-                    // into the SAME shared client the resolver reads from so
-                    // DID resolution follows the migration forward.
-                    // `DidDht::new()` would surface
-                    // "no signing function configured".
-                    let publish_client = rotation_publish_client(&bi)?;
-                    let dht = make_dht_with_signer(kc, publish_client);
-                    // Bootstrap the BEP44 sequence from the OLD DID's current
-                    // record so the migration republish (old-DID `alsoKnownAs`
-                    // update + new-DID document) strictly overwrites it. Mirrors
-                    // PyO3 `run_migrate_publish`.
-                    dht.initialize_sequence(&old_did)
-                        .await
-                        .map_err(ScpError::from)?;
-                    let scp_identity::MigrationOutcome {
-                        new_identity,
-                        new_document,
-                        rotation_event,
-                        new_pre_rotation_handle,
-                    } = dht
-                        .migrate_identity(
-                            &old_identity,
-                            &old_document,
-                            &pre_rotation_handle,
-                            pre_rotation_custody.as_ref(),
-                            &kc.0,
-                            rotated_at,
-                        )
-                        .await
-                        .map_err(ScpError::from)?;
-                    let rotation_event_json =
-                        serde_json::to_string(&rotation_event).map_err(|e| ScpError::Identity {
-                            msg: format!("failed to serialize rotation event: {e}"),
-                            code: codes::IDENT_1004.to_owned(),
-                        })?;
-
-                    let new_did = new_identity.did.clone();
-                    let has_agent = new_document.has_agent_key();
-                    let verifying_key_hex =
-                        kc.0.public_key(&new_identity.identity_key)
-                            .await
-                            .ok()
-                            .map(|pk| hex::encode(pk.as_bytes()));
-                    let new_active_key = new_identity.active_signing_key;
-                    let handle = Arc::new(Identity {
-                        did: new_identity.did.clone(),
-                        custody_type,
-                        core_id: Some(new_identity),
-                        core_document: Some(new_document),
-                        #[cfg(feature = "allow_in_memory_custody")]
-                        in_memory_custody: custody_arc,
-                        callback_custody,
-                        verifying_key_hex,
-                        instance_id,
-                        bi: Arc::clone(&bi),
-                        rotation_event_json: Some(rotation_event_json),
-                        pre_rotation_handle: new_pre_rotation_handle,
-                        pre_rotation_custody,
-                    });
-                    increment_handle_count();
-                    let _ = has_agent; // suppress unused warning
-
-                    // Migration re-published BOTH documents at higher BEP44
-                    // sequences into the shared DHT client (the new DID's
-                    // document and the old DID's `alsoKnownAs` update). Drop both
-                    // stale cache entries so resolution follows the migration
-                    // forward instead of serving pre-migration docs (AC[6]).
-                    invalidate_resolver_cache(&bi, &old_did).await;
-                    invalidate_resolver_cache(&bi, &new_did).await;
-
-                    // Migrate attestation and custody registries from old DID to
-                    // new DID. The custody-registry block (now un-gated — the
-                    // registry exists in bare production builds) always consumes
-                    // `new_did`, so the attestation block clones.
-                    let attestation_did = new_did.clone();
-                    {
-                        let registry = identity_link_attestation_registry(&bi);
-                        if let Some((_, attestations)) = registry.remove(&old_did) {
-                            registry.insert(attestation_did, attestations);
-                        }
-                    }
-                    {
-                        // Re-register under the new DID with the migrated active
-                        // signing key. `migrate_identity` rotates the active key,
-                        // so the old entry's key handle is stale (and destroyed);
-                        // reuse the same custody enum but swap in the new handle.
-                        let registry = identity_custody_registry(&bi);
-                        if let Some((_, (custody_enum, _stale_handle))) = registry.remove(&old_did)
-                        {
-                            registry.insert(new_did, (custody_enum, new_active_key));
-                        }
-                    }
-
-                    return Ok(handle);
-                }
-
-                if let Some(ref cc) = callback_custody {
-                    // Spec §9.7.4.1 / §9.12: pre-rotation key lives in the
-                    // separate `PreRotationCustody` since creation; reusing
-                    // its handle satisfies the SHA-256(revealed) ==
-                    // commitment invariant. Callback custody MUST surface
-                    // the same handle on resume.
-                    let rotated_at = scp_clock::SystemClock.now_secs();
-
-                    // `migrate_identity` calls `publish_document` for the old
-                    // and new DID documents — both BEP44 puts require a
-                    // signing function bound to the identity custody, published
-                    // into the SAME shared client the resolver reads from.
-                    // `DidDht::new()` (sign_fn: None) would surface
-                    // "no signing function configured"; mirror the in-memory
-                    // branch above.
-                    let publish_client = rotation_publish_client(&bi)?;
-                    let dht = make_dht_with_signer(cc, publish_client);
-                    // Bootstrap the BEP44 sequence from the OLD DID's current
-                    // record so the migration republish strictly overwrites it
-                    // (see the in-memory branch). Mirrors PyO3 `run_migrate_publish`.
-                    dht.initialize_sequence(&old_did)
-                        .await
-                        .map_err(ScpError::from)?;
-                    let scp_identity::MigrationOutcome {
-                        new_identity,
-                        new_document,
-                        rotation_event,
-                        new_pre_rotation_handle,
-                    } = dht
-                        .migrate_identity(
-                            &old_identity,
-                            &old_document,
-                            &pre_rotation_handle,
-                            pre_rotation_custody.as_ref(),
-                            cc.as_ref(),
-                            rotated_at,
-                        )
-                        .await
-                        .map_err(ScpError::from)?;
-                    let rotation_event_json =
-                        serde_json::to_string(&rotation_event).map_err(|e| ScpError::Identity {
-                            msg: format!("failed to serialize rotation event: {e}"),
-                            code: codes::IDENT_1004.to_owned(),
-                        })?;
-
-                    let new_did = new_identity.did.clone();
-                    let verifying_key_hex =
-                        snapshot_verifying_key_hex(cc.as_ref(), &new_identity.identity_key).await;
-                    let new_active_key = new_identity.active_signing_key;
-                    let handle = Arc::new(Identity {
-                        did: new_identity.did.clone(),
-                        custody_type,
-                        core_id: Some(new_identity),
-                        core_document: Some(new_document),
-                        #[cfg(feature = "allow_in_memory_custody")]
-                        in_memory_custody: None,
-                        callback_custody: Some(Arc::clone(cc)),
-                        verifying_key_hex,
-                        instance_id,
-                        bi: Arc::clone(&bi),
-                        rotation_event_json: Some(rotation_event_json),
-                        pre_rotation_handle: new_pre_rotation_handle,
-                        pre_rotation_custody,
-                    });
-                    increment_handle_count();
-
-                    // Migration re-published BOTH documents at higher BEP44
-                    // sequences into the shared DHT client (the new DID's
-                    // document and the old DID's `alsoKnownAs` update). Drop both
-                    // stale cache entries so resolution follows the migration
-                    // forward instead of serving pre-migration docs (AC[6]).
-                    invalidate_resolver_cache(&bi, &old_did).await;
-                    invalidate_resolver_cache(&bi, &new_did).await;
-
-                    // Migrate attestation and custody registries from old DID to
-                    // new DID. The custody-registry block (now un-gated — the
-                    // registry exists in bare production builds) always consumes
-                    // `new_did`, so the attestation block clones.
-                    let attestation_did = new_did.clone();
-                    {
-                        let registry = identity_link_attestation_registry(&bi);
-                        if let Some((_, attestations)) = registry.remove(&old_did) {
-                            registry.insert(attestation_did, attestations);
-                        }
-                    }
-                    {
-                        // Re-register under the new DID with the migrated active
-                        // signing key. `migrate_identity` rotates the active key,
-                        // so the old entry's key handle is stale (and destroyed);
-                        // reuse the same custody enum but swap in the new handle.
-                        let registry = identity_custody_registry(&bi);
-                        if let Some((_, (custody_enum, _stale_handle))) = registry.remove(&old_did)
-                        {
-                            registry.insert(new_did, (custody_enum, new_active_key));
-                        }
-                    }
-
-                    return Ok(handle);
-                }
-
-                Err(ScpError::Identity {
-                    msg: "identity migration requires a retained custody provider \
-                              (in-memory or callback)"
                         .to_owned(),
                     code: codes::IDENT_1009.to_owned(),
+                })?;
+            let core_document =
+                identity
+                    .core_document
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "identity migration requires a retained DID document".to_owned(),
+                        code: codes::IDENT_1009.to_owned(),
+                    })?;
+
+            // We need a custody provider to generate new keys.
+            #[cfg(feature = "testing")]
+            let in_memory = identity.in_memory_custody.as_ref();
+
+            let old_did = identity.did.clone();
+            let old_identity = core_id.clone();
+            let old_document = core_document.clone();
+            let custody_type = identity.custody_type.clone();
+            let instance_id = identity.instance_id;
+
+            // Pre-rotation key state. The pre-rotation handle points into the
+            // cold-storage custody; revealing it must yield a public key whose
+            // SHA-256 matches the committed value (spec §9.7.4.1 §6 / ADR-003
+            // §4b). The custody `Arc` is preserved across migrations; only the
+            // handle changes per rotation.
+            let pre_rotation_handle = identity.pre_rotation_handle;
+            let pre_rotation_custody = Arc::clone(&identity.pre_rotation_custody);
+
+            #[cfg(feature = "testing")]
+            let custody_arc = in_memory.map(Arc::clone);
+            let callback_custody = identity.callback_custody.as_ref().map(Arc::clone);
+            let bi = Arc::clone(&self.inner);
+
+            runtime()
+                .spawn(async move {
+                    // Determine which custody to use for key generation.
+                    #[cfg(feature = "testing")]
+                    if let Some(ref kc) = custody_arc {
+                        // Spec §9.7.4.1 / §9.12 / ADR-003 §4b: the pre-rotation
+                        // key whose hash equals the committed value lives in
+                        // a separate `PreRotationCustody` instance from
+                        // creation. Generating a fresh key here would break
+                        // `verify_migration`'s SHA-256(revealed) == commitment
+                        // invariant.
+                        let rotated_at = scp_clock::SystemClock.now_secs();
+
+                        // `migrate_identity` calls `publish_document` for the old
+                        // and new DID documents — both BEP44 puts require a
+                        // signing function bound to the identity custody, published
+                        // into the SAME shared client the resolver reads from so
+                        // DID resolution follows the migration forward.
+                        // `DidDht::new()` would surface
+                        // "no signing function configured".
+                        let publish_client = rotation_publish_client(&bi)?;
+                        let dht = make_dht_with_signer(kc, publish_client);
+                        // Bootstrap the BEP44 sequence from the OLD DID's current
+                        // record so the migration republish (old-DID `alsoKnownAs`
+                        // update + new-DID document) strictly overwrites it. Mirrors
+                        // PyO3 `run_migrate_publish`.
+                        dht.initialize_sequence(&old_did)
+                            .await
+                            .map_err(ScpError::from)?;
+                        let scp_identity::MigrationOutcome {
+                            new_identity,
+                            new_document,
+                            rotation_event,
+                            new_pre_rotation_handle,
+                        } = dht
+                            .migrate_identity(
+                                &old_identity,
+                                &old_document,
+                                &pre_rotation_handle,
+                                pre_rotation_custody.as_ref(),
+                                &kc.0,
+                                rotated_at,
+                            )
+                            .await
+                            .map_err(ScpError::from)?;
+                        let rotation_event_json =
+                            serde_json::to_string(&rotation_event).map_err(|e| {
+                                ScpError::Identity {
+                                    msg: format!("failed to serialize rotation event: {e}"),
+                                    code: codes::IDENT_1004.to_owned(),
+                                }
+                            })?;
+
+                        let new_did = new_identity.did.clone();
+                        let has_agent = new_document.has_agent_key();
+                        let verifying_key_hex =
+                            kc.0.public_key(&new_identity.identity_key)
+                                .await
+                                .ok()
+                                .map(|pk| hex::encode(pk.as_bytes()));
+                        let new_active_key = new_identity.active_signing_key;
+                        let handle = Arc::new(Identity {
+                            did: new_identity.did.clone(),
+                            custody_type,
+                            core_id: Some(new_identity),
+                            core_document: Some(new_document),
+                            #[cfg(feature = "testing")]
+                            in_memory_custody: custody_arc,
+                            callback_custody,
+                            verifying_key_hex,
+                            instance_id,
+                            bi: Arc::clone(&bi),
+                            rotation_event_json: Some(rotation_event_json),
+                            pre_rotation_handle: new_pre_rotation_handle,
+                            pre_rotation_custody,
+                        });
+                        increment_handle_count();
+                        let _ = has_agent; // suppress unused warning
+
+                        // Migration re-published BOTH documents at higher BEP44
+                        // sequences into the shared DHT client (the new DID's
+                        // document and the old DID's `alsoKnownAs` update). Drop both
+                        // stale cache entries so resolution follows the migration
+                        // forward instead of serving pre-migration docs (AC[6]).
+                        invalidate_resolver_cache(&bi, &old_did).await;
+                        invalidate_resolver_cache(&bi, &new_did).await;
+
+                        // Migrate attestation and custody registries from old DID to
+                        // new DID. The custody-registry block (now un-gated — the
+                        // registry exists in bare production builds) always consumes
+                        // `new_did`, so the attestation block clones.
+                        let attestation_did = new_did.clone();
+                        {
+                            let registry = identity_link_attestation_registry(&bi);
+                            if let Some((_, attestations)) = registry.remove(&old_did) {
+                                registry.insert(attestation_did, attestations);
+                            }
+                        }
+                        {
+                            // Re-register under the new DID with the migrated active
+                            // signing key. `migrate_identity` rotates the active key,
+                            // so the old entry's key handle is stale (and destroyed);
+                            // reuse the same custody enum but swap in the new handle.
+                            let registry = identity_custody_registry(&bi);
+                            if let Some((_, (custody_enum, _stale_handle))) =
+                                registry.remove(&old_did)
+                            {
+                                registry.insert(new_did, (custody_enum, new_active_key));
+                            }
+                        }
+
+                        return Ok(handle);
+                    }
+
+                    if let Some(ref cc) = callback_custody {
+                        // Spec §9.7.4.1 / §9.12: pre-rotation key lives in the
+                        // separate `PreRotationCustody` since creation; reusing
+                        // its handle satisfies the SHA-256(revealed) ==
+                        // commitment invariant. Callback custody MUST surface
+                        // the same handle on resume.
+                        let rotated_at = scp_clock::SystemClock.now_secs();
+
+                        // `migrate_identity` calls `publish_document` for the old
+                        // and new DID documents — both BEP44 puts require a
+                        // signing function bound to the identity custody, published
+                        // into the SAME shared client the resolver reads from.
+                        // `DidDht::new()` (sign_fn: None) would surface
+                        // "no signing function configured"; mirror the in-memory
+                        // branch above.
+                        let publish_client = rotation_publish_client(&bi)?;
+                        let dht = make_dht_with_signer(cc, publish_client);
+                        // Bootstrap the BEP44 sequence from the OLD DID's current
+                        // record so the migration republish strictly overwrites it
+                        // (see the in-memory branch). Mirrors PyO3 `run_migrate_publish`.
+                        dht.initialize_sequence(&old_did)
+                            .await
+                            .map_err(ScpError::from)?;
+                        let scp_identity::MigrationOutcome {
+                            new_identity,
+                            new_document,
+                            rotation_event,
+                            new_pre_rotation_handle,
+                        } = dht
+                            .migrate_identity(
+                                &old_identity,
+                                &old_document,
+                                &pre_rotation_handle,
+                                pre_rotation_custody.as_ref(),
+                                cc.as_ref(),
+                                rotated_at,
+                            )
+                            .await
+                            .map_err(ScpError::from)?;
+                        let rotation_event_json =
+                            serde_json::to_string(&rotation_event).map_err(|e| {
+                                ScpError::Identity {
+                                    msg: format!("failed to serialize rotation event: {e}"),
+                                    code: codes::IDENT_1004.to_owned(),
+                                }
+                            })?;
+
+                        let new_did = new_identity.did.clone();
+                        let verifying_key_hex =
+                            snapshot_verifying_key_hex(cc.as_ref(), &new_identity.identity_key)
+                                .await;
+                        let new_active_key = new_identity.active_signing_key;
+                        let handle = Arc::new(Identity {
+                            did: new_identity.did.clone(),
+                            custody_type,
+                            core_id: Some(new_identity),
+                            core_document: Some(new_document),
+                            #[cfg(feature = "testing")]
+                            in_memory_custody: None,
+                            callback_custody: Some(Arc::clone(cc)),
+                            verifying_key_hex,
+                            instance_id,
+                            bi: Arc::clone(&bi),
+                            rotation_event_json: Some(rotation_event_json),
+                            pre_rotation_handle: new_pre_rotation_handle,
+                            pre_rotation_custody,
+                        });
+                        increment_handle_count();
+
+                        // Migration re-published BOTH documents at higher BEP44
+                        // sequences into the shared DHT client (the new DID's
+                        // document and the old DID's `alsoKnownAs` update). Drop both
+                        // stale cache entries so resolution follows the migration
+                        // forward instead of serving pre-migration docs (AC[6]).
+                        invalidate_resolver_cache(&bi, &old_did).await;
+                        invalidate_resolver_cache(&bi, &new_did).await;
+
+                        // Migrate attestation and custody registries from old DID to
+                        // new DID. The custody-registry block (now un-gated — the
+                        // registry exists in bare production builds) always consumes
+                        // `new_did`, so the attestation block clones.
+                        let attestation_did = new_did.clone();
+                        {
+                            let registry = identity_link_attestation_registry(&bi);
+                            if let Some((_, attestations)) = registry.remove(&old_did) {
+                                registry.insert(attestation_did, attestations);
+                            }
+                        }
+                        {
+                            // Re-register under the new DID with the migrated active
+                            // signing key. `migrate_identity` rotates the active key,
+                            // so the old entry's key handle is stale (and destroyed);
+                            // reuse the same custody enum but swap in the new handle.
+                            let registry = identity_custody_registry(&bi);
+                            if let Some((_, (custody_enum, _stale_handle))) =
+                                registry.remove(&old_did)
+                            {
+                                registry.insert(new_did, (custody_enum, new_active_key));
+                            }
+                        }
+
+                        return Ok(handle);
+                    }
+
+                    Err(ScpError::Identity {
+                        msg: "identity migration requires a retained custody provider \
+                              (in-memory or callback)"
+                            .to_owned(),
+                        code: codes::IDENT_1009.to_owned(),
+                    })
                 })
-            })
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("tokio task join error during identity migration: {e}"),
-                code: codes::IDENT_1007.to_owned(),
-            })?
+                .await
+                .map_err(|e| ScpError::Identity {
+                    msg: format!("tokio task join error during identity migration: {e}"),
+                    code: codes::IDENT_1007.to_owned(),
+                })?
+        }
     }
 
     /// Per-instance equivalent of the free-function `identity_create_with_agent_key`.
@@ -16976,12 +17194,12 @@ impl Scp {
             .spawn(async move {
                 match custody_method {
                     CustodyMethod::InMemory => {
-                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        #[cfg(not(feature = "testing"))]
                         {
                             let _ = &bi;
                             Err(ScpError::Identity {
                                 msg: "\"in_memory\" custody is not available in this build \
-                                      — enable the \"allow_in_memory_custody\" feature for \
+                                      — enable the \"testing\" feature for \
                                       dev/desktop use. Production mobile builds must use \
                                       \"platform\" custody (Secure Enclave / Android Keystore)."
                                     .to_owned(),
@@ -16989,7 +17207,7 @@ impl Scp {
                             })
                         }
 
-                        #[cfg(feature = "allow_in_memory_custody")]
+                        #[cfg(feature = "testing")]
                         {
                             let key_custody =
                                 Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
@@ -18587,7 +18805,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Minimal ENCRYPTED single-admin params for the 2J join-side tests.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
             mode: ContextMode::Encrypted,
@@ -18610,7 +18828,7 @@ mod tests {
     /// Test helper: build a [`SealedInvitation`] from its four wire fields (the
     /// reshaped `context_join_from_welcome` input, replacing the old loose
     /// `params` / `welcome_bytes` args).
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn sealed_test(
         context_id: &str,
         creator_did: &str,
@@ -18628,7 +18846,7 @@ mod tests {
     /// `reserve_key_package` returns a non-empty reservation id and PUBLIC
     /// `KeyPackage` bytes for a locally-custodied identity.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn reserve_key_package_returns_public_bytes() {
         let rt = runtime();
         let scp = scp_test();
@@ -18653,7 +18871,7 @@ mod tests {
     /// `reserve_key_package` rejects a non-custodied (DID-only, `identity_load`)
     /// identity with the canonical missing-key-material code.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn reserve_key_package_rejects_non_custodied_identity() {
         let rt = runtime();
         let scp = scp_test();
@@ -18679,7 +18897,7 @@ mod tests {
     /// `context_join_from_welcome` rejects a non-custodied joiner at the
     /// pseudonym-derivation seam, before any single-use `KeyPackage` is consumed.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_join_from_welcome_rejects_non_custodied_identity() {
         let rt = runtime();
         let scp = scp_test();
@@ -18739,7 +18957,7 @@ mod tests {
     /// with a different message, not the exact "expected 32" surfaced here. The
     /// assertion also pins that no bridge state leaked.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_join_from_welcome_rejects_non_32_byte_enc() {
         let rt = runtime();
         let scp = scp_test();
@@ -18786,7 +19004,7 @@ mod tests {
     /// A failed `spawn_actor_from_welcome` (bad Welcome) rolls the reversible
     /// bridge state back: no context handle, no UCAN state, no discovery entry.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_join_from_welcome_rollback_leaves_no_ffi_state() {
         let rt = runtime();
         let scp = scp_test();
@@ -18828,7 +19046,7 @@ mod tests {
     /// occupy — the join fails BEFORE the single-use `KeyPackage` is consumed,
     /// leaving the pre-existing handle untouched.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_join_from_welcome_occupied_context_fails_before_consume() {
         let rt = runtime();
         let scp = scp_test();
@@ -18893,7 +19111,7 @@ mod tests {
     /// with the "already registered" class BEFORE any consume, and every piece
     /// of the winner's state must survive.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_join_from_welcome_loser_preserves_winner_ffi_state() {
         let rt = runtime();
         let scp = scp_test();
@@ -18986,7 +19204,7 @@ mod tests {
     /// the two distinct failures prove both seams are exercised, not
     /// short-circuited.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn invite_member_rejects_unknown_context_and_non_custodied_inviter() {
         let rt = runtime();
         let scp = scp_test();
@@ -19051,7 +19269,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: fetch the `KnownContext` discovery entry for a context id.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn known_context_entry(
         scp: &crate::scp::Scp,
         context_id: &str,
@@ -19069,7 +19287,7 @@ mod tests {
     /// deterministic `context_routing_id` fallback), member is the creator, and
     /// `relay_url` is `None`.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_create_registers_encrypted_known_context() {
         let rt = runtime();
         let scp = scp_test();
@@ -19119,7 +19337,7 @@ mod tests {
     /// per-member pseudonym, so the mode-appropriate fallback is used — matching
     /// the `PyO3` reference).
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_create_registers_broadcast_known_context() {
         let rt = runtime();
         let scp = scp_test();
@@ -19159,7 +19377,7 @@ mod tests {
     /// entry); that entry is cleared, then the creator re-joins — proving the
     /// JOIN path re-registers, not merely create's prior entry.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_join_registers_known_context() {
         let rt = runtime();
         let scp = scp_test();
@@ -19766,7 +19984,7 @@ mod tests {
             context_id: "ctx-test".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
             creator_did: "did:dht:z6MkTestUser".to_owned(),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             in_memory_custody: None,
             callback_custody: None,
             signing_key: None,
@@ -19796,7 +20014,7 @@ mod tests {
             custody_type: CustodyMethod::InMemory,
             core_id: None,
             core_document: None,
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             in_memory_custody: None,
             callback_custody: None,
             verifying_key_hex: None,
@@ -19969,7 +20187,7 @@ mod tests {
             context_id: "ctx-sign-only".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
             creator_did: "did:dht:z6MkSignOnly".to_owned(),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             in_memory_custody: None,
             callback_custody: Some(callback_custody),
             signing_key: Some(key_handle),
@@ -21172,7 +21390,7 @@ mod tests {
     /// `SHA-256(revealed_key) == commitment`. Cross-bridge parity with
     /// the corresponding `PyO3` and NAPI tests.
     #[tokio::test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn identity_migrate_pre_rotation_proof_satisfies_sha256_invariant() {
         use sha2::{Digest, Sha256};
 
@@ -22405,7 +22623,7 @@ mod tests {
     /// gate — matching the `PyO3` reference bridge — before touching the
     /// registry. A syntactically valid but absent DID is accepted as an
     /// idempotent no-op. Mirrors `petname_malformed_owner_rejected_uniffi`.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[test]
     fn identity_remove_malformed_did_rejected_uniffi() {
         let scp = scp_test();
@@ -22438,7 +22656,7 @@ mod tests {
     /// created identity reported `false`. Also exercises the unconditional
     /// `identity_remove` on a separately created identity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn identity_remove_if_present_reports_presence() {
         let scp = scp_test();
 
@@ -22475,12 +22693,12 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Production (callback-custody) path coverage — NOT gated on
-    // `allow_in_memory_custody`. These pin the bare-build fix: re-typing the
+    // `testing`. These pin the bare-build fix: re-typing the
     // identity custody registry to the `UniffiKeyCustody` enum un-gated
     // `scpid_sign`, `identity_create_link_attestation`, and `identity_remove*`
     // so they ship in the released Swift/Kotlin SDKs and route over callback
     // (Secure Enclave / Android Keystore) custody. Before the fix these ops
-    // were `#[cfg(allow_in_memory_custody)]`-gated and silently absent.
+    // were `#[cfg(testing)]`-gated and silently absent.
     // -----------------------------------------------------------------------
 
     /// A full `KeyCustodyProvider` backed by real Ed25519 keys with a
@@ -22595,7 +22813,7 @@ mod tests {
     /// `identity_create_with_custody` must register the callback identity in the
     /// per-instance custody registry so `identity_remove_if_present` reports
     /// `true` on first removal — proving the registry exists and is populated in
-    /// a BARE (no `allow_in_memory_custody`) build over callback custody.
+    /// a BARE (no `testing`) build over callback custody.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn callback_identity_is_registered_for_remove_if_present() {
         let scp = scp_test();
@@ -22693,9 +22911,9 @@ mod tests {
     }
 
     /// `add_agent_key` must work over callback custody (production path) in a
-    /// BARE (no `allow_in_memory_custody`) build, returning a handle whose DID
+    /// BARE (no `testing`) build, returning a handle whose DID
     /// document and retained identity both carry the new `#agent` key. Before
-    /// the fix this op was `#[cfg(allow_in_memory_custody)]`-gated and the
+    /// the fix this op was `#[cfg(testing)]`-gated and the
     /// bare build returned SCP-IDENT-1008 unconditionally. Pins that the op
     /// resolves custody via `resolve_identity_custody` →
     /// `UniffiKeyCustody::Callback` and signs the DHT publish with the callback
@@ -22832,7 +23050,7 @@ mod tests {
             custody_type: live.custody_type.clone(),
             core_id: live.core_id.clone(),
             core_document: live.core_document.clone(),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             in_memory_custody: None,
             callback_custody: None,
             verifying_key_hex: live.verifying_key_hex.clone(),
@@ -23051,7 +23269,7 @@ mod tests {
     /// future `import_ed25519_seed_bytes` lands on the SDK callback interface.
     ///
     /// A "migrate succeeds over callback custody" assertion is therefore
-    /// infeasible by any means (bare OR `allow_in_memory_custody`-gated) —
+    /// infeasible by any means (bare OR `testing`-gated) —
     /// `ProdLikeCustody` is still callback custody and cannot import a seed. This
     /// test instead pins the real, current contract: migrate over callback
     /// custody fails fast at the seed-import constraint (Step 0), leaving the
@@ -23095,10 +23313,10 @@ mod tests {
     // Context-level custody ops over CALLBACK custody (production path)
     //
     // `ucan_mint`, `ucan_delegate`, and `event_log_checkpoint` previously read
-    // the `allow_in_memory_custody`-only custody and fail-closed
+    // the `testing`-only custody and fail-closed
     // (SCP-IDENT-1017) in a bare production build — even when the context
     // creator used platform/callback (OS-keychain / HSM) custody. These tests
-    // pin the production path: in a BARE build (no `allow_in_memory_custody`),
+    // pin the production path: in a BARE build (no `testing`),
     // a callback-custody context handle / identity must sign UCANs and event-log
     // checkpoints, and the produced UCAN signature must verify against the
     // custody's `#active` public key. They are NOT cfg-gated, so they run on the
@@ -23135,7 +23353,7 @@ mod tests {
             context_id: "ctx-callback".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
             creator_did: "did:dht:z6MkCallbackCreator".to_owned(),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             in_memory_custody: None,
             callback_custody: Some(callback_custody),
             signing_key: Some(signing_key),
@@ -23324,7 +23542,7 @@ mod tests {
     /// A `did` that differs from the signing identity's own DID must be
     /// rejected with `SCP-VALID-7000`, and the matching `did` must succeed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn checkpoint_by_did_binds_recorded_sender_to_signing_identity() {
         let scp = scp_test();
         let identity = scp
@@ -23603,12 +23821,12 @@ mod tests {
 
     /// All §6.2.4 cross-context-outlet saga binding tests and their pure-string /
     /// DHT / governance helpers live in this single submodule gated on
-    /// `allow_in_memory_custody`. Gating the module (rather than each item)
+    /// `testing`. Gating the module (rather than each item)
     /// covers every helper AND every future saga test added here by
     /// construction, closing the no-feature `function is never used` regression
     /// class: a saga test added without an explicit per-item `#[cfg(...)]` can
     /// no longer silently reintroduce the no-feature compile warning.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     mod xctx_saga_tests {
         use super::*;
 
@@ -24410,7 +24628,7 @@ mod tests {
         /// `identity_custody_registry.contains_key` axis (a) check is removed, and is
         /// INDEPENDENT of axis (b) by construction.
         ///
-        /// Gated on `allow_in_memory_custody`: that feature is what enables
+        /// Gated on `testing`: that feature is what enables
         /// `scp-core/testing` (hence `scp-runtime/testing`), which provides
         /// `Supervisor::test_insert_member`. Mirrors the NAPI sibling
         /// `xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis`.

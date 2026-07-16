@@ -18,8 +18,8 @@ use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
 use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
+use scp_platform::file::FileKeyCustody;
 use scp_platform::in_memory::InMemoryStorage;
-use scp_platform::testing::InMemoryKeyCustody;
 
 use crate::dht::{DhtInitError, FfiDhtClient};
 // `ClientDhtConfig` is only referenced by the production (non-test) fail-closed
@@ -301,12 +301,15 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 
 /// Starts a full application node with in-memory storage.
 ///
-/// When `identity` is `None` (auto-generate):
-/// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
-/// - [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage)
-/// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT network)
-/// - Self-signed TLS (for the localhost domain)
-/// - Relay bound to `127.0.0.1:0` (OS-assigned port)
+/// When `identity` is `None` (auto-generate): available ONLY in a `testing`
+/// build via the test-harness `ApplicationNode::dev` (in-memory key custody,
+/// [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage), and the
+/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
+/// network). A shipped (no-`testing`) build FAILS CLOSED with
+/// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
+/// node (ADR-062 §Decision 1/6); production callers pass an explicit
+/// `Some(NodeIdentity)`. Self-signed TLS (localhost); relay bound to
+/// `127.0.0.1:0` (OS-assigned port).
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
 /// identity instead of generating a fresh one. This enables identity
@@ -346,9 +349,10 @@ pub async fn start_node_in_memory(
                         domain: "localhost".to_owned(),
                     },
                     // `Explicit` carries no custody, so `K` is unconstrained by
-                    // the variant; annotate it to the bridge's in-memory custody
-                    // type (matching `ApplicationNode::dev`'s `K`).
-                    IdentitySource::<InMemoryKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
+                    // the variant; annotate it to a production custody type
+                    // (`FileKeyCustody`) so no test-only nullifier type appears
+                    // on this shipped `server`-feature path (ADR-062 §Decision 6).
+                    IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
                         ExplicitIdentity {
                             identity: id.identity,
                             document: id.document,
@@ -458,10 +462,10 @@ pub async fn start_node_local(
                     domain: "localhost".to_owned(),
                 },
                 // `Explicit` carries no custody, so `K` is unconstrained by the
-                // variant; annotate it to the bridge's in-memory custody type
-                // (the persisted arm below uses `FileKeyCustody`, but the
-                // `Explicit` arm has no custody to derive `K` from).
-                IdentitySource::<InMemoryKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
+                // variant; annotate it to `FileKeyCustody` (matching the
+                // persisted arm below), so no test-only nullifier type appears on
+                // this shipped `server`-feature path (ADR-062 §Decision 6).
+                IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
                     ExplicitIdentity {
                         identity: id.identity,
                         document: id.document,

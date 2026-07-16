@@ -139,7 +139,7 @@
       "name": "context_seed_peer_pseudonym",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "test-fixture",
-      "reason": "\u00a79.10.4 pseudonym-announcement injection for E2E tests; feature-gated (allow_in_memory_custody) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
+      "reason": "\u00a79.10.4 pseudonym-announcement injection for E2E tests; feature-gated (testing) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
     },
     {
       "name": "creator_did",
@@ -935,7 +935,7 @@
       "name": "context_seed_peer_pseudonym",
       "path": "crates/scp-ffi/napi/src/scp.rs",
       "kind": "test-fixture",
-      "reason": "\u00a79.10.4 pseudonym-announcement injection for E2E tests; feature-gated (allow_in_memory_custody) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
+      "reason": "\u00a79.10.4 pseudonym-announcement injection for E2E tests; feature-gated (testing) test-only helper that seeds a peer's per-context routing pseudonym so multi-member encrypted sends do not fail closed with SCP-CTX-2095. Not a protocol operation."
     },
     {
       "name": "fullstack_add_member",

@@ -7,7 +7,7 @@
 //! - **Non-gated** — the two pure protocol wrappers round-trip, and the
 //!   control-plane ops on an UNKNOWN handle return clean, distinct not-found
 //!   errors (never a panic, never a silent `None`).
-//! - **Live-flow** (gated `all(allow_in_memory_custody, testing,
+//! - **Live-flow** (gated `all(testing, testing,
 //!   outlet-capability-test-grant)`) — a REAL member-backed stream driven through
 //!   `poll_next` to its terminal, plus CRITICAL #1 (a non-invoker grant →
 //!   `SCP-PERM-3001`). Like NAPI (no GIL), it needs no `allow_threads` guard, but
@@ -180,7 +180,7 @@ async fn terminate_unknown_slug_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Live-flow (gated: allow_in_memory_custody + testing + outlet-capability-test-grant)
+// Live-flow (gated: testing + testing + outlet-capability-test-grant)
 // ---------------------------------------------------------------------------
 
 /// Installs a per-instance DID resolver backed by a caller-retained in-memory DHT
@@ -189,7 +189,7 @@ async fn terminate_unknown_slug_is_rejected() {
 /// reads from — WITHOUT depending on the process-global resolver. Mirrors the
 /// `bridge.rs` saga test's `install_seedable_resolver`.
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
@@ -220,7 +220,7 @@ fn install_seedable_resolver(
 /// the BEP44 record with the identity's retained in-memory custody. Mirrors the
 /// `bridge.rs` saga test's `seed_owner_document_into_resolver`.
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
@@ -265,7 +265,7 @@ async fn seed_owner_document_into_resolver(
 /// Builds a single-admin, ephemeral, Encrypted `ContextParams` carrying the given
 /// capability ceiling — the streaming context owned by the creator.
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
@@ -308,7 +308,7 @@ fn streaming_context_params(ceiling: &[&str]) -> crate::bridge::ContextParams {
 /// live pump to terminal, and the caller==invoker gate rejects a stranger before
 /// any signing / reserve.
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
@@ -511,7 +511,7 @@ async fn live_poll_next_drains_to_terminal() {
 // `streaming_vectors_live` so the `streaming_vectors` test filter selects it.
 // ---------------------------------------------------------------------------
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]

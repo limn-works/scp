@@ -49,7 +49,7 @@ use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
 #[cfg(feature = "server")]
 use crate::server::{NapiNodeHandle, NapiRelayHandle};
 use crate::sync::NapiSyncPolicy;
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 use crate::testing::NapiFullStackNode;
 use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
 use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiTrustScoreResult};
@@ -383,13 +383,13 @@ impl Scp {
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
     // compiled out, so the bare build sees an await-free async fn.
-    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(clippy::unused_async))]
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn identity_create(
         &self,
         custody: String,
         testing_seed: Option<napi::bindgen_prelude::Buffer>,
     ) -> napi::Result<crate::identity::NapiIdentity> {
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
@@ -434,7 +434,7 @@ impl Scp {
         ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
 
         match custody.as_str() {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             "in_memory" => {
                 use scp_platform::testing::InMemoryKeyCustody;
 
@@ -497,26 +497,24 @@ impl Scp {
                 crate::increment_handle_count();
                 Ok(handle)
             }
-            #[cfg(not(feature = "allow_in_memory_custody"))]
+            #[cfg(not(feature = "testing"))]
             "in_memory" => {
                 // Mirrors PyO3 `parse_custody_with_seed`
-                // (cfg(not(allow_in_memory_custody))): a `testing_seed` is
+                // (cfg(not(testing))): a `testing_seed` is
                 // a parity-harness affordance gated on the
-                // `allow_in_memory_custody` feature, so surface it as
+                // `testing` feature, so surface it as
                 // SCP-VALID-7008 ("testing-only feature requires feature
                 // flag") ahead of the generic custody-unavailable error.
                 if testing_seed_bytes.is_some() {
                     return Err(NapiError::from(ScpNapiError::Validation {
-                        message:
-                            "`testing_seed` parameter requires the allow_in_memory_custody feature"
-                                .to_owned(),
+                        message: "`testing_seed` parameter requires the testing feature".to_owned(),
                         code: codes::VALID_7008.to_owned(),
                     }));
                 }
                 Err(ScpNapiError::Identity {
-                    message:
-                        "in_memory custody is not available in this build -- enable allow_in_memory_custody"
-                            .to_owned(),
+                    message: "in_memory custody is not available in this build -- use \
+                              \"software\" or \"platform\" custody for production key storage"
+                        .to_owned(),
                     code: codes::IDENT_1008.to_owned(),
                 }
                 .into())
@@ -559,12 +557,12 @@ impl Scp {
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
     // compiled out, so the bare build sees an await-free async fn.
-    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(clippy::unused_async))]
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn identity_create_with_agent_key(
         &self,
         custody: String,
     ) -> napi::Result<crate::identity::NapiIdentity> {
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
@@ -574,7 +572,7 @@ impl Scp {
         ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
 
         match custody.as_str() {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             "in_memory" => {
                 use scp_platform::testing::InMemoryKeyCustody;
 
@@ -627,11 +625,11 @@ impl Scp {
                 crate::increment_handle_count();
                 Ok(handle)
             }
-            #[cfg(not(feature = "allow_in_memory_custody"))]
+            #[cfg(not(feature = "testing"))]
             "in_memory" => Err(ScpNapiError::Identity {
-                message:
-                    "in_memory custody is not available in this build -- enable allow_in_memory_custody"
-                        .to_owned(),
+                message: "in_memory custody is not available in this build -- use \
+                          \"software\" or \"platform\" custody for production key storage"
+                    .to_owned(),
                 code: codes::IDENT_1008.to_owned(),
             }
             .into()),
@@ -709,7 +707,12 @@ impl Scp {
         // raw seed into Rust (held in `Zeroizing`, wiped on drop), a surface
         // tracked for migration to `KeyCustody::sign`.
 
-        use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
+        // `NapiIdentityInner` is only named in the `testing`-gated success arm
+        // below; the shipped build fails closed before minting a handle
+        // (ADR-062 §Decision 6).
+        #[cfg(feature = "testing")]
+        use crate::identity::NapiIdentityInner;
+        use crate::identity::ensure_did_resolver_initialized_on;
 
         let bi_arc = Arc::clone(&self.inner);
         ensure_did_resolver_initialized_on(&bi_arc).map_err(NapiError::from)?;
@@ -721,52 +724,68 @@ impl Scp {
         let key_custody = Arc::new(crate::custody::NapiKeyCustody::Callback(callback));
 
         env.spawn_future(async move {
-            let bi = &*bi_arc;
-            let pre_rotation_custody =
-                Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-            let dht = crate::identity::shared_did_method()?;
-            let (scp_identity, document, pre_rotation_handle) = dht
-                .create(&*key_custody, pre_rotation_custody.as_ref())
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+            // FAIL CLOSED on a shipped (no-`testing`) build (ADR-062 §Decision
+            // 6, IDENT_1059). This callback-custody path funnels through the
+            // same mandatory pre-rotation commitment as every other create path
+            // (spec §9.7.4.1 §3); the only `PreRotationCustody` backend is the
+            // severed in-memory nullifier, so production returns a typed error
+            // rather than minting it. Mirrors the `PyO3` reference bridge.
+            #[cfg(not(feature = "testing"))]
+            {
+                let _ = (&bi_arc, &key_custody);
+                Err::<crate::identity::NapiIdentity, NapiError>(NapiError::from(
+                    crate::identity::no_pre_rotation_backend(),
+                ))
+            }
+            #[cfg(feature = "testing")]
+            {
+                let bi = &*bi_arc;
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let dht = crate::identity::shared_did_method()?;
+                let (scp_identity, document, pre_rotation_handle) = dht
+                    .create(&*key_custody, pre_rotation_custody.as_ref())
+                    .await
+                    .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-            let verifying_key_hex = crate::identity::identity_verifying_key_hex(
-                &key_custody,
-                &scp_identity.identity_key,
-            )
-            .await;
-
-            crate::runtime::register_identity(
-                bi,
-                &scp_identity.did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: scp_identity.clone(),
-                    custody: Arc::clone(&key_custody),
-                    document: document.clone(),
-                    identity_link_attestations: Vec::new(),
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                },
-            );
-
-            crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
+                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                    &key_custody,
+                    &scp_identity.identity_key,
+                )
                 .await;
 
-            let handle = crate::identity::NapiIdentity {
-                inner: Arc::new(NapiIdentityInner {
-                    did: scp_identity.did.clone(),
-                    custody_type: "callback".to_owned(),
-                    scp_identity: Some(scp_identity),
-                    in_memory_custody: Some(key_custody),
-                    document: Some(document),
-                    bi: Arc::clone(&bi_arc),
-                    verifying_key_hex,
-                    instance_id: bi.instance_id(),
-                    rotation_event_json: None,
-                }),
-            };
-            crate::increment_handle_count();
-            Ok(handle)
+                crate::runtime::register_identity(
+                    bi,
+                    &scp_identity.did,
+                    crate::runtime::NapiIdentityEntry {
+                        identity: scp_identity.clone(),
+                        custody: Arc::clone(&key_custody),
+                        document: document.clone(),
+                        identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    },
+                );
+
+                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
+                    .await;
+
+                let handle = crate::identity::NapiIdentity {
+                    inner: Arc::new(NapiIdentityInner {
+                        did: scp_identity.did.clone(),
+                        custody_type: "callback".to_owned(),
+                        scp_identity: Some(scp_identity),
+                        in_memory_custody: Some(key_custody),
+                        document: Some(document),
+                        bi: Arc::clone(&bi_arc),
+                        verifying_key_hex,
+                        instance_id: bi.instance_id(),
+                        rotation_event_json: None,
+                    }),
+                };
+                crate::increment_handle_count();
+                Ok(handle)
+            }
         })
     }
 
@@ -4430,7 +4449,7 @@ impl Scp {
     /// selects in-memory storage. This wraps
     /// [`NapiBridgeInstance::new_napi`] (the internal in-memory builder) —
     /// an explicit dev/test selection, NOT a silent default.
-    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_in_memory_for_test() -> Self {
         Self {
@@ -4483,9 +4502,90 @@ impl Scp {
 }
 
 // ---------------------------------------------------------------------------
+// Fail-closed device-attestation methods on shipped (no-`testing`) builds.
+//
+// Spec §9:187 — device attestation (Apple App Attest / Google Play Integrity) is
+// an optional SDK-level trust signal whose absence is expected and
+// non-penalizing. No production device-attestation backend is wired yet: App
+// Attest / Play Integrity are hardware/platform-backed and are intentionally
+// deferred (with hardware keychain custody) until an e2e-driven integration
+// lands (ADR-062 §Decision 3 severs the test-harness `InMemoryDeviceAttestation`
+// nullifier — always-attest / always-valid — from every production dependency
+// line). So a shipped build returns a typed honest-absent error rather than a
+// silently-valid attestation. See ADR-025 and #2171 for the real backend.
+//
+// These live in a SEPARATE `#[cfg(not(feature = "testing"))] #[napi] impl`
+// block (mirroring the `testing` block below) so napi-rs emits the
+// `_c_callback` registration in BOTH build configs — the TS surface is
+// identical across builds; only the body differs. Mirrors the PyO3 reference
+// bridge's not(testing) `identity_attest_device` /
+// `identity_verify_device_attestation`.
+// ---------------------------------------------------------------------------
+#[cfg(not(feature = "testing"))]
+#[napi]
+impl Scp {
+    /// Fail-closed [`Self::identity_attest_device`] on a shipped build.
+    ///
+    /// Returns [`codes::IDENT_1015`] (device attestation unavailable — no
+    /// production backend wired yet; spec §9:187 / ADR-062 §Decision 3) rather
+    /// than reaching for the severed `InMemoryDeviceAttestation` nullifier.
+    #[napi(js_name = "identityAttestDevice")]
+    // napi requires `async` for the `Promise` return type; the fail-closed body
+    // has no `.await`. It DOES dereference `self`: the identity is resolved
+    // against THIS instance's registry first, so an unregistered DID surfaces
+    // the standard not-found identity error while a registered DID fails closed
+    // with the typed honest-absent IDENT_1015.
+    #[allow(clippy::unused_async)]
+    pub async fn identity_attest_device(&self, did: String) -> napi::Result<String> {
+        crate::runtime::with_identity(&self.inner, &did, |_entry| {
+            Err(ScpNapiError::Identity {
+                message: "device attestation unavailable: no production \
+                          device-attestation backend is wired yet — Apple App Attest / \
+                          Google Play Integrity are hardware/platform-backed and are \
+                          intentionally deferred (with hardware keychain custody) until \
+                          an e2e-driven integration lands (spec §9:187). See #2171."
+                    .to_owned(),
+                code: codes::IDENT_1015.to_owned(),
+            })
+        })
+        .map_err(NapiError::from)
+    }
+
+    /// Fail-closed [`Self::identity_verify_device_attestation`] on a shipped
+    /// build.
+    ///
+    /// Returns [`codes::IDENT_1016`] (device attestation unavailable — no
+    /// production backend wired yet; spec §9:187 / ADR-062 §Decision 3) rather
+    /// than a silently-valid result.
+    #[napi(js_name = "identityVerifyDeviceAttestation")]
+    // Fail-closed body has no `.await`; it DOES dereference `self` by resolving
+    // the identity against THIS instance's registry before the typed decline.
+    #[allow(clippy::unused_async)]
+    pub async fn identity_verify_device_attestation(
+        &self,
+        did: String,
+        token_base64: String,
+    ) -> napi::Result<bool> {
+        let _ = token_base64;
+        crate::runtime::with_identity(&self.inner, &did, |_entry| {
+            Err(ScpNapiError::Identity {
+                message: "device attestation verification unavailable: no production \
+                          device-attestation backend is wired yet — Apple App Attest / \
+                          Google Play Integrity are hardware/platform-backed and are \
+                          intentionally deferred (with hardware keychain custody) until \
+                          an e2e-driven integration lands (spec §9:187). See #2171."
+                    .to_owned(),
+                code: codes::IDENT_1016.to_owned(),
+            })
+        })
+        .map_err(NapiError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // In-memory-custody-only `Scp` methods.
 //
-// These methods are gated behind `allow_in_memory_custody` because they
+// These methods are gated behind `testing` because they
 // depend on an in-memory *backend* — the `InMemoryDeviceAttestation` software
 // attestation backend (production hardware attestation per ADR-025 is not yet
 // wired) or the full-stack in-memory test network. They live in a SEPARATE
@@ -4498,7 +4598,7 @@ impl Scp {
 // signing, link attestations) lives in the main `impl Scp` block above and is
 // NOT gated, mirroring the PyO3 reference bridge.
 // ---------------------------------------------------------------------------
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 #[napi]
 impl Scp {
     /// Per-instance equivalent of `identity_attest_device`.
@@ -4686,7 +4786,7 @@ impl Scp {
     /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4) into
     /// this bridge's `Supervisor`, simulating a delivered `PseudonymAnnouncement`
     /// so multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
-    /// Lives in this `allow_in_memory_custody`-gated `#[napi] impl Scp` block
+    /// Lives in this `testing`-gated `#[napi] impl Scp` block
     /// (never shipped in production) so napi-rs does not emit a dangling
     /// `_c_callback` registration reference in bare builds.
     #[napi(js_name = "contextSeedPeerPseudonym")]
@@ -4720,7 +4820,7 @@ impl Scp {
 // rejected-upstream callers never consume a permit") and the busy-error
 // shape are both validated without depending on orchestrator timing.
 // ---------------------------------------------------------------------------
-#[cfg(all(test, feature = "allow_in_memory_custody"))]
+#[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod concurrency_cap_tests {
     use super::*;
@@ -5071,7 +5171,7 @@ mod storage_mandatory_tests {
     }
 }
 
-#[cfg(all(test, feature = "allow_in_memory_custody"))]
+#[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod identity_remove_validation_tests {
     use super::*;

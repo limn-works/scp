@@ -19,12 +19,6 @@ default = ["server"]
 # but incompatible with test binaries. Maturin passes this explicitly.
 # cargo test runs WITHOUT it, so auto-initialize can embed Python.
 extension-module = ["pyo3/extension-module"]
-# Gates the "in_memory" custody path in `parse_custody` via code-level
-# `#[cfg(feature = "allow_in_memory_custody")]` guards. `InMemoryKeyCustody`
-# stores private key material in unprotected heap memory. Note: the `testing`
-# feature is always enabled in deps (needed for `InMemoryStorage`), so this
-# feature is a pure code-level gate. See issue #394 and ADR-006.
-allow_in_memory_custody = ["scp-platform/testing", "dep:scp-testing"]
 # Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Enables testing-only affordances like `scpid_sign(signed_at_override=...)`
@@ -32,18 +26,29 @@ server = ["scp-ffi-common/server", "dep:scp-node"]
 # production bridge builds — the override lets callers pin `signed_at` to
 # an arbitrary value within the challenge window, which is a parity-test
 # construct, not a protocol feature.
-# `scp-dht/testing` compiles the `InMemoryDhtClient` §17.17.3 nullifier and
-# `scp-ffi-common/testing` exposes the `FfiDhtClient::InMemory` arm the bridge's
-# test seams construct. Forwarded here (never in `default`/`server`) so the
-# testing-gated DHT seam compiles from this feature alone, without relying on
-# dev-dependency feature unification. INVARIANT: `scp-dht/testing` appears ONLY
-# inside a `testing = [...]` list (ADR-062 §Decision 1).
-testing = ["scp-core/testing", "scp-dht/testing", "scp-ffi-common/testing"]
+# Single test-harness feature (ADR-062 §Decision 6): folds in every in-memory
+# nullifier double the bridge test seams construct. `scp-platform/testing`
+# compiles `InMemoryKeyCustody`/`InMemoryDeviceAttestation`/
+# `InMemoryPreRotationCustody` (the §17.17.2 security nullifiers, formerly behind
+# the deleted custody switch); `scp-dht/testing` compiles the
+# `InMemoryDhtClient` §17.17.3 nullifier; `scp-ffi-common/testing` exposes the
+# `FfiDhtClient::InMemory` arm; `dep:scp-testing` pulls the full-stack E2E
+# harness. Forwarded here (never in `default`/`server`) so every testing-gated
+# seam compiles from this feature alone, without relying on dev-dependency
+# feature unification. INVARIANT: `scp-platform/testing` and `scp-dht/testing`
+# appear ONLY inside a `testing = [...]` list (ADR-062 §Decision 1/6) — the G1
+# shipped-feature-graph gate proves they never reach a shipped artifact.
+testing = [
+    "scp-core/testing",
+    "scp-dht/testing",
+    "scp-ffi-common/testing",
+    "scp-platform/testing",
+    "dep:scp-testing",
+]
 # Forwards the non-leaking capability-escalation test seam feature so the
 # outlet-stream live-flow e2e test can authorize a member invoker. Deliberately
-# NOT implied by `testing` / `allow_in_memory_custody` (see
-# scp-runtime/Cargo.toml) so the capability-escalation seam is never compiled
-# into a custody-escape-hatch bridge build.
+# NOT implied by `testing` (see scp-runtime/Cargo.toml) so the
+# capability-escalation seam is never compiled into a test-harness bridge build.
 outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
@@ -63,7 +68,11 @@ scp-event-log = { path = "../scp-event-log" }
 scp-ffi-common = { path = "common", features = ["custody"] }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"], optional = true }
 scp-mcp = { path = "../scp-mcp" }
-scp-platform = { path = "../scp-platform", features = ["software_platform", "file", "testing", "encrypting", "filesystem", "sqlite"] }
+# Production dep line: durability-only `in-memory-storage` (the shippable
+# `{"type":"in_memory"}` storage affordance, SCP-CAPSEL-8011) — NEVER `testing`
+# (that would ship the in-memory custody/attestation/pre-rotation nullifiers).
+# The `testing` crate-feature adds `scp-platform/testing` on top for test builds.
+scp-platform = { path = "../scp-platform", features = ["software_platform", "file", "in-memory-storage", "encrypting", "filesystem", "sqlite"] }
 scp-media = { path = "../scp-media" }
 scp-testing = { path = "../scp-testing", optional = true }
 scp-transport = { path = "../scp-transport" }
@@ -97,9 +106,9 @@ tempfile = "3"
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
-# Needs `allow_in_memory_custody` for the in-memory custody/storage test
+# Needs `testing` for the in-memory custody/storage test
 # harness (`new_in_memory_for_test`, `scp-platform/testing`).
-required-features = ["allow_in_memory_custody"]
+required-features = ["testing"]
 
 [[test]]
 # SCP-OUT-039 (C12) — outlet-streaming conformance vectors replayed through the
@@ -108,7 +117,7 @@ required-features = ["allow_in_memory_custody"]
 # `testing` + `outlet-capability-test-grant` (see the `live` module).
 name = "outlet_stream_vectors_real"
 path = "tests/outlet_stream_vectors_real.rs"
-required-features = ["allow_in_memory_custody"]
+required-features = ["testing"]
 
 [lints]
 workspace = true

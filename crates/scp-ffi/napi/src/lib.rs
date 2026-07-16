@@ -148,10 +148,10 @@ pub use scp::Scp;
 #[cfg(feature = "server")]
 pub mod server;
 
-// Full-stack E2E testing module — feature-gated behind allow_in_memory_custody.
+// Full-stack E2E testing module — feature-gated behind testing.
 // Exposes FullStackNetwork/FullStackNode from scp-testing for real
 // encrypt→decrypt roundtrip tests from TypeScript.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 pub mod testing;
 
 // ---------------------------------------------------------------------------

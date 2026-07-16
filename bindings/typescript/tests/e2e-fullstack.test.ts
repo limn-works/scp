@@ -6,7 +6,7 @@
  * ContextManager -> CapturingTransport -> decrypt.
  *
  * Prerequisites:
- * - The NAPI bridge must be compiled with `allow_in_memory_custody` feature.
+ * - The NAPI bridge must be compiled with `testing` feature.
  * - The platform-specific `@limn-works/scp-ts-napi-*` package must be loadable.
  *
  * If the native addon is not available, all tests are skipped gracefully.
@@ -23,7 +23,7 @@ import { createRequire } from "node:module";
 
 // ---------------------------------------------------------------------------
 // Load the raw native addon — the fullstack methods live on `SCP` (gated
-// behind the `allow_in_memory_custody` feature). We call them through a
+// behind the `testing` feature). We call them through a
 // per-test `SCP` instance instead of module-level free functions.
 // ---------------------------------------------------------------------------
 
@@ -59,9 +59,7 @@ try {
   // defined on the class, not on the addon module.
   const probe = new addon.SCP(JSON.stringify({ type: "in_memory" }));
   if (typeof probe.fullstackCreateNode !== "function") {
-    throw new Error(
-      "SCP.fullstackCreateNode not found — rebuild with allow_in_memory_custody feature",
-    );
+    throw new Error("SCP.fullstackCreateNode not found — rebuild with testing feature");
   }
 } catch (e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);

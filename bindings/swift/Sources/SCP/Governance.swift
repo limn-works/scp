@@ -179,12 +179,16 @@ func validateContentPath(_ rawPath: String) throws {
     try rejectForbiddenPathChars(path)
     try rejectPathControlChars(path)
     try rejectPathUnicodeFormatting(path)
-    if path.contains("//") { throw contentPathError("ContentPath must not contain '//'") }
+    if path.contains("//") {
+        throw contentPathError("ContentPath must not contain '//'")
+    }
     if path.count > 1, path.hasSuffix("/") {
         throw contentPathError("ContentPath must not have trailing slash (except root '/')")
     }
     for segment in path.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
-        if segment == "." { throw contentPathError("ContentPath must not contain '.' segments") }
+        if segment == "." {
+            throw contentPathError("ContentPath must not contain '.' segments")
+        }
         if segment == ".." {
             throw contentPathError("ContentPath must not contain '..' segments (directory traversal)")
         }

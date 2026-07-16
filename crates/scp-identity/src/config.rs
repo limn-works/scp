@@ -57,6 +57,12 @@
 //! ```
 
 use scp_platform::EncryptedStorage;
+// Gated on the `testing` feature ONLY (never a bare `#[cfg(test)]` disjunct):
+// `InMemoryPreRotationCustody` is a §17.17.2 security nullifier, and per ADR-062
+// §Decision 6 / A5 the single activation path is `feature = "testing"`, so
+// feature-absence ≡ type-absence holds for the G1 shipped-feature-graph gate.
+// A shipped build never enables `testing`, so its `create_inner` fails closed.
+#[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryPreRotationCustody;
 use scp_platform::traits::{KeyCustody, PreRotationKeyHandle, Storage};
 
@@ -238,14 +244,13 @@ impl Identity {
     /// Creates a new standalone identity from an [`IdentityConfig`]
     /// (production path).
     ///
-    /// Lowers the flat config to the existing [`DidMethod::create`] call,
-    /// minting a fresh per-identity [`InMemoryPreRotationCustody`] for the
-    /// cold-storage pre-rotation key — the same internal mint every other
-    /// identity-creation path performs (the construction-standard
-    /// `IdentityConfig` shape carries no separate pre-rotation slot). When
-    /// `config.persistence` is `Some`, the identity's public DID document is
-    /// persisted under the spec §17.3 key `identity/{did}/document` after
-    /// successful creation.
+    /// Lowers the flat config to the existing [`DidMethod::create`] call via the
+    /// shared [`create_inner`] pre-rotation lowering. On a shipped (no-`testing`)
+    /// build there is no real pre-rotation backend, so this **fails closed** with
+    /// [`IdentityError::NoPreRotationBackend`] rather than minting the in-memory
+    /// nullifier (see [`create_inner`]). When `config.persistence` is `Some` and
+    /// creation succeeds, the identity's public DID document is persisted under
+    /// the spec §17.3 key `identity/{did}/document`.
     ///
     /// # The `EncryptedStorage` seal (M2 / construction.md)
     ///
@@ -315,37 +320,69 @@ impl Identity {
 /// [`DidMethod::create`]. Both [`Identity::create`] paths funnel through here so
 /// the creation logic is written exactly once.
 ///
-/// # Pre-rotation custody (known limitation, shared with `Node::start`)
+/// # Pre-rotation custody — FAILS CLOSED in production (ADR-062 §Decision 6)
 ///
-/// This mints an [`InMemoryPreRotationCustody`] internally, exactly as the Node
-/// builder (`generate_identity_with`/`identity_with_storage`) and every FFI
-/// `identity_create*` path do. Per spec §9.7.4.1 §3 (storage isolation) the
-/// pre-rotation key lives in a *separate substrate* from the operational
-/// `custody`, which the type system guarantees (distinct custody type). However,
-/// the only [`PreRotationCustody`](scp_platform::PreRotationCustody) backend that
-/// exists today is the in-memory one, which is process-local: the returned
-/// [`PreRotationKeyHandle`] cannot be reloaded after a process restart. A
-/// `warn!` records this so operators know Layer-2 DID migration (recovery from
-/// `#0` compromise, spec §9.7.4.1) is not durable for this identity until a
-/// persistent pre-rotation backend ships. Unlike the Node path, this entry point
-/// *returns* the handle rather than dropping it, so a future durable backend can
-/// be threaded without an API change.
+/// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
+/// §3 — mandatory, not optional), which requires a
+/// [`PreRotationCustody`](scp_platform::PreRotationCustody) backend. The only
+/// implementation that exists today is [`InMemoryPreRotationCustody`], a
+/// §17.17.2 security nullifier now gated to the test harness (`testing`) only.
+///
+/// - **`testing` build:** mints a fresh per-identity `InMemoryPreRotationCustody`
+///   (as the Node builder and every FFI `identity_create*` path do). Per spec
+///   §9.7.4.1 §3 the pre-rotation key lives in a *separate substrate* from the
+///   operational `custody`, which the type system guarantees (distinct custody
+///   type). It is process-local, so the returned [`PreRotationKeyHandle`] cannot
+///   be reloaded after a restart — a `warn!` records this. Unlike the Node path,
+///   this entry point *returns* the handle rather than dropping it. Note that
+///   wiring a real durable [`PreRotationCustody`](scp_platform::PreRotationCustody)
+///   backend WILL thread a new injected parameter through this lowering (DI, per
+///   the no-singletons tenet) — that is an additive API change, not a no-op. The
+///   DOA-safe property this severance secures is the `Result` return *shape*: the
+///   fail-closed arm already returns `Err`, so adding the backend never changes
+///   the signature's fallibility, only supplies the missing capability.
+/// - **shipped (no-`testing`) build:** there is NO real pre-rotation backend, so
+///   creation FAILS CLOSED with [`IdentityError::NoPreRotationBackend`] rather
+///   than silently minting the nullifier. Masking a missing production backend
+///   with a dev stand-in would ship a false durability guarantee (CLAUDE.md
+///   builder tenet "No dev/test-only stand-ins in production"). A real backend is
+///   tracked by #1729 / RFC #2130; non-committing create (Option A, #1553) is out
+///   of scope and would violate spec §9.7.4.1.
+// On a shipped build the body is a single fail-closed `Err` with no `.await`;
+// the `async` signature is preserved for the `testing` build (which awaits
+// `method.create`) and the callers' `.await` sites.
+#[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
 async fn create_inner<K, D>(method: &D, custody: &K) -> Result<CreatedIdentity, IdentityError>
 where
     K: KeyCustody,
     D: DidMethod,
 {
-    let pre_rotation_custody = InMemoryPreRotationCustody::new();
-    let (identity, document, pre_rotation_handle) =
-        method.create(custody, &pre_rotation_custody).await?;
-    tracing::warn!(
-        did = %identity.did,
-        "identity created with a process-local in-memory PreRotationCustody — \
-         Layer-2 DID migration (recovery from `#0` compromise via spec §9.7.4.1) \
-         is not durable across process restart until a persistent pre-rotation \
-         backend ships."
-    );
-    Ok((identity, document, pre_rotation_handle))
+    #[cfg(feature = "testing")]
+    {
+        let pre_rotation_custody = InMemoryPreRotationCustody::new();
+        let (identity, document, pre_rotation_handle) =
+            method.create(custody, &pre_rotation_custody).await?;
+        tracing::warn!(
+            did = %identity.did,
+            "identity created with a process-local in-memory PreRotationCustody — \
+             Layer-2 DID migration (recovery from `#0` compromise via spec §9.7.4.1) \
+             is not durable across process restart until a persistent pre-rotation \
+             backend ships."
+        );
+        Ok((identity, document, pre_rotation_handle))
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        // Fail closed: no real pre-rotation backend exists yet (RFC #2130 / #1729).
+        // Never silently substitute the in-memory nullifier on a shipped build.
+        // The `testing` feature is the SOLE activation path for the mint arm above
+        // (ADR-062 A5), so this arm is selected by any build with `testing` off —
+        // a shipped binary AND this crate's own default-feature unit-test lane
+        // (`cargo test -p scp-identity`), which is exactly what proves the
+        // fail-closed behavior end-to-end (`ephemeral_create_fails_closed_*`).
+        let _ = (method, custody);
+        Err(IdentityError::NoPreRotationBackend)
+    }
 }
 
 /// Persists an identity's public DID document under the spec §17.3 key
@@ -426,7 +463,9 @@ mod tests {
 
     /// A `did:dht` is always 32 verifying-key bytes z-base-32 encoded, so the
     /// `did:dht:z` prefix is the cheap structural check that creation produced a
-    /// real, well-formed identity.
+    /// real, well-formed identity. Only the mint (`testing`) lane creates a real
+    /// identity to check — the shipped lane fails closed before any DID exists.
+    #[cfg(feature = "testing")]
     fn assert_valid_did_dht(did: &str) {
         assert!(
             did.starts_with("did:dht:z"),
@@ -445,6 +484,79 @@ mod tests {
         ))
     }
 
+    /// AC5 core path (ADR-062 §Decision 6 / SCP-CAPINJECT-006): on a shipped
+    /// (no-`testing`) build there is NO real pre-rotation custody backend, so the
+    /// shared [`create_inner`] lowering FAILS CLOSED with
+    /// [`IdentityError::NoPreRotationBackend`] (surfaced across the FFI as
+    /// SCP-IDENT-1059) rather than minting the in-memory
+    /// `InMemoryPreRotationCustody` nullifier.
+    ///
+    /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed arm of
+    /// `create_inner` is selected by *this crate's* `testing` feature being off —
+    /// the shipped configuration — NOT by `test` cfg. The create *inputs*
+    /// (`InMemoryKeyCustody` / `InMemoryDhtClient`) are still constructible here
+    /// because they enter via this crate's `[dev-dependencies]`
+    /// `scp-platform/testing` + `scp-dht/testing` edges, which activate *those*
+    /// crates' testing features WITHOUT turning on `scp-identity/testing`. This is
+    /// exactly how scp-node's `pre_rotation_severance_generate_fails_closed`
+    /// asserts the shipped path — the double is a test fixture for the caller's
+    /// arguments; the production lowering it drives has no nullifier to fall back
+    /// to. Adding a self `testing` dev-dependency would instead force
+    /// `scp-identity/testing` ON for the whole unit-test build (cargo unifies a
+    /// self dev-dep's features into the lib under test), compiling out this arm
+    /// and leaving the severance untested — so this crate deliberately does not
+    /// carry one.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn ephemeral_create_fails_closed_without_pre_rotation_backend() {
+        let result = Identity::create_ephemeral(IdentityConfig::ephemeral(
+            crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
+            InMemoryKeyCustody::new(),
+        ))
+        .await;
+        match result {
+            Err(IdentityError::NoPreRotationBackend) => {}
+            Err(other) => {
+                panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}")
+            }
+            Ok(_) => panic!(
+                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                 pre-rotation nullifier was minted on a shipped-config create path!"
+            ),
+        }
+    }
+
+    /// Companion to the above covering the persisting `Identity::create` path: it
+    /// likewise funnels through `create_inner`'s pre-rotation commitment and fails
+    /// closed on a shipped build — BEFORE ever writing the document to storage.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn persisted_create_fails_closed_without_pre_rotation_backend() {
+        let storage = encrypted_test_storage();
+        let result = Identity::create(IdentityConfig {
+            method: crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
+            custody: InMemoryKeyCustody::new(),
+            persistence: Some(Arc::clone(&storage)),
+        })
+        .await;
+        match result {
+            Err(IdentityError::NoPreRotationBackend) => {}
+            Err(other) => {
+                panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}")
+            }
+            Ok(_) => panic!(
+                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                 pre-rotation nullifier was minted on a shipped-config persist create path!"
+            ),
+        }
+    }
+
+    // Mint-path success tests require a real pre-rotation backend, which only the
+    // `testing` feature supplies (`InMemoryPreRotationCustody`). On a shipped
+    // build `create_inner` fails closed, so these assertions only hold — and only
+    // compile the mint arm — under `--features testing`. The fail-closed behavior
+    // is proven separately by `ephemeral_create_fails_closed_*` below.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn ephemeral_create_produces_valid_did_dht() {
         let (identity, document, _pre_rotation) =
@@ -460,6 +572,7 @@ mod tests {
         assert_eq!(document.id, identity.did);
     }
 
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn ephemeral_create_via_explicit_none_persistence() {
         // The literal-struct form with an explicit `None` storage is the
@@ -476,6 +589,7 @@ mod tests {
         assert_valid_did_dht(&identity.did);
     }
 
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn persisted_create_round_trips_document() {
         let storage = encrypted_test_storage();
@@ -511,6 +625,7 @@ mod tests {
         assert_eq!(reloaded.id, identity.did);
     }
 
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn ephemeral_create_persists_nothing() {
         // An ephemeral identity must leave no document at rest. We assert the
@@ -590,6 +705,7 @@ mod tests {
     /// document's JSON bytes, and it carries the shared
     /// `CURRENT_STORE_VERSION`. This local guard catches drift away from the
     /// envelope shape even before the cross-crate round-trip test runs.
+    #[cfg(feature = "testing")]
     #[tokio::test]
     async fn serialize_document_produces_stored_value_envelope() {
         let (_identity, document, _pre_rotation) =
