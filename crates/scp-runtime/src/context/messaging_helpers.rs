@@ -59,6 +59,10 @@ use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::pseudonym::{
+    self, PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement, PseudonymAnnouncementDecision,
+    classify_pseudonym_announcement, is_pseudonym_announcement_payload,
+};
 use scp_protocol::context::roles::Capability;
 use scp_protocol::crypto::access_keys::wrapping::Recipient;
 use scp_protocol::crypto::access_keys::{AccessKey, WrappedContent};
@@ -74,10 +78,7 @@ use crate::context::actor::class_s::{BroadcastContextClassCMut, ClassCMut};
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_helpers;
-use crate::context::state::{
-    self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, PSEUDONYM_ANNOUNCEMENT_TAG,
-    PseudonymAnnouncement, emit_event_into,
-};
+use crate::context::state::{self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, emit_event_into};
 use crate::context::supervisor::MessageSigner;
 use crate::crypto::mls::provider::MlsCryptoProvider;
 
@@ -508,69 +509,6 @@ pub fn deliver_plaintext_or_announcement(
 // §9.10.4 announcement / routing helpers
 // ---------------------------------------------------------------------------
 
-/// Classifies a send-path payload as a `PseudonymAnnouncement` (§9.10.4).
-///
-/// Announcements are the ONLY payload class permitted to use the shared
-/// `context_routing_id` as an addressee — they form the bootstrap channel
-/// peers use to learn each other's pseudonyms before regular app data can fan
-/// out on pseudonym-only paths. Returns `true` only when the payload
-/// deserializes as a well-formed `PseudonymAnnouncement` AND carries the magic
-/// tag (`PSEUDONYM_ANNOUNCEMENT_TAG`, `\0`-prefixed to avoid collision with
-/// UTF-8 user content). False positives from adversarial payloads cannot
-/// escalate: the worst outcome is a legitimate app message routed to the
-/// shared RID, which is not a confidentiality issue (MLS still gates content)
-/// and is detected as a non-announcement on the receive path.
-fn is_pseudonym_announcement_payload(payload: &[u8]) -> bool {
-    rmp_serde::from_slice::<PseudonymAnnouncement>(payload)
-        .is_ok_and(|a| a.tag == PSEUDONYM_ANNOUNCEMENT_TAG)
-}
-
-/// Returns `true` if `pseudonym` is a reserved routing ID a member is not
-/// permitted to announce as their own (§9.10.4).
-///
-/// The pseudonym registry maps each member's DID to the routing ID honest
-/// senders fan their app-data ciphertext out to. If a member could announce a
-/// reserved value for their own DID, they could redirect every honest sender's
-/// app-data:
-///
-/// - `[0u8; 32]` — the zero/degraded sentinel; maps to nothing meaningful.
-/// - `context_routing_id(context_id)` — the shared bootstrap RID; announcing
-///   it would push app-data ciphertext onto the shared channel, defeating
-///   unlinkability.
-/// - `broadcast_routing_id(context_id)` — the derivable `SHA-256(context_id)`
-///   broadcast RID; same leak vector.
-///
-/// Honest pseudonyms are the raw 32-byte Ed25519 public key of the member's
-/// per-context keypair (stored and routed on verbatim, NOT hashed). They
-/// collide with these reserved values only with negligible probability, so
-/// rejecting them costs nothing for legitimate members.
-fn is_reserved_pseudonym(pseudonym: &[u8; 32], context_id: &str) -> bool {
-    *pseudonym == [0u8; 32]
-        || *pseudonym == scp_protocol::context::context_routing_id(context_id)
-        || *pseudonym == scp_protocol::context::broadcast_routing_id(context_id)
-}
-
-/// Returns `true` if `pseudonym` is already registered under a DID OTHER than
-/// `announcer_did` (§9.10.4 defense-in-depth).
-///
-/// The announcement path already enforces `announcement.member_did ==
-/// sender_did`, so a member can only announce a routing ID for their own DID.
-/// This guards the remaining vector: a member claiming a routing ID an
-/// existing peer already legitimately uses, which would let two DIDs resolve
-/// to one routing ID (a relay would then receive both members' fan-out at one
-/// address, and honest senders addressing the colliding DID could misroute).
-/// A member re-announcing the SAME value for their OWN DID is legitimate (key
-/// rotation re-broadcast) and is NOT a collision.
-fn pseudonym_collides_with_other_did(
-    registry: &std::collections::HashMap<DID, [u8; 32]>,
-    announcer_did: &DID,
-    pseudonym: &[u8; 32],
-) -> bool {
-    registry.iter().any(|(other_did, other_pseudonym)| {
-        other_pseudonym == pseudonym && other_did != announcer_did
-    })
-}
-
 /// Outcome of running the shared §9.10.4 pseudonym-announcement ingest
 /// validator over a single inbound plaintext.
 ///
@@ -617,88 +555,80 @@ fn ingest_pseudonym_announcement(
     context_id: &str,
     event_tx: Option<&ContextEventSender>,
 ) -> AnnouncementOutcome {
-    // Step 1: tag-decode. A non-announcement (or untagged payload) is ordinary
-    // application data.
-    let Ok(announcement) = rmp_serde::from_slice::<PseudonymAnnouncement>(plaintext) else {
-        return AnnouncementOutcome::NotAnnouncement;
-    };
-    if announcement.tag != PSEUDONYM_ANNOUNCEMENT_TAG {
-        return AnnouncementOutcome::NotAnnouncement;
-    }
-
-    // Step 2: the announced DID must match the authenticated sender. A member
-    // can only announce a routing ID for their OWN DID.
-    if announcement.member_did != sender_did {
-        crate::metrics::record_pseudonym_announcement_rejected();
-        tracing::warn!(
-            context_id,
-            sender_did,
-            claimed_did = %announcement.member_did,
-            "pseudonym announcement sender mismatch — rejecting forged announcement"
-        );
-        return AnnouncementOutcome::Rejected(
-            "pseudonym announcement member_did does not match sender",
-        );
-    }
-
-    let announced_did = DID(announcement.member_did.clone());
-
-    // Step 3: reject reserved pseudonym VALUES before touching the registry.
-    // Announcing the zero sentinel, the shared bootstrap RID, or the broadcast
-    // RID for one's own DID would redirect every honest sender's app-data
-    // fan-out, defeating unlinkability or leaking ciphertext onto the shared
-    // channel.
-    if is_reserved_pseudonym(&announcement.pseudonym, context_id) {
-        crate::metrics::record_pseudonym_announcement_rejected();
-        tracing::warn!(
-            context_id,
-            sender_did,
-            "pseudonym announcement uses a reserved routing ID — rejecting"
-        );
-        return AnnouncementOutcome::Rejected("pseudonym announcement uses a reserved routing ID");
-    }
-
-    // Step 4: registry updates are meaningful only for encrypted contexts. A
-    // broadcast context carries no peer registry — reject as a spec-level
-    // violation. Otherwise reject a routing ID already claimed by a DIFFERENT
-    // member (same-DID re-announce for key rotation stays allowed), then insert.
-    let Some(pseudonym_registry) = view.routing_mut().peer_registry_mut() else {
-        crate::metrics::record_pseudonym_announcement_rejected();
-        tracing::warn!(
-            context_id,
-            sender_did,
-            "pseudonym announcement received on broadcast context — rejecting"
-        );
-        return AnnouncementOutcome::Rejected(
-            "pseudonym announcement received on broadcast context",
-        );
-    };
-    if pseudonym_collides_with_other_did(
-        pseudonym_registry,
-        &announced_did,
-        &announcement.pseudonym,
+    // Run the shared, wasm-safe §9.10.4 decision core over the immutable peer
+    // registry (`None` for a broadcast context). The classifier owns the
+    // four-step validation; the native side effects — the rejection metric, the
+    // per-branch `tracing` warn, the registry insert, and the `PseudonymAnnounced`
+    // buffer emit — stay HERE and are byte-and-trace-identical to the previous
+    // inline implementation.
+    match classify_pseudonym_announcement(
+        plaintext,
+        sender_did,
+        context_id,
+        view.routing_mut().peer_registry(),
     ) {
-        crate::metrics::record_pseudonym_announcement_rejected();
-        tracing::warn!(
-            context_id,
-            sender_did,
-            "pseudonym announcement collides with another member's routing ID — rejecting"
-        );
-        return AnnouncementOutcome::Rejected(
-            "pseudonym announcement collides with another member's routing ID",
-        );
+        PseudonymAnnouncementDecision::NotAnnouncement => AnnouncementOutcome::NotAnnouncement,
+        PseudonymAnnouncementDecision::Rejected {
+            reason,
+            claimed_did,
+        } => {
+            crate::metrics::record_pseudonym_announcement_rejected();
+            // Reproduce the exact warn that fired before for each rejection
+            // branch. The sender-mismatch branch is the ONLY one carrying a
+            // `claimed_did`, and it logs it as a field (`%claimed_did` renders
+            // the raw DID string, identical to the prior `%announcement.member_did`);
+            // the other three branches are disambiguated by their stable reason.
+            if let Some(claimed_did) = claimed_did {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    claimed_did = %claimed_did,
+                    "pseudonym announcement sender mismatch — rejecting forged announcement"
+                );
+            } else if reason == pseudonym::REJECT_RESERVED {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "pseudonym announcement uses a reserved routing ID — rejecting"
+                );
+            } else if reason == pseudonym::REJECT_BROADCAST {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "pseudonym announcement received on broadcast context — rejecting"
+                );
+            } else {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "pseudonym announcement collides with another member's routing ID — rejecting"
+                );
+            }
+            AnnouncementOutcome::Rejected(reason)
+        }
+        PseudonymAnnouncementDecision::Accept {
+            member_did,
+            pseudonym,
+        } => {
+            // The classifier only returns `Accept` for an encrypted context whose
+            // peer registry is present and non-colliding; re-borrow it mutably to
+            // insert. The `if let` (rather than a workspace-denied `expect`) is a
+            // total match over that proven invariant — the registry presence
+            // cannot change between the classify read and this insert (no mutation
+            // occurs in between).
+            if let Some(pseudonym_registry) = view.routing_mut().peer_registry_mut() {
+                pseudonym_registry.insert(member_did.clone(), pseudonym);
+            }
+            // Record + emit. The `routing_mut()` borrow above has ended (NLL)
+            // before this disjoint `receive_buffer` emit.
+            let event = ContextEvent::PseudonymAnnounced {
+                member_did,
+                pseudonym,
+            };
+            emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
+            AnnouncementOutcome::Recorded
+        }
     }
-    pseudonym_registry.insert(announced_did.clone(), announcement.pseudonym);
-
-    // Record + emit. The validator stops here; per-site follow-up runs at the
-    // call site. The `routing_mut()` borrow above has ended (NLL) before this
-    // disjoint `receive_buffer` emit.
-    let event = ContextEvent::PseudonymAnnounced {
-        member_did: announced_did,
-        pseudonym: announcement.pseudonym,
-    };
-    emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
-    AnnouncementOutcome::Recorded
 }
 
 // ---------------------------------------------------------------------------
@@ -3580,8 +3510,8 @@ pub async fn send_pseudonym_announcement(
     let Some(pseudonym) = cell.routing.local_pseudonym() else {
         return;
     };
-    let announcement = state::PseudonymAnnouncement {
-        tag: state::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+    let announcement = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
         member_did: sender_did.as_ref().to_owned(),
         pseudonym,
     };
@@ -3618,14 +3548,8 @@ pub async fn send_pseudonym_announcement(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod pseudonym_routing_tests {
-    use super::{
-        is_pseudonym_announcement_payload, is_reserved_pseudonym, pseudonym_collides_with_other_did,
-    };
-    use crate::context::state::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
     use scp_did::DID;
-    use std::collections::HashMap;
-
-    const CTX: &str = "ctx-pseudonym-routing-tests";
+    use scp_protocol::context::pseudonym::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
 
     fn announcement_bytes(member_did: &str, pseudonym: [u8; 32]) -> Vec<u8> {
         let ann = PseudonymAnnouncement {
@@ -3636,77 +3560,14 @@ mod pseudonym_routing_tests {
         rmp_serde::to_vec_named(&ann).expect("serialize announcement")
     }
 
-    /// §9.10.4: the shared `context_routing_id` is a RESERVED value — a member
-    /// must not be able to announce it as their own pseudonym, because honest
-    /// senders fan app-data out to announced pseudonyms and the shared RID is
-    /// relay-derivable. This is the type-level proof that the deleted
-    /// `shared_rid` fallback cannot be reintroduced through an announcement.
-    #[test]
-    fn shared_context_routing_id_is_reserved() {
-        let shared = scp_protocol::context::context_routing_id(CTX);
-        assert!(
-            is_reserved_pseudonym(&shared, CTX),
-            "shared context routing id must be rejected as a pseudonym value"
-        );
-    }
-
-    #[test]
-    fn zero_and_broadcast_routing_ids_are_reserved() {
-        assert!(
-            is_reserved_pseudonym(&[0u8; 32], CTX),
-            "zero sentinel reserved"
-        );
-        let broadcast = scp_protocol::context::broadcast_routing_id(CTX);
-        assert!(
-            is_reserved_pseudonym(&broadcast, CTX),
-            "broadcast routing id reserved"
-        );
-    }
-
-    #[test]
-    fn honest_pseudonym_is_not_reserved() {
-        // A raw Ed25519-public-key-shaped value (non-zero, not a derivable RID).
-        let honest = [7u8; 32];
-        assert!(
-            !is_reserved_pseudonym(&honest, CTX),
-            "an ordinary pseudonym must be accepted"
-        );
-    }
-
-    #[test]
-    fn cross_did_collision_detected_same_did_allowed() {
-        let mut registry: HashMap<DID, [u8; 32]> = HashMap::new();
-        let alice = DID("did:key:alice".to_owned());
-        let bob = DID("did:key:bob".to_owned());
-        let rid = [9u8; 32];
-        registry.insert(alice.clone(), rid);
-
-        // Bob claiming Alice's routing ID is a cross-DID collision.
-        assert!(
-            pseudonym_collides_with_other_did(&registry, &bob, &rid),
-            "a different DID claiming an existing routing ID is a collision"
-        );
-        // Alice re-announcing her OWN routing ID (key rotation rebroadcast) is fine.
-        assert!(
-            !pseudonym_collides_with_other_did(&registry, &alice, &rid),
-            "same-DID re-announce is not a collision"
-        );
-    }
-
-    #[test]
-    fn announcement_classifier_matches_only_tagged_payloads() {
-        let tagged = announcement_bytes("did:key:alice", [3u8; 32]);
-        assert!(
-            is_pseudonym_announcement_payload(&tagged),
-            "a well-formed tagged announcement is classified as such"
-        );
-        // Arbitrary user content must NOT be classified as an announcement, so
-        // it never gets routed to the shared bootstrap RID.
-        assert!(
-            !is_pseudonym_announcement_payload(b"hello world"),
-            "ordinary app data is not an announcement"
-        );
-    }
+    // The pure §9.10.4 predicate + classifier unit tests
+    // (`is_reserved_pseudonym`, `pseudonym_collides_with_other_did`,
+    // `is_pseudonym_announcement_payload`, `classify_pseudonym_announcement`)
+    // moved to `scp_protocol::context::pseudonym` alongside the logic they
+    // exercise (ADR-057 T-1). The behavioral ingest tests below STAY here: they
+    // drive the native `&mut ClassCMut` wrapper (`ingest_pseudonym_announcement`)
+    // against a real `PerContextState`, proving the wrapper's collapse onto the
+    // shared classifier is behavior-identical.
 
     // -----------------------------------------------------------------------
     // Behavioral ingest-hardening tests — buffered site + shared validator.
@@ -4557,8 +4418,8 @@ mod pseudonym_routing_tests {
         // routing ID). The drain path reads sequence/timestamp/context/sender
         // from the inner envelope; the announcement payload is the `plaintext`.
         let alice_pseudonym = [0x42u8; 32];
-        let announcement = crate::context::state::PseudonymAnnouncement {
-            tag: crate::context::state::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        let announcement = PseudonymAnnouncement {
+            tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
             member_did: ALICE.to_owned(),
             pseudonym: alice_pseudonym,
         };
@@ -4653,8 +4514,7 @@ mod pseudonym_routing_tests {
             "checkpoint tag must be null-prefixed to avoid UTF-8 content collision"
         );
         assert_ne!(
-            CHECKPOINT_PAYLOAD_TAG,
-            crate::context::state::PSEUDONYM_ANNOUNCEMENT_TAG,
+            CHECKPOINT_PAYLOAD_TAG, PSEUDONYM_ANNOUNCEMENT_TAG,
             "checkpoint and announcement tags must be distinct"
         );
     }

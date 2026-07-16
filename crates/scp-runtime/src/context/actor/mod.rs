@@ -1361,7 +1361,7 @@ mod tests {
     }
 
     fn announcement_bytes(member_did: &str, pseudonym: [u8; 32]) -> Vec<u8> {
-        use crate::context::state::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+        use scp_protocol::context::pseudonym::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
         let ann = PseudonymAnnouncement {
             tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
             member_did: member_did.to_owned(),
