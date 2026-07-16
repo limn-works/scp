@@ -145,6 +145,84 @@ jobs:
           path: fuzz/artifacts/${{ matrix.target }}/
           retention-days: 90
 
+  # ── MLS decrypt-path panic safety (ADR-057 §Prereq-4, #1444) ─────────────
+  # Separate job because this target MUST run with `-O` (release,
+  # debug-assertions OFF). It validates the SHIPPED RELEASE decrypt path, where
+  # openmls's `debug_assert!` ("Ciphertext decryption failed") is compiled out
+  # and a tampered ciphertext yields a typed `Err` instead of a panic. The
+  # standard Tier matrices run WITHOUT `-O`, so cargo-fuzz injects
+  # `-Cdebug-assertions` and that assert would false-crash on every tampered
+  # input — which is exactly why this target cannot live in those matrices. No
+  # dictionary: the input is raw MLS wire ciphertext and the target
+  # self-generates a valid frame to tamper.
+  fuzz-mls-decrypt:
+    name: Fuzz / fuzz_mls_decrypt (release, debug-assertions off)
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - uses: actions/checkout@v5
+
+      # TEMPORARY: pinned nightly (see the note in fuzz-nightly). Unpin once
+      # openmls publishes a fixed prelude and scp-runtime updates its dependency.
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+          key: fuzz-mls-decrypt
+
+      - name: Restore corpus cache
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/fuzz_mls_decrypt
+          key: corpus-fuzz_mls_decrypt-${{ github.run_id }}
+          restore-keys: corpus-fuzz_mls_decrypt-
+
+      - name: Run fuzzer (release, debug-assertions off)
+        # `-O` is LOAD-BEARING: it builds the release profile with
+        # debug-assertions OFF (the shipped path). Dropping it would re-arm
+        # openmls's decrypt `debug_assert!` and turn every tampered input into a
+        # false crash.
+        run: |
+          cargo fuzz run fuzz_mls_decrypt -O \
+            --fuzz-dir fuzz \
+            fuzz/corpus/fuzz_mls_decrypt \
+            -- \
+            -max_total_time=${{ github.event.inputs.fuzz_time || '300' }} \
+            -max_len=8192 \
+            -rss_limit_mb=2048 \
+            -timeout=30 \
+            -detect_leaks=0
+
+      - name: Minimize corpus
+        if: always()
+        run: |
+          cargo fuzz cmin fuzz_mls_decrypt -O \
+            --fuzz-dir fuzz \
+            fuzz/corpus/fuzz_mls_decrypt \
+            || true
+
+      - name: Save corpus cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/fuzz_mls_decrypt
+          key: corpus-fuzz_mls_decrypt-${{ github.run_id }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-fuzz_mls_decrypt-${{ github.run_id }}
+          path: fuzz/artifacts/fuzz_mls_decrypt/
+          retention-days: 90
+
   # ── Weekly deep-fuzz: Tier 1 targets, 2 hours each, with UBSan ────────────
   # Runs at 00:00 UTC every Saturday, or on workflow_dispatch. Only Tier 1
   # targets (highest trust-boundary exposure). Longer time budget surfaces
