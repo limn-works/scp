@@ -42,7 +42,7 @@ import type { Context } from "./context";
 import type { PaymentReceiptVerificationResult } from "./economy";
 import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
-import { getBridge, toCapabilityValidation } from "./internal/bridge";
+import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
@@ -1586,6 +1586,7 @@ export class SCP {
     payload: Uint8Array | readonly number[],
     spendingUcanJwt?: string | null,
   ): Promise<void> {
+<<<<<<< HEAD
     try {
       const payloadArray = ArrayBuffer.isView(payload)
         ? Array.from(payload as Uint8Array)
@@ -1601,6 +1602,18 @@ export class SCP {
     } catch (err) {
       throw mapBridgeError(err);
     }
+=======
+    const payloadUint8 = ArrayBuffer.isView(payload)
+      ? (payload as Uint8Array)
+      : new Uint8Array(payload as readonly number[]);
+    const bridge = await getBridge(this);
+    return bridge.contextSend(
+      handle as BridgeContextHandle,
+      identityDid,
+      payloadUint8,
+      spendingUcanJwt ?? null,
+    );
+>>>>>>> 28623a226 (fix(ts): migrate 5 async methods to getBridge for structural error mapping)
   }
 
   async contextSubscribe(
@@ -1630,11 +1643,16 @@ export class SCP {
   }
 
   async contextMemberCount(handle: unknown): Promise<number> {
+<<<<<<< HEAD
     try {
       return await (this.#native.contextMemberCount as (h: unknown) => Promise<number>)(handle);
     } catch (err) {
       throw mapBridgeError(err);
     }
+=======
+    const bridge = await getBridge(this);
+    return (await bridge.contextMemberCount(handle as BridgeContextHandle)) ?? 0;
+>>>>>>> 28623a226 (fix(ts): migrate 5 async methods to getBridge for structural error mapping)
   }
 
   async contextIsMember(handle: unknown, did: string): Promise<boolean> {
@@ -2079,6 +2097,7 @@ export class SCP {
     actionJson: string,
     proposerDid: string,
   ): Promise<string> {
+<<<<<<< HEAD
     try {
       return await (
         this.#native.contextGovernancePropose as (
@@ -2090,6 +2109,10 @@ export class SCP {
     } catch (err) {
       throw mapBridgeError(err);
     }
+=======
+    const bridge = await getBridge(this);
+    return bridge.contextGovernancePropose(handle as BridgeContextHandle, actionJson, proposerDid);
+>>>>>>> 28623a226 (fix(ts): migrate 5 async methods to getBridge for structural error mapping)
   }
 
   async contextGovernanceApprove(
@@ -2516,6 +2539,7 @@ export class SCP {
     proofTokens?: readonly string[],
     spendingUcanJwt?: string,
   ): Promise<string> {
+<<<<<<< HEAD
     try {
     return await (
       this.#native.outletInvoke as (
@@ -2528,6 +2552,18 @@ export class SCP {
         s: string | undefined,
       ) => Promise<string>
     )(handle, outletId, inputJson, identityDid, ucanToken, proofTokens, spendingUcanJwt);
+=======
+    const bridge = await getBridge(this);
+    return bridge.outletInvoke(
+      handle as BridgeContextHandle,
+      outletId,
+      inputJson,
+      identityDid,
+      ucanToken,
+      proofTokens,
+      spendingUcanJwt,
+    );
+>>>>>>> 28623a226 (fix(ts): migrate 5 async methods to getBridge for structural error mapping)
   }
 
   async outletVerify(handle: unknown, outletId: string): Promise<unknown> {
@@ -2894,6 +2930,7 @@ export class SCP {
     presentingAgentDid: string,
     proofTokens?: readonly string[],
   ): Promise<void> {
+<<<<<<< HEAD
     // NOTE: this method deliberately does NOT route through `mapBridgeError`.
     // Its sole SDK consumer, `evaluateTrust` (trust.ts), classifies the raw
     // bridge error itself — it detects UCAN-permission failures and re-throws
@@ -2910,6 +2947,16 @@ export class SCP {
         pt: readonly string[] | undefined,
       ) => Promise<void>
     )(handle, token, capability, presentingAgentDid, proofTokens);
+=======
+    const bridge = await getBridge(this);
+    return bridge.ucanValidate(
+      handle as BridgeContextHandle,
+      token,
+      capability,
+      presentingAgentDid,
+      proofTokens,
+    );
+>>>>>>> 28623a226 (fix(ts): migrate 5 async methods to getBridge for structural error mapping)
   }
 
   /**

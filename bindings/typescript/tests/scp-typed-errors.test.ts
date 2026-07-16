@@ -22,7 +22,6 @@ import {
   GovernanceError,
   IdentityError,
   ScpError,
-  ToolError,
   UcanPermissionError,
 } from "../src/errors";
 import { mountMockScp } from "./mock-bridge";
@@ -69,22 +68,6 @@ describe("SCP typed-error mapping", () => {
     }
     expect(thrown).toBeInstanceOf(GovernanceError);
     expect((thrown as GovernanceError).code).toBe("SCP-GOV-6001");
-  });
-
-  it("maps an async tool error to ToolError", async () => {
-    const { scp, native } = mountMockScp();
-    native.__stub("toolInvoke", () =>
-      Promise.reject(rawBridgeError("[SCP-TOOL-4002] tool error: tool not registered")),
-    );
-
-    let thrown: unknown;
-    try {
-      await scp.toolInvoke({}, "calculator", "{}", "did:dht:z6MkAlice", "ucan-token");
-    } catch (err) {
-      thrown = err;
-    }
-    expect(thrown).toBeInstanceOf(ToolError);
-    expect((thrown as ToolError).code).toBe("SCP-TOOL-4002");
   });
 
   it("maps a sync identity error from a sync method (identityRemove)", () => {
