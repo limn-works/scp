@@ -8728,8 +8728,6 @@ mod tests {
     #[cfg(test)]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     mod cross_context_036_seal {
-        use std::sync::Arc;
-
         use ed25519_dalek::{Signer as _, SigningKey};
 
         use scp_protocol::context::outlets::stream::{
@@ -8764,12 +8762,14 @@ mod tests {
         /// against B's pinned `context_id` — never re-signed by the bridge.
         #[test]
         fn ac10_seal_for_a_preserves_operator_sig() {
+            use crate::context::actor::state::PerContextState;
             use crate::crypto::mls::provider::MlsCryptoProvider;
             use crate::crypto::mls::two_party_test_support::stand_up_two_party;
             use crate::envelope::inner::sign::create_inner_envelope_raw;
             use crate::envelope::inner::{
                 InnerEnvelopeParams, MessageType, SCP_INNER_ENVELOPE_VERSION,
             };
+            use scp_did::DID;
             use scp_protocol::context::builder::OpenResult;
 
             let a_ctx_str = "a-ctx-036-seal";
@@ -8779,6 +8779,26 @@ mod tests {
             // group for the receiving context A.
             let (alice, bob, a_ctx_bytes) = stand_up_two_party(a_ctx_str, alice_did, bob_did);
             let routing_id = a_ctx_bytes.to_vec();
+
+            // ADR-049 PR-7 moved seal/open off the `MlsCryptoProvider` onto the
+            // per-context actor. Destructively take each party's provider-resident
+            // crypto onto an actor `PerContextState` (the production seed
+            // primitive) so this bridge test drives the actor seal/open seam
+            // exactly as every other two-party crypto test now does.
+            let take_into_actor = |provider: &MlsCryptoProvider, did: &str| -> PerContextState {
+                let owned = provider
+                    .take_crypto_state(&a_ctx_bytes)
+                    .expect("take owned crypto material off the provider");
+                let mut state = PerContextState::new_for_test_encrypted(
+                    a_ctx_bytes,
+                    0,
+                    DID::from(did.to_owned()),
+                );
+                state.seed_encrypted_crypto_from_owned(owned);
+                state
+            };
+            let mut alice_a = take_into_actor(alice.as_ref(), alice_did);
+            let mut bob_a = take_into_actor(bob.as_ref(), bob_did);
 
             let chunk = operator_signed_chunk();
             let operator_pk = SigningKey::from_bytes(&[0x5c; 32]).verifying_key();
@@ -8807,30 +8827,35 @@ mod tests {
             };
 
             // Two independently-sealed copies (MLS forward secrecy consumes the
-            // per-message secret on first open of a given ciphertext).
-            let sealed_for_outsider = alice
-                .seal(&a_ctx_bytes, &build_inner(0), &routing_id, 300)
+            // per-message secret on first open of a given ciphertext). Each actor
+            // `seal` advances the send tracker exactly as the provider's
+            // `send_sequence` did (AAD sequence 0 then 1).
+            let sealed_for_outsider = alice_a
+                .seal(alice_did, &build_inner(0), &routing_id, 300)
                 .unwrap();
-            let sealed_for_member = alice
-                .seal(&a_ctx_bytes, &build_inner(1), &routing_id, 300)
+            let sealed_for_member = alice_a
+                .seal(alice_did, &build_inner(1), &routing_id, 300)
                 .unwrap();
 
-            // (a) A non-A-member (fresh provider, no A group key) CANNOT decrypt.
-            let outsider = Arc::new(MlsCryptoProvider::new(
-                "did:dht:z6MkOutsiderOutsiderOutsiderOutsiderOut".to_owned(),
-                Arc::new(scp_clock::SystemClock),
-            ));
+            // (a) A non-A-member (fresh actor, no A group key) CANNOT decrypt:
+            // an empty encrypted-mode `PerContextState` holds no MLS group, so
+            // `open` fails closed with "no MLS group for this context".
+            let mut outsider_a = PerContextState::new_for_test_encrypted(
+                a_ctx_bytes,
+                0,
+                DID::from("did:dht:z6MkOutsiderOutsiderOutsiderOutsiderOut".to_owned()),
+            );
             assert!(
-                outsider
-                    .open(&a_ctx_bytes, a_ctx_str, &sealed_for_outsider)
+                outsider_a
+                    .open(&scp_clock::SystemClock, a_ctx_str, &sealed_for_outsider)
                     .is_err(),
                 "a non-A-member holding no A group key must not decrypt the sealed chunk"
             );
 
             // (b) An A member decrypts and recovers the chunk with B's operator
             // signature intact and verifying against B's PINNED context_id.
-            let opened = bob
-                .open(&a_ctx_bytes, a_ctx_str, &sealed_for_member)
+            let opened = bob_a
+                .open(&scp_clock::SystemClock, a_ctx_str, &sealed_for_member)
                 .unwrap();
             let recovered_bytes = match opened {
                 OpenResult::Application(env) => env.inner.payload,
