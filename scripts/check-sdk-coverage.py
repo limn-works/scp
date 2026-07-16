@@ -922,10 +922,9 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["resume"],
     },
     # Bridge -- Python uses bare 'register' and 'evaluate_trust'.
-    # TypeScript exports bridgeRegister (src/index.ts re-exports from src/bridge.ts).
+    # TypeScript's bridgeRegister is matched by the domain_camel auto-candidate.
     ("Bridge", "register"): {
         "python": ["register"],
-        "typescript": ["bridgeRegister"],
     },
     ("Bridge", "evaluate_trust"): {
         "python": ["evaluate_trust"],
