@@ -244,14 +244,14 @@ const fn _assert_send_sync() {
 
 // ---------------------------------------------------------------------------
 // Test-only convenience: build a Supervisor with providers + no-op
-// persistence (ADR-049 commit 12).
+// persistence (ADR-049 §15).
 // ---------------------------------------------------------------------------
 
 /// Constructs a fresh test-only [`supervisor::Supervisor`].
 ///
 /// Mirror of the legacy
 /// `attach_test_supervisor(ContextManager::new(...))` shorthand: the
-/// `ContextManager` type is gone in commit 12, so callers now build a
+/// `ContextManager` type is gone in ADR-049 §15, so callers now build a
 /// supervisor directly via [`supervisor::Supervisor::with_providers`].
 ///
 /// Returns [`Arc<supervisor::Supervisor>`] — the supervisor is the

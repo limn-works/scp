@@ -17,9 +17,9 @@
 //! actor B directly" a compile-time property. Cross-actor atomicity is
 //! saga-only, enforced through the `start_saga` shape.
 //!
-//! # Commit 12a.5 expansion
+//! # ADR-049 §15 — collaborator-bundle expansion
 //!
-//! Commit 12a.5 of ADR-049 (pre-work for handler body migration)
+//! The ADR-049 actor migration (§15, pre-work for handler body migration)
 //! extended the bundle with every cross-cutting collaborator the
 //! deleted `ContextManager` handler submodules reached via `self.X`:
 //!
@@ -35,9 +35,9 @@
 //!   `ContextManager::payment_adapter`. `Option` because "free context"
 //!   is a valid configuration.
 //!
-//! # Commit 12b.2a expansion
+//! # ADR-049 §15 — actor-owned-state expansion
 //!
-//! Commit 12b.2a of ADR-049 (actor-owned-state infrastructure) adds one
+//! The ADR-049 actor migration (§15, actor-owned-state infrastructure) adds one
 //! additional cross-cutting collaborator that handler bodies needed once
 //! they stopped delegating to the legacy manager:
 //!
@@ -57,13 +57,13 @@
 //! over `S: Storage` (see `ProtocolRepositorySagaJournal<S>`,
 //! `ProtocolRepository<S>`). Embedding a generic in `ActorDeps` would
 //! require parameterizing every handler signature over `S`, which is a
-//! non-additive restructure out of scope for commit 12b.2a.
+//! non-additive restructure out of scope for the ADR-049 actor migration (§15).
 //!
 //! Handler bodies that need raw byte-blob storage (saga evidence, KP
 //! store blobs) reach it through the specific bridge that already
 //! owns a concrete `Arc<S>` — e.g. [`ActorDeps::persistence`] (typed
 //! `ContextSnapshot` persistence), or the
-//! [`KeyPackageStoreHandle`](crate::context::supervisor::key_package_actor::KeyPackageStoreHandle)
+//! [`KeyPackageStoreHandle`]
 //! inside the bundle. No handler currently needs `dyn Storage`
 //! directly; if one ever does, the path is a focused generic
 //! parameterization, not a dyn-trait field here.
@@ -204,7 +204,7 @@ pub struct ActorDeps {
     /// carrying its own lock — the `Arc<ArcSwap<_>>` is clone-cheap
     /// and every actor gets a snapshot reference at spawn time.
     ///
-    /// Added in commit 12b.2a of ADR-049. Read by the messaging
+    /// Added in ADR-049 §15. Read by the messaging
     /// handler's `deliver_incoming` body to resolve which local DID
     /// the incoming envelope addresses.
     pub local_dids: Arc<ArcSwap<HashSet<DID>>>,

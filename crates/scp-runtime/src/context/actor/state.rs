@@ -19,17 +19,17 @@
 //! that type was consumed through
 //! the `per-context-state Mutex` lock-based model that ADR-049 deleted.
 //! The actor's state type here is a SUPERSET-COMPATIBLE shape: every field
-//! the legacy struct owned is represented here (so the commit 12b+
+//! the legacy struct owned is represented here (so the ADR-049 §15
 //! handler-body migrations moved calls mechanically off `manager.field`
 //! onto `state.field`), plus the new per-actor fields (`saga_pending`,
 //! `welcome_scratchpad`, `send_tracker`, `recv_tracker`, split mode
 //! state) that the legacy struct did not own.
 //!
 //! The two types coexisted through the commit ladder (commit 6 through
-//! commit 12); the legacy state struct stayed byte-identical apart from
-//! the `pub(crate)` field elevations commit 12a added so the actor could
+//! ADR-049 §15); the legacy state struct stayed byte-identical apart from
+//! the `pub(crate)` field elevations ADR-049 §15 added so the actor could
 //! name the sub-struct types. Commits 12b-12c migrated handler bodies to
-//! take `&mut actor::PerContextState`. Commit 12d deleted the legacy
+//! take `&mut actor::PerContextState`. ADR-049 §15 deleted the legacy
 //! `ContextManager`; the legacy state type was removed in the same
 //! mechanical pass.
 //!
@@ -312,7 +312,7 @@ pub struct ContextEventLog {
 /// for the broadcast-mode state that legacy `MlsCryptoProvider::broadcast_keys`
 /// and `PerContextState.broadcast_context` split across two structures.
 ///
-/// Commit 12a populates the field set; commit 12b+ migrates the broadcast
+/// ADR-049 §15 populates the field set; ADR-049 §15 migrates the broadcast
 /// handler body to operate on `&mut BroadcastState` directly.
 #[derive(Debug, Default)]
 pub struct BroadcastState {
@@ -396,7 +396,7 @@ pub struct PendingBroadcastKeyRotation {
 /// non-optional. The actor model separates actor spawn (supervisor puts a
 /// live handle in the registry) from MLS group construction (a Create /
 /// Join handler runs inside the actor's dispatch loop). Between those
-/// two events `mls_group` is `None`. Commit 12b's lifecycle handler
+/// two events `mls_group` is `None`. ADR-049 §15's lifecycle handler
 /// migration populates the `Some` path.
 ///
 /// # `sender_key` is `Option<SenderKey>`
@@ -1280,10 +1280,10 @@ pub struct PerContextState {
     // -----------------------------------------------------------------
     /// Governance engine + proposals + tooling per-context state
     /// (ADR-031). Mirrors legacy `state::PerContextState::governance`.
-    /// Type is elevated from private to `pub(crate)` by commit 12a so
+    /// Type is elevated from private to `pub(crate)` by ADR-049 §15 so
     /// the actor can carry it; field visibility matches the type
     /// (`pub(crate)`) because the `GovernanceState` struct itself cannot
-    /// be named outside this crate. Commit 12d deletes both it and the
+    /// be named outside this crate. ADR-049 §15 deletes both it and the
     /// legacy manager module together.
     pub(crate) governance: GovernanceState,
 
@@ -1292,22 +1292,22 @@ pub struct PerContextState {
     // -----------------------------------------------------------------
     /// MLS epoch + reconnection state (§5.9, §23.11). Mirrors legacy
     /// `state::PerContextState::epoch`. Type is elevated from private
-    /// to `pub(crate)` by commit 12a; field visibility matches.
+    /// to `pub(crate)` by ADR-049 §15; field visibility matches.
     pub(crate) epoch: EpochState,
 
     /// Access-control / CEK-wrapping exclusion list (ADR-038, §9.17).
     /// Mirrors legacy `state::PerContextState::access`. Type is
-    /// elevated from private to `pub(crate)` by commit 12a; field
+    /// elevated from private to `pub(crate)` by ADR-049 §15; field
     /// visibility matches.
     ///
     /// This is the sole authoritative storage site for the
-    /// `access_key_store`: commit 12d removed the vestigial duplicate
+    /// `access_key_store`: ADR-049 §15 removed the vestigial duplicate
     /// that briefly lived on [`ContextCryptoState`].
     pub(crate) access: AccessControlState,
 
     /// TTL timer + extension state (SCP-021). Mirrors legacy
     /// `state::PerContextState::ttl`. Type is elevated from private
-    /// to `pub(crate)` by commit 12a; field visibility matches.
+    /// to `pub(crate)` by ADR-049 §15; field visibility matches.
     pub(crate) ttl: TtlState,
 
     // -----------------------------------------------------------------

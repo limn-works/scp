@@ -1222,7 +1222,7 @@ async fn handle_send_heartbeat(
 /// dispatch loop) — the `result` field carries a representative
 /// variant (preserving the `TransportTimeout` / `TransportFailed` /
 /// `CryptoFailed` classification when recoverable from the
-/// `Display` string). This is a shim workaround; commit 12 deletes
+/// `Display` string). This is a shim workaround; ADR-049 §15 deletes
 /// the two-channel pattern by making `Outcome`'s `Err` consumption
 /// the sole error path.
 fn outcome_error_sketch(err: &ContextError) -> ContextError {

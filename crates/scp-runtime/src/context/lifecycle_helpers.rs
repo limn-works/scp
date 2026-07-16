@@ -96,7 +96,7 @@ use crate::context::state::{
 };
 use crate::context::ttl::{self, CloseResult, TtlTimer};
 
-// ADR-049 Phase 2A finalization keystone (commit 12 phase 2A finalization
+// ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A finalization
 // — type unification, single PerContextState): the prior alias to the
 // legacy struct was deleted alongside the struct itself. Every bootstrap
 // call site now constructs the unified `PerContextState` directly and
@@ -1724,7 +1724,7 @@ pub async fn create_context(
         routing: create_routing,
         // ADR-049 commit 8: fresh actor-shape tracker at creation.
         send_tracker: SendSequenceTracker::new(),
-        // ADR-049 Phase 2A finalization keystone (commit 12 phase 2A
+        // ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A
         // finalization — type unification): the actor-owned state fields
         // start in their fresh-instance shapes. `event_log` is `None`
         // until the first event lands; the in-memory RFC-6962 Merkle

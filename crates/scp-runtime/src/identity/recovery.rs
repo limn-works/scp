@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use scp_did::DID;
 
-// ContextManager type deleted in ADR-049 commit 12; recovery binds to
+// ContextManager type deleted in ADR-049 §15; recovery binds to
 // the supervisor directly.
 use scp_clock::Clock;
 
@@ -1973,11 +1973,11 @@ mod tests {
 
     /// Helper to create a minimal `ContextManager` for testing.
     ///
-    /// After ADR-049 commit 12c.9e, the `ContextCryptoProvider` trait is
+    /// After ADR-049 §15, the `ContextCryptoProvider` trait is
     /// deleted and tests bind to a real
     /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
     /// — fail-injection and stub-seal overrides move to
-    /// backend-injection in commit 12c.9f.
+    /// backend-injection in ADR-049 §15.
     fn test_context_manager() -> Arc<crate::context::supervisor::Supervisor> {
         use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
         use scp_protocol::context::builder::ContextCreationError;
@@ -2033,7 +2033,7 @@ mod tests {
             }
         }
 
-        // ADR-049 commit 12: `ContextManager` is gone. Build the
+        // ADR-049 §15: `ContextManager` is gone. Build the
         // `Supervisor` directly via `test_supervisor`.
         crate::context::test_supervisor(
             Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(

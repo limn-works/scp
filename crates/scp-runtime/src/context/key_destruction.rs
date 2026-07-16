@@ -3,7 +3,7 @@
 //! Hosts the concrete-typed key-destruction orchestrators that were
 //! previously defined as trait-based stubs in
 //! [`scp_protocol::context::memory_scope`] and
-//! [`scp_protocol::context::close`]. After ADR-049 commit 12c.9e the
+//! [`scp_protocol::context::close`]. After ADR-049 §15 the
 //! orchestrators operate directly on the concrete
 //! [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider),
 //! so they cannot live in `scp-protocol` (which is a forward dependency

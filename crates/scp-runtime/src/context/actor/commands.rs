@@ -859,7 +859,7 @@ pub struct RestoreContextPayload {
 /// [`Supervisor`](crate::context::supervisor::Supervisor) lifecycle
 /// surface one-to-one: the handler shim delegates to the legacy method
 /// under the hood while the command shape fixes the post-refactor
-/// dispatch envelope. Commit 12 deletes the shim; the handler bodies
+/// dispatch envelope. ADR-049 §15 deletes the shim; the handler bodies
 /// keep their current shape (input types + reply channels) but route
 /// state mutations to the actor's owned
 /// [`PerContextState`](crate::context::actor::state::PerContextState).
@@ -1276,8 +1276,8 @@ pub struct ExecuteGovernanceActionPayload {
     pub proposal_id: scp_protocol::context::governance::ProposalId,
 }
 
-/// See [`ContextCommand::Governance`]. Real variants land in commit 10
-/// of the ADR-049 commit ladder (see `handlers/governance.rs`).
+/// See [`ContextCommand::Governance`]. Real variants land in a later slice of
+/// the ADR-049 actor migration (ADR-049 §15; see `handlers/governance.rs`).
 /// Variants mirror the public surface of
 /// [`crate::context::governance_helpers`] one-to-one: propose, vote,
 /// approve/reject/withdraw, execute, read proposals, apply pending
@@ -1897,16 +1897,16 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
     >,
 >;
 
-/// See [`ContextCommand::Economy`]. Real variants land in commit 10 of
-/// the ADR-049 commit ladder (see `handlers/economy.rs`). The public
+/// See [`ContextCommand::Economy`]. Real variants land in a later slice of
+/// the ADR-049 actor migration (ADR-049 §15; see `handlers/economy.rs`). The public
 /// surface of [`crate::context::economy_helpers`] currently consists
 /// of a single method, [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
 /// all other economy methods (`authorize_paid_action`,
 /// `complete_paid_action`, `void_paid_action`,
 /// `rollback_economy_ticket_inline_view`)
-/// are `pub(super)` helpers invoked by the messaging path. Commit 12
+/// are `pub(super)` helpers invoked by the messaging path. ADR-049 §15
 /// rewires the sender-side pipeline to construct economy commands
-/// internally rather than calling the helpers directly; commit 10
+/// internally rather than calling the helpers directly; ADR-049 §15
 /// lands only the public surface.
 pub enum EconomyCommand {
     /// Verifies a batch of payment receipts against the configured
@@ -3751,7 +3751,7 @@ pub enum SagaPhaseMessage {
 
 /// See [`ContextCommand::LifecycleControl`]. The supervisor's suspend /
 /// resume / shutdown path sends these; real variants land with the
-/// BridgeInstance integration in commit 11. Commit 6 only carries the
+/// BridgeInstance integration in ADR-049 §15. Commit 6 only carries the
 /// two Pause / PersistSync variants that the
 /// `BridgeInstanceCore` (in `scp_ffi_common::bridge_instance`)'s
 /// default `suspend()` body calls, plus the terminal `Shutdown`.

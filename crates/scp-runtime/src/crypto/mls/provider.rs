@@ -4,7 +4,7 @@
 //! [`MlsBackend`](super::backend::MlsBackend) and
 //! [`HpkeBackend`](crate::crypto::hpke_backend::HpkeBackend) primitives. State
 //! that used to live in `Mutex<HashMap>` / `Mutex<scalar>` fields on the
-//! provider has migrated to lock-free containers per ADR-049 commit 12c.9f
+//! provider has migrated to lock-free containers per ADR-049 §15
 //! (`MlsCryptoProvider` dissolution):
 //!
 //! - Per-context MLS state → `DashMap<[u8;32], ContextCryptoState>`
@@ -466,21 +466,21 @@ pub struct MlsCryptoProvider {
     /// [`ProductionMlsBackend`] share — one hardened clock per node, never
     /// openmls's internal one.
     clock: Arc<dyn Clock>,
-    /// Injected MLS primitive backend (ADR-049 commit 12). Production
+    /// Injected MLS primitive backend (ADR-049 §15). Production
     /// callers receive a [`ProductionMlsBackend`] from
     /// [`MlsCryptoProvider::new`]; tests inject failure-driven mocks via
     /// [`MlsCryptoProvider::with_backends`]. The provider's orchestration
     /// methods route every inline `OpenMLS` primitive through this trait —
     /// state still lives on the provider's lock-free containers below.
     mls_backend: Arc<dyn MlsBackend>,
-    /// Injected HPKE primitive backend (ADR-049 commit 12). Same
+    /// Injected HPKE primitive backend (ADR-049 §15). Same
     /// injection contract as `mls_backend` — production wires
     /// [`ProductionHpkeBackend`]; tests can substitute mocks for fail
     /// injection on the wrapping-key seal/unseal path.
     hpke_backend: Arc<dyn HpkeBackend>,
     /// Per-context crypto state, keyed by the 32-byte context ID.
     ///
-    /// Lock-free [`DashMap`] — the actor refactor (ADR-049 commit 12)
+    /// Lock-free [`DashMap`] — the actor refactor (ADR-049 §15)
     /// removed the `std::sync::Mutex<HashMap<...>>` wrapper. State that
     /// migrates onto [`crate::context::actor::ContextActor`] via
     /// [`Self::take_crypto_state`] is removed from this map and recorded
@@ -509,7 +509,7 @@ pub struct MlsCryptoProvider {
     wrapping_keypair: ArcSwap<WrappingKeypair>,
     /// Contexts whose crypto state has been destructively moved into a
     /// [`crate::context::actor::ContextActor`] via
-    /// [`Self::take_crypto_state`] (ADR-049 commit 12).
+    /// [`Self::take_crypto_state`] (ADR-049 PR-7).
     ///
     /// Tracked separately from [`Self::contexts`] so [`Self::with_context`]
     /// can distinguish "context was never created" (returns the legacy
@@ -531,7 +531,7 @@ pub struct MlsCryptoProvider {
     ///   (ADR-049 §6).
     ///
     /// Lock-free [`DashSet`] — the prior `std::sync::Mutex<HashSet>`
-    /// wrapper was removed in ADR-049 commit 12c.9f.
+    /// wrapper was removed in ADR-049 §15.
     taken_context_ids: DashSet<[u8; 32]>,
     /// One-shot test seam: when set, the NEXT `rotate_sender_key`
     /// call returns [`ContextError::CryptoFailed`] and resets the flag.
@@ -579,7 +579,7 @@ impl MlsCryptoProvider {
 
     /// Creates an `MlsCryptoProvider` with caller-supplied backends.
     ///
-    /// Test seam introduced by ADR-049 commit 12c.9f. Production code
+    /// Test seam introduced by ADR-049 §15. Production code
     /// uses [`Self::new`]; failure-injection tests instantiate mock
     /// `MlsBackend` / `HpkeBackend` impls and pass them here. The
     /// `local_did` and lock-free state containers behave identically to
@@ -638,7 +638,7 @@ impl MlsCryptoProvider {
     }
 
     /// Borrowed reference to the injected MLS primitive backend
-    /// (ADR-049 commit 12). Helper functions outside the provider
+    /// (ADR-049 §15). Helper functions outside the provider
     /// that need the same backend (e.g. handler code in
     /// `handlers/messaging.rs` once the deletion ladder lands) can
     /// borrow through this accessor.
@@ -648,7 +648,7 @@ impl MlsCryptoProvider {
     }
 
     /// Borrowed reference to the injected HPKE primitive backend
-    /// (ADR-049 commit 12). See [`Self::mls_backend`].
+    /// (ADR-049 §15). See [`Self::mls_backend`].
     #[must_use]
     pub fn hpke_backend(&self) -> &Arc<dyn HpkeBackend> {
         &self.hpke_backend
@@ -670,7 +670,7 @@ impl MlsCryptoProvider {
     /// Destructively move the per-context MLS crypto state out of this
     /// provider and return it as an [`OwnedMlsCryptoState`] the caller
     /// can hand to a [`crate::context::actor::ContextActor`] at spawn
-    /// time (ADR-049 commit 12).
+    /// time (ADR-049 PR-7).
     ///
     /// After `Ok` return:
     /// - `self.contexts[context_id]` is absent (`HashMap::remove`d).
@@ -712,7 +712,7 @@ impl MlsCryptoProvider {
         &self,
         context_id: &[u8; 32],
     ) -> Result<OwnedMlsCryptoState, ContextError> {
-        // ADR-049 commit 12c.9f: the underlying `contexts` map is now a
+        // ADR-049 §15: the underlying `contexts` map is now a
         // lock-free `DashMap`. `DashMap::remove` is atomic over the
         // shard; the post-removal taken-set insert is unconditionally
         // reachable so the actor-ownership marker stays consistent.
@@ -768,14 +768,14 @@ impl MlsCryptoProvider {
     ///   if the context was never created (or its state was evicted).
     /// - [`ContextError::CryptoFailed`] with
     ///   `"context state owned by actor"` if the state was destructively
-    ///   moved via [`Self::take_crypto_state`] (ADR-049 commit 12).
+    ///   moved via [`Self::take_crypto_state`] (ADR-049 PR-7).
     ///   Callers seeing this error must route through the actor's
     ///   mailbox — the provider no longer owns the state.
     fn with_context<F, R>(&self, context_id: &[u8; 32], f: F) -> Result<R, ContextError>
     where
         F: FnOnce(&mut ContextCryptoState) -> Result<R, ContextError>,
     {
-        // ADR-049 commit 12c.9f: lock-free per-shard access via
+        // ADR-049 §15: lock-free per-shard access via
         // `DashMap::get_mut`. The returned guard is per-entry and is
         // dropped when the closure returns.
         if let Some(mut entry) = self.contexts.get_mut(context_id) {
@@ -835,7 +835,7 @@ impl MlsCryptoProvider {
         // Under the `testing` feature gate, also accept `did:test:*` and
         // `did:key:*` prefixes so the extensive test suite — which used
         // non-dht test DIDs with the deleted `ContextCryptoProvider`
-        // mocks before ADR-049 commit 12c.9e — continues to work with
+        // mocks before ADR-049 §15 — continues to work with
         // the inherent `MlsCryptoProvider` API. Production builds (no
         // `testing` feature) still require `did:dht:z*`.
         let accepted = self.local_did.starts_with("did:dht:z")
@@ -1109,7 +1109,7 @@ impl MlsCryptoProvider {
                 hex::encode(context_id)
             )));
         }
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        // ADR-049 §15: lock-free `DashMap::get_mut`.
         let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextCreationError::CryptoFailed(
                 "no MLS group for this context — cannot generate sender key".to_string(),
@@ -1129,7 +1129,7 @@ impl MlsCryptoProvider {
     ///
     /// Returns [`ContextCreationError`] if broadcast key initialisation fails.
     pub fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        // ADR-049 commit 12c.9f: lock-free `DashMap::insert`.
+        // ADR-049 §15: lock-free `DashMap::insert`.
         let key = generate_sender_key();
         self.broadcast_keys.insert(*context_id, key);
         Ok(())
@@ -1141,7 +1141,7 @@ impl MlsCryptoProvider {
     ///
     /// Returns [`ContextCreationError`] if destruction fails.
     pub fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        // ADR-049 commit 12c.9f: lock-free `DashMap::remove`.
+        // ADR-049 §15: lock-free `DashMap::remove`.
         if let Some((_, mut state)) = self.contexts.remove(context_id) {
             let _ = group::destroy_group(&mut state.mls_group);
         }
@@ -1154,7 +1154,7 @@ impl MlsCryptoProvider {
     ///
     /// Returns [`ContextCreationError`] if destruction fails.
     pub fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        // ADR-049 commit 12c.9f: lock-free per-shard mutation. Drop the
+        // ADR-049 §15: lock-free per-shard mutation. Drop the
         // `RefMut` guard before touching `broadcast_keys` to release the
         // shard lock.
         if let Some(mut entry) = self.contexts.get_mut(context_id) {
@@ -1198,7 +1198,7 @@ impl MlsCryptoProvider {
     ) -> Result<(), ContextError> {
         // Under `cfg(test)` / `testing` feature accept `None` as a valid
         // key package — matches the old `MockCrypto::validate_key_package`
-        // behaviour deleted in ADR-049 commit 12c.9e.
+        // behaviour deleted in ADR-049 §15.
         let Some(bytes) = key_package_bytes else {
             if cfg!(any(test, feature = "testing")) {
                 let _ = owner_did;
@@ -1297,7 +1297,7 @@ impl MlsCryptoProvider {
 
         // No KeyPackage. Under the `testing` feature or `cfg(test)`, `None`
         // key-package bytes were previously handled by the no-op `MockCrypto`
-        // fixture (deleted in ADR-049 commit 12c.9e). Preserve the
+        // fixture (deleted in ADR-049 §15). Preserve the
         // mock-equivalent return so integration tests that don't produce real
         // MLS key packages continue to exercise the non-crypto pipeline — role
         // state sync, event logging, governance side effects.
@@ -1398,7 +1398,7 @@ impl MlsCryptoProvider {
         member_did: &str,
     ) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(context_id);
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        // ADR-049 §15: lock-free `DashMap::get_mut`.
         let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
@@ -1486,7 +1486,7 @@ impl MlsCryptoProvider {
 
         match msg {
             SenderKeyDistributionMessage::KeyResponse(response) => {
-                // ADR-049 commit 12c.9f: load wrapping secret through
+                // ADR-049 §15: load wrapping secret through
                 // `ArcSwap`. The returned `Arc` is held only for the
                 // duration of the HPKE-open call (no `.await` between
                 // load and drop).
@@ -1617,7 +1617,7 @@ impl MlsCryptoProvider {
         sender_key: SenderKey,
     ) {
         let ctx_id_hex = hex::encode(context_id);
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        // ADR-049 §15: lock-free `DashMap::get_mut`.
         if let Some(mut entry) = self.contexts.get_mut(context_id) {
             entry
                 .value_mut()
@@ -1673,7 +1673,7 @@ impl MlsCryptoProvider {
         // hardened clock, not a fresh un-injected `SystemClock`.
         let now_secs = self.clock.now_secs();
 
-        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        // ADR-049 §15: lock-free `DashMap::get_mut`.
         let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
@@ -4280,7 +4280,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // ADR-049 commit 12b.2a — `take_crypto_state` tests
+    // ADR-049 PR-7 — `take_crypto_state` tests
     // -----------------------------------------------------------------
 
     #[test]

@@ -8,7 +8,7 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Cross-domain `ContextManager` infrastructure helpers with explicit-
-//! collaborator signatures (ADR-049 commit 12).
+//! collaborator signatures (ADR-049 §15).
 //!
 //! # Purpose
 //!
@@ -34,7 +34,7 @@
 //!   [`Supervisor`](crate::context::supervisor::Supervisor), or
 //! - `supervisor.X_ref()` accessor calls for the provider slots already
 //!   lifted to [`Supervisor`](crate::context::supervisor::Supervisor) in
-//!   ADR-049 commit 12c.9a/9b.
+//!   ADR-049 §15.
 //!
 //! The legacy inherent methods on
 //! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
@@ -42,7 +42,7 @@
 //! through the `Weak<Supervisor>` back-pointer installed by
 //! [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
 //! during bridge construction. The forwarders are deleted alongside the
-//! outer shim in commit 12c.9g.4.
+//! outer shim in ADR-049 §15.
 //!
 //! # Hoisted methods
 //!
@@ -98,7 +98,7 @@ pub const PROVIDER_NOT_INITIALIZED: &str =
 ///
 /// Hoisted body of the legacy
 /// [`has_persistence`](crate::context::manager_methods::has_persistence)
-/// (ADR-049 commit 12). Byte-identical behavior — uses the
+/// (ADR-049 §15). Byte-identical behavior — uses the
 /// supervisor's lifted persistence slot
 /// (`Supervisor::persistence_ref`) which already collapses the
 /// "not attached" + "attached but no persistence" cases to a single
@@ -174,7 +174,7 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
 ///
 /// Hoisted body of the legacy
 /// [`init_broadcast_context`](crate::context::supervisor::handle::SupervisorHandle::init_broadcast_context)
-/// (ADR-049 commit 12). Byte-identical behavior.
+/// (ADR-049 §15). Byte-identical behavior.
 pub fn init_broadcast_context(
     supervisor: &Supervisor,
     context_id: &str,
@@ -258,7 +258,7 @@ pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: 
 ///
 /// Hoisted body of the legacy
 /// [`snapshot_context`](crate::context::manager_methods::snapshot_context)
-/// (ADR-049 commit 12). Byte-identical behavior.
+/// (ADR-049 §15). Byte-identical behavior.
 ///
 /// Must be called while the contexts mutex is held (snapshot under lock).
 pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {

@@ -1,6 +1,6 @@
 //! Context lifecycle: free-function logic for create, join, leave,
 //! restore, export, import. Hoisted out of the deleted `manager/`
-//! directory in ADR-049 commit 12; the helpers in
+//! directory in ADR-049 §15; the helpers in
 //! [`crate::context::lifecycle_helpers`] call into these primitives.
 
 use std::collections::HashMap;
@@ -164,7 +164,7 @@ pub fn validate_consequence_rules_for_import(
     Ok(())
 }
 
-// ADR-049 Phase 2A finalization keystone — type unification (commit 12):
+// ADR-049 Phase 2A finalization keystone — type unification (ADR-049 §15):
 // the legacy `evaluate_sybil_resistance(&PerContextState, ...)` /
 // `post_join_bookkeeping(&mut PerContextState, ...)` /
 // `enforce_join_economy(&mut PerContextState, ...)` wrappers were carried

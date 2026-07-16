@@ -1,6 +1,6 @@
-//! E2E crypto side channel for the full-stack harness (ADR-049 commit 12c.9f).
+//! E2E crypto side channel for the full-stack harness (ADR-049 §15).
 //!
-//! After ADR-049 commit 12c.9e the `ContextCryptoProvider` trait is gone:
+//! After ADR-049 §15 the `ContextCryptoProvider` trait is gone:
 //! `Supervisor` binds the concrete [`MlsCryptoProvider`], and the per-context
 //! MLS / sender-key / access-key state is owned by the context actor (the
 //! creator side) or by the provider directly (the joiner side, which never

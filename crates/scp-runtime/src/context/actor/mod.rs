@@ -275,7 +275,7 @@ pub struct ContextActor {
 
 impl ContextActor {
     /// Construct a fresh actor that owns [`PerContextState`] and
-    /// [`ActorDeps`] directly (introduced by ADR-049 commit 12b.2a).
+    /// [`ActorDeps`] directly (introduced by ADR-049 §15).
     ///
     /// This is the production constructor. The owned-state spawn path
     /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`]
@@ -1106,7 +1106,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // ADR-049 commit 12b.2a — state-carrying `ContextActor::new` tests
+    // ADR-049 §15 — state-carrying `ContextActor::new` tests
     // -----------------------------------------------------------------
 
     /// Minimal event log provider for the `ContextActor::new` test.

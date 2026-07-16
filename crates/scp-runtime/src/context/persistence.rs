@@ -1,6 +1,6 @@
 //! `ContextPersistence` trait — durable storage seam for context state.
 //!
-//! Hoisted to its own module in ADR-049 commit 12 ahead of the
+//! Hoisted to its own module in ADR-049 §15 ahead of the
 //! `manager/` directory deletion. This module is the canonical home of
 //! the trait and its no-op stub.
 

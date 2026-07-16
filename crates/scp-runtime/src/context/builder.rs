@@ -1123,7 +1123,7 @@ pub async fn create_context(
     clippy::panic,
     clippy::significant_drop_tightening,
     dead_code,
-    reason = "ADR-049 commit 12c.9e: scaffolding for tests ignored pending 12c.9f MlsBackend injection"
+    reason = "ADR-049 §15: scaffolding for tests ignored pending 12c.9f MlsBackend injection"
 )]
 mod tests {
     use super::*;
@@ -1190,7 +1190,7 @@ mod tests {
         assert!(validate_params(&params).is_ok());
     }
 
-    /// Smoke verifying that ADR-049 commit 12c.9f's
+    /// Smoke verifying that ADR-049 §15's
     /// [`MlsCryptoProvider::with_backends`] seam compiles and that
     /// inherent backend accessors return the injected pointers.
     /// Functional fail-injection tests (one per orchestration path)

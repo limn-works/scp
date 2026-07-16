@@ -1,6 +1,6 @@
 //! Governance proposal, vote, execute, and dispatch operations —
 //! free-function logic hoisted out of the deleted `manager/` directory
-//! in ADR-049 commit 12.
+//! in ADR-049 §15.
 
 use scp_did::DID;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};

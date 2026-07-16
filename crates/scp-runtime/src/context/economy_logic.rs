@@ -193,7 +193,7 @@ pub fn validate_spending_ucan_or_error(
 /// Holds the escrow authorization and evaluated cost so that
 /// `complete_paid_action` and `void_paid_action` can finalize or roll back.
 ///
-/// Field visibility widened to `pub(crate)` in ADR-049 commit 12c.9g.1
+/// Field visibility widened to `pub(crate)` in ADR-049 §15
 /// so the hoisted free functions in
 /// [`crate::context::economy_helpers`] can construct / destructure the
 /// token without going through this module.
@@ -210,7 +210,7 @@ pub struct PaidActionAuthorization {
 
 /// Maps an [`IntegrationError`] to a [`ContextError`] with proper SCP error codes.
 ///
-/// Visibility widened in ADR-049 commit 12c.9g.1 so the hoisted
+/// Visibility widened in ADR-049 §15 so the hoisted
 /// [`crate::context::economy_helpers`] free functions can map the same
 /// way the legacy methods did. The enclosing `economy` module is
 /// `pub(crate)` so the effective visibility is unchanged.
@@ -250,7 +250,7 @@ pub fn integration_error_to_context(err: IntegrationError) -> ContextError {
 
 /// Verifies a receipt and checks it is valid.
 ///
-/// Visibility widened in ADR-049 commit 12c.9g.1 so the hoisted
+/// Visibility widened in ADR-049 §15 so the hoisted
 /// [`crate::context::economy_helpers::complete_paid_action`] free
 /// function can call the same verifier the legacy method did. The
 /// enclosing `economy` module is `pub(crate)` so the effective

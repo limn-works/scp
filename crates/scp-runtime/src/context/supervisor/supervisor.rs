@@ -1454,13 +1454,13 @@ pub struct Supervisor {
         DashMap<SagaId, Vec<SagaDivergenceRepairRecord>>,
 
     // -----------------------------------------------------------------
-    // ADR-049 commit 12 — providers lifted from ContextManager (now
+    // ADR-049 §15 — providers lifted from ContextManager (now
     // authoritative on Supervisor).
     //
     // Each `OnceLock<Arc<...>>` provider slot is populated directly by
     // [`Self::with_providers`]. There is no `ContextManager` to attach
     // — the supervisor IS the source of truth for every provider after
-    // commit 12. Slots are still wrapped in `OnceLock` so the
+    // ADR-049 §15. Slots are still wrapped in `OnceLock` so the
     // [`Self::for_query_shim`] constructor path (used by tests +
     // saga-only call sites) can build a supervisor without providers
     // and the FFI layer can populate them once at construction time.
@@ -1511,7 +1511,7 @@ pub struct Supervisor {
     mls_storage: OnceLock<Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
 
     // -----------------------------------------------------------------
-    // ADR-049 commit 12 — supervisor-authoritative direct fields.
+    // ADR-049 §15 — supervisor-authoritative direct fields.
     //
     // These were previously mirrored from `ContextManager`. The
     // supervisor now owns them directly; eagerly initialized in
@@ -1869,7 +1869,7 @@ impl Supervisor {
             #[cfg(any(test, feature = "testing"))]
             force_welcome_export_failure_once: std::sync::atomic::AtomicBool::new(false),
             saga_repair_records: DashMap::new(),
-            // ADR-049 commit 12 — providers lifted from
+            // ADR-049 §15 — providers lifted from
             // ContextManager. Populated by `with_providers`.
             crypto: OnceLock::new(),
             transport: OnceLock::new(),
@@ -1940,7 +1940,7 @@ impl Supervisor {
     }
 
     /// Construct a supervisor with the providers that previously lived on
-    /// the deleted `ContextManager` (ADR-049 commit 12).
+    /// the deleted `ContextManager` (ADR-049 §15).
     ///
     /// The supervisor is now the authoritative owner of every provider —
     /// there is no `ContextManager` to attach. FFI bridges call this
@@ -2221,7 +2221,7 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------------
-    // ADR-049 commit 12 — provider + state accessors.
+    // ADR-049 §15 — provider + state accessors.
     //
     // Provider accessors (`crypto_ref`, `transport_ref`, etc.) return
     // `Option<&...>` because providers are populated only by
@@ -2415,7 +2415,7 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------------
-    // ADR-049 commit 12 — direct-state accessors (always populated).
+    // ADR-049 §15 — direct-state accessors (always populated).
     // -------------------------------------------------------------------
 
     /// Cheap reference to the supervisor's local-DID registry.
@@ -2454,7 +2454,7 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------------
-    // ADR-049 commit 12c.9f — per-identity wrapping-key accessors.
+    // ADR-049 §15 — per-identity wrapping-key accessors.
     //
     // The plan §"MlsCryptoProvider dissolution" lifts the wrapping
     // keypair off [`crate::crypto::mls::provider::MlsCryptoProvider`]
@@ -2750,7 +2750,7 @@ impl Supervisor {
 
     /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
     /// bundle entirely from the supervisor's own provider slots
-    /// (ADR-049 §1 / commit 12), scoped to `owning_did`.
+    /// (ADR-049 §1 / ADR-049 §15), scoped to `owning_did`.
     ///
     /// Self-sources every collaborator from the `OnceLock`s populated by
     /// [`Self::with_providers`]: the `MlsBackend` / `HpkeBackend` pair is
@@ -3598,7 +3598,7 @@ impl Supervisor {
     }
 
     /// Dispatch a [`GovernanceCommand`] to its per-context actor's mailbox
-    /// (ADR-049 commit 10 / plan row 10).
+    /// (ADR-049 §15 / plan row 10).
     ///
     /// Contract (byte-identical to the legacy
     /// [`Supervisor`](crate::context::supervisor::Supervisor)
@@ -3655,7 +3655,7 @@ impl Supervisor {
     }
 
     /// Dispatch an [`EconomyCommand`] to its per-context actor's mailbox
-    /// (ADR-049 commit 10 / plan row 10).
+    /// (ADR-049 §15 / plan row 10).
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. The
     /// economy handler only exposes the single public-surface method
@@ -3813,7 +3813,7 @@ impl Supervisor {
     }
 
     /// Dispatch a [`TrustRecoveryCommand`] to its per-context actor's mailbox
-    /// (ADR-049 commit 10 / plan row 10).
+    /// (ADR-049 §15 / plan row 10).
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. Covers the
     /// checkpoint + cosignature paths, MLS epoch advancement for
@@ -4407,7 +4407,7 @@ impl Supervisor {
     /// Spawn a new `ContextActor` task that owns drained
     /// [`PerContextState`](crate::context::actor::PerContextState) +
     /// [`ActorDeps`](crate::context::actor::ActorDeps) directly
-    /// (ADR-049 commit 12).
+    /// (ADR-049 §15).
     ///
     /// This is the owned-state spawn path. The lifecycle bootstrap caller
     /// (create / restore / import in
@@ -5345,7 +5345,7 @@ impl Supervisor {
 
     /// Dispatch a [`StandingCommand`] — mailbox-first for variants that
     /// map to an existing per-context actor, otherwise the supervisor-
-    /// scoped `dispatch_standing_direct` path (ADR-049 commit 11 / plan
+    /// scoped `dispatch_standing_direct` path (ADR-049 §15 / plan
     /// row 11).
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. Covers the
@@ -5469,7 +5469,7 @@ impl Supervisor {
     }
 
     /// Dispatch a [`OutletsCommand`] to its per-context actor's mailbox
-    /// (ADR-049 commit 11 / plan row 11).
+    /// (ADR-049 §15 / plan row 11).
     ///
     /// Covers the hard-rate-limit consume / refund helpers that FFI
     /// bridges call from their outlet-dispatch paths. The cross-context
@@ -5814,7 +5814,7 @@ impl Supervisor {
     }
 
     /// Dispatch a [`BroadcastCommand`] with an explicit key custody
-    /// reference (ADR-049 commit 11 / plan row 11).
+    /// reference (ADR-049 §15 / plan row 11).
     ///
     /// # Why a custody-generic shim still exists
     ///
@@ -6057,7 +6057,7 @@ impl Supervisor {
     ///
     /// # Coordinator FSM
     ///
-    /// Commit 11 implements the `Initiated → PreparingA → PreparingB →
+    /// ADR-049 §15 implements the `Initiated → PreparingA → PreparingB →
     /// Committing → Committed | Aborting → Aborted | NeedsRepair` state
     /// machine with journal durability. Each phase transition is
     /// persisted to the
@@ -10524,7 +10524,7 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------------
-    // ADR-049 commit 12c.9g.3 — FFI passthrough surface.
+    // ADR-049 §15 — FFI passthrough surface.
     //
     // The 4 FFI bridges (PyO3, NAPI, UniFFI, common) hold an
     // `Arc<Supervisor>` and invoke the methods below directly. They cover
@@ -16081,7 +16081,7 @@ mod tests {
         s.reap_stream_admission("never-existed");
     }
 
-    /// ADR-049 commit 12c.9f: per-identity wrapping-key accessors lift
+    /// ADR-049 §15: per-identity wrapping-key accessors lift
     /// the keypair off `MlsCryptoProvider`. Verifies that `set` →
     /// `get` returns the same bytes via the supervisor's
     /// `DashMap<DID, ArcSwap<WrappingKeyPair>>`.
@@ -16191,7 +16191,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // ADR-049 commit 12b.2a — `spawn_actor_with_state` tests
+    // ADR-049 §15 — `spawn_actor_with_state` tests
     // -----------------------------------------------------------------
 
     /// Construct a minimal [`crate::context::actor::deps::ActorDeps`] for

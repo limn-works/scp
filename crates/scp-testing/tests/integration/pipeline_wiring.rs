@@ -23,7 +23,7 @@
 
 // Production helper modules + domain logic modules. The legacy
 // `manager/<domain>.rs` submodules and `manager/mod.rs` were deleted
-// in ADR-049 commit 12 — every method body that the pipeline-wiring
+// in ADR-049 §15 — every method body that the pipeline-wiring
 // assertions probe now lives in `<domain>_helpers.rs` (forwarder-free),
 // `<domain>_helpers_legacy.rs` during Phase 2A actor migration windows,
 // or in `<domain>_logic.rs` (the free-function logic that used to share

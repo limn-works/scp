@@ -1132,11 +1132,11 @@ mod tests {
     ///
     /// The prior `MockCrypto` / `FailingMlsCrypto` / `TransientFailCrypto`
     /// scaffolds are deleted along with the `ContextCryptoProvider`
-    /// trait in ADR-049 commit 12c.9e. Success-path tests now build a
+    /// trait in ADR-049 §15. Success-path tests now build a
     /// real [`MlsCryptoProvider::new(TEST_DID.to_owned())`]; tests that
     /// asserted mock trackers (`mls_destroyed` counts, sender-key-destroyed
     /// counts) or fail-injection semantics are `#[ignore]`d pending
-    /// `MlsBackend`-level fail-injection in commit 12c.9f.
+    /// `MlsBackend`-level fail-injection in ADR-049 §15.
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
     fn mk_crypto() -> std::sync::Arc<MlsCryptoProvider> {
@@ -1534,7 +1534,7 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Smoke tests — just exercise the real MlsCryptoProvider path.
     // Deeper behaviour was covered by mock trackers that no longer exist;
-    // those tests are deferred to commit 12c.9f (MlsBackend injection).
+    // those tests are deferred to ADR-049 §15 (MlsBackend injection).
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1826,7 +1826,7 @@ mod tests {
         assert_eq!(ext.active_remaining(&active), 1);
     }
 
-    // ADR-049 commit 12c.9f: backend-injection seam landed via
+    // ADR-049 §15: backend-injection seam landed via
     // `MlsCryptoProvider::with_backends`. Pre-existing tests that
     // asserted `MockCrypto` tracker behaviour (mls_destroyed counters,
     // sender-key-destroyed counters, fail-injection retry semantics)

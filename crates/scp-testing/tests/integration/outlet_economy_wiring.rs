@@ -1,4 +1,4 @@
-// ADR-049 commit 12c.9e: ContextCryptoProvider trait deleted. MockCrypto
+// ADR-049 §15: ContextCryptoProvider trait deleted. MockCrypto
 // here reimplements that trait for unit-test coverage of outlet economy
 // wiring. Rewiring to real `MlsCryptoProvider` requires backend injection
 // (12c.9f). File gated until then.
@@ -445,7 +445,7 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     // bound to the invoker DID. Use mock_key_resolver so validate_spending_ucan_signed
     // can resolve the verifying key, and signed_spending_ucan_for to produce a
     // token signed by the matching private key.
-    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+    // ADR-049 §15 — wrap with `attach_test_supervisor`.
     let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport::connected()),
@@ -568,7 +568,7 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
 
 #[tokio::test]
 async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
-    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+    // ADR-049 §15 — wrap with `attach_test_supervisor`.
     let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport::connected()),

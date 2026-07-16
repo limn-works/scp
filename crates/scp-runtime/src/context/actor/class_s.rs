@@ -59,7 +59,7 @@
 //!   `suspended_capabilities` Class-S pair is now privatized to `pub(crate)` and
 //!   GROW-confined to the consequence-only view — see the dedicated section below.)
 //! - **Mutation through a combinator** — every combinator hands `f` a *view*
-//!   ([`ClassSMut`] for the Class-S-capable combinators, [`ClassCMut`] for the
+//!   (`ClassSMut` for the Class-S-capable combinators, `ClassCMut` for the
 //!   Class-C best-effort combinator) rather than the bare `&mut PerContextState`.
 //!   The view chooses which slice of the state `f` can reach `&mut`. The
 //!   Class-S-capable combinators ([`commit_class_s_keep`](ClassSCell::commit_class_s_keep),
@@ -120,7 +120,7 @@
 //! whole-struct `&mut` if one were ever handed out — but none is). Field
 //! privatization (`PerContextState.class_s` / `GovernanceState.class_s` are now
 //! `pub(in crate::context)`) closes the LAST whole-`&mut` reach that DID exist —
-//! the deleted `ClassSCell::state_mut` escape hatch and [`ClassSMut`]'s
+//! the deleted `ClassSCell::state_mut` escape hatch and `ClassSMut`'s
 //! `pub(crate)` reach — NOT this view, which was already airtight.
 //! - `*_then_append` — persist fail-closed AFTER `f`, then run an async `after`
 //!   step that appends a derived record to an EXTERNAL durable sink (the event
@@ -224,7 +224,7 @@
 //!     the applied GROW FAIL-CLOSED (RED-CS3), not that the GROW is unreachable.
 //!   - **(B) the inherent `pub` GROW.** `ContextRoleState::suspend_capabilities` /
 //!     `suspend_all` are inherent `pub` methods reachable through ANY whole
-//!     `&mut ContextRoleState` — e.g. [`ClassSMut::rest_mut`], used by the
+//!     `&mut ContextRoleState` — e.g. `ClassSMut::rest_mut`, used by the
 //!     governance helpers. That whole-`&mut` is handed out only by a
 //!     fail-closed-PERSISTING combinator, so the GROW it can reach is persisted
 //!     fail-closed by construction.
