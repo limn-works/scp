@@ -741,9 +741,17 @@ pub struct CommittedStreamingOutletInvocation {
     /// `stream_reservations` reconcile net — the streaming saga runs with
     /// `settlement_sink = None`). The unavoidable cross-process CRASH window (capture
     /// R1, persist fails, crash before retry ⇒ durable `settled == false` ⇒ recovery
-    /// re-captures R2) is backstopped by the payment adapter idempotency key (the
-    /// stable `request_id` below), giving exactly-once billing as a two-layer model
-    /// (flag = concurrent; key = crash). Crash recovery also reads it:
+    /// re-captures R2) is NOT closed by this flag and NOT closed by the runtime: the
+    /// runtime keeps no capture-dedup ledger. It only provides the STABLE idempotency
+    /// key (the `request_id` below, set on `authorize`; capture idempotency rides the
+    /// authorization identity). Whether the crash re-capture actually bills once is a
+    /// REQUIRED CONTRACT ON THE INJECTED ADAPTER (dedup `authorize` by key + idempotent
+    /// `capture`), not a runtime guarantee — the flag is the runtime-enforced
+    /// concurrent layer, the key is the delegated crash layer. The runtime-enforced
+    /// root close is a capture-dedup ledger tracked as
+    /// <https://github.com/limn-works/scp/issues/2156>; see the two-layer model on
+    /// [`settle_outlet_stream`](crate::context::outlets_helpers::settle_outlet_stream).
+    /// Crash recovery also reads it:
     /// witness present &
     /// `settled == false` ⇒ the money move never ran (crash / eviction in the
     /// seal→settle window) ⇒ rebuild the settlement from the durable fields below
