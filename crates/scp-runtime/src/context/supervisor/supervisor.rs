@@ -20484,6 +20484,7 @@ mod tests {
     ///   — and the requester recovers a real sender key from the ephemeral seal.
     #[cfg(feature = "testing")]
     #[test]
+    #[allow(clippy::too_many_lines)] // one cohesive receive-path flow: BLACK-P7-1 identity-binding reject + BLACK-P7-2 wire-format answer round-trip
     fn sender_key_pull_receive_path_binds_identity_and_wire_format() {
         use ed25519_dalek::Signer as _;
         use scp_clock::Clock as _;
@@ -20627,7 +20628,10 @@ mod tests {
         };
         assert_eq!(resp.sender_did, ALICE);
         assert_eq!(resp.epoch, 1);
-        assert_eq!(resp.request_nonce, [2u8; 16], "the answer echoes the request nonce");
+        assert_eq!(
+            resp.request_nonce, [2u8; 16],
+            "the answer echoes the request nonce"
+        );
         let recovered = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
             &resp.hpke_sealed_key,
             &resp.ephemeral_pubkey,

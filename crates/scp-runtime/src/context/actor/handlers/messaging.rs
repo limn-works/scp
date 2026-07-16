@@ -259,6 +259,15 @@ pub(crate) async fn dispatch(
 /// mutate nothing beyond that same intrinsic ratchet step, so they report
 /// `ok_mutated` on a decoded-but-non-application open and `err` on a decrypt
 /// failure.
+///
+/// # Caveat — inspect-then-deliver consumes the MLS receive ratchet
+///
+/// Because a successful open advances the MLS decryption ratchet, inspecting an
+/// envelope and THEN delivering the same envelope through the real receive seam
+/// would fail the second decrypt (the ratchet step for that message is already
+/// spent). This surface is therefore test-only and one-shot per envelope: a
+/// harness inspects OR delivers a given ciphertext, never both. Never wire it
+/// ahead of the production receive path for a message you also intend to deliver.
 #[cfg(feature = "testing")]
 fn handle_inspect_incoming_inner(
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -344,8 +353,9 @@ async fn handle_handle_sender_key_request(
     let local_did = deps.crypto.local_did().to_owned();
     let now_secs = deps.clock.now_secs();
     // No per-context sender-key block list is resident on the actor (the
-    // blocking-flow wiring is deferred); the §9.16.6 Mitigation-1 membership gate
-    // on the MLS group tree is the live Sybil defense.
+    // blocking-flow wiring into the actor answer path is a forward-only follow-up,
+    // tracked in #2146); the §9.16.6 Mitigation-1 membership gate on the MLS group
+    // tree is the live Sybil defense.
     let blocked = std::collections::HashSet::new();
 
     let mut view = cell.class_c_view();
@@ -412,8 +422,9 @@ async fn handle_land_sender_key_response(
     let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
 
     // GATE first (FAIL-CLOSED, no cell borrow) — the Class-M registry enforces
-    // epoch monotonicity + the poisoning ceiling and persists the floor advance
-    // durably before we touch the store.
+    // epoch monotonicity + the poisoning ceiling and advances the authoritative
+    // in-memory Class-M floor (durable at the next coalesced snapshot, coherently
+    // with the Class-C install below) before we touch the store.
     if let Err(e) = deps.supervisor.check_and_advance_sender_epoch(
         &context_id_bytes,
         sender_did,

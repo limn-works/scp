@@ -4443,14 +4443,17 @@ mod crypto_ops_golden {
         };
 
         // The answer is the KeyResponse envelope the production receiver parses.
-        let resp = match scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
-            &resp_bytes,
-        )
-        .expect("answer decodes as a SenderKeyDistributionMessage")
-        {
-            scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(r) => r,
-            other => panic!("expected a KeyResponse envelope, got {other:?}"),
-        };
+        let resp =
+            match scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+                &resp_bytes,
+            )
+            .expect("answer decodes as a SenderKeyDistributionMessage")
+            {
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(r) => {
+                    r
+                }
+                other => panic!("expected a KeyResponse envelope, got {other:?}"),
+            };
         let key_actor = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
             &resp.hpke_sealed_key,
             &resp.ephemeral_pubkey,

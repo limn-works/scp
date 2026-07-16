@@ -21,8 +21,10 @@
 //!
 //! # Helpers
 //!
-//! 1. [`build_encrypted_envelope`] — pure: access-key wrap, inner
-//!    envelope sign+pad, sender-key + MLS + outer-envelope seal.
+//! 1. [`build_inner_wire`] (pure: access-key wrap + inner-envelope
+//!    sign+pad) feeding [`build_encrypted_envelope_actor`] — the
+//!    ADR-049 PR-7 actor seal (sender-key + MLS + outer-envelope)
+//!    against an actor-owned `ContextCryptoState`.
 //! 2. [`enforce_send_economy`] — unified economy enforcement against
 //!    actor-owned governance state.
 //! 3. [`build_broadcast_envelope`] — broadcast-mode publish (pure).
@@ -108,11 +110,11 @@ pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
 /// wrap → inner-envelope stamp+sign), returning it alongside the canonical
 /// 32-byte context-id digest.
 ///
-/// Extracted from [`build_encrypted_envelope`] so the two seal seams — the
-/// retained provider path ([`build_encrypted_envelope`]) and the ADR-049 PR-7
-/// actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
-/// driven from the Class-C view in [`encrypt_and_send`]) — share ONE
-/// inner-envelope construction, so the sealed wire stays byte-identical across
+/// Shared by both seal seams — the deleted pre-PR-7 provider path and the
+/// ADR-049 PR-7 actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
+/// driven from the Class-C view in [`encrypt_and_send`], via
+/// [`build_encrypted_envelope_actor`]) — so both bottom out in ONE
+/// inner-envelope construction and the sealed wire stays byte-identical across
 /// the flip (the 16 golden byte-identity tests continue to hold).
 #[allow(clippy::too_many_arguments)]
 fn build_inner_wire(
@@ -194,8 +196,8 @@ fn build_inner_wire(
 
 /// Builds and seals an application-data send through the ADR-049 PR-7 actor
 /// crypto state (Class-C `&mut ContextCryptoState`), the field-granular crypto
-/// sub-state reached via `ClassCMut::mode_mut()`. Byte-identical to the retained
-/// provider path [`build_encrypted_envelope`]: it shares [`build_inner_wire`] and
+/// sub-state reached via `ClassCMut::mode_mut()`. Byte-identical to the deleted
+/// pre-PR-7 provider seal path: it shares [`build_inner_wire`] and
 /// passes the same all-zero app-data `routing_id`, `DEFAULT_BLOB_TTL_SECS`, and
 /// the caller-supplied `aad_sequence` (the authoritative sender-layer AAD
 /// sequence — today `MembershipState::next_sequence_number`, matching what the
@@ -1836,7 +1838,18 @@ pub async fn encrypt_and_send(
 /// every fan-out send fails. Callers that publish checkpoints opportunistically
 /// (the periodic-broadcast path in [`finalize_send`]) treat any error as
 /// best-effort and MUST NOT roll back the originating send.
-pub async fn send_checkpoint(
+// ADR-049 PR-7 (inquisitor item 8): narrowed `pub` → `pub(crate)`. The only
+// callers of this FREE function are in-crate actor handlers (the reconnection
+// driver in `handlers/messaging.rs` and `finalize_send` here); cross-crate code
+// reaches checkpoint sending through the distinct `Supervisor::send_*` methods,
+// never this helper. `pub(crate)` is the minimal correct visibility, and it keeps
+// this internal seam out of the source-text `check-cross-layer` gate at the root
+// (no FFI/SDK surface, no bridge-export obligation) with no PR-body exemption.
+// `redundant_pub_crate` is a false positive: the enclosing `messaging_helpers`
+// module is already `pub(crate)`, but this item is genuinely reached crate-wide
+// (same rationale as `build_encrypted_envelope_actor` above).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn send_checkpoint(
     deps: &ActorDeps,
     cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
@@ -1945,7 +1958,16 @@ pub async fn send_checkpoint(
 /// any error as best-effort (a failed heartbeat is itself a suppression
 /// signal, surfaced separately by the receiver's gap detection) and MUST NOT
 /// tear down the subscription on a single failure.
-pub async fn send_heartbeat(
+// ADR-049 PR-7 (inquisitor item 8): narrowed `pub` → `pub(crate)`. Same rationale
+// as `send_checkpoint` above — the only callers of this FREE function are in-crate
+// actor handlers (`handle_send_heartbeat`); cross-crate code reaches heartbeat
+// sending through the distinct `Supervisor::send_heartbeat` method. `pub(crate)`
+// is the minimal correct visibility and keeps the seam out of the source-text
+// `check-cross-layer` gate with no PR-body exemption. `redundant_pub_crate` is a
+// false positive (the enclosing module is already `pub(crate)`, the item is
+// reached crate-wide).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn send_heartbeat(
     deps: &ActorDeps,
     cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
@@ -3147,7 +3169,8 @@ pub fn decrypt_and_dispatch(
                         ContextError::CryptoFailed(format!("request re-serialization: {e}"))
                     })?;
                     // No per-context sender-key block list is resident on the actor
-                    // (the blocking-flow wiring is deferred); the §9.16.6
+                    // (the blocking-flow wiring into the actor answer path is a
+                    // forward-only follow-up, tracked in #2146); the §9.16.6
                     // Mitigation-1 membership gate on the MLS group tree is the live
                     // Sybil defense.
                     let blocked = std::collections::HashSet::new();

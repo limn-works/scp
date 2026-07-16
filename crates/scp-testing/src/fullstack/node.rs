@@ -839,17 +839,17 @@ impl FullStackNode {
             // `SenderKeyDistributionMessage::KeyResponse` envelope (matching the
             // production receive path + the proactive push), so decode the enum
             // rather than a bare `SenderKeyResponse`.
-            let response = match SenderKeyDistributionMessage::from_bytes(&response_bytes)
-                .map_err(|e| {
+            let response =
+                match SenderKeyDistributionMessage::from_bytes(&response_bytes).map_err(|e| {
                     ContextError::CryptoFailed(format!("decode sender-key response: {e}"))
                 })? {
-                SenderKeyDistributionMessage::KeyResponse(resp) => resp,
-                other => {
-                    return Err(ContextError::CryptoFailed(format!(
-                        "expected a KeyResponse from the joiner, got {other:?}"
-                    )));
-                }
-            };
+                    SenderKeyDistributionMessage::KeyResponse(resp) => resp,
+                    other => {
+                        return Err(ContextError::CryptoFailed(format!(
+                            "expected a KeyResponse from the joiner, got {other:?}"
+                        )));
+                    }
+                };
             let joiner_key = open_sender_key_response(
                 &custody,
                 &request.wrapping_key_handle,
