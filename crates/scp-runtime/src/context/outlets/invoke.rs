@@ -4429,20 +4429,27 @@ async fn forward_frame(
 /// snapshot is updated only AFTER a successful forward (§6.2.5) — it is a
 /// replay snapshot, never a forwarding buffer.
 ///
-/// Returns `true` iff the terminal was DELIVERED to A's invoker (the outer
-/// channel accepted it). `false` means A stopped consuming before the terminal
-/// landed — the caller MUST NOT synthesize a further terminal onto a closed
-/// channel.
+/// Returns `Some(chunk)` — the synthesized terminal `OutletStreamChunk` — iff it
+/// was DELIVERED to A's invoker (the outer channel accepted it); `None` means A
+/// stopped consuming before the terminal landed and the caller MUST NOT
+/// synthesize a further terminal onto a closed channel.
+///
+/// This helper does NOT own retention: it folds the synthesized terminal into
+/// the `terminal` summary and RETURNS the chunk so the caller decides whether to
+/// retain it. The best-effort bridge ([`run_cross_context_bridge`]) pushes the
+/// returned chunk into its own §6.2.5 write-through replay snapshot; the O(log n)
+/// streaming-saga seal task retains only the sealed frontier + the last sequence
+/// (SCP-OUT-046 AC4 / ADR-061 no-buffering) and drops the returned chunk after
+/// reading `.sequence`.
 #[must_use]
 async fn forward_bridge_terminal(
     outer_tx: &mpsc::Sender<ForwardedStreamFrame>,
     send_tracker: &mut crate::context::actor::SendSequenceTracker,
-    reassembled: &mut Vec<OutletStreamChunk>,
     terminal: &mut StreamTerminalSummary,
     request_id: RequestId,
     sequence: u64,
     payload: ChunkPayload,
-) -> bool {
+) -> Option<OutletStreamChunk> {
     let chunk = OutletStreamChunk {
         request_id,
         sequence,
@@ -4453,16 +4460,15 @@ async fn forward_bridge_terminal(
     // own per-sender `base_sequence` anchor, allocated + committed on the send
     // hop like every forwarded chunk. A send failure rolls the reservation back.
     if !forward_frame(outer_tx, send_tracker, &chunk).await {
-        // A's invoker stopped consuming before the terminal landed — record
-        // what was already delivered; the terminal summary keeps its prior
-        // (default) status.
-        return false;
+        // A's invoker stopped consuming before the terminal landed — the caller
+        // records what was already delivered; the terminal summary keeps its
+        // prior (default) status.
+        return None;
     }
     // The manifest snapshot commits over the bare `OutletStreamChunk` (never the
     // runtime frame), so B's committed manifest and A's recomputation agree.
     terminal.observe(&chunk.payload);
-    reassembled.push(chunk);
-    true
+    Some(chunk)
 }
 
 /// Records the receiving context A's own `OutletInvoked` event at stream close
@@ -4701,13 +4707,16 @@ pub(crate) async fn run_cross_context_bridge(
             delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 request_id,
                 next_seq,
                 payload,
             )
-            .await;
+            .await
+            .is_some_and(|chunk| {
+                reassembled.push(chunk);
+                true
+            });
             outer_open = delivered_terminal;
             break;
         }
@@ -4730,13 +4739,16 @@ pub(crate) async fn run_cross_context_bridge(
             delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 request_id,
                 chunk.sequence,
                 payload,
             )
-            .await;
+            .await
+            .is_some_and(|chunk| {
+                reassembled.push(chunk);
+                true
+            });
             outer_open = delivered_terminal;
             break;
         }
@@ -4753,13 +4765,16 @@ pub(crate) async fn run_cross_context_bridge(
             delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 request_id,
                 chunk.sequence,
                 payload,
             )
-            .await;
+            .await
+            .is_some_and(|chunk| {
+                reassembled.push(chunk);
+                true
+            });
             outer_open = delivered_terminal;
             break;
         }
@@ -4791,13 +4806,16 @@ pub(crate) async fn run_cross_context_bridge(
             delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 request_id,
                 chunk.sequence,
                 payload,
             )
-            .await;
+            .await
+            .is_some_and(|chunk| {
+                reassembled.push(chunk);
+                true
+            });
             outer_open = delivered_terminal;
             break;
         }
@@ -4852,16 +4870,18 @@ pub(crate) async fn run_cross_context_bridge(
         let next_seq = reassembled
             .last()
             .map_or(0, |c| c.sequence.saturating_add(1));
-        let _ = forward_bridge_terminal(
+        if let Some(chunk) = forward_bridge_terminal(
             &outer_tx,
             &mut send_tracker,
-            &mut reassembled,
             &mut terminal,
             request_id,
             next_seq,
             payload,
         )
-        .await;
+        .await
+        {
+            reassembled.push(chunk);
+        }
     }
 
     // (AC7) A-side recording through the verified-append boundary.
@@ -4907,9 +4927,13 @@ pub(crate) async fn run_cross_context_bridge(
 /// autonomous crash-recovery sweep (SCP-OUT-046 #136).
 ///
 /// The receiving-context A-side `CrossContextOutletInvoked` dual-log leaf
-/// (SCP-OUT-046 #135) is recorded from the `reassembled` sequence this task
-/// accumulates; that recording is wired in the next slice and its seam is marked
-/// below. This task never re-signs a chunk and never re-invokes the outlet.
+/// (SCP-OUT-046 #135) is recorded from the SEALED `outcome` (the signed receipt +
+/// the sealed manifest root) at close — never from a locally-accumulated payload
+/// buffer. This task therefore retains NO O(n) chunk buffer (SCP-OUT-046 AC4 /
+/// ADR-061 no-buffering): it tracks only the last forwarded `sequence` (to anchor
+/// a synthesized terminal) while B's DURABLE manifest is the `SagaId`-keyed
+/// frontier folded via `StreamCaptureAppend`. This task never re-signs a chunk and
+/// never re-invokes the outlet.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_streaming_saga_seal_task(
     supervisor: std::sync::Arc<crate::context::supervisor::Supervisor>,
@@ -4943,11 +4967,13 @@ pub(crate) async fn run_streaming_saga_seal_task(
         "streaming-saga seal task: forwarding B→A + durable frontier capture (ADR-061)"
     );
 
-    // The forwarded sequence (operator chunks + any synthesized terminal),
-    // retained for the receiving-context A-side `CrossContextOutletInvoked`
-    // recording (SCP-OUT-046 #135, wired next slice). B's DURABLE manifest is the
-    // `SagaId`-keyed frontier folded via `StreamCaptureAppend`, NOT this Vec.
-    let mut reassembled: Vec<OutletStreamChunk> = Vec::new();
+    // The LAST forwarded sequence (operator chunks + any synthesized terminal).
+    // The seal task retains NO O(n) payload buffer (SCP-OUT-046 AC4 / ADR-061
+    // no-buffering): the receiving-context A-side `CrossContextOutletInvoked` leaf
+    // is recorded from the SEALED `outcome`, and B's DURABLE manifest is the
+    // `SagaId`-keyed frontier folded via `StreamCaptureAppend`. This scalar exists
+    // only to anchor a synthesized terminal's `base_sequence` at the next slot.
+    let mut last_sequence: Option<u64> = None;
     let mut terminal = StreamTerminalSummary::default();
     // Per-sender MLS send-sequence allocator for THIS send hop (SCP-OUT-044) —
     // task-scoped, exactly as `run_cross_context_bridge` (the off-mailbox seal
@@ -4977,13 +5003,16 @@ pub(crate) async fn run_streaming_saga_seal_task(
             delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 descriptor.expected_request_id,
                 chunk.sequence,
                 payload,
             )
-            .await;
+            .await
+            .is_some_and(|term| {
+                last_sequence = Some(term.sequence);
+                true
+            });
             outer_open = delivered_terminal;
             break;
         }
@@ -5012,13 +5041,16 @@ pub(crate) async fn run_streaming_saga_seal_task(
             delivered_terminal = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 descriptor.expected_request_id,
                 chunk.sequence,
                 payload,
             )
-            .await;
+            .await
+            .is_some_and(|term| {
+                last_sequence = Some(term.sequence);
+                true
+            });
             outer_open = delivered_terminal;
             break;
         }
@@ -5036,9 +5068,12 @@ pub(crate) async fn run_streaming_saga_seal_task(
         // `SagaId`-keyed frontier (§6.2.5 replay snapshot; Class-S KEEP monotonic
         // credit). Forwarding already happened — the capture never gates delivery.
         // A vanished/diverged actor closes the seal over the durable prefix.
+        // `outer_open` STAYS true: `capture_broke` is a B-side fault (the target
+        // actor is unreachable), NOT A closing its channel — the post-loop
+        // terminal-guarantee synthesis must still fire so A never truncates after
+        // a non-terminal `Data` (crypto review: preserve the terminal guarantee).
         let Some(actor) = supervisor.lookup(&target_context_hex) else {
             capture_broke = true;
-            outer_open = false;
             break;
         };
         let capture_chunk = chunk.clone();
@@ -5061,39 +5096,54 @@ pub(crate) async fn run_streaming_saga_seal_task(
                     "streaming-saga seal task: durable StreamCaptureAppend failed — \
                      sealing over the durable prefix"
                 );
+                // `outer_open` stays true — see the lookup-miss branch above: a
+                // capture fault is B-side, so A must still get its terminal.
                 capture_broke = true;
-                outer_open = false;
                 break;
             }
         }
 
         terminal.observe(&chunk.payload);
-        reassembled.push(chunk);
+        last_sequence = Some(chunk.sequence);
         if is_terminal {
             delivered_terminal = true;
             break;
         }
     }
 
-    // Terminal guarantee: B's pump dropped its sender without a terminal AND the
-    // caller is still consuming — synthesize a transport-fault terminal so the
-    // caller never truncates after a non-terminal `Data`.
-    if !delivered_terminal && outer_open && !capture_broke {
-        let payload = ChunkPayload::Error {
-            code: CODE_TRANSPORT_FAULT.to_owned(),
-            message: format!(
+    // Terminal guarantee: synthesize a transport-fault terminal so the caller
+    // never truncates after a non-terminal `Data`. Two cases reach here without a
+    // delivered terminal while A is still consuming:
+    //   - B's pump dropped its sender WITHOUT a terminal chunk (`!capture_broke`);
+    //   - the durable frontier capture broke mid-stream (`capture_broke`) — the
+    //     target actor vanished/diverged, so the seal closes over the durable
+    //     prefix. The caller must STILL receive a terminal (crypto review: the
+    //     `capture_broke` path was previously excluded, silently truncating A
+    //     after a non-terminal `Data` and losing the §5.4.5 terminal guarantee).
+    if !delivered_terminal && outer_open {
+        let message = if capture_broke {
+            format!(
+                "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: durable frontier capture broke \
+                 mid-stream — sealed over the durable prefix (§5.4.5)"
+            )
+        } else {
+            format!(
                 "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: operating context closed the \
                  stream without a terminal chunk (§5.4.5)"
-            ),
+            )
+        };
+        let payload = ChunkPayload::Error {
+            code: CODE_TRANSPORT_FAULT.to_owned(),
+            message,
             terminal: true,
         };
-        let next_seq = reassembled
-            .last()
-            .map_or(0, |c| c.sequence.saturating_add(1));
+        let next_seq = last_sequence.map_or(0, |s| s.saturating_add(1));
+        // The synthesized terminal is the final chunk — its sequence is not read
+        // again, so the delivery result is discarded (the terminal summary was
+        // already folded inside `forward_bridge_terminal`).
         let _ = forward_bridge_terminal(
             &outer_tx,
             &mut send_tracker,
-            &mut reassembled,
             &mut terminal,
             descriptor.expected_request_id,
             next_seq,
@@ -5155,8 +5205,8 @@ pub(crate) async fn run_streaming_saga_seal_task(
             // move below so it borrows the whole `outcome`. Uses the SEALED root
             // from `outcome` (never a re-derivation) + the convergent
             // timestamp/nonce/context-ids from the signed receipt, so every
-            // honest member's leaf is byte-identical. `reassembled` is no longer
-            // needed — B's durable frontier is the authoritative manifest.
+            // honest member's leaf is byte-identical. No local payload buffer is
+            // read — B's durable frontier is the authoritative manifest.
             record_streaming_saga_a_event(&a_event_log, &saga_id, &outcome).await;
 
             // Apply the ACTUAL budget movement (SCP-OUT-046): the seal handler
