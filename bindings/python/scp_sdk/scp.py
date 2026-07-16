@@ -817,9 +817,14 @@ class SCP:
         """
         import json
 
-        result_json = await asyncio.to_thread(
-            self._native.identity_execute_recovery, did, tier, context_ids
-        )
+        from scp_sdk.errors import _coded_bridge_error
+
+        try:
+            result_json = await asyncio.to_thread(
+                self._native.identity_execute_recovery, did, tier, context_ids
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return json.loads(result_json) if isinstance(result_json, str) else result_json
 
     async def identity_link_attestations(self, did: str) -> list[Any]:
@@ -881,7 +886,12 @@ class SCP:
         without error when the DID is not present. Delegates to
         ``_scp_core.SCP.identity_remove``.
         """
-        await asyncio.to_thread(self._native.identity_remove, did)
+        from scp_sdk.errors import _coded_bridge_error
+
+        try:
+            await asyncio.to_thread(self._native.identity_remove, did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def identity_remove_if_present(self, did: str) -> bool:
         """Remove a DID from the identity registry if present.
@@ -1265,7 +1275,12 @@ class SCP:
 
     async def context_member_count(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_count``."""
-        return await asyncio.to_thread(self._native.context_member_count, handle)
+        from scp_sdk.errors import _coded_bridge_error
+
+        try:
+            return await asyncio.to_thread(self._native.context_member_count, handle)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def context_member_dids(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_dids``."""
@@ -1352,9 +1367,14 @@ class SCP:
         event); retry once peers' pseudonym-announcement messages have arrived.
         A lone-member send is a no-op; broadcast contexts are unaffected.
         """
-        return await asyncio.to_thread(
-            self._native.context_send, handle, identity_did, payload, spending_ucan_jwt
-        )
+        from scp_sdk.errors import _coded_bridge_error
+
+        try:
+            return await asyncio.to_thread(
+                self._native.context_send, handle, identity_did, payload, spending_ucan_jwt
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def get_economic_policy(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.get_economic_policy``."""
@@ -1432,14 +1452,19 @@ class SCP:
         step-5 audience check the tautology ``aud == aud`` and inflate trust).
         Pass the DID the token must be addressed to.
         """
-        return await asyncio.to_thread(
-            self._native.ucan_validate,
-            context_id,
-            token,
-            capability,
-            presenting_agent_did,
-            proof_tokens,
-        )
+        from scp_sdk.errors import _coded_bridge_error
+
+        try:
+            return await asyncio.to_thread(
+                self._native.ucan_validate,
+                context_id,
+                token,
+                capability,
+                presenting_agent_did,
+                proof_tokens,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def ucan_evaluate(
         self,
@@ -1724,9 +1749,14 @@ class SCP:
 
     async def governance_propose(self, handle: Any, identity_did: str, action_json: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_propose``."""
-        return await asyncio.to_thread(
-            self._native.governance_propose, handle, identity_did, action_json
-        )
+        from scp_sdk.errors import _coded_bridge_error
+
+        try:
+            return await asyncio.to_thread(
+                self._native.governance_propose, handle, identity_did, action_json
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def governance_reject(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_reject``."""
@@ -2101,9 +2131,13 @@ class SCP:
 
         Returns a list of :class:`~scp_sdk.event_log.Event` dataclasses.
         """
+        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.event_log import Event
 
-        raw_events = await asyncio.to_thread(self._native.event_log_query, context_id, filter)
+        try:
+            raw_events = await asyncio.to_thread(self._native.event_log_query, context_id, filter)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return [
             Event(
                 event_type=e.event_type,
@@ -2494,16 +2528,21 @@ class SCP:
         spending_ucan: str | None = None,
     ) -> Any:
         """Delegate to ``_scp_core.SCP.outlet_invoke``."""
-        return await asyncio.to_thread(
-            self._native.outlet_invoke,
-            context_id,
-            outlet_id,
-            input,
-            identity_did,
-            ucan_token,
-            proof_tokens,
-            spending_ucan,
-        )
+        from scp_sdk.errors import _coded_bridge_error
+
+        try:
+            return await asyncio.to_thread(
+                self._native.outlet_invoke,
+                context_id,
+                outlet_id,
+                input,
+                identity_did,
+                ucan_token,
+                proof_tokens,
+                spending_ucan,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def outlet_invoke_cross_context(
         self,

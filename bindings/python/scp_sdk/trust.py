@@ -30,11 +30,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypedDict
 
-from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ScpError
+from scp_sdk.errors import ContextError, ScpError, _coded_bridge_error
 
 if TYPE_CHECKING:
     from scp_sdk.scp import SCP
@@ -47,30 +46,6 @@ logger = logging.getLogger("scp_sdk")
 #: "no facts yet" into a zeroed behavioral record while letting every other
 #: failure propagate. Maps from ``ContextError::NoParticipationFacts``.
 NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076"
-
-#: Extracts a ``[SCP-CAT-NNNN]`` code from a bridge exception's string form. The
-#: PyO3 bridge formats native exceptions as ``[{code}] {category} error: ...``.
-#: Anchored to the start so a code-like substring embedded in {message} cannot
-#: masquerade as the real code (same discipline as the TS mapBridgeError anchor).
-_SCP_CODE_RE = re.compile(r"^\s*\[(SCP-[A-Z]+-\d+)\]")
-
-
-def _coded_bridge_error(exc: Exception) -> ScpError:
-    """Translate a native ``_scp_core`` exception into a coded SDK exception.
-
-    Looks up the SDK class by the bridge exception's class name (via
-    :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP`, defaulting to
-    :class:`~scp_sdk.errors.ContextError`) and recovers the structured
-    ``SCP-CAT-NNNN`` code from the message so callers can branch on
-    ``exc.code`` rather than parsing prose. An already-typed
-    :class:`~scp_sdk.errors.ScpError` is returned unchanged.
-    """
-    if isinstance(exc, ScpError):
-        return exc
-    sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
-    match = _SCP_CODE_RE.search(str(exc))
-    code = match.group(1) if match is not None else None
-    return sdk_cls(str(exc), code=code)
 
 
 # ---------------------------------------------------------------------------

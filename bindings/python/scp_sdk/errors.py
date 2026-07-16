@@ -26,6 +26,8 @@ shadowing Python's built-in ``PermissionError``.
 
 from __future__ import annotations
 
+import re
+
 
 class ScpError(Exception):
     """Base exception for all SCP errors.
@@ -303,6 +305,30 @@ BRIDGE_ERROR_MAP: dict[str, type[ScpError]] = {
 }
 
 
+#: Extracts a ``[SCP-CAT-NNNN]`` code from a bridge exception's string form. The
+#: PyO3 bridge formats native exceptions as ``[{code}] {category} error: ...``.
+#: Anchored to the start so a code-like substring embedded in {message} cannot
+#: masquerade as the real code (same discipline as the TS mapBridgeError anchor).
+_SCP_CODE_RE = re.compile(r"^\s*\[(SCP-[A-Z]+-\d+)\]")
+
+
+def _coded_bridge_error(exc: Exception) -> ScpError:
+    """Translate a native ``_scp_core`` exception into a coded SDK exception.
+
+    Looks up the SDK class by the bridge exception's class name (via
+    :data:`BRIDGE_ERROR_MAP`, defaulting to :class:`ContextError`) and
+    recovers the structured ``SCP-CAT-NNNN`` code from the message so
+    callers can branch on ``exc.code`` rather than parsing prose. An
+    already-typed :class:`ScpError` is returned unchanged.
+    """
+    if isinstance(exc, ScpError):
+        return exc
+    sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
+    match = _SCP_CODE_RE.search(str(exc))
+    code = match.group(1) if match is not None else None
+    return sdk_cls(str(exc), code=code)
+
+
 __all__ = [
     "BRIDGE_ERROR_MAP",
     "ContextError",
@@ -320,4 +346,5 @@ __all__ = [
     "TransportError",
     "UcanPermissionError",
     "ValidationError",
+    "_coded_bridge_error",
 ]
