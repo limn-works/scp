@@ -32,15 +32,15 @@ from scp_sdk.errors import (
     TransportError,
     UcanPermissionError,
     ValidationError,
+    _coded_bridge_error,
 )
-from scp_sdk.outlets import _translate_bridge_error
 
 # ---------------------------------------------------------------------------
-# _translate_bridge_error tests (still in scp_sdk.outlets)
+# _coded_bridge_error tests (centralized in scp_sdk.errors; used by outlets)
 # ---------------------------------------------------------------------------
 
 
-class TestTranslateBridgeError:
+class TestCodedBridgeError:
     """Tests for the bridge-to-SDK exception translator."""
 
     @pytest.mark.parametrize(
@@ -51,7 +51,6 @@ class TestTranslateBridgeError:
             ("UcanError", UcanPermissionError),
             ("CryptoError", CryptoError),
             ("TransportError", TransportError),
-            ("OutletError", OutletError),
             ("ValidationError", ValidationError),
         ],
     )
@@ -64,7 +63,7 @@ class TestTranslateBridgeError:
         bridge_cls = type(bridge_name, (Exception,), {})
         bridge_exc = bridge_cls("something went wrong")
 
-        result = _translate_bridge_error(bridge_exc)
+        result = _coded_bridge_error(bridge_exc)
 
         assert isinstance(result, expected_sdk_cls)
         assert result.message == "something went wrong"
@@ -74,37 +73,36 @@ class TestTranslateBridgeError:
         bridge_cls = type("SomeUnknownBridgeError", (Exception,), {})
         bridge_exc = bridge_cls("unexpected failure")
 
-        result = _translate_bridge_error(bridge_exc)
+        result = _coded_bridge_error(bridge_exc)
 
         assert isinstance(result, ContextError)
         assert "unexpected failure" in result.message
 
-    def test_leading_bridge_code_is_extracted_into_structured_code(self) -> None:
-        """The bridge's ``[SCP-CAT-NNNN]`` Display prefix surfaces as ``.code``.
-
-        A money-moving rejection (e.g. a non-invoker grant/cancel/recover) is
-        raised bridge-side as a ``ContextError`` whose message carries
-        ``[SCP-PERM-3001]``; the caller must be able to branch on ``.code``
-        rather than substring-match the message text.
-        """
+    def test_extracts_scp_code_from_leading_bracket(self) -> None:
+        """Structured SCP code at position 0 is recovered into .code."""
         bridge_cls = type("ContextError", (Exception,), {})
-        bridge_exc = bridge_cls("[SCP-PERM-3001] context error: caller is not the pinned invoker")
+        bridge_exc = bridge_cls("[SCP-CTX-2023] context error: state lookup failed")
 
-        result = _translate_bridge_error(bridge_exc)
+        result = _coded_bridge_error(bridge_exc)
 
-        assert isinstance(result, ContextError)
-        assert result.code == "SCP-PERM-3001"
+        assert result.code == "SCP-CTX-2023"
 
-    def test_unbracketed_message_keeps_sdk_class_default_code(self) -> None:
-        """A bridge message without a ``[SCP-...]`` prefix carries no recoverable
-        code, so the receiving SDK class's default ``.code`` applies."""
+    def test_embedded_code_is_not_captured(self) -> None:
+        """A [SCP-...] token buried in the message body must not masquerade as the code."""
         bridge_cls = type("ContextError", (Exception,), {})
-        bridge_exc = bridge_cls("no active saga 'x'")
+        bridge_exc = bridge_cls("failed to process token: [SCP-CTX-2076] embedded")
 
-        result = _translate_bridge_error(bridge_exc)
+        result = _coded_bridge_error(bridge_exc)
 
-        assert isinstance(result, ContextError)
-        assert result.code == ContextError._default_code == "SCP-CTX-2000"
+        assert result.code != "SCP-CTX-2076"
+
+    def test_already_typed_scperror_returned_unchanged(self) -> None:
+        """An already-typed ScpError passthrough must preserve the original instance."""
+        original = ContextError("already typed", code="SCP-CTX-2099")
+
+        result = _coded_bridge_error(original)
+
+        assert result is original
 
 
 # ---------------------------------------------------------------------------
