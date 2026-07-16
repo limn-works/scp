@@ -37,10 +37,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::dtls::AsyncDtlsSession;
-use crate::native::protocol::{ClientMessage, DEFAULT_QUERY_LIMIT, MIN_BLOB_TTL, RelayMessage};
 use crate::native::server::RelayConfig;
 use crate::native::storage::BlobStorage;
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter};
+use scp_relay_client::{ClientMessage, DEFAULT_QUERY_LIMIT, MIN_BLOB_TTL, RelayMessage};
 
 /// Configuration for the UDP/DTLS listener.
 ///

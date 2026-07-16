@@ -2566,6 +2566,7 @@ dependencies = [
  "scp-event-log",
  "scp-mls",
  "scp-protocol",
+ "scp-relay-client",
  "scp-runtime",
  "scp-transport",
  "serde",
@@ -2681,6 +2682,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scp-relay-client"
+version = "0.1.0-beta.2"
+dependencies = [
+ "rmp-serde",
+ "scp-protocol",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "scp-runtime"
 version = "0.1.0-beta.2"
 dependencies = [
@@ -2747,6 +2759,7 @@ dependencies = [
  "scp-clock",
  "scp-core",
  "scp-identity",
+ "scp-relay-client",
  "serde",
  "serde_bytes",
  "serde_json",

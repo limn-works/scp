@@ -82,6 +82,12 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 scp-client = { path = "../scp-client", features = ["testing"] }
 scp-did = { path = "../scp-did", features = ["testing"] }
 
+# The cross-target determinism KAT also round-trips the relay wire types
+# (ClientMessage/RelayMessage) — a types-only dep on the wasm-safe
+# scp-relay-client leaf (ADR-057 Slice 3, D5). It pulls NO transport/pump code,
+# so it stays inside the D5 fence.
+scp-relay-client = { path = "../scp-relay-client" }
+
 # The cross-target determinism KAT round-trips committed golden MLS wire blobs
 # (Commit / Welcome / KeyPackage) through openmls's canonical TLS codec on BOTH
 # targets (ADR-057 Prerequisite 5 (i)/(iii)): deserialize the golden blob, then

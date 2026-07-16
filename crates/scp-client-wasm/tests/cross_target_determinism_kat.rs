@@ -111,6 +111,7 @@ use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_mls::{ScpCredential, encode_convergent_timestamp_aad};
 use scp_protocol::crypto::sender_keys::SenderKey;
 use scp_protocol::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
+use scp_relay_client::{ClientMessage, RelayMessage};
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
 #[cfg(target_arch = "wasm32")]
@@ -192,6 +193,28 @@ const GOLDEN_MLS_WELCOME_HEX: &str = "00014098206355b0c46bf3322a064b18e11eb62005
 /// GOLDEN: a serialized MLS **`KeyPackage`** (bare wire bytes) for the joiner,
 /// hex-encoded. Round-trips directly via `KeyPackageIn`.
 const GOLDEN_KEY_PACKAGE_HEX: &str = "0001000120628e627c3dc03946d45c062be0a8fdf7617d04cb71fb2150b08cc300f94dd95520771f9f0de022b08d756c166fe89616824debc7f47e9e32890448e174a6dbbf1a20e3e14431dd3a00609e5bbb7d79104b010bdb16b52dea23483f417dcfac9eaea50001404293d9366469643a6468743a7a364d6b44657465726d696e69736d4b617446697874757265424242424242424242424242424242424242424242c0a72361637469766502000108000100020003004d02ff010002000101000000006a57cb39000000006ac6974923ff0120caa87cb8b359ebe1c29d3133eb6d06c6b5486a0c7db5bbd51145c98751cb1a6f4040e6d3ad0288d13d5bfcc7a3074b433fa1164be4e30691ed37596ee553cb9895dddef90b6505ff6e12e5ee51f7ba9ea7e797a0453e7000cd47a763095637e95f0b00404033520c2aa9f9cc4280705a9ca8a68f9dd5ccf6214300a6c7acf25f3aab20517d9fb0b1ec6c24771cfe269f4d2e856e3d0ea26d60e240ebc6c49ea0d747f37e00";
+
+// GOLDEN relay wire blobs (ADR-057 Slice 3, Decision D5). The relay
+// `ClientMessage` / `RelayMessage` wire types moved to the wasm-safe
+// `scp-relay-client` leaf so the native relay and the in-browser client share
+// ONE definition. Their `rmp_serde::to_vec_named` `MessagePack` encoding is a
+// name-keyed map with explicit integer widths and `serde_bytes` binary fields —
+// no `usize`, no float, no map iteration to order — so re-encoding a fixed
+// message is deterministic and cross-target-stable. This leg deserializes each
+// committed golden blob and re-serializes it through the crate's own
+// `from_bytes` / `to_bytes` API, asserting byte-identity on BOTH targets: a
+// `usize`/width divergence (wasm32 is 32-bit) or a field-order change would move
+// the re-encoding off the golden and be caught.
+
+/// GOLDEN: a fixed `ClientMessage::Publish` (fixed `ref`, `routing_id`,
+/// `recipient_hint`, `blob_ttl`, and `blob`), `MessagePack`-encoded via
+/// `ClientMessage::to_bytes`, hex-encoded.
+const GOLDEN_CLIENT_PUBLISH_HEX: &str = "86a26f70a75055424c495348a3726566ab6b61742d7075626c697368aa726f7574696e675f6964c4201111111111111111111111111111111111111111111111111111111111111111ae726563697069656e745f68696e74c4202222222222222222222222222222222222222222222222222222222222222222a8626c6f625f74746ccd0e10a4626c6f62c41c7363702d72656c61792d636c69656e742064657465726d696e69736d";
+
+/// GOLDEN: a fixed `RelayMessage::Blob` (fixed `routing_id`, `blob_id`,
+/// `recipient_hint`, `blob_ttl`, `stored_at`, and `blob`), `MessagePack`-encoded
+/// via `RelayMessage::to_bytes`, hex-encoded.
+const GOLDEN_RELAY_BLOB_HEX: &str = "87a26f70a4424c4f42aa726f7574696e675f6964c4203333333333333333333333333333333333333333333333333333333333333333a7626c6f625f6964c4204444444444444444444444444444444444444444444444444444444444444444ae726563697069656e745f68696e74c4205555555555555555555555555555555555555555555555555555555555555555a8626c6f625f74746ccd1c20a973746f7265645f6174ce6553f100a4626c6f62c41c7363702d72656c61792d636c69656e742064657465726d696e69736d";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -476,4 +499,61 @@ fn assert_mls_wire_encoding_roundtrips() {
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn mls_wire_encoding_is_target_deterministic() {
     assert_mls_wire_encoding_roundtrips();
+}
+
+// ---------------------------------------------------------------------------
+// Relay wire-encoding round-trips (ADR-057 Slice 3, Decision D5)
+// ---------------------------------------------------------------------------
+
+/// Asserts that deserializing then re-serializing each committed golden relay
+/// wire blob (`ClientMessage::Publish`, `RelayMessage::Blob`) reproduces the
+/// golden bytes byte-for-byte, through the `scp-relay-client` crate's own
+/// `from_bytes` / `to_bytes` (`rmp_serde::to_vec_named`) API. Called from BOTH
+/// targets: the `MessagePack` name-keyed encoding is canonical for a fixed value,
+/// so `native == golden` and `wasm == golden` together prove the relay wire codec
+/// does not diverge across targets on `usize` width or field order — the exact
+/// byte-parity property the shared-crate move (D5) exists to guarantee (one
+/// definition, both targets, no forked copy / byte-parity tax).
+fn assert_relay_wire_encoding_roundtrips() {
+    {
+        let golden = from_hex(GOLDEN_CLIENT_PUBLISH_HEX);
+        let msg = ClientMessage::from_bytes(&golden)
+            .unwrap_or_else(|e| panic!("ClientMessage golden blob deserializes: {e}"));
+        let reserialized = msg
+            .to_bytes()
+            .unwrap_or_else(|e| panic!("ClientMessage re-serializes: {e}"));
+        assert_eq!(
+            to_hex(&reserialized),
+            GOLDEN_CLIENT_PUBLISH_HEX,
+            "ClientMessage::Publish wire encoding is not target-deterministic \
+             (scp-relay-client MessagePack codec diverged from the golden — a \
+             width/field-order bug)"
+        );
+    }
+
+    {
+        let golden = from_hex(GOLDEN_RELAY_BLOB_HEX);
+        let msg = RelayMessage::from_bytes(&golden)
+            .unwrap_or_else(|e| panic!("RelayMessage golden blob deserializes: {e}"));
+        let reserialized = msg
+            .to_bytes()
+            .unwrap_or_else(|e| panic!("RelayMessage re-serializes: {e}"));
+        assert_eq!(
+            to_hex(&reserialized),
+            GOLDEN_RELAY_BLOB_HEX,
+            "RelayMessage::Blob wire encoding is not target-deterministic \
+             (scp-relay-client MessagePack codec diverged from the golden — a \
+             width/field-order bug)"
+        );
+    }
+}
+
+/// Relay wire-encoding determinism KAT (`ClientMessage` / `RelayMessage`). Runs
+/// natively and under `wasm-pack test --node`, both asserting the round-trip
+/// re-encoding equals the SAME committed golden — the cross-target byte-parity
+/// guard for the D5 shared relay wire types (ADR-057 Slice 3).
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn relay_wire_encoding_is_target_deterministic() {
+    assert_relay_wire_encoding_roundtrips();
 }

@@ -41,10 +41,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use zeroize::Zeroizing;
 
-use super::protocol::{ClientMessage, RelayMessage};
 use crate::backoff::ReconnectBackoff;
 use crate::error::TransportError;
 use crate::subscription::TransportSubscriptionMap;
+use scp_relay_client::{ClientMessage, RelayMessage};
 
 /// Keepalive interval: client sends PING every 30 seconds.
 const PING_INTERVAL: Duration = Duration::from_secs(30);

@@ -26,6 +26,7 @@ hex = "0.4"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 scp-protocol = { path = "../crates/scp-protocol", features = ["testing"] }
+scp-relay-client = { path = "../crates/scp-relay-client" }
 scp-transport = { path = "../crates/scp-transport" }
 scp-runtime = { path = "../crates/scp-runtime", features = ["testing"] }
 scp-event-log = { path = "../crates/scp-event-log" }

@@ -23,14 +23,14 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::native::error::code;
-use crate::native::protocol::{
-    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT, MIN_BLOB_TTL,
-    RelayMessage,
-};
 use crate::native::storage::BlobStorage;
 use crate::relay::rate_limit::{PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
+use scp_relay_client::code;
+use scp_relay_client::{
+    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT, MIN_BLOB_TTL,
+    RelayMessage,
+};
 
 // ---------------------------------------------------------------------------
 // Session-scoped types

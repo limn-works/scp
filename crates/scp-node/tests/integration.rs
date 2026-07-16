@@ -27,7 +27,7 @@ use scp_identity::{DidCache, DidMethod};
 use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach};
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_transport::native::protocol::{ClientMessage, RelayMessage};
+use scp_relay_client::{ClientMessage, RelayMessage};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Builds a WebSocket client request to the relay with the bridge secret

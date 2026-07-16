@@ -1,0 +1,29 @@
+[package]
+name = "scp-relay-client"
+version = "0.1.0-beta.2"
+description = "SCP relay wire protocol (ClientMessage/RelayMessage + MessagePack wire format) — wasm-safe leaf shared by the native relay and the in-browser client (ADR-057)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# scp-relay-client is a wasm-safe leaf: it depends ONLY on scp-protocol (for the
+# `serde_util::serde_bounded_bytes` helper) plus the pure serde/MessagePack
+# stack. It MUST NOT depend on scp-runtime / scp-identity / scp-clock / tokio /
+# openmls — the ADR-057 mechanical fence that keeps the crate compilable to
+# wasm32-unknown-unknown so the native relay and the in-browser client share one
+# wire-type definition.
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+rmp-serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The moved wire-format tests build MessagePack maps with unknown fields via
+# `rmpv::Value` (protocol.rs) to assert forward-compatible deserialization.
+rmpv = { workspace = true }
+
+[lints]
+workspace = true

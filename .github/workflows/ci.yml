@@ -370,7 +370,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - run: cargo check -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
+      - run: cargo check -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   wasm-test:
     needs: check-draft

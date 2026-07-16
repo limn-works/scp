@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use quinn::{ClientConfig, Endpoint};
-use scp_transport::native::protocol::{ClientMessage, RelayMessage};
+use scp_relay_client::{ClientMessage, RelayMessage};
 use scp_transport::quic::listener::SCP_ALPN;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 

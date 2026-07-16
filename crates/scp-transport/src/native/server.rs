@@ -46,17 +46,17 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::error::code;
-use super::protocol::{
-    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT, MIN_BLOB_TTL,
-    RelayMessage,
-};
 use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
 use crate::error::TransportError;
 use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
+use scp_relay_client::code;
+use scp_relay_client::{
+    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT, MIN_BLOB_TTL,
+    RelayMessage,
+};
 
 /// Whether a relay brokers BRIDGE traffic for symmetric-NAT fallback
 /// (spec §10.12.4).
