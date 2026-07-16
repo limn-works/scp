@@ -21,6 +21,7 @@ pub mod outlets;
 pub mod params;
 pub mod policy;
 pub mod promotion;
+pub mod pseudonym;
 pub mod roles;
 pub mod state_machine;
 pub mod templates;
