@@ -17,8 +17,6 @@ tests run without the compiled ``_scp_core`` extension.
 
 from __future__ import annotations
 
-import base64
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,30 +25,23 @@ from scp_sdk import SCP, discovery
 from scp_sdk.errors import ScpError
 
 
-def _b64url(obj: dict) -> str:
-    """Encode a dict as base64url without padding (mirrors _make_mock_token in test_trust.py)."""
-    return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
-
-
-@pytest.mark.asyncio
-async def test_discover_contexts_dispatches_and_wraps_results_as_dicts() -> None:
+def test_discover_contexts_dispatches_and_wraps_results_as_dicts() -> None:
     mock_bridge = MagicMock()
     mock_bridge.context_discover.return_value = [{"context_id": "abc", "name": "cooking"}]
 
     with patch("scp_sdk.discovery._bridge", return_value=mock_bridge):
-        result = await discovery.discover_contexts("did:dht:z6Mkexample")
+        result = discovery.discover_contexts("did:dht:z6Mkexample")
 
     assert result == [{"context_id": "abc", "name": "cooking"}]
     mock_bridge.context_discover.assert_called_once_with("did:dht:z6Mkexample")
 
 
-@pytest.mark.asyncio
-async def test_discover_contexts_returns_empty_list_when_nothing_advertised() -> None:
+def test_discover_contexts_returns_empty_list_when_nothing_advertised() -> None:
     mock_bridge = MagicMock()
     mock_bridge.context_discover.return_value = []
 
     with patch("scp_sdk.discovery._bridge", return_value=mock_bridge):
-        result = await discovery.discover_contexts("scp://example/ctx")
+        result = discovery.discover_contexts("scp://example/ctx")
 
     assert result == []
 
@@ -121,31 +112,21 @@ async def test_evaluate_trust_reraises_perm_3030_handle_affinity_error() -> None
     perm3030_msg = "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance"
 
     mock_bridge = MagicMock()
-    # UcanError must be a real exception class so `except bridge.UcanError`
-    # catches it and the `raise` re-raises it.
-    mock_bridge.UcanError = type("UcanError", (Exception,), {})
-    mock_bridge.ucan_validate.side_effect = mock_bridge.UcanError(perm3030_msg)
+    # evaluate_trust routes through mock_bridge.ucan_evaluate (ADR-059 typed path).
     # MagicMock already carries _mock_name, so the test seam in trust.py
     # routes through mock_bridge without any extra setup.
+    mock_bridge.ucan_evaluate.side_effect = Exception(perm3030_msg)
 
     scp = SCP.__new__(SCP)
     scp._native = MagicMock()
 
-    # Build a real JWT so _extract_first_capability_uri returns a non-None URI
-    # and the bridge is actually called. "token.a.b" has a 1-char payload that
-    # fails base64 decoding → returns None → the bridge is never reached and
-    # the 3030 side_effect never fires.
-    valid_token = (
-        f"{_b64url({'alg': 'EdDSA', 'typ': 'JWT', 'ucv': '0.10.0'})}."
-        f"{_b64url({'att': [{'with': 'scp:ctx:ctx-1/messages:read', 'can': 'messages/read'}]})}."
-        f"sig"
-    )
-
+    # evaluate_trust passes all tokens directly to ucan_evaluate (ADR-059),
+    # so any non-empty token string causes the side_effect to fire.
     with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
         with pytest.raises(Exception, match=r"\[SCP-PERM-3030\]"):
             await evaluate_trust(
                 scp,
                 subject_did="did:dht:z6Mkexample",
                 context_id="ctx-1",
-                capability_tokens=[valid_token],
+                capability_tokens=["header.payload.sig"],
             )
