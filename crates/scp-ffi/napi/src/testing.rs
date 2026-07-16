@@ -264,64 +264,28 @@ pub(crate) fn fullstack_join_from_welcome_on(
 }
 
 /// Per-bridge-instance implementation of [`fullstack_sync_sender_keys`].
+///
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): sender keys are no longer shuffled by an
+/// explicit provider `distribute` / `pickup`. The inviter's in-actor MLS add
+/// pushes its MLS-wrapped sender key onto the transport during
+/// `fullstack_add_member`, and the joiner ingests it through the REAL actor
+/// receive path during `fullstack_join_from_welcome` — so both nodes can
+/// encrypt and decrypt each other's traffic by the time they finish joining,
+/// with no manual key shuffle.
+///
+/// This call is retained as a no-op beyond the per-instance handle-affinity
+/// guard so existing harness scripts and the ADR-048 handle-affinity
+/// conformance test keep a stable API surface.
 pub(crate) fn fullstack_sync_sender_keys_on(
     bi: &NapiBridgeInstance,
     node_a: &NapiFullStackNode,
     node_b: &NapiFullStackNode,
-    context_id: String,
+    _context_id: String,
 ) -> napi::Result<()> {
     // Both nodes must have been minted by this bridge — mixing nodes
     // from two different `SCP` instances would cross-wire the shared
     // `KeyExchange` used for sender key distribution.
     crate::napi_check_handle!(&bi.core, node_a, node_b);
-    // ADR-056: key the shared KeyExchange under the canonical digest via the
-    // chokepoint, never the raw routing primitive.
-    let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    let did_a = node_a.inner.did.to_string();
-    let did_b = node_b.inner.did.to_string();
-
-    // A distributes to B, B distributes to A.
-    node_a
-        .inner
-        .crypto
-        .distribute_sender_key(&ctx_bytes, &did_b)
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Crypto {
-                message: format!("failed to distribute sender key from A to B: {e}"),
-                code: codes::CRYPTO_4056.to_owned(),
-            })
-        })?;
-    node_b
-        .inner
-        .crypto
-        .distribute_sender_key(&ctx_bytes, &did_a)
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Crypto {
-                message: format!("failed to distribute sender key from B to A: {e}"),
-                code: codes::CRYPTO_4057.to_owned(),
-            })
-        })?;
-
-    // Both pick up the other's key from the exchange.
-    node_a
-        .inner
-        .pickup_sender_keys(&context_id, &ctx_bytes)
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Crypto {
-                message: format!("failed to pick up sender keys for A: {e}"),
-                code: codes::CRYPTO_4058.to_owned(),
-            })
-        })?;
-    node_b
-        .inner
-        .pickup_sender_keys(&context_id, &ctx_bytes)
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Crypto {
-                message: format!("failed to pick up sender keys for B: {e}"),
-                code: codes::CRYPTO_4059.to_owned(),
-            })
-        })?;
-
     Ok(())
 }
 

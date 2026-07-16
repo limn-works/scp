@@ -1629,12 +1629,11 @@ mod tests {
             .expect("generate_sender_key under the digest");
 
         // The group MUST be present under the digest before expiry — proves this
-        // is a real destroy, not a phantom no-op against an empty slot.
-        let before = crypto
-            .export_crypto_state(&digest, Vec::new(), Vec::new())
-            .expect("export under the decoded digest must not error");
+        // is a real destroy, not a phantom no-op against an empty slot. Probe via
+        // the retained `context_crypto_present` (the serializing `export_crypto_
+        // state` twin is deleted post-ADR-049 PR-7).
         assert!(
-            !before.is_empty(),
+            crypto.context_crypto_present(&digest),
             "precondition: crypto state must be keyed under the digest before TTL expiry"
         );
 
@@ -1673,11 +1672,8 @@ mod tests {
         // resolved via the raw `SHA-256(id)` primitive, `destroy_mls_group`
         // would have addressed an unkeyed slot (a silent no-op) and the digest
         // slot would still be populated — this assertion FAILS in that case.
-        let after_digest = crypto
-            .export_crypto_state(&digest, Vec::new(), Vec::new())
-            .expect("export under the decoded digest must not error");
         assert!(
-            after_digest.is_empty(),
+            !crypto.context_crypto_present(&digest),
             "ADR-056 FAIL-OPEN: the MLS group SURVIVED under the digest after TTL \
              expiry — destruction keyed off the wrong slot (raw SHA-256(id) \
              instead of the chokepoint digest)"

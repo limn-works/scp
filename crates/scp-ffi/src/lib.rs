@@ -45,6 +45,22 @@
 // FFI bridge requires targeted unsafe for PyO3 interop. Each usage is documented.
 #![allow(unsafe_code)]
 
+// ADR-049 PR-7 (BLACK-P7-5) — build-time seam-leak guard. The `testing` feature
+// forwards `scp-core/testing` → `scp-runtime/testing`, which compiles the
+// test-only actor handlers (`InspectIncomingInner`, `HandleSenderKeyRequest`,
+// `LandSenderKeyResponse`) and the `signed_at_override` parity seam. These bypass
+// production gating and MUST NEVER reach a shipped artifact. `extension-module`
+// marks the production Python cdylib that maturin builds for the release wheel;
+// it is incompatible with test binaries, so a legitimate build never enables both
+// at once. This turns an accidental co-enable (a release wheel built with
+// `testing`) into a HARD compile error instead of a silently shipped back door.
+#[cfg(all(feature = "testing", feature = "extension-module"))]
+compile_error!(
+    "scp-ffi: the `testing` feature (test-only, gate-bypassing seams) must never be \
+     co-enabled with `extension-module` (the production Python cdylib). Build the \
+     release wheel WITHOUT `testing`. See ADR-049 PR-7 BLACK-P7-5."
+);
+
 pub mod context;
 pub mod economy;
 

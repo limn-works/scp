@@ -21,8 +21,10 @@
 //!
 //! # Helpers
 //!
-//! 1. [`build_encrypted_envelope`] — pure: access-key wrap, inner
-//!    envelope sign+pad, sender-key + MLS + outer-envelope seal.
+//! 1. [`build_inner_wire`] (pure: access-key wrap + inner-envelope
+//!    sign+pad) feeding [`build_encrypted_envelope_actor`] — the
+//!    ADR-049 PR-7 actor seal (sender-key + MLS + outer-envelope)
+//!    against an actor-owned `ContextCryptoState`.
 //! 2. [`enforce_send_economy`] — unified economy enforcement against
 //!    actor-owned governance state.
 //! 3. [`build_broadcast_envelope`] — broadcast-mode publish (pure).
@@ -80,7 +82,6 @@ use crate::context::actor::state::PerContextState;
 use crate::context::governance_helpers;
 use crate::context::state::{self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, emit_event_into};
 use crate::context::supervisor::MessageSigner;
-use crate::crypto::mls::provider::MlsCryptoProvider;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
 /// external subscribers (webhook dispatcher, SDK event streams).
@@ -95,28 +96,30 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
 
 // ---------------------------------------------------------------------------
-// 1. build_encrypted_envelope
+// 1. build_inner_wire (shared inner-envelope construction)
 // ---------------------------------------------------------------------------
+//
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001, C8): the `#[cfg(test)]` provider seal twin
+// `build_encrypted_envelope` is DELETED — its last callers (the send-path unit /
+// pipeline / agent-binding fixtures) now drive the production actor seal
+// `build_encrypted_envelope_actor` directly against an actor-owned
+// `ContextCryptoState`. The shared inner-envelope construction below
+// (`build_inner_wire`) is retained; the actor path bottoms out in it, so the
+// sealed wire stays byte-identical across the flip.
 
-/// Builds the encrypted envelope bytes for the send path.
+/// Builds and signs the [`InnerEnvelope`] for an application-data send (access-key
+/// wrap → inner-envelope stamp+sign), returning it alongside the canonical
+/// 32-byte context-id digest.
 ///
-/// Pure helper — no per-context state. Identical to the legacy
-/// [`crate::context::messaging_helpers_legacy::build_encrypted_envelope_legacy`]
-/// body; carried here so the actor-shape send path does not have to
-/// import from the legacy module.
-///
-/// # Routing
-///
-/// The outer envelope's cleartext `routing_id` is zeroed (`[0u8; 32]`) for
-/// application data: a single sealed blob fans out to N per-member pseudonym
-/// transport addresses, so no single per-recipient value belongs in the
-/// envelope, and embedding the relay-derivable `context_routing_id` would leak
-/// a correlator to the relay (§9.10.4). The receiver ignores this field for
-/// app-data, routing on the transport key instead.
+/// Shared by both seal seams — the deleted pre-PR-7 provider path and the
+/// ADR-049 PR-7 actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
+/// driven from the Class-C view in [`encrypt_and_send`], via
+/// [`build_encrypted_envelope_actor`]) — so both bottom out in ONE
+/// inner-envelope construction and the sealed wire stays byte-identical across
+/// the flip (the 16 golden byte-identity tests continue to hold).
 #[allow(clippy::too_many_arguments)]
-pub fn build_encrypted_envelope(
+fn build_inner_wire(
     clock: &Arc<dyn Clock>,
-    crypto: &Arc<MlsCryptoProvider>,
     context_id: &str,
     sender_did: &DID,
     payload: &[u8],
@@ -125,7 +128,7 @@ pub fn build_encrypted_envelope(
     sequence: u64,
     source_provenance: Option<&SourceContextInfo>,
     message_type: MessageType,
-) -> Result<Vec<u8>, ContextError> {
+) -> Result<(InnerEnvelope, [u8; 32]), ContextError> {
     // ADR-056: key the send-path crypto by the canonical digest (matches
     // `state.context_id` and the MLS group keyed at creation), not a re-hash
     // of the hex id.
@@ -189,24 +192,71 @@ pub fn build_encrypted_envelope(
     let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signer.key())
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    // §9.10.4 privacy: the cleartext outer-envelope `routing_id` is zeroed for
-    // application data. One sealed blob is fanned out to N per-member pseudonym
-    // transport addresses (seal-once-send-to-all), so there is no single
-    // per-recipient value to embed here. Embedding the relay-derivable
-    // `context_routing_id(context_id)` would let a curious relay read it off
-    // every pseudonym-addressed app-data blob and re-correlate all senders,
-    // defeating the pseudonym scheme. The all-zero value is a RESERVED/forbidden
-    // pseudonym (§9.10.4), so it cannot collide with a real routing ID, and the
-    // receiver never reads this field for app-data (it routes on the transport
-    // key and MLS-decrypts `encrypted_blob`), so receive is unaffected.
-    // `create_outer_envelope` enforces `routing_id.len() == 32`, which a
-    // 32-byte zero sentinel satisfies.
+    Ok((inner, context_id_bytes))
+}
+
+/// Builds and seals an application-data send through the ADR-049 PR-7 actor
+/// crypto state (Class-C `&mut ContextCryptoState`), the field-granular crypto
+/// sub-state reached via `ClassCMut::mode_mut()`. Byte-identical to the deleted
+/// pre-PR-7 provider seal path: it shares [`build_inner_wire`] and
+/// passes the same all-zero app-data `routing_id`, `DEFAULT_BLOB_TTL_SECS`, and
+/// the caller-supplied `aad_sequence` (the authoritative sender-layer AAD
+/// sequence — today `MembershipState::next_sequence_number`, matching what the
+/// provider's `seal` derived from the inner envelope). `local_did` is sourced
+/// from `deps.crypto.local_did()` so the sealed sender-layer AAD binds the same
+/// local identity the provider used.
+#[allow(clippy::too_many_arguments)]
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): widened from module-private so the relocated
+// app-data send-path callers (crypto/mls/provider.rs `encrypt_and_send`, plus the
+// agent_binding_pipeline_tests) can drive the PRODUCTION actor app-data seal — the
+// one that zeroes the outer `routing_id` (§9.10.4) — after the deleted provider
+// twin `build_encrypted_envelope` is removed. `pub(crate)` is the minimal correct
+// visibility: callers span `crypto/mls/provider.rs` and `context/`, so a
+// `pub(super)` / `pub(in crate::context)` cap would wrongly forbid the crypto/mls
+// caller (E0624). It is a purely internal crate seam with no FFI/SDK surface, so it
+// carries no cross-layer bridge-export requirement. `redundant_pub_crate` is a
+// false positive here for the same reason as `Supervisor::build_actor_deps`: the
+// enclosing module is `pub(crate)`, but the item is genuinely reached crate-wide.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn build_encrypted_envelope_actor(
+    clock: &Arc<dyn Clock>,
+    crypto_state: &mut crate::context::actor::state::ContextCryptoState,
+    local_did: &str,
+    context_id: &str,
+    sender_did: &DID,
+    payload: &[u8],
+    signer: MessageSigner<'_>,
+    recipients_data: &std::collections::HashMap<String, AccessKey>,
+    aad_sequence: u64,
+    source_provenance: Option<&SourceContextInfo>,
+    message_type: MessageType,
+) -> Result<Vec<u8>, ContextError> {
+    let (inner, context_id_bytes) = build_inner_wire(
+        clock,
+        context_id,
+        sender_did,
+        payload,
+        signer,
+        recipients_data,
+        aad_sequence,
+        source_provenance,
+        message_type,
+    )?;
+    // §9.10.4 privacy: app-data outer `routing_id` is the 32-byte zero sentinel
+    // — one sealed blob fans out to N per-member pseudonym transport addresses,
+    // so no single per-recipient value belongs here, and embedding the
+    // relay-derivable `context_routing_id` would leak a correlator to the relay.
+    // The all-zero value is a RESERVED/forbidden pseudonym that cannot collide
+    // with a real routing ID; the receiver routes on the transport key and never
+    // reads this field for app-data.
     let routing_id = [0u8; 32];
-    crypto.seal(
+    crypto_state.seal(
         &context_id_bytes,
+        local_did,
         &inner,
         &routing_id,
         DEFAULT_BLOB_TTL_SECS,
+        aad_sequence,
     )
 }
 
@@ -1191,20 +1241,34 @@ pub async fn send_message(
     };
 
     // Phase 2: encrypt + send.
-    let phase2_result = encrypt_and_send(
-        deps,
-        broadcast_envelope,
-        signer,
-        &context_id,
-        sender_did,
-        payload,
-        &recipients_data,
-        sequence,
-        source_provenance,
-        &send_routing_ids,
-        MessageType::Content,
-    )
-    .await;
+    //
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor's field-granular
+    // Class-C `&mut ContextCryptoState` (reached via `mode_mut().crypto_mut()`).
+    // Broadcast contexts have no crypto sub-state, so `crypto_mut()` is `None` and
+    // the broadcast branch of `encrypt_and_send` builds the wire without it. The
+    // `&mut` view is scoped to just this call so `cell` is free for the abort /
+    // finalize arms below (NLL). Holding a `&mut ContextCryptoState` across the
+    // fan-out await is `Send` (mirrors `handle_deliver_incoming`'s `class_c_view`
+    // held across its timeout await).
+    let phase2_result = {
+        let mut view = cell.class_c_view();
+        let crypto_state = view.mode_mut().crypto_mut();
+        encrypt_and_send(
+            deps,
+            crypto_state,
+            broadcast_envelope,
+            signer,
+            &context_id,
+            sender_did,
+            payload,
+            &recipients_data,
+            sequence,
+            source_provenance,
+            &send_routing_ids,
+            MessageType::Content,
+        )
+        .await
+    };
     if let Err(e) = phase2_result {
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // (via `&*cell`) BEFORE the existing escrow-void + ticket rollback. If the
@@ -1389,8 +1453,18 @@ pub async fn deliver_incoming(
     drop(local_dids);
 
     // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
-    let Some(opened_envelope) =
-        decrypt_and_dispatch(deps, context_id, &context_id_bytes, encrypted_blob)?
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's field-granular
+    // Class-C `&mut ContextCryptoState` (`mode_mut().crypto_mut()`). Broadcast
+    // contexts carry no crypto sub-state (`None`), matching the retained provider
+    // fallback; the `&mut` view is released as soon as the sync call returns, so
+    // `view` is free for the dispatch cascade below.
+    let Some(opened_envelope) = decrypt_and_dispatch(
+        deps,
+        view.mode_mut().crypto_mut(),
+        context_id,
+        &context_id_bytes,
+        encrypted_blob,
+    )?
     else {
         // MLS Commit / Proposal — processed internally by the crypto layer,
         // no inner envelope to classify.
@@ -1576,6 +1650,7 @@ fn deliver_checkpoint_message(
 #[allow(clippy::too_many_arguments)]
 pub async fn encrypt_and_send(
     deps: &ActorDeps,
+    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     broadcast_envelope: Option<BroadcastEnvelope>,
     signer: MessageSigner<'_>,
     context_id: &str,
@@ -1597,9 +1672,25 @@ pub async fn encrypt_and_send(
         let encrypt_start = std::time::Instant::now();
         // The key and stamped persona travel together in the one `MessageSigner`
         // straight into the single stamp+sign site, so they cannot diverge.
-        let result = build_encrypted_envelope(
+        //
+        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor's OWNED
+        // field-granular Class-C `&mut ContextCryptoState`
+        // ([`build_encrypted_envelope_actor`]) — every non-broadcast send seam
+        // (`send_message` / `send_checkpoint` / `send_heartbeat`) now supplies it.
+        // The provider `build_encrypted_envelope` twin is deleted. This else-branch
+        // is only reached for a non-broadcast encrypted send (a broadcast send took
+        // the pre-built-envelope branch above), so a `None` crypto state means a
+        // non-broadcast context with no MLS group — fail closed.
+        let cs = crypto_state.ok_or_else(|| {
+            ContextError::CryptoFailed(
+                "no MLS crypto state for encrypted send (non-broadcast context has no group)"
+                    .to_string(),
+            )
+        })?;
+        let result = build_encrypted_envelope_actor(
             &deps.clock,
-            &deps.crypto,
+            cs,
+            deps.crypto.local_did(),
             context_id,
             sender_did,
             payload,
@@ -1677,70 +1768,91 @@ pub async fn encrypt_and_send(
 /// every fan-out send fails. Callers that publish checkpoints opportunistically
 /// (the periodic-broadcast path in [`finalize_send`]) treat any error as
 /// best-effort and MUST NOT roll back the originating send.
-pub fn send_checkpoint<'d, 'c, 's, 'k, 'cp>(
-    deps: &'d ActorDeps,
-    state: &PerContextState,
-    context_id: &'c str,
-    sender_did: &'s DID,
-    signing_key: &'k ed25519_dalek::SigningKey,
-    checkpoint: &'cp scp_event_log::checkpoint::ConsistencyCheckpoint,
-) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c, 's, 'k, 'cp> {
-    // SYNC PRELUDE (ADR-049 Decision 7 Send-discipline): read `&PerContextState`
-    // (which is `!Sync`) here and produce OWNED routing data, so the returned
-    // future does NOT capture the `state` lifetime and stays `Send` (mirrors
-    // `persist_state_best_effort`). `state` is deliberately absent from `use<>`.
+// ADR-049 PR-7 (inquisitor item 8): narrowed `pub` → `pub(crate)`. The only
+// callers of this FREE function are in-crate actor handlers (the reconnection
+// driver in `handlers/messaging.rs` and `finalize_send` here); cross-crate code
+// reaches checkpoint sending through the distinct `Supervisor::send_*` methods,
+// never this helper. `pub(crate)` is the minimal correct visibility, and it keeps
+// this internal seam out of the source-text `check-cross-layer` gate at the root
+// (no FFI/SDK surface, no bridge-export obligation) with no PR-body exemption.
+// `redundant_pub_crate` is a false positive: the enclosing `messaging_helpers`
+// module is already `pub(crate)`, but this item is genuinely reached crate-wide
+// (same rationale as `build_encrypted_envelope_actor` above).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn send_checkpoint(
+    deps: &ActorDeps,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    context_id: &str,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    checkpoint: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+) -> Result<(), ContextError> {
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): this is now a plain `async fn` taking
+    // `&mut ClassSCell` — `&mut PerContextState` is `Send`, so the crypto view can
+    // be held across the fan-out await and the former sync-prelude gymnastics (a
+    // `&PerContextState`-shared prelude producing owned routing data because
+    // `&PerContextState` is `!Send`) are gone.
     //
-    // Routing parallels the application-data send path (§9.10.4): broadcast
-    // contexts address the derivable broadcast RID; encrypted contexts fan out
-    // to each known peer pseudonym. An empty encrypted routing set (no peers
-    // known yet) is a legitimate no-op — there is simply nobody to inform.
-    let (broadcast_envelope, recipients_data, routing_ids) = if state.broadcast_context.is_some() {
-        let broadcast_rid = scp_protocol::context::broadcast_routing_id(context_id);
-        // Broadcast contexts carry the checkpoint inside an encrypted inner
-        // envelope addressed to the broadcast RID (the checkpoint exchange is
-        // an MLS-management-style message, not author-keyed broadcast content).
-        (None, std::collections::HashMap::new(), vec![broadcast_rid])
+    // Routing (shared reads via `cell` `Deref`) into OWNED data, parallel to the
+    // application-data send path (§9.10.4): broadcast contexts address the
+    // derivable broadcast RID; encrypted contexts fan out to each known peer
+    // pseudonym. An empty encrypted routing set is a legitimate no-op.
+    let (recipients_data, routing_ids) = if cell.broadcast_context.is_some() {
+        (
+            std::collections::HashMap::new(),
+            vec![scp_protocol::context::broadcast_routing_id(context_id)],
+        )
     } else {
-        let peer_pseudonyms: Vec<[u8; 32]> = state
+        let peer_pseudonyms: Vec<[u8; 32]> = cell
             .routing
             .peer_registry()
             .map(|reg| reg.values().copied().collect())
             .unwrap_or_default();
         (
-            None,
-            state.access.access_key_store.get_all(context_id),
+            cell.access.access_key_store.get_all(context_id),
             peer_pseudonyms,
         )
     };
 
-    async move {
-        let message = CheckpointMessage {
-            tag: CHECKPOINT_PAYLOAD_TAG.to_owned(),
-            checkpoint: checkpoint.clone(),
-        };
-        let payload = rmp_serde::to_vec_named(&message).map_err(|e| {
-            ContextError::CryptoFailed(format!("checkpoint message serialization: {e}"))
-        })?;
+    let message = CheckpointMessage {
+        tag: CHECKPOINT_PAYLOAD_TAG.to_owned(),
+        checkpoint: checkpoint.clone(),
+    };
+    let payload = rmp_serde::to_vec_named(&message).map_err(|e| {
+        ContextError::CryptoFailed(format!("checkpoint message serialization: {e}"))
+    })?;
 
-        encrypt_and_send(
-            deps,
-            broadcast_envelope,
-            // Consistency checkpoints are device/human-originated signals, not
-            // agent-autonomous messages — sign under `#active` (ADR-039).
-            MessageSigner::Active(signing_key),
-            context_id,
-            sender_did,
-            &payload,
-            &recipients_data,
-            // Checkpoints do not consume the application content sequence; the
-            // receive path dispatches them before the sequence tracker.
-            0,
-            None,
-            &routing_ids,
-            MessageType::ConsistencyCheckpoint,
-        )
-        .await
-    }
+    // Seal through the actor's field-granular Class-C `&mut ContextCryptoState`.
+    let mut view = cell.class_c_view();
+    let Some(crypto_state) = view.mode_mut().crypto_mut() else {
+        // Broadcast context: no MLS `ContextCryptoState` to seal with. This is
+        // DELIVERY-IDENTICAL to the pre-PR-7 provider path (which errored "no MLS
+        // group" and was swallowed best-effort → nothing delivered); we simply
+        // drop the spurious warn. Whether broadcast-context checkpoints SHOULD
+        // deliver via MLS is a pre-existing gap — broadcast checkpoint
+        // MLS-delivery: tracked as a separate §9.9.3 finding (a broadcast-native
+        // redesign, outside this ownership move).
+        return Ok(());
+    };
+    encrypt_and_send(
+        deps,
+        Some(crypto_state),
+        None,
+        // Consistency checkpoints are device/human-originated signals, not
+        // agent-autonomous messages — sign under `#active` (ADR-039).
+        MessageSigner::Active(signing_key),
+        context_id,
+        sender_did,
+        &payload,
+        &recipients_data,
+        // Checkpoints do not consume the application content sequence; the
+        // receive path dispatches them before the sequence tracker.
+        0,
+        None,
+        &routing_ids,
+        MessageType::ConsistencyCheckpoint,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1776,102 +1888,101 @@ pub fn send_checkpoint<'d, 'c, 's, 'k, 'cp>(
 /// any error as best-effort (a failed heartbeat is itself a suppression
 /// signal, surfaced separately by the receiver's gap detection) and MUST NOT
 /// tear down the subscription on a single failure.
-pub fn send_heartbeat<'d, 'c, 's, 'k>(
-    deps: &'d ActorDeps,
-    state: &PerContextState,
-    context_id: &'c str,
-    sender_did: &'s DID,
-    signing_key: &'k ed25519_dalek::SigningKey,
-) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c, 's, 'k> {
-    // SYNC PRELUDE (ADR-049 Decision 7 Send-discipline): the send-authorization
-    // gates and routing reads touch `&PerContextState` (`!Sync`) here and produce
-    // an OWNED `Result`, so the returned future does NOT capture the `state`
-    // lifetime and stays `Send` (mirrors `persist_state_best_effort` /
-    // `send_checkpoint`). `state` is deliberately absent from `use<>`.
+// ADR-049 PR-7 (inquisitor item 8): narrowed `pub` → `pub(crate)`. Same rationale
+// as `send_checkpoint` above — the only callers of this FREE function are in-crate
+// actor handlers (`handle_send_heartbeat`); cross-crate code reaches heartbeat
+// sending through the distinct `Supervisor::send_heartbeat` method. `pub(crate)`
+// is the minimal correct visibility and keeps the seam out of the source-text
+// `check-cross-layer` gate with no PR-body exemption. `redundant_pub_crate` is a
+// false positive (the enclosing module is already `pub(crate)`, the item is
+// reached crate-wide).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn send_heartbeat(
+    deps: &ActorDeps,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    context_id: &str,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<(), ContextError> {
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): plain `async fn` taking `&mut ClassSCell`
+    // (Send), so the seal runs on the actor's crypto view held across the fan-out
+    // await — the former sync-prelude (needed only because `&PerContextState` is
+    // `!Send`) is gone.
     //
     // Send-authorization gates, mirroring `send_message` (§9.9.2 routes a
     // heartbeat through the same write path, so it must clear the same write
     // gates). Without these a member whose `MessagesWrite` capability was
-    // suspended or revoked could keep asserting liveness on the write path,
-    // and a heartbeat racing a context close could slip through after the
-    // context is no longer active.
-    type Prep = Result<
-        (
-            Option<BroadcastEnvelope>,
-            std::collections::HashMap<String, AccessKey>,
-            Vec<[u8; 32]>,
-        ),
-        ContextError,
-    >;
-    let prep: Prep = (|| {
-        // 1. The context must be active. A send racing context-close is rejected.
-        state::require_active(&state.handle)?;
-        // 2. Capability check (broadcast contexts have no per-member write
-        //    capability and address the public broadcast routing ID, exactly as
-        //    in `send_message`). A suspended capability surfaces a distinct
-        //    message so the scheduler's best-effort log is actionable.
-        if state.broadcast_context.is_none()
-            && !state
-                .role_state
-                .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
-        {
-            let is_suspended = state
-                .role_state
-                .suspended_for(sender_did.as_ref())
-                .is_some_and(|s| s.contains(&Capability::MessagesWrite));
-            let msg = if is_suspended {
-                format!("member {sender_did} write access has been revoked")
-            } else {
-                format!("member {sender_did} does not have messages:write capability")
-            };
-            return Err(ContextError::PermissionDenied(msg));
-        }
-
-        // Routing parallels the application-data and checkpoint send paths
-        // (§9.10.4): broadcast contexts address the derivable broadcast RID;
-        // encrypted contexts fan out to each known peer pseudonym. An empty
-        // encrypted routing set (no peers known yet) is a legitimate no-op —
-        // there is simply nobody to signal liveness to.
-        Ok(if state.broadcast_context.is_some() {
-            let broadcast_rid = scp_protocol::context::broadcast_routing_id(context_id);
-            (None, std::collections::HashMap::new(), vec![broadcast_rid])
+    // suspended or revoked could keep asserting liveness on the write path, and a
+    // heartbeat racing a context close could slip through after the context is no
+    // longer active. Shared reads via `cell` `Deref`.
+    state::require_active(&cell.handle)?;
+    if cell.broadcast_context.is_none()
+        && !cell
+            .role_state
+            .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
+    {
+        let is_suspended = cell
+            .role_state
+            .suspended_for(sender_did.as_ref())
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+        let msg = if is_suspended {
+            format!("member {sender_did} write access has been revoked")
         } else {
-            let peer_pseudonyms: Vec<[u8; 32]> = state
-                .routing
-                .peer_registry()
-                .map(|reg| reg.values().copied().collect())
-                .unwrap_or_default();
-            (
-                None,
-                state.access.access_key_store.get_all(context_id),
-                peer_pseudonyms,
-            )
-        })
-    })();
-
-    async move {
-        let (broadcast_envelope, recipients_data, routing_ids) = prep?;
-        encrypt_and_send(
-            deps,
-            broadcast_envelope,
-            // Heartbeats are device/human-originated liveness beacons, not
-            // agent-autonomous messages — sign under `#active` (ADR-039).
-            MessageSigner::Active(signing_key),
-            context_id,
-            sender_did,
-            // Heartbeats carry NO user content — the empty payload is the whole
-            // point: a minimal liveness beacon, padded by the envelope machinery.
-            &[],
-            &recipients_data,
-            // Heartbeats do not consume the application content sequence; the
-            // receive path classifies them before the sequence tracker.
-            0,
-            None,
-            &routing_ids,
-            MessageType::Heartbeat,
-        )
-        .await
+            format!("member {sender_did} does not have messages:write capability")
+        };
+        return Err(ContextError::PermissionDenied(msg));
     }
+
+    // Routing parallels the application-data and checkpoint send paths (§9.10.4):
+    // broadcast contexts address the derivable broadcast RID; encrypted contexts
+    // fan out to each known peer pseudonym. An empty encrypted routing set is a
+    // legitimate no-op.
+    let (recipients_data, routing_ids) = if cell.broadcast_context.is_some() {
+        (
+            std::collections::HashMap::new(),
+            vec![scp_protocol::context::broadcast_routing_id(context_id)],
+        )
+    } else {
+        let peer_pseudonyms: Vec<[u8; 32]> = cell
+            .routing
+            .peer_registry()
+            .map(|reg| reg.values().copied().collect())
+            .unwrap_or_default();
+        (
+            cell.access.access_key_store.get_all(context_id),
+            peer_pseudonyms,
+        )
+    };
+
+    // Seal through the actor's field-granular Class-C `&mut ContextCryptoState`.
+    let mut view = cell.class_c_view();
+    let Some(crypto_state) = view.mode_mut().crypto_mut() else {
+        // Broadcast context: no MLS `ContextCryptoState`. Delivery-identical no-op
+        // (see `send_checkpoint`). Broadcast checkpoint MLS-delivery: tracked as a
+        // separate §9.9.3 finding.
+        return Ok(());
+    };
+    encrypt_and_send(
+        deps,
+        Some(crypto_state),
+        None,
+        // Heartbeats are device/human-originated liveness beacons, not
+        // agent-autonomous messages — sign under `#active` (ADR-039).
+        MessageSigner::Active(signing_key),
+        context_id,
+        sender_did,
+        // Heartbeats carry NO user content — the empty payload is the whole point:
+        // a minimal liveness beacon, padded by the envelope machinery.
+        &[],
+        &recipients_data,
+        // Heartbeats do not consume the application content sequence; the receive
+        // path classifies them before the sequence tracker.
+        0,
+        None,
+        &routing_ids,
+        MessageType::Heartbeat,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,7 +2400,9 @@ async fn create_and_broadcast_checkpoint_if_due(
             &*deps.event_log,
         )
     };
-    // `send_checkpoint` takes a SHARED `&PerContextState`, reachable via `&*cell`.
+    // ADR-049 PR-7: `send_checkpoint` now takes `&mut ClassSCell` (Send) and seals
+    // on the actor crypto view; `cell` is free here (the `due_checkpoint` view
+    // borrow above ended) and this is its last use.
     if let Some(checkpoint) = due_checkpoint
         && let Err(e) = send_checkpoint(deps, cell, context_id, sender_did, sk, &checkpoint).await
     {
@@ -2396,11 +2509,16 @@ pub fn build_snapshot_for_persist(
     // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
     // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
     // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
-    // durable-blob params. The provider floor mirrors are deleted.
-    match deps.crypto.export_crypto_state(
-        &ctx_id_bytes,
+    // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
+    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
+    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
+    // sequence is read from `state.send_tracker` inside the twin.
+    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    match state.export_crypto_state(
         deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
         deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        wrapping_public_key,
+        &*wrapping_secret_key,
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
@@ -2891,14 +3009,30 @@ pub(in crate::context) fn stream_reservations_snapshot(
 /// messages.
 pub fn decrypt_and_dispatch(
     deps: &ActorDeps,
+    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     encrypted_blob: &[u8],
 ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
     let decrypt_start = std::time::Instant::now();
-    let open_result = deps
-        .crypto
-        .open(context_id_bytes, context_id, encrypted_blob)?;
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
+    // field-granular Class-C `&mut ContextCryptoState` (driven from
+    // `deliver_incoming`'s `ClassCMut` view) — byte-identical to the deleted
+    // provider `open` twin (the 16 golden tests hold). `process_incoming_sender_key`
+    // below stays on the provider (it HPKE-opens with the NODE-RESIDENT wrapping
+    // secret — receive-side, NOT in the delete set); the sender-key INSTALL,
+    // however, now writes to the ACTOR-owned `cs.sender_key_store.set_unchecked`
+    // (the provider store is empty on a taken context — see the KeyResponse arm
+    // below), and `local_did` is likewise retained. A `None` crypto
+    // state means a context with no MLS group (a broadcast context, which never
+    // reaches this MLS-decrypt path — its receive path is author-signed) — fail
+    // closed, matching the deleted provider `open`'s "no MLS group" error.
+    let cs = crypto_state.ok_or_else(|| {
+        ContextError::CryptoFailed(
+            "no MLS crypto state for decrypt (context has no group)".to_string(),
+        )
+    })?;
+    let open_result = cs.open(&*deps.clock, context_id_bytes, context_id, encrypted_blob)?;
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {
@@ -2936,24 +3070,110 @@ pub fn decrypt_and_dispatch(
             payload,
         } => {
             tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
-            // ADR-049 PR-6 (read-authority switch): GATE-BEFORE-INSTALL. The
-            // provider only HPKE-opens + DID-authenticates the key; the
-            // authoritative Class-M registry enforces epoch monotonicity + the
-            // poisoning ceiling, FAIL-CLOSED, BEFORE the key is installed. A
-            // regressing/poisoned remote epoch is rejected with the key NEVER
-            // reaching the sender-key store (D1 close, fail-safe ordering).
-            let (sender_key, epoch) =
-                deps.crypto
-                    .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
-            deps.supervisor.check_and_advance_sender_epoch(
-                context_id_bytes,
-                &sender_did,
-                epoch,
-                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
-            )?;
-            deps.crypto
-                .set_sender_key_unchecked(context_id_bytes, &sender_did, sender_key);
-            Ok(None)
+            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2: a management payload is a
+            // `SenderKeyDistributionMessage`. Branch on its variant — a PULL
+            // REQUEST is ANSWERED on the actor's OWNED crypto state (the answer
+            // HPKE-seals to the requester's EPHEMERAL wrapping key, so no signing
+            // key is needed — a clean receive-side answer); a RESPONSE is the
+            // push-distribution install path.
+            let dist = scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+                &payload,
+            )
+            .map_err(|e| ContextError::CryptoFailed(format!("distribution message decode: {e}")))?;
+            match dist {
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyRequest(
+                    request,
+                ) => {
+                    // BLACK-P7-1 (identity binding): the actor answer gates BOTH
+                    // membership (§9.16.6 Mitigation-1) and the block list on
+                    // `request.requester_did` — a PAYLOAD field. It MUST equal the
+                    // MLS-authenticated `sender_did`, or a member could request
+                    // under a DIFFERENT member's identity: e.g. a BLOCKED member
+                    // naming an unblocked one to pass the membership + block gates,
+                    // then receiving the sender key sealed to their OWN ephemeral
+                    // wrapping key. Bind the two here, before answering. The
+                    // requester public key the request signature is verified against
+                    // is ALSO resolved from `sender_did` (below), so this makes the
+                    // gated DID, the authenticated DID, and the signing key one and
+                    // the same.
+                    if request.requester_did != sender_did {
+                        return Err(ContextError::CryptoFailed(
+                            "sender-key request requester_did does not match the \
+                             MLS-authenticated sender"
+                                .to_string(),
+                        ));
+                    }
+                    // The request's Ed25519 signature is by the requester
+                    // (== MLS-authenticated `sender_did`) over its ephemeral
+                    // wrapping key. MLS already authenticated `sender_did`; the
+                    // request signature additionally binds the ephemeral key, so
+                    // resolve the requester's Active verification key to check it.
+                    let requester_pk =
+                        (deps.key_resolver)(&DID(sender_did.clone()), SigningKeyId::Active)
+                            .ok_or_else(|| {
+                                ContextError::CryptoFailed(format!(
+                                    "cannot resolve requester public key for {sender_did}"
+                                ))
+                            })?;
+                    // The actor answer takes the request as bytes (byte-identical
+                    // to the retained oracle); re-serialize the parsed request.
+                    let request_bytes = rmp_serde::to_vec_named(&request).map_err(|e| {
+                        ContextError::CryptoFailed(format!("request re-serialization: {e}"))
+                    })?;
+                    // No per-context sender-key block list is resident on the actor
+                    // (the blocking-flow wiring into the actor answer path is a
+                    // forward-only follow-up, tracked in #2146); the §9.16.6
+                    // Mitigation-1 membership gate on the MLS group tree is the live
+                    // Sybil defense.
+                    let blocked = std::collections::HashSet::new();
+                    let now_secs = deps.clock.now_secs();
+                    if let Some(sealed) = cs.handle_sender_key_request(
+                        context_id_bytes,
+                        deps.crypto.local_did(),
+                        now_secs,
+                        &request_bytes,
+                        requester_pk.as_bytes(),
+                        &blocked,
+                    )? {
+                        // Queue the ephemeral-sealed answer for MLS-wrap + transmit
+                        // by `drain_and_deliver_sender_keys` after the Class-C view
+                        // drops (in `handle_deliver_incoming`). A blocked requester
+                        // returns `None` (§9.16.2 silent drop) — nothing queued.
+                        cs.pending_distributions.push((sender_did.clone(), sealed));
+                    }
+                    Ok(None)
+                }
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(_) => {
+                    // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
+                    // fix. `process_incoming_sender_key` HPKE-opens with the
+                    // NODE-RESIDENT wrapping secret (unaffected by the crypto move)
+                    // and returns the authenticated `(key, epoch)`; the
+                    // authoritative Class-M registry gates epoch monotonicity + the
+                    // poisoning ceiling FAIL-CLOSED BEFORE install; the install then
+                    // writes to the ACTOR's OWNED `cs.sender_key_store`. The provider
+                    // store is EMPTY on a taken (actor-owned) context, so the former
+                    // `deps.crypto.set_sender_key_unchecked` was a silent no-op — the
+                    // latent bug this fixes (D1 close, fail-safe ordering preserved).
+                    let (sender_key, epoch) = deps.crypto.process_incoming_sender_key(
+                        context_id_bytes,
+                        &sender_did,
+                        &payload,
+                    )?;
+                    deps.supervisor.check_and_advance_sender_epoch(
+                        context_id_bytes,
+                        &sender_did,
+                        epoch,
+                        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+                    )?;
+                    let ctx_id_hex = hex::encode(context_id_bytes);
+                    cs.sender_key_store
+                        .set_unchecked(&ctx_id_hex, &sender_did, sender_key);
+                    Ok(None)
+                }
+                other => Err(ContextError::CryptoFailed(format!(
+                    "unexpected sender-key distribution variant on the receive path: {other:?}"
+                ))),
+            }
         }
     }
 }
@@ -2961,17 +3181,23 @@ pub fn decrypt_and_dispatch(
 /// ADR-049 PR-6 (read-authority switch): advance the LOCAL sender-key epoch
 /// floor in the authoritative Class-M registry after a local rotation.
 ///
-/// Call AFTER `deps.crypto.rotate_sender_key(ctx)` succeeds. `rotate_sender_key`
-/// increments the local epoch scalar (`state.sender_key_epoch`, which
-/// `set_unchecked` does NOT record in the store's per-sender epoch map), so the
-/// local floor is read via
+/// Call AFTER a local `rotate_sender_key` succeeds, passing the post-rotation
+/// local epoch as `epoch`. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the epoch is now a
+/// CALLER-SUPPLIED parameter rather than re-read here, so flipped sites source it
+/// from the actor's `PerContextState::local_sender_key_epoch()` (read inside the
+/// same `commit_class_s_keep` closure that durably persisted the bump) and
+/// not-yet-flipped sites source it from the retained
 /// [`MlsCryptoProvider::local_sender_key_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::local_sender_key_epoch)
-/// and advanced in the supervisor floor registry keyed by the provider's local
-/// DID. FAIL-CLOSED: a non-monotonic / overshooting local advance surfaces as a
-/// [`ContextError`] (via `From<FloorAdvanceError>`) that the caller `?`-propagates,
-/// aborting the enclosing operation. In practice a local rotation advances the
-/// scalar monotonically by +1, so this never fires; propagating it is the
-/// fail-closed default rather than a rollback the caller must orchestrate.
+/// — the read-authority follows the write-authority coherently.
+///
+/// The floor is advanced in the supervisor registry keyed by the local DID.
+/// FAIL-CLOSED: a non-monotonic / overshooting local advance surfaces as a
+/// [`ContextError`] (via `From<FloorAdvanceError>`) that the caller `?`-propagates
+/// — this registry floor raise is the never-regressing anti-replay backstop, so
+/// it is NEVER swallowed even though the sender-key rotation + distribution around
+/// it is best-effort (M23). In practice a local rotation advances the scalar
+/// monotonically by +1, so this never fires; propagating it is the fail-closed
+/// default rather than a rollback the caller must orchestrate.
 ///
 /// # Errors
 ///
@@ -2980,8 +3206,8 @@ pub fn decrypt_and_dispatch(
 pub(in crate::context) fn mirror_forward_local_sender_epoch(
     deps: &ActorDeps,
     ctx: &[u8; 32],
+    epoch: u64,
 ) -> Result<(), ContextError> {
-    let epoch = deps.crypto.local_sender_key_epoch(ctx);
     let local_did = deps.crypto.local_did();
     deps.supervisor.check_and_advance_sender_epoch(
         ctx,

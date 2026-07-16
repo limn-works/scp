@@ -1424,6 +1424,24 @@ pub struct Supervisor {
     /// `send_modify` call (zero overhead, no behavior change).
     #[cfg(feature = "testing")]
     pub(in crate::context::supervisor) kp_watchdog_processed_tx: tokio::sync::watch::Sender<u64>,
+    /// One-shot test seam: when set, the NEXT spawn-from-Welcome step-3b crypto
+    /// durability check (ADR-049 PR-7 / SCP-CRYPTOMOVE-001) treats the ACTOR
+    /// [`PerContextState::export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state)
+    /// as NON-durable and clears the flag.
+    ///
+    /// The crypto move relocated `export_crypto_state` off the provider onto the
+    /// seeded actor `state`, and the spawn durability check now reads
+    /// `state.export_crypto_state(...)`; the former provider `arm_export_failure_once`
+    /// seam no longer sits on that path. This supervisor-resident seam lets the
+    /// spawn-from-Welcome durability fail-closed branch be driven end-to-end (the
+    /// real actor export always yields a durable blob for a just-installed group,
+    /// so the branch is otherwise structurally unreachable). Armed pre-spawn via
+    /// [`Self::arm_welcome_export_failure_once`]; consulted (and cleared) inside
+    /// `spawn_actor_from_welcome`. Gated so production builds carry neither the
+    /// field nor the branch.
+    #[cfg(any(test, feature = "testing"))]
+    pub(in crate::context::supervisor) force_welcome_export_failure_once:
+        std::sync::atomic::AtomicBool,
     /// Supervisor-level divergence repair journal (spec §6.2.4 "Dual event-log
     /// recording"): the fallback witnesses recorded when a `NeedsRepair` side is
     /// UNREACHABLE and its signed [`SagaDivergenceRepairRecord`] could not be
@@ -1848,6 +1866,8 @@ impl Supervisor {
             // current value.
             #[cfg(feature = "testing")]
             kp_watchdog_processed_tx: tokio::sync::watch::channel(0u64).0,
+            #[cfg(any(test, feature = "testing"))]
+            force_welcome_export_failure_once: std::sync::atomic::AtomicBool::new(false),
             saga_repair_records: DashMap::new(),
             // ADR-049 commit 12 — providers lifted from
             // ContextManager. Populated by `with_providers`.
@@ -1881,6 +1901,20 @@ impl Supervisor {
                 OriginAdmissionTracker::new(),
             )),
         }
+    }
+
+    /// Arms the one-shot [`Self::force_welcome_export_failure_once`] seam: the
+    /// NEXT spawn-from-Welcome step-3b crypto durability check treats the actor
+    /// export as NON-durable and clears the flag (ADR-049 PR-7 /
+    /// SCP-CRYPTOMOVE-001).
+    ///
+    /// Test-only (see the field docs) — drives the spawn-from-Welcome
+    /// crypto-durability fail-closed branch, which the real actor export cannot
+    /// otherwise reach (an installed group always exports a durable blob).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn arm_welcome_export_failure_once(&self) {
+        self.force_welcome_export_failure_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Test-only constructor used by saga + spawn unit tests that never
@@ -2768,8 +2802,17 @@ impl Supervisor {
     // Non-test callers land when `dispatch_lifecycle_direct` switches to
     // actor-shape (storage-foundation Step 5); until then this is reached
     // only from the supervisor + actor test fixtures.
+    // `pub(crate)` (widened from `pub(in crate::context)`): the shared two-party
+    // test fixture in `crate::crypto::mls::two_party_test_support` drives a
+    // provider-resident join (`ConfirmConsume` → `install_joined_group`) through
+    // Bob's `key_package_store` handle, reached via these deps.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(in crate::context) async fn build_actor_deps(
+    // `redundant_pub_crate` is a false positive here: this method is defined in a
+    // private module but is genuinely reached crate-wide (the shared two-party
+    // test fixture in `crate::crypto::mls`), which `pub(in crate::context)` would
+    // wrongly forbid (E0624). `pub(crate)` is the minimal correct visibility.
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) async fn build_actor_deps(
         self: &Arc<Self>,
         owning_did: &DID,
     ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
@@ -3783,7 +3826,7 @@ impl Supervisor {
     ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_trust_recovery_command(
-        &self,
+        self: &Arc<Self>,
         cmd: TrustRecoveryCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // Phase 2A.1 of ADR-049 — trust_recovery is the first migrated
@@ -3872,7 +3915,7 @@ impl Supervisor {
     ///   providers attached, or a closed reply channel surfacing as
     ///   [`ContextError::TransportFailed`]).
     async fn recovery_notify_contact(
-        &self,
+        self: &Arc<Self>,
         recovering_did: &str,
         contact_did: &str,
         payload: &[u8],
@@ -3956,7 +3999,10 @@ impl Supervisor {
     /// erroring — this is a supported operation, not an unknown-context
     /// fault.
     #[allow(clippy::too_many_lines)] // flat match over every trust-recovery variant
-    async fn dispatch_trust_recovery_direct(&self, cmd: TrustRecoveryCommand) -> Outcome<()> {
+    async fn dispatch_trust_recovery_direct(
+        self: &Arc<Self>,
+        cmd: TrustRecoveryCommand,
+    ) -> Outcome<()> {
         const TRUST_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
@@ -4019,32 +4065,20 @@ impl Supervisor {
             }
             // Unlike the other per-context recovery variants, a
             // `RecoverySendNotification` to an unregistered context is a
-            // legitimate, supported operation. This direct path is reached
-            // for ANY context with no live actor at recovery time (ADR-049
-            // lazy-spawn), of two distinct shapes:
-            //   - the synthetic `identity-private-state` pseudo-context (PSK
-            //     rotation, spec §9.12 step 6), deliberately never registered
-            //     as a per-context actor; and
-            //   - real (64-hex) member contexts during compromise recovery —
-            //     the `revoke_ucans` (seq 1) and `rotate_key_packages` (seq 2)
-            //     steps in `identity/recovery.rs` dispatch real member ids with
-            //     no registration gate.
-            // Both need only the supervisor-shared crypto + transport
-            // providers — no per-context membership, governance, or MLS group
-            // state. Seal and send directly through the shared providers,
-            // keying through the canonical ADR-056 chokepoint
-            // `context_id_to_bytes` so the seal lands in the same slot as the
-            // registered-actor handler's `recovery_send_notification` (the
-            // decoded 32-byte digest for a real id, the hashed synthetic label
-            // otherwise). The envelope's `inner.epoch` is hardcoded to 0: the
-            // direct path has no per-context actor state to read `mls_epoch`
-            // from. This is safe because `inner.epoch` is a signed *plaintext*
-            // field that is NOT AAD-bound — the epoch the AAD does bind is the
-            // *sender-key* epoch, drawn from real crypto state inside `seal`,
-            // not this envelope field — and the recipient's recovery handler
-            // ignores `inner.epoch` entirely, so the hardcoded 0 does not
-            // affect openability even when a real unregistered member context
-            // has a digest-keyed MLS group at a non-zero MLS epoch.
+            // legitimate, supported operation. Since PR-7 moved the MLS crypto
+            // state onto the per-context actor (one-way take), the direct path
+            // no longer seals through the retired supervisor-scoped provider: it
+            // lazily respawns the target context's actor from its persisted
+            // snapshot and dispatches the notification to that actor's mailbox,
+            // where the actor-shape `recovery_send_notification` handler seals
+            // through the authoritative owned `ContextCryptoState`. Real
+            // (64-hex) member contexts (`revoke_ucans` seq 1 /
+            // `rotate_key_packages` seq 2) respawn and seal via the mailbox; the
+            // synthetic `identity-private-state` pseudo-context (PSK rotation
+            // §9.12 step 6) is non-64-hex with no snapshot and no production MLS
+            // group, so it returns the same "no MLS group" error the retired
+            // provider seal produced (best-effort no-op). See
+            // `recovery_send_notification_direct` for the full contract.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
                 let signing_key = payload.signing_key.to_signing_key();
                 let send_result = self
@@ -4071,122 +4105,171 @@ impl Supervisor {
         }
     }
 
-    /// Seals and sends a recovery notification for a context with no
-    /// registered actor, using only the supervisor-shared crypto and
-    /// transport providers (ADR-049 §9.12).
+    /// Delivers a recovery notification for a context with no live actor by
+    /// lazily respawning that actor from its persisted snapshot and dispatching
+    /// the notification to its mailbox (ADR-049 §9.12, PR-7 SCP-CRYPTOMOVE-001).
     ///
-    /// This is the supervisor-direct twin of the per-context actor's
+    /// This is the supervisor-direct fallback for the per-context actor's
     /// [`recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification)
-    /// helper, reached when the target context has no registered actor.
-    /// It is used by identity-scoped recovery steps — chiefly PSK
-    /// rotation (step 6) — whose synthetic `identity-private-state`
-    /// pseudo-context is never registered as a per-context actor. Because
-    /// no MLS group exists for that synthetic context, the envelope is
-    /// constructed with `epoch == 0`, exactly as the registered-actor
-    /// handler does when `state.epoch.mls_epoch` is its default 0.
+    /// handler, reached when the target context has no registered actor. Since
+    /// PR-7 moved the MLS crypto state onto the per-context actor (one-way
+    /// take), this path can no longer seal through the retired supervisor-scoped
+    /// provider; it instead respawns the actor so the notification is sealed by
+    /// the authoritative owned `ContextCryptoState` (the actor drives the
+    /// persist-before-ack send sequence, so the reserved AAD sequence is
+    /// nonce-safe — no risk of the transient-materialize `(epoch, sequence)`
+    /// reuse the seal fork rejected).
     ///
-    /// This direct path is reached for ANY context with no live actor at
-    /// recovery time (ADR-049 lazy-spawn), NOT only the synthetic
-    /// pseudo-context. Two distinct callers exercise it:
+    /// Two shapes reach here at recovery time (ADR-049 lazy-spawn):
     ///
-    /// - The synthetic `identity-private-state` pseudo-context (PSK
-    ///   rotation §9.12 step 6), which is never a real (64-hex) context id.
-    /// - Real (64-hex) member contexts that simply have no spawned actor at
-    ///   recovery time — e.g. the
-    ///   [`revoke_ucans`](crate::identity::recovery) (seq 1) and
+    /// - Real (64-hex) member contexts that simply have no spawned actor —
+    ///   e.g. the [`revoke_ucans`](crate::identity::recovery) (seq 1) and
     ///   [`rotate_key_packages`](crate::identity::recovery) (seq 2)
     ///   compromise-recovery notifications, which dispatch to a real member
-    ///   context id with no registration gate.
-    ///
-    /// Because both shapes reach here, the seal MUST key off the canonical
-    /// ADR-056 resolver [`context_id_to_bytes`](crate::context::state::context_id_to_bytes):
-    /// it decodes a real 64-hex id to its 32-byte digest — matching the
-    /// registered-actor handler
-    /// [`recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification),
-    /// which also keys via that resolver — and hashes a synthetic, non-64-hex
-    /// label via `SHA-256`. The raw
-    /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive
-    /// must NOT be used here: on a real id it would compute
-    /// `SHA-256(hex(digest))`, double-hashing and keying a slot no member
-    /// listens on — the ADR-056 fail-open. The relay routing ID is taken from
-    /// the domain-separated
-    /// [`context_routing_id`](scp_protocol::context::context_routing_id),
-    /// which requires no per-context state.
+    ///   context id with no registration gate. These respawn from their
+    ///   persisted Active snapshot and seal via the mailbox. In practice
+    ///   `restore_on_startup` eagerly spawns an actor for every persisted
+    ///   Active context, so live recovery flows normally reach the mailbox
+    ///   directly; this fallback covers only the transient crash-respawn gap.
+    /// - The synthetic `identity-private-state` pseudo-context (PSK rotation
+    ///   §9.12 step 6), which is never a real (64-hex) context id, never a
+    ///   registered actor, and has no persisted snapshot. In production it has
+    ///   no MLS group (`seed_identity_private_state_group` is test-only), so the
+    ///   retired provider seal ALSO failed "no MLS group" and was swallowed
+    ///   (`rotate_psk` returns false — a best-effort no-op). This method
+    ///   preserves that exact contract: it returns the same "no MLS group"
+    ///   [`ContextError::CryptoFailed`] for any non-64-hex id WITHOUT attempting
+    ///   a snapshot respawn that cannot exist (which would emit a spurious
+    ///   "state is lost" error and consume the crash budget on every rotation).
+    ///   Whether production PSK delivery SHOULD work is a pre-existing question,
+    ///   tracked separately — not changed here.
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no crypto / transport / clock
-    ///   provider has been attached to the supervisor.
-    /// - [`ContextError::CryptoFailed`] if envelope signing or sealing
-    ///   fails.
-    /// - Any [`ContextError`] surfaced by the transport's `send_message`.
-    async fn recovery_send_notification_direct(
-        &self,
+    /// - [`ContextError::CryptoFailed`] ("no MLS group for this context") for a
+    ///   non-64-hex synthetic id — the preserved best-effort no-op contract.
+    /// - [`ContextError::ActorCrashed`] if a real context cannot be respawned
+    ///   (genuinely lost snapshot) or the respawned actor vanishes before
+    ///   dispatch — fail-closed and retryable.
+    /// - [`ContextError::TransportFailed`] if the mailbox reply channel closes.
+    /// - Any [`ContextError`] surfaced by the actor-shape handler's seal /
+    ///   transport send.
+    // Manual `Box::pin(async move { … })` (NOT `async fn`) is REQUIRED, not a
+    // stack optimization: this method is transitively reachable from a spawned
+    // `ContextActor::run()` future (via the actor-shape cross-context
+    // `recovery_notify_contact` → `dispatch_recovery_send_notification`), and it
+    // calls `respawn_from_snapshot`, which constructs a fresh `run()` future to
+    // `tokio::spawn`. As an `async fn` its opaque return type would make
+    // `run()`'s type/`Send` inference cyclic (`run` ⊇ … ⊇
+    // `recovery_send_notification_direct` ⊇ `respawn` ⊇ `run`) and fail to
+    // resolve (E0391). Returning an explicit `Pin<Box<dyn Future + Send>>`
+    // erases this method's opaque type: `run()`'s inference sees a trait object
+    // that is `Send` by declaration and stops descending into the recursive
+    // concrete type, breaking the cycle. Owned copies of the borrowed arguments
+    // are captured so the returned future borrows only `self` (`&Arc<Self>`).
+    fn recovery_send_notification_direct<'a>(
+        self: &'a Arc<Self>,
         context_id: &str,
         sender_did: &str,
         payload: &[u8],
         sequence: u64,
         signing_key: &ed25519_dalek::SigningKey,
-    ) -> Result<(), ContextError> {
-        let not_init = || {
-            ContextError::NotInitialized(
-                "recovery_send_notification_direct: providers not attached".to_owned(),
-            )
-        };
-        let crypto = self.crypto_ref().ok_or_else(not_init)?;
-        let transport = self.transport_ref().ok_or_else(not_init)?;
-        let clock = self.clock_ref().ok_or_else(not_init)?;
-
-        // Resolve the keying bytes through the canonical ADR-056 chokepoint
-        // (see the doc comment above). This path is reached for ANY
-        // unregistered context: the synthetic `identity-private-state`
-        // pseudo-context (PSK rotation §9.12 step 6, hashed because it is a
-        // non-64-hex label) AND real (64-hex) member contexts with no live
-        // actor — e.g. the `revoke_ucans` / `rotate_key_packages` compromise-
-        // recovery notifications, which decode to their 32-byte digest. Using
-        // the raw `context_id_bytes` primitive here would double-hash a real id
-        // (`SHA-256(hex(digest))`) and key a slot no member listens on, the
-        // ADR-056 fail-open. The resolver matches the registered-actor handler
-        // `recovery_send_notification`, so both paths key the same slot.
-        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
-
-        // No MLS group exists for an unregistered context, so the epoch is
-        // 0 — matching the registered-actor handler's behaviour when
-        // `state.epoch.mls_epoch` holds its default value.
-        let current_epoch = 0;
-
-        let timestamp = clock.now_millis();
-        let params = scp_protocol::envelope::inner::InnerEnvelopeParams {
-            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-            context_id,
-            sender_did,
-            epoch: current_epoch,
-            generation: 0,
-            sequence,
-            timestamp,
-            message_type: scp_protocol::envelope::inner::MessageType::Recovery,
-            payload,
-            provenance: None,
-            signing_key_id: scp_did::SigningKeyId::Active,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ContextError>> + Send + 'a>>
+    {
+        use crate::context::actor::commands::{
+            ContextCommand, RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
         };
 
-        let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let context_id = context_id.to_owned();
+        let sender_did = sender_did.to_owned();
+        let payload = payload.to_vec();
+        let signing_key = signing_key.clone();
 
-        // Domain-separated routing ID for relay routing, distinct from the
-        // canonical-resolver `context_id_bytes` (digest for a real id, hash of
-        // a synthetic label) used above for MLS crypto keying.
-        let routing_id = scp_protocol::context::context_routing_id(context_id);
-        let encrypted = crypto.seal(
-            &context_id_bytes,
-            &inner,
-            &routing_id,
-            300, // 5 minute blob TTL
-        )?;
+        Box::pin(async move {
+            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) lazy-spawn seal: the per-context
+            // MLS crypto state is now OWNED by the context's actor (one-way take),
+            // so a recovery notification can no longer seal through the retired
+            // supervisor-scoped provider. Instead, respawn the target context's
+            // actor from its persisted snapshot and dispatch the notification to
+            // its mailbox, where the actor-shape `recovery_send_notification`
+            // handler seals through the authoritative owned `ContextCryptoState`
+            // (nonce-safe: the actor drives the persist-before-ack send sequence).
+            //
+            // Only a REAL (64-hex) context id — decodable by the ADR-056 chokepoint
+            // `context_id_to_bytes` — can be respawned. The synthetic
+            // `identity-private-state` pseudo-context (PSK rotation §9.12 step 6) is
+            // never a registered actor and has NO persisted snapshot, and in
+            // production has no MLS group at all (`seed_identity_private_state_group`
+            // is test-only), so the retired provider seal ALSO failed with "no MLS
+            // group" and was swallowed (`rotate_psk` returned false — a best-effort
+            // no-op). Preserve that exact contract: return the same "no MLS group"
+            // error for any non-real context id rather than respawning a snapshot
+            // that cannot exist (which would emit a spurious "state is lost" error
+            // and pollute the crash-window budget on every PSK rotation). The
+            // 64-hex-lowercase predicate mirrors `context_id_to_bytes`'s canonical
+            // branch (ADR-056).
+            let is_real_context_id = context_id.len() == 64
+                && context_id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !is_real_context_id {
+                return Err(ContextError::CryptoFailed(
+                    "no MLS group for this context".to_string(),
+                ));
+            }
 
-        transport.send_message(&routing_id, &encrypted).await?;
+            // Derive `owning_did` exactly as the watchdog respawn path does: prefer
+            // a registered local DID (the node performing the recovery), falling
+            // back to a context-id-derived seed. Restore/respawn does not key crypto
+            // on this DID (it rehydrates the snapshot's MLS state), so the seed
+            // fallback is sound and never fabricates a foreign participant.
+            let owning_did = self
+                .local_dids_ref()
+                .load()
+                .iter()
+                .min()
+                .cloned()
+                .unwrap_or_else(|| DID(context_id.clone()));
 
-        Ok(())
+            // Respawn holds `bootstrap_spawn_lock` internally and is re-entrancy-
+            // safe (the caller holds no bootstrap lock). A failed respawn (genuinely
+            // lost snapshot for a real context) fails closed — the direct path is
+            // defensively reached only in the transient crash-respawn gap, since
+            // `restore_on_startup` eagerly spawns an actor for every persisted
+            // Active context, so live compromise-recovery flows normally reach the
+            // mailbox directly, not here. (The whole method is boxed as a
+            // `dyn Future + Send` — see the note on its signature — so this plain
+            // `.await` on the actor-spawning respawn does not reopen the cycle.)
+            self.respawn_from_snapshot(&context_id, &owning_did).await?;
+
+            // The actor is registered now — dispatch the notification straight to
+            // its mailbox (NOT back through `dispatch_trust_recovery_command`, so a
+            // transient lookup miss cannot re-enter this respawn path and loop).
+            let Some(actor) = self.lookup(&context_id) else {
+                return Err(ContextError::ActorCrashed(format!(
+                    "{context_id} (respawned actor vanished before recovery-notification dispatch)"
+                )));
+            };
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let send_payload = RecoverySendNotificationPayload {
+                context_id: context_id.clone(),
+                sender_did,
+                payload,
+                sequence,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            };
+            let cmd =
+                ContextCommand::TrustRecovery(TrustRecoveryCommand::RecoverySendNotification {
+                    payload: Box::new(send_payload),
+                    reply: reply_tx,
+                });
+            Self::dispatch_via_mailbox(&actor, cmd).await?;
+            reply_rx.await.map_err(|_| {
+                ContextError::TransportFailed(
+                    "recovery_send_notification_direct: mailbox reply channel closed".to_owned(),
+                )
+            })?
+        })
     }
 
     /// Direct supervisor-scoped dispatch for [`QueriesCommand`] variants
@@ -13689,7 +13772,7 @@ impl Supervisor {
                     // 3. Build the Welcome-derived PerContextState. On any failure, roll the
                     //    just-installed group back so nothing keyed is left resident. (No
                     //    durable snapshot exists yet, so no `delete_context` is needed here.)
-                    let state = match Self::build_welcome_joiner_state(
+                    let mut state = match Self::build_welcome_joiner_state(
                         &deps,
                         &context_id,
                         &params,
@@ -13704,6 +13787,40 @@ impl Supervisor {
                             return Err(e);
                         }
                     };
+
+                    // 2b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 WELCOME seam: TAKE the
+                    //     just-installed joined group's crypto out of the provider and
+                    //     SEED it onto the actor state. This is a BIRTH seam, exactly
+                    //     like CREATE: `install_joined_group` (step 2, a RETAINED
+                    //     provider birth-seam) births the group + local sender key into
+                    //     the provider; `take_crypto_state` then hands it to the actor
+                    //     ONE-WAY (removes the `contexts` entry AND records
+                    //     `taken_context_ids`, so a subsequent provider birth/take for
+                    //     this id fails closed — CM-001 double-owner guard). No crypto is
+                    //     ever handed back to the provider. `build_welcome_joiner_state`
+                    //     deliberately built an EMPTY encrypted mode; `seed` installs the
+                    //     owned group + sender key and resumes `send_sequence` via
+                    //     `from_persisted` (a freshly-installed joiner group starts at 0).
+                    //     From here the actor `state` is the SOLE crypto authority — the
+                    //     durability check (3b) and the fail-closed persist (4) read the
+                    //     export off `state`, not the provider.
+                    //
+                    //     Rollback semantics past this point: the crypto now lives in
+                    //     `state`, so every early-return below DROPS it (zeroizing the
+                    //     `ScpMlsGroup` / `SenderKey`); the `destroy_mls_group` calls
+                    //     become defensive no-ops (the group is no longer provider-
+                    //     resident) and the `taken_context_ids` marker is LEFT in place
+                    //     (fail-closed — the id must not resurrect a divergent second
+                    //     group; a retry re-drives a fresh Welcome).
+                    let owned = match deps.crypto.take_crypto_state(&context_id_bytes) {
+                        Ok(owned) => owned,
+                        Err(e) => {
+                            let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                            return Err(e);
+                        }
+                    };
+                    state.seed_encrypted_crypto_from_owned(owned);
+
                     let handle = state.handle.clone();
 
                     // 3a. Activate the joiner's lifecycle handle. A freshly-built
@@ -13748,14 +13865,39 @@ impl Supervisor {
                     // (`deps.supervisor.export_*`) and threaded into
                     // `export_crypto_state` as the durable-blob params; the
                     // provider floor mirrors are deleted.
-                    if !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
-                        &deps.crypto.export_crypto_state(
-                            &context_id_bytes,
-                            deps.supervisor.export_sender_key_epochs(&context_id_bytes),
-                            deps.supervisor
-                                .export_recv_sequence_floors(&context_id_bytes),
-                        ),
-                    ) {
+                    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 WELCOME seam: the crypto is
+                    // now OWNED by the seeded actor `state` (taken from the provider in
+                    // step 2b), so read the export off `state` — identical to what
+                    // `build_snapshot_for_persist` (step 4) will persist. The X25519
+                    // wrapping keypair is node-level and enters as params from the
+                    // RETAINED `deps.crypto.wrapping_keypair()` accessor.
+                    let (welcome_wrapping_public, welcome_wrapping_secret) =
+                        deps.crypto.wrapping_keypair();
+                    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the crypto move relocated
+                    // `export_crypto_state` onto the actor `state`, so the former
+                    // provider `arm_export_failure_once` seam no longer sits on
+                    // this path. The supervisor-resident one-shot seam
+                    // (`force_welcome_export_failure_once`, armed pre-spawn by the
+                    // durability test) forces THIS actor-export read to be treated
+                    // as non-durable. Production builds compile it to a constant
+                    // `false` (the field and the branch are gated away).
+                    #[cfg(any(test, feature = "testing"))]
+                    let forced_non_durable = self
+                        .force_welcome_export_failure_once
+                        .swap(false, std::sync::atomic::Ordering::SeqCst);
+                    #[cfg(not(any(test, feature = "testing")))]
+                    let forced_non_durable = false;
+                    if forced_non_durable
+                        || !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
+                            &state.export_crypto_state(
+                                deps.supervisor.export_sender_key_epochs(&context_id_bytes),
+                                deps.supervisor
+                                    .export_recv_sequence_floors(&context_id_bytes),
+                                welcome_wrapping_public,
+                                &*welcome_wrapping_secret,
+                            ),
+                        )
+                    {
                         let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
                         return Err(ContextError::PersistenceFailed(format!(
                             "spawn-from-Welcome: the joined group for '{context_id}' produces no \
@@ -14333,6 +14475,145 @@ impl Supervisor {
         rx.await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::test_insert_member — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Answers a §9.16.2 sender-key PULL request on the OWNED actor crypto state
+    /// via the actor mailbox — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
+    ///
+    /// The steady-state ANSWER half moved off the provider onto
+    /// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request);
+    /// a taken (actor-owned) context can no longer answer through the emptied
+    /// provider. This routes the answer to the actor by `context_id` and returns
+    /// the ephemeral-sealed response (`Some`) or `None` for a blocked requester.
+    /// The full-stack harness drives the requester side externally with its own
+    /// custody (actor-loop request INITIATION is deferred #2049).
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] on signature / freshness / replay /
+    ///   membership rejection of the request.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn handle_sender_key_request(
+        &self,
+        context_id: &str,
+        request_bytes: &[u8],
+        requester_public_key: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::HandleSenderKeyRequest {
+            context_id: context_id.to_owned(),
+            request_bytes: request_bytes.to_vec(),
+            requester_public_key: *requester_public_key,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::handle_sender_key_request — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Lands a §9.16.2 pull-response sender key onto the OWNED actor sender-key
+    /// store via the actor mailbox — test-only (ADR-049 PR-7 /
+    /// SCP-CRYPTOMOVE-001).
+    ///
+    /// GATE-BEFORE-INSTALL: the actor handler gates the authenticated
+    /// `(sender_did, epoch)` against the Class-M floor registry
+    /// (`check_and_advance_sender_epoch`, FAIL-CLOSED) and then installs the key
+    /// onto `cs.sender_key_store`. The provider store is empty on a taken context,
+    /// so the install MUST land on the actor; the requester (harness) already
+    /// HPKE-opened the ephemeral-sealed response with its own wrapping secret.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] if the epoch fails the Class-M floor gate
+    ///   or no crypto state is resident.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn land_sender_key_response(
+        &self,
+        context_id: &str,
+        sender_did: &str,
+        sender_key: scp_protocol::crypto::sender_keys::SenderKey,
+        epoch: u64,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::LandSenderKeyResponse {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.to_owned(),
+            sender_key,
+            epoch,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::land_sender_key_response — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// READ-ONLY inner-envelope inspection on the OWNED actor crypto state via
+    /// the actor mailbox — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
+    ///
+    /// Decrypts a captured outer-envelope blob through the context actor and
+    /// returns the raw decrypted
+    /// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope) WITHOUT
+    /// unwrapping the §9.17 access-key content layer, so a test can read the
+    /// wire-level `message_type` / `sequence` (e.g. assert a sent heartbeat is
+    /// tagged `MessageType::Heartbeat` and carries sequence `0`, and that a
+    /// heartbeat does NOT advance the per-sender application sequence — §9.9.2).
+    /// This is the actor twin of the deleted provider `open` inspection twin;
+    /// the taken (actor-owned) context can no longer be opened through the
+    /// emptied provider.
+    ///
+    /// # Non-mutating receive-state invariant (§9)
+    ///
+    /// The actor handler drives ONLY
+    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open)
+    /// — a PURE decrypt that surfaces `env.receive_floor` but runs NONE of the
+    /// receive-side anti-replay enforcement (`check_and_advance_recv_sequence`,
+    /// the Class-M floor registry, `nonce_dedup`, epoch advance) that lives at
+    /// the messaging seam. The only state change is the MLS decryption-ratchet
+    /// advance intrinsic to any decrypt. Inspecting a blob therefore never
+    /// consumes an anti-replay slot, so the same wire bytes remain re-openable by
+    /// the real receive path.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] if the blob decodes to a Control /
+    ///   Management result rather than an application envelope, or on any MLS /
+    ///   sender-key / decode failure.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn inspect_incoming_inner(
+        &self,
+        context_id: &str,
+        envelope_bytes: Vec<u8>,
+    ) -> Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::InspectIncomingInner {
+            context_id: context_id.to_owned(),
+            envelope_bytes,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::inspect_incoming_inner — actor reply channel closed".to_owned(),
             )
         })?
     }
@@ -16138,6 +16419,47 @@ mod tests {
         )
     }
 
+    /// Export a provider-resident context through the relocated actor
+    /// [`PerContextState::export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state)
+    /// seam — the provider `export_crypto_state` twin is deleted post-ADR-049
+    /// PR-7. Sources the node-resident wrapping keypair from the provider exactly
+    /// as the production actor-export caller does. DESTRUCTIVE: the one-way
+    /// `take_crypto_state` empties the source provider for `ctx`, so capture
+    /// anything else you need off it first.
+    /// Destructively move a provider-resident context onto a throwaway actor
+    /// [`PerContextState`](crate::context::actor::state::PerContextState) via the
+    /// retained `take_crypto_state` + the production
+    /// `seed_encrypted_crypto_from_owned` seed primitive. Post-ADR-049 PR-7 the
+    /// steady-state crypto twins (`seal` / `rotate_sender_key` / `drain_pending_
+    /// sender_key_messages` / …) live on the actor, so tests that drive them move
+    /// the party onto the actor first. One-way: the provider loses the context.
+    fn take_into_actor(
+        crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        ctx: &[u8; 32],
+    ) -> crate::context::actor::state::PerContextState {
+        let owned = crypto
+            .take_crypto_state(ctx)
+            .expect("take owned crypto material off the provider");
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            *ctx,
+            0,
+            DID::from(crypto.local_did().to_owned()),
+        );
+        state.seed_encrypted_crypto_from_owned(owned);
+        state
+    }
+
+    fn actor_export(
+        crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        ctx: &[u8; 32],
+        sender_key_epochs: Vec<(String, u64)>,
+        recv_sequence_floors: Vec<(String, scp_protocol::context::builder::ReceiveFloor)>,
+    ) -> Result<Vec<u8>, ContextError> {
+        let (wpub, wsec) = crypto.wrapping_keypair_snapshot();
+        let state = take_into_actor(crypto, ctx);
+        state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
+    }
+
     /// Build a `Supervisor` around an EXISTING crypto provider `Arc` — used by the
     /// two-party seam-level e2e tests to wrap Bob's post-join `bob_crypto` (which
     /// holds the joined group) in a fresh supervisor so `build_actor_deps` yields
@@ -16147,9 +16469,23 @@ mod tests {
     fn supervisor_with_crypto(
         crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
     ) -> Arc<Supervisor> {
+        supervisor_with_crypto_and_resolver(
+            crypto,
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+        )
+    }
+
+    /// Like [`supervisor_with_crypto`] but with a caller-supplied `key_resolver`
+    /// — used by the §9.16.2 sender-key receive-path test, whose
+    /// `decrypt_and_dispatch` must resolve the requester's verification key to
+    /// check the request signature.
+    #[cfg(feature = "testing")]
+    fn supervisor_with_crypto_and_resolver(
+        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        key_resolver: KeyResolver,
+    ) -> Arc<Supervisor> {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -20688,13 +21024,13 @@ mod tests {
         // Capture the live crypto state INCLUDING the registry floor (=5) into
         // the persisted snapshot, exactly as `build_snapshot_for_persist` does
         // (floors sourced from the authoritative registry).
-        snap.mls_crypto_state = crypto
-            .export_crypto_state(
-                &ctx_id_bytes,
-                sup.export_sender_key_epochs(&ctx_id_bytes),
-                sup.export_recv_sequence_floors(&ctx_id_bytes),
-            )
-            .unwrap();
+        snap.mls_crypto_state = actor_export(
+            &crypto,
+            &ctx_id_bytes,
+            sup.export_sender_key_epochs(&ctx_id_bytes),
+            sup.export_recv_sequence_floors(&ctx_id_bytes),
+        )
+        .unwrap();
         assert!(
             !snap.mls_crypto_state.is_empty(),
             "snapshot must carry crypto state so the floor guard runs on respawn"
@@ -20798,13 +21134,13 @@ mod tests {
             .unwrap();
 
         // Persist the durable blob, floors sourced FROM the registry (the G2 path).
-        let blob = origin_crypto
-            .export_crypto_state(
-                &ctx,
-                origin.export_sender_key_epochs(&ctx),
-                origin.export_recv_sequence_floors(&ctx),
-            )
-            .unwrap();
+        let blob = actor_export(
+            &origin_crypto,
+            &ctx,
+            origin.export_sender_key_epochs(&ctx),
+            origin.export_recv_sequence_floors(&ctx),
+        )
+        .unwrap();
         assert!(
             !blob.is_empty(),
             "keyed context must export a non-empty blob"
@@ -20915,13 +21251,13 @@ mod tests {
         exporter
             .check_and_advance_sender_epoch(&ctx, sender, 2, MAX_EPOCH_ADVANCE)
             .unwrap();
-        let blob = exporter_crypto
-            .export_crypto_state(
-                &ctx,
-                exporter.export_sender_key_epochs(&ctx),
-                exporter.export_recv_sequence_floors(&ctx),
-            )
-            .unwrap();
+        let blob = actor_export(
+            &exporter_crypto,
+            &ctx,
+            exporter.export_sender_key_epochs(&ctx),
+            exporter.export_recv_sequence_floors(&ctx),
+        )
+        .unwrap();
 
         // Importer's LIVE registry floor for `sender` is HIGHER (=9).
         let importer = supervisor_with_providers();
@@ -20961,13 +21297,11 @@ mod tests {
         );
 
         // Provider rolled back: the just-restored group was destroyed on the Err
-        // path, so the importer's provider holds NO crypto state for `ctx`
-        // (`export_crypto_state` returns an empty blob for an absent context).
+        // path, so the importer's provider holds NO crypto state for `ctx`. Probe
+        // via the retained `context_crypto_present` (the serializing
+        // `export_crypto_state` twin is deleted post-ADR-049 PR-7).
         assert!(
-            importer_crypto
-                .export_crypto_state(&ctx, Vec::new(), Vec::new())
-                .unwrap()
-                .is_empty(),
+            !importer_crypto.context_crypto_present(&ctx),
             "the restored crypto must be rolled back (group destroyed) on rejection"
         );
     }
@@ -21007,13 +21341,13 @@ mod tests {
                 high,
             )
             .unwrap();
-        let blob = origin_crypto
-            .export_crypto_state(
-                &ctx,
-                origin.export_sender_key_epochs(&ctx),
-                origin.export_recv_sequence_floors(&ctx),
-            )
-            .unwrap();
+        let blob = actor_export(
+            &origin_crypto,
+            &ctx,
+            origin.export_sender_key_epochs(&ctx),
+            origin.export_recv_sequence_floors(&ctx),
+        )
+        .unwrap();
 
         // Cold restart: fresh Supervisor, EMPTY registry (local=0), trusted_local.
         let fresh = supervisor_with_providers();
@@ -21081,13 +21415,13 @@ mod tests {
                 MAX_EPOCH_ADVANCE,
             )
             .unwrap();
-        let blob = exporter_crypto
-            .export_crypto_state(
-                &ctx,
-                exporter.export_sender_key_epochs(&ctx),
-                exporter.export_recv_sequence_floors(&ctx),
-            )
-            .unwrap();
+        let blob = actor_export(
+            &exporter_crypto,
+            &ctx,
+            exporter.export_sender_key_epochs(&ctx),
+            exporter.export_recv_sequence_floors(&ctx),
+        )
+        .unwrap();
 
         // Importer live: epoch 5 (< blob's 9 → epoch axis PASSES), recv rf(4, 0)
         // (> blob's rf(2,0) → recv axis REGRESSES under RejectRegression).
@@ -21162,9 +21496,13 @@ mod tests {
             .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
             .expect("build bob's actor deps");
 
+        // Move Alice onto the actor seam (the provider `seal` twin is deleted
+        // post-ADR-049 PR-7); she seals from her actor-owned crypto.
+        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+
         // Alice seals an Application envelope; the sender-layer header carries her
         // current (epoch, send_sequence). First seal → sequence 0, second → 1.
-        let seal_app = |payload: &[u8]| -> Vec<u8> {
+        let mut seal_app = |payload: &[u8]| -> Vec<u8> {
             let params = InnerEnvelopeParams {
                 version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
                 context_id: ctx_str,
@@ -21184,18 +21522,35 @@ mod tests {
             )
             .expect("alice signs her inner application envelope");
             let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-            alice_crypto
-                .seal(&ctx_bytes, &inner, &routing_id, 3600)
+            alice_actor
+                .seal(ALICE, &inner, &routing_id, 3600)
                 .expect("alice seals the application message")
         };
 
         let msg_a = seal_app(b"first-application-message"); // header sequence 0
         let msg_b = seal_app(b"second-application-message"); // header sequence 1
 
+        // Move Bob onto the actor seam and hand `decrypt_and_dispatch` his
+        // actor-owned crypto state: post-ADR-049 PR-7 the receive seam opens
+        // through the actor's `&mut ContextCryptoState` (a `None` means "no
+        // group"). App-data delivery never touches the provider's per-context
+        // crypto, so the emptied `bob_deps.crypto` is only read for `local_did`.
+        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        let bob_cs = match &mut bob_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c,
+            crate::context::actor::ContextModeState::Broadcast(_) => {
+                panic!("expected encrypted mode")
+            }
+        };
+
         // Deliver the LATER message (b, sequence 1) FIRST. Accepted; the registry
         // recv floor advances to exactly the surfaced receive_floor.
         let opened_b = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, ctx_str, &ctx_bytes, &msg_b,
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &msg_b,
         )
         .expect("first (in-order) delivery must succeed")
         .expect("an Application envelope must surface");
@@ -21210,7 +21565,11 @@ mod tests {
         // MLS ciphertext (so MLS decrypts it), but an older floor. The authoritative
         // registry recv gate MUST reject it fail-closed, and NO envelope surfaces.
         let reorder = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, ctx_str, &ctx_bytes, &msg_a,
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &msg_a,
         );
         // Pin the REASON: the rejection must be the registry recv-floor gate
         // (`FloorAdvanceError::RecvSequenceNotMonotonic`, whose Display is
@@ -21234,7 +21593,11 @@ mod tests {
 
         // A replay of the accepted message b is also rejected (no envelope).
         let replay = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, ctx_str, &ctx_bytes, &msg_b,
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &msg_b,
         );
         assert!(
             replay.is_err(),
@@ -21262,14 +21625,14 @@ mod tests {
         let (alice_crypto, bob_crypto, ctx_bytes) =
             crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
-        // Alice rotates her sender key (epoch 1 → 2) and redistributes it to Bob,
-        // who installs it — exactly what the live key-distribution flow does.
-        alice_crypto.rotate_sender_key(&ctx_bytes).unwrap();
-        alice_crypto.distribute_sender_key(&ctx_bytes, ALICE).ok();
-        for (_t, msg) in alice_crypto
-            .drain_pending_sender_key_messages(&ctx_bytes)
-            .unwrap()
-        {
+        // Move Alice onto the actor seam (the provider rotate/drain twins are
+        // deleted post-ADR-049 PR-7). Alice rotates her sender key (epoch 1 → 2)
+        // and redistributes it to Bob, who installs it via the retained
+        // receive-side provider methods — exactly what the live flow does.
+        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+        alice_actor.rotate_sender_key(ALICE).unwrap();
+        alice_actor.distribute_sender_key(ALICE, ALICE).ok();
+        for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
             if let Ok((key, _epoch)) =
                 bob_crypto.process_incoming_sender_key(&ctx_bytes, ALICE, &msg)
             {
@@ -21313,12 +21676,26 @@ mod tests {
         )
         .expect("alice signs her inner envelope");
         let routing_id = scp_protocol::context::context_routing_id(ctx_str);
-        let sealed = alice_crypto
-            .seal(&ctx_bytes, &inner, &routing_id, 3600)
+        let sealed = alice_actor
+            .seal(ALICE, &inner, &routing_id, 3600)
             .expect("alice seals at the rotated epoch");
 
+        // Hand Bob's actor-owned crypto state to the receive seam (it now opens
+        // through the actor's `&mut ContextCryptoState`); the rotated key Bob
+        // installed above is carried onto the actor by `take_into_actor`.
+        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        let bob_cs = match &mut bob_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c,
+            crate::context::actor::ContextModeState::Broadcast(_) => {
+                panic!("expected encrypted mode")
+            }
+        };
         let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps, ctx_str, &ctx_bytes, &sealed,
+            &bob_deps,
+            Some(bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
         )
         .expect("a recv at the just-advanced epoch must be ACCEPTED (no stale over-reject)")
         .expect("an Application envelope must surface");
@@ -21332,6 +21709,269 @@ mod tests {
                 .iter()
                 .any(|(d, f)| d == ALICE && f.epoch == 2),
             "the registry recv floor must track the epoch-2 receive"
+        );
+    }
+
+    /// ADR-049 §9 / cryptographer HIGH-1 regression: a heartbeat send reports
+    /// `Outcome { mutated: true }`. `send_heartbeat` SEALS an encrypted
+    /// `Heartbeat` envelope, which advances the actor-owned MLS group's send
+    /// ratchet GENERATION — Class-C per-context crypto state that a
+    /// `mutated: false` would silently drop on a ≤50ms coalesce-window crash.
+    /// The handler previously returned `Outcome::ok(())`; this pins the
+    /// `ok_mutated` fix so a heartbeat-only generation advance is coalesced.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn send_heartbeat_handler_reports_mutated() {
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::commands::{MessagingCommand, SigningKeyBytes};
+        use scp_protocol::context::ContextState;
+        use scp_protocol::context::roles::Capability;
+
+        const ALICE: &str = "did:dht:z6MkAliceHeartbeatAliceHeartbeatAlice1";
+        const BOB: &str = "did:dht:z6MkBobHeartbeatBobHeartbeatBobHeartbe1";
+        let ctx_str = "heartbeat-mutated-regression";
+
+        // Real two-party join: Alice owns the joined MLS group + her sender key.
+        let (alice_crypto, _bob_crypto, ctx_bytes) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let alice_sup = supervisor_with_crypto(Arc::clone(&alice_crypto));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives async dispatch from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let alice_deps = rt
+            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .expect("build alice's actor deps");
+
+        // Move Alice's joined crypto onto the actor. Activate the context and seed
+        // Alice as a member with `messages:write` directly (mirroring the
+        // `writable_encrypted_state` fixture) so the heartbeat's require-active and
+        // send-authorization gates pass without a governance round-trip.
+        let mut alice_state = take_into_actor(&alice_crypto, &ctx_bytes);
+        alice_state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("transition test handle to Active");
+        alice_state
+            .membership
+            .add_member(DID::from(ALICE), "member".to_owned(), Vec::new());
+        alice_state.members.insert(DID::from(ALICE));
+        alice_state.role_state.members.insert(ALICE.to_owned());
+        alice_state.role_state.member_capabilities.insert(
+            ALICE.to_owned(),
+            std::collections::HashSet::from([Capability::MessagesWrite]),
+        );
+        let mut cell = ClassSCell::new(alice_state);
+
+        rt.block_on(async {
+            // Send a heartbeat as Alice. The encrypted seal advances the MLS
+            // generation even with no peers to fan out to (the seal precedes the
+            // empty-routing no-op), so the handler MUST report `mutated: true`.
+            let (htx, hrx) = tokio::sync::oneshot::channel();
+            let heartbeat = MessagingCommand::SendHeartbeat {
+                context_id: ctx_str.to_owned(),
+                sender_did: DID::from(ALICE),
+                signing_key: SigningKeyBytes::from_signing_key(
+                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+                ),
+                reply: htx,
+            };
+            let outcome = crate::context::actor::handlers::messaging::dispatch(
+                &mut cell,
+                &alice_deps,
+                heartbeat,
+            )
+            .await;
+            assert!(
+                outcome.result.is_ok(),
+                "a peerless heartbeat is a successful no-op send: {:?}",
+                outcome.result
+            );
+            assert!(
+                outcome.mutated,
+                "a heartbeat seals an MLS envelope and advances the send-ratchet \
+                 generation — the handler MUST report mutated (ADR-049 §9 HIGH-1)"
+            );
+            hrx.await.expect("heartbeat reply").expect("heartbeat ok");
+        });
+    }
+
+    /// ADR-049 §9.16.2 sender-key PULL through the PRODUCTION receive path
+    /// (`decrypt_and_dispatch`). One test, two findings:
+    ///
+    /// - **BLACK-P7-1 (identity binding):** a KeyRequest whose payload
+    ///   `requester_did` != the MLS-authenticated sender is REJECTED before any
+    ///   answer is enqueued (a blocked/impersonating member cannot request under
+    ///   another member's identity).
+    /// - **BLACK-P7-2 (wire format):** a well-formed request is answered, and the
+    ///   enqueued answer parses via the SAME
+    ///   `SenderKeyDistributionMessage::from_bytes` the receiver uses — proving
+    ///   the answer is the `KeyResponse` envelope, not a bare `SenderKeyResponse`
+    ///   — and the requester recovers a real sender key from the ephemeral seal.
+    #[cfg(feature = "testing")]
+    #[test]
+    #[allow(clippy::too_many_lines)] // one cohesive receive-path flow: BLACK-P7-1 identity-binding reject + BLACK-P7-2 wire-format answer round-trip
+    fn sender_key_pull_receive_path_binds_identity_and_wire_format() {
+        use ed25519_dalek::Signer as _;
+        use scp_clock::Clock as _;
+        use scp_protocol::crypto::sender_keys::{SenderKeyDistributionMessage, SenderKeyRequest};
+
+        const ALICE: &str = "did:dht:z6MkAlicePullAlicePullAlicePullAlice12";
+        const BOB: &str = "did:dht:z6MkBobPullBobPullBobPullBobPullBobPu12";
+        const CHARLIE: &str = "did:dht:z6MkCharliePullCharliePullCharliePul12";
+        let ctx_str = "sender-key-pull-receive-path";
+
+        let (alice_crypto, bob_crypto, ctx_bytes) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        let ctx_hex = hex::encode(ctx_bytes);
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str).to_vec();
+
+        // Alice's production receive deps, with a resolver that maps BOB → his
+        // #active key so the request signature check can run.
+        let alice_sup = supervisor_with_crypto_and_resolver(
+            Arc::clone(&alice_crypto),
+            crate::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Alice's ActorDeps from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let alice_deps = rt
+            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .expect("build alice's actor deps");
+
+        // Build a Bob-signed KeyRequest (for Alice's key) sealing to a fresh
+        // ephemeral wrapping key, wrapped in the distribution-message envelope.
+        let bob_sk = crate::crypto::mls::two_party_test_support::bob_signing_key();
+        let build_request = |requester_did: &str, nonce: [u8; 16]| -> (Vec<u8>, [u8; 32]) {
+            let (wrapping_pub, wrapping_secret) =
+                scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+            let timestamp = scp_clock::SystemClock.now_secs();
+            let hash =
+                scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
+                    requester_did,
+                    ALICE,
+                    1,
+                    &wrapping_pub,
+                    &nonce,
+                    timestamp,
+                )
+                .unwrap();
+            let signature: [u8; 64] = bob_sk.sign(&hash).to_bytes();
+            let request = SenderKeyRequest {
+                requester_did: requester_did.to_owned(),
+                sender_did: ALICE.to_owned(),
+                epoch: 1,
+                wrapping_pubkey: wrapping_pub,
+                nonce,
+                timestamp,
+                signature,
+            };
+            let dist = SenderKeyDistributionMessage::KeyRequest(request)
+                .to_bytes()
+                .unwrap();
+            (dist, wrapping_secret)
+        };
+
+        // Bob seals both requests through his actor-owned MLS group as management
+        // envelopes (in MLS-generation order: mismatch first, then well-formed).
+        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        let bob_cs = match &mut bob_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c.as_mut(),
+            crate::context::actor::ContextModeState::Broadcast(_) => panic!("expected encrypted"),
+        };
+        // Mismatch: Bob (authenticated) claims requester_did = CHARLIE.
+        let (mismatch_dist, _) = build_request(CHARLIE, [1u8; 16]);
+        let mismatch_sealed = bob_cs
+            .mls_encrypt_management(&mismatch_dist, &routing_id, 3600)
+            .expect("bob seals the mismatched request");
+        // Well-formed: requester_did == BOB (the authenticated sender).
+        let (ok_dist, bob_ephemeral_secret) = build_request(BOB, [2u8; 16]);
+        let ok_sealed = bob_cs
+            .mls_encrypt_management(&ok_dist, &routing_id, 3600)
+            .expect("bob seals the well-formed request");
+
+        // Alice opens on the production receive seam.
+        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+        let alice_cs = match &mut alice_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c.as_mut(),
+            crate::context::actor::ContextModeState::Broadcast(_) => panic!("expected encrypted"),
+        };
+
+        // BLACK-P7-1: the mismatch is rejected, and NO answer is enqueued.
+        let reject = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &alice_deps,
+            Some(&mut *alice_cs),
+            ctx_str,
+            &ctx_bytes,
+            &mismatch_sealed,
+        );
+        assert!(
+            matches!(
+                &reject,
+                Err(ContextError::CryptoFailed(m))
+                    if m.contains("does not match the")
+            ),
+            "a requester_did != authenticated sender must be rejected, got {reject:?}"
+        );
+        assert!(
+            alice_cs.pending_distributions.is_empty(),
+            "a rejected request must not enqueue an answer"
+        );
+
+        // BLACK-P7-2: the well-formed request is answered.
+        let ok = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &alice_deps,
+            Some(&mut *alice_cs),
+            ctx_str,
+            &ctx_bytes,
+            &ok_sealed,
+        )
+        .expect("a well-formed request is accepted on the receive path");
+        assert!(
+            ok.is_none(),
+            "a KeyRequest is consumed on the receive side (no application envelope surfaces)"
+        );
+        assert_eq!(
+            alice_cs.pending_distributions.len(),
+            1,
+            "alice enqueues exactly one answer for the authenticated requester"
+        );
+        let (dest_did, answer_bytes) = alice_cs.pending_distributions[0].clone();
+        assert_eq!(
+            dest_did, BOB,
+            "the answer is addressed to the authenticated requester"
+        );
+
+        // The answer parses via the SAME call the receiver makes (a bare
+        // SenderKeyResponse would fail here) and recovers a real sender key from
+        // the ephemeral seal.
+        let resp = match SenderKeyDistributionMessage::from_bytes(&answer_bytes)
+            .expect("the answer parses as a SenderKeyDistributionMessage")
+        {
+            SenderKeyDistributionMessage::KeyResponse(r) => r,
+            other => panic!("expected a KeyResponse envelope, got {other:?}"),
+        };
+        assert_eq!(resp.sender_did, ALICE);
+        assert_eq!(resp.epoch, 1);
+        assert_eq!(
+            resp.request_nonce, [2u8; 16],
+            "the answer echoes the request nonce"
+        );
+        let recovered = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
+            &resp.hpke_sealed_key,
+            &resp.ephemeral_pubkey,
+            &bob_ephemeral_secret,
+            &ctx_hex,
+            &resp.sender_did,
+            resp.epoch,
+        )
+        .expect("the requester opens the ephemeral-sealed answer");
+        assert_eq!(
+            recovered.as_bytes().len(),
+            32,
+            "a real 32-byte sender key was recovered from the KeyResponse envelope"
         );
     }
 
@@ -21387,23 +22027,37 @@ mod tests {
             "test precondition: digest must differ from SHA-256(hex(digest))"
         );
 
-        // Seed MLS group + sender key under the DIGEST — the slot the
-        // registered-actor handler (and the chokepoint) key on.
-        let crypto = sup
-            .crypto_ref()
-            .expect("test supervisor has crypto")
-            .clone();
-        crypto
-            .create_mls_group(&digest)
-            .expect("create_mls_group under the digest");
-        crypto
-            .generate_sender_key(&digest)
-            .expect("generate_sender_key under the digest");
-
-        // Sanity: NO crypto state exists under the raw SHA-256(id) key, so a
-        // direct-path seal that (wrongly) keyed off the raw primitive would
-        // fail at the seal step.
-        assert_ne!(raw_bytes, digest);
+        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the per-context MLS crypto is now
+        // OWNED by the context actor, so `recovery_send_notification_direct` no
+        // longer seals through the supervisor-scoped provider — it respawns the
+        // target actor from its persisted Active snapshot and seals through the
+        // actor's owned `ContextCryptoState`. Stand up a REAL context under the
+        // 64-hex id via the production create path (`finalize_create` durably
+        // persists the initial Active snapshot, and the created group commits its
+        // `scp_context_params` `0xFF02` extension under the DIGEST via the ADR-056
+        // chokepoint) so the direct path's `respawn_from_snapshot` finds state and
+        // stands the actor back up with a sealable owned crypto state. Because the
+        // group's crypto is keyed under the digest, a respawn/restore that
+        // (wrongly) resolved the id through the raw `SHA-256(hex(digest))`
+        // primitive would key a slot with no crypto and fail the seal with
+        // `CryptoFailed` — which is exactly what the `TransportFailed`-not-
+        // `CryptoFailed` assertion below rejects.
+        let creator = DID::from(
+            sup.crypto_ref()
+                .expect("test supervisor has crypto")
+                .local_did()
+                .to_owned(),
+        );
+        let created = sup
+            .create_context(
+                context_id.clone(),
+                scp_protocol::context::ContextParams::default(),
+                creator,
+                None,
+            )
+            .await
+            .expect("create the real 64-hex context under the digest");
+        assert_eq!(created.context_id(), context_id);
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
         let result = sup

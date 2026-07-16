@@ -122,23 +122,27 @@ use crate::economy::adapter::PaymentAdapterDyn;
 /// handler ever needs to re-dispatch through the handle set it should
 /// hold its own clones of the individual handles.
 pub struct ActorDeps {
-    /// MLS crypto provider — owns the per-context MLS group + sender-key
-    /// state map. Formerly `ContextManager::crypto`. Held on
-    /// [`Supervisor`](crate::context::supervisor::Supervisor) directly
-    /// during the helper-migration window; cloned into each actor's
-    /// `ActorDeps` at spawn time so handler bodies can call
-    /// [`MlsCryptoProvider::seal`] / `open` / `advance_epoch` without
-    /// reaching back through `&Supervisor`.
+    /// MLS crypto provider — the group **birth/restore seam** (ADR-049 §15).
     ///
-    /// Added in Phase 2A.1 of ADR-049 (trust_recovery domain migration)
-    /// — first migrated handler that needs MLS provider state. Will
-    /// remain populated through the rest of Phase 2A; eventually the
-    /// `MlsCryptoProvider` is reduced (plan §"MlsCryptoProvider
-    /// dissolution") to a supervisor-owned store for the Class-M
-    /// epoch/replay floors, which must outlive the actor-task unwind
-    /// (ADR-049 Decision 9); the non-floor per-context crypto state moves
-    /// onto [`crate::context::actor::state::ContextCryptoState`] inside
-    /// [`crate::context::actor::state::PerContextState`].
+    /// Post-PR-7 (SCP-CRYPTOMOVE-001) the steady-state per-context MLS group +
+    /// sender-key state is **owned by the actor** — it lives on
+    /// [`ContextCryptoState`](crate::context::actor::state::ContextCryptoState)
+    /// inside
+    /// [`PerContextState`](crate::context::actor::state::PerContextState), and
+    /// per-context crypto reads/writes go through the actor's inherent crypto
+    /// methods (`seal` / `open` / `rotate_sender_key` / `advance_epoch` /
+    /// `add_member`), never back through this provider. The atomic crypto move
+    /// `take`s the freshly-built state off this provider onto the actor, after
+    /// which a `take` on an already-taken context fails closed ("context state
+    /// owned by actor").
+    ///
+    /// What remains here is the work the actor delegates at spawn/birth time:
+    /// group birth/restore at the Create/Join seam (`create_mls_group` /
+    /// `add_member`, and `restore_crypto_state` returning owned material — §15
+    /// keeps these permitted provider calls after PR-7), plus the
+    /// supervisor-owned Class-M epoch/replay floors, which must outlive the
+    /// actor-task unwind (ADR-049 Decision 9). Cloned into each actor's
+    /// `ActorDeps` at spawn time.
     pub crypto: Arc<MlsCryptoProvider>,
     /// Transport provider (relay, subscription, publish).
     pub transport: Arc<dyn ContextTransportProvider>,

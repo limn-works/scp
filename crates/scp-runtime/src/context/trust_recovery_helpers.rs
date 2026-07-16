@@ -230,12 +230,22 @@ pub async fn recovery_advance_epoch(
     // 1. Validate the context is active.
     require_active(&cell.handle)?;
 
-    // 2. Perform the MLS epoch advance (Update + self-Commit). Operates
-    //    on the supervisor-scoped `MlsCryptoProvider` contexts map; this
-    //    will move onto `state.mode` directly when the MLS provider
-    //    dissolves (plan §"MlsCryptoProvider dissolution"). If this
-    //    fails the bookkeeping counter is NOT incremented.
-    let epoch_output = deps.crypto.advance_epoch(&context_id_bytes)?;
+    // 2. Perform the MLS epoch advance (Update + self-Commit). ADR-049 PR-7
+    //    (SCP-CRYPTOMOVE-001): now driven on the actor `state.mode` via
+    //    `commit_class_s_keep` -> `rest_mut` — §9 Class-S, the ratchet is durable
+    //    before the Commit is broadcast (this is the highest-stakes safety-gated
+    //    advance; see the broadcast note below). `wrapping_public_key` from the
+    //    retained `deps.crypto.wrapping_keypair()`. If this fails (or its
+    //    fail-closed persist fails) the error `?`-propagates and the bookkeeping
+    //    counter is NOT incremented — disposition preserved.
+    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    let epoch_commit_bytes = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            v.rest_mut()
+                .advance_epoch(wrapping_public_key)
+                .map(|out| out.commit_bytes)
+        })
+        .await?;
 
     // 2b. Broadcast the MLS Commit to all members so they advance their group
     //     epoch and ratchet key material AWAY from the compromised keys. Broadcast
@@ -252,7 +262,7 @@ pub async fn recovery_advance_epoch(
     if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
-        epoch_output.commit_bytes,
+        epoch_commit_bytes,
         &CommitOperation::RecoveryAdvanceEpoch,
     )
     .await
@@ -341,10 +351,11 @@ pub async fn recovery_advance_epoch(
 /// purposes (spec §9.12 step 5).
 ///
 /// State-owning signature: reads `state.epoch.mls_epoch` for envelope
-/// construction and `deps.clock` for the timestamp. Sealing routes
-/// through `deps.crypto` (still supervisor-scoped during the migration
-/// window); transport delivery via `deps.transport`. Does NOT mutate
-/// `state`.
+/// construction and `deps.clock` for the timestamp. Sealing routes through
+/// the actor-owned `ContextCryptoState` (the Class-C `crypto_mut()` view),
+/// reserving from the actor's authoritative `send_tracker`; transport
+/// delivery via `deps.transport`. Mutates only the coalesced Class-C
+/// `send_tracker` counter (advanced once per successful seal).
 pub async fn recovery_send_notification(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
@@ -385,12 +396,48 @@ pub async fn recovery_send_notification(
     // chokepoint-resolved 32-byte digest `context_id_bytes` (per ADR-056,
     // resolved above via `context_id_to_bytes`) used for MLS crypto keying.
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    let encrypted = deps.crypto.seal(
-        &context_id_bytes,
-        &inner,
-        &routing_id,
-        300, // 5 minute blob TTL
-    )?;
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor-owned
+    // `ContextCryptoState` (the field-granular Class-C `crypto_mut()` view), not
+    // the retired supervisor-scoped provider. Recovery notifications share the
+    // actor's authoritative send-sequence counter with ordinary sends, so this
+    // reserves from the same `send_tracker`: read the pre-increment high-water
+    // mark as the sender-layer AAD sequence (byte-identical to the provider,
+    // which read `state.send_sequence` then post-incremented), guard the
+    // `u64::MAX` overflow boundary fail-closed BEFORE sealing so nothing is
+    // emitted and the counter is left untouched at the ceiling, seal, then
+    // advance the tracker exactly once on a successful seal via the single
+    // canonical `SequenceReservation`. A `?`-early return on seal failure leaves
+    // the counter untouched, matching the provider's `checked_add(1)`
+    // fail-closed. The send-tracker bookkeeping is a coalesced Class-C mutation
+    // (the run loop persists on `mutated`), routed through the non-persisting
+    // `class_c_view`.
+    // Seal inside a block so the `class_c_view` (whose field-granular borrows of
+    // `PerContextState` are `Send + !Sync`) is dropped BEFORE the transport
+    // `.await` below — the enclosing actor future must stay `Send`.
+    let encrypted = {
+        let mut view = cell.class_c_view();
+        let aad_sequence = view.send_tracker_mut().last_issued();
+        if aad_sequence == u64::MAX {
+            return Err(ContextError::CryptoFailed(
+                "send sequence counter overflow".into(),
+            ));
+        }
+        let crypto = view.mode_mut().crypto_mut().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let encrypted = crypto.seal(
+            &context_id_bytes,
+            deps.crypto.local_did(),
+            &inner,
+            &routing_id,
+            300, // 5 minute blob TTL
+            aad_sequence,
+        )?;
+        crate::context::actor::sequence::SequenceReservation::reserve(view.send_tracker_mut())
+            .commit();
+        encrypted
+    };
 
     // Send via transport using the domain-separated routing ID.
     deps.transport.send_message(&routing_id, &encrypted).await?;
@@ -493,11 +540,16 @@ fn persist_state_best_effort<'d, 'c>(
     // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
     // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
     // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
-    // durable-blob params. The provider floor mirrors are deleted.
-    match deps.crypto.export_crypto_state(
-        &ctx_id_bytes,
+    // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
+    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
+    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
+    // sequence is read from `state.send_tracker` inside the twin.
+    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    match state.export_crypto_state(
         deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
         deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        wrapping_public_key,
+        &*wrapping_secret_key,
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {

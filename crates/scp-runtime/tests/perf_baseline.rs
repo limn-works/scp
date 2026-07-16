@@ -382,7 +382,6 @@ async fn setup_deliver(n: usize) -> Vec<Arc<DeliverInst>> {
     let mut instances = Vec::with_capacity(n);
     for i in 0..n {
         let (network, alice, bob, handle, ctx_id) = build_pair("deliver", i).await;
-        let ctx_bytes = context_id_bytes(&ctx_id);
 
         // Pre-generate one probe envelope + WARMUP+ROUNDS measured envelopes.
         // Each Alice send yields exactly one captured ciphertext (single peer);
@@ -402,9 +401,11 @@ async fn setup_deliver(n: usize) -> Vec<Arc<DeliverInst>> {
             );
             envelopes.push(captured.remove(0).1);
         }
-        // Resolve Alice's sender key on Bob's shared provider before delivery.
-        bob.pickup_sender_keys(&ctx_id, &ctx_bytes)
-            .expect("bob picks up alice sender keys");
+        // Alice's sender key was pushed on the transport during `add_member` and
+        // ingested into Bob's actor through the real receive path during
+        // `join_from_welcome` (ADR-049 PR-7, SCP-CRYPTOMOVE-001) — no explicit
+        // pre-delivery pickup is needed. The untimed correctness probe below
+        // confirms the key resolves on the actor deliver path.
 
         // Correctness probe (untimed): the actor deliver path must return real
         // application content for a genuine inbound message.
