@@ -986,7 +986,47 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             "recovery:{}:scopes={}:before={}",
             context_id, scopes, key_rotation.rotated_at,
         );
-        revocation_list.revoke(revocation_cid);
+        revocation_list.revoke(revocation_cid.clone());
+
+        // Best-effort: anchor the revocation in the Merkle event log so
+        // auditors can verify UCAN invalidation without re-running recovery.
+        if let Some(elp) = self.manager.event_log_ref() {
+            let ctx_bytes = crate::context::state::context_id_to_bytes(context_id);
+            match scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::TokenRevokedPayload {
+                    revocation_cid: revocation_cid.clone(),
+                    scopes: key_rotation.rotated_key_scopes.clone(),
+                    revoked_at: key_rotation.rotated_at,
+                },
+            ) {
+                Ok(payload) => {
+                    let ts_secs = key_rotation.rotated_at / 1000;
+                    if let Err(e) = elp
+                        .append_context_event_with_payload(
+                            &ctx_bytes,
+                            scp_event_log::EventType::TokenRevoked,
+                            key_rotation.did_after.as_ref(),
+                            payload,
+                            ts_secs,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            context_id = %context_id,
+                            error = %e,
+                            "TokenRevoked event-log append failed (best-effort)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = %e,
+                        "TokenRevoked payload encode failed (best-effort)"
+                    );
+                }
+            }
+        }
 
         // Serialize the revocation list for distribution.
         let revocation_payload =

@@ -289,6 +289,23 @@ pub struct MediaSessionEndedPayload {
     pub ended_at: u64,
 }
 
+/// Payload for [`EventType::TokenRevoked`](crate::EventType::TokenRevoked)
+/// (ADR-011 amendment; issue #1847 Phase 1.3).
+///
+/// Records the UCAN token revocation anchored in the Merkle log immediately
+/// after `RevocationList::revoke()` so the revocation is durably verifiable.
+/// Field order is the wire contract under positional `MessagePack` —
+/// **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenRevokedPayload {
+    /// The revocation CID / marker string (e.g. `"recovery:{ctx}:scopes={s}:before={t}"`).
+    pub revocation_cid: String,
+    /// The key scopes that were revoked (e.g. `["#agent"]`, `["#active", "#agent"]`).
+    pub scopes: Vec<String>,
+    /// Unix timestamp (milliseconds) of the key rotation that triggered revocation.
+    pub revoked_at: u64,
+}
+
 /// Builds the durable Merkle-leaf payload bytes for a consequence-enforcement
 /// event.
 ///
@@ -882,6 +899,34 @@ mod tests {
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 5);
         let decoded: MediaSessionStartedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn token_revoked_payload_round_trip() {
+        let p = TokenRevokedPayload {
+            revocation_cid: "recovery:ctx-001:scopes=#agent:before=1700000000".to_owned(),
+            scopes: vec!["#agent".to_owned()],
+            revoked_at: 1_700_000_000,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 3-field struct → fixarray of length 3
+        assert_positional_array(&encoded.data, 3);
+        let decoded: TokenRevokedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn token_revoked_payload_multi_scope_round_trip() {
+        // IdentityKey tier: both #active and #agent scopes revoked together.
+        let p = TokenRevokedPayload {
+            revocation_cid: "recovery:ctx-abc:scopes=#active,#agent:before=1700009999".to_owned(),
+            scopes: vec!["#active".to_owned(), "#agent".to_owned()],
+            revoked_at: 1_700_009_999,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 3);
+        let decoded: TokenRevokedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 }
