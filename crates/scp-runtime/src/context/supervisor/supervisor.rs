@@ -32208,6 +32208,254 @@ mod streaming_saga_tests {
         drop(recording);
     }
 
+    /// SCP-OUT-046 PASS-2 RESIDUAL CRITICAL — the settle handler must be
+    /// SELF-idempotent, not merely crash-atomic. The
+    /// `..._recovers_exactly_once` sibling above proves SEQUENTIAL double-recovery
+    /// is safe; it does NOT prove that TWO settles for the SAME unsettled witness
+    /// (against the MATCHING generation) move money exactly once. That is the
+    /// concurrent-double-settle race the residual CRITICAL flags: a mobile
+    /// `resume()` sweep racing the live seal task, or two overlapping recovery
+    /// sweeps, both dispatch `settle_outlet_stream_via_actor` for the same witness.
+    /// Without the in-closure `!settled` gate the money move (release + refund +
+    /// capture) runs UNCONDITIONALLY when the witness is present → double
+    /// `reverse_spend`, double §7.3.8 `AmountCumulative` release (re-spend past the
+    /// cap), double capture.
+    ///
+    /// The per-context actor serializes every settle through its mailbox, so the
+    /// in-closure flag read+set is authoritative: the FIRST settle moves the money
+    /// and flips `settled`; the SECOND observes `settled == true` and is a total
+    /// no-op (no release/refund/capture) while still resolving `Committed`
+    /// (`applied == true`, receipt `None`). The two settles are submitted
+    /// CONCURRENTLY (`tokio::join!`) to exercise the race, not sequenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_concurrent_double_settle_moves_money_exactly_once() {
+        use crate::context::actor::commands::StreamSettleApplication;
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let supervisor =
+            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+        spawn_ss_pair(&supervisor).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x46; 16]);
+        let executor = Arc::new(PrefixThenBlockExecutor {
+            data_chunks: 5,
+            invoked: Arc::clone(&invoked),
+        });
+        let target_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+
+        let mut handle = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x46u8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                executor,
+                Some(binding),
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                params,
+            )
+            .await
+            .expect("the paid streaming saga starts");
+
+        let saga_id = handle.saga_id.clone();
+        let target_hex = hex::encode(SS_TARGET);
+        let actor = supervisor
+            .lookup(&target_hex)
+            .expect("target actor resident");
+
+        // Drain the 5-chunk prefix (the executor wedges before a terminal).
+        let mut received: Vec<_> = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_secs(1), handle.receiver.recv()).await
+        {
+            received.push(frame.chunk.clone());
+        }
+        assert_eq!(received.len(), 5, "the 5-chunk prefix forwarded");
+
+        // Settle barrier — force the in-flight durable StreamCaptureAppend folds to
+        // land before we seal (same FIFO mailbox).
+        for _ in 0..25 {
+            let sid = saga_id.clone();
+            let _ = actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
+                        saga_id: sid,
+                        reply,
+                    })
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Seal the witness (settled=false) + get the rebuilt settlement + B's
+        // seal-time generation — WITHOUT applying the money move (the seal task's
+        // handoff point).
+        let outcome = {
+            let sid = saga_id.clone();
+            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
+                        saga_id: sid,
+                        terminal_status:
+                            scp_protocol::context::outlets::stream::StreamTerminalStatus::Error(
+                                "concurrent-settle seal".to_owned(),
+                            ),
+                        cancel_ack_seq: None,
+                        target_signing_key: target_key_bytes,
+                        reply,
+                    })
+                })
+                .await
+                .expect("the seal handler inserts the witness + returns the settlement")
+        };
+        let k = outcome.billed_count as usize;
+        assert!((1..=5).contains(&k), "sealed a non-empty prefix (got {k})");
+        let rebuilt = outcome
+            .settlement
+            .as_deref()
+            .expect("the FIRST seal returns Some(settlement) — the money has NOT moved")
+            .clone();
+        let generation = outcome.generation;
+
+        // No money has moved yet: escrow fully held, nothing captured.
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_RESERVED),
+            "the escrow is fully HELD in the seal→settle window (no refund yet)"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            0,
+            "no capture in the window"
+        );
+
+        // THE RACE: two settles for the SAME unsettled witness, MATCHING generation,
+        // submitted CONCURRENTLY. The actor mailbox serializes them — one moves the
+        // money and flips `settled`; the other reads `settled == true` and no-ops.
+        let (r1, r2) = tokio::join!(
+            supervisor.settle_outlet_stream_via_actor(
+                rebuilt.clone(),
+                generation,
+                Some(saga_id.clone()),
+            ),
+            supervisor.settle_outlet_stream_via_actor(
+                rebuilt.clone(),
+                generation,
+                Some(saga_id.clone()),
+            ),
+        );
+        let a1 = r1.expect("first concurrent settle dispatch succeeds");
+        let a2 = r2.expect("second concurrent settle dispatch succeeds");
+
+        // BOTH resolve Committed (applied=true): the money moved exactly once, on
+        // whichever settle won the mailbox race.
+        assert!(
+            a1.applied && a2.applied,
+            "both concurrent settles resolve Committed (applied=true)"
+        );
+        // EXACTLY ONE captured a PaymentReceipt — the winner. The loser observed
+        // `settled == true` and returned `Settled(None)` (no capture).
+        assert_eq!(
+            usize::from(a1.receipt.is_some()) + usize::from(a2.receipt.is_some()),
+            1,
+            "exactly ONE of the two concurrent settles captured a receipt \
+             (the other is the idempotent no-op)"
+        );
+
+        // Money conservation: the escrow refund (reserved − billed) is credited
+        // EXACTLY ONCE. Because the §7.3.8 `AmountCumulative` counter release lives
+        // in the SAME `commit_class_s_keep` closure behind the SAME `!settled` gate
+        // as this refund, refund-exactly-once transitively proves the counter was
+        // RELEASED EXACTLY ONCE — a double release cannot occur without a double
+        // refund, which this assertion would catch.
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_COST * k as u64),
+            "CRITICAL: the refund (and the coupled §7.3.8 counter release) is applied \
+             EXACTLY ONCE across two concurrent settles"
+        );
+        // The billed PaymentReceipt is captured EXACTLY ONCE — no double-bill.
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            1,
+            "CRITICAL: exactly ONE PaymentReceipt captured across two concurrent settles"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            1,
+            "the outlet is never re-invoked"
+        );
+
+        // The witness is now SETTLED and a re-check rebuilds NO settlement, so any
+        // further settle / recovery is a guaranteed no-op.
+        let status = {
+            let sid = saga_id.clone();
+            actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
+                        saga_id: sid,
+                        reply,
+                    })
+                })
+                .await
+                .expect("witness re-check")
+        };
+        assert!(
+            status.present && status.settled,
+            "witness present + settled"
+        );
+        assert!(
+            status.settlement.is_none(),
+            "a settled witness rebuilds NO settlement — no further money moves"
+        );
+
+        // A THIRD settle (a late straggler) is still a total no-op.
+        let third: StreamSettleApplication = supervisor
+            .settle_outlet_stream_via_actor(rebuilt.clone(), generation, Some(saga_id.clone()))
+            .await
+            .expect("third settle dispatch succeeds");
+        assert!(
+            third.applied,
+            "the straggler resolves Committed (applied=true)"
+        );
+        assert!(
+            third.receipt.is_none(),
+            "the straggler captures nothing (idempotent no-op)"
+        );
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED - SS_COST * k as u64),
+            "CRITICAL: a third settle does NOT double-refund"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            1,
+            "CRITICAL: a third settle does NOT double-capture"
+        );
+
+        drop(recording);
+    }
+
     /// COMMIT 3 — AC2: the Commit-transition RELEASES the per-participant-context-set
     /// concurrency slot once the pump is triggered (ADR-049 §3a amendment (b)).
     ///
