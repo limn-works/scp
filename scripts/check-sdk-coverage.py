@@ -922,10 +922,10 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["resume"],
     },
     # Bridge -- Python uses bare 'register' and 'evaluate_trust'.
-    # TypeScript does not expose bridge_register as a named public SDK function
-    # (matrix: typescript=false); the entry below covers only the SDKs that do.
+    # TypeScript exports bridgeRegister (src/index.ts re-exports from src/bridge.ts).
     ("Bridge", "register"): {
         "python": ["register"],
+        "typescript": ["bridgeRegister"],
     },
     ("Bridge", "evaluate_trust"): {
         "python": ["evaluate_trust"],
