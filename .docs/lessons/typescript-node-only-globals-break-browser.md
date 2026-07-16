@@ -1,16 +1,22 @@
-# Node-Only Globals Silently Break the Browser/WASM Path
+# Node-Only Globals Silently Break Cross-Environment Code Paths
 
 **Date:** 2026-07-15
 **Source:** branch `fix/sdk-coverage-fail-closed-and-parity` — `bindings/typescript/src/trust.ts`
 
+**Note:** As of ADR-055 (PR #1934), the `scp-ffi/wasm` bridge is removed and
+`bindings/typescript/` is NAPI-only (Node/Bun). The pattern documented here
+was a real bug found during development. The principle remains relevant for any
+TypeScript utility code intended to run cross-environment (e.g. shared helpers
+used in future browser-facing SDKs under ADR-057's shared-wasm model).
+
 ## The trap
 
-`bindings/typescript/` ships one codebase that runs in **two** environments: Node/Bun
-(NAPI bridge) and the browser/edge (WASM bridge). Node globals — `Buffer`, `process`,
-`setImmediate` — do **not** exist in the browser. Referencing one there throws
-`ReferenceError`. The compiler will not catch it: `Buffer` is a valid ambient type in a
-TypeScript project with `@types/node`, so browser-only breakage sails through `tsc` and
-through every test that happens to run under Node/Bun.
+TypeScript utility code compiled for cross-environment use may reference Node globals —
+`Buffer`, `process`, `setImmediate` — that do **not** exist in the browser or edge
+runtimes. Referencing one throws `ReferenceError`. The compiler will not catch it:
+`Buffer` is a valid ambient type in a TypeScript project with `@types/node`, so
+browser-only breakage sails through `tsc` and through every test that happens to run
+under Node/Bun.
 
 ## What happened
 
@@ -29,8 +35,7 @@ The two failure amplifiers, together, made this near-undetectable:
 
 ## The fix pattern
 
-Feature-detect the global and fall back to Web-standard APIs. Mirror the existing
-`src/internal/wasm.ts` helpers (which already do this for base64 encode/decode):
+Feature-detect the global and fall back to Web-standard APIs:
 
 ```ts
 function __decodeBase64UrlToUtf8(segment: string): string {
@@ -58,8 +63,8 @@ branch is dead code that regresses the moment someone "simplifies" it back to `B
 
 ## The rule
 
-- In `bindings/typescript/`, treat `Buffer`, `process`, `setImmediate`, and any other
-  Node global as **absent** on any code path reachable from the WASM bridge. Feature-detect
+- Treat `Buffer`, `process`, `setImmediate`, and any other Node global as **absent**
+  on any code path intended to run cross-environment. Feature-detect
   (`typeof X !== "undefined"`) and provide a Web-standard fallback (`atob`/`btoa`,
   `TextEncoder`/`TextDecoder`, `crypto.subtle`, `queueMicrotask`).
 - `@types/node` in the project makes these compile — the type checker is **not** a guard
@@ -68,5 +73,3 @@ branch is dead code that regresses the moment someone "simplifies" it back to `B
 - Never let a `try/catch` swallow a `ReferenceError` into a fail-closed value. A missing
   global is a build/packaging defect, not a data-validity outcome — folding it into
   `null`/all-false hides the defect behind a plausible verdict.
-- Prefer reusing the established cross-env helpers in `src/internal/wasm.ts` over rolling
-  a new one per call site.

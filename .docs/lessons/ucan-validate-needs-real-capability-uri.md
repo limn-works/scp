@@ -51,8 +51,7 @@ if (/^\[SCP-PERM-3001\]/.test(msg)) {
 
 Re-throws (both TS and Python):
 - `[SCP-PERM-3030]` — handle-affinity misuse (the token's context handle belongs to a different SCP instance). This is a programming error and must propagate visibly.
-- `[SCP-PERM-3000]` — WASM manager permission failures.
-- `[SCP-CTX-2023]` — context-state lookup/writeback faults (see "WASM error routing" below).
+- `[SCP-CTX-2023]` — context-state lookup/writeback faults.
 - Any other code — unknown codes are genuine faults, not UCAN pipeline or URI-parse outcomes.
 
 ## Closed allowlist, not open denylist — for error absorption
@@ -77,37 +76,20 @@ and "absorb by default" turns every unmodeled fault into a false verdict. Keep
 Python and TypeScript in lockstep: Python's `if not error_msg.startswith("[SCP-PERM-3001]"): raise`
 mirrors TS's `if (/^\[SCP-PERM-3001\]/.test(msg)) { ... } ... throw error`.
 
-## WASM error routing: don't route infrastructure faults to an absorbed code
+## Bridge error routing: don't route infrastructure faults to an absorbed code
 
 Because Layer 1 absorbs `[SCP-PERM-3001]` silently, **which code a bridge stamps on a
-failure decides whether that failure is visible.** The WASM bridge originally wrapped
-context-state lookup/writeback failures (`with_manager` errors) as
-`UcanError::MalformedToken` → `[SCP-PERM-3001]`. That routed a genuine infrastructure
-fault straight into the absorb path: WASM returned all-false where NAPI — which emits
-`[SCP-CTX-2023]` via `ensure_registered` for the same runtime condition — correctly
-re-threw. A silent WASM/NAPI parity break.
+failure decides whether that failure is visible.** A UCAN validation entrypoint has (at
+least) two failure classes — *the token failed the protocol* vs *the infrastructure
+failed to evaluate it*. They MUST carry distinct error codes, because a downstream
+absorber keys on the code to decide visible-fault vs trust-verdict.
 
-Fix pattern (`crates/scp-ffi/wasm/src/ucan.rs`): introduce a `WasmValidateError` enum
-that separates the two failure classes at the source, so callers route each to the
-right code:
+Never collapse an infrastructure fault (e.g. context-state lookup/writeback) into the
+protocol-failure code just because it is convenient — always emit `[SCP-CTX-2023]` for
+context-state faults (so they re-throw) and `[SCP-PERM-3001]` only for real pipeline
+errors (so they absorb into a partial or all-false verdict).
 
-```rust
-enum WasmValidateError {
-    Ucan(UcanError),  // step 1–11 pipeline failure → [SCP-PERM-3001] (absorbed by trust.ts)
-    Context(String),  // with_manager state fault  → [SCP-CTX-2023]  (re-thrown by trust.ts)
-}
-```
-
-`run_validate_ucan` returns `Context(_)` for every `with_manager` failure and
-`Ucan(_)` only for real pipeline errors. Both `ucan_validate` and
-`validate_tool_ucan_wasm` `match` on the enum and stamp the matching code.
-
-**Rule:** a UCAN validation entrypoint has (at least) two failure classes — *the token
-failed the protocol* vs *the infrastructure failed to evaluate it*. They MUST carry
-distinct error codes, because a downstream absorber keys on the code to decide
-visible-fault vs trust-verdict. Never collapse an infrastructure fault into the
-protocol-failure code just because it is convenient (`MalformedToken(format!(...))`) —
-match the sibling bridge's code for the equivalent condition.
+**Rule:** match the error code to the failure class, not to the convenient catch block.
 
 ## Rules
 
@@ -137,28 +119,28 @@ Do not treat a green Layer-1 `CapabilityValidation` as an authorization decision
 Binding a token to a subject (ensuring `aud == subjectDid`) is likewise the
 upstream credential-issuance flow's job, not Layer 1's.
 
-## The `_PASSED_BEFORE` inference is a stringly-typed heuristic — treat it as fragile
+## Historical: `_PASSED_BEFORE` inference (superseded by ADR-059)
 
-Layer 1 does not receive structured per-step results from the bridge. When a token
-fails, it gets one error *message string*, classifies it into a pipeline stage
-(`__classifyUcanError` / `_classify_ucan_error` — prefix matching on the Display
-text), then infers "everything before this stage must have passed" via the
-`__PASSED_BEFORE` / `_PASSED_BEFORE` map. Two hidden assumptions make this fragile:
+> **Note:** The Display-string classification approach described in this section was
+> superseded by ADR-059 (structured `ucan_evaluate` → `CapabilityValidation`). The
+> typed bridge op now returns six booleans directly; no string parsing occurs. This
+> section is preserved as historical context explaining the design trap.
 
-1. **Fixed step ordering.** The map hardcodes the 11-step pipeline sequence (parse →
-   signatures → ceiling → nonce → revoked → expiry). If `validate.rs` reorders steps,
-   the inference silently reports wrong `true` fields for every failure.
-2. **Message-string stability.** Classification is prefix matching on `thiserror`
-   Display strings. Reword a message in the Rust pipeline and the classifier drops to
-   `"unknown"` → all-false, or worse, misclassifies into a more-passing category.
+The old Layer 1 did not receive structured per-step results from the bridge. When a
+token failed, it got one error *message string*, classified it into a pipeline stage
+(`__classifyUcanError` / `_classify_ucan_error` — prefix matching on the Display text),
+then inferred "everything before this stage must have passed" via the `__PASSED_BEFORE`
+/ `_PASSED_BEFORE` map. Two hidden assumptions made this fragile:
 
-This is why the revocation-prefix set must contain *exactly* `"token revoked:"` and
-must exclude the operational admin-side messages (see below): the classifier cannot
-tell a step-10 pipeline result from an unrelated message that happens to share a
-prefix. The safe failure mode is `"unknown"` → all-false; any change that lets a
-non-pipeline message map to a passing stage is a regression. These string-coupling
-invariants are pinned by conformance gates in both SDKs — if a gate goes red, find
-why the bridge changed its message; do not adjust the prefixes to make it pass.
+1. **Fixed step ordering.** The map hardcoded the 11-step pipeline sequence. If
+   `validate.rs` reordered steps, the inference silently reported wrong `true` fields.
+2. **Message-string stability.** Reword a message in the Rust pipeline and the
+   classifier drops to `"unknown"` → all-false, or misclassifies into a more-passing
+   category.
+
+**Why ADR-059 replaced this:** the safe failure mode (all-false on unknown) meant any
+Rust Display-string change was a silent regression in SDK trust reporting. Typed results
+from `ucan_evaluate` are stable and don't couple SDKs to prose.
 
 ## Multi-att limitation: only att[0] is validated
 
@@ -189,10 +171,12 @@ classify as `"unknown"` → all-false (fail-closed). They must be kept **out** o
 token could then be misclassified into a more-passing category if the Rust pipeline
 messages ever changed, narrowing the `not_revoked` verdict incorrectly.
 
-This cross-SDK invariant is pinned by the conformance gate
-`test_operational_errors_classify_as_unknown` in `tests/test_ucan_conformance.py`.
-If that gate is red, do not add the operational prefixes to fix it — find why the bridge
-is emitting them from step 10 (it shouldn't be).
+This cross-SDK invariant was previously pinned by `test_operational_errors_classify_as_unknown`
+in `tests/test_ucan_conformance.py` (removed with ADR-059 — the typed `CapabilityValidation`
+struct enforces the same property structurally). Under the typed path, operational messages
+that don't match UCAN pipeline stages produce a non-`PERM-3001` error code, which the SDK
+re-throws rather than absorbs — the invariant is now enforced by the absorption allowlist
+itself rather than a conformance gate.
 
 ## See also
 
