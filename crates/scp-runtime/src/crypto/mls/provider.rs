@@ -519,16 +519,16 @@ pub struct MlsCryptoProvider {
     /// different call-site remediations — the former indicates a
     /// create-before-send ordering bug, the latter indicates a caller
     /// reaching through the provider after actor ownership has been
-    /// transferred (post-12b.2b that caller should route through the
-    /// actor's mailbox instead).
+    /// transferred — that caller should route through the actor's mailbox
+    /// instead.
     ///
     /// # Lifecycle
     ///
     /// - Insert: on successful [`Self::take_crypto_state`].
-    /// - Remove: never in this commit — actor ownership is one-way during
-    ///   the 12b.2a → 12 window. Commit 12 deletes the provider
-    ///   entirely; until then a taken context stays taken for the
-    ///   provider's lifetime.
+    /// - Remove: never — actor ownership is permanently one-way. A taken
+    ///   context stays taken for the provider's lifetime; the crypto never
+    ///   returns to the provider. Full provider dissolution is deferred
+    ///   (ADR-049 §6).
     ///
     /// Lock-free [`DashSet`] — the prior `std::sync::Mutex<HashSet>`
     /// wrapper was removed in ADR-049 commit 12c.9f.
@@ -683,12 +683,11 @@ impl MlsCryptoProvider {
     ///
     /// # Invariant
     ///
-    /// Actor ownership is one-way during the 12b.2a → 12f migration
-    /// window. Once taken, a context's crypto state does not return to
-    /// the provider — the actor becomes the sole authority for its
-    /// lifetime. This matches plan §"`MlsCryptoProvider` dissolution":
-    /// production lookups (publish, subscribe, etc.) reach the crypto
-    /// state only through the actor's mailbox post-12b.2b.
+    /// Actor ownership is permanent and one-way. Once taken, a context's
+    /// crypto state never returns to the provider — the actor becomes the
+    /// sole authority for that context's crypto for the rest of its
+    /// lifetime. Production lookups (publish, subscribe, etc.) reach the
+    /// crypto state only through the actor's mailbox.
     ///
     /// # Errors
     ///
@@ -700,11 +699,15 @@ impl MlsCryptoProvider {
     ///   poisoned (caller should treat this as fatal — the provider is
     ///   now inconsistent).
     ///
-    /// # Scope — infrastructure only
+    /// # Production call sites
     ///
-    /// This commit wires the move path but no production call site
-    /// invokes it yet. The first production caller arrives in commit
-    /// 12b.2b with the atomic messaging-handler migration.
+    /// Invoked at the two owned-state spawn seams: the CREATE seam
+    /// ([`crate::context::lifecycle_helpers`] finalize, after the provider
+    /// births the group) and the WELCOME seam
+    /// ([`crate::context::supervisor`] welcome processing). Each takes the
+    /// freshly-born crypto out of the provider and seeds it into the
+    /// spawning actor's `PerContextState` via
+    /// [`seed_encrypted_crypto_from_owned`](crate::context::actor::state::PerContextState::seed_encrypted_crypto_from_owned).
     pub fn take_crypto_state(
         &self,
         context_id: &[u8; 32],
@@ -1806,10 +1809,6 @@ impl MlsCryptoProvider {
     /// halves through one `.load()` makes the pair atomic by construction, so a
     /// rotation can never pair a public of generation N with a secret of N+1.
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "ADR-049 PR-7 prep B (SCP-CRYPTOMOVE-000b) / H3: node-resident accessor lands ahead of the atomic move; production caller is the atomic core actor-seeding path (SCP-CRYPTOMOVE-001). Exercised now by a crate-internal unit test."
-    )]
     pub(crate) fn wrapping_keypair(&self) -> ([u8; 32], zeroize::Zeroizing<[u8; 32]>) {
         let guard = self.wrapping_keypair.load();
         (guard.public, zeroize::Zeroizing::new(*guard.secret))

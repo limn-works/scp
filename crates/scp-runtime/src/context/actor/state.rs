@@ -753,10 +753,6 @@ impl ContextModeState {
     /// `&mut ContextCryptoState` (coalesced Class-C) rather than a whole
     /// `&mut PerContextState` (fail-closed Class-S). Broadcast contexts carry no
     /// MLS crypto state and seal through [`BroadcastState`] instead.
-    #[allow(
-        dead_code,
-        reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): production callers (the send/receive seal/open seams) wire in as the atomic-core seams land."
-    )]
     pub(crate) fn crypto_mut(&mut self) -> Option<&mut ContextCryptoState> {
         match self {
             Self::Encrypted(crypto) => Some(crypto),
@@ -768,7 +764,11 @@ impl ContextModeState {
     /// broadcast context. Companion to [`Self::crypto_mut`].
     #[allow(
         dead_code,
-        reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): production callers wire in as the atomic-core seams land."
+        reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): immutable read twin of \
+                  crypto_mut. The send/receive seams reach the crypto through \
+                  the &mut crypto_mut accessor, so this shared-read companion \
+                  currently has no caller; retained for read-only call sites \
+                  and symmetry with crypto_mut."
     )]
     pub(crate) fn crypto(&self) -> Option<&ContextCryptoState> {
         match self {
@@ -2131,16 +2131,29 @@ impl ContextCryptoState {
 // they are NOT re-implemented. Byte-identity with the retained provider twins
 // is guarded by the golden tests in this module (`crypto_ops_golden`).
 //
-// The provider's own copies are RETAINED (this story does NOT delete them or
-// change any `deps.crypto.*` call site); the atomic core SCP-CRYPTOMOVE-001
-// deletes them and wires production callers to these methods. Until then these
-// methods have no production caller, so `dead_code` is allow-listed additively.
+// The per-context methods below are the actor-side twins on the actor's OWNED
+// `PerContextState`. A subset is production-wired: the CREATE/WELCOME seed via
+// `seed_encrypted_crypto_from_owned`, plus `advance_epoch` / `add_member`. The
+// remaining sender-key-exchange and teardown twins are exercised only by this
+// module's golden byte-identity and two-party seam tests; their corresponding
+// production operations, where they exist, run on the retained provider
+// birth/teardown seam (e.g. `destroy_mls_group`) or through dedicated delivery
+// helpers on the actor-owned state (e.g. `drain_and_deliver_sender_keys` →
+// `mls_encrypt_management`, which replaced the deleted provider drain), pending
+// full provider dissolution (ADR-049 §6). In the `--no-default-features` lib
+// build (no tests) those twins have no caller, so `dead_code` is allow-listed
+// additively across the impl.
 #[allow(
     dead_code,
-    reason = "ADR-049 PR-7 prep A (SCP-CRYPTOMOVE-000a): PerContextState crypto \
-              methods land ahead of the atomic move; production callers wire in \
-              the atomic core SCP-CRYPTOMOVE-001. Exercised now by the \
-              golden byte-identity tests in this module."
+    reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): actor-side per-context crypto \
+              twins on the actor-owned `PerContextState`. A subset is \
+              production-wired (CREATE/WELCOME seed, advance_epoch, add_member); \
+              the remaining sender-key-exchange and teardown twins are exercised \
+              only by this module's golden and two-party seam tests, so they \
+              have no caller in the --no-default-features lib build. Their \
+              production counterparts, where they exist, route through the \
+              retained provider seam or dedicated actor-owned delivery helpers \
+              pending full provider dissolution (ADR-049 §6)."
 )]
 impl PerContextState {
     /// `&mut` access to the encrypted-mode crypto state, or the provider's
