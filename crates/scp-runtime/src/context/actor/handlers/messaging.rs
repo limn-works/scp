@@ -337,7 +337,7 @@ async fn handle_handle_sender_key_request(
     deps: &ActorDeps,
     context_id: &str,
     request_bytes: &[u8],
-    requester_public_key: &[u8],
+    requester_public_key: &[u8; 32],
     reply: oneshot::Sender<Result<Option<Vec<u8>>, ContextError>>,
 ) -> Outcome<()> {
     let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);

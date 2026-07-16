@@ -1899,6 +1899,18 @@ impl ContextCryptoState {
     /// last window cannot open a re-spend / re-grant window (the Class-S
     /// fail-closed rationale does not apply, per spec §9.16).
     ///
+    /// **Accepted crash-replay window (≤300s).** Concretely, an actor crash in
+    /// the ≤50ms coalesce window can lose the `nonce_dedup.record` of a just-
+    /// answered request, so on respawn the SAME request (if replayed while still
+    /// within `NONCE_EXPIRY_SECS` = 300s of freshness) is answered a SECOND time.
+    /// That re-answer re-seals the identical sender key to the identical ephemeral
+    /// `wrapping_pubkey` the requester already holds — it grants the requester
+    /// nothing it was not already granted, leaks no new key material, and never
+    /// re-opens a downward-authorization decision. The bounded (≤300s, then the
+    /// stale request fails the freshness gate) replay of an idempotent re-seal is
+    /// the documented, accepted Class-C residual for this field — it is NOT an
+    /// authorization break and deliberately does NOT warrant a Class-S persist.
+    ///
     /// Answering needs NO signing key: the response is HPKE-sealed to the fresh
     /// EPHEMERAL `request.wrapping_pubkey`, so this is a clean receive-side move
     /// — not new signed-request protocol.
@@ -1918,7 +1930,10 @@ impl ContextCryptoState {
         local_did: &str,
         now_secs: u64,
         request_bytes: &[u8],
-        requester_public_key: &[u8],
+        // api-design: an Ed25519 verification key is EXACTLY 32 bytes — encode the
+        // width in the type so a mis-sized key is a compile error, not a runtime
+        // signature failure. Every caller already passes `VerifyingKey::as_bytes()`.
+        requester_public_key: &[u8; 32],
         blocked_dids: &std::collections::HashSet<String>,
     ) -> Result<Option<Vec<u8>>, ContextError> {
         let ctx_id_hex = hex::encode(context_id);
@@ -2027,7 +2042,14 @@ impl ContextCryptoState {
             request_nonce: request.nonce,
         };
 
-        let message = rmp_serde::to_vec_named(&response)
+        // BLACK-P7-2 (wire format): wrap the answer in the
+        // `SenderKeyDistributionMessage::KeyResponse` envelope the receiver
+        // parses (`decrypt_and_dispatch` → `SenderKeyDistributionMessage::from_bytes`),
+        // matching the proactive PUSH path (`distribute_sender_key`, above). A
+        // bare `SenderKeyResponse` here would fail the receiver's enum decode and
+        // silently drop the pulled key.
+        let message = SenderKeyDistributionMessage::KeyResponse(response)
+            .to_bytes()
             .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))?;
 
         // Record nonce only after successful processing (so a request that fails
@@ -4343,23 +4365,23 @@ mod crypto_ops_golden {
         }
     }
 
-    /// Byte-identity golden ORACLE test for the §9.16.2 sender-key ANSWER half
-    /// (ADR-049 PR-7): the actor
-    /// [`ContextCryptoState::handle_sender_key_request`] and the retained
-    /// provider oracle [`MlsCryptoProvider::handle_sender_key_request`] recover
-    /// the IDENTICAL sender key (and echo identical response metadata) for a
-    /// member requester.
+    /// §9.16.2 sender-key ANSWER round-trip (ADR-049 PR-7): the actor
+    /// [`ContextCryptoState::handle_sender_key_request`] seals its local sender
+    /// key to a member requester's fresh ephemeral wrapping key, and the
+    /// requester recovers Alice's ACTUAL local sender key — the ground truth —
+    /// plus the response metadata (`sender_did` / `epoch` / echoed nonce).
     ///
-    /// The sealed ciphertext is HPKE-randomised (a fresh ephemeral per answer),
-    /// so the deterministic golden — as in
-    /// [`golden_distribute_and_process_recover_identical_key`] — is the
-    /// RECOVERED key plus the response `sender_did` / `epoch` / echoed nonce. The
-    /// oracle is driven BEFORE the destructive `take_into_actor` (which moves
-    /// Alice's crypto — including its nonce-dedup cache — onto the actor); the
-    /// actor is then driven with a SECOND, fresh-nonce request (a replay of the
-    /// first would be rejected by the moved dedup cache).
+    /// The answer is the `SenderKeyDistributionMessage::KeyResponse` envelope the
+    /// production receive path parses (BLACK-P7-2), so the test decodes the enum,
+    /// not a bare `SenderKeyResponse`. This is a self-contained actor round-trip:
+    /// the earlier oracle-vs-actor byte comparison was DROPPED — the retained
+    /// provider `handle_sender_key_request` is a test FIXTURE builder, not a wire
+    /// authority, so agreement with a second copy of the same code proved nothing
+    /// the ground-truth assert below does not. The sealed ciphertext is
+    /// HPKE-randomised (fresh ephemeral per answer), so the deterministic golden
+    /// is the RECOVERED key, not the ciphertext bytes.
     #[test]
-    fn golden_handle_sender_key_request_actor_matches_oracle() {
+    fn golden_handle_sender_key_request_actor_round_trip() {
         use ed25519_dalek::Signer as _;
         use scp_clock::Clock as _;
 
@@ -4374,55 +4396,35 @@ mod crypto_ops_golden {
         let bob_verifying_key = bob_request_signing_key.verifying_key();
 
         // Build a signed SenderKeyRequest for Alice's key, sealing to a fresh
-        // ephemeral X25519 wrapping keypair. Returns (request_bytes, secret).
-        let build_request = |nonce: [u8; 16]| -> (Vec<u8>, [u8; 32]) {
-            let (wrapping_pub, wrapping_secret) =
-                scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
-            let timestamp = SystemClock.now_secs();
-            let hash =
-                scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
-                    BOB,
-                    ALICE,
-                    1,
-                    &wrapping_pub,
-                    &nonce,
-                    timestamp,
-                )
-                .unwrap();
-            let signature: [u8; 64] = bob_request_signing_key.sign(&hash).to_bytes();
-            let request = scp_protocol::crypto::sender_keys::SenderKeyRequest {
-                requester_did: BOB.to_owned(),
-                sender_did: ALICE.to_owned(),
-                epoch: 1,
-                wrapping_pubkey: wrapping_pub,
-                nonce,
-                timestamp,
-                signature,
-            };
-            (rmp_serde::to_vec_named(&request).unwrap(), wrapping_secret)
-        };
-
-        // 1. ORACLE (provider), BEFORE the destructive take.
-        let (req1_bytes, secret1) = build_request([1u8; 16]);
-        let resp_oracle_bytes = alice_p
-            .handle_sender_key_request(&ctx, &req1_bytes, bob_verifying_key.as_bytes(), &blocked)
-            .expect("oracle answers a member request")
-            .expect("member requester receives a response");
-        let resp_oracle: SenderKeyResponse = rmp_serde::from_slice(&resp_oracle_bytes).unwrap();
-        let key_oracle = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
-            &resp_oracle.hpke_sealed_key,
-            &resp_oracle.ephemeral_pubkey,
-            &secret1,
-            &ctx_hex,
-            &resp_oracle.sender_did,
-            resp_oracle.epoch,
+        // ephemeral X25519 wrapping keypair.
+        let nonce = [2u8; 16];
+        let (wrapping_pub, wrapping_secret) =
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        let timestamp = SystemClock.now_secs();
+        let hash = scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
+            BOB,
+            ALICE,
+            1,
+            &wrapping_pub,
+            &nonce,
+            timestamp,
         )
         .unwrap();
+        let signature: [u8; 64] = bob_request_signing_key.sign(&hash).to_bytes();
+        let request = scp_protocol::crypto::sender_keys::SenderKeyRequest {
+            requester_did: BOB.to_owned(),
+            sender_did: ALICE.to_owned(),
+            epoch: 1,
+            wrapping_pubkey: wrapping_pub,
+            nonce,
+            timestamp,
+            signature,
+        };
+        let req_bytes = rmp_serde::to_vec_named(&request).unwrap();
 
-        // 2. ACTOR, after the take, with a fresh-nonce request.
+        // Move Alice's crypto onto the actor and answer.
         let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
-        let (req2_bytes, secret2) = build_request([2u8; 16]);
-        let resp_actor_bytes = {
+        let resp_bytes = {
             let crypto = match &mut alice_a.mode {
                 ContextModeState::Encrypted(c) => c.as_mut(),
                 ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
@@ -4432,41 +4434,44 @@ mod crypto_ops_golden {
                     &ctx,
                     ALICE,
                     SystemClock.now_secs(),
-                    &req2_bytes,
+                    &req_bytes,
                     bob_verifying_key.as_bytes(),
                     &blocked,
                 )
                 .expect("actor answers a member request")
                 .expect("member requester receives a response")
         };
-        let resp_actor: SenderKeyResponse = rmp_serde::from_slice(&resp_actor_bytes).unwrap();
+
+        // The answer is the KeyResponse envelope the production receiver parses.
+        let resp = match scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+            &resp_bytes,
+        )
+        .expect("answer decodes as a SenderKeyDistributionMessage")
+        {
+            scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(r) => r,
+            other => panic!("expected a KeyResponse envelope, got {other:?}"),
+        };
         let key_actor = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
-            &resp_actor.hpke_sealed_key,
-            &resp_actor.ephemeral_pubkey,
-            &secret2,
+            &resp.hpke_sealed_key,
+            &resp.ephemeral_pubkey,
+            &wrapping_secret,
             &ctx_hex,
-            &resp_actor.sender_did,
-            resp_actor.epoch,
+            &resp.sender_did,
+            resp.epoch,
         )
         .unwrap();
 
-        // Byte-identity of the recovered material + response metadata.
-        assert_eq!(
-            key_actor.as_bytes(),
-            key_oracle.as_bytes(),
-            "actor and oracle recover the identical sender key"
-        );
+        // Ground truth: the recovered key is Alice's ACTUAL local sender key, and
+        // the metadata echoes the request.
         assert_eq!(
             key_actor.as_bytes(),
             actor_sender_key(&alice_a).as_bytes(),
             "the recovered key is Alice's actual local sender key"
         );
-        assert_eq!(resp_actor.sender_did, resp_oracle.sender_did);
-        assert_eq!(resp_actor.sender_did, ALICE);
-        assert_eq!(resp_actor.epoch, resp_oracle.epoch);
-        assert_eq!(resp_actor.epoch, 1);
+        assert_eq!(resp.sender_did, ALICE);
+        assert_eq!(resp.epoch, 1);
         assert_eq!(
-            resp_actor.request_nonce, [2u8; 16],
+            resp.request_nonce, nonce,
             "response echoes the request nonce"
         );
     }

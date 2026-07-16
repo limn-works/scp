@@ -64,14 +64,19 @@ pub fn alice_signing_key() -> SigningKey {
 /// Bob's (joiner) fixed #active key. Bob's custody imports THIS seed and the
 /// resolver maps `bob_did` to its verifying key, so a bundle sealed to the
 /// resolved #active opens with the identical private key.
-fn bob_signing_key() -> SigningKey {
+// `pub` (crate-internal via the `pub(crate)` module ceiling) so seam-level
+// e2e tests can sign Bob's inner envelopes / sender-key requests with the SAME
+// key the pair resolver maps `bob_did` to.
+pub fn bob_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB0; 32])
 }
 
 /// Resolves `alice_did` / `bob_did` to their fixed verifying keys (all else
 /// `None`). The joiner verifies the creator (`alice`) signature; the seal
-/// addresses the invitee (`bob`) #active key.
-fn pair_resolver(alice_did: &str, bob_did: &str) -> KeyResolver {
+/// addresses the invitee (`bob`) #active key. `pub` (crate-internal) so
+/// seam-level e2e tests can hand a real DID→key resolver to a production
+/// `ActorDeps` (e.g. to verify a §9.16.2 sender-key request signature).
+pub fn pair_resolver(alice_did: &str, bob_did: &str) -> KeyResolver {
     let alice = DID::from(alice_did);
     let bob = DID::from(bob_did);
     let alice_vk = alice_signing_key().verifying_key();

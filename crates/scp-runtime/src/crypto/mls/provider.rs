@@ -1625,16 +1625,21 @@ impl MlsCryptoProvider {
     /// Returns `Some(serialized_response)` if the requester should receive
     /// a key, or `None` if the request was silently dropped (e.g., blocked).
     ///
-    /// # ADR-049 PR-7 — retained golden ORACLE only
+    /// # ADR-049 PR-7 — test/fixture-only
     ///
     /// The steady-state ANSWER half of §9.16.2 was MOVED onto the actor
     /// ([`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request));
     /// this provider copy is RETAINED under `#[cfg(any(test, feature =
-    /// "testing"))]` solely as the byte-identity golden oracle (and for
-    /// provider-level two-party test fixtures). Production is zero-grep clean of
-    /// this method — a taken (actor-owned) context answers on the actor, not
-    /// here. Keep this body byte-for-byte in step with the actor method so the
-    /// `crypto_ops_golden` oracle comparison stays meaningful.
+    /// "testing"))]` as a **test FIXTURE builder** — it stands up the
+    /// provider-side answer for the two-party join fixtures
+    /// ([`two_party_test_support`](crate::crypto::mls::two_party_test_support),
+    /// `spawn_from_welcome_tests`) that must return providers still OWNING their
+    /// per-context crypto. Production is zero-grep clean of this method — a taken
+    /// (actor-owned) context answers on the actor, not here. It is NOT a wire
+    /// authority: there is **no byte-for-byte-sync obligation** with the actor
+    /// method (the retired oracle-vs-actor comparison proved nothing the actor
+    /// round-trip's ground-truth assert does not), so its serialization is not
+    /// required to track the actor's `SenderKeyDistributionMessage` framing.
     ///
     /// # Errors
     ///

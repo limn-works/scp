@@ -752,7 +752,7 @@ impl FullStackNode {
         context_id: &[u8; 32],
         joiner_handle: &ContextHandle,
     ) -> Result<(), ContextError> {
-        use scp_core::crypto::sender_keys::SenderKeyResponse;
+        use scp_core::crypto::sender_keys::SenderKeyDistributionMessage;
         use scp_core::crypto::sender_keys::key_protocol::{
             open_sender_key_response, request_sender_key,
         };
@@ -835,10 +835,21 @@ impl FullStackNode {
             //    (ADR-049 PR-7): the incumbent's provider is likewise taken, so
             //    the former direct `set_sender_key_unchecked` was a no-op on an
             //    emptied context. The Class-M floor gate runs inside the handler.
-            let response: SenderKeyResponse =
-                rmp_serde::from_slice(&response_bytes).map_err(|e| {
+            // BLACK-P7-2 (ADR-049 PR-7): the actor answer is the
+            // `SenderKeyDistributionMessage::KeyResponse` envelope (matching the
+            // production receive path + the proactive push), so decode the enum
+            // rather than a bare `SenderKeyResponse`.
+            let response = match SenderKeyDistributionMessage::from_bytes(&response_bytes)
+                .map_err(|e| {
                     ContextError::CryptoFailed(format!("decode sender-key response: {e}"))
-                })?;
+                })? {
+                SenderKeyDistributionMessage::KeyResponse(resp) => resp,
+                other => {
+                    return Err(ContextError::CryptoFailed(format!(
+                        "expected a KeyResponse from the joiner, got {other:?}"
+                    )));
+                }
+            };
             let joiner_key = open_sender_key_response(
                 &custody,
                 &request.wrapping_key_handle,

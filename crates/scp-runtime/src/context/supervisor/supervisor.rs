@@ -13203,13 +13203,13 @@ impl Supervisor {
         &self,
         context_id: &str,
         request_bytes: &[u8],
-        requester_public_key: &[u8],
+        requester_public_key: &[u8; 32],
     ) -> Result<Option<Vec<u8>>, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::HandleSenderKeyRequest {
             context_id: context_id.to_owned(),
             request_bytes: request_bytes.to_vec(),
-            requester_public_key: requester_public_key.to_vec(),
+            requester_public_key: *requester_public_key,
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -15143,9 +15143,23 @@ mod tests {
     fn supervisor_with_crypto(
         crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
     ) -> Arc<Supervisor> {
+        supervisor_with_crypto_and_resolver(
+            crypto,
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+        )
+    }
+
+    /// Like [`supervisor_with_crypto`] but with a caller-supplied `key_resolver`
+    /// — used by the §9.16.2 sender-key receive-path test, whose
+    /// `decrypt_and_dispatch` must resolve the requester's verification key to
+    /// check the request signature.
+    #[cfg(feature = "testing")]
+    fn supervisor_with_crypto_and_resolver(
+        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        key_resolver: KeyResolver,
+    ) -> Arc<Supervisor> {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -20454,6 +20468,180 @@ mod tests {
             );
             hrx.await.expect("heartbeat reply").expect("heartbeat ok");
         });
+    }
+
+    /// ADR-049 §9.16.2 sender-key PULL through the PRODUCTION receive path
+    /// (`decrypt_and_dispatch`). One test, two findings:
+    ///
+    /// - **BLACK-P7-1 (identity binding):** a KeyRequest whose payload
+    ///   `requester_did` != the MLS-authenticated sender is REJECTED before any
+    ///   answer is enqueued (a blocked/impersonating member cannot request under
+    ///   another member's identity).
+    /// - **BLACK-P7-2 (wire format):** a well-formed request is answered, and the
+    ///   enqueued answer parses via the SAME
+    ///   `SenderKeyDistributionMessage::from_bytes` the receiver uses — proving
+    ///   the answer is the `KeyResponse` envelope, not a bare `SenderKeyResponse`
+    ///   — and the requester recovers a real sender key from the ephemeral seal.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn sender_key_pull_receive_path_binds_identity_and_wire_format() {
+        use ed25519_dalek::Signer as _;
+        use scp_clock::Clock as _;
+        use scp_protocol::crypto::sender_keys::{SenderKeyDistributionMessage, SenderKeyRequest};
+
+        const ALICE: &str = "did:dht:z6MkAlicePullAlicePullAlicePullAlice12";
+        const BOB: &str = "did:dht:z6MkBobPullBobPullBobPullBobPullBobPu12";
+        const CHARLIE: &str = "did:dht:z6MkCharliePullCharliePullCharliePul12";
+        let ctx_str = "sender-key-pull-receive-path";
+
+        let (alice_crypto, bob_crypto, ctx_bytes) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        let ctx_hex = hex::encode(ctx_bytes);
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str).to_vec();
+
+        // Alice's production receive deps, with a resolver that maps BOB → his
+        // #active key so the request signature check can run.
+        let alice_sup = supervisor_with_crypto_and_resolver(
+            Arc::clone(&alice_crypto),
+            crate::crypto::mls::two_party_test_support::pair_resolver(ALICE, BOB),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Alice's ActorDeps from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
+        let alice_deps = rt
+            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .expect("build alice's actor deps");
+
+        // Build a Bob-signed KeyRequest (for Alice's key) sealing to a fresh
+        // ephemeral wrapping key, wrapped in the distribution-message envelope.
+        let bob_sk = crate::crypto::mls::two_party_test_support::bob_signing_key();
+        let build_request = |requester_did: &str, nonce: [u8; 16]| -> (Vec<u8>, [u8; 32]) {
+            let (wrapping_pub, wrapping_secret) =
+                scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+            let timestamp = scp_clock::SystemClock.now_secs();
+            let hash =
+                scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
+                    requester_did,
+                    ALICE,
+                    1,
+                    &wrapping_pub,
+                    &nonce,
+                    timestamp,
+                )
+                .unwrap();
+            let signature: [u8; 64] = bob_sk.sign(&hash).to_bytes();
+            let request = SenderKeyRequest {
+                requester_did: requester_did.to_owned(),
+                sender_did: ALICE.to_owned(),
+                epoch: 1,
+                wrapping_pubkey: wrapping_pub,
+                nonce,
+                timestamp,
+                signature,
+            };
+            let dist = SenderKeyDistributionMessage::KeyRequest(request)
+                .to_bytes()
+                .unwrap();
+            (dist, wrapping_secret)
+        };
+
+        // Bob seals both requests through his actor-owned MLS group as management
+        // envelopes (in MLS-generation order: mismatch first, then well-formed).
+        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        let bob_cs = match &mut bob_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c.as_mut(),
+            crate::context::actor::ContextModeState::Broadcast(_) => panic!("expected encrypted"),
+        };
+        // Mismatch: Bob (authenticated) claims requester_did = CHARLIE.
+        let (mismatch_dist, _) = build_request(CHARLIE, [1u8; 16]);
+        let mismatch_sealed = bob_cs
+            .mls_encrypt_management(&mismatch_dist, &routing_id, 3600)
+            .expect("bob seals the mismatched request");
+        // Well-formed: requester_did == BOB (the authenticated sender).
+        let (ok_dist, bob_ephemeral_secret) = build_request(BOB, [2u8; 16]);
+        let ok_sealed = bob_cs
+            .mls_encrypt_management(&ok_dist, &routing_id, 3600)
+            .expect("bob seals the well-formed request");
+
+        // Alice opens on the production receive seam.
+        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+        let alice_cs = match &mut alice_actor.mode {
+            crate::context::actor::ContextModeState::Encrypted(c) => c.as_mut(),
+            crate::context::actor::ContextModeState::Broadcast(_) => panic!("expected encrypted"),
+        };
+
+        // BLACK-P7-1: the mismatch is rejected, and NO answer is enqueued.
+        let reject = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &alice_deps,
+            Some(&mut *alice_cs),
+            ctx_str,
+            &ctx_bytes,
+            &mismatch_sealed,
+        );
+        assert!(
+            matches!(
+                &reject,
+                Err(ContextError::CryptoFailed(m))
+                    if m.contains("does not match the")
+            ),
+            "a requester_did != authenticated sender must be rejected, got {reject:?}"
+        );
+        assert!(
+            alice_cs.pending_distributions.is_empty(),
+            "a rejected request must not enqueue an answer"
+        );
+
+        // BLACK-P7-2: the well-formed request is answered.
+        let ok = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &alice_deps,
+            Some(&mut *alice_cs),
+            ctx_str,
+            &ctx_bytes,
+            &ok_sealed,
+        )
+        .expect("a well-formed request is accepted on the receive path");
+        assert!(
+            ok.is_none(),
+            "a KeyRequest is consumed on the receive side (no application envelope surfaces)"
+        );
+        assert_eq!(
+            alice_cs.pending_distributions.len(),
+            1,
+            "alice enqueues exactly one answer for the authenticated requester"
+        );
+        let (dest_did, answer_bytes) = alice_cs.pending_distributions[0].clone();
+        assert_eq!(
+            dest_did, BOB,
+            "the answer is addressed to the authenticated requester"
+        );
+
+        // The answer parses via the SAME call the receiver makes (a bare
+        // SenderKeyResponse would fail here) and recovers a real sender key from
+        // the ephemeral seal.
+        let resp = match SenderKeyDistributionMessage::from_bytes(&answer_bytes)
+            .expect("the answer parses as a SenderKeyDistributionMessage")
+        {
+            SenderKeyDistributionMessage::KeyResponse(r) => r,
+            other => panic!("expected a KeyResponse envelope, got {other:?}"),
+        };
+        assert_eq!(resp.sender_did, ALICE);
+        assert_eq!(resp.epoch, 1);
+        assert_eq!(resp.request_nonce, [2u8; 16], "the answer echoes the request nonce");
+        let recovered = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
+            &resp.hpke_sealed_key,
+            &resp.ephemeral_pubkey,
+            &bob_ephemeral_secret,
+            &ctx_hex,
+            &resp.sender_did,
+            resp.epoch,
+        )
+        .expect("the requester opens the ephemeral-sealed answer");
+        assert_eq!(
+            recovered.as_bytes().len(),
+            32,
+            "a real 32-byte sender key was recovered from the KeyResponse envelope"
+        );
     }
 
     /// ADR-056 regression guard: `recovery_send_notification_direct` MUST

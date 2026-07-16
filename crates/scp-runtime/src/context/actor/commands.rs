@@ -474,9 +474,10 @@ pub enum MessagingCommand {
         context_id: String,
         /// The serialized [`SenderKeyRequest`](scp_protocol::crypto::sender_keys::SenderKeyRequest).
         request_bytes: Vec<u8>,
-        /// The requester's Ed25519 verification key bytes (the responder verifies
-        /// the request signature against it).
-        requester_public_key: Vec<u8>,
+        /// The requester's Ed25519 verification key (the responder verifies the
+        /// request signature against it). Exactly 32 bytes — an Ed25519 public key
+        /// — encoded in the type so a mis-sized key cannot cross the mailbox.
+        requester_public_key: [u8; 32],
         /// Oneshot reply channel. `Ok(Some(sealed_response))` for a member
         /// requester, `Ok(None)` when the requester is blocked.
         reply: oneshot::Sender<Result<Option<Vec<u8>>, ContextError>>,

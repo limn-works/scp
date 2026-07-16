@@ -3110,6 +3110,25 @@ pub fn decrypt_and_dispatch(
                 scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyRequest(
                     request,
                 ) => {
+                    // BLACK-P7-1 (identity binding): the actor answer gates BOTH
+                    // membership (§9.16.6 Mitigation-1) and the block list on
+                    // `request.requester_did` — a PAYLOAD field. It MUST equal the
+                    // MLS-authenticated `sender_did`, or a member could request
+                    // under a DIFFERENT member's identity: e.g. a BLOCKED member
+                    // naming an unblocked one to pass the membership + block gates,
+                    // then receiving the sender key sealed to their OWN ephemeral
+                    // wrapping key. Bind the two here, before answering. The
+                    // requester public key the request signature is verified against
+                    // is ALSO resolved from `sender_did` (below), so this makes the
+                    // gated DID, the authenticated DID, and the signing key one and
+                    // the same.
+                    if request.requester_did != sender_did {
+                        return Err(ContextError::CryptoFailed(
+                            "sender-key request requester_did does not match the \
+                             MLS-authenticated sender"
+                                .to_string(),
+                        ));
+                    }
                     // The request's Ed25519 signature is by the requester
                     // (== MLS-authenticated `sender_did`) over its ephemeral
                     // wrapping key. MLS already authenticated `sender_did`; the
