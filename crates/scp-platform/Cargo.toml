@@ -17,7 +17,7 @@ software_platform = [
     "dep:rand",
     "dep:hmac",
     "dep:sha2",
-    "dep:hkdf",
+    "dep:scp-crypto",
     "dep:uuid",
 ]
 # Durability-only in-memory Storage adapter (`InMemoryStorage`, spec §17.6 /
@@ -83,10 +83,14 @@ argon2 = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 x25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
-hkdf = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
+# Per-context pseudonym derivation (§9.10.4.A) lives in the wasm-safe `scp-crypto`
+# leaf (ADR-057 Option A); every software-custody backend delegates to it. Its
+# HKDF/HMAC/SHA-256 primitives are pulled transitively, so `scp-platform` no
+# longer needs a direct `hkdf` dependency.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = true }
 
 # sqlite dependencies, gated behind the `sqlite` feature flag.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }

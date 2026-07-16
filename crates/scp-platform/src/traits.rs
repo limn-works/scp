@@ -402,7 +402,7 @@ pub trait KeyCustody: Send + Sync {
     /// `pseudonym_secret` is a device-local value computed inside the boundary;
     /// hardware pseudonyms are therefore device-local BY DESIGN, not cross-platform
     /// identical. The Rust software backends share this derivation via
-    /// [`crate::pseudonym::derive_pseudonym_keypair`].
+    /// [`scp_crypto::pseudonym::derive_pseudonym_keypair`].
     ///
     /// The returned [`PseudonymKeypair`] is always software-managed (derived
     /// output).

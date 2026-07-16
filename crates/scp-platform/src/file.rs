@@ -565,7 +565,7 @@ impl FileKeyCustody {
     }
 }
 
-use crate::pseudonym::derive_pseudonym_keypair;
+use scp_crypto::pseudonym::derive_pseudonym_keypair;
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.

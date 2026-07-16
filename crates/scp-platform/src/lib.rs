@@ -71,10 +71,6 @@ pub mod testing;
 // and the SqliteStorage passphrase constructor (`sqlite`).
 #[cfg(any(feature = "file", feature = "sqlite"))]
 pub mod kdf;
-// Shared pseudonym secret derivation — used by all KeyCustody backends.
-// Gated behind `software_platform` because it depends on ed25519-dalek, hkdf, sha2.
-#[cfg(feature = "software_platform")]
-pub(crate) mod pseudonym;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 // Versioned storage envelope + spec §17.3 key conventions. The single source of
