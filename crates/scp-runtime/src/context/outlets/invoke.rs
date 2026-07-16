@@ -4174,8 +4174,8 @@ fn build_terminal_chunk(inputs: BuildTerminalChunkInputs<'_>) -> ChunkPayload {
 use ed25519_dalek::VerifyingKey;
 use scp_protocol::context::outlets::OutletKind;
 use scp_protocol::context::outlets::error_codes::{
-    CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_CREDIT, CODE_OUTPUT_VIOLATION, CODE_TRANSPORT_FAULT,
-    SLUG_AUTHORIZATION_DENIED, SLUG_EXECUTION_STREAM_GAP, SLUG_OUTPUT_SCHEMA_VIOLATION,
+    CODE_AUTHORIZATION_DENIED, CODE_OUTPUT_VIOLATION, CODE_TRANSPORT_FAULT,
+    SLUG_AUTHORIZATION_DENIED, SLUG_OUTPUT_SCHEMA_VIOLATION,
     SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE,
 };
 use scp_protocol::context::outlets::registration::OutletRegistration;
@@ -4330,101 +4330,6 @@ pub(crate) fn cross_context_economy_gate(
 /// infrastructure failure that the best-effort bridge cannot recover.
 pub(crate) type BridgeFaultProbe = Box<dyn Fn(&OutletStreamChunk) -> Option<String> + Send>;
 
-/// Outcome of feeding one chunk's `sequence` to the SCP-OUT-045
-/// [`ReassemblyGapDetector`]. A typed value (never a `panic!`/`debug_assert!`):
-/// the ADR-049 §10 handler-panic ban forbids panic-family macros in the
-/// off-mailbox bridge, so a gap is signalled by returning [`GapOutcome::Gap`]
-/// and surfacing a terminal, never by aborting the task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GapOutcome {
-    /// The observed `sequence` was exactly the expected next value (strict
-    /// `+1`). Reassembly is contiguous — keep forwarding.
-    Contiguous,
-    /// The observed `sequence` was NON-contiguous — a chunk went missing over
-    /// the cross-context hop. The reassembly hop MUST terminate with a
-    /// `StreamGap` terminal and stop (§5.4.5 "Ordering and gaps": cancel-and-
-    /// rerun; MLS has no per-message retransmit primitive).
-    Gap,
-}
-
-/// The AUTHORITATIVE cross-context reassembly gap-detector (SCP-OUT-045) — the
-/// RUNTIME-side locus of the §5.4.5:513/:515 ordering DUAL-LOCUS.
-///
-/// Provenance: §5.4.5 "Ordering and gaps" (.docs/specs/05-contexts.md:513/:515).
-///
-/// # What it keys on — `chunk.sequence`
-///
-/// §5.4.5 fixes the ordering key: "`sequence` values are strictly monotonic per
-/// `request_id`. A receiver that observes a gap (missing `sequence`) MUST cancel
-/// the stream." This detector keys on `chunk.sequence` (the operator's per-
-/// request chunk index, contiguous from 0) — the value that actually rides in
-/// each operator-signed chunk, so a genuinely dropped chunk makes it non-
-/// contiguous.
-///
-/// # Dual-locus (defense-in-depth, NOT a replacement)
-///
-/// §5.4.5 makes the invoker-side SDK-drain `InvocationHandle` (SCP-OUT-037's
-/// `ReceiverSequenceTracker`) the MUST-bound receiver; it then states that "any
-/// additional authoritative gap-detection introduced at a cross-context
-/// reassembly layer is reconciled with this SDK-drain check as defense-in-depth
-/// (as the revocation dual-locus is), NOT as a replacement." This detector is
-/// that additional runtime locus. BOTH loci key on `sequence`: the runtime
-/// detector catches a `sequence` gap at the reassembly boundary even if a future
-/// SDK-drain is bypassed or buggy. This story does NOT remove or weaken the
-/// SDK-drain `ReceiverSequenceTracker`.
-///
-/// # Cancel-surfacing (the §5.4.5:515 design ruling)
-///
-/// The off-mailbox bridge holds NO invoker signer / session handle, so it CANNOT
-/// mint a signed `OutletCancel` — minting the signed cancel toward the operator
-/// stays the SDK-drain locus (SCP-OUT-037). The runtime locus's action on a gap
-/// is to surface a TERMINAL `StreamGap` error (`CODE_EXECUTION_CREDIT` =
-/// `SCP-OUTLET-6131`, slug `execution.stream-gap`) via the same
-/// [`forward_bridge_terminal`] machinery every other bridge terminal uses
-/// (all-zero signature placeholder — the bridge never re-signs a synthesized
-/// terminal), then STOP: dropping `inner_rx` on the loop break closes B's pump,
-/// which is the cancel toward the producer. The SDK-drain locus, observing that
-/// terminal, mints the signed `OutletCancel` toward the operator.
-///
-/// # Same-context / lossless behaviour
-///
-/// The operator pump assigns `sequence` consecutively from 0 and feeds a lossless
-/// in-process channel, so a contiguous stream never fires the detector — exactly
-/// as the SDK-drain check "cannot fire on a same-context stream." It fires only
-/// on a genuine dropped chunk (a `sequence` discontinuity in the delivered
-/// stream), which is producer-expressible and testable without any synthetic
-/// injection seam.
-struct ReassemblyGapDetector {
-    /// The `chunk.sequence` the next contiguous chunk must carry. Starts at 0
-    /// (§5.4.5: `sequence` is contiguous from 0).
-    expected: u64,
-}
-
-impl ReassemblyGapDetector {
-    /// A fresh detector for one `(request_id, sender)` stream. `expected` starts
-    /// at 0 — the first chunk's `sequence` (§5.4.5, contiguous from 0).
-    const fn new() -> Self {
-        Self { expected: 0 }
-    }
-
-    /// Observe one chunk's `sequence`. Returns [`GapOutcome::Contiguous`] and
-    /// advances `expected` iff the sequence is exactly the expected next value;
-    /// otherwise returns [`GapOutcome::Gap`] and leaves `expected` unchanged (the
-    /// caller terminates the stream, so no further observation follows).
-    /// `saturating_add` mirrors
-    /// [`SendSequenceTracker::reserve_next`](crate::context::actor::SendSequenceTracker)
-    /// — the u64 ceiling is unreachable in practice and must never wrap-panic in
-    /// the handler-panic-banned bridge.
-    const fn observe(&mut self, sequence: u64) -> GapOutcome {
-        if sequence == self.expected {
-            self.expected = self.expected.saturating_add(1);
-            GapOutcome::Contiguous
-        } else {
-            GapOutcome::Gap
-        }
-    }
-}
-
 /// Forward a single chunk to A's outer channel, mirroring the same-context
 /// `invoke_outlet` handoff: the bridge never re-signs and introduces NO new
 /// send-sequence at this plaintext hand-off (§5.4.5). A's per-sender MLS
@@ -4481,8 +4386,8 @@ async fn forward_bridge_terminal(
         payload,
         sig: [0u8; 64],
     };
-    // A synthesized terminal is forwarded like any other chunk, but it is NOT fed
-    // to the gap-detector — it is bridge-authored, not a relayed operator chunk.
+    // A synthesized terminal is forwarded like any other chunk — it is
+    // bridge-authored, not a relayed operator chunk.
     if !forward_frame(outer_tx, &chunk).await {
         // A's invoker stopped consuming before the terminal landed — the caller
         // records what was already delivered; the terminal summary keeps its
@@ -4695,15 +4600,16 @@ pub(crate) async fn run_cross_context_bridge(
     );
     let mut reassembled: Vec<OutletStreamChunk> = Vec::new();
     let mut terminal = StreamTerminalSummary::default();
-    // (SCP-OUT-045) The AUTHORITATIVE cross-context reassembly gap-detector — the
-    // runtime-side locus of the §5.4.5:513/:515 ordering dual-locus. Per-stream
-    // (this bridge task pins a single `(request_id, sender)` by construction, so a
-    // `HashMap` is unnecessary), keyed on `chunk.sequence` (the §5.4.5 per-request
-    // operator chunk index, contiguous from 0 — the value a real dropped chunk
-    // makes non-contiguous).
-    // Strictly-additive to the SDK-drain `ReceiverSequenceTracker` (SCP-OUT-037),
-    // which also keys on `sequence` — defense-in-depth, not a replacement (§5.4.5).
-    let mut gap_detector = ReassemblyGapDetector::new();
+    // (SCP-OUT-045) No runtime-side reassembly gap-detector here. `inner_rx` is fed
+    // by the dispatch pump (`dispatch.rs`), which RENUMBERS every emitted chunk to
+    // its own contiguous cursor (`next_seq`, advanced only on emit) and RE-SIGNS it
+    // under that sequence (`try_build_signed_chunk`) before handing it to this
+    // bridge over an in-process backpressured mpsc. So `chunk.sequence` arrives
+    // contiguous BY CONSTRUCTION — a runtime detector here could never observe a
+    // gap. Gap-detection over the LOSSY leg (the A-context MLS re-seal to A's other
+    // members) is the receive-side SDK-drain's job (the invoker `InvocationHandle`
+    // drain / `ReceiverSequenceTracker`, SCP-OUT-037), keyed on `chunk.sequence`
+    // (§5.4.5:515 — the §5.4.5 MUST-bound receiver locus).
     let mut execution_time_ms: u64 = 0;
     // Terminal-guarantee bookkeeping: `delivered_terminal` becomes true once a
     // terminal chunk (operator-authored or synthesized) is DELIVERED to A;
@@ -4847,50 +4753,11 @@ pub(crate) async fn run_cross_context_bridge(
 
         let is_terminal = chunk.payload.is_terminal();
 
-        // (SCP-OUT-045) AUTHORITATIVE cross-context reassembly gap check on
-        // `chunk.sequence` (§5.4.5:513/:515 dual-locus, defense-in-depth). A
-        // receiver observes a gap ON RECEIPT and cancels rather than forwarding an
-        // out-of-order chunk onward (§5.4.5 "Ordering and gaps"). This runs on
-        // NON-terminal chunks only: a delivered operator TERMINAL legitimately
-        // ends the stream and is not gap-checked — a lost earlier chunk is caught
-        // by the log-insert manifest backstop (§5.4.5:566) — which also avoids a
-        // double-terminal (End then StreamGap). Because the operator pump assigns
-        // `sequence` consecutively from 0 into a lossless in-process channel, a
-        // contiguous stream never fires this; it fires only on a genuinely dropped
-        // chunk (a real `sequence` discontinuity in the delivered stream).
-        if !is_terminal && matches!(gap_detector.observe(chunk.sequence), GapOutcome::Gap) {
-            // Surface a TERMINAL StreamGap error (`SCP-OUTLET-6131`,
-            // `execution.stream-gap`) via the same machinery as every other bridge
-            // terminal, in the offending chunk's place, then STOP. The off-mailbox
-            // bridge holds NO invoker signer/session, so it does NOT mint a signed
-            // `OutletCancel` — that stays the SDK-drain locus (SCP-OUT-037),
-            // triggered by observing this terminal. Dropping `inner_rx` on the
-            // break closes B's pump = cancel toward the producer (§5.4.5). Setting
-            // `delivered_terminal` stops the post-loop synthesis from
-            // double-terminaling.
-            let payload = ChunkPayload::Error {
-                code: CODE_EXECUTION_CREDIT.to_owned(),
-                message: format!(
-                    "{SLUG_EXECUTION_STREAM_GAP}: non-contiguous chunk sequence over the \
-                     cross-context hop — cancel-and-rerun (§5.4.5)"
-                ),
-                terminal: true,
-            };
-            let forwarded = forward_bridge_terminal(
-                &outer_tx,
-                &mut terminal,
-                request_id,
-                chunk.sequence,
-                payload,
-            )
-            .await;
-            delivered_terminal = forwarded.is_some();
-            if let Some(sent) = forwarded {
-                reassembled.push(sent);
-            }
-            outer_open = delivered_terminal;
-            break;
-        }
+        // (SCP-OUT-045) No reassembly gap-check here: the dispatch pump feeding
+        // `inner_rx` renumbers+re-signs to a contiguous `chunk.sequence` (see the
+        // `reassembled` declaration above), so a runtime detector could never
+        // observe a gap. Gap-detection over the lossy A-leg is the receive-side
+        // SDK-drain's (`ReceiverSequenceTracker`, SCP-OUT-037; §5.4.5:515).
 
         // (AC3) Forward as produced — no buffering. The operator signature is
         // preserved verbatim (never re-signed); the bridge introduces no new
@@ -5101,10 +4968,11 @@ pub(crate) async fn run_streaming_saga_seal_task(
         // verbatim; the bridge introduces no new send-sequence at this plaintext
         // hand-off (§5.4.5). A send failure means the caller stopped consuming:
         // stop forwarding, seal over the durable prefix. The saga's authoritative
-        // ordering is the DURABLE MerkleFrontier — SCP-OUT-045's gap-detector is
-        // scoped to the best-effort outlet-stream mode
-        // ([`run_cross_context_bridge`]); the seal task is deliberately untouched
-        // (§5.4.5).
+        // ordering is the DURABLE MerkleFrontier; neither the seal task nor the
+        // best-effort bridge (`run_cross_context_bridge`) runs a reassembly
+        // gap-check — both forward the dispatch pump's contiguously-renumbered,
+        // re-signed stream, and gap-detection over the lossy A-leg is the
+        // receive-side SDK-drain's (SCP-OUT-045; §5.4.5:515, SCP-OUT-037).
         let is_terminal = chunk.payload.is_terminal();
         if !forward_frame(&outer_tx, &chunk).await {
             outer_open = false;
@@ -5445,10 +5313,12 @@ pub(crate) async fn record_streaming_saga_a_event(
 /// shared-member invoker (a member of BOTH contexts, §6.2.0) — identical to the
 /// same-context [`invoke_outlet`]. Each chunk is the unmodified operator-signed
 /// `OutletStreamChunk`, forwarded verbatim; the bridge never re-signs and
-/// introduces NO new send-sequence at this plaintext hand-off (§5.4.5). The
-/// SCP-OUT-045 reassembly gap-detector keys on `chunk.sequence` (§5.4.5, the
-/// operator per-request index — the only value a lost chunk makes
-/// non-contiguous). Re-encryption for A's OTHER members is the delivery seam
+/// introduces NO new send-sequence at this plaintext hand-off (§5.4.5). There is
+/// NO runtime-side reassembly gap-detector: the dispatch pump feeding the bridge
+/// renumbers+re-signs to a contiguous `chunk.sequence`, so gap-detection over the
+/// lossy A-leg is the receive-side SDK-drain's (`ReceiverSequenceTracker`,
+/// SCP-OUT-045; §5.4.5:515, SCP-OUT-037). Re-encryption for A's OTHER members is
+/// the delivery seam
 /// (the SDK seals each still-operator-signed chunk under A's MLS group key, its
 /// per-sender MLS send-sequence reserved at the §9.16/§5.15.7 encrypt seam over
 /// A's persistent counter — SCP-OUT-047), NOT this return type.
@@ -7098,17 +6968,17 @@ mod tests {
         );
     }
 
-    /// SCP-OUT-045 AC5 — the SAME-CONTEXT path is UNAFFECTED by the
-    /// cross-context reassembly gap-detector. The runtime pump is the PRODUCER
-    /// here (it assigns `sequence` consecutively), and `invoke_outlet` NEVER
-    /// calls `run_cross_context_bridge`, so `ReassemblyGapDetector` is
-    /// structurally unreachable — it is instantiated ONLY inside the
-    /// cross-context bridge (§5.4.5: the same-context pump "has no gap to
-    /// detect"). This regression drives a multi-`Data` same-context stream and
-    /// confirms no StreamGap/6131 terminal appears and delivery stays
-    /// contiguous.
+    /// SCP-OUT-045 — the SAME-CONTEXT streaming path forwards contiguously. The
+    /// runtime pump is the PRODUCER here (it assigns `sequence` consecutively),
+    /// and `invoke_outlet` NEVER calls `run_cross_context_bridge` (§5.4.5: the
+    /// same-context pump "has no gap to detect"). Gap-detection is the
+    /// receive-side SDK-drain's (`ReceiverSequenceTracker`, SCP-OUT-037;
+    /// §5.4.5:515), which cannot fire on a lossless same-context stream. This
+    /// regression drives a multi-`Data` same-context stream and confirms
+    /// delivery stays contiguous and closes on the operator's own `End` — no
+    /// synthesized error terminal.
     #[tokio::test]
-    async fn out045_same_context_stream_never_fires_gap_detector() {
+    async fn out045_same_context_stream_forwards_contiguously() {
         struct StreamingExecutor;
         #[async_trait::async_trait]
         impl super::OutletExecutor for StreamingExecutor {
@@ -7164,12 +7034,14 @@ mod tests {
             "5 Data + 1 End; the same-context pump produces consecutive sequences"
         );
         assert!(
-            !chunks.iter().any(|c| matches!(
-                &c.payload,
-                ChunkPayload::Error { code, .. }
-                    if code == scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT
-            )),
-            "the same-context path never surfaces a cross-context StreamGap/6131 terminal"
+            matches!(chunks.last().unwrap().payload, ChunkPayload::End { .. }),
+            "the same-context stream closes on the operator's own End"
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| matches!(&c.payload, ChunkPayload::Error { .. })),
+            "the lossless same-context path surfaces no synthesized error terminal"
         );
     }
 
@@ -8780,179 +8652,23 @@ mod tests {
         }
 
         // -----------------------------------------------------------------
-        // SCP-OUT-045 — AUTHORITATIVE cross-context reassembly gap-detector
-        // (invoker-side hop; §5.4.5:515 dual-locus, strictly-additive to the
-        // SCP-OUT-037 SDK-drain ReceiverSequenceTracker).
+        // SCP-OUT-045 — the cross-context bridge forwards the dispatch pump's
+        // contiguously-renumbered, re-signed stream VERBATIM. There is NO
+        // runtime-side reassembly gap-detector: `inner_rx` is fed by the
+        // dispatch pump (dispatch.rs), which renumbers to its own contiguous
+        // cursor and re-signs under it, so `chunk.sequence` at the bridge is
+        // contiguous BY CONSTRUCTION. Gap-detection over the lossy A-leg is the
+        // receive-side SDK-drain's (`ReceiverSequenceTracker`, SCP-OUT-037;
+        // §5.4.5:515). These tests assert the bridge forwards a lossless stream
+        // to its operator terminal without synthesizing any error terminal.
         // -----------------------------------------------------------------
 
-        /// AC1/AC2 (unit) — the detector keys on `chunk.sequence` (contiguous
-        /// from 0, §5.4.5) and tracks the expected next value as strict `+1`. A
-        /// missing sequence (3 dropped → 4 observed where 3 was expected) is a
-        /// [`GapOutcome::Gap`]; a contiguous run is [`GapOutcome::Contiguous`].
-        #[test]
-        fn out045_gap_detector_flags_non_contiguous_sequence() {
-            let mut d = ReassemblyGapDetector::new();
-            // contiguous from 0: 0,1,2.
-            for seq in 0..=2u64 {
-                assert_eq!(
-                    d.observe(seq),
-                    GapOutcome::Contiguous,
-                    "sequence {seq} is the expected next value"
-                );
-            }
-            // Chunk sequence 3 was dropped over the cross-context hop → the
-            // reassembler observes 4 where it expected 3.
-            assert_eq!(
-                d.observe(4),
-                GapOutcome::Gap,
-                "a missing sequence (3) over the hop is a gap"
-            );
-            // A gap does NOT advance `expected` (it stays at 3): defensive — the
-            // caller terminates the stream, so there is no silent re-sync.
-            assert_eq!(
-                d.observe(3),
-                GapOutcome::Contiguous,
-                "expected stayed at 3 after the gap — the detector did not skip past the loss"
-            );
-        }
-
-        /// AC1 — `sequence` is contiguous from 0 (§5.4.5): a first chunk of 1 or
-        /// 2 is a gap; only 0 opens the stream contiguously.
-        #[test]
-        fn out045_gap_detector_is_zero_based() {
-            assert_eq!(
-                ReassemblyGapDetector::new().observe(1),
-                GapOutcome::Gap,
-                "a skipped first chunk (1) is a gap"
-            );
-            assert_eq!(
-                ReassemblyGapDetector::new().observe(2),
-                GapOutcome::Gap,
-                "a skipped first chunk (2) is a gap"
-            );
-            assert_eq!(
-                ReassemblyGapDetector::new().observe(0),
-                GapOutcome::Contiguous,
-                "0 is the contiguous-from-0 first sequence"
-            );
-        }
-
-        /// AC4 (unit) — across a contiguous 0..=9 run `expected` advances to 10,
-        /// so the 11th chunk (sequence 10) is still contiguous and a fresh
-        /// detector rejects an 11 (it expects 0).
-        #[test]
-        fn out045_gap_detector_advances_expected_across_ten_chunks() {
-            let mut d = ReassemblyGapDetector::new();
-            for seq in 0..=9u64 {
-                assert_eq!(
-                    d.observe(seq),
-                    GapOutcome::Contiguous,
-                    "contiguous sequence {seq}"
-                );
-            }
-            assert_eq!(
-                d.observe(10),
-                GapOutcome::Contiguous,
-                "expected advanced to 10 across the 0..=9 run"
-            );
-            assert_eq!(
-                ReassemblyGapDetector::new().observe(11),
-                GapOutcome::Gap,
-                "a fresh detector rejects 11 (it expects the contiguous-from-0 first sequence)"
-            );
-        }
-
-        /// AC2 (bridge-level) — a cross-context stream that DROPS chunk sequence 3
-        /// (the producer delivers Data at 0,1,2,4) fires the terminal `StreamGap`
-        /// error (`CODE_EXECUTION_CREDIT` = `SCP-OUTLET-6131`, slug
-        /// `execution.stream-gap`) via the bridge's existing terminal machinery,
-        /// in the offending chunk's place, then STOPS (dropping `inner_rx` =
-        /// cancel toward the producer). No synthetic injection seam — a dropped
-        /// chunk is a real, producer-expressible `sequence` discontinuity.
+        /// SCP-OUT-045 — a contiguous cross-context 10-chunk stream (the
+        /// dispatch pump assigns sequence 0..9 consecutively) forwards verbatim:
+        /// all ten chunks are delivered and the stream ends in the operator's
+        /// own `End`, with no synthesized error terminal.
         #[tokio::test]
-        async fn out045_dropped_chunk_fires_stream_gap() {
-            let op = operator_key();
-            // A genuinely lossy stream: the producer delivers Data at sequence
-            // 0,1,2,4 — chunk 3 was dropped over the cross-context hop.
-            let chunks: Vec<_> = [0u64, 1, 2, 4]
-                .into_iter()
-                .map(|seq| {
-                    sign_chunk(
-                        &op,
-                        B_CTX,
-                        OUTLET,
-                        &CB,
-                        seq,
-                        ChunkPayload::Data {
-                            value: serde_json::json!({ "n": seq }),
-                        },
-                    )
-                })
-                .collect();
-
-            let (received, _a_log, _a_bytes) = drive_bridge(
-                chunks,
-                pinned_descriptor(&op),
-                permissive_schema(),
-                None,
-                None,
-            )
-            .await;
-
-            // 0,1,2 forward cleanly (contiguous); observing sequence 4 where 3 is
-            // expected is a gap, so the bridge surfaces the StreamGap/6131 terminal
-            // in its place and stops (the out-of-order chunk 4 is NOT forwarded on).
-            assert_terminal_error(received.last().unwrap(), CODE_EXECUTION_CREDIT);
-            match &received.last().unwrap().payload {
-                ChunkPayload::Error {
-                    code,
-                    message,
-                    terminal,
-                } => {
-                    assert_eq!(
-                        code, CODE_EXECUTION_CREDIT,
-                        "StreamGap reuses the shared Execution 6131 code"
-                    );
-                    assert!(
-                        message.starts_with(SLUG_EXECUTION_STREAM_GAP),
-                        "the terminal message carries the execution.stream-gap slug; got {message:?}"
-                    );
-                    assert!(*terminal, "the StreamGap chunk is terminal");
-                }
-                other => panic!("expected a StreamGap terminal Error, got {other:?}"),
-            }
-            // The three contiguous Data chunks precede the terminal (chunk 4 is not
-            // forwarded); the gap fires exactly once.
-            assert_eq!(
-                received.len(),
-                4,
-                "Data 0,1,2 + the StreamGap terminal in chunk 4's place"
-            );
-            for (i, chunk) in received.iter().take(3).enumerate() {
-                assert_eq!(
-                    chunk.sequence, i as u64,
-                    "the contiguous prefix is delivered in order"
-                );
-                assert!(
-                    matches!(chunk.payload, ChunkPayload::Data { .. }),
-                    "the prefix chunks are Data"
-                );
-            }
-            let gap_count = received
-                .iter()
-                .filter(|c| {
-                    matches!(&c.payload, ChunkPayload::Error { code, .. } if code == CODE_EXECUTION_CREDIT)
-                })
-                .count();
-            assert_eq!(gap_count, 1, "the StreamGap terminal fires exactly once");
-        }
-
-        /// AC4 (bridge-level) — a LOSSLESS contiguous cross-context 10-chunk
-        /// stream (the operator pump assigns sequence 0..9 consecutively) NEVER
-        /// fires the detector: all ten chunks forward and the stream ends in the
-        /// operator's own `End`, with no synthesized StreamGap/6131 terminal.
-        #[tokio::test]
-        async fn out045_lossless_contiguous_ten_chunk_stream_no_gap() {
+        async fn out045_lossless_contiguous_ten_chunk_stream_forwards_verbatim() {
             let op = operator_key();
             // 9 Data (seq 0..=8) + operator End (seq 9) = a contiguous 10-chunk
             // A→B stream.
@@ -8997,10 +8713,11 @@ mod tests {
                 "a lossless stream ends in the operator's End, not a synthesized terminal"
             );
             assert!(
-                !received.iter().any(|c| {
-                    matches!(&c.payload, ChunkPayload::Error { code, .. } if code == CODE_EXECUTION_CREDIT)
-                }),
-                "a lossless contiguous stream never fires the StreamGap/6131 detector"
+                !received
+                    .iter()
+                    .any(|c| { matches!(&c.payload, ChunkPayload::Error { .. }) }),
+                "a lossless contiguous stream is forwarded verbatim, with no synthesized error \
+                 terminal"
             );
         }
     }
