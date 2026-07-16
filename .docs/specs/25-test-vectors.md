@@ -805,7 +805,7 @@ Expected v2 pseudonym public key (epoch = 1):
   0xedd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639
 ```
 
-These vectors are mechanically enforced by the Rust known-answer test `derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-platform/src/pseudonym.rs`.
+These vectors are mechanically enforced by the Rust known-answer test `derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A), and cross-checked for native/`wasm32` byte-parity by `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs`.
 
 ### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
 

@@ -2,7 +2,7 @@
 
 Pure-Python, stdlib-only reference implementation of the cross-platform
 per-context pseudonym recipe that every SCP custody backend MUST reproduce
-byte-for-byte (Rust ``crates/scp-platform/src/pseudonym.rs`` plus the per-bridge
+byte-for-byte (Rust ``crates/scp-crypto/src/pseudonym.rs`` plus the per-bridge
 custody callbacks; the TypeScript, Swift, and Kotlin SDKs implement the same
 recipe). It exists so the Python KAT and the Python custody test fixture share
 one canonical algorithm rather than re-deriving it (and risking drift) in each.
