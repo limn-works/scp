@@ -298,40 +298,46 @@ struct ContextCryptoState {
 
 /// Owned per-context MLS crypto state moved out of
 /// [`MlsCryptoProvider::contexts`] by [`MlsCryptoProvider::take_crypto_state`]
-/// (ADR-049 commit 12).
+/// (ADR-049 PR-7, SCP-CRYPTOMOVE-001).
 ///
-/// Mirrors the private [`ContextCryptoState`] struct above — one public
-/// `pub` field per legacy field, plus the `send_sequence` counter so
-/// callers can seed an actor-side
+/// This is the one-way move payload that transfers a context's crypto state
+/// from the provider to its per-context actor. It mirrors the private
+/// [`ContextCryptoState`] struct above — one public `pub` field per legacy
+/// field, plus the `send_sequence` counter so callers can seed an actor-side
 /// [`crate::context::actor::SendSequenceTracker`] at take-time. After
 /// `take_crypto_state` returns `Ok(OwnedMlsCryptoState)`, the provider's
-/// `contexts[ctx_id]` entry is absent and subsequent `seal` / `open` /
-/// `with_context` calls targeting that context return
-/// [`ContextError::CryptoFailed`] with a "context state owned by actor"
-/// message. The invariant is tracked by
-/// [`MlsCryptoProvider::taken_context_ids`] — a post-refactor set that
-/// distinguishes "state has been taken" from "state was never created"
-/// so the error message is actionable.
+/// `contexts[ctx_id]` entry is absent and any subsequent
+/// [`Self::with_context`] access (or provider birth-seam) targeting that
+/// context returns [`ContextError::CryptoFailed`] with a "context state owned
+/// by actor" message. The invariant is tracked by
+/// [`MlsCryptoProvider::taken_context_ids`] — a set that distinguishes
+/// "state has been taken" from "state was never created" so the error
+/// message is actionable.
 ///
-/// # Scope — infrastructure only
+/// # Ownership — the actor owns crypto by move
 ///
-/// Commit 12b.2a does NOT move any production state into actor ownership.
-/// `take_crypto_state` is callable but no production site calls it yet;
-/// the legacy `create_mls_group` still populates `contexts` via the
-/// `ContextCryptoProvider` trait impl, and the legacy `seal` / `open`
-/// path continues to operate on `contexts[ctx_id]`. Commit 12b.2b is the
-/// first site that invokes `take_crypto_state` to atomically migrate every
-/// messaging handler's state into actor ownership at spawn time — see
-/// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder row 12b.2b.
+/// This is the shipped steady state, not an interim scaffold.
+/// `take_crypto_state` IS called from the production spawn paths — the
+/// join/WELCOME birth seam
+/// ([`crate::context::supervisor::Supervisor::spawn_actor_from_welcome`]) and
+/// the CREATE seam in `context/lifecycle_helpers.rs` — to hand each context's
+/// freshly-born group + sender key onto its actor's `PerContextState` at spawn
+/// time. The provider's steady-state `seal` / `open` methods are DELETED: once
+/// seeded, the actor is the sole crypto authority. The transfer is one-way —
+/// crypto is never handed back to the provider, so there is no dual-home
+/// window. The remaining provider entry points (`create_mls_group`,
+/// `install_joined_group`, sender-key generation, `with_context`) are birth
+/// seams or fail-closed "owned by actor" guards, never a live steady-state
+/// crypto path.
 ///
 /// # Why every field is `pub`
 ///
-/// This type is a move payload, not a domain struct. Callers (the actor
-/// construction helper in 12b.2b) destructure it field-by-field to build
-/// the actor-side [`crate::context::actor::ContextCryptoState`]. The
-/// legacy `ContextCryptoState` keeps its fields private because it is
-/// internal to the provider; the owned mirror here is the FFI-boundary
-/// shape between the provider and the actor.
+/// This type is a move payload, not a domain struct. Callers (the actor spawn
+/// seams above) destructure it field-by-field to build the actor-side
+/// [`crate::context::actor::ContextCryptoState`]. The legacy
+/// `ContextCryptoState` keeps its fields private because it is internal to the
+/// provider; the owned mirror here is the boundary shape between the provider
+/// and the actor.
 pub struct OwnedMlsCryptoState {
     /// The `OpenMLS` group handle for this context.
     pub mls_group: ScpMlsGroup,
@@ -4081,9 +4087,9 @@ mod tests {
     }
 
     /// Build a minimal `InnerEnvelope` with a deterministic signing key.
-    /// `provider.open()` does not verify signatures (per the comment in
-    /// `open()`, signature verification is deferred to `ContextManager`),
-    /// so an arbitrary key suffices for the H9 receive-ceiling tests.
+    /// The actor seal/open seam (`PerContextState::open`) does not verify inner
+    /// signatures — signature verification is deferred to the receive/dispatch
+    /// path — so an arbitrary key suffices for the H9 receive-ceiling tests.
     fn build_test_inner(
         context_id_str: &str,
         sender_did: &str,

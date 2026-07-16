@@ -1496,9 +1496,45 @@ fn bridge_resume_path_routes_through_restore_on_startup() {
     }
 }
 
+// First-occurrence binding pin for the seal/open crypto-pipeline gates below.
+//
+// `extract_fn_body` / `extract_fn_signature` bind to the FIRST `fn seal(` /
+// `fn open(` in STATE_SRC. STATE_SRC now defines each name TWICE: the
+// production `ContextCryptoState::seal`/`open` core (whose bodies call
+// `create_outer_envelope` / `encrypt_sender_layer` / `decrypt_sender_layer` /
+// `strip_padding`) AND a `#[cfg(test)]` `PerContextState` delegating wrapper
+// (whose body only forwards to `crypto.seal(...)` / `crypto.open(...)`). The
+// production core is authored first, so first-occurrence binding is correct
+// TODAY — but a future impl-block reorder that placed a wrapper first would
+// silently rebind the gates below to a delegating body. Pin the assumption by a
+// signature token unique to the production core (`aad_sequence` on `seal`; the
+// raw `context_id: &[u8; 32]` digest on `open`), absent from the wrappers, so a
+// reorder fails HERE loudly instead of masking a downstream regression.
+#[test]
+fn state_seal_open_first_binding_is_production_core() {
+    let seal_sig = extract_fn_signature(STATE_SRC, "seal").expect("STATE_SRC defines a `seal`");
+    assert!(
+        seal_sig.contains("aad_sequence"),
+        "the first `fn seal(` in STATE_SRC must be the production \
+         ContextCryptoState core (takes `aad_sequence`), not the #[cfg(test)] \
+         PerContextState delegating wrapper — else the seal gates below rebind \
+         to the wrapper body"
+    );
+    let open_sig = extract_fn_signature(STATE_SRC, "open").expect("STATE_SRC defines an `open`");
+    assert!(
+        open_sig.contains("context_id: &[u8; 32]"),
+        "the first `fn open(` in STATE_SRC must be the production \
+         ContextCryptoState core (takes the raw `context_id` digest), not the \
+         #[cfg(test)] PerContextState delegating wrapper — else the open gates \
+         below rebind to the wrapper body"
+    );
+}
+
 // Actor-state level: `ContextCryptoState::seal` calls create_outer_envelope
 // (envelope construction). Repointed from the deleted provider `seal` to its
 // actor home in `state.rs` (STATE_SRC) — the moved pipeline, not a weakening.
+// First-occurrence binding to the production core is pinned by
+// `state_seal_open_first_binding_is_production_core` above.
 #[test]
 fn seal_calls_create_outer_envelope() {
     assert!(

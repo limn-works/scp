@@ -1680,10 +1680,6 @@ pub struct WrappingKeyPair {
 /// AAD is byte-identical to the provider's `state.send_sequence` read order. The
 /// `#[cfg(test)]` [`PerContextState`] wrappers below preserve the original
 /// whole-state call shape for the golden byte-identity tests.
-#[allow(
-    dead_code,
-    reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): production callers (build_encrypted_envelope + the receive path) wire in as the atomic-core seams land; until then the golden byte-identity tests + the #[cfg(test)] PerContextState wrappers exercise these Class-C crypto methods."
-)]
 impl ContextCryptoState {
     /// Seals an [`InnerEnvelope`] into an outer-envelope byte blob (sender-key
     /// AES-256-GCM under MLS). `aad_sequence` is the caller-reserved
