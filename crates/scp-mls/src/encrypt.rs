@@ -141,18 +141,29 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
 
     // Process the message — this verifies membership tag and generation number.
     //
-    // OpenMLS may panic on AEAD decryption failure for tampered ciphertexts
-    // (e.g., corrupted authentication tags). We guard against this with
-    // catch_unwind to convert the panic into an MlsError::DecryptionFailed,
-    // preventing a malicious relay from crashing the client process (DoS).
+    // In a DEBUG/native build, OpenMLS's decrypt path can panic on AEAD
+    // decryption failure for a tampered ciphertext (e.g. a corrupted
+    // authentication tag): the panic is an openmls `debug_assert!`
+    // ("Ciphertext decryption failed",
+    // openmls-0.8.1/src/framing/private_message_in.rs). We guard against it with
+    // `catch_unwind`, converting the panic into an `MlsError::DecryptionFailed`
+    // so a malicious relay cannot crash a native client process (DoS).
     //
-    // NOTE (ADR-057 §Prereq-4): `catch_unwind` is INERT under the wasm default
-    // `panic=abort` — a single attacker-delivered tampered ciphertext would
-    // abort the whole tab (a remote-triggerable availability hit, worse than
-    // native). The browser target MUST therefore build with `panic=unwind`, and
-    // the wasm unwind-ABI panic-safety of openmls/RustCrypto across these
-    // `AssertUnwindSafe` boundaries must be re-validated — not "accept the
-    // no-op." This applies to every `catch_unwind` site in this file.
+    // NOTE (ADR-057 §Prereq-4): the LOAD-BEARING fail-closed guarantee is NOT
+    // this `catch_unwind` — it is the `--release` build. That openmls panic is a
+    // `debug_assert!`, so it is COMPILED OUT of release builds; a shipped
+    // `--release` client (native cdylib and the browser `wasm-pack build
+    // --release` artifact alike) gets a typed `Err` from `process_message` on
+    // tampered/malformed ciphertext, which becomes `MlsError::DecryptionFailed`
+    // (browser: `[SCP-CRYPTO-4010]`). Pinned by `[profile.release]
+    // debug-assertions = false` (root `Cargo.toml`) plus the decrypt-path fuzz
+    // target `fuzz/fuzz_targets/fuzz_mls_decrypt.rs`; the browser SDK MUST build
+    // `--release` (a `--dev` build would re-arm the `debug_assert`). This
+    // `catch_unwind` remains as DEFENSE-IN-DEPTH for native/debug builds (where
+    // the assert can fire) and is a harmless no-op on the release wasm path
+    // (wasm `panic=abort`, so nothing to catch — and nothing panics in release
+    // anyway). It is NOT relied upon for the browser guarantee. This applies to
+    // every `catch_unwind` site in this file.
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let process_result = catch_unwind(AssertUnwindSafe(|| {
         g.process_message(&group.provider, protocol_message)
@@ -222,10 +233,12 @@ pub fn decrypt_with_sender_key(
 
     // Process the message — this verifies membership tag and generation number.
     //
-    // OpenMLS may panic on AEAD decryption failure for tampered ciphertexts.
-    // We guard against this with catch_unwind (same as in `decrypt`).
-    // NOTE (ADR-057 §Prereq-4): inert under wasm `panic=abort`; browser build
-    // must use `panic=unwind` (see the `decrypt` note above).
+    // Debug/native-only openmls decrypt `debug_assert!` panic on a tampered
+    // ciphertext; guarded with catch_unwind (same as in `decrypt`).
+    // NOTE (ADR-057 §Prereq-4): the load-bearing fail-closed guarantee is the
+    // `--release` build (the assert is compiled out → typed `Err`); this
+    // catch_unwind is defense-in-depth for native/debug builds, a no-op on the
+    // release wasm path. See the full note on the `decrypt` site above.
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let process_result = catch_unwind(AssertUnwindSafe(|| {
         g.process_message(&group.provider, protocol_message)
@@ -330,8 +343,11 @@ pub fn decrypt_with_sender_did(
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    // NOTE (ADR-057 §Prereq-4): inert under wasm `panic=abort`; browser build
-    // must use `panic=unwind` (see the `decrypt` note above).
+    // NOTE (ADR-057 §Prereq-4): the load-bearing fail-closed guarantee is the
+    // `--release` build (openmls's decrypt `debug_assert!` is compiled out →
+    // typed `Err`); this catch_unwind is defense-in-depth for native/debug
+    // builds, a harmless no-op on the release wasm path. See the full note on
+    // the `decrypt` site above.
     let process_result = catch_unwind(AssertUnwindSafe(|| {
         g.process_message(&group.provider, protocol_message)
     }));
@@ -706,8 +722,11 @@ pub fn decrypt_with_membership_changes(
         .map_err(|e| MlsError::DecryptionFailed(format!("extracting protocol message: {e}")))?;
 
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
-    // NOTE (ADR-057 §Prereq-4): inert under wasm `panic=abort`; browser build
-    // must use `panic=unwind` (see the `decrypt` note above).
+    // NOTE (ADR-057 §Prereq-4): the load-bearing fail-closed guarantee is the
+    // `--release` build (openmls's decrypt `debug_assert!` is compiled out →
+    // typed `Err`); this catch_unwind is defense-in-depth for native/debug
+    // builds, a harmless no-op on the release wasm path. See the full note on
+    // the `decrypt` site above.
     let process_result = catch_unwind(AssertUnwindSafe(|| {
         g.process_message(&group.provider, protocol_message)
     }));
