@@ -1533,14 +1533,26 @@ pub enum StreamSettleOutcome {
     /// the owned reserves, CLEARED the crash-recovery record, and captured the
     /// receipt. The inner `Option` is the captured receipt (`None` when nothing
     /// was billed / no adapter / capture failed). Owed a coalesced persist.
-    ///
-    /// SCP-OUT-046 CRITICAL — this variant ALSO covers the idempotent no-op: a
-    /// witness-bearing xctx settle whose durable `settled` flag was ALREADY set by
-    /// a prior settle (a concurrent live seal task or a crash-recovery sweep). In
-    /// that case NO money moved (release/refund/capture all skipped) and the
-    /// receipt is `None`; the caller still resolves `Committed` because the money
-    /// moved exactly once on that first settle.
     Settled(Option<PaymentReceipt>),
+    /// SCP-OUT-046 CRITICAL (pass-3) — the idempotent no-op: a witness-bearing
+    /// xctx settle whose durable `settled` flag was ALREADY set by a prior settle
+    /// (a concurrent live seal task or a crash-recovery sweep), observed by the
+    /// AUTHORITATIVE pre-commit read at the top of [`settle_outlet_stream`]. The
+    /// money moved EXACTLY ONCE on that first settle, so this settle skips the
+    /// ENTIRE money move — NO persist and NO capture run. The caller still
+    /// resolves `Committed` (the money is durably accounted), but the handler
+    /// flags NO mutation (unchanged owned state), so no spurious Class-C persist
+    /// is scheduled.
+    ///
+    /// DISTINCT from `Settled(None)`: that is a genuine FIRST settle that moved
+    /// money (release/refund + record clear) but captured no receipt (zero-cost
+    /// / no adapter / capture failed) — owed a persist. `AlreadySettled` touched
+    /// nothing at all. Separating them is why the pre-commit read is
+    /// authoritative even across a persist failure: an in-closure `bool` return
+    /// is discarded by `commit_class_s_keep` on a persist `Err`
+    /// (`persist_state_fail_closed(..).map(|()| value)` only maps on `Ok`), which
+    /// would let the external capture re-run and double-bill.
+    AlreadySettled,
 }
 
 /// §5.4.5 close-time economic settlement of a streaming-native invocation, run
@@ -1583,6 +1595,40 @@ pub enum StreamSettleOutcome {
 /// nothing was billed, no payment adapter / policy is configured, or capture
 /// failed (a `PaymentCaptureFailed` local event records the failure — the billed
 /// budget is NOT reversed).
+///
+/// # Exactly-once billing — the two-layer model (SCP-OUT-046)
+///
+/// The external payment capture is NOT transactional with the durable owned
+/// state, so exactly-once is enforced by two complementary layers:
+///
+/// 1. **The durable `settled` flag (concurrent guard, same-process,
+///    authoritative).** For a witness-bearing xctx settle the flag is read at the
+///    TOP of this function (pre-commit, through the cell `Deref`) and set inside
+///    the money-move persist. Because the per-context actor serializes every
+///    settle through its mailbox, this read wins any CONCURRENT double-settle race
+///    (two overlapping recovery sweeps, or a sweep racing the live seal task): the
+///    first settle moves the money + sets the flag; every later settle observes it
+///    and returns [`StreamSettleOutcome::AlreadySettled`] BEFORE any persist or
+///    capture. The read is deliberately pre-commit — an in-closure gate cannot
+///    survive a persist `Err` (`commit_class_s_keep` discards the closure's return
+///    on failure), which would let the external capture re-run and double-bill.
+///
+/// 2. **The payment adapter idempotency key (crash-window backstop,
+///    cross-process).** The flag cannot close the unavoidable CRASH window: a
+///    first settle that captures its receipt, then fails the money-move persist,
+///    then crashes before the run-loop retry lands, leaves the durable witness at
+///    `settled == false`, so crash recovery re-settles and re-captures. That
+///    re-capture is deduped by the payment adapter: every capture flows through
+///    [`authorize_and_capture_stream_billed`], which sets
+///    [`PaymentMetadata::idempotency_key`](crate::economy::adapter::PaymentMetadata::idempotency_key)
+///    to the stream `request_id`. The `request_id` is stable across the crash
+///    (recovery rebuilds the identical settlement from the durable witness), so
+///    the two captures share one idempotency key and the adapter authorizes /
+///    captures at most once. The narrow residual is bounded to a single
+///    already-metered capture attempt and is fully covered by this backstop; it
+///    is NOT a durable "captured" sub-flag (capture is external and
+///    non-transactional, so a sub-flag would only shrink, never close, the
+///    window — the flag+key pair is the correct exactly-once story).
 #[allow(
     clippy::too_many_lines,
     reason = "one linear close-time settlement: unspent math + live-policy read + \
@@ -1642,6 +1688,43 @@ pub async fn settle_outlet_stream(
         "StreamSettlement.reserved must equal billed + refund"
     );
 
+    // SCP-OUT-046 CRITICAL (pass-3) — AUTHORITATIVE pre-commit idempotency read.
+    // For a witness-bearing xctx settle, read the durable `settled` flag through
+    // the cell `Deref` BEFORE the commit block. The per-context actor serializes
+    // every settle for this context through its mailbox, so no other settle
+    // interleaves within this single handler turn — this read is authoritative and
+    // wins any concurrent-double-settle race (two overlapping recovery sweeps, or a
+    // sweep racing the live seal task).
+    //
+    // It is placed BEFORE the fail-closed commit ON PURPOSE. `commit_class_s_keep`
+    // runs `persist_state_fail_closed(..).map(|()| value)`: on a persist FAILURE the
+    // closure's return is DISCARDED (mapped only on `Ok`), so an in-closure "already
+    // settled" signal cannot survive a persist `Err`. If the money move were gated
+    // only inside the closure, an already-settled settle whose (redundant) persist
+    // then failed would fall through to the external capture below and bill a SECOND
+    // time — the xctx path has NO `stream_reservations` reconcile net to dedup the
+    // capture (streaming saga runs with `settlement_sink = None`). Reading the flag
+    // here, before any persist, closes that window: if a prior settle already moved
+    // the money exactly once, skip the WHOLE settlement (no persist, no capture) and
+    // resolve `Committed` via `AlreadySettled`. The first-settle atomic money+flag
+    // SET stays inside the closure below (money and `settled` land in ONE persist).
+    if let Some(sid) = witness_saga_id
+        && cell
+            .class_s
+            .xctx_committed_stream_outputs
+            .get(sid)
+            .is_some_and(|w| w.settled)
+    {
+        tracing::debug!(
+            context_id = %context_id,
+            request_id = %hex::encode(request_id),
+            "outlet stream settlement (xctx saga): witness already settled \
+             (authoritative pre-commit read) — skipping the whole settlement \
+             (no persist, no capture)"
+        );
+        return StreamSettleOutcome::AlreadySettled;
+    }
+
     // Money-conservation fail-closed (crypto): `billed_amount` and the
     // (`billed_count`, `cost_per_chunk`) pair are INDEPENDENT settlement fields,
     // but the captured `PaymentReceipt` (a money artifact) must never bill MORE
@@ -1678,11 +1761,15 @@ pub async fn settle_outlet_stream(
     if generation != cell.generation {
         // SCP-OUT-046 CRITICAL — a witness-bearing cross-context streaming
         // settlement DEFERS ENTIRELY on a generation mismatch: touch no owned
-        // state AND do NOT capture. The durable witness stays `settled == false`,
-        // so crash recovery completes the WHOLE settlement (refund + release +
-        // capture) exactly once against the restored instance. Capturing here and
-        // letting recovery re-capture would double-bill the invoker (the xctx path
-        // has no `stream_reservations` reconcile net to dedup the capture).
+        // state AND do NOT capture. Touching owned state is unsafe here (this may
+        // be the WRONG respawned context), so the release/refund MUST defer to
+        // recovery on the restored instance regardless. Bundling the capture into
+        // that deferral keeps the whole settlement single-shot and avoids relying
+        // on the payment adapter to collapse an eager capture here against
+        // recovery's — the durable witness stays `settled == false`, so crash
+        // recovery completes the WHOLE settlement (refund + release + capture)
+        // exactly once against the restored instance, using the SAME durable
+        // `request_id` as this call's idempotency key.
         if witness_saga_id.is_some() {
             tracing::debug!(
                 context_id = %context_id,
@@ -1795,47 +1882,33 @@ pub async fn settle_outlet_stream(
     let has_record = cell.class_s.stream_reservations.contains_key(&request_key);
     // SCP-OUT-046 CRITICAL: a witness-bearing xctx settle ALWAYS persists (even a
     // zero-money settle) so the `settled` flag is flipped atomically with any
-    // money move — recovery reads the flag to know the settlement completed.
+    // money move — recovery reads the flag to know the settlement completed. The
+    // already-settled case has ALREADY returned above (the authoritative
+    // pre-commit read), so reaching here is necessarily the FIRST settle for this
+    // witness; the closure just SETS `settled` in the same persist as the money.
     let witness_for_commit = witness_saga_id.cloned();
-    // SCP-OUT-046 CRITICAL — `true` once the in-closure witness gate observes the
-    // durable `settled` flag ALREADY set (a prior settle — a concurrent live seal
-    // task or a crash-recovery sweep — already moved the money exactly once). When
-    // set, the whole money move (release + refund + capture) is skipped and the
-    // caller resolves `Committed` without moving money again.
-    let mut already_settled = false;
     if should_release || refund_amount.value() > 0 || has_record || witness_for_commit.is_some() {
         let invoker_for_commit = invoker_did.clone();
         let ucan_for_commit = ucan_cid.clone();
         let commit_result = cell
             .commit_class_s_keep(deps, &context_id, move |mut view| {
                 let state = view.rest_mut();
-                // SCP-OUT-046 CRITICAL — witness idempotency gate. READ the durable
-                // `settled` flag FIRST, and skip the entire money move if it is
-                // already set. This in-closure read is AUTHORITATIVE: the per-context
-                // actor serializes every settle for this context through its mailbox,
-                // so this read+set wins any race — two overlapping recovery sweeps, or
-                // a recovery sweep racing the live seal task. (The prior split
-                // recovery read via `StreamSettleCheckWitness` + this apply are two
-                // mailbox round-trips — a TOCTOU window; this in-closure gate closes
-                // it, since the flag is now read and set atomically with the money.)
-                // The flag is thus the AUTHORITATIVE double-refund guard for the xctx
-                // path (which has no `stream_reservations` reconcile net), not merely
-                // a recovery-time hint. A witness-bearing settle where the witness is
-                // somehow absent (an anomalous rollback race — the append-rollback
-                // branch is the only remover, and it re-stages the slot so no settle
-                // is driven) falls through to the money move exactly as before.
+                // SCP-OUT-046 CRITICAL — FIRST-settle atomic money+flag SET. The
+                // authoritative idempotency decision happened PRE-COMMIT (above): an
+                // already-settled witness returned `AlreadySettled` before this block,
+                // and the per-context actor serializes settles so no other settle
+                // interleaves between that read and this persist. Reaching here is
+                // therefore the first settle — flip `settled` in the SAME Class-S
+                // persist as the money move below so money and flag land (or KEEP)
+                // together, making `settled` the durable, atomic record that the
+                // refund + §7.3.8 counter release actually happened. (Gating the money
+                // move on the flag INSIDE the closure would be unsound on its own: a
+                // fallible persist discards the closure's return on `Err`, so a
+                // persist-failed already-settled settle could still reach the external
+                // capture below — the pre-commit read closes exactly that window.)
                 if let Some(sid) = witness_for_commit.as_ref()
                     && let Some(w) = state.class_s.xctx_committed_stream_outputs.get_mut(sid)
                 {
-                    if w.settled {
-                        // Already settled by a prior settle — money moved exactly
-                        // once. Touch NOTHING (release/refund/record already done by
-                        // that first settle) and signal the caller to skip capture.
-                        return Ok(true);
-                    }
-                    // First settle for this witness — flip `settled` in the SAME
-                    // Class-S persist as the money move below, so money+flag are
-                    // atomic and durable together.
                     w.settled = true;
                 }
                 if should_release {
@@ -1855,34 +1928,23 @@ pub async fn settle_outlet_stream(
                 // Unconditionally drop the crash-recovery record on the clean
                 // terminal (no-op if absent) — the double-release guard.
                 state.class_s.stream_reservations.remove(&request_key);
-                Ok(false)
+                Ok(())
             })
             .await;
-        match commit_result {
-            Ok(settled_already) => already_settled = settled_already,
-            Err(err) => {
-                // KEEP semantics: the in-memory release/refund IS applied; the run
-                // loop retries the durable write. Capture runs regardless (H8).
-                tracing::warn!(
-                    context_id = %context_id,
-                    request_id = %hex::encode(request_id),
-                    "outlet stream settlement: release/refund persist failed (kept in memory): {err}"
-                );
-            }
+        if let Err(err) = commit_result {
+            // KEEP semantics: the in-memory release/refund IS applied; the run loop
+            // retries the durable write. Capture runs regardless (H8). If this FIRST
+            // settle's persist fails and the process crashes before the retry lands,
+            // the durable witness stays `settled == false` and crash recovery
+            // re-settles with the SAME durable `request_id` — the payment adapter's
+            // idempotency key collapses the re-capture (the two-layer exactly-once
+            // model; see the fn doc-comment).
+            tracing::warn!(
+                context_id = %context_id,
+                request_id = %hex::encode(request_id),
+                "outlet stream settlement: release/refund persist failed (kept in memory): {err}"
+            );
         }
-    }
-
-    // SCP-OUT-046 CRITICAL — the witness was already settled by a prior settle, so
-    // the money move ran exactly once there. Resolve `Committed` (via
-    // `Settled(None)` ⇒ `applied: true`) WITHOUT capturing a second receipt.
-    if already_settled {
-        tracing::debug!(
-            context_id = %context_id,
-            request_id = %hex::encode(request_id),
-            "outlet stream settlement (xctx saga): witness already settled by a prior \
-             settle — skipping the money move (idempotent no-op)"
-        );
-        return StreamSettleOutcome::Settled(None);
     }
 
     // Capture the §19.15.5 PaymentReceipt for the EXACT billed amount. Skip when

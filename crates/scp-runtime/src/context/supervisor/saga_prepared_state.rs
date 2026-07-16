@@ -725,16 +725,25 @@ pub struct CommittedStreamingOutletInvocation {
     /// the staged slot, BEFORE the off-mailbox money move runs (the money move is
     /// a separate off-mailbox
     /// [`settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)).
-    /// The on-actor `SettleOutletStream` handler READS this flag FIRST (in the
-    /// `commit_class_s_keep` closure, actor-serialized so the read is authoritative)
-    /// and skips the ENTIRE money move if it is already `true`; otherwise it moves
-    /// the money AND flips this to `true` in the SAME Class-S persist (refund +
+    /// The on-actor `SettleOutletStream` handler READS this flag FIRST — a
+    /// PRE-COMMIT `Deref` read at the top of
+    /// [`settle_outlet_stream`](crate::context::outlets_helpers::settle_outlet_stream),
+    /// actor-serialized so the read is authoritative — and skips the ENTIRE
+    /// settlement (no persist, no capture) if it is already `true`; otherwise it
+    /// moves the money AND flips this to `true` in the SAME Class-S persist (refund +
     /// counter release), so `settled` is the durable, atomic record that the escrow
-    /// refund + §7.3.8 counter release actually landed. Because the handler READS it
-    /// to gate the money move, it is the authoritative double-refund guard for the
-    /// xctx path (which has NO `stream_reservations` reconcile net — the streaming
-    /// saga runs with `settlement_sink = None`) — it closes the concurrent-double-
-    /// settle race, not merely a recovery-time hint. Crash recovery also reads it:
+    /// refund + §7.3.8 counter release actually landed. The read is deliberately
+    /// pre-commit, NOT inside the persist closure: `commit_class_s_keep` discards the
+    /// closure's return on a persist `Err`, so an in-closure gate could not stop the
+    /// external capture from re-running on a persist failure (a double-bill). Because
+    /// the handler READS the flag to gate the money move, it is the authoritative
+    /// CONCURRENT double-refund guard for the xctx path (which has NO
+    /// `stream_reservations` reconcile net — the streaming saga runs with
+    /// `settlement_sink = None`). The unavoidable cross-process CRASH window (capture
+    /// R1, persist fails, crash before retry ⇒ durable `settled == false` ⇒ recovery
+    /// re-captures R2) is backstopped by the payment adapter idempotency key (the
+    /// stable `request_id` below), giving exactly-once billing as a two-layer model
+    /// (flag = concurrent; key = crash). Crash recovery also reads it:
     /// witness present &
     /// `settled == false` ⇒ the money move never ran (crash / eviction in the
     /// seal→settle window) ⇒ rebuild the settlement from the durable fields below

@@ -32226,17 +32226,22 @@ mod streaming_saga_tests {
     /// concurrent-double-settle race the residual CRITICAL flags: a mobile
     /// `resume()` sweep racing the live seal task, or two overlapping recovery
     /// sweeps, both dispatch `settle_outlet_stream_via_actor` for the same witness.
-    /// Without the in-closure `!settled` gate the money move (release + refund +
-    /// capture) runs UNCONDITIONALLY when the witness is present → double
-    /// `reverse_spend`, double §7.3.8 `AmountCumulative` release (re-spend past the
-    /// cap), double capture.
+    /// Without the `!settled` gate the money move (release + refund + capture)
+    /// runs UNCONDITIONALLY when the witness is present → double `reverse_spend`,
+    /// double §7.3.8 `AmountCumulative` release (re-spend past the cap), double
+    /// capture.
     ///
     /// The per-context actor serializes every settle through its mailbox, so the
-    /// in-closure flag read+set is authoritative: the FIRST settle moves the money
-    /// and flips `settled`; the SECOND observes `settled == true` and is a total
-    /// no-op (no release/refund/capture) while still resolving `Committed`
-    /// (`applied == true`, receipt `None`). The two settles are submitted
-    /// CONCURRENTLY (`tokio::join!`) to exercise the race, not sequenced.
+    /// authoritative PRE-COMMIT flag read is decisive: the FIRST settle moves the
+    /// money and flips `settled` (in one Class-S persist); the SECOND reads
+    /// `settled == true` before any persist and is a total no-op (no
+    /// release/refund/capture) while still resolving `Committed` (`applied ==
+    /// true`, receipt `None`). The two settles are submitted CONCURRENTLY
+    /// (`tokio::join!`) to exercise the race, not sequenced. (The failing-store
+    /// edge — where an in-closure-only gate would double-capture on a persist
+    /// `Err` — is covered by
+    /// `already_settled_witness_with_failing_store_does_not_recapture` in
+    /// `stream_settlement_adapter.rs`.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_concurrent_double_settle_moves_money_exactly_once() {
         use crate::context::actor::commands::StreamSettleApplication;
@@ -32384,7 +32389,8 @@ mod streaming_saga_tests {
             "both concurrent settles resolve Committed (applied=true)"
         );
         // EXACTLY ONE captured a PaymentReceipt — the winner. The loser observed
-        // `settled == true` and returned `Settled(None)` (no capture).
+        // `settled == true` via the authoritative pre-commit read and returned
+        // `AlreadySettled` (no persist, no capture).
         assert_eq!(
             usize::from(a1.receipt.is_some()) + usize::from(a2.receipt.is_some()),
             1,

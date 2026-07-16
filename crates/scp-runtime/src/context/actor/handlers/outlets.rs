@@ -383,10 +383,13 @@ async fn handle_reverse_stream_escrow(
 /// [`Outcome`]. Fix-D: a generation-mismatch settle CAPTURES the receipt for
 /// rendered service but touches no owned state (`Outcome::ok` — no coalesced
 /// persist; the durable reserves are left for the restore-time reconcile
-/// sweep); a matching-instance settlement mutated owned state
-/// (`Outcome::ok_mutated`). Either way the reply carries the (possibly `None`)
-/// receipt. The helper never returns `Err` (a persist failure is KEEP'd +
-/// logged, service-rendered capture runs regardless).
+/// sweep); a matching-instance FIRST settlement mutated owned state
+/// (`Outcome::ok_mutated`). SCP-OUT-046 (pass-3): an ALREADY-settled
+/// witness-bearing settle (authoritative pre-commit read) touched NOTHING — it
+/// resolves `Committed` (`applied: true`) with NO receipt and `Outcome::ok`
+/// (unmutated, so no spurious Class-C persist). Either way the reply carries the
+/// (possibly `None`) receipt. The helper never returns `Err` (a persist failure
+/// is KEEP'd + logged, service-rendered capture runs regardless).
 async fn handle_settle_outlet_stream(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -426,6 +429,19 @@ async fn handle_settle_outlet_stream(
                 applied: true,
             }));
             Outcome::ok_mutated(())
+        }
+        StreamSettleOutcome::AlreadySettled => {
+            // SCP-OUT-046 CRITICAL (pass-3): the witness was ALREADY settled by a
+            // prior settle (authoritative pre-commit read) — the money moved
+            // exactly once there, and THIS settle touched NO owned state (no
+            // persist, no capture). Resolve `Committed` (`applied: true`) but flag
+            // NO mutation so the actor does not schedule a spurious Class-C persist
+            // of unchanged state.
+            let _ = reply.send(Ok(StreamSettleApplication {
+                receipt: None,
+                applied: true,
+            }));
+            Outcome::ok(())
         }
     }
 }
