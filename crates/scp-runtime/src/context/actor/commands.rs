@@ -613,6 +613,19 @@ pub struct SendPseudonymAnnouncementPayload {
 /// [`ed25519_dalek::SigningKey`] from the bytes on the receive side.
 pub struct SigningKeyBytes(pub zeroize::Zeroizing<[u8; 32]>);
 
+/// Redacting `Debug` (security def-in-depth): the seed bytes are NEVER formatted
+/// into a log line. `SigningKeyBytes` deliberately does not `derive(Debug)`, but
+/// providing a redacting impl means a FUTURE enclosing enum/struct that DOES
+/// `derive(Debug)` (a command variant carrying this key) prints `<redacted>`
+/// instead of failing to compile OR dumping the key bytes.
+impl std::fmt::Debug for SigningKeyBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SigningKeyBytes")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
 impl SigningKeyBytes {
     /// Construct from an [`ed25519_dalek::SigningKey`] borrowed from
     /// the caller. Copies the 32-byte seed so the caller's key can be
@@ -2497,11 +2510,24 @@ pub enum OutletsCommand {
         /// Spawn-generation the reservation was made against. Compared to the
         /// live actor's `PerContextState::generation`; a mismatch DROPS.
         generation: u64,
+        /// SCP-OUT-046 CRITICAL — the streaming-saga witness key. `Some` for the
+        /// cross-context streaming saga (the seal task + crash recovery): on a
+        /// clean matching-instance settle the handler READS
+        /// `xctx_committed_stream_outputs[saga_id].settled` FIRST (in the
+        /// commit closure, actor-serialized ⇒ authoritative) and skips the whole
+        /// money move if already `true`; otherwise it moves the money AND flips the
+        /// flag `= true` in the SAME Class-S persist, making money+flag atomic. The
+        /// flag is thus the authoritative double-refund guard closing the
+        /// concurrent-double-settle race (the xctx path has no `stream_reservations`
+        /// reconcile net). `None` for the same-context streaming pump (whose double
+        /// -release guard is the `stream_reservations` record).
+        witness_saga_id: Option<crate::context::supervisor::saga_journal::SagaId>,
         /// Oneshot reply carrying the captured receipt (`None` when nothing was
-        /// billed / no adapter / capture failed / dropped on generation
-        /// mismatch), or the dispatch / transport infra error.
-        reply:
-            oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
+        /// billed / no adapter / capture failed / deferred on generation mismatch)
+        /// plus `applied` — whether the owned-state settlement (refund + release +
+        /// witness-settled flag) actually landed on the matching live instance, or
+        /// was DEFERRED (gen-mismatch / no-actor) for crash recovery to complete.
+        reply: oneshot::Sender<Result<StreamSettleApplication, ContextError>>,
     },
 
     /// Fix-D — durably persist the streaming crash-recovery
@@ -3078,6 +3104,175 @@ pub type CommitBReserveReply = oneshot::Sender<Result<CommitBReserveOutcome, Con
 /// Reply-channel type alias for [`SagaPhaseMessage::CommitBSettle`].
 pub type CommitBSettleReply = oneshot::Sender<Result<CommitBSettleOutcome, ContextError>>;
 
+/// Reply payload for [`SagaPhaseMessage::CommitBStreamSettle`] (ADR-061 seal
+/// phase; spec §6.2.5 streaming saga). The seal-close over the durable
+/// `SagaId`-keyed Merkle frontier: the signed streaming receipt + the sealed
+/// manifest root + the billing/chunk counters + the escrow settlement (billed +
+/// refund from the durable ledger) + the `OutletInvoked` event id the FSM's
+/// off-mailbox seal task forwards to Commit-A.
+///
+/// On a replayed `CommitBStreamSettle` (this `SagaId` already sealed) the SAME
+/// stored bytes are returned — byte-for-byte identical receipt, root, settlement,
+/// and `outlet_invoked_event_id` — and the outlet is NOT re-invoked (the manifest
+/// re-derives from the durable frontier prefix, never from re-execution).
+#[derive(Debug)]
+pub struct CommitBStreamSettleOutcome {
+    /// The target's signed streaming receipt bytes (JCS of
+    /// [`CrossContextOutletStreamReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt)).
+    pub receipt: Vec<u8>,
+    /// The sealed RFC-6962 Merkle root (`frontier.root()`) — the
+    /// `stream_manifest_hash` (`[0u8; 32]` for an honest empty/zero-chunk prefix).
+    pub stream_manifest_hash: [u8; 32],
+    /// Credit billed at seal-close, settled from the DURABLE ledger
+    /// (`cost_per_chunk × billed_count` via `StreamEscrow::settle_at_close`) —
+    /// ADR-061 seal step 3, NOT the in-memory `PumpEscrowGuard`. The FSM applies
+    /// the refund against the invoker's escrow reservation.
+    pub billed: scp_protocol::economy::types::Amount,
+    /// Escrow refund at seal-close = `reserved − billed` (`settle_at_close`).
+    /// Decoupled-release semantics (ADR-049 §3a(b)): the concurrency slot
+    /// released at the Commit-transition; the escrow settles here.
+    pub refund: scp_protocol::economy::types::Amount,
+    /// The §5.4.5 billable-`Data`-chunk count sealed at close.
+    pub billed_count: u32,
+    /// Total chunks in the sealed manifest (`frontier.leaf_count()`).
+    pub stream_chunk_count: u64,
+    /// The `SagaId`-stable `OutletInvoked` event-log entry id.
+    pub outlet_invoked_event_id: String,
+    /// The complete close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// built by the handler from the DURABLE ledger (SCP-OUT-046): the escrow
+    /// refund + billed capture + §7.3.8 cumulative-counter release. `Some` on the
+    /// FIRST seal — the off-mailbox seal task applies it via
+    /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)
+    /// (the actor handler CANNOT dispatch to its own mailbox — re-entrant
+    /// deadlock — so the money movement runs off-mailbox). `None` on a REPLAY
+    /// (the money already moved on the first settle; the seal task must NOT
+    /// re-apply it). Boxed to keep the outcome small.
+    pub settlement: Option<Box<crate::context::outlets::invoke::StreamSettlement>>,
+    /// B's CURRENT spawn-generation at seal time (SCP-OUT-046). BOTH the normal
+    /// seal task AND crash recovery settle against THIS seal-time generation (not
+    /// the reserve-time generation): the seal just ran on this instance, so its
+    /// generation is the one the off-mailbox settle must target to APPLY against
+    /// the live hold. Using the reserve-time generation instead would falsely
+    /// mismatch after a mid-stream respawn and strand the refund + counter release
+    /// (the confused-deputy guard would drop a settlement meant for THIS instance).
+    pub generation: u64,
+}
+
+/// Reply-channel type alias for [`SagaPhaseMessage::CommitBStreamSettle`].
+pub type CommitBStreamSettleReply =
+    oneshot::Sender<Result<CommitBStreamSettleOutcome, ContextError>>;
+
+/// Reply payload for [`OutletsCommand::SettleOutletStream`] (SCP-OUT-046
+/// CRITICAL settlement-atomicity). Carries the captured `PaymentReceipt` (if
+/// any) plus whether the owned-state settlement actually LANDED.
+#[derive(Debug)]
+pub struct StreamSettleApplication {
+    /// The §19.15.5 `PaymentReceipt` captured for the billed amount, or `None`
+    /// (nothing billed / no adapter / capture failed / deferred).
+    pub receipt: Option<crate::economy::adapter::PaymentReceipt>,
+    /// `true` iff the matching-live-instance settlement applied — the escrow
+    /// refund + §7.3.8 counter release landed AND (for a witness-bearing xctx
+    /// settlement) `xctx_committed_stream_outputs[saga_id].settled` was flipped to
+    /// `true` in the same Class-S persist. `false` means the settle was DEFERRED
+    /// (generation mismatch / no resident actor): no owned state was touched and,
+    /// for a witness-bearing settlement, NO capture ran either — the durable
+    /// witness stays unsettled for crash recovery to complete exactly once.
+    pub applied: bool,
+}
+
+/// Reply payload for [`SagaPhaseMessage::StreamSettleCheckWitness`] (SCP-OUT-046
+/// CRITICAL; §17.16.4 crash recovery). READ-ONLY snapshot of the durable
+/// streaming seal witness the keyless recovery sweep needs to decide how to
+/// resolve a `Committing` streaming saga.
+///
+/// Modeled as an ENUM so illegal states are unrepresentable: only the
+/// [`Unsettled`](Self::Unsettled) case carries the money settlement + generation +
+/// A-leaf (they are meaningless when the witness is absent or already settled), so
+/// there is no "present-but-no-generation" or "settled-with-a-pending-settlement"
+/// combination to guard against, and no synthetic sentinel `generation: 0` on the
+/// absent path.
+#[derive(Debug)]
+pub enum StreamWitnessRecoveryStatus {
+    /// The `SagaId` is NOT durably captured in `xctx_committed_stream_outputs` —
+    /// the seal-close never landed, OR the witness could not be read (send failure
+    /// / non-resident target). Recovery treats this as unsealed → `NeedsRepair`
+    /// with the escrow HELD for the key-bearing truncated close.
+    Absent,
+    /// The witness is durably captured AND its `settled` flag is set — the money
+    /// move (escrow refund + §7.3.8 counter release) already landed on the first
+    /// settle. Recovery resolves the journal `Committed` idempotently, moving no
+    /// money.
+    Settled,
+    /// The witness is durably captured but NOT settled — B sealed, then crashed /
+    /// was evicted in the seal→settle window, so the money move never ran.
+    /// Recovery completes it KEYLESSLY (money ops need no signing key).
+    Unsettled {
+        /// B's CURRENT spawn-generation — the generation the recovery settlement
+        /// must target so the confused-deputy guard admits it against the restored
+        /// hold.
+        generation: u64,
+        /// The close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+        /// rebuilt from the witness's durable fields — the money to move.
+        settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+        /// The A-side dual-log leaf reconstruction inputs (JCS receipt bytes +
+        /// sealed root + counts + event id) — `Some` iff the stored receipt parses.
+        /// Recovery records the `CrossContextOutletInvoked` leaf from this so the
+        /// dual-log is completed even if the seal task crashed before recording it
+        /// (SCP-OUT-046 #135; best-effort, convergent leaf).
+        a_event: Option<Box<CommitBStreamSettleOutcome>>,
+    },
+}
+
+/// Boxed field set for [`SagaPhaseMessage::PrepareBStreaming`] (ADR-061 seal
+/// phase; spec §6.2.5). The unary §6.2.4 Prepare-B field set + the streaming
+/// escrow-ledger inputs (`reserved` / `cost_per_chunk`), boxed into the message
+/// variant so `ContextCommand` / the actor dispatch future stay under the
+/// `clippy::large_enum_variant` / `clippy::large_futures` thresholds. The handler
+/// destructures this to build a `PrepareBRequest` and stage the streaming slot.
+#[derive(Debug)]
+pub struct PrepareBStreamingFields {
+    /// Caller context id (raw 32-byte digest).
+    pub caller_context_id: [u8; 32],
+    /// Target context id (raw 32-byte digest) — MUST equal B's own context.
+    pub target_context_id: [u8; 32],
+    /// Channel-authenticated caller DID (the confused-deputy re-bind audience).
+    pub caller_did: scp_did::DID,
+    /// Context-local outlet registration id (indexes B's own registry).
+    pub outlet_registration_id: String,
+    /// UCAN proof reference — an INDEX into B's own UCAN store, never the proof
+    /// bytes. `None` for an ungated outlet.
+    pub ucan_proof_id: Option<String>,
+    /// The invocation input — validated against the outlet's registered schema
+    /// specificity floor (spec §9.2.1); never journaled.
+    pub input: serde_json::Value,
+    /// Caller-asserted chain depth — advisory; the `+1` base for B's re-derived
+    /// `recorded_chain_depth`.
+    pub asserted_chain_depth: u8,
+    /// Caller-asserted 16-byte envelope nonce — checked against B's TTL dedup
+    /// cache, then staged on accept.
+    pub asserted_nonce: [u8; 16],
+    /// Caller-asserted send-time (ms) — used ONLY for the §9.14 skew check.
+    pub asserted_timestamp_ms: u64,
+    /// The channel-authenticated caller's ROLE in the caller context, resolved
+    /// supervisor-side at initiation (NOT envelope-asserted).
+    pub caller_source_role: Option<String>,
+    /// Total escrow reserved at the Commit-transition (the debited hold cap);
+    /// staged onto the durable ledger so the seal settles `reserved − billed`.
+    pub reserved: scp_protocol::economy::types::Amount,
+    /// The per-billable-`Data`-chunk price pinned at reservation; staged so the
+    /// seal reconstructs the escrow from `(cost_per_chunk, reserved)`.
+    pub cost_per_chunk: scp_protocol::economy::types::Amount,
+    /// The stream `request_id` (SCP-OUT-046 settlement ledger) — staged so the
+    /// seal's [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// receipt + event provenance anchor to the id the pump billed.
+    pub request_id: [u8; 16],
+    /// The acceptance-time economic policy (raw, `Serialize`; the
+    /// `EconomicPolicySnapshot` wrapper is not) — `None` for zero-cost / Query
+    /// streams. Staged so the seal captures the billed `PaymentReceipt` for
+    /// service rendered even if B is torn down mid-stream (SCP-OUT-046).
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+}
+
 /// See [`ContextCommand::SagaPhase`]. The per-phase messages the supervisor
 /// FSM dispatches to a participant actor for a cross-context outlet-invocation
 /// saga (spec §6.2.4). Each variant carries a typed `oneshot` reply.
@@ -3310,6 +3505,147 @@ pub enum SagaPhaseMessage {
         /// per-call. Zeroizes on drop.
         signing_key: SigningKeyBytes,
         /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+    /// Append one emitted stream chunk to the durable `SagaId`-keyed Merkle
+    /// frontier (ADR-061 seal phase; spec §6.2.5 streaming saga). Runs on the
+    /// LOCAL target (B) actor. Sent by the FSM's off-mailbox seal task per
+    /// forwarded chunk (coalesced batching permitted) so the durable capture is
+    /// a **replay snapshot** the seal at stream-close reads to finalize
+    /// `stream_manifest_hash` — an O(log n) frontier, NEVER the payload set.
+    ///
+    /// Folds `chunk` into the staged
+    /// [`CrossContextStreamingOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextStreamingOutletInvocationPrepared)
+    /// `frontier` and advances the billable-chunk counter + durable credit
+    /// ledger, then Class-S sync-persists **KEEP** (ADR-061: the per-chunk credit
+    /// is Class-S monotonic — a durably-recorded chunk must never un-record on a
+    /// coalesce crash). It NEVER two-phase-commits (AC8): no Prepare/Commit per
+    /// chunk. Idempotent no-op if the saga already sealed (its slot is gone and
+    /// the committed witness is present) or was aborted (slot absent).
+    StreamCaptureAppend {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The emitted operator-signed chunk to fold into the durable frontier.
+        /// The seal task pushes exactly what B's pump emitted (already dropping
+        /// above-cancel-ack `Data` chunks), so the unbounded-ceiling frontier
+        /// yields the correct §5.4.5 billable count. BOXED to keep this variant
+        /// small (`OutletStreamChunk` embeds a `serde_json::Value` payload) so
+        /// `ContextCommand` / the actor dispatch future stay under the
+        /// `clippy::large_enum_variant` / `large_futures` thresholds.
+        chunk: Box<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+        /// Oneshot reply channel — `Ok(())` once the chunk is durably folded (or
+        /// on the idempotent no-op paths).
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+    /// Seal the streaming saga at stream-close (ADR-061 seal phase; spec §6.2.5
+    /// streaming saga). Runs on the LOCAL target (B) actor. Sent ONCE by the
+    /// FSM's off-mailbox seal task at the terminal chunk.
+    ///
+    /// Finalizes `stream_manifest_hash = frontier.root()` (the REAL 32-byte root,
+    /// never `[0u8; 32]`) from the durable `SagaId`-keyed frontier, settles the
+    /// escrow from the durable ledger (`settle_at_close` → refund = reserved −
+    /// billed), signs the
+    /// [`CrossContextOutletStreamReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt)
+    /// (`SCP-XCTX-STREAM-RECEIPT-V1`, SCP-OUT-043) over the staged
+    /// `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms` + the
+    /// root + the `SagaId`-stable event id, appends the B-side `OutletInvoked`
+    /// (real root, `chunks_billed = frontier.billed_count()`,
+    /// `stream_chunk_count = frontier.leaf_count()`), durably captures the
+    /// [`CommittedStreamingOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation)
+    /// witness keyed by `SagaId` (AC7 replay witness), clears the staged slot, and
+    /// Class-S sync-persists fail-closed. A replay (this `SagaId` already sealed)
+    /// re-emits the stored receipt + root + settlement verbatim and does NOT
+    /// re-append or re-sign. This is the ONLY commit — commit ONCE over the
+    /// bounded root (AC8).
+    CommitBStreamSettle {
+        /// Durable saga identifier.
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The stream's §5.4.5 terminal status, recorded into the B-side
+        /// `OutletInvoked` event (Ok / Error / Cancelled).
+        terminal_status: scp_protocol::context::outlets::stream::StreamTerminalStatus,
+        /// The pinned cancel-ack sequence if an `OutletCancel` closed the stream,
+        /// else `None`. Recorded for audit; the durable frontier already reflects
+        /// the cancel-ack billing boundary because the seal task never pushes an
+        /// above-ceiling chunk (the pump drops them before emission).
+        cancel_ack_seq: Option<u64>,
+        /// The target context's Active Signing Key (§6.2.5 receipt signing). The
+        /// actor holds NO signing key (ADR-049): the FSM resolves the key
+        /// authorized for `target_context_id` and passes it per-call. Zeroizes on
+        /// drop.
+        target_signing_key: SigningKeyBytes,
+        /// Oneshot reply channel. See [`CommitBStreamSettleReply`].
+        reply: CommitBStreamSettleReply,
+    },
+    /// Prepare-B (streaming) — the streaming-saga sibling of [`Self::PrepareB`]
+    /// (ADR-061 seal phase; spec §6.2.5 streaming saga). Runs on the LOCAL
+    /// target (B) actor. Re-runs the IDENTICAL §6.2.4 Prepare-B validation gate
+    /// (`run_prepare_b_checks` + the inbound §6.2.0.2 rate consume), captures the
+    /// same B-controlled provenance (`recorded_timestamp_ms` / `recorded_nonce` /
+    /// `recorded_chain_depth`), but STAGES a
+    /// [`SagaPreparedState::CrossContextStreamingOutletInvocation`](crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextStreamingOutletInvocation)
+    /// slot (empty `MerkleFrontier::new()` + the pinned escrow ledger
+    /// `reserved`/`cost_per_chunk`, zeroed `billed`/`billed_count`, unbounded
+    /// cancel-ack ceiling) instead of the unary eight-field projection. Persists
+    /// Class-S fail-closed via the SAME keep-nonce/restore-slot split as
+    /// [`Self::PrepareB`] and replies [`PrepareBOutcome`]. The staged frontier is
+    /// the durable, `SagaId`-keyed capture the off-mailbox seal task folds chunks
+    /// into ([`Self::StreamCaptureAppend`]) and seals at close
+    /// ([`Self::CommitBStreamSettle`]).
+    PrepareBStreaming {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The boxed §6.2.4 Prepare-B field set + the streaming escrow ledger
+        /// inputs. BOXED to keep this variant small so `ContextCommand` and the
+        /// actor dispatch future stay under the `clippy::large_enum_variant` /
+        /// `clippy::large_futures` thresholds (same discipline as the other large
+        /// saga payloads in this enum).
+        fields: Box<PrepareBStreamingFields>,
+        /// Oneshot reply channel. A §6.2.4 policy reject rides
+        /// `Ok(PrepareBOutcome::Rejected(SagaReject))`; the `Err(ContextError)`
+        /// channel carries only codeless mailbox / Class-S-persist failures.
+        reply: oneshot::Sender<Result<PrepareBOutcome, ContextError>>,
+    },
+    /// Streaming-saga seal witness check (ADR-061 seal phase; §17.16.4 crash
+    /// recovery). Runs on the LOCAL target (B) actor. READ-ONLY (no mutation, no
+    /// Class-S persist): reports whether this `SagaId` is already recorded in
+    /// `xctx_committed_stream_outputs` (the durable seal-close idempotency
+    /// witness). The streaming sibling of [`Self::CommitACheckWitness`]: the
+    /// autonomous, key-less crash-recovery sweep
+    /// ([`Supervisor::recover_committing_entry`](crate::context::supervisor::Supervisor))
+    /// uses it to distinguish an already-sealed streaming saga (witness present ⇒
+    /// resolve `Committed` without a signing key) from one that only has a
+    /// durable prefix (witness absent ⇒ the truncated close needs the target's
+    /// Active Signing Key, supplied at the key-bearing recovery surface).
+    StreamSettleCheckWitness {
+        /// Durable saga identifier (the `xctx_committed_stream_outputs` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Oneshot reply: the durable witness recovery status (present / settled /
+        /// rebuilt settlement / A-side leaf inputs), READ-ONLY.
+        reply: oneshot::Sender<Result<StreamWitnessRecoveryStatus, ContextError>>,
+    },
+    /// Stage the §7.3.8 cumulative-counter reserve into the durable streaming
+    /// prepared slot (ADR-061 seal phase; SCP-OUT-046). Runs on the LOCAL target
+    /// (B) actor. Sent by the streaming-saga driver at the Commit-transition,
+    /// AFTER `open_stream_session` commits the counter CAS (the reserved amount is
+    /// computed inside the open's final gate, so it is not known at Prepare-B).
+    ///
+    /// Folds `amount_cumulative_reserved` / `reserved_chunks` / `ucan_cid` into
+    /// the staged
+    /// [`CrossContextStreamingOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextStreamingOutletInvocationPrepared)
+    /// slot, then Class-S sync-persists **KEEP** (the counter release is a
+    /// durable settlement input the seal + crash recovery read). Idempotent no-op
+    /// if the saga already sealed / aborted (slot gone).
+    StreamStageCounterReserve {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The §7.3.8 worst-case cumulative amount reserved at open.
+        amount_cumulative_reserved: u64,
+        /// The invoker-declared `estimated_chunk_count` (diagnostics only).
+        reserved_chunks: u32,
+        /// The opening UCAN CID — the cumulative counter's key.
+        ucan_cid: String,
+        /// Oneshot reply — `Ok(())` once durably folded (or on the idempotent
+        /// no-op path).
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 }

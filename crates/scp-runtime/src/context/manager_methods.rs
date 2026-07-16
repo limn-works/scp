@@ -341,6 +341,8 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
             ctx,
         ),
+        xctx_committed_stream_outputs:
+            crate::context::messaging_helpers::xctx_committed_stream_outputs_snapshot(ctx),
         xctx_committed_invocations:
             crate::context::messaging_helpers::xctx_committed_invocations_snapshot(ctx),
         xctx_caller_reservations:

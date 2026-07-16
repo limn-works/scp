@@ -76,6 +76,13 @@ use crate::context::supervisor::saga_journal::SagaId;
 ///
 /// **Non-derives.** No `Clone`, `Debug`, `Display`, `Serialize`,
 /// `Deserialize` — see module-level documentation for rationale.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "The streaming variant carries the durable Merkle frontier + the \
+              SCP-OUT-046 settlement ledger; the large variant is the NORMAL \
+              durable-state case (not an error path), and boxing a hot durable \
+              slot to equalize with the unary variant is negative value."
+)]
 pub enum SagaPreparedState {
     /// Cross-context outlet invocation. The UCAN proof bytes are NOT carried
     /// here — only the proof's identifier — to keep the prepared-state non-
@@ -337,7 +344,15 @@ pub struct CrossContextStreamingOutletInvocationPrepared {
     /// Total credit reserved at Prepare (the escrow cap). Refund at close is
     /// `reserved − billed`.
     pub reserved: Amount,
-    /// Credit billed so far (advances with the frontier's billable chunks).
+    /// The per-billable-`Data`-chunk price pinned at the Commit-transition
+    /// (ADR-061 seal phase). Held on the durable ledger so the seal at
+    /// stream-close can reconstruct the escrow (`StreamEscrow::from_reserved`)
+    /// and settle `refund = reserved − billed` with NO live pump — the pump is
+    /// gone after a crash, so escrow MUST settle from this durable ledger, not
+    /// the in-memory `PumpEscrowGuard`.
+    pub cost_per_chunk: Amount,
+    /// Credit billed so far (advances with the frontier's billable chunks;
+    /// `cost_per_chunk × frontier.billed_count()`). Class-S monotonic (KEEP).
     pub billed: Amount,
     /// The §5.4.5 billable-`Data`-chunk count captured alongside the ledger;
     /// the escrow cross-check verifies it against `frontier.billed_count()`.
@@ -345,6 +360,33 @@ pub struct CrossContextStreamingOutletInvocationPrepared {
     /// The `CancelAckTracker` ceiling that bounds a truncated close (the
     /// cancel-ack billing boundary; `u64::MAX` when the stream has no cancel).
     pub cancel_ack_ceiling: u64,
+    /// The stream `request_id` (SCP-OUT-046 settlement ledger) — the key the
+    /// close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// receipt + event-log provenance anchor to. Staged at Prepare-B so the
+    /// seal (and crash recovery) settle against the SAME id the pump billed.
+    pub request_id: [u8; 16],
+    /// The §5.4.5 MED-HIGH economic policy snapshotted at acceptance
+    /// (SCP-OUT-046 settlement ledger). Stored as the raw
+    /// [`EconomicPolicy`](scp_protocol::economy::types::EconomicPolicy) (the
+    /// `EconomicPolicySnapshot` wrapper is not `Serialize`) so the seal captures
+    /// the billed `PaymentReceipt` for service rendered even if B is torn down
+    /// mid-stream. `None` for zero-cost / Query streams.
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+    /// The §7.3.8 worst-case cumulative-counter amount RESERVED at the open-time
+    /// final gate (SCP-OUT-046 settlement ledger). The seal releases the UNSPENT
+    /// portion (`reserved − billed_count × cost_per_chunk`) back to the counter
+    /// at close. `0` when no cap / no store / `cost_per_chunk == 0`. Staged
+    /// post-open via [`SagaPhaseMessage::StreamStageCounterReserve`](crate::context::actor::commands::SagaPhaseMessage::StreamStageCounterReserve).
+    pub amount_cumulative_reserved: u64,
+    /// The invoker-declared `estimated_chunk_count` (SCP-OUT-046 settlement
+    /// ledger; diagnostics / event field only — the release reconciles by
+    /// AMOUNT). Staged post-open alongside `amount_cumulative_reserved`.
+    pub reserved_chunks: u32,
+    /// The opening UCAN CID (SCP-OUT-046 settlement ledger) — the durable
+    /// `AmountCumulative` counter's key, so the close-time release targets the
+    /// same counter the open reserved. Empty when no counter reservation.
+    /// Staged post-open alongside `amount_cumulative_reserved`.
+    pub ucan_cid: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +426,12 @@ pub struct CrossContextStreamingOutletInvocationPrepared {
 /// visibility. A future saga type would add its own branch here under the
 /// same discipline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Mirrors SagaPreparedState — the streaming snapshot carries the \
+              durable frontier + SCP-OUT-046 settlement ledger; the large \
+              variant is the normal durable-snapshot case."
+)]
 pub enum SagaPreparedStateSnapshot {
     /// Mirror of [`SagaPreparedState::CrossContextOutletInvocation`].
     CrossContextOutletInvocation(CrossContextOutletInvocationSnapshot),
@@ -450,12 +498,26 @@ pub struct CrossContextStreamingOutletInvocationSnapshot {
     pub frontier: MerkleFrontier,
     /// Total credit reserved at Prepare (the escrow cap).
     pub reserved: Amount,
+    /// The per-billable-`Data`-chunk price pinned at the Commit-transition; the
+    /// seal reconstructs the escrow from `(cost_per_chunk, reserved)` at close.
+    pub cost_per_chunk: Amount,
     /// Credit billed so far.
     pub billed: Amount,
     /// The §5.4.5 billable-`Data`-chunk count.
     pub billed_count: u32,
     /// The cancel-ack billing ceiling.
     pub cancel_ack_ceiling: u64,
+    /// The stream `request_id` (SCP-OUT-046 settlement ledger).
+    pub request_id: [u8; 16],
+    /// The acceptance-time economic policy (raw, `Serialize`) — `None` for
+    /// zero-cost / Query streams.
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+    /// The §7.3.8 worst-case cumulative-counter amount reserved at open.
+    pub amount_cumulative_reserved: u64,
+    /// The invoker-declared `estimated_chunk_count` (diagnostics only).
+    pub reserved_chunks: u32,
+    /// The opening UCAN CID — the cumulative counter's key.
+    pub ucan_cid: String,
 }
 
 impl SagaPreparedStateSnapshot {
@@ -493,9 +555,15 @@ impl SagaPreparedStateSnapshot {
                         recorded_chain_depth: inner.recorded_chain_depth,
                         frontier: inner.frontier.clone(),
                         reserved: inner.reserved,
+                        cost_per_chunk: inner.cost_per_chunk,
                         billed: inner.billed,
                         billed_count: inner.billed_count,
                         cancel_ack_ceiling: inner.cancel_ack_ceiling,
+                        request_id: inner.request_id,
+                        economic_policy: inner.economic_policy.clone(),
+                        amount_cumulative_reserved: inner.amount_cumulative_reserved,
+                        reserved_chunks: inner.reserved_chunks,
+                        ucan_cid: inner.ucan_cid.clone(),
                     },
                 )
             }
@@ -536,9 +604,15 @@ impl SagaPreparedStateSnapshot {
                         recorded_chain_depth: snap.recorded_chain_depth,
                         frontier: snap.frontier,
                         reserved: snap.reserved,
+                        cost_per_chunk: snap.cost_per_chunk,
                         billed: snap.billed,
                         billed_count: snap.billed_count,
                         cancel_ack_ceiling: snap.cancel_ack_ceiling,
+                        request_id: snap.request_id,
+                        economic_policy: snap.economic_policy,
+                        amount_cumulative_reserved: snap.amount_cumulative_reserved,
+                        reserved_chunks: snap.reserved_chunks,
+                        ucan_cid: snap.ucan_cid,
                     },
                 )
             }
@@ -588,6 +662,132 @@ pub struct CommittedOutletInvocation {
     /// the receipt; stored explicitly so a replay re-acks the same id without
     /// re-deriving it).
     pub outlet_invoked_event_id: String,
+}
+
+/// Durable, `SagaId`-keyed capture of a COMMITTED cross-context **streaming**
+/// outlet invocation, held on the TARGET (B) actor.
+///
+/// ADR-061 seal phase; spec §6.2.5 streaming saga — the streaming sibling of
+/// [`CommittedOutletInvocation`].
+///
+/// The seal phase reaches the `Committed` terminal at stream-close (not at the
+/// Commit-transition). At that instant the target durably captures — keyed by
+/// `SagaId` — the signed streaming receipt plus the sealed `stream_manifest_hash`
+/// and the billing/chunk counters, so a Commit replayed after a crash (§17.16.4)
+/// re-emits the IDENTICAL signed receipt and the SAME `outlet_invoked_event_id`
+/// **without re-invoking the outlet** (re-invoking a non-deterministic LLM would
+/// break §6.2.4 replay-determinism). Unlike the unary
+/// [`CommittedOutletInvocation`], no output bytes are captured — the streaming
+/// receipt attests the Merkle root, and the root reproduces from the durable
+/// `SagaId`-keyed frontier, never from carried output (ADR-061 "Receipt
+/// (streaming)").
+///
+/// **Class S** — held in
+/// [`PerContextState.xctx_committed_stream_outputs`](crate::context::actor::state::PerContextState::xctx_committed_stream_outputs)
+/// and synchronously persisted fail-closed (ADR-049 §9), the same discipline as
+/// [`CommittedOutletInvocation`]: a crash that rolled the capture back behind an
+/// acked seal-close would re-invoke the outlet on replay, breaking exactly-once.
+///
+/// **Not bearer-bearing.** The receipt and the manifest root are public protocol
+/// artifacts (the receipt is the signed streaming return-path response), so — like
+/// [`CommittedOutletInvocation`] — this type derives `Serialize`/`Clone` directly
+/// and rides the public [`ContextSnapshot`](crate::context::state::ContextSnapshot)
+/// surface without a separate mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedStreamingOutletInvocation {
+    /// The target's signed streaming receipt over the staged provenance + the
+    /// sealed `stream_manifest_hash` + event id. Re-emitted verbatim on a
+    /// replayed Commit so the signature preimage reproduces byte-for-byte.
+    pub receipt:
+        scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt,
+    /// The sealed RFC-6962 Merkle root over the emitted chunk sequence — the
+    /// `frontier.root()` finalized at stream-close (also carried on the receipt;
+    /// stored explicitly so a replay re-emits it without re-deriving).
+    pub stream_manifest_hash: [u8; 32],
+    /// Credit billed at seal-close settled from the durable ledger
+    /// (`cost_per_chunk × billed_count`); stored so a replayed Commit re-emits the
+    /// IDENTICAL settlement without recomputing.
+    pub billed: Amount,
+    /// Escrow refund at seal-close = `reserved − billed`; stored so a replay
+    /// re-emits the same refund.
+    pub refund: Amount,
+    /// The §5.4.5 billable-`Data`-chunk count sealed at close
+    /// (`frontier.billed_count()`), recorded into the B-side `OutletInvoked` event.
+    pub billed_count: u32,
+    /// Total chunks in the sealed manifest (`frontier.leaf_count()`), the §5.4.5
+    /// `stream_chunk_count` recorded into the B-side `OutletInvoked` event.
+    pub stream_chunk_count: u64,
+    /// The `SagaId`-stable `OutletInvoked` event-log entry id (also carried on the
+    /// receipt; stored explicitly so a replay re-acks the same id).
+    pub outlet_invoked_event_id: String,
+    /// SCP-OUT-046 CRITICAL — settlement-atomicity flag. The seal handler inserts
+    /// this witness with `settled = false` in the SAME Class-S persist that clears
+    /// the staged slot, BEFORE the off-mailbox money move runs (the money move is
+    /// a separate off-mailbox
+    /// [`settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)).
+    /// The on-actor `SettleOutletStream` handler READS this flag FIRST — a
+    /// PRE-COMMIT `Deref` read at the top of
+    /// [`settle_outlet_stream`](crate::context::outlets_helpers::settle_outlet_stream),
+    /// actor-serialized so the read is authoritative — and skips the ENTIRE
+    /// settlement (no persist, no capture) if it is already `true`; otherwise it
+    /// moves the money AND flips this to `true` in the SAME Class-S persist (refund +
+    /// counter release), so `settled` is the durable, atomic record that the escrow
+    /// refund + §7.3.8 counter release actually landed. The read is deliberately
+    /// pre-commit, NOT inside the persist closure: `commit_class_s_keep` discards the
+    /// closure's return on a persist `Err`, so an in-closure gate could not stop the
+    /// external capture from re-running on a persist failure (a double-bill). Because
+    /// the handler READS the flag to gate the money move, it is the authoritative
+    /// CONCURRENT double-refund guard for the xctx path (which has NO
+    /// `stream_reservations` reconcile net — the streaming saga runs with
+    /// `settlement_sink = None`). The unavoidable cross-process CRASH window (capture
+    /// R1, persist fails, crash before retry ⇒ durable `settled == false` ⇒ recovery
+    /// re-captures R2) is NOT closed by this flag and NOT closed by the runtime: the
+    /// runtime keeps no capture-dedup ledger. It only provides the STABLE idempotency
+    /// key (the `request_id` below, set on `authorize`; capture idempotency rides the
+    /// authorization identity). Whether the crash re-capture actually bills once is a
+    /// REQUIRED CONTRACT ON THE INJECTED ADAPTER (dedup `authorize` by key + idempotent
+    /// `capture`), not a runtime guarantee — the flag is the runtime-enforced
+    /// concurrent layer, the key is the delegated crash layer. The runtime-enforced
+    /// root close is a capture-dedup ledger tracked as
+    /// <https://github.com/limn-works/scp/issues/2156>; see the two-layer model on
+    /// [`settle_outlet_stream`](crate::context::outlets_helpers::settle_outlet_stream).
+    /// Crash recovery also reads it:
+    /// witness present &
+    /// `settled == false` ⇒ the money move never ran (crash / eviction in the
+    /// seal→settle window) ⇒ rebuild the settlement from the durable fields below
+    /// and APPLY it (money ops need NO signing key); `settled == true` ⇒ resolve
+    /// `Committed` idempotently, moving no money.
+    pub settled: bool,
+    // ---- Durable settlement-rebuild fields (SCP-OUT-046) ----
+    // Copied from the prepared slot into the witness at seal, since the prepared
+    // slot is REMOVED at seal — so keyless crash recovery can reconstruct the
+    // complete `StreamSettlement` from the witness alone, with no live pump and no
+    // staged slot.
+    /// Target (B) context id — the settlement's `context_id` is `hex(this)`.
+    pub target_context_id: [u8; 32],
+    /// The §5.4.5 `invoker_did` whose escrow hold the refund credits back.
+    pub invoker_did: DID,
+    /// Total escrow reserved at open (`billed + refund`) — receipt/audit provenance.
+    pub reserved: Amount,
+    /// The stream `request_id` — the settlement's receipt + event-log provenance
+    /// key, and the `stream_reservations` map key on the same-context path.
+    pub request_id: [u8; 16],
+    /// Outlet registration id — the settlement's `outlet_id`.
+    pub outlet_registration_id: String,
+    /// The §5.4.5 MED-HIGH economic policy snapshotted at acceptance (raw, so it
+    /// serializes with the witness). `None` for zero-cost / Query streams. Drives
+    /// the close-time `PaymentReceipt` capture on recovery.
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+    /// The §7.3.8 worst-case cumulative-counter amount reserved at open — the
+    /// recovery settlement releases the unspent portion back to the counter.
+    pub amount_cumulative_reserved: u64,
+    /// The invoker-declared `estimated_chunk_count` (diagnostics / event field).
+    pub reserved_chunks: u32,
+    /// The opening UCAN CID — the §7.3.8 `AmountCumulative` counter's key.
+    pub ucan_cid: String,
+    /// The per-billable-`Data`-chunk cost — the unit the cumulative release
+    /// multiplies the unspent chunk count by.
+    pub cost_per_chunk: Amount,
 }
 
 /// Caller-side (A-owned) durable reversal record for a cross-context outlet
@@ -865,9 +1065,18 @@ mod tests {
                 recorded_chain_depth: 5,
                 frontier,
                 reserved: Amount::new(1_000),
+                cost_per_chunk: Amount::new(100),
                 billed: Amount::new(300),
                 billed_count: 3,
                 cancel_ack_ceiling: 2,
+                request_id: [0x7Au8; 16],
+                // Query / zero-cost stream — no policy snapshot. The
+                // `Option<EconomicPolicy>` field round-trips as `None`;
+                // `EconomicPolicy`'s own `Serialize` is proven by its derive.
+                economic_policy: None,
+                amount_cumulative_reserved: 900,
+                reserved_chunks: 9,
+                ucan_cid: "bafy-stream-ucan".to_owned(),
             },
         );
 
@@ -890,13 +1099,159 @@ mod tests {
         assert_eq!(inner.recorded_nonce, [0x8Fu8; 16]);
         assert_eq!(inner.recorded_chain_depth, 5);
         assert_eq!(inner.reserved, Amount::new(1_000));
+        assert_eq!(inner.cost_per_chunk, Amount::new(100));
         assert_eq!(inner.billed, Amount::new(300));
         assert_eq!(inner.billed_count, 3);
         assert_eq!(inner.cancel_ack_ceiling, 2);
+        // SCP-OUT-046 settlement-ledger fields survive the snapshot (durable
+        // for crash-recovery settlement).
+        assert_eq!(inner.request_id, [0x7Au8; 16]);
+        assert_eq!(inner.economic_policy, None);
+        assert_eq!(inner.amount_cumulative_reserved, 900);
+        assert_eq!(inner.reserved_chunks, 9);
+        assert_eq!(inner.ucan_cid, "bafy-stream-ucan");
         // The AC7 durable-prefix reproducibility witness: the frontier's
         // root and counters survive the snapshot byte-for-byte.
         assert_eq!(inner.frontier.root(), expected_root);
         assert_eq!(inner.frontier.billed_count(), expected_billed);
         assert_eq!(inner.frontier.leaf_count(), expected_leaves);
+    }
+
+    /// SCP-OUT-046 CRITICAL: the committed-streaming witness — including the new
+    /// `settled` flag and the full settlement-rebuild field set — survives serde
+    /// round-trip byte-for-byte. The witness rides the public `ContextSnapshot`
+    /// (Class-S fail-closed), so these fields MUST persist across a crash for
+    /// keyless recovery to rebuild the `StreamSettlement` and read `settled`.
+    #[test]
+    fn committed_streaming_witness_round_trips_with_settled_and_settlement_fields() {
+        use scp_protocol::context::outlets::cross_context_saga::{
+            CrossContextOutletStreamReceipt, CrossContextOutletStreamReceiptFields,
+        };
+        use scp_protocol::economy::types::Amount;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let receipt = CrossContextOutletStreamReceipt::sign(
+            &signing_key,
+            CrossContextOutletStreamReceiptFields {
+                caller_context_id: [0x3Au8; 32],
+                target_context_id: [0x4Bu8; 32],
+                caller_did: "did:example:alice".to_owned(),
+                nonce: [0x8Fu8; 16],
+                outlet_registration_id: "llm-stream-v1".to_owned(),
+                stream_manifest_hash: [0x55u8; 32],
+                outlet_invoked_event_id: "evt-1".to_owned(),
+                chain_depth: 5,
+                timestamp_ms: 1_700_222_333_444,
+            },
+        )
+        .expect("receipt signs");
+
+        let witness = CommittedStreamingOutletInvocation {
+            receipt,
+            stream_manifest_hash: [0x55u8; 32],
+            billed: Amount::new(30),
+            refund: Amount::new(170),
+            billed_count: 3,
+            stream_chunk_count: 4,
+            outlet_invoked_event_id: "evt-1".to_owned(),
+            settled: false,
+            target_context_id: [0x4Bu8; 32],
+            invoker_did: alice(),
+            reserved: Amount::new(200),
+            request_id: [0x7Au8; 16],
+            outlet_registration_id: "llm-stream-v1".to_owned(),
+            economic_policy: None,
+            amount_cumulative_reserved: 900,
+            reserved_chunks: 9,
+            ucan_cid: "bafy-stream-ucan".to_owned(),
+            cost_per_chunk: Amount::new(10),
+        };
+
+        let bytes = serde_json::to_vec(&witness).expect("serialize witness");
+        let back: CommittedStreamingOutletInvocation =
+            serde_json::from_slice(&bytes).expect("deserialize witness");
+        assert_eq!(witness, back);
+        // The load-bearing fields for the CRITICAL fix survive verbatim.
+        assert!(!back.settled, "settled flag survives (false at seal)");
+        assert_eq!(back.reserved, Amount::new(200));
+        assert_eq!(back.request_id, [0x7Au8; 16]);
+        assert_eq!(back.amount_cumulative_reserved, 900);
+        assert_eq!(back.ucan_cid, "bafy-stream-ucan");
+        assert_eq!(back.cost_per_chunk, Amount::new(10));
+        assert_eq!(back.target_context_id, [0x4Bu8; 32]);
+
+        // Flip `settled` and confirm it round-trips as `true`.
+        let mut settled_witness = witness;
+        settled_witness.settled = true;
+        let bytes = serde_json::to_vec(&settled_witness).expect("serialize settled witness");
+        let back: CommittedStreamingOutletInvocation =
+            serde_json::from_slice(&bytes).expect("deserialize settled witness");
+        assert!(back.settled, "settled=true survives round-trip");
+    }
+
+    /// SCP-OUT-046 AC4: the durable `SagaId`-keyed capture is the O(log n)
+    /// RFC-6962 [`MerkleFrontier`] + credit ledger — a replay SNAPSHOT, NOT a
+    /// full-payload buffer. This is the load-bearing memory property: the durable
+    /// per-`SagaId` state MUST NOT grow O(n) in the chunk count, or a long stream
+    /// would let the invoker exhaust the target's Class-S storage.
+    ///
+    /// Proof: fold two very different chunk counts (64 and 4096, both powers of two
+    /// so the frontier holds exactly ONE perfect-subtree peak) and serialize the
+    /// durable `MerkleFrontier`. The two serialized captures are the SAME size up
+    /// to the few digits by which the `leaf_count`/`billed_count` integers widen —
+    /// the per-chunk payloads are NOT retained. A full-payload buffer over 4096
+    /// chunks would be orders of magnitude larger (>128 KiB of chunk hashes alone);
+    /// the durable capture stays a few hundred bytes regardless of chunk count.
+    #[test]
+    fn streaming_frontier_capture_memory_is_sublinear_in_chunk_count() {
+        use scp_protocol::context::outlets::stream::{
+            ChunkPayload, MerkleFrontier, OutletStreamChunk,
+        };
+
+        fn fold_n(n: u64) -> MerkleFrontier {
+            let mut frontier = MerkleFrontier::new();
+            for seq in 0..n {
+                frontier
+                    .push(&OutletStreamChunk {
+                        request_id: [0x11u8; 16],
+                        sequence: seq,
+                        payload: ChunkPayload::Data {
+                            value: serde_json::json!({ "seq": seq }),
+                        },
+                        sig: [0x22u8; 64],
+                    })
+                    .expect("valid chunk hashes");
+            }
+            frontier
+        }
+
+        let small = fold_n(64);
+        let large = fold_n(4096);
+
+        // Both fold EVERY chunk (nothing dropped) — the capture is complete.
+        assert_eq!(small.leaf_count(), 64);
+        assert_eq!(large.leaf_count(), 4096);
+
+        let small_bytes = serde_json::to_vec(&small).expect("serialize small frontier");
+        let large_bytes = serde_json::to_vec(&large).expect("serialize large frontier");
+
+        // A 64× increase in chunk count adds only the handful of digits by which the
+        // `leaf_count`/`billed_count` integers widen — NOT 64× the bytes. Both
+        // powers of two hold exactly one peak, so the peak set is identical in size.
+        assert!(
+            large_bytes.len() <= small_bytes.len() + 8,
+            "durable frontier capture must be O(log n): 64 chunks serialized to {} bytes, \
+             4096 chunks to {} bytes — a payload buffer, not a frontier",
+            small_bytes.len(),
+            large_bytes.len(),
+        );
+
+        // Absolute bound: the capture stays tiny regardless of chunk count. A
+        // full-payload buffer of even the 4096 chunk *hashes* would be >128 KiB.
+        assert!(
+            large_bytes.len() < 512,
+            "the 4096-chunk durable capture is {} bytes — memory does not grow O(n)",
+            large_bytes.len(),
+        );
     }
 }

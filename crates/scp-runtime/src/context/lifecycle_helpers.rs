@@ -1625,6 +1625,7 @@ pub async fn create_context(
         class_s: crate::context::actor::state::ClassSState {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
+            xctx_committed_stream_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             // Caller-side cross-context reservation reversal records (spec §6.2.4):
             // fresh on create; cross-node import DROPS them (caller economy is
@@ -2508,6 +2509,7 @@ pub async fn import_context(
         class_s: crate::context::actor::state::ClassSState {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
+            xctx_committed_stream_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             // Caller-side cross-context reservation reversal records (spec §6.2.4):
             // fresh on create; cross-node import DROPS them (caller economy is
@@ -3105,6 +3107,7 @@ pub async fn restore_context(
             // re-invoking the outlet. The live `CommittedOutletInvocation` is public (no
             // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
             xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
+            xctx_committed_stream_outputs: ctx_snapshot.xctx_committed_stream_outputs,
             xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
             // ADR-049 §9 Class S (spec §6.2.4): same-node restore REHYDRATES the
             // caller-side durable reservation reversal records so a crash-recovery

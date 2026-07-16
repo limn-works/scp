@@ -1081,6 +1081,30 @@ pub struct ContextSnapshot {
         crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
     >,
 
+    /// Target-side (B-owned) durable, `SagaId`-keyed capture of COMMITTED
+    /// cross-context **streaming** outlet invocations (ADR-061 seal phase; spec
+    /// §6.2.5 streaming saga). **Class S** — synchronously-persisted, fail-closed,
+    /// mirroring [`Self::xctx_committed_outputs`].
+    ///
+    /// The live slot is
+    /// [`ClassSState::xctx_committed_stream_outputs`](crate::context::actor::state::ClassSState::xctx_committed_stream_outputs).
+    /// The seal at stream-close captures the signed streaming receipt + sealed
+    /// `stream_manifest_hash` + billing/chunk counters here BEFORE journaling
+    /// `Committed`, so a Commit replayed after a crash (§17.16.4) re-emits the
+    /// IDENTICAL receipt and re-acks the SAME event id **without re-invoking the
+    /// outlet**. A coalesce-window rollback would re-invoke a non-deterministic
+    /// LLM on replay, the exact hazard the synchronous persist forecloses. It also
+    /// makes the AC7 mid-stream-crash truncated-close well-defined: recovery seals
+    /// the restored durable frontier prefix once, and a replayed seal short-circuits
+    /// on this witness. Same-node restore REHYDRATES it; cross-node export/import
+    /// DROP it to empty. `#[serde(default)]` so legacy / stripped snapshots
+    /// deserialize as empty.
+    #[serde(default)]
+    pub xctx_committed_stream_outputs: HashMap<
+        crate::context::supervisor::saga_journal::SagaId,
+        crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
+    >,
+
     /// Caller-side (A-owned) durable set of COMMITTED cross-context outlet
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
     /// §17.16.4). **Class S** — synchronously-persisted, fail-closed, mirroring

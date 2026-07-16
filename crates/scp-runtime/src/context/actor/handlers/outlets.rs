@@ -210,8 +210,12 @@ pub(crate) async fn dispatch(
         OutletsCommand::SettleOutletStream {
             settlement,
             generation,
+            witness_saga_id,
             reply,
-        } => handle_settle_outlet_stream(cell, deps, settlement, generation, reply).await,
+        } => {
+            handle_settle_outlet_stream(cell, deps, settlement, generation, witness_saga_id, reply)
+                .await
+        }
         OutletsCommand::PersistStreamReservation {
             context_id,
             request_id,
@@ -379,32 +383,65 @@ async fn handle_reverse_stream_escrow(
 /// [`Outcome`]. Fix-D: a generation-mismatch settle CAPTURES the receipt for
 /// rendered service but touches no owned state (`Outcome::ok` — no coalesced
 /// persist; the durable reserves are left for the restore-time reconcile
-/// sweep); a matching-instance settlement mutated owned state
-/// (`Outcome::ok_mutated`). Either way the reply carries the (possibly `None`)
-/// receipt. The helper never returns `Err` (a persist failure is KEEP'd +
-/// logged, service-rendered capture runs regardless).
+/// sweep); a matching-instance FIRST settlement mutated owned state
+/// (`Outcome::ok_mutated`). SCP-OUT-046 (pass-3): an ALREADY-settled
+/// witness-bearing settle (authoritative pre-commit read) touched NOTHING — it
+/// resolves `Committed` (`applied: true`) with NO receipt and `Outcome::ok`
+/// (unmutated, so no spurious Class-C persist). Either way the reply carries the
+/// (possibly `None`) receipt. The helper never returns `Err` (a persist failure
+/// is KEEP'd + logged, service-rendered capture runs regardless).
 async fn handle_settle_outlet_stream(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
     generation: u64,
-    reply: oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
+    witness_saga_id: Option<crate::context::supervisor::saga_journal::SagaId>,
+    reply: oneshot::Sender<
+        Result<crate::context::actor::commands::StreamSettleApplication, ContextError>,
+    >,
 ) -> Outcome<()> {
+    use crate::context::actor::commands::StreamSettleApplication;
     use crate::context::outlets_helpers::StreamSettleOutcome;
-    match crate::context::outlets_helpers::settle_outlet_stream(cell, deps, *settlement, generation)
-        .await
+    match crate::context::outlets_helpers::settle_outlet_stream(
+        cell,
+        deps,
+        *settlement,
+        generation,
+        witness_saga_id.as_ref(),
+    )
+    .await
     {
         StreamSettleOutcome::CapturedWithoutMutation(receipt) => {
-            // Fix-D: generation mismatch — a receipt may have been captured for
-            // rendered service, but NO owned state was touched (the durable
-            // reserves are left for the restore-time reconcile sweep). Reply the
-            // receipt WITHOUT flagging a mutation (no coalesced persist).
-            let _ = reply.send(Ok(receipt));
+            // Fix-D / SCP-OUT-046: generation mismatch — DEFERRED. No owned state
+            // was touched (durable reserves left for the restore-time reconcile
+            // sweep / crash recovery), and for a witness-bearing xctx settle no
+            // capture ran either. Reply `applied: false` so the caller leaves the
+            // journal `Committing` for recovery to complete exactly once.
+            let _ = reply.send(Ok(StreamSettleApplication {
+                receipt,
+                applied: false,
+            }));
             Outcome::ok(())
         }
         StreamSettleOutcome::Settled(receipt) => {
-            let _ = reply.send(Ok(receipt));
+            let _ = reply.send(Ok(StreamSettleApplication {
+                receipt,
+                applied: true,
+            }));
             Outcome::ok_mutated(())
+        }
+        StreamSettleOutcome::AlreadySettled => {
+            // SCP-OUT-046 CRITICAL (pass-3): the witness was ALREADY settled by a
+            // prior settle (authoritative pre-commit read) — the money moved
+            // exactly once there, and THIS settle touched NO owned state (no
+            // persist, no capture). Resolve `Committed` (`applied: true`) but flag
+            // NO mutation so the actor does not schedule a spurious Class-C persist
+            // of unchanged state.
+            let _ = reply.send(Ok(StreamSettleApplication {
+                receipt: None,
+                applied: true,
+            }));
+            Outcome::ok(())
         }
     }
 }

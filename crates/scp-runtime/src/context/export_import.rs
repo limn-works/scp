@@ -798,6 +798,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // ALWAYS dropped from the public export.
         saga_pending: HashMap::new(),
         xctx_committed_outputs: HashMap::new(),
+        xctx_committed_stream_outputs: HashMap::new(),
         xctx_committed_invocations: std::collections::HashSet::new(),
         // Caller-side reservation reversal records are local-instance economy
         // state with no authority on any other node — ALWAYS dropped from the
@@ -1010,6 +1011,7 @@ mod tests {
             routing: crate::context::actor::state::ContextRouting::Broadcast,
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
+            xctx_committed_stream_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             // Caller-side reservation reversal records are local-instance
             // economy state — dropped from the export (no foreign authority).

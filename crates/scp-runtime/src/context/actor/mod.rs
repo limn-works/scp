@@ -398,7 +398,12 @@ impl ContextActor {
                                     LifecycleControlCommand::PrepareForReplace { .. }
                                 )
                             );
-                            self.dispatch(cmd).await;
+                            // `Box::pin` the dispatch future so the large per-command
+                            // handler frame lives on the heap, keeping the actor
+                            // run-loop future under the `clippy::large_futures`
+                            // threshold (the streaming-saga seal handlers added
+                            // large stack frames held across `.await`).
+                            Box::pin(self.dispatch(cmd)).await;
                             if is_shutdown {
                                 break;
                             }

@@ -51,6 +51,27 @@ pub trait PaymentAdapter: Send + Sync {
     /// Returns a [`PaymentAuthorization`] that can later be captured or
     /// voided. The authorization may have an expiry after which it is
     /// automatically voided by the payment rail.
+    ///
+    /// # Idempotency (MUST honor)
+    ///
+    /// A conforming adapter MUST honor [`PaymentMetadata::idempotency_key`]: two
+    /// `authorize` calls carrying the SAME key MUST be deduplicated to a single
+    /// reservation (returning the SAME [`PaymentAuthorization`], not a second
+    /// hold). Exactly-once billing ACROSS A CRASH depends on this — the runtime
+    /// replays a settlement with the identical key after a crash and relies on the
+    /// adapter to collapse the duplicate. An adapter that ignores the key will
+    /// double-authorize (and, after [`capture`](Self::capture), double-bill) on
+    /// the crash-recovery path, which the runtime cannot detect or prevent.
+    ///
+    /// The dedup MUST persist for **at least as long as a crashed node may take
+    /// to recover and re-settle** — recovery timing is unbounded (a node may be
+    /// down arbitrarily long). An adapter with a bounded idempotency-key TTL
+    /// (e.g. a 24h expiry, common on real rails) does NOT satisfy this: a
+    /// recovery re-settle delayed past the TTL is treated as a fresh `authorize`
+    /// and double-bills. Such adapters require the runtime-enforced
+    /// capture-dedup ledger tracked in
+    /// <https://github.com/limn-works/scp/issues/2156>, which makes the runtime
+    /// authoritative (the idempotency key downgraded to defense-in-depth).
     fn authorize(
         &self,
         payer: &DID,
@@ -64,6 +85,18 @@ pub trait PaymentAdapter: Send + Sync {
     ///
     /// Moves funds from payer to payee. Returns a [`PaymentReceipt`] that
     /// serves as a provenance record in the context event log.
+    ///
+    /// # Idempotency (MUST honor)
+    ///
+    /// `capture` carries no idempotency key of its own — capture idempotency
+    /// rides the AUTHORIZATION IDENTITY. A conforming adapter MUST be idempotent
+    /// per authorization: capturing an already-captured [`PaymentAuthorization`]
+    /// MUST NOT move funds a second time — it either returns the same
+    /// [`PaymentReceipt`] or [`PaymentError::AlreadyCaptured`], never a fresh
+    /// charge. Combined with idempotency-key dedup on
+    /// [`authorize`](Self::authorize) (which yields the SAME authorization for a
+    /// replayed key), this is what makes a crash-recovery re-settlement bill
+    /// exactly once. Exactly-once billing across a crash depends on it.
     fn capture(
         &self,
         auth: &PaymentAuthorization,

@@ -135,8 +135,11 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
         let supervisor = Arc::clone(&self.supervisor);
         let generation = self.generation;
         self.runtime.spawn(async move {
+            // Same-context streaming pump: no cross-context witness (its double-
+            // release guard is the `stream_reservations` record), so
+            // `witness_saga_id: None`. The captured receipt is fire-and-forget.
             if let Err(e) = supervisor
-                .settle_outlet_stream_via_actor(settlement, generation)
+                .settle_outlet_stream_via_actor(settlement, generation, None)
                 .await
             {
                 // A dispatch failure (reply channel closed / residual not-
@@ -375,7 +378,53 @@ mod tests {
         }
     }
 
+    /// A [`ContextPersistence`](crate::context::persistence::ContextPersistence)
+    /// whose `persist_context` ALWAYS fails — models a storage-layer write error
+    /// on a Class-S commit so a settle's fail-closed persist returns `Err`. Loads
+    /// / lists / deletes still succeed (the test only exercises the write path).
+    struct FailPersistence;
+    #[async_trait::async_trait]
+    impl crate::context::persistence::ContextPersistence for FailPersistence {
+        async fn persist_context(
+            &self,
+            _context_id: &str,
+            _snapshot: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        async fn load_context(
+            &self,
+            _context_id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _context_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
     fn build_supervisor(adapter: Option<Arc<dyn PaymentAdapterDyn>>) -> Arc<Supervisor> {
+        build_supervisor_with_persistence(
+            adapter,
+            Box::new(crate::context::persistence::NoopContextPersistence),
+        )
+    }
+
+    fn build_supervisor_with_persistence(
+        adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+    ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             INVOKER.to_owned(),
             Arc::new(scp_clock::SystemClock),
@@ -397,9 +446,7 @@ mod tests {
             transport,
             event_log,
             key_resolver,
-            Some(Box::new(
-                crate::context::persistence::NoopContextPersistence,
-            )),
+            Some(persistence),
             adapter,
             None,
             Some(clock),
@@ -518,6 +565,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 50, None),
             live_gen,
+            None,
         )
         .await;
 
@@ -540,6 +588,125 @@ mod tests {
         assert_eq!(
             cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 30,
             "counter released the unspent 20 of the 50 reserved: 50 − 20 = 30 billed spend"
+        );
+    }
+
+    /// SCP-OUT-046 PASS-3 REGRESSION — the pass-2 fix carried the "already
+    /// settled" decision as the `bool` RETURN of the `commit_class_s_keep`
+    /// closure. `commit_class_s_keep` runs `persist_state_fail_closed(..).map(|()|
+    /// value)`, so on a persist FAILURE the closure's `bool` is DISCARDED (mapped
+    /// only on `Ok`) and the caller's `already_settled` stayed `false` → the
+    /// capture-skip was bypassed → a SECOND `PaymentReceipt` was captured
+    /// (double-bill; the xctx path has NO `stream_reservations` reconcile net to
+    /// dedup the capture). The concurrent test in `supervisor.rs` misses this: its
+    /// `InMemoryStorage` never fails a persist.
+    ///
+    /// This test seeds an ALREADY-settled witness and drives a late/concurrent
+    /// second settle against a FAILING storage backend. The pass-3 AUTHORITATIVE
+    /// PRE-COMMIT read short-circuits to `AlreadySettled` BEFORE any persist or
+    /// capture, so the capture is NOT re-run despite the persist `Err`
+    /// (`captured == 0`) — the introduced double-capture is closed. Pre-fix this
+    /// asserts `captured == 1` and FAILS.
+    #[tokio::test]
+    async fn already_settled_witness_with_failing_store_does_not_recapture() {
+        use crate::context::supervisor::saga_journal::SagaId;
+        use crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation;
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        // Counting payment adapter + a FAILING persistence backend: the settle's
+        // fail-closed Class-S persist returns `Err` on this call.
+        let supervisor =
+            build_supervisor_with_persistence(Some(counting(&captured)), Box::new(FailPersistence));
+        let deps = deps_for(&supervisor).await;
+
+        let saga_id = SagaId("saga-already-settled-failstore".to_owned());
+        let mut state = member_state(100, 50);
+        state.governance.economic_policy = Some(policy());
+
+        // Seed the durable witness ALREADY settled — a prior settle moved the money
+        // exactly once. Only `settled == true` + the `SagaId` key are load-bearing
+        // for the pre-commit idempotency read; the rest mirrors a real seal.
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let receipt =
+            scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt::sign(
+                &signing_key,
+                scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceiptFields {
+                    caller_context_id: [0x3Au8; 32],
+                    target_context_id: [CTX_BYTE; 32],
+                    caller_did: INVOKER.to_owned(),
+                    nonce: [0x8Fu8; 16],
+                    outlet_registration_id: "outlet-x".to_owned(),
+                    stream_manifest_hash: [0x55u8; 32],
+                    outlet_invoked_event_id: "evt-x".to_owned(),
+                    chain_depth: 3,
+                    timestamp_ms: NOW.saturating_mul(1000),
+                },
+            )
+            .expect("receipt signs");
+        state.class_s.xctx_committed_stream_outputs.insert(
+            saga_id.clone(),
+            CommittedStreamingOutletInvocation {
+                receipt,
+                stream_manifest_hash: [0x55u8; 32],
+                billed: Amount::new(30),
+                refund: Amount::new(70),
+                billed_count: 3,
+                stream_chunk_count: 3,
+                outlet_invoked_event_id: "evt-x".to_owned(),
+                settled: true,
+                target_context_id: [CTX_BYTE; 32],
+                invoker_did: invoker(),
+                reserved: Amount::new(100),
+                request_id: [3u8; 16],
+                outlet_registration_id: "outlet-x".to_owned(),
+                economic_policy: Some(policy()),
+                amount_cumulative_reserved: 50,
+                reserved_chunks: 3,
+                ucan_cid: UCAN_CID.to_owned(),
+                cost_per_chunk: Amount::new(10),
+            },
+        );
+
+        let mut cell = ClassSCell::new(state);
+        let live_gen = cell.generation;
+        let spent_before = cell.governance.budget_tracker.total_spent(&invoker());
+        let counter_before = cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used;
+
+        let outcome = settle_outlet_stream(
+            &mut cell,
+            &deps,
+            settlement(30, 70, 3, 10, 50, None),
+            live_gen,
+            Some(&saga_id),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, StreamSettleOutcome::AlreadySettled),
+            "an already-settled witness short-circuits to AlreadySettled \
+             (no persist, no capture): {outcome:?}"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            0,
+            "CRITICAL: the capture is NOT re-run for an already-settled witness even \
+             when the persist would fail — no double-bill"
+        );
+        assert_eq!(
+            cell.governance.budget_tracker.total_spent(&invoker()),
+            spent_before,
+            "no refund / reverse_spend ran (money untouched)"
+        );
+        assert_eq!(
+            cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, counter_before,
+            "no §7.3.8 counter release ran (money untouched)"
+        );
+        assert!(
+            cell.class_s
+                .xctx_committed_stream_outputs
+                .get(&saga_id)
+                .is_some_and(|w| w.settled),
+            "the witness stays settled"
         );
     }
 
@@ -580,8 +747,14 @@ mod tests {
 
         // reserved = 0 (open reserved nothing; the grant's apply rejected so the
         // ledger never extended), billed = 0, refund = 0, cumulative = 0.
-        let outcome =
-            settle_outlet_stream(&mut cell, &deps, settlement(0, 0, 0, 0, 0, None), live_gen).await;
+        let outcome = settle_outlet_stream(
+            &mut cell,
+            &deps,
+            settlement(0, 0, 0, 0, 0, None),
+            live_gen,
+            None,
+        )
+        .await;
 
         assert!(
             matches!(outcome, StreamSettleOutcome::Settled(None)),
@@ -619,6 +792,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 50, None),
             live_gen.wrapping_add(1),
+            None,
         )
         .await;
 
@@ -667,6 +841,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 50, Some(snapshot)),
             live_gen.wrapping_add(1),
+            None,
         )
         .await;
 
@@ -726,6 +901,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 50, None),
             live_gen,
+            None,
         )
         .await;
 
@@ -814,6 +990,7 @@ mod tests {
             &deps,
             settlement(0, 0, 10, 10, 40, None),
             live_gen,
+            None,
         )
         .await;
         assert!(matches!(outcome, StreamSettleOutcome::Settled(None)));
@@ -830,6 +1007,7 @@ mod tests {
             &deps,
             settlement(0, 0, 2, u64::MAX, 40, None),
             live_gen,
+            None,
         )
         .await;
         assert!(matches!(outcome, StreamSettleOutcome::Settled(None)));
@@ -886,6 +1064,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 0, None),
             live_gen,
+            None,
         )
         .await;
 
@@ -925,11 +1104,13 @@ mod tests {
         );
 
         let snap = EconomicPolicySnapshot { policy: policy() };
-        let receipt = supervisor
-            .settle_outlet_stream_via_actor(settlement(30, 70, 3, 10, 50, Some(snap)), 0)
+        let application = supervisor
+            .settle_outlet_stream_via_actor(settlement(30, 70, 3, 10, 50, Some(snap)), 0, None)
             .await
             .expect("the no-actor fallback never errors");
-        let receipt = receipt.expect("captured against the open-time snapshot");
+        let receipt = application
+            .receipt
+            .expect("captured against the open-time snapshot");
         assert_eq!(receipt.amount, Amount::new(30));
         assert_eq!(receipt.action_type, PaidActionType::OutletCall);
         assert_eq!(captured.load(Ordering::SeqCst), 1);

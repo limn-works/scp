@@ -4429,20 +4429,27 @@ async fn forward_frame(
 /// snapshot is updated only AFTER a successful forward (§6.2.5) — it is a
 /// replay snapshot, never a forwarding buffer.
 ///
-/// Returns `true` iff the terminal was DELIVERED to A's invoker (the outer
-/// channel accepted it). `false` means A stopped consuming before the terminal
-/// landed — the caller MUST NOT synthesize a further terminal onto a closed
-/// channel.
+/// Returns `Some(chunk)` — the synthesized terminal `OutletStreamChunk` — iff it
+/// was DELIVERED to A's invoker (the outer channel accepted it); `None` means A
+/// stopped consuming before the terminal landed and the caller MUST NOT
+/// synthesize a further terminal onto a closed channel.
+///
+/// This helper does NOT own retention: it folds the synthesized terminal into
+/// the `terminal` summary and RETURNS the chunk so the caller decides whether to
+/// retain it. The best-effort bridge ([`run_cross_context_bridge`]) pushes the
+/// returned chunk into its own §6.2.5 write-through replay snapshot; the O(log n)
+/// streaming-saga seal task retains only the sealed frontier + the last sequence
+/// (SCP-OUT-046 AC4 / ADR-061 no-buffering) and drops the returned chunk after
+/// reading `.sequence`.
 #[must_use]
 async fn forward_bridge_terminal(
     outer_tx: &mpsc::Sender<ForwardedStreamFrame>,
     send_tracker: &mut crate::context::actor::SendSequenceTracker,
-    reassembled: &mut Vec<OutletStreamChunk>,
     terminal: &mut StreamTerminalSummary,
     request_id: RequestId,
     sequence: u64,
     payload: ChunkPayload,
-) -> bool {
+) -> Option<OutletStreamChunk> {
     let chunk = OutletStreamChunk {
         request_id,
         sequence,
@@ -4453,16 +4460,15 @@ async fn forward_bridge_terminal(
     // own per-sender `base_sequence` anchor, allocated + committed on the send
     // hop like every forwarded chunk. A send failure rolls the reservation back.
     if !forward_frame(outer_tx, send_tracker, &chunk).await {
-        // A's invoker stopped consuming before the terminal landed — record
-        // what was already delivered; the terminal summary keeps its prior
-        // (default) status.
-        return false;
+        // A's invoker stopped consuming before the terminal landed — the caller
+        // records what was already delivered; the terminal summary keeps its
+        // prior (default) status.
+        return None;
     }
     // The manifest snapshot commits over the bare `OutletStreamChunk` (never the
     // runtime frame), so B's committed manifest and A's recomputation agree.
     terminal.observe(&chunk.payload);
-    reassembled.push(chunk);
-    true
+    Some(chunk)
 }
 
 /// Records the receiving context A's own `OutletInvoked` event at stream close
@@ -4698,16 +4704,19 @@ pub(crate) async fn run_cross_context_bridge(
             let next_seq = reassembled
                 .last()
                 .map_or(chunk.sequence, |c| c.sequence.saturating_add(1));
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 request_id,
                 next_seq,
                 payload,
             )
             .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(sent) = forwarded {
+                reassembled.push(sent);
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -4727,16 +4736,19 @@ pub(crate) async fn run_cross_context_bridge(
                 ),
                 terminal: true,
             };
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 request_id,
                 chunk.sequence,
                 payload,
             )
             .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(sent) = forwarded {
+                reassembled.push(sent);
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -4750,16 +4762,19 @@ pub(crate) async fn run_cross_context_bridge(
                 message: format!("{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: {detail}"),
                 terminal: true,
             };
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 request_id,
                 chunk.sequence,
                 payload,
             )
             .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(sent) = forwarded {
+                reassembled.push(sent);
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -4788,16 +4803,19 @@ pub(crate) async fn run_cross_context_bridge(
                 message: format!("{SLUG_OUTPUT_SCHEMA_VIOLATION}: {message}"),
                 terminal: true,
             };
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
-                &mut reassembled,
                 &mut terminal,
                 request_id,
                 chunk.sequence,
                 payload,
             )
             .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(sent) = forwarded {
+                reassembled.push(sent);
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -4852,16 +4870,18 @@ pub(crate) async fn run_cross_context_bridge(
         let next_seq = reassembled
             .last()
             .map_or(0, |c| c.sequence.saturating_add(1));
-        let _ = forward_bridge_terminal(
+        if let Some(chunk) = forward_bridge_terminal(
             &outer_tx,
             &mut send_tracker,
-            &mut reassembled,
             &mut terminal,
             request_id,
             next_seq,
             payload,
         )
-        .await;
+        .await
+        {
+            reassembled.push(chunk);
+        }
     }
 
     // (AC7) A-side recording through the verified-append boundary.
@@ -4878,6 +4898,488 @@ pub(crate) async fn run_cross_context_bridge(
         timestamp_secs,
     )
     .await;
+}
+
+/// The transactional streaming-saga seal task (SCP-OUT-046 #134; the ADR-061
+/// seal phase). The off-mailbox sibling of [`run_cross_context_bridge`]: it
+/// owns B's operator-signed chunk receiver + the caller's outer channel, runs
+/// the SAME §5.4.5 crossing gates (verify against the pinned descriptor →
+/// schema-validate → forward), but instead of the best-effort A-side manifest
+/// reassembly it drives the SAGA seal:
+///
+/// - After each successfully-forwarded operator chunk it sends
+///   [`SagaPhaseMessage::StreamCaptureAppend`] to the target (B) actor, folding
+///   the chunk into the DURABLE `SagaId`-keyed Merkle frontier staged at
+///   Prepare-B (the O(log n) replay snapshot the seal reads to finalize the
+///   manifest root). Forwarding is NEVER gated on the capture persist (§6.2.5):
+///   the chunk is delivered first, captured second.
+/// - At stream-close it sends [`SagaPhaseMessage::CommitBStreamSettle`] ONCE
+///   (AC8 — commit once over the bounded root, never a per-chunk 2PC): the B
+///   actor seals `stream_manifest_hash = frontier.root()`, signs the streaming
+///   receipt (SCP-OUT-043), settles the escrow from the durable ledger, appends
+///   B's `OutletInvoked`, and durably captures the replay witness.
+///
+/// On a successful seal the open-failure `escrow_ticket` is `consume`d (its hold
+/// stays reserved through the pump per AC3; the durable ledger owns the billed /
+/// refund split the seal recorded) and the saga journal is resolved to
+/// `Committed`. On a seal FAILURE the ticket is dropped so its `Drop` reverses
+/// the open-time hold, and the journal is LEFT at `Committing` for the
+/// autonomous crash-recovery sweep (SCP-OUT-046 #136).
+///
+/// The receiving-context A-side `CrossContextOutletInvoked` dual-log leaf
+/// (SCP-OUT-046 #135) is recorded from the SEALED `outcome` (the signed receipt +
+/// the sealed manifest root) at close — never from a locally-accumulated payload
+/// buffer. This task therefore retains NO O(n) chunk buffer (SCP-OUT-046 AC4 /
+/// ADR-061 no-buffering): it tracks only the last forwarded `sequence` (to anchor
+/// a synthesized terminal) while B's DURABLE manifest is the `SagaId`-keyed
+/// frontier folded via `StreamCaptureAppend`. This task never re-signs a chunk and
+/// never re-invokes the outlet.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn run_streaming_saga_seal_task(
+    supervisor: std::sync::Arc<crate::context::supervisor::Supervisor>,
+    target_context_hex: String,
+    saga_id: crate::context::supervisor::saga_journal::SagaId,
+    target_signing_key: crate::context::actor::commands::SigningKeyBytes,
+    mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
+    outer_tx: mpsc::Sender<ForwardedStreamFrame>,
+    escrow_ticket: crate::context::outlets::dispatch::StreamEscrowTicket,
+    descriptor: CrossContextVerificationDescriptor,
+    output_schema: serde_json::Value,
+    aggregate_schema: Option<serde_json::Value>,
+    // The RECEIVING context A's shared event-log provider (SCP-OUT-046 #135) —
+    // where the A-side `CrossContextOutletInvoked` dual-log leaf is recorded at
+    // seal-close, completing the atomic dual-log (B's `OutletInvoked` is
+    // recorded by the seal handler).
+    a_event_log: std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
+) {
+    use crate::context::actor::ContextCommand;
+    use crate::context::actor::commands::SagaPhaseMessage;
+
+    tracing::debug!(
+        saga_id = %saga_id.0,
+        request_id = %hex::encode(descriptor.expected_request_id),
+        context_id = %target_context_hex,
+        "streaming-saga seal task: forwarding B→A + durable frontier capture (ADR-061)"
+    );
+
+    // The LAST forwarded sequence (operator chunks + any synthesized terminal).
+    // The seal task retains NO O(n) payload buffer (SCP-OUT-046 AC4 / ADR-061
+    // no-buffering): the receiving-context A-side `CrossContextOutletInvoked` leaf
+    // is recorded from the SEALED `outcome`, and B's DURABLE manifest is the
+    // `SagaId`-keyed frontier folded via `StreamCaptureAppend`. This scalar exists
+    // only to anchor a synthesized terminal's `base_sequence` at the next slot.
+    let mut last_sequence: Option<u64> = None;
+    let mut terminal = StreamTerminalSummary::default();
+    // Per-sender MLS send-sequence allocator for THIS send hop (SCP-OUT-044) —
+    // task-scoped, exactly as `run_cross_context_bridge` (the off-mailbox seal
+    // cannot reach the actor's `send_tracker` under ADR-049 isolation).
+    let mut send_tracker = crate::context::actor::SendSequenceTracker::new();
+    let mut delivered_terminal = false;
+    let mut outer_open = true;
+    // `true` once a durable-frontier fold or the seal itself observes the target
+    // actor is unreachable / diverged — the seal then closes over the durable
+    // prefix (a well-defined truncated close; the journal stays `Committing` so
+    // crash recovery reconciles). Set only on the actor-mailbox error paths.
+    let mut capture_broke = false;
+
+    while let Some(chunk) = inner_rx.recv().await {
+        // Verify the operator signature against the PINNED descriptor (§5.4.5
+        // "Verification source at the crossing") — never against chunk-asserted
+        // values. A mismatch is an Authorization-class terminal.
+        if !verify_forwarded_chunk(&descriptor, &chunk) {
+            let payload = ChunkPayload::Error {
+                code: CODE_AUTHORIZATION_DENIED.to_owned(),
+                message: format!(
+                    "{SLUG_AUTHORIZATION_DENIED}: operator chunk signature failed verification \
+                     against the pinned outlet-interface descriptor (§5.4.5)"
+                ),
+                terminal: true,
+            };
+            let forwarded = forward_bridge_terminal(
+                &outer_tx,
+                &mut send_tracker,
+                &mut terminal,
+                descriptor.expected_request_id,
+                chunk.sequence,
+                payload,
+            )
+            .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(term) = forwarded {
+                last_sequence = Some(term.sequence);
+            }
+            outer_open = delivered_terminal;
+            break;
+        }
+
+        // Schema validation: `Data.value` against `output_schema`; `End.aggregate`
+        // against `aggregate_schema` (else `output_schema`). `Progress` / `Error`
+        // pass through unvalidated. A violation forwards a terminal in the
+        // offending chunk's place, then stops (the valid prefix already forwarded
+        // + captured is what the seal attests).
+        let schema_violation: Option<String> = match &chunk.payload {
+            ChunkPayload::Data { value } => {
+                validate_value_against_schema(value, &output_schema).err()
+            }
+            ChunkPayload::End { aggregate, .. } => {
+                let effective_schema = aggregate_schema.as_ref().unwrap_or(&output_schema);
+                validate_value_against_schema(aggregate, effective_schema).err()
+            }
+            ChunkPayload::Progress { .. } | ChunkPayload::Error { .. } => None,
+        };
+        if let Some(message) = schema_violation {
+            let payload = ChunkPayload::Error {
+                code: CODE_OUTPUT_VIOLATION.to_owned(),
+                message: format!("{SLUG_OUTPUT_SCHEMA_VIOLATION}: {message}"),
+                terminal: true,
+            };
+            let forwarded = forward_bridge_terminal(
+                &outer_tx,
+                &mut send_tracker,
+                &mut terminal,
+                descriptor.expected_request_id,
+                chunk.sequence,
+                payload,
+            )
+            .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(term) = forwarded {
+                last_sequence = Some(term.sequence);
+            }
+            outer_open = delivered_terminal;
+            break;
+        }
+
+        // Forward as produced — no buffering, operator signature preserved
+        // verbatim (SCP-OUT-044 reserve-at-consumption). A send failure means the
+        // caller stopped consuming: stop forwarding, seal over the durable prefix.
+        let is_terminal = chunk.payload.is_terminal();
+        if !forward_frame(&outer_tx, &mut send_tracker, &chunk).await {
+            outer_open = false;
+            break;
+        }
+
+        // Durable capture: fold the just-forwarded operator chunk into B's
+        // `SagaId`-keyed frontier (§6.2.5 replay snapshot; Class-S KEEP monotonic
+        // credit). Forwarding already happened — the capture never gates delivery.
+        // A vanished/diverged actor closes the seal over the durable prefix.
+        // `outer_open` STAYS true: `capture_broke` is a B-side fault (the target
+        // actor is unreachable), NOT A closing its channel — the post-loop
+        // terminal-guarantee synthesis must still fire so A never truncates after
+        // a non-terminal `Data` (crypto review: preserve the terminal guarantee).
+        let Some(actor) = supervisor.lookup(&target_context_hex) else {
+            capture_broke = true;
+            break;
+        };
+        let capture_chunk = chunk.clone();
+        let capture_saga_id = saga_id.clone();
+        match actor
+            .send(move |reply| {
+                ContextCommand::SagaPhase(SagaPhaseMessage::StreamCaptureAppend {
+                    saga_id: capture_saga_id,
+                    chunk: Box::new(capture_chunk),
+                    reply,
+                })
+            })
+            .await
+        {
+            Ok(()) => {}
+            Err(err) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "streaming-saga seal task: durable StreamCaptureAppend failed — \
+                     sealing over the durable prefix"
+                );
+                // `outer_open` stays true — see the lookup-miss branch above: a
+                // capture fault is B-side, so A must still get its terminal.
+                capture_broke = true;
+                break;
+            }
+        }
+
+        terminal.observe(&chunk.payload);
+        last_sequence = Some(chunk.sequence);
+        if is_terminal {
+            delivered_terminal = true;
+            break;
+        }
+    }
+
+    // Terminal guarantee: synthesize a transport-fault terminal so the caller
+    // never truncates after a non-terminal `Data`. Two cases reach here without a
+    // delivered terminal while A is still consuming:
+    //   - B's pump dropped its sender WITHOUT a terminal chunk (`!capture_broke`);
+    //   - the durable frontier capture broke mid-stream (`capture_broke`) — the
+    //     target actor vanished/diverged, so the seal closes over the durable
+    //     prefix. The caller must STILL receive a terminal (crypto review: the
+    //     `capture_broke` path was previously excluded, silently truncating A
+    //     after a non-terminal `Data` and losing the §5.4.5 terminal guarantee).
+    if !delivered_terminal && outer_open {
+        let message = if capture_broke {
+            format!(
+                "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: durable frontier capture broke \
+                 mid-stream — sealed over the durable prefix (§5.4.5)"
+            )
+        } else {
+            format!(
+                "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: operating context closed the \
+                 stream without a terminal chunk (§5.4.5)"
+            )
+        };
+        let payload = ChunkPayload::Error {
+            code: CODE_TRANSPORT_FAULT.to_owned(),
+            message,
+            terminal: true,
+        };
+        let next_seq = last_sequence.map_or(0, |s| s.saturating_add(1));
+        // The synthesized terminal is the final chunk — its sequence is not read
+        // again, so the delivery result is discarded (the terminal summary was
+        // already folded inside `forward_bridge_terminal`).
+        let _ = forward_bridge_terminal(
+            &outer_tx,
+            &mut send_tracker,
+            &mut terminal,
+            descriptor.expected_request_id,
+            next_seq,
+            payload,
+        )
+        .await;
+    }
+
+    // Seal the durable frontier ONCE (AC8). The B actor finalizes the manifest
+    // root, signs the SCP-OUT-043 streaming receipt under the target's Active
+    // Signing Key, settles the escrow from the durable ledger, appends B's
+    // `OutletInvoked`, and durably captures the replay witness. `cancel_ack_seq`
+    // is `None` — this task processes no cross-context `OutletCancel` (the pump
+    // already drops above-cancel-ack `Data`, so the frontier reflects the correct
+    // §5.4.5 billing boundary).
+    //
+    // SCOPE (§6.2.5): live mid-stream cross-context `OutletCancel` is NOT in
+    // SCP-OUT-046 (none of its 9 ACs mention it). §6.2.5 uses `cancel_ack` for
+    // truncated-close REPRODUCIBILITY (the billing boundary a cancel pins so a
+    // replayed close re-derives the same root), NOT a live cancel channel — hence
+    // `cancel_ack_ceiling = u64::MAX` (no cancel) + `cancel_ack_seq: None` here.
+    // This no-live-cancel scope is spec-sanctioned (§6.2.5 / §5.4.5). A live
+    // cross-context cancel control-plane channel, if specced, is wired through the
+    // SCP-OUT-047 streaming-saga FFI control surface (which owns the caller-side
+    // control plane), NOT here — see SCP-OUT-047's live-cancel control-plane
+    // action item.
+    let terminal_status = terminal.terminal_status.clone();
+    let seal_result = match supervisor.lookup(&target_context_hex) {
+        Some(actor) => {
+            let settle_saga_id = saga_id.clone();
+            actor
+                .send(move |reply| {
+                    ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
+                        saga_id: settle_saga_id,
+                        terminal_status,
+                        cancel_ack_seq: None,
+                        target_signing_key,
+                        reply,
+                    })
+                })
+                .await
+        }
+        None => Err(scp_protocol::context::ContextError::ContextNotRegistered(
+            format!(
+                "streaming-saga seal task: target context '{target_context_hex}' is no longer a \
+                 co-resident actor at seal-close — journal left Committing for crash recovery"
+            ),
+        )),
+    };
+
+    match seal_result {
+        Ok(outcome) => {
+            // The seal committed: the durable ledger owns the billed / refund
+            // split (`outcome.billed` / `outcome.refund`), so the open-failure
+            // guard must NOT reverse the hold. Consume it (mirrors the
+            // same-context open's consume-on-`Ok`).
+            escrow_ticket.consume();
+            tracing::debug!(
+                saga_id = %saga_id.0,
+                billed = outcome.billed.value(),
+                refund = outcome.refund.value(),
+                billed_count = outcome.billed_count,
+                stream_chunk_count = outcome.stream_chunk_count,
+                manifest_root = %hex::encode(outcome.stream_manifest_hash),
+                "streaming-saga seal task: sealed — Committing→Committed"
+            );
+            // #135 — record the receiving-context (A) `CrossContextOutletInvoked`
+            // dual-log leaf, completing the atomic dual-log (B's `OutletInvoked`
+            // was recorded by the seal handler). Recorded BEFORE the settlement
+            // move below so it borrows the whole `outcome`. Uses the SEALED root
+            // from `outcome` (never a re-derivation) + the convergent
+            // timestamp/nonce/context-ids from the signed receipt, so every
+            // honest member's leaf is byte-identical. No local payload buffer is
+            // read — B's durable frontier is the authoritative manifest.
+            record_streaming_saga_a_event(&a_event_log, &saga_id, &outcome).await;
+
+            // Apply the ACTUAL budget movement (SCP-OUT-046 CRITICAL): the seal
+            // handler durably inserted the `settled = false` witness and built the
+            // complete `StreamSettlement`, but CANNOT dispatch to its own actor
+            // mailbox (re-entrant deadlock), so the off-mailbox seal task applies
+            // it here against B's SEAL-TIME generation (`outcome.generation`, the
+            // instance the seal just ran on — NOT the reserve-time generation,
+            // which would falsely mismatch after a mid-stream respawn and strand
+            // the refund). `witness_saga_id: Some` flips `settled` atomically with
+            // the money move, so the money+flag are crash-atomic and the flag is
+            // the double-refund guard.
+            //
+            // Only resolve the journal `Committed` when the settlement ACTUALLY
+            // applied (`applied == true`). If it was DEFERRED (target evicted /
+            // replaced between the seal and the settle) or errored, the witness
+            // stays unsettled and the journal is LEFT `Committing` so the keyless
+            // crash-recovery sweep completes the money move exactly once (money
+            // ops need no signing key). `settlement == None` means a replay (the
+            // witness is already settled) — resolve `Committed` idempotently.
+            let settlement_applied = match outcome.settlement {
+                None => true,
+                Some(settlement) => {
+                    match supervisor
+                        .settle_outlet_stream_via_actor(
+                            *settlement,
+                            outcome.generation,
+                            Some(saga_id.clone()),
+                        )
+                        .await
+                    {
+                        Ok(application) => application.applied,
+                        Err(err) => {
+                            tracing::error!(
+                                saga_id = %saga_id.0,
+                                %err,
+                                "streaming-saga seal task: close-time escrow settlement failed — \
+                                 journal left Committing; the crash-recovery sweep completes the \
+                                 refund + counter release from the durable witness"
+                            );
+                            false
+                        }
+                    }
+                }
+            };
+
+            if settlement_applied {
+                // Resolve the journal to `Committed` so crash recovery does not
+                // redrive a completed saga. Non-secret (the streaming saga journals
+                // public metadata only).
+                if let Err(err) = supervisor.resolve_saga_committed(&saga_id).await {
+                    tracing::error!(
+                        saga_id = %saga_id.0,
+                        %err,
+                        "streaming-saga seal task: journal resolve-to-Committed failed — the \
+                         crash recovery sweep will reconcile from the durable committed witness"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    saga_id = %saga_id.0,
+                    "streaming-saga seal task: settlement DEFERRED (target evicted/replaced at \
+                     settle) — journal left Committing; keyless crash recovery completes it"
+                );
+            }
+        }
+        Err(err) => {
+            // The seal did not commit. Drop the ticket so its `Drop` reverses the
+            // open-time hold (the sole refund path when no seal ran). Leave the
+            // journal at `Committing` — the autonomous crash-recovery sweep
+            // (SCP-OUT-046 #136) resolves it (witness present → Committed; absent
+            // → the key-bearing truncated close, or an honest NeedsRepair).
+            drop(escrow_ticket);
+            tracing::error!(
+                saga_id = %saga_id.0,
+                %err,
+                "streaming-saga seal task: CommitBStreamSettle failed — open-time escrow hold \
+                 reversed, journal left Committing for crash recovery"
+            );
+        }
+    }
+}
+
+/// Record the receiving-context (A) `CrossContextOutletInvoked` dual-log leaf at
+/// a streaming-saga seal-close (SCP-OUT-046 #135; the streaming sibling of the
+/// unary saga's caller-side `cross_context_invoked_leaf`). Shared by the seal
+/// task AND the key-bearing crash-recovery truncated close (#136) so both record
+/// the identical A-side leaf.
+///
+/// The leaf is a commit-ordered CONVERGENT durable leaf (ADR-011 Amendment §6
+/// carve-out): every field is derived from the SIGNED streaming receipt
+/// (`outcome.receipt`) + the SEALED root (`outcome.stream_manifest_hash`) — never
+/// a re-derivation over a locally reassembled sequence and never a local clock —
+/// so every honest member reconstructs the byte-identical leaf. The convergent
+/// timestamp is `receipt.timestamp_ms / 1000` (B's staged `recorded_timestamp_ms`),
+/// the SAME instant B's `OutletInvoked` leaf hashes, so the two `nonce`-joined
+/// records date the one provenance edge identically (§6.2.4 "Dual event-log
+/// recording"; §7.3.1 / §9.9.3).
+///
+/// Best-effort append (mirrors `record_cross_context_a_event`): the atomic seal
+/// guarantee is the durable `xctx_committed_stream_outputs` witness + the journal,
+/// so a receiver-side recording fault surfaces to the audit log rather than
+/// un-committing the sealed saga. Never re-signs, never re-invokes.
+pub(crate) async fn record_streaming_saga_a_event(
+    a_event_log: &std::sync::Arc<dyn crate::context::builder::ContextEventLogProvider>,
+    saga_id: &crate::context::supervisor::saga_journal::SagaId,
+    outcome: &crate::context::actor::commands::CommitBStreamSettleOutcome,
+) {
+    let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt =
+        match serde_json::from_slice(&outcome.receipt) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::error!(
+                    saga_id = %saga_id.0,
+                    %err,
+                    "streaming-saga A-side record: sealed receipt could not be parsed for the \
+                     convergent timestamp/nonce — skipping CrossContextOutletInvoked"
+                );
+                return;
+            }
+        };
+    // The A-side leaf carries the SEALED manifest root (never the unary
+    // `output_hash`) + the streaming counters, joined to B's `OutletInvoked` by
+    // the shared `nonce`. The context id the leaf lands in is A
+    // (`receipt.caller_context_id`); it REFERENCES B (`receipt.target_context_id`).
+    let payload = serde_json::json!({
+        "saga_id": saga_id.0,
+        "target_context_id": hex::encode(receipt.target_context_id),
+        "nonce": hex::encode(receipt.nonce),
+        "outlet_registration_id": receipt.outlet_registration_id,
+        "outlet_invoked_event_id": receipt.outlet_invoked_event_id,
+        "stream_manifest_hash": hex::encode(outcome.stream_manifest_hash),
+        "chunks_billed": outcome.billed_count,
+        "stream_chunk_count": outcome.stream_chunk_count,
+        "receipt_len": outcome.receipt.len(),
+    });
+    let payload_bytes = match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::error!(
+                saga_id = %saga_id.0,
+                %err,
+                "streaming-saga A-side record: CrossContextOutletInvoked payload serialization \
+                 failed — skipping"
+            );
+            return;
+        }
+    };
+    if let Err(err) = a_event_log
+        .append_context_event_with_payload(
+            &receipt.caller_context_id,
+            scp_event_log::EventType::CrossContextOutletInvoked,
+            &receipt.caller_did,
+            scp_event_log::EventPayload {
+                data: payload_bytes,
+            },
+            receipt.timestamp_ms / 1000,
+        )
+        .await
+    {
+        tracing::error!(
+            saga_id = %saga_id.0,
+            %err,
+            "streaming-saga A-side record: CrossContextOutletInvoked append failed — the sealed \
+             witness remains the authoritative dual-record source"
+        );
+    }
 }
 
 /// Best-effort cross-context re-encrypting streaming bridge (SCP-OUT-036).
