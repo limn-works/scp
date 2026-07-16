@@ -116,3 +116,27 @@ too_many_arguments = "deny"
 # denied here. See scripts/check-block-in-place.py for the complementary
 # sync-bridge enforcement.
 await_holding_lock = "deny"
+
+# ── Release profile ─────────────────────────────────────────────────────────
+# `debug-assertions = false` is the cargo release DEFAULT — this line changes no
+# behavior; it makes an otherwise-implicit invariant EXPLICIT and greppable.
+#
+# LOAD-BEARING (ADR-057 §Prereq-4, in-browser client untrusted-relay guarantee):
+# the one known attacker-reachable panic on the openmls 0.8.1 MLS decrypt path is
+# a `debug_assert!` ("Ciphertext decryption failed",
+# openmls-0.8.1/src/framing/private_message_in.rs) that is compiled OUT of release
+# builds — a construction guarantee. No OTHER release-mode panic has been FOUND on
+# that path (evidenced by the `fuzz_mls_decrypt` decrypt-path fuzz target, pinned
+# to openmls 0.8.1; a future version bump could add one, caught by the nightly
+# fuzz job). With debug-assertions off, a tampered/malformed ciphertext from an
+# untrusted relay makes `process_message` return a typed `Err`
+# (→ MlsError::DecryptionFailed → [SCP-CRYPTO-4010]) instead of panicking — so a
+# hostile relay cannot abort a browser tab (or a native process). Keeping this
+# anchor explicit guards against a future `debug-assertions = true` override
+# silently re-arming that panic. The shipped browser wasm MUST be a `--release`
+# build for the same reason (a `wasm-pack build --dev` would re-arm it); the
+# decrypt-path fuzz target `fuzz/fuzz_targets/fuzz_mls_decrypt.rs` (run with
+# debug-assertions off) is the standing evidence that no found tampered input
+# panics the release decrypt path.
+[profile.release]
+debug-assertions = false

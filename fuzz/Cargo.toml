@@ -9,6 +9,21 @@ cargo-fuzz = true
 
 [workspace]
 
+# ── Release profile ─────────────────────────────────────────────────────────
+# CRITICAL for `fuzz_mls_decrypt` (ADR-057 §Prereq-4). cargo-fuzz builds the
+# `release` profile but, unless `-O`/`--release` is passed, ALSO injects
+# `-Cdebug-assertions` — which would make openmls's decrypt `debug_assert!`
+# ("Ciphertext decryption failed") fire on EVERY tampered ciphertext and report
+# a false crash. `fuzz_mls_decrypt` must validate the SHIPPED release path
+# (debug_assert compiled out → typed `Err`), so it MUST be run with
+# `cargo +nightly fuzz run fuzz_mls_decrypt -O ...` (release, debug-assertions
+# off). This explicit profile line keeps debug-assertions off in the profile
+# itself (the release default) so the two agree; the `-O` flag is the operative
+# switch that stops cargo-fuzz re-enabling them. See the dedicated
+# `fuzz-mls-decrypt` job in `.github/workflows/fuzz.yml`.
+[profile.release]
+debug-assertions = false
+
 [lib]
 name = "scp_fuzz"
 path = "src/lib.rs"
@@ -192,5 +207,14 @@ doc = false
 [[bin]]
 name = "fuzz_epoch_monotonicity"
 path = "fuzz_targets/fuzz_epoch_monotonicity.rs"
+test = false
+doc = false
+
+# Tier 4 — MLS decrypt-path panic safety (ADR-057 §Prereq-4, #1444).
+# MUST be run with `-O` (release, debug-assertions OFF) — see the
+# `[profile.release]` note above and `.github/workflows/fuzz.yml`.
+[[bin]]
+name = "fuzz_mls_decrypt"
+path = "fuzz_targets/fuzz_mls_decrypt.rs"
 test = false
 doc = false
