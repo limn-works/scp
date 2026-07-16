@@ -1220,35 +1220,20 @@ pub async fn execute_add_member(
     // the stateless `MlsBackend` (`deps.mls`) — the provider `validate_key_package`
     // copy is retired from the production call path (§15 grants no carve-out; the
     // symbol is retained only as a test-exercised copy at `crypto/mls/provider.rs`).
-    // The stateless backend validates signature / lifetime / ciphersuite but does
-    // NOT bind identity, so the DID binding is preserved here via
-    // `scp_mls::group::key_package_in_did`, which authenticates the KP credential
-    // DID under the same hardened clock the MLS add uses.
-    //
-    // The KP signature/lifetime is therefore validated TWICE by design — once
-    // through `deps.mls.validate_key_package` (the §15-mandated `MlsBackend`
-    // route) and once inside `key_package_in_did` (which also extracts the
-    // authenticated DID). This is an accepted belt-and-suspenders, not a bug.
+    // `validate_key_package` runs the full validation (signature / hardened-clock
+    // lifetime / ciphersuite) ONCE and returns the authenticated `credential_did`
+    // extracted from the same validated leaf, so the DID binding is preserved
+    // here as a single validate-and-bind under the same hardened clock the MLS
+    // add uses — no second parse or re-validation.
     match key_package {
         Some(bytes) => {
-            deps.mls
+            let validated = deps
+                .mls
                 .validate_key_package(bytes, deps.clock.as_ref())
                 .await
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-            let kp_in = {
-                use openmls::prelude::tls_codec::Deserialize as _;
-                openmls::prelude::KeyPackageIn::tls_deserialize(&mut &*bytes).map_err(|e| {
-                    ContextError::MembershipFailed(format!("key package deserialization: {e}"))
-                })?
-            };
             let owner_did: &str = did.as_ref();
-            let cred_did = scp_mls::group::key_package_in_did(
-                &kp_in,
-                openmls::prelude::ProtocolVersion::Mls10,
-                deps.clock.as_ref(),
-            )
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-            if cred_did.as_str() != owner_did {
+            if validated.credential_did.as_str() != owner_did {
                 return Err(ContextError::MembershipFailed(
                     "key package credential DID does not match target DID".to_string(),
                 ));

@@ -3070,8 +3070,11 @@ pub fn decrypt_and_dispatch(
     // field-granular Class-C `&mut ContextCryptoState` (driven from
     // `deliver_incoming`'s `ClassCMut` view) — byte-identical to the deleted
     // provider `open` twin (the 16 golden tests hold). `process_incoming_sender_key`
-    // + `set_sender_key_unchecked` below stay on the provider (receive-side, NOT
-    // in the delete set), and `local_did` is likewise retained. A `None` crypto
+    // below stays on the provider (it HPKE-opens with the NODE-RESIDENT wrapping
+    // secret — receive-side, NOT in the delete set); the sender-key INSTALL,
+    // however, now writes to the ACTOR-owned `cs.sender_key_store.set_unchecked`
+    // (the provider store is empty on a taken context — see the KeyResponse arm
+    // below), and `local_did` is likewise retained. A `None` crypto
     // state means a context with no MLS group (a broadcast context, which never
     // reaches this MLS-decrypt path — its receive path is author-signed) — fail
     // closed, matching the deleted provider `open`'s "no MLS group" error.

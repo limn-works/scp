@@ -824,38 +824,23 @@ pub async fn join_context(
     // the production call path (retained only as a test-exercised copy at
     // `crypto/mls/provider.rs`), and §15 grants it no carve-out
     // ("`validate_key_package` … becomes a stateless free-fn / `MlsBackend` method
-    // over `&dyn Clock`"). The backend validates signature / lifetime / ciphersuite
-    // but does NOT bind identity, so the load-bearing binding (the KP credential
-    // DID MUST equal the envelope's `owner_did`, formerly enforced inside the
-    // provider method) is preserved explicitly via the
-    // `scp_mls::group::key_package_in_did` primitive, which authenticates the DID
-    // under the same hardened clock `add_member` uses. Under `cfg(test)`/`testing`
-    // a `None` KP is accepted (mock fixtures); production requires real bytes.
-    //
-    // The KP signature/lifetime is therefore validated TWICE by design — once
-    // through `deps.mls.validate_key_package` (the §15-mandated `MlsBackend`
-    // route) and once inside `key_package_in_did` (which also extracts the
-    // authenticated DID). This is an accepted belt-and-suspenders, not a bug.
+    // over `&dyn Clock`"). `validate_key_package` runs the full validation
+    // (signature / hardened-clock lifetime / ciphersuite) ONCE and returns the
+    // authenticated `credential_did` extracted from the same validated leaf, so
+    // the load-bearing binding (the KP credential DID MUST equal the envelope's
+    // `owner_did`, formerly enforced inside the provider method) is preserved
+    // here as a single validate-and-bind — no second parse or re-validation.
+    // Under `cfg(test)`/`testing` a `None` KP is accepted (mock fixtures);
+    // production requires real bytes.
     let kp_bytes = key_package.mls_key_package_bytes.as_deref();
     match kp_bytes {
         Some(bytes) => {
-            deps.mls
+            let validated = deps
+                .mls
                 .validate_key_package(bytes, deps.clock.as_ref())
                 .await
                 .map_err(|e| ContextError::InvalidKeyPackage(e.to_string()))?;
-            let kp_in = {
-                use openmls::prelude::tls_codec::Deserialize as _;
-                openmls::prelude::KeyPackageIn::tls_deserialize(&mut &*bytes).map_err(|e| {
-                    ContextError::InvalidKeyPackage(format!("TLS deserialization: {e}"))
-                })?
-            };
-            let cred_did = scp_mls::group::key_package_in_did(
-                &kp_in,
-                openmls::prelude::ProtocolVersion::Mls10,
-                deps.clock.as_ref(),
-            )
-            .map_err(|e| ContextError::InvalidKeyPackage(e.to_string()))?;
-            if member_did != cred_did {
+            if member_did != validated.credential_did {
                 return Err(ContextError::InvalidKeyPackage(
                     "key package credential DID does not match owner_did".to_string(),
                 ));
