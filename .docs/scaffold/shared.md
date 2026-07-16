@@ -18,7 +18,7 @@ crates/
     napi/             # Node/Bun TypeScript FFI (napi-rs)
 bindings/
   python/             # scp-python (PyPI) — scp_sdk package
-  typescript/         # @limn-works/scp-ts (npm) — Bun/Node native (napi); browser = remote thin client (ADR-055)
+  typescript/         # @limn-works/scp-ts (npm, Bun/Node native napi) + @limn-works/scp-ts-wasm (browser/edge, in-tab SCP client over scp-client-wasm, keys on-device, ADR-057)
   swift/              # SCP (Swift Package Manager)
   kotlin/             # works.limn:scp-kt (Maven Central)
 ```
@@ -43,7 +43,7 @@ Three bridges serve four languages:
 | **UniFFI** | `crates/scp-ffi/uniffi` | Swift, Kotlin | Single UDL definition generates Swift + Kotlin bindings |
 | **napi-rs** | `crates/scp-ffi/napi` | TypeScript (Bun/Node) | Native addon for server-side JS runtimes |
 
-Browser clients do not run a protocol engine in-process: they are remote thin clients to a server-side `scp-node` over RPC/WebSocket (ADR-055).
+Browser/edge clients run the protocol **in-tab** over the wasm-bindgen surface `scp-client-wasm` (a participant-subset engine, distinct from the three FFI bridges above), with keys on-device and the server untrusted (ADR-057, which amends ADR-055's browser-deployment conclusion; ADR-055's removal of the WASM **bridge** stands).
 
 Every FFI bridge crate:
 - Depends on `scp-core`, `scp-transport`, `scp-platform`
@@ -196,8 +196,8 @@ Binary artifact build, sign, and distribute workflow. Conformance gate (100% pas
 |----------|---------|----------|----------|
 | Rust | `scp-core`, `scp-transport`, `scp-platform` | crates.io | Source crate |
 | Python | `scp-python` | PyPI | maturin-built wheel (includes compiled Rust) |
-| TypeScript (Node/Bun) | `@limn-works/scp-ts` | npm | napi-rs native addon |
-| TypeScript (browser) | `@limn-works/scp-ts` | npm | Remote thin client — RPC/WebSocket to a server-side `scp-node` (ADR-055); no in-process engine |
+| TypeScript (Node/Bun) | `@limn-works/scp-ts` | npm | napi-rs native addon (full-capability `ScpClient`) |
+| TypeScript (browser/edge) | `@limn-works/scp-ts-wasm` | npm | In-browser SCP client over `scp-client-wasm` (wasm-bindgen), keys on-device, participant subset (ADR-057) |
 | Swift | `SCP` | Swift Package Manager | XCFramework binary target |
 | Kotlin | `works.limn:scp-kt` | Maven Central | AAR with bundled .so |
 
