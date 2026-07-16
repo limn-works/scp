@@ -3,10 +3,11 @@
 //!
 //! The §9.10.4 pseudonym logic — the [`PseudonymAnnouncement`] wire type and the
 //! pure [`classify_pseudonym_announcement`] decision core — was extracted into
-//! the wasm-safe `scp-protocol::context::pseudonym` module so the native
-//! orchestrator (`scp-runtime`) and the in-browser client driver share ONE copy
-//! (not a fork). This file is the guard that the shared code produces
-//! **byte-identical** output on both native and `wasm32`:
+//! the wasm-safe `scp-protocol::context::pseudonym` module so it is READY to be
+//! consumed verbatim by a future in-browser client driver without forking the
+//! native orchestrator's (`scp-runtime`) copy. This file is the guard that the
+//! shared code produces **byte-identical** output on both native and `wasm32`,
+//! so that a future browser call site inherits one non-forked implementation:
 //!
 //! 1. **Wire encoding.** `rmp_serde::to_vec_named` of a FIXED
 //!    [`PseudonymAnnouncement`] must equal a committed golden hex and round-trip,

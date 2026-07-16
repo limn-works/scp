@@ -4,10 +4,12 @@
 //! This is the single, wasm-safe home for the §9.10.4 per-context-pseudonym
 //! logic that the relay/MLS routing layer uses to learn peers' routing IDs. It
 //! carries NO async, NO transport, and NO platform dependency, so it compiles
-//! to `wasm32-unknown-unknown` and is shared VERBATIM by the native
-//! orchestrator (`scp-runtime`) and the in-browser client driver — one copy,
-//! never a fork, so the two targets cannot drift on the wire format or the
-//! accept/reject decision (ADR-057 "share, don't fork").
+//! to `wasm32-unknown-unknown` and is READY to be consumed verbatim by the
+//! in-browser client driver (ADR-057 "share, don't fork"). Today the native
+//! orchestrator (`scp-runtime`) is the sole production consumer; the
+//! cross-target byte/decision parity that a shared copy must hold is already
+//! exercised by `pseudonym_cross_target_kat` under `wasm-pack test`, so a
+//! future browser call site inherits one non-forked implementation.
 //!
 //! The module owns three things:
 //! 1. the [`PseudonymAnnouncement`] wire struct + its [`PSEUDONYM_ANNOUNCEMENT_TAG`]
@@ -17,8 +19,9 @@
 //!    [`is_reserved_pseudonym`], and [`pseudonym_collides_with_other_did`], and
 //! 3. the pure decision core [`classify_pseudonym_announcement`], which folds the
 //!    four-step ingest validation into a single [`PseudonymAnnouncementDecision`]
-//!    that each host maps to its own side effects (native: metric + `tracing`
-//!    warn + registry insert + event emit; browser: the equivalent driver hooks).
+//!    the host maps to its own side effects (native `scp-runtime`: metric +
+//!    `tracing` warn + registry insert + event emit; a future browser driver
+//!    would run the equivalent hooks).
 //!
 //! The reject-reason strings ([`REJECT_SENDER_MISMATCH`] et al.) are stable
 //! `&'static str`s that are part of the committed cross-target known-answer
@@ -112,14 +115,12 @@ pub fn is_reserved_pseudonym(pseudonym: &[u8; 32], context_id: &str) -> bool {
 /// address, and honest senders addressing the colliding DID could misroute).
 /// A member re-announcing the SAME value for their OWN DID is legitimate (key
 /// rotation re-broadcast) and is NOT a collision.
-// The peer registry is ALWAYS the default-hasher `HashMap` the routing state
-// owns (`peer_registry()`); this pure predicate is never called with a foreign
-// hasher, so a `BuildHasher` type parameter would add an unused generic to the
-// shared cross-target API (against the agent-first "one canonical shape" tenet)
-// without any real generality. Keep the concrete signature.
-#[allow(clippy::implicit_hasher)]
+///
+/// Crate-internal: the sole caller is [`classify_pseudonym_announcement`] in
+/// this module (plus this module's unit tests); the public entry point is the
+/// classifier, not this predicate.
 #[must_use]
-pub fn pseudonym_collides_with_other_did(
+pub(crate) fn pseudonym_collides_with_other_did(
     registry: &HashMap<DID, [u8; 32]>,
     announcer_did: &DID,
     pseudonym: &[u8; 32],
@@ -157,11 +158,12 @@ pub const REJECT_COLLISION: &str =
 /// plaintext.
 ///
 /// The classifier makes the accept/reject DECISION; it performs no side
-/// effects. Each host maps this to its own effects: the native orchestrator
+/// effects. The host maps this to its own effects: the native orchestrator
 /// records a rejection metric + `tracing` warn on `Rejected`, and inserts the
-/// registry entry + emits a `PseudonymAnnounced` event on `Accept`; the browser
-/// driver runs the equivalent hooks. Because both hosts share this one decision
-/// function, they cannot diverge on which announcements are accepted.
+/// registry entry + emits a `PseudonymAnnounced` event on `Accept` (a future
+/// browser driver would run the equivalent hooks). Because any host shares this
+/// one decision function, they cannot diverge on which announcements are
+/// accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PseudonymAnnouncementDecision {
     /// The plaintext is not a tagged `PseudonymAnnouncement` — the host should
@@ -190,8 +192,9 @@ pub enum PseudonymAnnouncementDecision {
 
 /// The pure §9.10.4 pseudonym-announcement decision core (ADR-057 T-1).
 ///
-/// This is the single, shared, wasm-safe validator both the native orchestrator
-/// and the browser driver run, so their accept/reject behavior cannot drift.
+/// This is the single, shared, wasm-safe validator the native orchestrator runs
+/// today and a future browser driver can run verbatim, so their accept/reject
+/// behavior cannot drift.
 ///
 /// Runs the four-step validation core over an inbound `plaintext`:
 /// 1. tag-decode ([`PseudonymAnnouncementDecision::NotAnnouncement`] if the
