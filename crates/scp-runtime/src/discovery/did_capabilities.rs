@@ -463,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_capabilities_invalid_did_returns_error() {
-        let did_dht = DidDht::new();
+        let did_dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let err = resolve_capabilities("did:dht:zInvalidDid", &did_dht, &scp_clock::SystemClock)
             .await

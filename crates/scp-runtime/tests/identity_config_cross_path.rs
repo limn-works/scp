@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
+use scp_dht::InMemoryDhtClient;
 use scp_did::DidDocument;
 use scp_identity::{DidDht, Identity, IdentityConfig};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
@@ -64,7 +65,7 @@ async fn identity_create_persisted_document_loads_via_protocol_repository() {
     let storage = shared_encrypted_storage();
 
     let (identity, document, _pre_rotation) = Identity::create(IdentityConfig {
-        method: DidDht::new(),
+        method: DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
         custody: InMemoryKeyCustody::new(),
         persistence: Some(Arc::clone(&storage)),
     })
@@ -100,11 +101,13 @@ async fn protocol_repository_document_decodes_with_shared_store_value_helper() {
     let repo = ProtocolRepository::new_for_testing(Arc::clone(&storage));
 
     // A real document, JSON-encoded exactly as the identity path encodes it.
-    let (identity, document, _pre_rotation) = Identity::create_ephemeral(
-        IdentityConfig::ephemeral(DidDht::new(), InMemoryKeyCustody::new()),
-    )
-    .await
-    .expect("ephemeral identity creation should succeed");
+    let (identity, document, _pre_rotation) =
+        Identity::create_ephemeral(IdentityConfig::ephemeral(
+            DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
+            InMemoryKeyCustody::new(),
+        ))
+        .await
+        .expect("ephemeral identity creation should succeed");
     let document_json = serde_json::to_vec(&document).expect("document JSON should serialize");
 
     let did = DID::from(identity.did.clone());
@@ -135,11 +138,13 @@ async fn protocol_repository_document_decodes_with_shared_store_value_helper() {
 #[tokio::test]
 async fn both_paths_write_byte_identical_documents() {
     // Build a document once.
-    let (identity, document, _pre_rotation) = Identity::create_ephemeral(
-        IdentityConfig::ephemeral(DidDht::new(), InMemoryKeyCustody::new()),
-    )
-    .await
-    .expect("ephemeral identity creation should succeed");
+    let (identity, document, _pre_rotation) =
+        Identity::create_ephemeral(IdentityConfig::ephemeral(
+            DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
+            InMemoryKeyCustody::new(),
+        ))
+        .await
+        .expect("ephemeral identity creation should succeed");
     let did = DID::from(identity.did.clone());
     let document_json = serde_json::to_vec(&document).expect("document JSON should serialize");
 

@@ -11,13 +11,17 @@ publish = false
 default = ["resolvers"]
 # Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
 # Requires scp-core, scp-identity, tokio, scp-mcp.
-resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-dht", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
+resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
 # BridgeDidResolver delegates decoding to `scp_did::extract_public_key_from_did`,
 # whose did:key:{hex} branch is itself gated behind `scp-did/testing`; forward
 # the flag so the single shared parser still accepts did:key in test builds.
-testing = ["resolvers", "scp-did/testing"]
+# `scp-node?/testing` forwards testing to scp-node ONLY when it is already
+# activated (via the `server` feature): the server.rs auto-generate path calls
+# the testing-gated `ApplicationNode::dev`. The `?` keeps testing usable without
+# `server`. Never in a default/non-testing list (ADR-062 §Decision 1).
+testing = ["resolvers", "scp-did/testing", "scp-dht/testing", "scp-node?/testing"]
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
 # PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
@@ -33,7 +37,7 @@ custody = ["dep:scp-platform"]
 # nullifier is supplied transitively via dep:scp-node (a hard dep here) until
 # ADR-062 Slice 6 (SCP-CAPINJECT-006) retypes those phantoms to a real
 # FileKeyCustody.
-server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:scp-dht", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
+server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
@@ -43,7 +47,11 @@ scp-clock = { path = "../../scp-clock" }
 scp-did = { path = "../../scp-did" }
 scp-event-log = { path = "../../scp-event-log", optional = true }
 scp-identity = { path = "../../scp-identity", optional = true }
-scp-dht = { path = "../../scp-dht", optional = true }
+# Non-optional: the shared `FfiDhtClient` (src/dht.rs) always ships the real
+# Mainline `PkarrDhtClient`, so `production-dht` is unconditional here (ADR-062
+# §Decision 1). `dep:scp-dht` was therefore removed from the `resolvers`/`server`
+# feature lists — the crate is always present, never feature-gated optional.
+scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
 scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite", "in-memory-storage"], optional = true }
@@ -70,6 +78,9 @@ tracing = { workspace = true, optional = true }
 scp-event-log = { path = "../../scp-event-log" }
 scp-identity = { path = "../../scp-identity" }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+# The crate's own tests (resolvers.rs, dht_capability_injection.rs) construct
+# `InMemoryDhtClient`; activate `scp-dht/testing` for this crate's test build.
+scp-dht = { path = "../../scp-dht", features = ["testing"] }
 # `test-util` enables tokio's paused-clock test harness (time::pause/advance,
 # #[tokio::test(start_paused = true)]) — not pulled in by the optional runtime
 # `tokio` dep's "full" features, which intentionally excludes it.

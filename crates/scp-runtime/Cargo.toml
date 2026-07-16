@@ -93,6 +93,10 @@ futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# The discovery test modules construct `InMemoryDhtClient` (now gated behind
+# `scp-dht/testing`); activate it for this crate's own test build (ADR-062
+# §Decision 1). `scp-dht/testing` never appears in a non-testing feature list.
+scp-dht = { path = "../scp-dht", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }

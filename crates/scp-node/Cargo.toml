@@ -82,6 +82,11 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+# The node's tests (config.rs, lib.rs, self_host.rs) and `ApplicationNode::dev`
+# construct `InMemoryDhtClient` (now gated behind `scp-dht/testing`); activate it
+# for this crate's own test build. `production-dht` still comes from the normal
+# [dependencies] edge, so `build_production_did_method` keeps its Pkarr client.
+scp-dht = { path = "../scp-dht", features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1"
@@ -92,6 +97,14 @@ tempfile = "3"
 # Gates `Node::start_for_testing` — accepts any `Storage`
 # backend without the `EncryptedStorage` bound. See issue #695.
 allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
+# Test-harness-only. Carries `scp-dht/testing` so `ApplicationNode::dev`,
+# `DhtMode::Memory`, and `build_memory_did_method` (all in-memory-DHT test
+# doubles) compile; implies `allow_unencrypted_storage` because
+# `ApplicationNode::dev` builds through `Node::start_for_testing`. MUST NOT
+# appear in any default/non-testing feature list (ADR-062 §Decision 1); a
+# shipped node build never enables it, so the in-memory DHT nullifier is absent
+# from shipped artifacts.
+testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]
 quic = ["scp-transport/quic", "dep:quinn"]
 http3 = ["scp-transport/http3"]
 udp = ["scp-transport/udp"]

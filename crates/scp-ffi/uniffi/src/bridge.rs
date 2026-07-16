@@ -32,51 +32,22 @@ use sha2::Digest;
 use zeroize::Zeroizing;
 
 use scp_clock::Clock;
-#[cfg(any(test, feature = "allow_in_memory_custody"))]
+// The DHT client the UniFFI bridge runs over is the SHARED
+// `scp_ffi_common::dht::FfiDhtClient` enum (ADR-062 §Decision 1): the real
+// Mainline Pkarr client in a shipped build, with an in-memory test-double arm
+// compiled only under `testing`. `DhtClient` is the publish/resolve trait.
+use scp_dht::DhtClient;
+// `InMemoryDhtClient` is the §17.17.3 DHT nullifier. Since the cfg-gated DHT
+// construction is now hoisted into `scp_ffi_common::dht::build_ffi_dht_client`,
+// this bridge names the type only in its own `#[cfg(test)]` unit tests — hence
+// the bare `test` gate (the `testing`-feature seam lives in scp-ffi-common now).
+#[cfg(test)]
 use scp_dht::InMemoryDhtClient;
-#[cfg(not(any(test, feature = "allow_in_memory_custody")))]
-use scp_dht::PkarrDhtClient;
+use scp_ffi_common::dht::FfiDhtClient;
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
-/// DHT client type alias: production builds use [`PkarrDhtClient`] for real
-/// Mainline DHT resolution; test and `allow_in_memory_custody` builds use
-/// [`InMemoryDhtClient`] to avoid network I/O and enable deterministic
-/// identity roundtrips.
-///
-/// `#[cfg(test)]` alone is insufficient: integration tests (`tests/` directory)
-/// compile the crate as a dependency where `cfg(test)` is false. The
-/// `allow_in_memory_custody` feature (already required by CI for integration
-/// tests) provides the correct gate for both unit and integration test builds.
-#[cfg(not(any(test, feature = "allow_in_memory_custody")))]
-type FfiDhtClient = PkarrDhtClient;
-#[cfg(any(test, feature = "allow_in_memory_custody"))]
-type FfiDhtClient = InMemoryDhtClient;
-
-/// Constructs a new [`FfiDhtClient`].
-///
-/// Production builds create a [`PkarrDhtClient`] (fallible — Mainline DHT
-/// socket binding can fail). Test builds create an [`InMemoryDhtClient`]
-/// (infallible).
-macro_rules! new_ffi_dht_client {
-    () => {{
-        let result: Result<FfiDhtClient, IdentityError> = {
-            #[cfg(not(any(test, feature = "allow_in_memory_custody")))]
-            {
-                // `PkarrDhtClient::new()` yields the transport-layer `DhtError`;
-                // map it into `IdentityError` so this macro keeps a single
-                // declared error type across both build configurations.
-                FfiDhtClient::new().map_err(IdentityError::from)
-            }
-            #[cfg(any(test, feature = "allow_in_memory_custody"))]
-            {
-                Ok(FfiDhtClient::new())
-            }
-        };
-        result
-    }};
-}
 use scp_did::DidDocument as CoreDidDocument;
 use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
@@ -278,8 +249,57 @@ async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle)
         .map(|pk| hex::encode(pk.as_bytes()))
 }
 
+/// Builds the shared [`FfiDhtClient`] for this bridge instance, **failing
+/// closed**.
+///
+/// Delegates to the single cfg-gated [`scp_ffi_common::dht::build_ffi_dht_client`]
+/// (shared by all three bridges) and maps its [`DhtInitError`] to a `ScpError`.
+/// A shipped (non-`testing`) build constructs the real Mainline Pkarr client; a
+/// malformed gateway or a Mainline build failure surfaces as
+/// [`codes::IDENT_1058`] (dedicated DHT-init-failure code), never an in-memory
+/// or no-op substitute (ADR-062 §Decision 1 / spec §17.17.3). The in-memory arm
+/// is reachable only through the common test seam under `testing`.
+pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpError> {
+    scp_ffi_common::dht::build_ffi_dht_client().map_err(|e| ScpError::Identity {
+        msg: format!("failed to initialize production DHT client for DID resolution: {e}"),
+        code: codes::IDENT_1058.to_owned(),
+    })
+}
+
+/// Selects the DHT client that key-rotation / agent-key / migration operations
+/// should publish their UPDATED DID document into, **failing closed**.
+///
+/// Rotation, agent-key, and migration operations re-publish a NEW DID document
+/// (a higher BEP44 sequence) that MUST land in the per-instance resolver DHT
+/// client — the one [`IdentityBackedDidResolver`](scp_ffi_common::IdentityBackedDidResolver)
+/// reads from — so that subsequent DID resolution (UCAN validation, governance
+/// vote-signature verification) sees the rotated `#active` key and rejects
+/// signatures from the retired one. Publishing into a throwaway client would
+/// leave the resolver permanently serving the stale, pre-rotation document,
+/// silently defeating rotation's revocation purpose.
+///
+/// Rotation / agent-key / migration only run against an identity already minted
+/// by `identity_create`, which initializes the resolver DHT client first — so by
+/// the time any re-publish runs the shared client is always present. If it is
+/// somehow absent, a typed error is strictly better than fabricating a throwaway
+/// client (and, in a shipped build, the in-memory arm does not even exist).
+/// Mirrors the `PyO3` bridge's `rotation_publish_client`.
+fn rotation_publish_client(
+    bi: &crate::runtime::UniffiBridgeInstance,
+) -> Result<Arc<FfiDhtClient>, ScpError> {
+    bi.core
+        .dht_client()
+        .map(Arc::clone)
+        .ok_or_else(|| ScpError::Identity {
+            msg: "DID resolver DHT client is not initialized on this instance — \
+              create an identity (identity_create) before publishing document updates"
+                .to_owned(),
+            code: codes::IDENT_1001.to_owned(),
+        })
+}
+
 /// Creates a `DidDht` instance with a signing function derived from any
-/// [`KeyCustody`] implementation.
+/// [`KeyCustody`] implementation, over the **per-instance shared** DHT client.
 ///
 /// Generic over the custody backend so it works for both production callback
 /// custody ([`UniffiKeyCustody::Callback`], Secure Enclave / Android Keystore)
@@ -293,10 +313,17 @@ async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle)
 /// `remove_agent_key`, `rotate_key` (active-key rotation), and
 /// `migrate_identity`) to fail. This helper constructs a properly configured
 /// instance with the signing function wired to the custody's key material.
+///
+/// The DHT client is passed in by the caller (via [`rotation_publish_client`])
+/// so the re-published (higher-`seq`) document lands in the SAME per-instance
+/// client the resolver reads from — NOT a fresh per-call client, which would let
+/// the re-published document land somewhere the resolver never sees, silently
+/// defeating rotation's revocation purpose.
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer<C: KeyCustody + Send + Sync + 'static>(
     custody: &Arc<C>,
-) -> Result<DidDht<FfiDhtClient, scp_clock::SystemClock>, IdentityError> {
+    dht_client: Arc<FfiDhtClient>,
+) -> DidDht<FfiDhtClient, scp_clock::SystemClock> {
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<
         dyn Fn(
@@ -317,11 +344,80 @@ fn make_dht_with_signer<C: KeyCustody + Send + Sync + 'static>(
             Ok(sig.into_bytes())
         })
     });
-    Ok(DidDht::with_client_and_signer(
-        Arc::new(new_ffi_dht_client!()?),
-        Arc::new(DidCache::new()),
-        sign_fn,
-    ))
+    DidDht::with_client_and_signer(dht_client, Arc::new(DidCache::new()), sign_fn)
+}
+
+/// Publishes a newly created DID document into this instance's resolver DHT
+/// client so the freshly minted identity is discoverable.
+///
+/// After `identity_create`, the DID document must be resolvable by the
+/// per-instance `DualLayerResolver` (used by UCAN validation and governance
+/// vote-signature verification). The minting `DidDht` used by `create` carries
+/// no `sign_fn` and does not publish, so this explicitly publishes the freshly
+/// signed document into the SAME shared client the resolver reads from.
+///
+/// Constructs a BEP44 signed mutable item (32-byte public key, 64-byte
+/// signature, document JSON, sequence number 1) and calls
+/// [`scp_dht::DhtClient::publish`]. This is the FIRST publish of a freshly
+/// minted DID, so `seq = 1` is correct by construction; subsequent re-publishes
+/// (rotation, agent-key, migration) go through [`make_dht_with_signer`] over the
+/// same client with a bootstrapped monotonic sequence. Best-effort: errors are
+/// logged but never fail identity creation.
+///
+/// Mirrors the `PyO3` bridge's `publish_to_resolver_dht_for` and the NAPI
+/// bridge's `publish_to_shared_dht_for`.
+async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    identity: &ScpIdentity,
+    document: &CoreDidDocument,
+    custody: &C,
+) {
+    let Some(dht_client) = bi.core.dht_client().map(Arc::clone) else {
+        // Resolver not initialized on this instance; nothing to seed.
+        return;
+    };
+
+    // Serialize the document to JSON (the BEP44 value).
+    let doc_json = match document.to_json() {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("publish_to_resolver_dht: failed to serialize document: {e}");
+            return;
+        }
+    };
+    let value = doc_json.as_bytes();
+
+    // Extract the 32-byte public key from the DID string.
+    let public_key = match scp_identity::extract_public_key(&identity.did) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!("publish_to_resolver_dht: failed to extract public key: {e}");
+            return;
+        }
+    };
+
+    // Build the BEP44 signable payload and sign it with the identity key.
+    let seq: u64 = 1;
+    let signable = scp_dht::bep44_signable(value, seq);
+    let sig_bytes = match custody.sign(&identity.identity_key, &signable).await {
+        Ok(sig) => sig.into_bytes(),
+        Err(e) => {
+            tracing::warn!("publish_to_resolver_dht: signing failed: {e}");
+            return;
+        }
+    };
+    let Ok(signature): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        tracing::warn!("publish_to_resolver_dht: signature is not 64 bytes");
+        return;
+    };
+
+    // Publish into the per-instance DHT the resolver reads from.
+    if let Err(e) = dht_client
+        .publish(&public_key, &signature, value, seq)
+        .await
+    {
+        tracing::warn!("publish_to_resolver_dht: DHT publish failed: {e}");
+    }
 }
 
 /// Derives this member's per-context pseudonymous routing ID (§9.10.4).
@@ -2432,6 +2528,13 @@ pub struct Identity {
     /// every `#[uniffi::export]` entry that accepts an `Identity`. Mismatches
     /// map to `ScpError::Permission` with code `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
+    /// The bridge instance that minted this handle — retained so mutable
+    /// identity methods (`rotate_key`, `add_agent_key`, `rotate_agent_key`,
+    /// `remove_agent_key`, migrate) can reach the per-instance shared DHT
+    /// client and resolver cache. Mirrors the NAPI bridge's `bi` field.
+    ///
+    /// Rust-internal field — NOT exposed through `#[uniffi::export]`.
+    pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// JSON-serialized `scp_did::DidRotationEvent` produced when this
     /// handle was minted by [`Scp::identity_migrate`]. SDK callers MUST
     /// distribute the event to active context members per spec §3.2.1
@@ -2557,7 +2660,14 @@ impl Identity {
             // requires a signing function bound to the identity custody.
             // `DidDht::new()` (sign_fn: None) would surface
             // "no signing function configured"; mirror the in-memory branch.
-            let dht = make_dht_with_signer(callback)?;
+            let publish_client = rotation_publish_client(&self.bi)?;
+            let dht = make_dht_with_signer(callback, publish_client);
+            // Bootstrap the BEP44 sequence past the shared DHT's current record
+            // so the rotated document strictly overwrites it — a lower-or-equal
+            // seq is a silent no-op (BEP44 monotonicity). Mirrors PyO3/NAPI.
+            dht.initialize_sequence(&core_id.did)
+                .await
+                .map_err(ScpError::from)?;
             let (new_identity, new_document) = dht
                 .rotate(core_id, callback.as_ref())
                 .await
@@ -2565,6 +2675,12 @@ impl Identity {
 
             let verifying_key_hex =
                 snapshot_verifying_key_hex(callback.as_ref(), &new_identity.identity_key).await;
+
+            // Drop the resolver's stale cached document so the next resolve
+            // serves the rotated `#active` key and rejects the retired one
+            // (AC[6]). The rotated document already landed at a higher BEP44
+            // `seq` in the shared DHT client via `dht.rotate` above.
+            invalidate_resolver_cache(&self.bi, &new_identity.did).await;
 
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
@@ -2576,6 +2692,7 @@ impl Identity {
                 callback_custody: self.callback_custody.clone(),
                 verifying_key_hex,
                 instance_id: self.instance_id,
+                bi: Arc::clone(&self.bi),
                 rotation_event_json: None,
                 // `rotate` (active-signing-key rotation) does NOT mint a new
                 // pre-rotation commitment, so the per-identity pre-rotation
@@ -2591,7 +2708,13 @@ impl Identity {
 
         #[cfg(feature = "allow_in_memory_custody")]
         if let Some(ref custody) = self.in_memory_custody {
-            let dht = make_dht_with_signer(custody)?;
+            let publish_client = rotation_publish_client(&self.bi)?;
+            let dht = make_dht_with_signer(custody, publish_client);
+            // Bootstrap the BEP44 sequence past the shared DHT's current record
+            // so the rotated document strictly overwrites it (see callback arm).
+            dht.initialize_sequence(&core_id.did)
+                .await
+                .map_err(ScpError::from)?;
             let (new_identity, new_document) = dht
                 .rotate(core_id, &custody.0)
                 .await
@@ -2599,6 +2722,11 @@ impl Identity {
 
             let verifying_key_hex =
                 snapshot_verifying_key_hex(&custody.0, &new_identity.identity_key).await;
+
+            // Drop the resolver's stale cached document so the next resolve
+            // serves the rotated `#active` key and rejects the retired one
+            // (AC[6]); see the callback-custody branch above.
+            invalidate_resolver_cache(&self.bi, &new_identity.did).await;
 
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
@@ -2609,6 +2737,7 @@ impl Identity {
                 callback_custody: None,
                 verifying_key_hex,
                 instance_id: self.instance_id,
+                bi: Arc::clone(&self.bi),
                 rotation_event_json: None,
                 // See note above: active-key rotation preserves the
                 // pre-rotation custody and handle.
@@ -2723,14 +2852,22 @@ impl Identity {
         let in_memory_custody = self.in_memory_custody.clone();
         let callback_custody = self.callback_custody.clone();
         let instance_id = self.instance_id;
+        let bi = Arc::clone(&self.bi);
         // Agent-key operations don't change the pre-rotation commitment
         // — preserve the existing handle and custody.
         let pre_rotation_handle = self.pre_rotation_handle;
         let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
-        let dht = make_dht_with_signer(&custody)?;
+        let publish_client = rotation_publish_client(&self.bi)?;
+        let dht = make_dht_with_signer(&custody, publish_client);
 
         runtime()
             .spawn(async move {
+                // Bootstrap the BEP44 sequence past the shared DHT's current
+                // record so the agent-key-bearing document strictly overwrites
+                // it (see rotate_key). Mirrors PyO3/NAPI.
+                dht.initialize_sequence(&did)
+                    .await
+                    .map_err(ScpError::from)?;
                 let (updated_identity, updated_doc) = dht
                     .add_agent_key(&identity_clone, &doc_clone, &*custody)
                     .await
@@ -2738,6 +2875,11 @@ impl Identity {
 
                 let verifying_key_hex =
                     snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
+
+                // Drop the resolver's stale cached document so the next resolve
+                // serves the new agent key (AC[6]). The updated document already
+                // landed at a higher BEP44 `seq` in the shared DHT client above.
+                invalidate_resolver_cache(&bi, &updated_identity.did).await;
 
                 let handle = Arc::new(Self {
                     did,
@@ -2749,6 +2891,7 @@ impl Identity {
                     callback_custody,
                     verifying_key_hex,
                     instance_id,
+                    bi,
                     rotation_event_json: None,
                     pre_rotation_handle,
                     pre_rotation_custody,
@@ -2814,14 +2957,22 @@ impl Identity {
         let in_memory_custody = self.in_memory_custody.clone();
         let callback_custody = self.callback_custody.clone();
         let instance_id = self.instance_id;
+        let bi = Arc::clone(&self.bi);
         // Agent-key operations don't change the pre-rotation commitment
         // — preserve the existing handle and custody.
         let pre_rotation_handle = self.pre_rotation_handle;
         let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
-        let dht = make_dht_with_signer(&custody)?;
+        let publish_client = rotation_publish_client(&self.bi)?;
+        let dht = make_dht_with_signer(&custody, publish_client);
 
         runtime()
             .spawn(async move {
+                // Bootstrap the BEP44 sequence past the shared DHT's current
+                // record so the agent-key-removed document strictly overwrites
+                // it (see rotate_key). Mirrors PyO3/NAPI.
+                dht.initialize_sequence(&did)
+                    .await
+                    .map_err(ScpError::from)?;
                 let (updated_identity, updated_doc) = dht
                     .remove_agent_key(&identity_clone, &doc_clone)
                     .await
@@ -2829,6 +2980,12 @@ impl Identity {
 
                 let verifying_key_hex =
                     snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
+
+                // Drop the resolver's stale cached document so the next resolve
+                // stops serving the removed agent key (AC[6]). The updated
+                // document already landed at a higher BEP44 `seq` in the shared
+                // DHT client above.
+                invalidate_resolver_cache(&bi, &updated_identity.did).await;
 
                 let handle = Arc::new(Self {
                     did,
@@ -2840,6 +2997,7 @@ impl Identity {
                     callback_custody,
                     verifying_key_hex,
                     instance_id,
+                    bi,
                     rotation_event_json: None,
                     pre_rotation_handle,
                     pre_rotation_custody,
@@ -2905,14 +3063,22 @@ impl Identity {
         let in_memory_custody = self.in_memory_custody.clone();
         let callback_custody = self.callback_custody.clone();
         let instance_id = self.instance_id;
+        let bi = Arc::clone(&self.bi);
         // Agent-key rotation doesn't change the pre-rotation commitment
         // — preserve the existing handle and custody.
         let pre_rotation_handle = self.pre_rotation_handle;
         let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
-        let dht = make_dht_with_signer(&custody)?;
+        let publish_client = rotation_publish_client(&self.bi)?;
+        let dht = make_dht_with_signer(&custody, publish_client);
 
         runtime()
             .spawn(async move {
+                // Bootstrap the BEP44 sequence past the shared DHT's current
+                // record so the rotated-agent-key document strictly overwrites
+                // it (see rotate_key). Mirrors PyO3/NAPI.
+                dht.initialize_sequence(&did)
+                    .await
+                    .map_err(ScpError::from)?;
                 let (updated_identity, updated_doc) = dht
                     .rotate_agent_key(&identity_clone, &doc_clone, &*custody)
                     .await
@@ -2920,6 +3086,12 @@ impl Identity {
 
                 let verifying_key_hex =
                     snapshot_verifying_key_hex(&*custody, &updated_identity.identity_key).await;
+
+                // Drop the resolver's stale cached document so the next resolve
+                // rejects the retired agent key (AC[6]). The updated document
+                // already landed at a higher BEP44 `seq` in the shared DHT
+                // client above.
+                invalidate_resolver_cache(&bi, &updated_identity.did).await;
 
                 let handle = Arc::new(Self {
                     did,
@@ -2931,6 +3103,7 @@ impl Identity {
                     callback_custody,
                     verifying_key_hex,
                     instance_id,
+                    bi,
                     rotation_event_json: None,
                     pre_rotation_handle,
                     pre_rotation_custody,
@@ -3903,13 +4076,16 @@ async fn identity_create_link_attestation_impl(
 
 /// Resolves a DID to its document.
 ///
-/// DID resolution uses a fresh `DidDht::new()` and reads zero per-instance
-/// state — it is a pure helper per ADR-048 §1.
+/// DID resolution builds the production DHT client fail-closed (via
+/// [`build_ffi_dht_client`]) and reads zero per-instance state — it is a pure
+/// helper per ADR-048 §1. The in-memory arm is reachable only under `testing`;
+/// a shipped build always resolves against the real Mainline Pkarr client
+/// (ADR-062 §Decision 1).
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
     runtime()
         .spawn(async move {
-            let did_method = DidDht::new();
+            let did_method = DidDht::with_client(Arc::new(build_ffi_dht_client()?));
             let document = did_method.resolve(&did).await.map_err(ScpError::from)?;
 
             Ok(DIDDocument {
@@ -8061,7 +8237,7 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
 
         runtime()
             .spawn(async move {
-                let did_dht = DidDht::new();
+                let did_dht = DidDht::with_client(Arc::new(build_ffi_dht_client()?));
                 let results = scp_core::discovery::resolve_contexts_from_did(&query, &did_dht)
                     .await
                     .map_err(|e| ScpError::Context {
@@ -8876,20 +9052,66 @@ fn ensure_did_resolver_initialized_on(
         return Ok(());
     }
 
-    let dht_client = Arc::new(new_ffi_dht_client!().map_err(ScpError::from)?);
-    let relay_querier = Arc::new(NoOpRelayQuerier);
-    let cache = Arc::new(DidCache::new());
-    let bootstrap_relays = Vec::new();
+    // Build the shared DHT client fail-closed (ADR-062 §Decision 1) and store
+    // it on the instance so `make_dht_with_signer` / `rotation_publish_client`
+    // and the freshly-minted-document publish step all see the SAME client the
+    // resolver reads from. Without a shared client, freshly minted identities
+    // are never resolvable and any DID-resolving verification (UCAN validation,
+    // governance vote verification) fails with "unknown voter". Retain the same
+    // cache `Arc` the resolver was built over so post-rotation re-publishes can
+    // invalidate the stale cached document.
+    //
+    // Atomic init (restores what the pre-slice `std::sync::Once` guaranteed):
+    // bind the resolver over the CANONICAL client AND cache — set each OnceLock
+    // if-unset, then RE-READ the winner — so a concurrent first-init on the same
+    // instance can never leave the stored resolver reading one client/cache while
+    // `dht_client()` / `resolver_cache()` (what `rotation_publish_client` and
+    // `invalidate_resolver_cache` target) return another. Every resolver ends up
+    // over the same shared client + cache the instance retains.
+    let candidate_client = Arc::new(build_ffi_dht_client()?);
+    bi.core.set_dht_client(Arc::clone(&candidate_client));
+    let dht_client = bi
+        .core
+        .dht_client()
+        .map(Arc::clone)
+        .unwrap_or(candidate_client);
+
+    let candidate_cache = Arc::new(DidCache::new());
+    bi.core.set_resolver_cache(Arc::clone(&candidate_cache));
+    let cache = bi
+        .core
+        .resolver_cache()
+        .map(Arc::clone)
+        .unwrap_or(candidate_cache);
 
     let resolver = Arc::new(DualLayerResolver::new(
-        relay_querier,
+        Arc::new(NoOpRelayQuerier),
         dht_client,
         cache,
-        bootstrap_relays,
+        Vec::new(),
     ));
 
     bi.set_did_resolver(resolver, handle);
     Ok(())
+}
+
+/// Drops the resolver's cached document for `did` after a higher-sequence
+/// re-publish (key rotation, agent-key add/rotate/remove, migration).
+///
+/// The per-instance `DualLayerResolver` caches resolved documents with a
+/// multi-day TTL and short-circuits on a cached hit without re-querying the
+/// DHT. Without this invalidation a freshly rotated identity keeps resolving to
+/// its pre-rotation document — and pre-rotation `#active` key — until the TTL
+/// expires, defeating rotation's revocation purpose. The rotation re-publish
+/// (higher BEP44 `seq`) has already landed in the shared DHT client
+/// (`rotation_publish_client`); this drops the resolver's stale copy so the
+/// next resolve reads the fresh document. Best-effort: a no-op when no resolver
+/// cache is wired on this instance.
+///
+/// Delegates to the shared [`BridgeInstanceCore::invalidate_resolver_cache`]
+/// (the single implementation of the invalidation body, shared across bridges).
+async fn invalidate_resolver_cache(bi: &crate::runtime::UniffiBridgeInstance, did: &str) {
+    bi.core.invalidate_resolver_cache(did).await;
 }
 
 use crate::scp::Scp;
@@ -9008,7 +9230,16 @@ impl Scp {
                                 |seed| InMemoryKeyCustody::from_seed_bytes(**seed),
                             );
                             let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
-                            let dht = DidDht::new();
+                            // Initialize the production DID resolver + shared DHT
+                            // client on this instance BEFORE minting so `create`
+                            // and the freshly-minted-document publish below run
+                            // against the SAME client the resolver reads from
+                            // (H4 — matching PyO3/NAPI behavior).
+                            ensure_did_resolver_initialized_on(
+                                &bi,
+                                tokio::runtime::Handle::current(),
+                            )?;
+                            let dht = DidDht::with_client(rotation_publish_client(&bi)?);
                             // Mint a fresh per-identity pre-rotation custody.
                             // ADR-003 §4b: the pre-rotation key lives in a
                             // separate substrate from operational
@@ -9025,14 +9256,6 @@ impl Scp {
                             let verifying_key_hex =
                                 snapshot_verifying_key_hex(&key_custody.0, &identity.identity_key).await;
 
-                            // Initialize the production DID resolver for UCAN
-                            // validation on this instance (H4 — matching
-                            // PyO3/NAPI behavior).
-                            ensure_did_resolver_initialized_on(
-                                &bi,
-                                tokio::runtime::Handle::current(),
-                            )?;
-
                             // Register the freshly created in-memory identity
                             // in the per-instance custody registry, keyed by DID,
                             // so `identity_remove_if_present` reports presence —
@@ -9048,6 +9271,18 @@ impl Scp {
                                 identity.active_signing_key,
                             )?;
 
+                            // Publish the freshly minted document into the shared
+                            // resolver DHT client so the DID is resolvable by
+                            // UCAN validation / governance vote verification
+                            // (mirrors PyO3/NAPI). Best-effort.
+                            publish_to_resolver_dht_for(
+                                &bi,
+                                &identity,
+                                &document,
+                                &key_custody.0,
+                            )
+                            .await;
+
                             let handle = Arc::new(Identity {
                                 did: identity.did.clone(),
                                 custody_type: CustodyMethod::InMemory,
@@ -9057,6 +9292,7 @@ impl Scp {
                                 callback_custody: None,
                                 verifying_key_hex,
                                 instance_id: bi.core.instance_id(),
+                                bi: Arc::clone(&bi),
                                 rotation_event_json: None,
                                 pre_rotation_handle,
                                 pre_rotation_custody,
@@ -9128,7 +9364,12 @@ impl Scp {
             .spawn(async move {
                 let callback_custody = Arc::new(CallbackKeyCustody::new(provider));
 
-                let dht = DidDht::new();
+                // Initialize the production DID resolver + shared DHT client on
+                // this instance BEFORE minting so `create` and the freshly-
+                // minted-document publish below run against the SAME client the
+                // resolver reads from (matching PyO3/NAPI behavior).
+                ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
+                let dht = DidDht::with_client(rotation_publish_client(&bi)?);
                 // Mint a fresh per-identity pre-rotation custody (ADR-003 §4b).
                 // Production callback custody integration is a follow-up
                 // workstream; in-memory custody is used here so the
@@ -9144,10 +9385,6 @@ impl Scp {
                 let verifying_key_hex =
                     snapshot_verifying_key_hex(callback_custody.as_ref(), &identity.identity_key)
                         .await;
-
-                // Initialize the production DID resolver for UCAN validation
-                // on this instance.
-                ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
 
                 // Register the freshly created callback-custody identity in the
                 // per-instance custody registry, keyed by DID, so the production
@@ -9165,6 +9402,12 @@ impl Scp {
                     identity.active_signing_key,
                 )?;
 
+                // Publish the freshly minted document into the shared resolver
+                // DHT client so the DID is resolvable by UCAN validation /
+                // governance vote verification (mirrors PyO3/NAPI). Best-effort.
+                publish_to_resolver_dht_for(&bi, &identity, &document, callback_custody.as_ref())
+                    .await;
+
                 let handle = Arc::new(Identity {
                     did: identity.did.clone(),
                     custody_type: CustodyMethod::Platform,
@@ -9175,6 +9418,7 @@ impl Scp {
                     callback_custody: Some(callback_custody),
                     verifying_key_hex,
                     instance_id: bi.core.instance_id(),
+                    bi: Arc::clone(&bi),
                     rotation_event_json: None,
                     pre_rotation_handle,
                     pre_rotation_custody,
@@ -9228,6 +9472,7 @@ impl Scp {
                     callback_custody: None,
                     verifying_key_hex: None,
                     instance_id: bi.core.instance_id(),
+                    bi: Arc::clone(&bi),
                     rotation_event_json: None,
                     pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
                     pre_rotation_custody,
@@ -16505,10 +16750,20 @@ impl Scp {
 
                     // `migrate_identity` calls `publish_document` for the old
                     // and new DID documents — both BEP44 puts require a
-                    // signing function bound to the identity custody.
+                    // signing function bound to the identity custody, published
+                    // into the SAME shared client the resolver reads from so
+                    // DID resolution follows the migration forward.
                     // `DidDht::new()` would surface
                     // "no signing function configured".
-                    let dht = make_dht_with_signer(kc)?;
+                    let publish_client = rotation_publish_client(&bi)?;
+                    let dht = make_dht_with_signer(kc, publish_client);
+                    // Bootstrap the BEP44 sequence from the OLD DID's current
+                    // record so the migration republish (old-DID `alsoKnownAs`
+                    // update + new-DID document) strictly overwrites it. Mirrors
+                    // PyO3 `run_migrate_publish`.
+                    dht.initialize_sequence(&old_did)
+                        .await
+                        .map_err(ScpError::from)?;
                     let scp_identity::MigrationOutcome {
                         new_identity,
                         new_document,
@@ -16549,12 +16804,21 @@ impl Scp {
                         callback_custody,
                         verifying_key_hex,
                         instance_id,
+                        bi: Arc::clone(&bi),
                         rotation_event_json: Some(rotation_event_json),
                         pre_rotation_handle: new_pre_rotation_handle,
                         pre_rotation_custody,
                     });
                     increment_handle_count();
                     let _ = has_agent; // suppress unused warning
+
+                    // Migration re-published BOTH documents at higher BEP44
+                    // sequences into the shared DHT client (the new DID's
+                    // document and the old DID's `alsoKnownAs` update). Drop both
+                    // stale cache entries so resolution follows the migration
+                    // forward instead of serving pre-migration docs (AC[6]).
+                    invalidate_resolver_cache(&bi, &old_did).await;
+                    invalidate_resolver_cache(&bi, &new_did).await;
 
                     // Migrate attestation and custody registries from old DID to
                     // new DID. The custody-registry block (now un-gated — the
@@ -16592,11 +16856,19 @@ impl Scp {
 
                     // `migrate_identity` calls `publish_document` for the old
                     // and new DID documents — both BEP44 puts require a
-                    // signing function bound to the identity custody.
+                    // signing function bound to the identity custody, published
+                    // into the SAME shared client the resolver reads from.
                     // `DidDht::new()` (sign_fn: None) would surface
                     // "no signing function configured"; mirror the in-memory
                     // branch above.
-                    let dht = make_dht_with_signer(cc)?;
+                    let publish_client = rotation_publish_client(&bi)?;
+                    let dht = make_dht_with_signer(cc, publish_client);
+                    // Bootstrap the BEP44 sequence from the OLD DID's current
+                    // record so the migration republish strictly overwrites it
+                    // (see the in-memory branch). Mirrors PyO3 `run_migrate_publish`.
+                    dht.initialize_sequence(&old_did)
+                        .await
+                        .map_err(ScpError::from)?;
                     let scp_identity::MigrationOutcome {
                         new_identity,
                         new_document,
@@ -16633,11 +16905,20 @@ impl Scp {
                         callback_custody: Some(Arc::clone(cc)),
                         verifying_key_hex,
                         instance_id,
+                        bi: Arc::clone(&bi),
                         rotation_event_json: Some(rotation_event_json),
                         pre_rotation_handle: new_pre_rotation_handle,
                         pre_rotation_custody,
                     });
                     increment_handle_count();
+
+                    // Migration re-published BOTH documents at higher BEP44
+                    // sequences into the shared DHT client (the new DID's
+                    // document and the old DID's `alsoKnownAs` update). Drop both
+                    // stale cache entries so resolution follows the migration
+                    // forward instead of serving pre-migration docs (AC[6]).
+                    invalidate_resolver_cache(&bi, &old_did).await;
+                    invalidate_resolver_cache(&bi, &new_did).await;
 
                     // Migrate attestation and custody registries from old DID to
                     // new DID. The custody-registry block (now un-gated — the
@@ -16712,7 +16993,15 @@ impl Scp {
                         {
                             let key_custody =
                                 Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
-                            let dht = DidDht::new();
+                            // Initialize the production DID resolver + shared DHT
+                            // client BEFORE minting so `create_with_agent_key`
+                            // and the freshly-minted-document publish below run
+                            // against the SAME client the resolver reads from.
+                            ensure_did_resolver_initialized_on(
+                                &bi,
+                                tokio::runtime::Handle::current(),
+                            )?;
+                            let dht = DidDht::with_client(rotation_publish_client(&bi)?);
                             // Fresh per-identity pre-rotation custody (ADR-003 §4b).
                             let pre_rotation_custody =
                                 Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -16729,13 +17018,6 @@ impl Scp {
                                 snapshot_verifying_key_hex(&key_custody.0, &identity.identity_key)
                                     .await;
 
-                            // Initialize the production DID resolver for UCAN
-                            // validation on this instance.
-                            ensure_did_resolver_initialized_on(
-                                &bi,
-                                tokio::runtime::Handle::current(),
-                            )?;
-
                             // Register the freshly created in-memory identity
                             // in the per-instance custody registry, keyed by DID,
                             // so `identity_remove_if_present` reports presence —
@@ -16751,6 +17033,12 @@ impl Scp {
                                 identity.active_signing_key,
                             )?;
 
+                            // Publish the freshly minted document into the shared
+                            // resolver DHT client so the DID is resolvable
+                            // (mirrors PyO3/NAPI). Best-effort.
+                            publish_to_resolver_dht_for(&bi, &identity, &document, &key_custody.0)
+                                .await;
+
                             let handle = Arc::new(Identity {
                                 did: identity.did.clone(),
                                 custody_type: CustodyMethod::InMemory,
@@ -16760,6 +17048,7 @@ impl Scp {
                                 callback_custody: None,
                                 verifying_key_hex,
                                 instance_id: bi.core.instance_id(),
+                                bi: Arc::clone(&bi),
                                 rotation_event_json: None,
                                 pre_rotation_handle,
                                 pre_rotation_custody,
@@ -19512,6 +19801,7 @@ mod tests {
             callback_custody: None,
             verifying_key_hex: None,
             instance_id,
+            bi: Arc::clone(&scp.inner),
             rotation_event_json: None,
             pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
             pre_rotation_custody,
@@ -22547,6 +22837,7 @@ mod tests {
             callback_custody: None,
             verifying_key_hex: live.verifying_key_hex.clone(),
             instance_id: live.instance_id,
+            bi: Arc::clone(&live.bi),
             rotation_event_json: None,
             pre_rotation_handle: live.pre_rotation_handle,
             pre_rotation_custody: Arc::clone(&live.pre_rotation_custody),
@@ -22593,8 +22884,12 @@ mod tests {
 
         // The fix under test: a DHT whose BEP44 signer is bound to the callback
         // custody. `DidDht::new()` (the pre-fix construct) would leave
-        // `sign_fn: None` and fail every publish below.
-        let dht = make_dht_with_signer(&callback).expect("make_dht_with_signer over callback");
+        // `sign_fn: None` and fail every publish below. A single in-memory
+        // client is used so `create`/`publish`/`rotate` round-trip in-process.
+        let dht = make_dht_with_signer(
+            &callback,
+            Arc::new(FfiDhtClient::InMemory(InMemoryDhtClient::new())),
+        );
 
         let (identity, document, _pre_handle) = dht
             .create(callback.as_ref(), pre_rotation_custody.as_ref())
@@ -22654,35 +22949,92 @@ mod tests {
     /// therefore cannot return `Ok` here regardless of the signer fix — full
     /// round-trip integration is a cross-process / relay-backed E2E concern.
     ///
-    /// Because the failure originates at the resolve stage (which runs ahead of
-    /// the signer-bearing publish), this test CANNOT distinguish the
-    /// `DidDht::new()` regression from the fix:
-    /// a `"no signing function configured"` assertion here would be vacuous.
-    /// The signer-regression guard lives in
-    /// `rotate_key_signer_is_wired_over_callback_custody`, which reaches
-    /// `publish_document` directly on a single shared `DidDht`. This test only
-    /// pins that the public op wires through to the resolve stage and surfaces
-    /// `DhtNotFound`.
+    /// `rotate_key` over callback (Secure Enclave / Android Keystore) custody
+    /// now round-trips end-to-end (ADR-062 §Decision 1): `identity_create_with_custody`
+    /// publishes the freshly minted document into the per-instance SHARED DHT
+    /// client, and `rotate_key` reads/re-publishes through that SAME client
+    /// (via `rotation_publish_client`) with a bootstrapped BEP44 sequence — so
+    /// its resolve stage finds the create-time document and rotation succeeds.
+    ///
+    /// Before the shared-client fix, `rotate_key` built a throwaway per-op DHT
+    /// whose resolve stage could never see the create-time publish, so this
+    /// path failed with `DhtNotFound`. This test now pins the corrected
+    /// behavior: rotation succeeds, preserving the DID and the identity key
+    /// `#0` while installing a fresh `#active` key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rotate_key_over_callback_custody_advances_past_signer_guard() {
+    async fn rotate_key_over_callback_custody_round_trips_via_shared_dht() {
         let scp = scp_test();
         let identity = scp
             .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
             .await
             .expect("identity_create_with_custody");
+        let pre_did = identity.did();
 
-        let Err(err) = Arc::clone(&identity).rotate_key().await else {
-            panic!(
-                "rotate_key cannot round-trip in the per-op in-memory DHT harness; \
-                 a successful result would mean the test DHT now shares state \
-                 cross-instance — revisit this assertion"
-            )
-        };
-        let err_str = err.to_string();
+        let rotated = Arc::clone(&identity)
+            .rotate_key()
+            .await
+            .expect("rotate_key must round-trip over the per-instance shared DHT");
+
+        assert_eq!(
+            rotated.did(),
+            pre_did,
+            "active-key rotation must preserve the DID string"
+        );
+    }
+
+    /// AC[6]: `rotate_key` drops the resolver's cached pre-rotation document so
+    /// the next resolution serves the rotated `#active` key, not the stale one.
+    ///
+    /// The `DualLayerResolver` short-circuits on a cached hit within TTL without
+    /// re-querying the DHT. `rotate_key` re-publishes the rotated document (a
+    /// higher BEP44 `seq`) into the shared DHT client AND calls
+    /// `invalidate_resolver_cache` on the SAME cache the resolver reads from
+    /// (retained by `ensure_did_resolver_initialized_on`). This test seeds that
+    /// cache with the pre-rotation document (modelling a prior resolution), runs
+    /// the real bridge rotation op, and asserts the cached entry is gone — so a
+    /// subsequent resolve re-queries the DHT and serves the new key. Without the
+    /// invalidation the resolver would keep serving the pre-rotation document
+    /// (and its retired `#active` key) for the multi-day cache TTL, silently
+    /// defeating rotation's revocation purpose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotate_key_invalidates_resolver_cache() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+            .await
+            .expect("identity_create_with_custody");
+        let did = identity.did();
+        let bi = Arc::clone(&identity.bi);
+
+        // Model a prior resolution that cached the pre-rotation document in the
+        // SAME cache the resolver reads from (the one the bridge retained in
+        // `ensure_did_resolver_initialized_on`).
+        let cache = bi
+            .core
+            .resolver_cache()
+            .expect("identity_create must initialize the resolver cache")
+            .clone();
+        let pre_doc = identity
+            .core_document
+            .clone()
+            .expect("created identity retains its DID document");
+        cache.insert(&did, pre_doc, 1).await;
         assert!(
-            err_str.contains("not found on DHT") || err_str.contains("DID not found"),
-            "rotate_key must fail at the resolve stage (DhtNotFound) in the \
-             per-op in-memory DHT harness; got: {err_str}"
+            cache.get(&did).await.is_some(),
+            "pre-condition: the pre-rotation document is cached"
+        );
+
+        // The real bridge rotation op re-publishes at a higher seq into the
+        // shared client and MUST invalidate the resolver's cached copy.
+        let _rotated = Arc::clone(&identity)
+            .rotate_key()
+            .await
+            .expect("rotate_key must round-trip over the per-instance shared DHT");
+
+        assert!(
+            cache.get(&did).await.is_none(),
+            "rotate_key must drop the stale cached document so the next resolve \
+             serves the rotated #active key (AC[6])"
         );
     }
 
@@ -23270,32 +23622,33 @@ mod tests {
         /// document into the SAME store the supervisor's governance key resolver
         /// reads from.
         ///
-        /// Why this is test scaffolding, not a production gap masked: the `UniFFI`
-        /// bridge's `ensure_did_resolver_initialized_on` builds its resolver over a
-        /// FRESH, unretained `InMemoryDhtClient` and `identity_create` publishes the
-        /// minted document only to a throwaway local `DidDht` — in a unit harness
-        /// the bridge op "builds a fresh DHT per call, so its `resolve_did` cannot
-        /// see the create-time publish" (see `rotate_key_signer_is_wired_over_callback_custody`).
-        /// The cross-process E2E covers the wired path. To drive a REAL `Committed`
-        /// terminal in-crate — which requires the supervisor to resolve the
-        /// proposer's published key for governance vote verification — the test must
-        /// itself seed the document into a resolver-visible store, exactly the
-        /// `publish_to_resolver_dht_for` step the PyO3/NAPI production
-        /// `identity_create` performs. Installing the resolver BEFORE the first
-        /// identity creation makes `ensure_did_resolver_initialized_on` a no-op
-        /// (it skips when a resolver is already present), so this client is the one
-        /// the supervisor snapshots.
+        /// The single [`FfiDhtClient::InMemory`] built here is installed as BOTH
+        /// the resolver's DHT client AND on the instance's `dht_client` /
+        /// `resolver_cache` slots — the exact wiring
+        /// `ensure_did_resolver_initialized_on` performs in production — so
+        /// `identity_create`'s `publish_to_resolver_dht_for` step (and any later
+        /// rotate/agent-key re-publish, which reads the client via
+        /// `rotation_publish_client`) lands in the same store this seed helper
+        /// and the supervisor's governance key resolver read from. Installing the
+        /// resolver BEFORE the first identity creation makes
+        /// `ensure_did_resolver_initialized_on` a no-op (it skips when a resolver
+        /// is already present), so this client is the one the supervisor snapshots.
         fn install_seedable_resolver(
             bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-        ) -> Arc<scp_dht::InMemoryDhtClient> {
-            let dht_client = Arc::new(scp_dht::InMemoryDhtClient::new());
+        ) -> Arc<scp_ffi_common::dht::FfiDhtClient> {
+            let dht_client = Arc::new(scp_ffi_common::dht::FfiDhtClient::InMemory(
+                scp_dht::InMemoryDhtClient::new(),
+            ));
+            let cache = Arc::new(scp_identity::DidCache::new());
             let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
                 Arc::new(scp_identity::resolver::NoOpRelayQuerier),
                 Arc::clone(&dht_client),
-                Arc::new(scp_identity::DidCache::new()),
+                Arc::clone(&cache),
                 Vec::new(),
             ));
             bi.set_did_resolver(resolver, tokio::runtime::Handle::current());
+            bi.core.set_dht_client(Arc::clone(&dht_client));
+            bi.core.set_resolver_cache(cache);
             dht_client
         }
 
@@ -23306,7 +23659,7 @@ mod tests {
         /// key during single-admin vote verification.
         async fn seed_owner_document_into_resolver(
             owner_identity: &Identity,
-            dht_client: &Arc<scp_dht::InMemoryDhtClient>,
+            dht_client: &Arc<scp_ffi_common::dht::FfiDhtClient>,
         ) {
             use scp_dht::DhtClient as _;
             use scp_platform::traits::KeyCustody as _;

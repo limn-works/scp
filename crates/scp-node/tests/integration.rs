@@ -860,6 +860,11 @@ async fn scenario8_projection_endpoints_coexist_with_well_known() {
 /// Verifies that `ApplicationNode::dev(port)` creates a fully functional node
 /// with in-memory storage, auto-generated DID identity, self-signed TLS, and
 /// a relay bound to localhost.
+///
+/// `ApplicationNode::dev` is a test-harness constructor (in-memory DHT nullifier)
+/// gated behind `feature = "testing"` (ADR-062 §Decision 1), so this test runs
+/// only in the testing lane (`cargo test -p scp-node --features testing`).
+#[cfg(feature = "testing")]
 #[tokio::test]
 async fn dev_constructor_creates_working_node() {
     use scp_node::ApplicationNode;

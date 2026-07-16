@@ -52,9 +52,21 @@ impl From<ServerError> for ScpError {
                 msg: user_msg,
                 code: codes::CTX_2052.to_owned(),
             },
-            ServerError::MissingPassphrase => Self::Validation {
+            // Both are actionable configuration errors surfaced as validation
+            // failures: a missing SQLCipher passphrase, and relay-identity
+            // auto-generation being unavailable in this (non-dev) build.
+            ServerError::MissingPassphrase | ServerError::AutoGenerateUnavailable => {
+                Self::Validation {
+                    msg: user_msg,
+                    code: codes::VALID_7004.to_owned(),
+                }
+            }
+            // The node's production DHT client could not be built (fail-closed,
+            // ADR-062 §Decision 1) — surfaced as an identity/DID-resolution
+            // error since the DHT backs DID resolution.
+            ServerError::DhtInit(_) => Self::Identity {
                 msg: user_msg,
-                code: codes::VALID_7004.to_owned(),
+                code: codes::IDENT_1001.to_owned(),
             },
         }
     }
@@ -619,7 +631,6 @@ pub(crate) async fn relay_start_local_on(
 #[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::type_complexity)]
 fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity, ScpError> {
-    use scp_dht::InMemoryDhtClient;
     use scp_ffi_common::server::ConcreteDidMethod;
     use scp_identity::{DidCache, IdentityError};
     use scp_platform::traits::KeyCustody;
@@ -675,7 +686,16 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
         })
     });
 
-    let dht_client = Arc::new(InMemoryDhtClient::new());
+    // Source the shared per-instance DHT client the identity was minted against
+    // (the one its DID document was published into by `identity_create`), so the
+    // node's DID method resolves against the SAME store — never a throwaway
+    // in-memory client. Falls back to the fail-closed production client if the
+    // instance somehow has none (ADR-062 §Decision 1). The shipped client is the
+    // real Mainline Pkarr client; the in-memory arm exists only under `testing`.
+    let dht_client = match id.bi.core.dht_client() {
+        Some(client) => Arc::clone(client),
+        None => Arc::new(crate::bridge::build_ffi_dht_client()?),
+    };
     let cache = Arc::new(DidCache::new());
     let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
         dht_client, cache, sign_fn,

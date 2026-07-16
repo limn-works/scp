@@ -35,7 +35,7 @@ server = ["scp-ffi-common/server", "dep:scp-node"]
 # Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
 # be enabled in production mobile builds; the parity harness (ADR-046)
 # enables it.
-testing = ["scp-core/testing"]
+testing = ["scp-core/testing", "scp-dht/testing", "scp-ffi-common/testing"]
 # §5.4.5 streaming-outlet live-flow test seam (SCP-OUT-037, C8b). Enables
 # `Supervisor::test_grant_member_capability` — an AUTHORITY-ESCALATION primitive
 # deliberately NOT folded into `testing` (which leaks into every
@@ -91,6 +91,16 @@ z-base-32 = { workspace = true }
 [dev-dependencies]
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+# Test seams (`install_seedable_resolver`) construct
+# `FfiDhtClient::InMemory(..)`, whose arm is gated behind
+# `scp-ffi-common/testing`; enable it for this crate's test build. The normal
+# dep (below) carries `custody`; the test build unifies to `custody` + `testing`.
+scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
+# Tests / test seams construct `FfiDhtClient::InMemory(InMemoryDhtClient::new())`,
+# which is gated behind `scp-dht/testing`; activate it for this crate's test
+# build (ADR-062 §Decision 1). `scp-dht/testing` never appears in a non-testing
+# feature list.
+scp-dht = { path = "../../scp-dht", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
 tempfile = "3"

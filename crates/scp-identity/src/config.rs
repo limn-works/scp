@@ -34,10 +34,14 @@
 //! # The pattern (construction.md §Identity)
 //!
 //! ```ignore
+//! // The DID method carries an explicit DHT client — production names a real
+//! // `PkarrDhtClient`; the in-memory arm shown here is test/testing-only.
+//! let method = DidDht::with_client(Arc::new(pkarr_client));
+//!
 //! // Ephemeral identity — no key material at rest (the fail-safe default, M2):
 //! let (identity, document, pre_rotation) =
 //!     Identity::create_ephemeral(IdentityConfig::ephemeral(
-//!         DidDht::new(),
+//!         method,
 //!         InMemoryKeyCustody::new(),
 //!     ))
 //!     .await?;
@@ -45,7 +49,7 @@
 //! // Persisted identity — encrypted-only (the EncryptedStorage seal):
 //! let (identity, document, pre_rotation) =
 //!     Identity::create(IdentityConfig {
-//!         method: DidDht::new(),
+//!         method: DidDht::with_client(Arc::new(pkarr_client)),
 //!         custody: InMemoryKeyCustody::new(),
 //!         persistence: Some(encrypted_storage), // S: EncryptedStorage
 //!     })
@@ -415,6 +419,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+    use scp_dht::InMemoryDhtClient;
     use scp_platform::encrypting_adapter::EncryptingAdapter;
     use scp_platform::in_memory::InMemoryStorage;
     use scp_platform::testing::InMemoryKeyCustody;
@@ -442,11 +447,13 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_create_produces_valid_did_dht() {
-        let (identity, document, _pre_rotation) = Identity::create_ephemeral(
-            IdentityConfig::ephemeral(crate::DidDht::new(), InMemoryKeyCustody::new()),
-        )
-        .await
-        .expect("ephemeral identity creation should succeed");
+        let (identity, document, _pre_rotation) =
+            Identity::create_ephemeral(IdentityConfig::ephemeral(
+                crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
+                InMemoryKeyCustody::new(),
+            ))
+            .await
+            .expect("ephemeral identity creation should succeed");
 
         assert_valid_did_dht(&identity.did);
         // The document's id is the same DID the identity reports.
@@ -459,7 +466,7 @@ mod tests {
         // ephemeral path; it must produce the same well-formed identity as the
         // `ephemeral` convenience constructor.
         let (identity, _document, _pre_rotation) = Identity::create_ephemeral(IdentityConfig {
-            method: crate::DidDht::new(),
+            method: crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
             custody: InMemoryKeyCustody::new(),
             persistence: None::<NoPersistence>,
         })
@@ -474,7 +481,7 @@ mod tests {
         let storage = encrypted_test_storage();
 
         let (identity, document, _pre_rotation) = Identity::create(IdentityConfig {
-            method: crate::DidDht::new(),
+            method: crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
             custody: InMemoryKeyCustody::new(),
             persistence: Some(Arc::clone(&storage)),
         })
@@ -510,11 +517,13 @@ mod tests {
         // negative by constructing a storage that is NOT handed to the config,
         // then confirming the ephemeral path returns without ever touching it.
         let untouched = encrypted_test_storage();
-        let (identity, _document, _pre_rotation) = Identity::create_ephemeral(
-            IdentityConfig::ephemeral(crate::DidDht::new(), InMemoryKeyCustody::new()),
-        )
-        .await
-        .expect("ephemeral identity creation should succeed");
+        let (identity, _document, _pre_rotation) =
+            Identity::create_ephemeral(IdentityConfig::ephemeral(
+                crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
+                InMemoryKeyCustody::new(),
+            ))
+            .await
+            .expect("ephemeral identity creation should succeed");
 
         let key = identity_document_key(&identity.did).expect("key build should succeed");
         assert!(
@@ -532,8 +541,14 @@ mod tests {
     /// ephemeral path can never carry a storage value.
     #[test]
     fn no_persistence_is_uninhabited() {
-        let config: IdentityConfig<InMemoryKeyCustody, crate::DidDht, NoPersistence> =
-            IdentityConfig::ephemeral(crate::DidDht::new(), InMemoryKeyCustody::new());
+        let config: IdentityConfig<
+            InMemoryKeyCustody,
+            crate::DidDht<InMemoryDhtClient>,
+            NoPersistence,
+        > = IdentityConfig::ephemeral(
+            crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
+            InMemoryKeyCustody::new(),
+        );
         assert!(
             config.persistence.is_none(),
             "ephemeral config must carry no persistence"
@@ -577,11 +592,13 @@ mod tests {
     /// envelope shape even before the cross-crate round-trip test runs.
     #[tokio::test]
     async fn serialize_document_produces_stored_value_envelope() {
-        let (_identity, document, _pre_rotation) = Identity::create_ephemeral(
-            IdentityConfig::ephemeral(crate::DidDht::new(), InMemoryKeyCustody::new()),
-        )
-        .await
-        .expect("ephemeral identity creation should succeed");
+        let (_identity, document, _pre_rotation) =
+            Identity::create_ephemeral(IdentityConfig::ephemeral(
+                crate::DidDht::with_client(Arc::new(InMemoryDhtClient::new())),
+                InMemoryKeyCustody::new(),
+            ))
+            .await
+            .expect("ephemeral identity creation should succeed");
 
         let bytes = serialize_document(&document).expect("serialization should succeed");
 

@@ -32,7 +32,13 @@ server = ["scp-ffi-common/server", "dep:scp-node"]
 # production bridge builds — the override lets callers pin `signed_at` to
 # an arbitrary value within the challenge window, which is a parity-test
 # construct, not a protocol feature.
-testing = ["scp-core/testing"]
+# `scp-dht/testing` compiles the `InMemoryDhtClient` §17.17.3 nullifier and
+# `scp-ffi-common/testing` exposes the `FfiDhtClient::InMemory` arm the bridge's
+# test seams construct. Forwarded here (never in `default`/`server`) so the
+# testing-gated DHT seam compiles from this feature alone, without relying on
+# dev-dependency feature unification. INVARIANT: `scp-dht/testing` appears ONLY
+# inside a `testing = [...]` list (ADR-062 §Decision 1).
+testing = ["scp-core/testing", "scp-dht/testing", "scp-ffi-common/testing"]
 # Forwards the non-leaking capability-escalation test seam feature so the
 # outlet-stream live-flow e2e test can authorize a member invoker. Deliberately
 # NOT implied by `testing` / `allow_in_memory_custody` (see
@@ -47,7 +53,10 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
-scp-dht = { path = "../scp-dht" }
+# The real Mainline DHT backend (PkarrDhtClient) is compiled unconditionally —
+# it is the single shipped backend (ADR-062 §Decision 1). `production-dht` is
+# NOT test-gated: it must be present in the shipped graph.
+scp-dht = { path = "../scp-dht", features = ["production-dht"] }
 scp-clock = { path = "../scp-clock" }
 scp-did = { path = "../scp-did" }
 scp-event-log = { path = "../scp-event-log" }
@@ -79,6 +88,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-ffi-common = { path = "common", features = ["testing", "custody"] }
 # Tests need InMemoryKeyCustody.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+# Tests construct `InMemoryDhtClient` directly (the §17.17.3 DHT nullifier) via
+# the `FfiDhtClient::InMemory` test seam. `features = ["testing"]` (no
+# slash-string in a feature list) is fine per the ADR-062 §Decision 1 invariant.
+scp-dht = { path = "../scp-dht", features = ["testing"] }
 tempfile = "3"
 
 [[test]]

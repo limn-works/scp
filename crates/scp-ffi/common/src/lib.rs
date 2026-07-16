@@ -195,3 +195,10 @@ pub mod test_helpers;
 // Requires scp-transport, scp-node, scp-platform, tokio.
 #[cfg(feature = "server")]
 pub mod server;
+
+// Shared DHT client for all FFI bridges (ADR-062 §Decision 1). `scp-dht` is a
+// non-optional dependency compiled with `production-dht`, so the real
+// `PkarrDhtClient` — and therefore `FfiDhtClient` — is always available; the
+// in-memory nullifier arm is `testing`-gated. Unconditional so every bridge
+// shares one DHT type regardless of which feature set it enables.
+pub mod dht;

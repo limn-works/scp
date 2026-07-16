@@ -20,7 +20,12 @@ async-trait = { workspace = true }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
 scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
-scp-dht = { path = "../scp-dht" }
+# NORMAL testing edge (not dev-dep): `helpers.rs` uses `InMemoryDhtClient` /
+# `TestDidDht` at LIB level (this whole crate is a test harness), mirroring its
+# existing normal `scp-platform/testing` edge. `scp-dht/testing` gates the
+# in-memory DHT nullifier; it never appears in a non-testing feature list
+# (ADR-062 §Decision 1).
+scp-dht = { path = "../scp-dht", features = ["testing"] }
 scp-clock = { path = "../scp-clock" }
 scp-did = { path = "../scp-did" }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }

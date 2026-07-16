@@ -44,8 +44,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use scp_clock::Clock;
-use scp_dht::InMemoryDhtClient;
 use scp_did::DidDocument;
+// Production DHT construction (real fail-closed Pkarr) and the `testing`
+// in-memory seam are both encapsulated in the single cfg-gated
+// `scp_ffi_common::dht::build_ffi_dht_client`; this bridge only maps its error.
+use scp_ffi_common::dht::FfiDhtClient;
 use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier, ScpIdentity};
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
@@ -59,29 +62,56 @@ use crate::validate;
 
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
+/// Builds the shared [`FfiDhtClient`] for this bridge instance, **failing
+/// closed**.
+///
+/// Delegates to the single cfg-gated [`scp_ffi_common::dht::build_ffi_dht_client`]
+/// (shared by all three bridges) and maps its [`DhtInitError`] to a `ScpPyError`.
+/// A shipped (non-`testing`) build constructs the real Mainline Pkarr client; a
+/// malformed gateway or a Mainline build failure surfaces as the dedicated
+/// `IDENT_1058` DHT-init-failure code (distinct from the generic `IDENT_1001`),
+/// never an in-memory or no-op substitute (ADR-062 §Decision 1 / spec §17.17.3).
+/// The in-memory arm is reachable only through the common test seam under
+/// `testing`.
+pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpPyError> {
+    scp_ffi_common::dht::build_ffi_dht_client().map_err(|e| {
+        ScpPyError::identity_with_code(
+            format!("failed to initialize production DHT client for DID resolution: {e}"),
+            scp_ffi_common::error_codes::IDENT_1058,
+        )
+    })
+}
+
 /// Ensures the given bridge instance's production DID resolver is initialized.
 ///
-/// Creates a `DualLayerResolver` backed by `InMemoryDhtClient` and
-/// `NoOpRelayQuerier` (relay resolution will be upgraded when a production
-/// relay querier is available). The resolver is shared across all UCAN
-/// validation and attestation verification calls on the same bridge.
+/// Creates a `DualLayerResolver` backed by the shared [`FfiDhtClient`] (the
+/// real Mainline Pkarr client in a shipped build, or the in-memory test seam
+/// under `testing`) and `NoOpRelayQuerier` (relay resolution will be upgraded
+/// when a production relay querier is available). The resolver is shared across
+/// all UCAN validation and attestation verification calls on the same bridge.
 ///
 /// This is idempotent: subsequent calls are no-ops.
 ///
-/// See #311 for the DID resolver unification design.
-fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runtime::Handle) {
+/// Fails closed: when the production DHT client cannot be built, this returns
+/// the [`DhtInitError`](scp_ffi_common::dht::DhtInitError)-derived
+/// [`ScpPyError`] rather than substituting a nullifier.
+///
+/// See #311 for the DID resolver unification design and ADR-062 §Decision 1.
+fn ensure_did_resolver_initialized_on(
+    bi: &PyBridgeInstance,
+    handle: tokio::runtime::Handle,
+) -> Result<(), ScpPyError> {
     if crate::runtime::did_resolver(bi).is_some() {
-        return;
+        return Ok(());
     }
 
     // Retain the DHT client on the instance so `identity_create` can publish
-    // freshly minted in-memory DID documents into the SAME client the resolver
-    // reads from. Without a shared client, in-memory identities are never
+    // freshly minted DID documents into the SAME client the resolver reads
+    // from. Without a shared client, freshly minted identities are never
     // resolvable and any DID-resolving verification (UCAN validation,
-    // governance vote verification) fails with "unknown voter". This mirrors
-    // the NAPI bridge's shared-DHT publish design, scoped per-instance
-    // to match where the resolver itself is stored.
-    let dht_client = Arc::new(InMemoryDhtClient::new());
+    // governance vote verification) fails with "unknown voter". Scoped
+    // per-instance to match where the resolver itself is stored.
+    let dht_client = Arc::new(build_ffi_dht_client()?);
     let relay_querier = Arc::new(NoOpRelayQuerier);
     let cache = Arc::new(DidCache::new());
     let bootstrap_relays = Vec::new();
@@ -99,6 +129,27 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
     // re-publishes can invalidate the stale cached document (see
     // `invalidate_resolver_cache`).
     crate::runtime::set_resolver_cache(bi, cache);
+    Ok(())
+}
+
+/// Builds a [`DidDht`] over the instance's shared DHT client, for **minting**
+/// (`create`) and **resolution** alike.
+///
+/// Both paths use the shared per-instance client (the one
+/// `identity_create`/rotation published into) when the resolver is initialized,
+/// and otherwise build the production client fail-closed via
+/// [`build_ffi_dht_client`]. Never substitutes an in-memory/no-op client on a
+/// shipped path. The returned method has no `sign_fn` — that is fine for
+/// `create` (which does not publish; publishing is a separate
+/// [`publish_to_resolver_dht_for`] step) and for `resolve` (which never signs).
+fn shared_did_method(
+    bi: &PyBridgeInstance,
+) -> Result<DidDht<FfiDhtClient, scp_clock::SystemClock>, ScpPyError> {
+    let client = match crate::runtime::resolver_dht_client(bi) {
+        Some(client) => client,
+        None => Arc::new(build_ffi_dht_client()?),
+    };
+    Ok(DidDht::with_client(client))
 }
 
 /// Publishes a newly created in-memory DID document into the instance's
@@ -194,14 +245,24 @@ async fn publish_to_resolver_dht_for(
 /// permanently serving the stale, pre-rotation document, silently defeating
 /// rotation's revocation purpose.
 ///
-/// Returns the shared resolver client when the resolver is initialized on this
-/// instance. When it is not (e.g. before any `identity_create`, or in a
-/// bridge configuration without DID resolution), there is nothing to keep in
-/// sync, so a fresh in-memory client is returned: the in-place document update
-/// in the registry still happens, and no stale state can be served because no
-/// resolver exists.
-fn rotation_publish_client(bi: &PyBridgeInstance) -> Arc<InMemoryDhtClient> {
-    crate::runtime::resolver_dht_client(bi).unwrap_or_else(|| Arc::new(InMemoryDhtClient::new()))
+/// Returns the shared resolver client. Rotation / agent-key / migration
+/// operations only run against an identity already in the registry, which is
+/// only populated by `identity_create` — and `identity_create` initializes the
+/// resolver DHT client first. So by the time any re-publish runs, the shared
+/// client is always present.
+///
+/// Fails closed if the client is somehow absent: fabricating a throwaway
+/// in-memory client would let the re-published document land somewhere the
+/// resolver never reads, silently defeating rotation's revocation purpose (and,
+/// in a shipped build, the in-memory arm does not even exist). A typed error is
+/// strictly better than a lie.
+fn rotation_publish_client(bi: &PyBridgeInstance) -> Result<Arc<FfiDhtClient>, ScpPyError> {
+    crate::runtime::resolver_dht_client(bi).ok_or_else(|| {
+        ScpPyError::identity(
+            "DID resolver DHT client is not initialized on this instance — \
+             create an identity (identity_create) before publishing document updates",
+        )
+    })
 }
 
 /// Runs the migration publish chain against the SHARED resolver DHT client.
@@ -229,8 +290,8 @@ where
     C: KeyCustody + Send + Sync + 'static,
 {
     let sign_fn =
-        DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(Arc::clone(key_custody));
-    let publish_client = rotation_publish_client(bi);
+        DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(Arc::clone(key_custody));
+    let publish_client = rotation_publish_client(bi)?;
     let did_method =
         DidDht::with_client_and_signer(publish_client, Arc::new(DidCache::new()), sign_fn);
     did_method
@@ -975,11 +1036,11 @@ impl crate::scp::PyScp {
 
         // Ensure the production DID resolver is initialized on this bridge
         // (idempotent). #311.
-        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone()).map_err(PyErr::from)?;
 
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = DidDht::new();
+                let did_method = shared_did_method(&bi_arc)?;
                 // Mint a fresh per-identity pre-rotation custody. ADR-003
                 // §4b: the pre-rotation key lives in a separate substrate
                 // from operational `key_custody`. The same `Arc` is
@@ -1083,11 +1144,11 @@ impl crate::scp::PyScp {
 
         // Ensure the production DID resolver is initialized on this bridge
         // (idempotent). #311.
-        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone()).map_err(PyErr::from)?;
 
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = DidDht::new();
+                let did_method = shared_did_method(&bi_arc)?;
                 // Fresh per-identity pre-rotation custody (see
                 // `identity_create` for rationale).
                 let pre_rotation_custody =
@@ -1211,7 +1272,7 @@ impl crate::scp::PyScp {
 
         // Ensure the production DID resolver is initialized on this bridge
         // (idempotent).
-        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone()).map_err(PyErr::from)?;
 
         // CRITICAL: a single top-level `py.allow_threads` releases the GIL for
         // the whole async DID-creation flow. The provider's custody methods
@@ -1221,7 +1282,7 @@ impl crate::scp::PyScp {
         // the GIL.
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = DidDht::new();
+                let did_method = shared_did_method(&bi_arc)?;
                 // Fresh per-identity pre-rotation custody (see
                 // `identity_create` for rationale). The pre-rotation key lives
                 // in a separate in-memory substrate from the caller's
@@ -1440,7 +1501,7 @@ impl crate::scp::PyScp {
 
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = DidDht::new();
+                let did_method = shared_did_method(&bi)?;
                 let document = did_method
                     .resolve(&did_owned)
                     .await
@@ -1483,11 +1544,11 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
-        let publish_client = rotation_publish_client(&self.inner);
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                    DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the rotated document into the SHARED resolver DHT
@@ -1578,11 +1639,11 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
-        let publish_client = rotation_publish_client(&self.inner);
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                    DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the agent-key-bearing document into the SHARED
@@ -1670,11 +1731,11 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
-        let publish_client = rotation_publish_client(&self.inner);
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                    DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the rotated-agent-key document into the SHARED
@@ -1761,11 +1822,11 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
-        let publish_client = rotation_publish_client(&self.inner);
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                    DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the agent-key-removed document into the SHARED
@@ -2040,7 +2101,7 @@ impl crate::scp::PyScp {
         py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did_owned, |entry| {
                 let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
-                let dht = DidDht::new();
+                let dht = shared_did_method(&bi_arc)?;
 
                 let new_document = rt
                     .block_on(async {

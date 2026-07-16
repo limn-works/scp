@@ -22,9 +22,22 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 [features]
 default = []
 production-dht = ["dep:mainline", "dep:reqwest", "dep:z-base-32", "dep:tracing"]
+# Test-harness-only. Compiles the `InMemoryDhtClient` type (a §17.17.3 resolve
+# nullifier — never shippable). Wired as a NORMAL feature edge from each
+# consumer's own `testing` feature and `[dev-dependencies]`; it MUST NOT appear
+# in any default / non-testing feature list (ADR-062 §Decision 1). The shipped
+# (non-`testing`) graph therefore never compiles the type — feature-absence ==
+# type-absence.
+testing = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# Self-reference (ADR-062 §Decision 1 / A5): the `InMemoryDhtClient` nullifier is
+# gated `#[cfg(feature = "testing")]` ONLY (never a bare `#[cfg(test)]` disjunct).
+# This crate's own `#[cfg(test)]` unit tests construct it, so activate `testing`
+# for this crate's test build via a self dev-dependency — the single, uniform
+# activation path. It never leaks into a shipped graph (dev-deps are test-only).
+scp-dht = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

@@ -1223,8 +1223,12 @@ mod tests {
         let pre_rotation_custody_b =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
 
-        let dht_a = scp_identity::DidDht::new();
-        let dht_b = scp_identity::DidDht::new();
+        let dht_a = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
+        let dht_b = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1333,7 +1337,9 @@ mod tests {
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-        let dht = scp_identity::DidDht::new();
+        let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1392,7 +1398,9 @@ mod tests {
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-        let dht = scp_identity::DidDht::new();
+        let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

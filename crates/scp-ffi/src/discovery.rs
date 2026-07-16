@@ -300,7 +300,14 @@ pub fn py_context_discover<'py>(py: Python<'py>, query: &str) -> PyResult<Bound<
 
         let results: Vec<scp_core::discovery::ContextDiscoveryResult> = py.allow_threads(|| {
             rt.block_on(async {
-                let did_dht = scp_identity::DidDht::new();
+                // No bridge instance is in scope for this free-function
+                // discovery entrypoint, so build the shipped DHT client
+                // fail-closed (real Mainline Pkarr in a shipped build; the
+                // in-memory test seam only under `testing`). Never a silent
+                // in-memory nullifier on a production path (ADR-062 §Decision 1).
+                let did_dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+                    crate::identity::build_ffi_dht_client()?,
+                ));
                 scp_core::discovery::resolve_contexts_from_did(&query_owned, &did_dht)
                     .await
                     .map_err(ScpPyError::from)

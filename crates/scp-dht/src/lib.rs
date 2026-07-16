@@ -19,7 +19,14 @@ use ed25519_dalek::VerifyingKey;
 
 mod dht_client;
 
-pub use dht_client::{DhtClient, DhtRecord, InMemoryDhtClient};
+pub use dht_client::{DhtClient, DhtRecord, DisabledDhtClient};
+// `InMemoryDhtClient` is a §17.17.3 resolve nullifier — never shippable. It is
+// compiled only under the `testing` feature — the SINGLE activation path
+// (ADR-062 §Decision 1 / A5; never a bare `#[cfg(test)]` disjunct), so a shipped
+// production graph cannot name the type. This crate's own tests activate it via
+// the `testing` dev-dependency.
+#[cfg(feature = "testing")]
+pub use dht_client::InMemoryDhtClient;
 #[cfg(feature = "production-dht")]
 pub use dht_client::{PkarrDhtClient, PkarrDhtClientBuilder};
 
@@ -43,6 +50,64 @@ pub enum DhtError {
     /// BEP44 signature verification failed on a resolved DHT record.
     #[error("BEP44 signature verification failed: {0}")]
     Bep44SignatureInvalid(String),
+
+    /// The DHT layer is disabled (`DhtMode::Disabled`). Publishing is refused
+    /// (fail-closed — no address is disclosed); resolution returns `Ok(None)`,
+    /// never a fabricated record. Emitted by [`DisabledDhtClient::publish`].
+    #[error("DHT layer disabled: publish refused (fail-closed — no address disclosed)")]
+    Disabled,
+}
+
+/// A DHT HTTP gateway URL was malformed.
+///
+/// The **single** gateway-URL validation contract, shared by every gateway
+/// caller — the FFI-bridge DHT client ([`crate::PkarrDhtClient`] via
+/// `scp-ffi-common`'s `ClientDhtConfig::into_client`) and the node/self-host
+/// pkarr builder (`scp-node`'s `build_pkarr_client`) — so both fail closed on the
+/// same rule instead of diverging (one validating, the other accepting any
+/// non-empty string). Each caller maps this into its own error type.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid DHT gateway URL {url:?}: {reason}")]
+pub struct GatewayUrlError {
+    /// The offending URL.
+    pub url: String,
+    /// Why it was rejected.
+    pub reason: String,
+}
+
+/// Validates a DHT gateway URL, **failing closed** on anything but a well-formed
+/// `http`/`https` URL with a non-empty, control-char-free host.
+///
+/// This is the one validation contract shared across the FFI-bridge DHT client
+/// and the node/self-host pkarr builder (see [`GatewayUrlError`]). It performs a
+/// pure O(n) scan with no allocations on the happy path and has no dependency on
+/// the `production-dht` feature, so both callers can validate before building.
+///
+/// # Errors
+///
+/// Returns [`GatewayUrlError`] when `url` does not start with `http://` or
+/// `https://`, or its host segment is empty or contains whitespace / control
+/// characters.
+pub fn validate_gateway_url(url: &str) -> Result<(), GatewayUrlError> {
+    let invalid = |reason: &str| GatewayUrlError {
+        url: url.to_owned(),
+        reason: reason.to_owned(),
+    };
+
+    let ((Some(rest), _) | (_, Some(rest))) =
+        (url.strip_prefix("https://"), url.strip_prefix("http://"))
+    else {
+        return Err(invalid("must start with http:// or https://"));
+    };
+
+    // Host is the segment before the first '/', '?' or '#'; it must be non-empty
+    // and free of whitespace/control characters. `split` always yields at least
+    // one element, so `next()` is `Some`; fall back to `rest` defensively.
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(invalid("missing or malformed host"));
+    }
+    Ok(())
 }
 
 /// Constructs the BEP44 signable payload for a value and sequence number.

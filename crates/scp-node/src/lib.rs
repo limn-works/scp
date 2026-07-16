@@ -1482,9 +1482,14 @@ impl<S: Storage> ApplicationNode<S> {
 
 /// Dev/demo convenience constructor for [`ApplicationNode`].
 ///
-/// Requires the `allow_unencrypted_storage` feature flag (or `#[cfg(test)]`).
-/// **Not for production use.**
-#[cfg(any(test, feature = "allow_unencrypted_storage"))]
+/// Requires the `testing` feature flag (or `#[cfg(test)]`). **Not for production
+/// use.** It wires the `InMemoryDhtClient` (a §17.17.3 resolve nullifier) and
+/// publishes its DID document at startup, so it is a test-harness node only —
+/// hence the `testing` gate, which keeps the nullifier out of shipped artifacts
+/// (ADR-062 §Decision 1). Production callers use [`Node::start`] with a real
+/// Pkarr client, or [`DhtMode::Disabled`](crate::DhtMode::Disabled) via
+/// `host_site` for a non-publishing node.
+#[cfg(any(test, feature = "testing"))]
 impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
     /// Creates an `ApplicationNode` with sensible development defaults.
     ///
@@ -1502,7 +1507,7 @@ impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```ignore
     /// # async fn example() -> Result<(), scp_node::NodeError> {
     /// let node = scp_node::ApplicationNode::dev(4000).await?;
     /// println!("Relay at {}", node.relay().bound_addr());
@@ -3018,6 +3023,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
+    dht_mode: DhtMode,
     storage: Arc<ProtocolRepository<S>>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
@@ -3044,7 +3050,15 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     document
         .add_relay_service(&relay_url)
         .map_err(IdentityError::from)?;
-    did_method.publish(&identity, &document).await?;
+    // Publish the domain→DID binding per the configured `DhtMode` (NOT
+    // unconditionally). `DhtMode::Disabled` — the fail-safe default, and a
+    // LEGITIMATE more-private `Domain + Disabled` config per construction.md M2
+    // (:63/:194): reachable via the domain, address NOT DHT-published, shared
+    // out-of-band — SKIPS the publish, so the node still starts. `Production`
+    // (and the test-only `Memory`) publish FATALLY, exactly as this path did
+    // before. `Domain + Disabled` is never rejected: erroring on the fail-safe
+    // direction would itself violate M2.
+    publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3171,12 +3185,74 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
     });
 }
 
+/// Publishes a node's DID document on the no-domain build path, discriminating
+/// on the configured [`DhtMode`] so the two semantically-opposite outcomes are
+/// never conflated.
+///
+/// The asymmetry is deliberate and honest:
+///
+/// - [`DhtMode::Disabled`]: the DID document is **not published at all** — the
+///   publish call is skipped entirely. The node is intentionally not
+///   DHT-discoverable (fail-safe by design; no address disclosed), which is a
+///   *success*, not a degradation. A single `info` is emitted; no warning/error
+///   path is taken, reserving those for genuine degradation. The `host_site`
+///   non-publishing node and any local/dev node rely on exactly this.
+/// - [`DhtMode::Production`] (and the test-harness-only [`DhtMode::Memory`]):
+///   the DID document is published, and a publish failure is **fatal** — it
+///   propagates so [`build_no_domain_inner`] fails and `Node::start` fails
+///   closed. A stable node's tier does not change, so a genuine startup publish
+///   failure (network / timeout / rate-limit) is not something a later periodic
+///   republish will heal into correctness; swallowing it would report a healthy
+///   start while the DID is NOT on the DHT — a false discoverability guarantee,
+///   strictly worse than an honest failure.
+///
+/// This brings the no-domain publishing reaches (`NatTraversal` / `Tunnel`, and
+/// the `Reach::Domain` TLS-provisioning fall-through) into line with the
+/// `Reach::Domain` path, which already treats publish as fatal.
+///
+/// Note the `DhtMode::Disabled` skip is independent of the concrete `D`: even if
+/// `D`'s client would error on publish (e.g.
+/// [`DisabledDhtClient`](scp_dht::DisabledDhtClient), ADR-062 §Decision 1), no
+/// publish is attempted, so a `Disabled` node always starts.
+async fn publish_did_document_for_mode<D: DidMethod + 'static>(
+    dht_mode: DhtMode,
+    did_method: &D,
+    identity: &ScpIdentity,
+    document: &DidDocument,
+) -> Result<(), NodeError> {
+    match dht_mode {
+        DhtMode::Disabled => {
+            tracing::info!(
+                did = %identity.did,
+                "DhtMode::Disabled — node is intentionally not DHT-published \
+                 (not discoverable by design; no address disclosed)"
+            );
+            Ok(())
+        }
+        // Production publishes to the global Mainline DHT; Memory (test-harness-
+        // only) publishes to its in-memory client. Both treat a publish failure
+        // as FATAL so the node fails closed instead of advertising a false
+        // discoverability guarantee. Gated `feature = "testing"` ONLY (ADR-062 A5)
+        // to match the `DhtMode::Memory` variant's single activation path.
+        #[cfg(feature = "testing")]
+        DhtMode::Memory => did_method
+            .publish(identity, document)
+            .await
+            .map_err(NodeError::from),
+        DhtMode::Production => did_method
+            .publish(identity, document)
+            .await
+            .map_err(NodeError::from),
+    }
+}
+
 // Node builder internal: all parameters are required for server construction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
+    dht_mode: DhtMode,
     storage: Arc<ProtocolRepository<S>>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
@@ -3216,8 +3292,12 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 
     push_relay_service(&mut document, &relay_url);
 
-    // 4. Publish DID document.
-    did_method.publish(&identity, &document).await?;
+    // 4. Publish the DID document per the configured DhtMode: skipped for
+    //    `Disabled` (fail-safe, not discoverable by design), FATAL on failure for
+    //    a publishing node (`Production` / test-only `Memory`) so a genuine
+    //    startup publish failure fails the node closed rather than advertising a
+    //    false discoverability guarantee.
+    publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
 
     tracing::info!(
         tier = ?tier,
@@ -4096,6 +4176,252 @@ mod tests {
             .unwrap();
 
         assert_eq!(node.relay_url(), "ws://203.0.113.42:8443/scp/v1");
+    }
+
+    // -----------------------------------------------------------------------
+    // No-domain publish asymmetry: `DhtMode::Production` fails closed on a
+    // genuine publish failure; `DhtMode::Disabled` starts without publishing.
+    // (P3 fail-closed fix — a Production node must never report a healthy start
+    // while its DID is NOT on the DHT.)
+    // -----------------------------------------------------------------------
+
+    /// A `DidMethod` spy whose `publish` **always fails** — simulating a genuine
+    /// Pkarr network / timeout / rate-limit error — and records whether publish
+    /// was attempted at all. `create` / `verify` / `resolve` / `rotate` delegate
+    /// to an inner `TestDidDht` so identity creation still succeeds.
+    struct FailingPublishDidMethod {
+        inner: TestDidDht,
+        publish_attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl DidMethod for FailingPublishDidMethod {
+        fn create(
+            &self,
+            key_custody: &impl KeyCustody,
+            pre_rotation_custody: &impl scp_platform::PreRotationCustody,
+        ) -> impl std::future::Future<
+            Output = Result<
+                (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                IdentityError,
+            >,
+        > + Send {
+            self.inner.create(key_custody, pre_rotation_custody)
+        }
+
+        fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
+            self.inner.verify(did_string, public_key)
+        }
+
+        fn publish(
+            &self,
+            _identity: &ScpIdentity,
+            _document: &DidDocument,
+        ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+            self.publish_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err(IdentityError::DhtPublishFailed(
+                "simulated Pkarr publish failure (network/timeout/rate-limit)".to_owned(),
+            )))
+        }
+
+        fn resolve(
+            &self,
+            did_string: &str,
+        ) -> impl std::future::Future<Output = Result<DidDocument, IdentityError>> + Send {
+            self.inner.resolve(did_string)
+        }
+
+        fn rotate(
+            &self,
+            identity: &ScpIdentity,
+            key_custody: &impl KeyCustody,
+        ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
+        {
+            self.inner.rotate(identity, key_custody)
+        }
+    }
+
+    /// Builds a no-domain (`Reach::NatTraversal`) config whose DID method's
+    /// `publish` always fails, with an explicit `DhtMode`. Returns the config and
+    /// the shared publish-attempt counter so tests can assert whether publish was
+    /// attempted.
+    fn failing_publish_no_domain_config(
+        dht: DhtMode,
+    ) -> (
+        NodeConfig<InMemoryKeyCustody, FailingPublishDidMethod, InMemoryStorage>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let publish_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let did_method = Arc::new(FailingPublishDidMethod {
+            inner: make_test_dht(&custody),
+            publish_attempts: Arc::clone(&publish_attempts),
+        });
+        // A resolvable NAT tier so the build reaches the publish step (the NAT
+        // probe succeeds; only the DHT publish fails).
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let config = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+            )
+        };
+        (config, publish_attempts)
+    }
+
+    #[tokio::test]
+    async fn no_domain_production_publish_failure_fails_closed() {
+        // A `DhtMode::Production` no-domain node whose DID publish genuinely
+        // FAILS must NOT report a healthy start — it fails closed so it never
+        // advertises a false discoverability guarantee.
+        let (config, publish_attempts) = failing_publish_no_domain_config(DhtMode::Production);
+
+        let err = Node::start_for_testing(config)
+            .await
+            .err()
+            .expect("Production no-domain start must fail closed when DID publish fails");
+
+        assert!(
+            matches!(err, NodeError::Identity(IdentityError::DhtPublishFailed(_))),
+            "expected a fatal NodeError::Identity(DhtPublishFailed), got: {err:?}"
+        );
+        assert_eq!(
+            publish_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Production must attempt the DID publish exactly once (and fail closed on error)"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_domain_disabled_starts_without_publishing() {
+        // A `DhtMode::Disabled` node must start cleanly WITHOUT attempting to
+        // publish — even when the underlying DID method's publish would error.
+        let (config, publish_attempts) = failing_publish_no_domain_config(DhtMode::Disabled);
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("a Disabled node must start cleanly even when publish would error");
+
+        assert_eq!(
+            publish_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Disabled must NOT attempt to publish the DID document (not discoverable by design)"
+        );
+        // The node is genuinely up (relay bound) — just not DHT-published.
+        assert!(
+            node.domain().is_none(),
+            "no-domain mode should have None domain"
+        );
+        assert_ne!(
+            node.relay().bound_addr().port(),
+            0,
+            "relay should be bound to a real port"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Domain-success publish honors DhtMode (R2-2). `build_domain_inner` (the
+    // TLS-provisioning-SUCCESS `Reach::Domain` path) previously published
+    // unconditionally + fatally, ignoring `config.dht`; now it routes through
+    // `publish_did_document_for_mode`, so `DhtMode::Disabled` — a legitimate
+    // more-private `Domain + Disabled` config (construction.md M2 :63/:194) —
+    // starts the node WITHOUT publishing, and `Production` still publishes
+    // fatally. `Domain + Disabled` is NEVER rejected.
+    // -----------------------------------------------------------------------
+
+    /// Builds a `Reach::Domain` config (with a succeeding self-signed TLS
+    /// provider so the build reaches `build_domain_inner`) whose DID method's
+    /// `publish` always fails, with an explicit `DhtMode`. Returns the config and
+    /// the shared publish-attempt counter.
+    fn failing_publish_domain_config(
+        dht: DhtMode,
+    ) -> (
+        NodeConfig<InMemoryKeyCustody, FailingPublishDidMethod, InMemoryStorage>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let publish_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let did_method = Arc::new(FailingPublishDidMethod {
+            inner: make_test_dht(&custody),
+            publish_attempts: Arc::clone(&publish_attempts),
+        });
+        let config = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
+                domain: "test.example.com".to_owned(),
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "test.example.com".to_owned(),
+                },
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+            )
+        };
+        (config, publish_attempts)
+    }
+
+    #[tokio::test]
+    async fn domain_disabled_starts_without_publishing() {
+        // A `Domain + DhtMode::Disabled` node (TLS provisioned) must start
+        // cleanly WITHOUT attempting to publish — even when the DID method's
+        // publish would error. This is the legitimate more-private config
+        // (reachable via the domain, address NOT DHT-published); M2 forbids
+        // rejecting it.
+        let (config, publish_attempts) = failing_publish_domain_config(DhtMode::Disabled);
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("a Domain + Disabled node must start cleanly (publish is SKIPPED, not fatal)");
+
+        assert_eq!(
+            publish_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Domain + Disabled must NOT attempt to publish the DID document"
+        );
+        // The node is genuinely up in domain mode (TLS active, relay bound).
+        assert_eq!(node.domain(), Some("test.example.com"));
+        assert_ne!(
+            node.relay().bound_addr().port(),
+            0,
+            "relay should be bound to a real port"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_production_publish_failure_fails_closed() {
+        // A `Domain + DhtMode::Production` node whose DID publish genuinely FAILS
+        // must fail closed — the domain-success path publishes fatally, never
+        // reporting a healthy start while the DID is NOT on the DHT.
+        let (config, publish_attempts) = failing_publish_domain_config(DhtMode::Production);
+
+        let err = Node::start_for_testing(config)
+            .await
+            .err()
+            .expect("Domain + Production start must fail closed when DID publish fails");
+
+        assert!(
+            matches!(err, NodeError::Identity(IdentityError::DhtPublishFailed(_))),
+            "expected a fatal NodeError::Identity(DhtPublishFailed), got: {err:?}"
+        );
+        assert_eq!(
+            publish_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Production must attempt the DID publish exactly once (and fail closed on error)"
+        );
     }
 
     #[tokio::test]

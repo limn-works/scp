@@ -34,7 +34,11 @@ use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationK
 use super::cache::{DidCache, DidResolutionResult, Staleness};
 use super::{DidMethod, IdentityError, ScpIdentity};
 use scp_clock::{Clock, SystemClock};
-use scp_dht::{DhtClient, InMemoryDhtClient};
+use scp_dht::DhtClient;
+// `InMemoryDhtClient` is a §17.17.3 resolve nullifier — it is compiled only in
+// test/testing builds (ADR-062 §Decision 1), so no production path can name it.
+#[cfg(any(test, feature = "testing"))]
+use scp_dht::InMemoryDhtClient;
 use scp_did::{
     DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
 };
@@ -82,19 +86,12 @@ pub trait SequenceStore: Send + Sync {
 ///
 /// Stores sequence numbers in a `HashMap` behind a `tokio::sync::Mutex`.
 /// Not suitable for production (no persistence across restarts).
+///
+/// Construct via [`Default`] (`InMemorySequenceStore::default()`); it carries
+/// no configuration, so a bespoke `new()` would be redundant.
 #[derive(Debug, Default)]
 pub struct InMemorySequenceStore {
     sequences: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
-}
-
-impl InMemorySequenceStore {
-    /// Creates a new empty in-memory sequence store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            sequences: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
 }
 
 impl SequenceStore for InMemorySequenceStore {
@@ -208,18 +205,23 @@ type SignFn = dyn Fn(u64, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>
 ///
 /// # Type Parameters
 ///
-/// * `D` — The DHT client implementation. Defaults to [`InMemoryDhtClient`]
-///   for testing. Production code should use a pkarr-based client.
-/// * `C` — The clock implementation for the cache. Defaults to [`SystemClock`].
+/// * `D` — The DHT client implementation. It has **no default**: every caller
+///   must name it explicitly (a production `PkarrDhtClient` / `DisabledDhtClient`,
+///   or an `InMemoryDhtClient` only in test/testing code). Removing the former
+///   `= InMemoryDhtClient` default makes the in-memory §17.17.3 nullifier
+///   inexpressible by omission (ADR-062 §Decision 1; spec §17.17.3 — the
+///   in-memory DHT resolve nullifier).
+/// * `C` — The clock implementation for the cache. Defaults to [`SystemClock`]
+///   (a wall-clock port, not a nullifier), so it keeps its default.
 ///
 /// # Construction
 ///
-/// - [`DidDht::new()`] — Creates a default instance with `InMemoryDhtClient`
-///   and no signing capability (for backward compatibility with SCP-006 tests).
 /// - [`DidDht::with_client()`] — Creates an instance with a specific DHT client.
-/// - `DidDht::with_client_and_custody()` — Creates a fully-configured instance
+/// - [`DidDht::with_client_and_signer()`] — Creates a fully-configured instance
 ///   with DHT client and signing capability.
-pub struct DidDht<D: DhtClient = InMemoryDhtClient, C: Clock = SystemClock> {
+/// - `DidDht::with_in_memory_custody()` — test/testing-only convenience over an
+///   `InMemoryDhtClient`.
+pub struct DidDht<D: DhtClient, C: Clock = SystemClock> {
     /// The DHT client used for publish/resolve operations.
     dht_client: Arc<D>,
     /// Resolution cache for DID documents.
@@ -261,31 +263,16 @@ impl<D: DhtClient + std::fmt::Debug, C: Clock + std::fmt::Debug> std::fmt::Debug
     }
 }
 
-impl Default for DidDht<InMemoryDhtClient, SystemClock> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+/// Test/testing-only convenience constructors over the in-memory DHT.
+///
+/// The former unconditional `Default` impl and no-arg constructor that
+/// hardcoded `InMemoryDhtClient` were **deleted** (ADR-062 §Decision 1): they
+/// made the
+/// §17.17.3 in-memory-DHT nullifier reachable by omission. All construction now
+/// goes through an explicit `DhtClient`. This block survives only for tests and
+/// testing-feature harnesses, where the in-memory arm is legitimate.
+#[cfg(any(test, feature = "testing"))]
 impl DidDht<InMemoryDhtClient, SystemClock> {
-    /// Creates a new `DidDht` instance with an in-memory DHT client and no
-    /// signing capability.
-    ///
-    /// This constructor is backward-compatible with SCP-006 tests. The
-    /// `publish` method will return an error unless a signing function is
-    /// configured via `DidDht::with_client_and_custody`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            dht_client: Arc::new(InMemoryDhtClient::new()),
-            cache: Arc::new(DidCache::new()),
-            sequence: AtomicU64::new(0),
-            sign_fn: None,
-            sequence_store: None,
-            post_resolve_hook: None,
-        }
-    }
-
     /// Creates a `DidDht` instance with in-memory DHT, cache, and a signing
     /// function derived from the provided [`KeyCustody`].
     ///
@@ -296,7 +283,7 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```ignore
     /// use std::sync::Arc;
     /// use scp_identity::dht::DidDht;
     /// use scp_identity::DidMethod;
@@ -655,6 +642,27 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         }
     }
 
+    /// Creates a new `DidDht` instance with a specific DHT client and a shared
+    /// cache, but **no** signing capability and no sequence store.
+    ///
+    /// This is the constructor for a node whose DHT layer never publishes (e.g.
+    /// `DidDht<DisabledDhtClient>` for `DhtMode::Disabled`, ADR-062 §Decision 1):
+    /// it still needs to share the node's [`DidCache`] with the co-located
+    /// resolver, but has nothing to sign because it does not publish. Any
+    /// `publish` attempt fails at the missing-`sign_fn` guard (and, for a
+    /// disabled client, at the client's fail-closed publish).
+    #[must_use]
+    pub fn with_client_and_cache(dht_client: Arc<D>, cache: Arc<DidCache<C>>) -> Self {
+        Self {
+            dht_client,
+            cache,
+            sequence: AtomicU64::new(0),
+            sign_fn: None,
+            sequence_store: None,
+            post_resolve_hook: None,
+        }
+    }
+
     /// Creates a new `DidDht` instance with DHT client, cache, signing
     /// function, and sequence persistence store (issue #327).
     ///
@@ -751,9 +759,15 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// 1. Load the last-persisted sequence from the [`SequenceStore`] (if
     ///    configured).
-    /// 2. Best-effort DHT query for the current sequence of the DID's BEP44
-    ///    record. If the DHT is unreachable, initialization proceeds with the
-    ///    locally-stored value and logs a warning.
+    /// 2. DHT query for the current sequence of the DID's BEP44 record. A
+    ///    genuine "no record exists" (`Ok(None)`) is a legitimate seq-0 first
+    ///    publish and proceeds. A resolve *failure*, however, is propagated
+    ///    (fail-closed): every caller of this method is a re-publish path (key
+    ///    rotation, agent-key add/rotate/remove, migration, node republish), so
+    ///    proceeding at a possibly-stale sequence would republish beneath a live
+    ///    BEP44 record — real-DHT monotonicity then rejects the write while the
+    ///    OLD (possibly compromised) document stays authoritative. That is
+    ///    fail-open on the revocation path, so we refuse rather than guess.
     /// 3. Set the local sequence to `max(stored, remote)`. The next publish
     ///    will increment this to `max(stored, remote) + 1`.
     ///
@@ -762,8 +776,10 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// # Errors
     ///
-    /// Store load errors are propagated as-is. DHT query failures are
-    /// logged but not propagated (best-effort).
+    /// Store load errors are propagated as-is. A DHT resolve **failure** is
+    /// propagated (fail-closed) — a re-publish must not proceed at a
+    /// possibly-stale sequence. A genuine `Ok(None)` no-record is not an error:
+    /// it yields seq 0 (legitimate first publish).
     pub async fn initialize_sequence(&self, did: &str) -> Result<(), IdentityError> {
         // Step 1: Load from persistent store.
         let mut best_seq: u64 = if let Some(store) = &self.sequence_store
@@ -774,22 +790,21 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             0
         };
 
-        // Step 2: Best-effort DHT query for the current remote sequence.
-        // If the DHT is unreachable we proceed with the locally-stored value
-        // rather than failing the entire initialization.
+        // Step 2: DHT query for the current remote sequence.
+        // A resolve *failure* is fail-closed (propagated): every caller here is
+        // a re-publish path, so proceeding at a possibly-stale sequence would
+        // republish beneath a live BEP44 record — real-DHT monotonicity rejects
+        // the write while the OLD (possibly compromised) document stays
+        // authoritative, i.e. fail-open on the revocation path. A genuine
+        // `Ok(None)` "no record" is NOT a failure: it is a legitimate seq-0
+        // first publish and must proceed.
         let public_key = extract_public_key(did)?;
         match self.dht_client.resolve(&public_key).await {
             Ok(Some(record)) => {
                 best_seq = best_seq.max(record.seq);
             }
             Ok(None) => {} // No record on DHT — first publish or expired.
-            Err(e) => {
-                tracing::warn!(
-                    did = %did,
-                    error = %e,
-                    "DHT query failed during sequence initialization, using local value"
-                );
-            }
+            Err(e) => return Err(e.into()),
         }
 
         // Step 3: Set to the maximum known sequence.
@@ -2165,7 +2180,12 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
 /// See ADR-003 acceptance criterion 5.
 #[must_use]
 pub fn verify_did(did_string: &str, public_key: &[u8]) -> bool {
-    DidDht::new().verify(did_string, public_key)
+    // Self-certification is a purely local decode — no DHT client is needed.
+    // Delegate to the same hardened `extract_public_key` parser `DidDht::verify`
+    // uses, so this stays byte-for-byte identical to the trait method without
+    // constructing a `DidDht` (whose `D: DhtClient` no longer defaults; ADR-062
+    // §Decision 1 removed the in-memory default).
+    extract_public_key(did_string).is_ok_and(|decoded_key| public_key == decoded_key.as_slice())
 }
 
 /// Validates that a migration's `rotated_at` timestamp is within the
@@ -2694,13 +2714,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Existing SCP-006 tests (preserved, using default DidDht::new())
+    // Existing SCP-006 tests (preserved; explicit in-memory DHT client)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn create_identity_produces_valid_did_format() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2720,7 +2740,7 @@ mod tests {
     #[tokio::test]
     async fn create_identity_verify_self_certifying() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2737,7 +2757,7 @@ mod tests {
     #[tokio::test]
     async fn verify_did_returns_false_for_mismatched_key() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2755,13 +2775,13 @@ mod tests {
 
     #[test]
     fn verify_did_returns_false_for_invalid_prefix() {
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
         assert!(!dht.verify("did:web:example.com", &[1u8; 32]));
     }
 
     #[test]
     fn verify_did_returns_false_for_missing_z_prefix() {
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
         assert!(!dht.verify("did:dht:notzbased", &[1u8; 32]));
     }
 
@@ -2775,7 +2795,7 @@ mod tests {
         // guard, `verify` would accept 16 distinct DID strings for one key.
         const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
 
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
         let key = [0x42u8; 32];
         let canonical_encoded = zbase32::encode(&key);
         let canonical_did = format!("did:dht:z{canonical_encoded}");
@@ -2830,7 +2850,7 @@ mod tests {
     #[tokio::test]
     async fn document_has_correct_verification_methods() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2862,7 +2882,7 @@ mod tests {
     #[tokio::test]
     async fn document_has_pre_rotation_service() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2882,7 +2902,7 @@ mod tests {
     async fn create_identity_deterministic_with_seeded_custody() {
         let custody1 = InMemoryKeyCustody::from_seed_bytes([42u8; 32]);
         let custody2 = InMemoryKeyCustody::from_seed_bytes([42u8; 32]);
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody1 =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2916,7 +2936,7 @@ mod tests {
     #[ignore = "diagnostic helper — run with --ignored --nocapture"]
     async fn print_parity_seed_expected_values() {
         let custody = InMemoryKeyCustody::from_seed_bytes([0x7bu8; 32]);
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let (identity, _doc, _pre_rotation_handle) =
@@ -2939,7 +2959,7 @@ mod tests {
         let seed = [0x7Bu8; 32];
         let custody1 = InMemoryKeyCustody::from_seed_bytes(seed);
         let custody2 = InMemoryKeyCustody::from_seed_bytes(seed);
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody1 =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2968,7 +2988,7 @@ mod tests {
     #[tokio::test]
     async fn document_json_roundtrip_from_create() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -3119,7 +3139,7 @@ mod tests {
     #[tokio::test]
     async fn publish_without_signer_returns_error() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -6252,7 +6272,7 @@ mod tests {
     async fn publish_persists_sequence_to_store() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
         let pre_rotation_custody =
@@ -6279,7 +6299,7 @@ mod tests {
     async fn initialize_sequence_from_store() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
         let pre_rotation_custody =
@@ -6311,7 +6331,7 @@ mod tests {
     async fn initialize_sequence_from_dht_when_no_store() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
 
         // First instance: publish with a store.
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
@@ -6325,7 +6345,7 @@ mod tests {
         assert_eq!(dht.current_sequence(), 5);
 
         // Second instance: fresh store (simulating lost storage), but same DHT.
-        let fresh_store = Arc::new(InMemorySequenceStore::new());
+        let fresh_store = Arc::new(InMemorySequenceStore::default());
         let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), fresh_store);
 
         dht2.initialize_sequence(&identity.did).await.unwrap();
@@ -6341,7 +6361,7 @@ mod tests {
     async fn initialize_sequence_uses_max_of_store_and_dht() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
 
         // First instance: publish to get DHT seq to 3.
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
@@ -6372,7 +6392,7 @@ mod tests {
         // "publish -> restart -> publish again -> second publication has higher sequence"
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
 
         // First session: create and publish.
         let dht1 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
@@ -6423,7 +6443,7 @@ mod tests {
         // New identity, no store, no DHT record: sequence stays at 0.
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
         let pre_rotation_custody =
@@ -6431,6 +6451,70 @@ mod tests {
         let (identity, _document, _pre_rotation_handle) =
             dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.initialize_sequence(&identity.did).await.unwrap();
+        assert_eq!(dht.current_sequence(), 0);
+    }
+
+    /// A `DhtClient` whose `resolve` always fails, to exercise the
+    /// fail-closed path in [`DidDht::initialize_sequence`]. `publish` is a
+    /// no-op success — it is never exercised by these tests.
+    struct ResolveFailingDhtClient;
+
+    #[allow(clippy::manual_async_fn)]
+    impl DhtClient for ResolveFailingDhtClient {
+        fn publish(
+            &self,
+            _public_key: &[u8; 32],
+            _signature: &[u8; 64],
+            _value: &[u8],
+            _seq: u64,
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
+            async { Ok(()) }
+        }
+
+        fn resolve(
+            &self,
+            _public_key: &[u8; 32],
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
+            async {
+                Err(DhtError::DhtResolveFailed(
+                    "simulated transient resolve failure".to_owned(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_fails_closed_on_dht_resolve_error() {
+        // Regression for the P4 fail-open-on-revocation finding: every caller
+        // of `initialize_sequence` is a re-publish path (key rotation,
+        // agent-key add/rotate/remove, migration, node republish). If a
+        // transient DHT resolve failure were swallowed, `best_seq` would stay
+        // at its stale stored value (0 with no store), the next publish would
+        // republish at seq=1 beneath a live BEP44 record already at seq=N,
+        // real-DHT monotonicity would reject the write, and the OLD (possibly
+        // compromised) document would stay authoritative. The resolve error
+        // MUST therefore propagate (fail-closed), NOT silently succeed at a
+        // stale sequence.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(clock));
+        let sign_fn =
+            DidDht::<ResolveFailingDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
+        let dht = DidDht::with_client_and_signer(Arc::new(ResolveFailingDhtClient), cache, sign_fn);
+
+        // A valid `did:dht` identity so `extract_public_key` succeeds and we
+        // reach Step 2's resolve. `create` neither resolves nor publishes.
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, _document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
+
+        let result = dht.initialize_sequence(&identity.did).await;
+        assert!(
+            matches!(result, Err(IdentityError::DhtResolveFailed(_))),
+            "resolve failure during initialize_sequence must propagate (fail closed), got {result:?}"
+        );
+        // Sequence must remain untouched (0) — we did NOT assume a stale value.
         assert_eq!(dht.current_sequence(), 0);
     }
 

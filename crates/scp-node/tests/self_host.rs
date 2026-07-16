@@ -1028,6 +1028,72 @@ async fn self_host_did_is_stable_across_restarts() {
     );
 }
 
+/// R2-1 regression (ADR-062 Slice 1): a `{Reach::NatTraversal, DhtMode::Disabled}`
+/// self-host node — the documented reachable-but-unpublished config — MUST start
+/// cleanly WITHOUT publishing. This is the exact config `build_host_site_node`
+/// now produces: the publishing reach selects a routable relay URL while
+/// `DhtMode::Disabled` selects the `DisabledDhtClient` AND sets
+/// `NodeConfig.dht = Disabled`, so `publish_did_document_for_mode` SKIPS publish.
+///
+/// Before the fix, `build_host_site_node` re-derived the publish `DhtMode` from
+/// `skip_nat` (`skip_nat ? Disabled : Production`), discarding `config.dht`. A
+/// `NatTraversal` (`skip_nat` = false) host therefore set `NodeConfig.dht =
+/// Production` even though the dispatch had selected the `DisabledDhtClient`, so
+/// `publish_did_document_for_mode(Production)` called `DisabledDhtClient::publish()`
+/// → `Err(DhtError::Disabled)` and `Node::start` FAILED on a documented-valid
+/// config. This test builds that exact `{NatTraversal, Disabled, DisabledDhtClient}`
+/// node (with a hermetic fixed-tier NAT strategy so no live STUN work runs) and
+/// asserts it starts — proving the selected client `D` and the publish mode agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nat_traversal_disabled_dht_node_starts_without_publishing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let storage_dir = tmp.path().to_path_buf();
+    let storage_key = Zeroizing::new([0x5Au8; 32]);
+
+    let node_storage =
+        SqliteStorage::new(&storage_dir, storage_key.as_ref()).expect("node SQLite should open");
+    let custody = build_custody(&storage_dir, &storage_key).await;
+
+    // DHT-layer-off DID method: `DisabledDhtClient::publish` fails closed. The
+    // production `dispatch_hosted_site_by_dht_mode` selects EXACTLY this method
+    // for `DhtMode::Disabled`.
+    let cache = Arc::new(DidCache::new());
+    let (did_method, _seq_init) = scp_node::self_host::build_disabled_did_method(cache);
+
+    // `NatTraversal` (skip_nat = false) is a PUBLISHING reach, yet `dht:
+    // DhtMode::Disabled` means the node must NOT publish — the reachable-but-
+    // unpublished self-host case. With the R2-1 fix `NodeConfig.dht = Disabled`
+    // agrees with the `DisabledDhtClient`, so the publish is skipped and the node
+    // starts. `FixedTierNatStrategy` (via `NatSlot::Custom`) keeps the probe
+    // hermetic.
+    let node = Node::start(NodeConfig {
+        nat: NatSlot::Custom(Arc::new(FixedTierNatStrategy)),
+        dht: DhtMode::Disabled,
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        ..NodeConfig::defaults(
+            Reach::NatTraversal,
+            IdentitySource::Generate {
+                custody: custody.clone(),
+                did_method,
+            },
+            node_storage,
+        )
+    })
+    .await
+    .expect(
+        "a {NatTraversal, Disabled} node must start cleanly without publishing \
+         (DisabledDhtClient::publish is SKIPPED, never invoked)",
+    );
+
+    assert!(
+        node.identity().did().starts_with("did:dht:"),
+        "node DID should be a did:dht, got {}",
+        node.identity().did()
+    );
+    node.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // FIX B — skip_nat_probe binds on a loopback relay URL without probing
 // ---------------------------------------------------------------------------

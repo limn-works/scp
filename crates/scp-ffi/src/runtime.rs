@@ -1318,22 +1318,31 @@ where
         )));
 }
 
-/// Returns the in-memory DHT client backing this instance's DID resolver, if
+/// Returns the shared DHT client backing this instance's DID resolver, if
 /// initialized.
 ///
-/// Used by `identity_create` to publish freshly minted in-memory DID documents
-/// into the same client the resolver reads from, so the DID resolves for
-/// signature verification (UCAN validation, governance vote verification).
+/// The client is the shared [`FfiDhtClient`](scp_ffi_common::dht::FfiDhtClient)
+/// — the real Mainline Pkarr client in a shipped build, or the in-memory test
+/// seam under `testing`. Used by `identity_create`/rotation/migration to
+/// publish freshly minted DID documents into the same client the resolver
+/// reads from, so the DID resolves for signature verification (UCAN
+/// validation, governance vote verification).
 #[must_use]
-pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_dht::InMemoryDhtClient>> {
+pub fn resolver_dht_client(
+    bi: &PyBridgeInstance,
+) -> Option<Arc<scp_ffi_common::dht::FfiDhtClient>> {
     bi.core.dht_client().map(Arc::clone)
 }
 
-/// Stores the in-memory DHT client backing this instance's DID resolver.
+/// Stores the shared DHT client backing this instance's DID resolver.
 ///
-/// Called once during resolver initialization with the SAME `InMemoryDhtClient`
-/// `Arc` the resolver was built over. Subsequent calls are no-ops.
-pub fn set_resolver_dht_client(bi: &PyBridgeInstance, client: Arc<scp_dht::InMemoryDhtClient>) {
+/// Called once during resolver initialization with the SAME
+/// [`FfiDhtClient`](scp_ffi_common::dht::FfiDhtClient) `Arc` the resolver was
+/// built over. Subsequent calls are no-ops.
+pub fn set_resolver_dht_client(
+    bi: &PyBridgeInstance,
+    client: Arc<scp_ffi_common::dht::FfiDhtClient>,
+) {
     bi.core.set_dht_client(client);
 }
 
@@ -1363,9 +1372,10 @@ pub fn resolver_cache(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::cache::
 /// (and pre-rotation `#active` key) until the cache TTL expired — defeating
 /// rotation's revocation purpose. Best-effort: a no-op when no cache is wired.
 pub fn invalidate_resolver_cache(bi: &PyBridgeInstance, did: &str, rt: &tokio::runtime::Runtime) {
-    if let Some(cache) = bi.core.resolver_cache() {
-        rt.block_on(cache.remove(did));
-    }
+    // Delegates to the shared `BridgeInstanceCore::invalidate_resolver_cache`
+    // (the single implementation of the invalidation body); the sync PyO3 bridge
+    // drives the async method on the shared runtime.
+    rt.block_on(bi.core.invalidate_resolver_cache(did));
 }
 
 // ---------------------------------------------------------------------------

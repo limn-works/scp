@@ -362,6 +362,19 @@ pub struct UniffiBridgeInstance {
     pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
 }
 
+impl std::fmt::Debug for UniffiBridgeInstance {
+    /// Redacted `Debug` — surfaces only the `instance_id` so the many
+    /// interior registries (custody, resolver, DHT client, protocol
+    /// repository) never leak into log output. Required because
+    /// [`crate::bridge::Identity`] derives `Debug` and now retains an
+    /// `Arc<UniffiBridgeInstance>` in its `bi` field.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniffiBridgeInstance")
+            .field("instance_id", &self.core.instance_id())
+            .finish_non_exhaustive()
+    }
+}
+
 impl UniffiBridgeInstance {
     /// Constructs a new `UniffiBridgeInstance` with default in-memory state.
     ///

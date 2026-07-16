@@ -5154,6 +5154,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "mainline",
  "reqwest",
+ "scp-dht",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

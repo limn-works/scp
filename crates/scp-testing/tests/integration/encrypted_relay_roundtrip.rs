@@ -168,7 +168,7 @@ async fn start_relay() -> SocketAddr {
 async fn create_identity() -> (ScpIdentity, InMemoryKeyCustody, Vec<u8>) {
     let custody = InMemoryKeyCustody::new();
     let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
-    let dht_method = DidDht::new();
+    let dht_method = DidDht::with_client(std::sync::Arc::new(scp_dht::InMemoryDhtClient::new()));
     let (identity, _doc, _pre_rotation_handle): (ScpIdentity, _, _) = dht_method
         .create(&custody, &pre_rotation_custody)
         .await
