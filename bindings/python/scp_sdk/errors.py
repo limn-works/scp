@@ -324,9 +324,14 @@ def _coded_bridge_error(exc: Exception) -> ScpError:
     if isinstance(exc, ScpError):
         return exc
     sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
-    match = _SCP_CODE_RE.search(str(exc))
+    raw_msg = str(exc)
+    match = _SCP_CODE_RE.search(raw_msg)
     code = match.group(1) if match is not None else None
-    return sdk_cls(str(exc), code=code)
+    # Strip the leading "[SCP-xxx-nnn] " prefix so ScpError.__str__ (which
+    # prepends f"[{code}] ") does not double the bracket when the bridge has
+    # already embedded the code at the start of the message.
+    message = raw_msg[match.end() :].lstrip() if match is not None else raw_msg
+    return sdk_cls(message, code=code)
 
 
 __all__ = [

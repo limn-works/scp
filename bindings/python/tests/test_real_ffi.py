@@ -34,6 +34,7 @@ except (ImportError, AttributeError):
     )
 
 from scp_sdk import SCP
+from scp_sdk.errors import ValidationError
 from scp_sdk.types import CustodyType
 
 # ---------------------------------------------------------------------------
@@ -226,10 +227,12 @@ class TestIdentity:
     async def test_remove_rejects_malformed_did(self, scp: SCP):
         # Both removal ops gate on the shared `validate_did` validator (the
         # PyO3 reference bridge) before touching the registry. A non-empty but
-        # syntactically invalid DID raises the native ValidationError rather
-        # than silently no-op'ing. Mirrors the petname malformed-owner tests.
+        # syntactically invalid DID raises a ValidationError rather than
+        # silently no-op'ing. Mirrors the petname malformed-owner tests.
+        # identity_remove is wrapped → typed SDK ValidationError.
+        # identity_remove_if_present is not wrapped → native bridge exception.
         bad = "not-a-did"
-        with pytest.raises(_scp_core.ValidationError):
+        with pytest.raises(ValidationError):
             await scp.identity_remove(bad)
         with pytest.raises(_scp_core.ValidationError):
             await scp.identity_remove_if_present(bad)

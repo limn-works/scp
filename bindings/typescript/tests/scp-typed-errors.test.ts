@@ -21,6 +21,7 @@ import {
   ContextError,
   GovernanceError,
   IdentityError,
+  OutletError,
   ScpError,
   UcanPermissionError,
 } from "../src/errors";
@@ -57,7 +58,7 @@ describe("SCP typed-error mapping", () => {
   it("maps an async governance error to GovernanceError", async () => {
     const { scp, native } = mountMockScp();
     native.__stub("contextGovernancePropose", () =>
-      Promise.reject(rawBridgeError("[SCP-GOV-6001] governance error: proposer is not a member")),
+      Promise.reject(rawBridgeError("[SCP-GOV-11001] governance error: proposer is not a member")),
     );
 
     let thrown: unknown;
@@ -67,8 +68,25 @@ describe("SCP typed-error mapping", () => {
       thrown = err;
     }
     expect(thrown).toBeInstanceOf(GovernanceError);
-    expect((thrown as GovernanceError).code).toBe("SCP-GOV-6001");
+    expect((thrown as GovernanceError).code).toBe("SCP-GOV-11001");
   });
+
+  it("maps an async outlet error to OutletError", async () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("outletInvoke", () =>
+      Promise.reject(rawBridgeError("[SCP-OUTLET-6002] outlet error: outlet not registered")),
+    );
+
+    let thrown: unknown;
+    try {
+      await scp.outletInvoke({}, "calculator", "{}", "did:dht:z6MkAlice", "ucan-token");
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(OutletError);
+    expect((thrown as OutletError).code).toBe("SCP-OUTLET-6002");
+  });
+
 
   it("maps a sync identity error from a sync method (identityRemove)", () => {
     const { scp, native } = mountMockScp();
@@ -104,10 +122,10 @@ describe("SCP typed-error mapping", () => {
     expect((thrown as UcanPermissionError).code).toBe("SCP-PERM-3030");
   });
 
-  it("falls back to the base ScpError for an unrecognized code prefix", async () => {
+  it("falls back to the base ScpError for a code with no registered class", async () => {
     const { scp, native } = mountMockScp();
     native.__stub("contextMemberCount", () =>
-      Promise.reject(rawBridgeError("[SCP-WEIRD-9999] something unmapped happened")),
+      Promise.reject(rawBridgeError("[SCP-UNKNOWN-9999] something unmapped happened")),
     );
 
     let thrown: unknown;

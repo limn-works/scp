@@ -79,13 +79,16 @@ class TestCodedBridgeError:
         assert "unexpected failure" in result.message
 
     def test_extracts_scp_code_from_leading_bracket(self) -> None:
-        """Structured SCP code at position 0 is recovered into .code."""
+        """Code at position 0 is recovered into .code; the prefix is stripped from .message."""
         bridge_cls = type("ContextError", (Exception,), {})
         bridge_exc = bridge_cls("[SCP-CTX-2023] context error: state lookup failed")
 
         result = _coded_bridge_error(bridge_exc)
 
         assert result.code == "SCP-CTX-2023"
+        # The leading "[SCP-xxx-nnn] " bracket is stripped so ScpError.__str__
+        # (which prepends f"[{code}] ") does not double the prefix.
+        assert result.message == "context error: state lookup failed"
 
     def test_embedded_code_is_not_captured(self) -> None:
         """A [SCP-...] token buried in the message body must not masquerade as the code."""
