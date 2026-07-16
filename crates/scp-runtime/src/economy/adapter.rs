@@ -62,6 +62,16 @@ pub trait PaymentAdapter: Send + Sync {
     /// adapter to collapse the duplicate. An adapter that ignores the key will
     /// double-authorize (and, after [`capture`](Self::capture), double-bill) on
     /// the crash-recovery path, which the runtime cannot detect or prevent.
+    ///
+    /// The dedup MUST persist for **at least as long as a crashed node may take
+    /// to recover and re-settle** — recovery timing is unbounded (a node may be
+    /// down arbitrarily long). An adapter with a bounded idempotency-key TTL
+    /// (e.g. a 24h expiry, common on real rails) does NOT satisfy this: a
+    /// recovery re-settle delayed past the TTL is treated as a fresh `authorize`
+    /// and double-bills. Such adapters require the runtime-enforced
+    /// capture-dedup ledger tracked in
+    /// <https://github.com/limn-works/scp/issues/2156>, which makes the runtime
+    /// authoritative (the idempotency key downgraded to defense-in-depth).
     fn authorize(
         &self,
         payer: &DID,

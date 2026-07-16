@@ -2657,15 +2657,21 @@ async fn commit_b_stream_first_settle(
 
         // Defense-in-depth (crypto): the escrow's credit ceiling guarantees
         // `billed ≤ reserved` by construction (the pump never accrues past the
-        // reserve). Assert it at the seal so a future upstream pump bug that
-        // over-accrued is caught here rather than silently over-charging the
-        // invoker — a cheap self-defense, no release-build cost.
-        debug_assert!(
-            billed.value() <= prepared.reserved.value(),
-            "SCP-OUT-046 seal: billed {} must not exceed reserved {} (upstream pump over-accrued)",
-            billed.value(),
-            prepared.reserved.value(),
-        );
+        // reserve). Log-only tripwire at the seal so a future upstream pump bug
+        // that over-accrued is surfaced here rather than silently over-charging
+        // the invoker. NOT a `debug_assert!`/panic: ADR-049 §10 forbids
+        // panic-family macros in actor handlers (a handler panic unwinds the
+        // actor and burns respawn budget); a `tracing::error!` runs in every
+        // build and never unwinds. `settle_at_close` already saturates the
+        // refund, so the invoker cannot be refunded negatively.
+        if billed.value() > prepared.reserved.value() {
+            tracing::error!(
+                billed = billed.value(),
+                reserved = prepared.reserved.value(),
+                "SCP-OUT-046 seal: billed exceeds reserved — upstream pump \
+                 over-accrued past the credit ceiling (should be impossible)"
+            );
+        }
 
         // Sign the streaming receipt over the STAGED provenance + the sealed root.
         // A signing failure leaves state as found (re-insert the owned original).

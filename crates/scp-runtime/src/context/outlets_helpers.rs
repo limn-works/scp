@@ -1599,7 +1599,8 @@ pub enum StreamSettleOutcome {
 /// # Exactly-once billing — the two-layer model (SCP-OUT-046)
 ///
 /// The external payment capture is NOT transactional with the durable owned
-/// state, so exactly-once is enforced by two complementary layers:
+/// state, so exactly-once is provided by two complementary layers (one
+/// runtime-enforced, one delegated to the adapter):
 ///
 /// 1. **The durable `settled` flag (concurrent guard, same-process,
 ///    authoritative).** For a witness-bearing xctx settle the flag is read at the
