@@ -31,8 +31,8 @@ use tracing::{debug, warn};
 
 use super::dtls::AsyncDtlsSession;
 use crate::error::TransportError;
-use crate::native::protocol::{ClientMessage, RelayMessage};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter};
+use scp_relay_client::{ClientMessage, RelayMessage};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
 /// [`TransportAdapter`] methods to ensure the trait is dyn-compatible.

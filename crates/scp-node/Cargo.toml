@@ -75,6 +75,9 @@ metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+# The cross-transport integration tests build relay wire messages directly; the
+# types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).
+scp-relay-client = { path = "../scp-relay-client" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }

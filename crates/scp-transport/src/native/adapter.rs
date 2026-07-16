@@ -48,8 +48,9 @@ use tokio_util::sync::CancellationToken;
 
 use zeroize::Zeroizing;
 
+use scp_relay_client::{ClientMessage, RelayMessage};
+
 use super::client::{NativeRelayClient, SubscriptionMessage};
-use super::protocol::{ClientMessage, RelayMessage};
 use crate::cover_traffic::{
     CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender,
 };
@@ -665,7 +666,7 @@ fn relay_message_to_event(msg: RelayMessage) -> Option<TransportEvent> {
             _ => None,
         },
         RelayMessage::Err { code, msg, .. } => {
-            if code == super::error::code::SHUTTING_DOWN {
+            if code == scp_relay_client::code::SHUTTING_DOWN {
                 Some(TransportEvent::Terminated {
                     reason: format!("relay shutting down: {msg}"),
                 })
@@ -686,8 +687,9 @@ fn relay_message_to_event(msg: RelayMessage) -> Option<TransportEvent> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use scp_relay_client::code;
+
     use super::*;
-    use crate::native::error::code;
 
     #[test]
     fn relay_blob_to_envelope_event() {

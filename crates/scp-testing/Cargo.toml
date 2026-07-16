@@ -46,6 +46,9 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core", features = ["testing"] }
+# The SDK-usability integration test builds relay wire messages directly; the
+# types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).
+scp-relay-client = { path = "../scp-relay-client" }
 # SCP-OUT-039 (C12) — the outlet-streaming conformance tests drive the RAW
 # runtime `open_stream_session` dispatch + `Supervisor::open_outlet_stream`
 # directly (the streaming trackers, `InProcessStreamSigner`, and the dispatch

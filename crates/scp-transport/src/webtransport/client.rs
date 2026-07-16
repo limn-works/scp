@@ -54,7 +54,6 @@ use super::fallback::{
     relay_url_to_webtransport,
 };
 use crate::error::TransportError;
-use crate::native::protocol::{ClientMessage, RelayMessage};
 use crate::quic::streams::{
     QuicClientFrame, QuicRelayFrame, decode_frame_from_buf, decode_relay_frame, encode_client_frame,
 };
@@ -62,6 +61,7 @@ use crate::subscription::{
     MAX_TRANSPORT_SUBSCRIPTIONS, SubscriptionError, TransportSubscriptionMap,
 };
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
+use scp_relay_client::{ClientMessage, RelayMessage};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
 /// [`TransportAdapter`] methods to ensure the trait is dyn-compatible.
