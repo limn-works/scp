@@ -312,6 +312,16 @@ pub fn stand_up_two_party(
                 )
                 .expect("alice accepts bob's sender-key request (H1 membership gate)")
                 .expect("alice returns a response for a non-blocked member");
+            // Decoded as a BARE `SenderKeyResponse` (NOT the tagged
+            // `SenderKeyDistributionMessage` envelope) by design: this fixture
+            // answers via the test-only PROVIDER copy
+            // `MlsCryptoProvider::handle_sender_key_request`, which serializes a
+            // bare `SenderKeyResponse` (`to_vec_named`) and — per its own doc —
+            // carries NO framing obligation to the actor's
+            // `SenderKeyDistributionMessage` wire shape. So `from_bytes` would find
+            // no `msg_type` tag; the bare decode is the correct match here. (The
+            // actor-path fixture in `spawn_from_welcome_tests.rs` decodes the
+            // wrapped envelope instead.)
             let response: scp_protocol::crypto::sender_keys::SenderKeyResponse =
                 rmp_serde::from_slice(&response_bytes).expect("decode alice's SenderKeyResponse");
             let ctx_id_hex = hex::encode(ctx_bytes);

@@ -3258,8 +3258,21 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
         )
         .expect("bob's actor returns a response for a member requester");
 
-    let response: scp_protocol::crypto::sender_keys::SenderKeyResponse =
-        rmp_serde::from_slice(&response_bytes).expect("decode bob's SenderKeyResponse");
+    // Decode via the tagged `SenderKeyDistributionMessage` envelope the receiver
+    // actually parses (`decrypt_and_dispatch` → `SenderKeyDistributionMessage::
+    // from_bytes`), matching bob's actor answer path
+    // (`state.rs::handle_sender_key_request` → `.to_bytes()`). A bare
+    // `SenderKeyResponse` decode here would silently ignore the `msg_type` tag and
+    // fail to assert the wrapped wire shape the pull protocol requires.
+    let response =
+        match scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+            &response_bytes,
+        )
+        .expect("decode bob's SenderKeyDistributionMessage envelope")
+        {
+            scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(r) => r,
+            other => panic!("expected a KeyResponse envelope, got {other:?}"),
+        };
     assert_eq!(
         response.sender_did, BOB_DID,
         "the response carries bob's sender key (not an empty/echoed answer)"

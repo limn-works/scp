@@ -820,16 +820,22 @@ pub async fn join_context(
     // Validate key package before any mutations (idempotent, no lock needed).
     //
     // ADR-049 §15 / SCP-CRYPTOMOVE-000c: stateless KP validation routes through
-    // the stateless `MlsBackend` (`deps.mls`) — the provider copy is retired, and
-    // §15 grants it no carve-out ("`validate_key_package` … becomes a stateless
-    // free-fn / `MlsBackend` method over `&dyn Clock`"). The backend validates
-    // signature / lifetime / ciphersuite but does NOT bind identity, so the
-    // load-bearing binding (the KP credential DID MUST equal the envelope's
-    // `owner_did`, formerly enforced inside the provider method) is preserved
-    // explicitly via the `scp_mls::group::key_package_in_did` primitive, which
-    // authenticates the DID under the same hardened clock `add_member` uses.
-    // Under `cfg(test)`/`testing` a `None` KP is accepted (mock fixtures);
-    // production requires real bytes.
+    // the stateless `MlsBackend` (`deps.mls`) — the provider copy is retired from
+    // the production call path (retained only as a test-exercised copy at
+    // `crypto/mls/provider.rs`), and §15 grants it no carve-out
+    // ("`validate_key_package` … becomes a stateless free-fn / `MlsBackend` method
+    // over `&dyn Clock`"). The backend validates signature / lifetime / ciphersuite
+    // but does NOT bind identity, so the load-bearing binding (the KP credential
+    // DID MUST equal the envelope's `owner_did`, formerly enforced inside the
+    // provider method) is preserved explicitly via the
+    // `scp_mls::group::key_package_in_did` primitive, which authenticates the DID
+    // under the same hardened clock `add_member` uses. Under `cfg(test)`/`testing`
+    // a `None` KP is accepted (mock fixtures); production requires real bytes.
+    //
+    // The KP signature/lifetime is therefore validated TWICE by design — once
+    // through `deps.mls.validate_key_package` (the §15-mandated `MlsBackend`
+    // route) and once inside `key_package_in_did` (which also extracts the
+    // authenticated DID). This is an accepted belt-and-suspenders, not a bug.
     let kp_bytes = key_package.mls_key_package_bytes.as_deref();
     match kp_bytes {
         Some(bytes) => {

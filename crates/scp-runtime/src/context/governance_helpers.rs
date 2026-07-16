@@ -1218,11 +1218,17 @@ pub async fn execute_add_member(
     //
     // ADR-049 §15 / SCP-CRYPTOMOVE-000c: the stateless validation routes through
     // the stateless `MlsBackend` (`deps.mls`) — the provider `validate_key_package`
-    // copy is retired (§15 grants no carve-out). The stateless backend validates
-    // signature / lifetime / ciphersuite but does NOT bind identity, so the
-    // DID binding is preserved here via `scp_mls::group::key_package_in_did`,
-    // which authenticates the KP credential DID under the same hardened clock the
-    // MLS add uses.
+    // copy is retired from the production call path (§15 grants no carve-out; the
+    // symbol is retained only as a test-exercised copy at `crypto/mls/provider.rs`).
+    // The stateless backend validates signature / lifetime / ciphersuite but does
+    // NOT bind identity, so the DID binding is preserved here via
+    // `scp_mls::group::key_package_in_did`, which authenticates the KP credential
+    // DID under the same hardened clock the MLS add uses.
+    //
+    // The KP signature/lifetime is therefore validated TWICE by design — once
+    // through `deps.mls.validate_key_package` (the §15-mandated `MlsBackend`
+    // route) and once inside `key_package_in_did` (which also extracts the
+    // authenticated DID). This is an accepted belt-and-suspenders, not a bug.
     match key_package {
         Some(bytes) => {
             deps.mls
