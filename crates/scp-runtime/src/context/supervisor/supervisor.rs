@@ -1248,20 +1248,22 @@ struct OutletStreamPhase1 {
 /// frontier capture + the seal-close asynchronously (AC6: the journal is
 /// `Committing` here; `Committed` is reached inside the seal task at close).
 ///
-/// `receiver` yields A's plaintext
-/// [`ForwardedStreamFrame`](crate::context::outlets::invoke::ForwardedStreamFrame)s
-/// (the unmodified operator-signed chunk + its per-sender `base_sequence` anchor,
-/// SCP-OUT-044). Re-encryption for A's OTHER members is the SDK delivery seam
-/// (seal each still-operator-signed `frame.chunk` under A's MLS group key), NOT
+/// `receiver` yields A's plaintext unmodified operator-signed
+/// [`OutletStreamChunk`](scp_protocol::context::outlets::stream::OutletStreamChunk)s,
+/// forwarded verbatim (the bridge never re-signs and introduces no new
+/// send-sequence at the plaintext hand-off, §5.4.5). Re-encryption for A's OTHER
+/// members is the SDK delivery seam (seal each still-operator-signed chunk under
+/// A's MLS group key, its per-sender MLS send-sequence reserved at the
+/// §9.16/§5.15.7 encrypt seam over A's persistent counter — SCP-OUT-047), NOT
 /// this return type — mirroring the best-effort
 /// [`open_outlet_stream_cross_context`](Supervisor::open_outlet_stream_cross_context).
 pub struct StreamingSagaHandle {
     /// The durable saga id — the operator-repair handle a crash-recovery
     /// resolution keys on, and the id the seal task seals under.
     pub saga_id: SagaId,
-    /// A's plaintext forwarded-frame receiver, returned promptly (AC1).
+    /// A's plaintext operator-signed chunk receiver, returned promptly (AC1).
     pub receiver:
-        tokio::sync::mpsc::Receiver<crate::context::outlets::invoke::ForwardedStreamFrame>,
+        tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
 }
 
 // ---------------------------------------------------------------------------
@@ -12268,18 +12270,15 @@ impl Supervisor {
     /// never both — the two are mutually exclusive (`settlement_sink` fires only
     /// once the pump spawns `Ok`, which is exactly when the ticket is consumed).
     ///
-    /// # Sequence allocation (`base_sequence`)
+    /// # Sequence allocation
     ///
     /// The reserve allocates NO per-sender MLS send-sequence. Per §5.4.5 the
     /// pump's per-chunk cursor starts at `0` per `request_id` (`invoke.rs`
     /// "sequence starts at 0"), a DISTINCT counter from the message
-    /// send-sequence, so nothing here reads a `base_sequence`. This same-context
-    /// path allocates NO `base_sequence` at all: the per-sender send-sequence
-    /// anchor is reserved at the point of consumption only on the CROSS-context
-    /// send hop, where the reassembly gap-detector is load-bearing (SCP-OUT-044,
-    /// `invoke::forward_frame`) — never pre-reserved at open, because a
-    /// rollback-in-place across the off-mailbox pump window would corrupt a
-    /// DIFFERENT message's sequence.
+    /// send-sequence. A's per-sender send-sequence is the A-context MLS re-seal's,
+    /// reserved at the §9.16/§5.15.7 encrypt seam over A's PERSISTENT per-sender
+    /// counter (SCP-OUT-047) — neither this open-time reserve nor the
+    /// cross-context bridge mints a send-sequence.
     ///
     /// # Errors
     ///
@@ -12607,16 +12606,18 @@ impl Supervisor {
     /// the same-context [`open_outlet_stream`](Self::open_outlet_stream)), and
     /// records A's own `OutletInvoked` at close over its independently
     /// reassembled chunk sequence. Returns A's plaintext
-    /// `mpsc::Receiver<ForwardedStreamFrame>` PROMPTLY (the caller consumes
-    /// frames as produced); each
-    /// [`ForwardedStreamFrame`](crate::context::outlets::invoke::ForwardedStreamFrame)
-    /// carries the per-sender MLS `base_sequence` anchor allocated at consumption
-    /// on the send hop (SCP-OUT-044) alongside the unmodified operator-signed
-    /// chunk, threading `(request_id, base_sequence)` to the SCP-OUT-045
-    /// gap-detector. Re-encryption for A's OTHER members is the SDK delivery
-    /// seam (seal each still-operator-signed `frame.chunk` under A's MLS group
-    /// key over the existing §9.7/§9.8/§9.16 transport — no new relay primitive),
-    /// NOT this return type.
+    /// `mpsc::Receiver<OutletStreamChunk>` PROMPTLY (the caller consumes chunks
+    /// as produced) — identical to the same-context
+    /// [`open_outlet_stream`](Self::open_outlet_stream): each chunk is the
+    /// unmodified operator-signed
+    /// [`OutletStreamChunk`](scp_protocol::context::outlets::stream::OutletStreamChunk),
+    /// forwarded verbatim, and the bridge introduces no new send-sequence at this
+    /// plaintext hand-off (§5.4.5). The SCP-OUT-045 gap-detector keys on
+    /// `chunk.sequence`. Re-encryption for A's OTHER members is the SDK delivery
+    /// seam (seal each still-operator-signed chunk under A's MLS group key over
+    /// the existing §9.7/§9.8/§9.16 transport, its per-sender MLS send-sequence
+    /// reserved at the §9.16/§5.15.7 encrypt seam over A's persistent counter —
+    /// SCP-OUT-047), NOT this return type.
     ///
     /// Zero-escrow (§5.4.5 "Cross-context economy"; ADR-061): a paid Action
     /// outlet (`cost.amount > 0`) — or a positive billed `cost_per_chunk` — is
@@ -12655,7 +12656,7 @@ impl Supervisor {
         caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<
-        tokio::sync::mpsc::Receiver<crate::context::outlets::invoke::ForwardedStreamFrame>,
+        tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
         crate::context::outlets::invoke::InvocationError,
     >
     where
@@ -30694,11 +30695,11 @@ mod open_outlet_stream_tests {
         let executor: Arc<dyn OutletExecutor> = Arc::new(FiniteStreamExecutor);
         let outlet_id: OutletId = "calculator".to_owned();
 
-        // The Ok variant is a PLAINTEXT `mpsc::Receiver<ForwardedStreamFrame>`:
-        // each frame pairs the plaintext operator-signed chunk with the
-        // per-sender `base_sequence` anchor (SCP-OUT-044).
+        // The Ok variant is a PLAINTEXT `mpsc::Receiver<OutletStreamChunk>`:
+        // each item is the unmodified operator-signed chunk, forwarded verbatim
+        // (identical to the same-context path).
         let mut rx: tokio::sync::mpsc::Receiver<
-            crate::context::outlets::invoke::ForwardedStreamFrame,
+            scp_protocol::context::outlets::stream::OutletStreamChunk,
         > = supervisor
             .open_outlet_stream_cross_context(
                 a_ctx,
@@ -30717,24 +30718,17 @@ mod open_outlet_stream_tests {
             .expect("zero-cost cross-context open must be accepted");
 
         // Drain the plaintext chunks the bridge forwards to the shared-member
-        // invoker: two Data payloads followed by a terminal End. Each frame also
-        // carries the per-sender `base_sequence` anchor (SCP-OUT-044); assert it
-        // is strictly `+1`-monotone across the whole forwarded stream to prove
-        // the anchor is threaded end-to-end through the supervisor path (AC4).
+        // invoker: two Data payloads followed by a terminal End. Each chunk is
+        // the unmodified operator-signed chunk, forwarded verbatim end-to-end
+        // through the supervisor path (AC4).
         let mut data = 0u32;
         let mut saw_end = false;
-        let mut expected_base_sequence = 1u64;
-        while let Some(frame) = rx.recv().await {
+        while let Some(chunk) = rx.recv().await {
             assert_eq!(
-                frame.base_sequence, expected_base_sequence,
-                "base_sequence is per-sender +1-monotone across the forwarded stream"
+                chunk.request_id, [CTX_BYTE; 16],
+                "the pinned request_id rides on every forwarded chunk"
             );
-            assert_eq!(
-                frame.chunk.request_id, [CTX_BYTE; 16],
-                "(request_id, base_sequence) anchor is threaded onto the forwarded frame"
-            );
-            expected_base_sequence += 1;
-            match frame.chunk.payload {
+            match chunk.payload {
                 ChunkPayload::Data { .. } => data += 1,
                 ChunkPayload::End { .. } => {
                     saw_end = true;
@@ -31540,11 +31534,11 @@ mod streaming_saga_tests {
             .expect("first forwarded frame within 5s")
             .expect("first forwarded frame present");
         assert!(
-            matches!(first.chunk.payload, ChunkPayload::Data { .. }),
+            matches!(first.payload, ChunkPayload::Data { .. }),
             "AC1: the Commit-transition returns the receiver and it yields a Data chunk while \
              the stream is still producing (before any terminal)"
         );
-        let mut chunks = vec![first.chunk.clone()];
+        let mut chunks = vec![first.clone()];
 
         // AC6 (mid) — the FSM is Committing (sealing), NOT yet Committed.
         assert_eq!(
@@ -31570,9 +31564,9 @@ mod streaming_saga_tests {
             .await
             .expect("forwarded frame within 5s")
         {
-            let is_end = matches!(frame.chunk.payload, ChunkPayload::End { .. });
-            let is_terminal = is_end || matches!(frame.chunk.payload, ChunkPayload::Error { .. });
-            chunks.push(frame.chunk.clone());
+            let is_end = matches!(frame.payload, ChunkPayload::End { .. });
+            let is_terminal = is_end || matches!(frame.payload, ChunkPayload::Error { .. });
+            chunks.push(frame.clone());
             if is_end {
                 saw_end = true;
             }
@@ -31795,10 +31789,10 @@ mod streaming_saga_tests {
             tokio::time::timeout(Duration::from_secs(1), handle.receiver.recv()).await
         {
             assert!(
-                matches!(frame.chunk.payload, ChunkPayload::Data { .. }),
+                matches!(frame.payload, ChunkPayload::Data { .. }),
                 "the wedged executor emits only Data chunks (no terminal)"
             );
-            received.push(frame.chunk.clone());
+            received.push(frame.clone());
         }
         assert_eq!(
             received.len(),
@@ -32054,7 +32048,7 @@ mod streaming_saga_tests {
         while let Ok(Some(frame)) =
             tokio::time::timeout(Duration::from_secs(1), handle.receiver.recv()).await
         {
-            received.push(frame.chunk.clone());
+            received.push(frame.clone());
         }
         assert_eq!(received.len(), 5, "the 5-chunk prefix forwarded");
 
@@ -32302,7 +32296,7 @@ mod streaming_saga_tests {
         while let Ok(Some(frame)) =
             tokio::time::timeout(Duration::from_secs(1), handle.receiver.recv()).await
         {
-            received.push(frame.chunk.clone());
+            received.push(frame.clone());
         }
         assert_eq!(received.len(), 5, "the 5-chunk prefix forwarded");
 
@@ -32562,7 +32556,7 @@ mod streaming_saga_tests {
             .expect("S1 chunk 0 within 5s")
             .expect("S1 chunk 0 present");
         assert!(
-            matches!(s1_first.chunk.payload, ChunkPayload::Data { .. }),
+            matches!(s1_first.payload, ChunkPayload::Data { .. }),
             "S1 is pumping (receiver returned; reservation released at Commit)"
         );
         assert_eq!(
@@ -32621,7 +32615,7 @@ mod streaming_saga_tests {
             .expect("S2 chunk 0 within 5s")
             .expect("S2 chunk 0 present");
         assert!(
-            matches!(s2_first.chunk.payload, ChunkPayload::Data { .. }),
+            matches!(s2_first.payload, ChunkPayload::Data { .. }),
             "AC2: S2 Prepared + Committed over the overlapping set and is pumping"
         );
 
@@ -32631,7 +32625,7 @@ mod streaming_saga_tests {
             tokio::time::timeout(Duration::from_secs(5), s2.receiver.recv()).await
         {
             if matches!(
-                frame.chunk.payload,
+                frame.payload,
                 ChunkPayload::End { .. } | ChunkPayload::Error { .. }
             ) {
                 break;

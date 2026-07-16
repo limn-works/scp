@@ -2307,9 +2307,9 @@ pub enum OutletsCommand {
     /// Consumes the hard rate limit, records the velocity entry, snapshots the
     /// economic policy, gates on membership, and DEBITS the §5.4.5 open-time
     /// escrow hold (`cost_per_chunk × estimated_chunk_count`) under a
-    /// fail-closed persist. The per-sender `base_sequence` is NOT allocated here
-    /// — the send path allocates it at consumption (the cross-context hop fills
-    /// this in `forward_frame` / `run_cross_context_bridge`, SCP-OUT-044).
+    /// fail-closed persist. This reserve carries no send-sequence; A's re-seal
+    /// draws A's own persistent per-sender counter at the §9.16/§5.15.7 encrypt
+    /// seam (SCP-OUT-047) — no bridge-local counter is minted.
     /// Replies with a `Send`
     /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
     /// the supervisor carries across the off-mailbox stream pump.

@@ -2949,7 +2949,7 @@
     },
     {
       "id": "SCP-OUT-044",
-      "title": "base_sequence wiring \u2014 per-sender MLS send-seq anchor allocated at consumption on the cross-context send path (W5)",
+      "title": "Cross-context send-sequence \u2014 no bridge anchor; A's per-sender MLS send-sequence is the SDK re-seal seam's (W5)",
       "gate": "gate-streaming-saga",
       "priority": "P1",
       "severity": "major",
@@ -2957,22 +2957,23 @@
       "files": [
         "crates/scp-runtime/src/context/outlets_helpers.rs",
         "crates/scp-runtime/src/context/outlets/invoke.rs",
-        "crates/scp-runtime/src/context/actor/commands.rs"
+        "crates/scp-runtime/src/context/actor/commands.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs"
       ],
-      "description": "Wire the per-sender MLS send-sequence anchor (`base_sequence`) on the cross-context outlet-stream send path, per \u00a75.4.5 (Ordering and gaps) and ADR-049 \u00a78 SequenceReservation. Today the per-sender `base_sequence` is DELIBERATELY NOT allocated in the outlet helpers (crates/scp-runtime/src/context/outlets_helpers.rs:494 and :1073 document 'the per-sender base_sequence is NOT allocated here \u2014 the transport/FFI layer allocates at consumption'). This story allocates it at CONSUMPTION on the cross-context send path (the invoke_outlet_cross_context bridge send hop, SCP-OUT-036), so each forwarded chunk carries a monotone per-sender MLS send-seq anchor that the authoritative reassembly gap-detector (SCP-OUT-045) keys on. Allocation uses the existing SequenceReservation RAII guard (ADR-049 \u00a78) \u2014 reserved at consumption, committed on send, rolled back on drop \u2014 so send-sequence monotonicity holds across panics and early returns. This is a wiring story: it fills the documented allocate-at-consumption hole, it does not redefine the sequence model.",
+      "description": "The cross-context outlet-stream bridge (`invoke_outlet_cross_context`, SCP-OUT-036) forwards each operator-signed `OutletStreamChunk` to the shared-member invoker in-process as PLAINTEXT and returns a bare `mpsc::Receiver<OutletStreamChunk>`, identical to same-context `invoke_outlet`. Per §5.4.5 (Cross-context streaming) the bridge never re-signs a chunk and introduces NO new send-sequence at its plaintext handoff: delivery to A's OTHER members is a normal A-context MLS application message whose per-sender send-sequence is reserved at the §9.16 Sender-Side Key Layer encrypt seam over A's PERSISTENT per-sender counter (§5.15.7 Send-Sequence Reservation) — the SDK re-seal delivery seam owned by SCP-OUT-047 — via the same ADR-049 §8 SequenceReservation guard the actor uses for every MLS send. Minting a bridge-local base_sequence at the plaintext hand-off has no §5.4.5/§5.15.7 basis, would diverge from A's real persistent counter, and could never be a gap-detector key (SCP-OUT-045 keys on `chunk.sequence`, the operator per-request index §5.4.5 — the only value a lost chunk makes non-contiguous). This story records that ruling: the open-time streaming reserve allocates no send-sequence, the bridge forwarding hop allocates none, and the per-sender MLS send-sequence is the A-context re-seal's (SCP-OUT-047), reserved at consumption over A's persistent counter at the §9.16 seam. It does not redefine the sequence model; it removes a fabricated bridge counter.",
       "acceptanceCriteria": [
-        "The per-sender base_sequence is allocated at consumption on the cross-context send path via a SequenceReservation guard \u2014 grep -n 'base_sequence' crates/scp-runtime/src/context/outlets/invoke.rs returns a call site that reserves and commits the anchor on the xctx send hop (no longer only the 'NOT allocated here' comments)",
-        "The allocated base_sequence is a per-sender monotone u64 that increments by exactly 1 per forwarded chunk from a given sender \u2014 unit test asserts strict +1 monotonicity across a 5-chunk send",
-        "Allocation uses the ADR-049 \u00a78 SequenceReservation RAII guard: a send that panics or returns early before commit() rolls the reservation back (no gap burned) \u2014 test drops a reservation without commit and asserts the next allocation reuses the sequence",
-        "The forwarded OutletStreamChunk / transport frame exposes the base_sequence anchor to the gap-detector (SCP-OUT-045) as (request_id, base_sequence) \u2014 grep confirms the anchor is threaded onto the cross-context send frame, not dropped",
-        "The same-context (non-cross-context) send path is unchanged (base_sequence remains allocate-at-consumption only on the cross-context/relayed hop where the gap-detector is load-bearing) \u2014 regression test confirms a same-context stream still succeeds",
-        "cargo test -p scp-runtime succeeds"
+        "The cross-context bridge returns a bare `mpsc::Receiver<OutletStreamChunk>`, identical to same-context `invoke_outlet` — the Ok type of `invoke_outlet_cross_context` and `open_outlet_stream_cross_context` is `Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>`; grep of the two signatures confirms the bare receiver.",
+        "No bridge-minted send-sequence anchor exists on any cross-context send path — `grep -rn 'base_sequence' crates/scp-runtime` and `grep -rn 'ForwardedStreamFrame' crates/scp-runtime` both return no matches.",
+        "The off-mailbox bridge constructs no SendSequenceTracker — `grep -n 'SendSequenceTracker::new' crates/scp-runtime/src/context/outlets/invoke.rs` returns no match (the tracker remains the actor's per-context MLS-send primitive in state.rs/messaging.rs, untouched).",
+        "The outlet-helper open-time streaming reserve allocates no send-sequence and names the §9.16.1/§5.15.7 SDK re-seal seam (SCP-OUT-047) as the send-sequence locus — `grep -n 'base_sequence' crates/scp-runtime/src/context/outlets_helpers.rs crates/scp-runtime/src/context/actor/commands.rs` returns no matches.",
+        "The same-context stream path is unchanged: `invoke_outlet` still returns `mpsc::Receiver<OutletStreamChunk>` and a same-context stream still succeeds — regression test.",
+        "cargo test -p scp-runtime succeeds."
       ],
       "actionItems": [
-        "Locate the allocate-at-consumption hole at outlets_helpers.rs:494/:1073 and the xctx send hop in invoke.rs",
-        "Reserve base_sequence via SequenceReservation on the cross-context send path; commit on send",
-        "Thread the (request_id, base_sequence) anchor onto the forwarded transport frame",
-        "Add the monotonicity, RAII-rollback, and same-context-unchanged tests"
+        "Remove the ForwardedStreamFrame wrapper + its base_sequence field; collapse the bridge return to mpsc::Receiver<OutletStreamChunk> (invoke.rs, supervisor.rs)",
+        "Drop the SendSequenceTracker/SequenceReservation misuse from forward_frame/forward_bridge_terminal/run_cross_context_bridge/run_streaming_saga_seal_task; the bridge forwards the chunk directly",
+        "Rewrite the outlets_helpers.rs/commands.rs/supervisor.rs doc comments to name the §9.16.1/§5.15.7 SDK re-seal seam (SCP-OUT-047), one sentence each",
+        "Delete the base_sequence monotonicity + RAII-rollback tests"
       ],
       "blockedBy": [
         "SCP-OUT-036"
@@ -2983,12 +2984,20 @@
           "section": "### 5.4.5 Progressive Output (Streaming)"
         },
         {
-          "file": ".docs/adrs/ADR-049-actor-per-context.md",
-          "section": "### 8. `SequenceReservation` RAII"
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.15.7 Send-Sequence Reservation"
         },
         {
           "file": ".docs/specs/06-cross-context-communication.md",
           "section": "### 6.2.0 Outlet Interface Transport"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.16.1 Key Architecture"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 8. `SequenceReservation` RAII"
         }
       ],
       "details": {}
@@ -2999,25 +3008,24 @@
       "gate": "gate-streaming-saga",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
-        "crates/scp-runtime/src/context/outlets/invoke.rs",
-        "crates/scp-runtime/src/context/outlets/stream.rs"
+        "crates/scp-runtime/src/context/outlets/invoke.rs"
       ],
-      "description": "Add the AUTHORITATIVE cross-context reassembly gap-detector on the invoker-side hop of the re-encrypting bridge (SCP-OUT-036), per \u00a75.4.5 'Ordering and gaps' (receiver-locus paragraph). \u00a75.4.5 makes the SDK-drain InvocationHandle (SCP-OUT-037's ReceiverSequenceTracker) the MUST-bound receiver for same-context ordered transport; it then states that 'any additional authoritative gap-detection introduced at a cross-context reassembly layer is reconciled with this SDK-drain check as defense-in-depth (as the revocation dual-locus is), NOT as a replacement.' This story adds that runtime-side authoritative locus, keyed on (request_id, base_sequence) (the anchor from SCP-OUT-044): it tracks the expected next base_sequence (contiguous, strict +1) per (request_id, base_sequence-origin sender) and, on any non-contiguous chunk over the lossy cross-context/relayed transport, cancels the stream with OutletErrorClass::Execution::StreamGap (code SCP-OUTLET-6131) via the signed OutletCancel path. It is STRICTLY-ADDITIVE: it does NOT remove or weaken the SDK-drain ReceiverSequenceTracker; the two loci reconcile exactly as the revocation re-check dual-locus does. On the lossless same-context path the runtime pump is the producer and this detector has no gap to find (it only becomes load-bearing on the relayed cross-context hop).",
+      "description": "Add the AUTHORITATIVE cross-context reassembly gap-detector on the invoker-side hop of the re-encrypting bridge (SCP-OUT-036), per \u00a75.4.5 'Ordering and gaps' (receiver-locus paragraph). \u00a75.4.5 makes the SDK-drain InvocationHandle (SCP-OUT-037's ReceiverSequenceTracker) the MUST-bound receiver, tracking the expected next `sequence` (contiguous from 0); it then states that 'any additional authoritative gap-detection introduced at a cross-context reassembly layer is reconciled with this SDK-drain check as defense-in-depth (as the revocation dual-locus is), NOT as a replacement.' This story adds that runtime-side authoritative locus, keyed on (request_id, sequence) \u2014 the per-request operator chunk index the bridge already reads at the reassembly boundary, contiguous from 0 per \u00a75.4.5: it tracks the expected next `sequence` (strict +1) and, on any non-contiguous chunk (a dropped chunk over the cross-context hop), surfaces a terminal OutletErrorClass::Execution::StreamGap error (code SCP-OUTLET-6131) that closes the reassembly hop toward the producer (dropping inner_rx); the signed OutletCancel toward the operator is the reconciled SDK-drain locus (SCP-OUT-037) triggered by that terminal, per the \u00a75.4.5:515 dual-locus (the off-mailbox bridge holds no invoker signer, so it never mints the signed cancel itself). It is STRICTLY-ADDITIVE: it does NOT remove or weaken the SDK-drain ReceiverSequenceTracker; both loci key on `sequence` and reconcile exactly as the revocation re-check dual-locus does \u2014 the runtime locus catches a sequence gap at the reassembly boundary even if a future SDK-drain is bypassed or buggy. On the lossless path the operator pump assigns `sequence` consecutively from 0, so a contiguous stream never fires the detector; it fires only on a genuine dropped chunk.",
       "acceptanceCriteria": [
-        "An authoritative gap-detector on the invoker-side cross-context reassembly hop keys on (request_id, base_sequence) and tracks the expected next base_sequence as strict +1 \u2014 grep -n 'StreamGap\\|base_sequence' crates/scp-runtime/src/context/outlets/invoke.rs returns the detector's contiguity check",
-        "On a non-contiguous chunk (a missing base_sequence over the cross-context hop) the detector cancels the stream via the signed OutletCancel path and surfaces OutletErrorClass::Execution::StreamGap with code SCP-OUTLET-6131 \u2014 Test: a lossy cross-context stream that drops chunk sequence 4 fires StreamGap/6131",
-        "The detector is strictly-additive: SCP-OUT-037's SDK-drain ReceiverSequenceTracker is NOT removed or modified by this story \u2014 grep confirms the ReceiverSequenceTracker still exists and still runs; a comment/doc references the \u00a75.4.5 dual-locus reconciliation (defense-in-depth, not replacement)",
-        "On a lossless (contiguous) cross-context 10-chunk stream the detector does NOT fire \u2014 Test: A \u2192 B 10-chunk stream with no loss completes with no StreamGap",
+        "An authoritative gap-detector on the invoker-side cross-context reassembly hop keys on (request_id, sequence) \u2014 the per-request operator chunk index, contiguous from 0 (\u00a75.4.5 'Ordering and gaps') \u2014 and tracks the expected next sequence as strict +1 \u2014 grep -n 'StreamGap\\|gap_detector' crates/scp-runtime/src/context/outlets/invoke.rs returns the detector's contiguity check on chunk.sequence",
+        "On a non-contiguous chunk (a missing sequence over the cross-context hop) the runtime detector surfaces a TERMINAL StreamGap error (OutletErrorClass::Execution::StreamGap, code SCP-OUTLET-6131, slug execution.stream-gap) via the bridge's existing terminal machinery, which closes the reassembly hop toward the producer (dropping inner_rx = cancel toward B's pump); the signed OutletCancel toward the operator is the reconciled SDK-drain locus (SCP-OUT-037) triggered by that terminal, per the \u00a75.4.5:515 dual-locus \u2014 the off-mailbox bridge holds no invoker signer/session, so it never mints the signed cancel itself \u2014 Test: a cross-context stream that drops chunk sequence 3 (delivering 0,1,2,4) fires the StreamGap/6131 terminal",
+        "The detector is strictly-additive: SCP-OUT-037's SDK-drain ReceiverSequenceTracker is NOT removed or modified by this story \u2014 grep -rn 'ReceiverSequenceTracker' crates/scp-testing confirms it still exists and still runs (both loci key on chunk.sequence \u2014 defense-in-depth, not replacement); the 045 detector's doc-comment references the \u00a75.4.5:515 dual-locus reconciliation",
+        "On a lossless (contiguous sequence 0..9) cross-context 10-chunk stream the detector does NOT fire \u2014 Test: A \u2192 B 10-chunk stream with no loss completes with no StreamGap",
         "The same-context path is unaffected: the runtime pump is the producer and assigns sequence consecutively, so the detector has no gap to detect \u2014 regression test confirms a same-context stream never triggers the cross-context detector",
         "cargo test -p scp-runtime succeeds"
       ],
       "actionItems": [
-        "Add the (request_id, base_sequence)-keyed contiguity tracker on the invoker-side hop of invoke_outlet_cross_context",
-        "On non-contiguity, cancel via signed OutletCancel and surface StreamGap/6131",
+        "Add the (request_id, sequence)-keyed contiguity tracker (chunk.sequence, contiguous from 0) on the invoker-side hop of invoke_outlet_cross_context",
+        "On non-contiguity, surface a terminal StreamGap/6131 error that closes the reassembly hop (dropping inner_rx); the signed OutletCancel is the reconciled SDK-drain locus (037)",
         "Add a doc note referencing the \u00a75.4.5 dual-locus reconciliation with ReceiverSequenceTracker",
-        "Add the gap-fires-on-lossy, no-fire-on-lossless, and same-context-unaffected tests"
+        "Add the gap-fires-on-dropped-chunk, no-fire-on-lossless, and same-context-unaffected tests"
       ],
       "blockedBy": [
         "SCP-OUT-044",
@@ -3046,7 +3054,7 @@
       ],
       "description": "Extend the \u00a76.2.4 cross-context outlet-invocation saga FSM with ADR-061's SEAL PHASE, realizing the STREAMING SAGA (streaming \u00d7 transactional) mode of \u00a76.2.5. Mechanism, per ADR-061 'Streaming-saga mechanism (the seal phase)' and the ADR-049 \u00a73a amendment: (1) the Commit-transition confirms the reservation and TRIGGERS the pump (ADR-049 \u00a73 \u2014 Commit triggers execution across the mailbox); it does NOT block for the stream, does NOT sign a receipt yet, RETURNS the mpsc::Receiver promptly, and RELEASES the per-participant-context-set concurrency slot (per the \u00a73a amendment (b) early-release policy \u2014 analogous to the \u00a76.2.4 NeedsRepair early slot-release, since the off-mailbox pump no longer contends the actor mailbox; the node-wide max_concurrent_outlet_stream_pumps ceiling bounds the released-slot seal phases). (2) During streaming the chunks are (a) forwarded to the caller as produced (no buffering \u2014 SCP-OUT-036 bridge) and (b) captured durably and INCREMENTALLY keyed by SagaId: the O(log n) RFC-6962 MerkleFrontier (scp-protocol) plus the per-chunk credit ledger, persisted as chunks arrive \u2014 a replay snapshot, not a bridge buffer. (3) At stream-close the SEAL PHASE finalizes stream_manifest_hash from the frontier, signs the SCP-XCTX-STREAM-RECEIPT-V1 receipt (SCP-OUT-046 uses SCP-OUT-043), settles escrow via settle_at_close (refund = reserved \u2212 billed), records BOTH event logs (OutletInvoked target-side, CrossContextOutletInvoked caller-side, atomic), then FSM \u2192 Committed. The Committed terminal is reached AT CLOSE, not at the Commit-transition. (4) MID-STREAM CRASH: seal-prefix-and-close-truncated, NEVER resume \u2014 recovery computes the manifest root over the durable sealed PREFIX, signs the receipt over that truncated manifest, settles escrow at the prefix billed_count; a replayed Commit re-emits the sealed prefix + terminal close and does NOT re-invoke the outlet (re-invoking a non-deterministic LLM would break \u00a76.2.4 replay-determinism). The CancelAckTracker billing-ceiling is the primitive that makes a truncated close well-defined. This story composes the existing same-context pump primitives (open_stream_session/StreamSessionHandle/CreditTracker/StreamEscrow, SCP-OUT-033/034/035) and the best-effort cross-context bridge (SCP-OUT-036); it wires stream_manifest_hash from the frontier at the saga close site (finishing the manifest wiring for the transactional path \u2014 the seal close writes the real frontier.root(), not [0u8;32]).",
       "acceptanceCriteria": [
-        "The streaming-saga Commit-transition returns the mpsc::Receiver<ForwardedStreamFrame> (each frame wrapping an OutletStreamChunk plus the SCP-OUT-044 per-sender base_sequence anchor) and does NOT block until Committed \u2014 grep -n 'StreamingSagaHandle' crates/scp-runtime/src/context/supervisor/supervisor.rs shows start_cross_context_streaming_outlet_invocation_saga handing back the mpsc::Receiver<ForwardedStreamFrame> (in StreamingSagaHandle) at the Commit-transition before the stream terminates; a test asserts the receiver is available while the stream is still producing chunks",
+        "The streaming-saga Commit-transition returns the mpsc::Receiver<OutletStreamChunk> and does NOT block until Committed \u2014 grep -n 'StreamingSagaHandle' crates/scp-runtime/src/context/supervisor/supervisor.rs shows start_cross_context_streaming_outlet_invocation_saga handing back the mpsc::Receiver<OutletStreamChunk> (in StreamingSagaHandle) at the Commit-transition before the stream terminates; a test asserts the receiver is available while the stream is still producing chunks",
         "The Commit-transition RELEASES the per-participant-context-set concurrency slot once the pump is triggered (\u00a73a amendment (b)) \u2014 Test: a second streaming saga on an overlapping participant-context-set can Prepare+Commit while the first saga's seal phase is still pumping off-mailbox (no SagaBusy wedge)",
         "The escrow/economic reservation is NOT released at the Commit-transition; it settles at seal-close via settle_at_close (decoupled release semantics per the \u00a73a amendment) \u2014 test asserts escrow is still reserved during the pump and refunded (reserved \u2212 billed) only at close",
         "Durable incremental capture keyed by SagaId uses the RFC-6962 MerkleFrontier + per-chunk credit ledger (NOT a full-payload buffer) \u2014 grep -n 'MerkleFrontier\\|SagaId' crates/scp-runtime/src/context/supervisor/saga_prepared_state.rs shows the frontier + ledger persisted per SagaId; a test asserts memory does not grow O(n) in chunk count",
@@ -3220,14 +3228,14 @@
         "crates/scp-testing/Cargo.toml",
         ".docs/specs/25-test-vectors.md"
       ],
-      "description": "Add the cross-context streaming-saga conformance vectors, mirroring the SCP-OUT-039 same-context streaming-vector pattern but for the transactional-streaming corner (\u00a76.2.4/\u00a76.2.5). The vector suite MUST cover: (1) SEAL-PHASE \u2014 a cross-context streaming saga reaches Committed at seal-close with a non-zero stream_manifest_hash and a verifiable SCP-XCTX-STREAM-RECEIPT-V1 receipt; (2) TRUNCATED-CLOSE \u2014 a mid-stream crash seals the durable prefix, signs the receipt over the truncated manifest, and settles escrow at the prefix billed_count without re-invoking the outlet; (3) STREAM-RECEIPT ROUND-TRIP KAT \u2014 a fixed (caller/target/nonce/manifest-root/\u2026) input produces a byte-exact SCP-XCTX-STREAM-RECEIPT-V1 preimage and a receipt that verify() accepts and any single-field mutation rejects; (4) XCTX 10-CHUNK A\u2192B \u2014 a 10-chunk cross-context stream completes and both event logs record the same stream_manifest_hash; (5) GAP-DETECTOR-FIRES-ON-LOSSY \u2014 a lossy cross-context stream that drops a base_sequence fires StreamGap/6131; (6) AGGREGATE-SCHEMA-VIOLATION \u2014 an End.aggregate violating aggregate_schema produces Error/6140. Vectors are checked-in JSON consumed by the scp-testing integration harness and referenced in \u00a725.",
+      "description": "Add the cross-context streaming-saga conformance vectors, mirroring the SCP-OUT-039 same-context streaming-vector pattern but for the transactional-streaming corner (\u00a76.2.4/\u00a76.2.5). The vector suite MUST cover: (1) SEAL-PHASE \u2014 a cross-context streaming saga reaches Committed at seal-close with a non-zero stream_manifest_hash and a verifiable SCP-XCTX-STREAM-RECEIPT-V1 receipt; (2) TRUNCATED-CLOSE \u2014 a mid-stream crash seals the durable prefix, signs the receipt over the truncated manifest, and settles escrow at the prefix billed_count without re-invoking the outlet; (3) STREAM-RECEIPT ROUND-TRIP KAT \u2014 a fixed (caller/target/nonce/manifest-root/\u2026) input produces a byte-exact SCP-XCTX-STREAM-RECEIPT-V1 preimage and a receipt that verify() accepts and any single-field mutation rejects; (4) XCTX 10-CHUNK A\u2192B \u2014 a 10-chunk cross-context stream completes and both event logs record the same stream_manifest_hash; (5) GAP-DETECTOR-FIRES-ON-LOSSY \u2014 a lossy cross-context stream that drops a chunk (making chunk.sequence non-contiguous) fires StreamGap/6131; (6) AGGREGATE-SCHEMA-VIOLATION \u2014 an End.aggregate violating aggregate_schema produces Error/6140. Vectors are checked-in JSON consumed by the scp-testing integration harness and referenced in \u00a725.",
       "acceptanceCriteria": [
         "A checked-in vector file tests/conformance/vectors/outlet_streaming_saga_vectors.json exists with named cases for all six scenarios (seal_phase, truncated_close, stream_receipt_kat, xctx_10_chunk, gap_detector_lossy, aggregate_schema_violation) \u2014 grep -n each case name returns a JSON entry",
         "seal_phase vector: the harness drives a cross-context streaming saga to Committed at seal-close and asserts a non-zero 32-byte stream_manifest_hash and a verifiable SCP-XCTX-STREAM-RECEIPT-V1 receipt",
         "truncated_close vector: a mid-stream crash after chunk 5 of 10 yields a receipt over the truncated (prefix) manifest, escrow settled at the prefix billed_count, and the outlet exec fn invoked exactly once (call-count assertion)",
         "stream_receipt_kat vector: a fixed input produces the byte-exact SCP-XCTX-STREAM-RECEIPT-V1 preimage; the resulting receipt passes verify() and any single-field mutation fails verify()",
         "xctx_10_chunk vector: a 10-chunk A\u2192B cross-context streaming saga completes and both context event logs record the identical stream_manifest_hash",
-        "gap_detector_lossy vector: a lossy cross-context stream dropping a base_sequence fires OutletErrorClass::Execution::StreamGap (SCP-OUTLET-6131)",
+        "gap_detector_lossy vector: a lossy cross-context stream dropping a chunk (non-contiguous chunk.sequence) fires OutletErrorClass::Execution::StreamGap (SCP-OUTLET-6131)",
         "aggregate_schema_violation vector: an End.aggregate violating aggregate_schema produces Error { code: 'SCP-OUTLET-6140', terminal: true }",
         "The vectors are referenced in .docs/specs/25-test-vectors.md and consumed by crates/scp-testing/tests/integration/outlet_streaming_saga_conformance.rs",
         "cargo test -p scp-testing --test outlet_streaming_saga_conformance succeeds"
