@@ -55,7 +55,6 @@ from typing import (
     runtime_checkable,
 )
 
-from scp_sdk.economy import PaymentReceiptVerificationResult
 from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
 
@@ -2186,7 +2185,7 @@ class SCP:
 
     async def economy_verify_payment_receipts(
         self, receipts: list[dict[str, Any]]
-    ) -> PaymentReceiptVerificationResult:
+    ) -> dict[str, Any]:
         """Delegate to ``_scp_core.SCP.economy_verify_payment_receipts``.
 
         Verifies a batch of payment receipts against this instance's economy
@@ -2200,9 +2199,9 @@ class SCP:
                 10,000 receipts per call.
 
         Returns:
-            A :class:`~scp_sdk.PaymentReceiptVerificationResult` with
-            ``all_valid`` and a list of per-receipt
-            :class:`~scp_sdk.PaymentReceiptVerificationEntry` records.
+            A dict with keys ``all_valid`` (bool) and ``results`` (list of
+            per-receipt dicts with ``receipt_id``, ``ok``, ``valid``, and
+            ``result`` keys).
 
         Raises:
             ScpError: If the receipts are invalid or the supervisor is
