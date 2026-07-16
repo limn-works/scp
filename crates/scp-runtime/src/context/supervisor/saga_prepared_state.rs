@@ -709,7 +709,7 @@ pub struct CommittedStreamingOutletInvocation {
     /// IDENTICAL settlement without recomputing.
     pub billed: Amount,
     /// Escrow refund at seal-close = `reserved − billed`; stored so a replay
-    /// re-emits the same refund (the money already moved on the first settle).
+    /// re-emits the same refund.
     pub refund: Amount,
     /// The §5.4.5 billable-`Data`-chunk count sealed at close
     /// (`frontier.billed_count()`), recorded into the B-side `OutletInvoked` event.
@@ -720,6 +720,52 @@ pub struct CommittedStreamingOutletInvocation {
     /// The `SagaId`-stable `OutletInvoked` event-log entry id (also carried on the
     /// receipt; stored explicitly so a replay re-acks the same id).
     pub outlet_invoked_event_id: String,
+    /// SCP-OUT-046 CRITICAL — settlement-atomicity flag. The seal handler inserts
+    /// this witness with `settled = false` in the SAME Class-S persist that clears
+    /// the staged slot, BEFORE the off-mailbox money move runs (the money move is
+    /// a separate off-mailbox
+    /// [`settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)).
+    /// The on-actor `SettleOutletStream` handler flips it to `true` in the SAME
+    /// Class-S persist as the money move (refund + counter release), so `settled`
+    /// is the durable, atomic record that the escrow refund + §7.3.8 counter
+    /// release actually landed. It is the double-refund guard for the xctx path
+    /// (which has NO `stream_reservations` reconcile net — the streaming saga runs
+    /// with `settlement_sink = None`). Crash recovery reads it: witness present &
+    /// `settled == false` ⇒ the money move never ran (crash / eviction in the
+    /// seal→settle window) ⇒ rebuild the settlement from the durable fields below
+    /// and APPLY it (money ops need NO signing key); `settled == true` ⇒ resolve
+    /// `Committed` idempotently, moving no money.
+    pub settled: bool,
+    // ---- Durable settlement-rebuild fields (SCP-OUT-046) ----
+    // Copied from the prepared slot into the witness at seal, since the prepared
+    // slot is REMOVED at seal — so keyless crash recovery can reconstruct the
+    // complete `StreamSettlement` from the witness alone, with no live pump and no
+    // staged slot.
+    /// Target (B) context id — the settlement's `context_id` is `hex(this)`.
+    pub target_context_id: [u8; 32],
+    /// The §5.4.5 `invoker_did` whose escrow hold the refund credits back.
+    pub invoker_did: DID,
+    /// Total escrow reserved at open (`billed + refund`) — receipt/audit provenance.
+    pub reserved: Amount,
+    /// The stream `request_id` — the settlement's receipt + event-log provenance
+    /// key, and the `stream_reservations` map key on the same-context path.
+    pub request_id: [u8; 16],
+    /// Outlet registration id — the settlement's `outlet_id`.
+    pub outlet_registration_id: String,
+    /// The §5.4.5 MED-HIGH economic policy snapshotted at acceptance (raw, so it
+    /// serializes with the witness). `None` for zero-cost / Query streams. Drives
+    /// the close-time `PaymentReceipt` capture on recovery.
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+    /// The §7.3.8 worst-case cumulative-counter amount reserved at open — the
+    /// recovery settlement releases the unspent portion back to the counter.
+    pub amount_cumulative_reserved: u64,
+    /// The invoker-declared `estimated_chunk_count` (diagnostics / event field).
+    pub reserved_chunks: u32,
+    /// The opening UCAN CID — the §7.3.8 `AmountCumulative` counter's key.
+    pub ucan_cid: String,
+    /// The per-billable-`Data`-chunk cost — the unit the cumulative release
+    /// multiplies the unspent chunk count by.
+    pub cost_per_chunk: Amount,
 }
 
 /// Caller-side (A-owned) durable reversal record for a cross-context outlet

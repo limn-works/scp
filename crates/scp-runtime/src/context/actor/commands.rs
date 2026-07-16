@@ -613,6 +613,19 @@ pub struct SendPseudonymAnnouncementPayload {
 /// [`ed25519_dalek::SigningKey`] from the bytes on the receive side.
 pub struct SigningKeyBytes(pub zeroize::Zeroizing<[u8; 32]>);
 
+/// Redacting `Debug` (security def-in-depth): the seed bytes are NEVER formatted
+/// into a log line. `SigningKeyBytes` deliberately does not `derive(Debug)`, but
+/// providing a redacting impl means a FUTURE enclosing enum/struct that DOES
+/// `derive(Debug)` (a command variant carrying this key) prints `<redacted>`
+/// instead of failing to compile OR dumping the key bytes.
+impl std::fmt::Debug for SigningKeyBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SigningKeyBytes")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
 impl SigningKeyBytes {
     /// Construct from an [`ed25519_dalek::SigningKey`] borrowed from
     /// the caller. Copies the 32-byte seed so the caller's key can be
@@ -2497,11 +2510,21 @@ pub enum OutletsCommand {
         /// Spawn-generation the reservation was made against. Compared to the
         /// live actor's `PerContextState::generation`; a mismatch DROPS.
         generation: u64,
+        /// SCP-OUT-046 CRITICAL — the streaming-saga witness key. `Some` for the
+        /// cross-context streaming saga (the seal task + crash recovery): on a
+        /// clean matching-instance settle the handler flips
+        /// `xctx_committed_stream_outputs[saga_id].settled = true` in the SAME
+        /// Class-S persist as the money move, making the money+flag atomic and the
+        /// flag the double-refund guard (the xctx path has no `stream_reservations`
+        /// reconcile net). `None` for the same-context streaming pump (whose double
+        /// -release guard is the `stream_reservations` record).
+        witness_saga_id: Option<crate::context::supervisor::saga_journal::SagaId>,
         /// Oneshot reply carrying the captured receipt (`None` when nothing was
-        /// billed / no adapter / capture failed / dropped on generation
-        /// mismatch), or the dispatch / transport infra error.
-        reply:
-            oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
+        /// billed / no adapter / capture failed / deferred on generation mismatch)
+        /// plus `applied` — whether the owned-state settlement (refund + release +
+        /// witness-settled flag) actually landed on the matching live instance, or
+        /// was DEFERRED (gen-mismatch / no-actor) for crash recovery to complete.
+        reply: oneshot::Sender<Result<StreamSettleApplication, ContextError>>,
     },
 
     /// Fix-D — durably persist the streaming crash-recovery
@@ -3094,8 +3117,8 @@ pub struct CommitBStreamSettleOutcome {
     /// The target's signed streaming receipt bytes (JCS of
     /// [`CrossContextOutletStreamReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt)).
     pub receipt: Vec<u8>,
-    /// The sealed RFC-6962 Merkle root (`frontier.root()`) — the real 32-byte
-    /// `stream_manifest_hash`, never `[0u8; 32]`.
+    /// The sealed RFC-6962 Merkle root (`frontier.root()`) — the
+    /// `stream_manifest_hash` (`[0u8; 32]` for an honest empty/zero-chunk prefix).
     pub stream_manifest_hash: [u8; 32],
     /// Credit billed at seal-close, settled from the DURABLE ledger
     /// (`cost_per_chunk × billed_count` via `StreamEscrow::settle_at_close`) —
@@ -3122,18 +3145,65 @@ pub struct CommitBStreamSettleOutcome {
     /// (the money already moved on the first settle; the seal task must NOT
     /// re-apply it). Boxed to keep the outcome small.
     pub settlement: Option<Box<crate::context::outlets::invoke::StreamSettlement>>,
-    /// B's CURRENT spawn-generation at seal time (SCP-OUT-046 #136). The normal
-    /// seal task ignores it (it settles under the RESERVE-time generation for the
-    /// confused-deputy drop-on-respawn guard). The KEY-BEARING crash-recovery
-    /// truncated close uses it: after a crash B respawned with the durable state
-    /// restored, so the recovery settlement must target B's CURRENT generation to
-    /// APPLY against the restored hold (the reserve-time generation is lost).
+    /// B's CURRENT spawn-generation at seal time (SCP-OUT-046). BOTH the normal
+    /// seal task AND crash recovery settle against THIS seal-time generation (not
+    /// the reserve-time generation): the seal just ran on this instance, so its
+    /// generation is the one the off-mailbox settle must target to APPLY against
+    /// the live hold. Using the reserve-time generation instead would falsely
+    /// mismatch after a mid-stream respawn and strand the refund + counter release
+    /// (the confused-deputy guard would drop a settlement meant for THIS instance).
     pub generation: u64,
 }
 
 /// Reply-channel type alias for [`SagaPhaseMessage::CommitBStreamSettle`].
 pub type CommitBStreamSettleReply =
     oneshot::Sender<Result<CommitBStreamSettleOutcome, ContextError>>;
+
+/// Reply payload for [`OutletsCommand::SettleOutletStream`] (SCP-OUT-046
+/// CRITICAL settlement-atomicity). Carries the captured `PaymentReceipt` (if
+/// any) plus whether the owned-state settlement actually LANDED.
+#[derive(Debug)]
+pub struct StreamSettleApplication {
+    /// The §19.15.5 `PaymentReceipt` captured for the billed amount, or `None`
+    /// (nothing billed / no adapter / capture failed / deferred).
+    pub receipt: Option<crate::economy::adapter::PaymentReceipt>,
+    /// `true` iff the matching-live-instance settlement applied — the escrow
+    /// refund + §7.3.8 counter release landed AND (for a witness-bearing xctx
+    /// settlement) `xctx_committed_stream_outputs[saga_id].settled` was flipped to
+    /// `true` in the same Class-S persist. `false` means the settle was DEFERRED
+    /// (generation mismatch / no resident actor): no owned state was touched and,
+    /// for a witness-bearing settlement, NO capture ran either — the durable
+    /// witness stays unsettled for crash recovery to complete exactly once.
+    pub applied: bool,
+}
+
+/// Reply payload for [`SagaPhaseMessage::StreamSettleCheckWitness`] (SCP-OUT-046
+/// CRITICAL; §17.16.4 crash recovery). READ-ONLY snapshot of the durable
+/// streaming seal witness the keyless recovery sweep needs to decide how to
+/// resolve a `Committing` streaming saga.
+#[derive(Debug)]
+pub struct StreamWitnessRecoveryStatus {
+    /// `true` iff the `SagaId` is durably captured in
+    /// `xctx_committed_stream_outputs` (the seal-close landed before any crash).
+    pub present: bool,
+    /// The witness's `settled` flag — `true` iff the money move (refund + counter
+    /// release) already landed. Meaningful only when `present`.
+    pub settled: bool,
+    /// B's CURRENT spawn-generation — the generation the recovery settlement must
+    /// target so the confused-deputy guard admits it against the restored hold.
+    pub generation: u64,
+    /// The close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// rebuilt from the witness's durable fields — `Some` iff `present && !settled`
+    /// (the money still needs to move). Money ops need NO signing key, so keyless
+    /// recovery applies it directly.
+    pub settlement: Option<Box<crate::context::outlets::invoke::StreamSettlement>>,
+    /// The A-side dual-log leaf reconstruction inputs (JCS receipt bytes + sealed
+    /// root + counts + event id) — `Some` iff `present` and the stored receipt
+    /// parses. Recovery records the `CrossContextOutletInvoked` leaf from this so
+    /// the dual-log is completed even if the seal task crashed before recording it
+    /// (SCP-OUT-046 #135; best-effort, convergent leaf).
+    pub a_event: Option<Box<CommitBStreamSettleOutcome>>,
+}
 
 /// Boxed field set for [`SagaPhaseMessage::PrepareBStreaming`] (ADR-061 seal
 /// phase; spec §6.2.5). The unary §6.2.4 Prepare-B field set + the streaming
@@ -3531,8 +3601,9 @@ pub enum SagaPhaseMessage {
     StreamSettleCheckWitness {
         /// Durable saga identifier (the `xctx_committed_stream_outputs` key).
         saga_id: crate::context::supervisor::saga_journal::SagaId,
-        /// Oneshot reply: `true` iff the streaming seal is durably captured.
-        reply: oneshot::Sender<Result<bool, ContextError>>,
+        /// Oneshot reply: the durable witness recovery status (present / settled /
+        /// rebuilt settlement / A-side leaf inputs), READ-ONLY.
+        reply: oneshot::Sender<Result<StreamWitnessRecoveryStatus, ContextError>>,
     },
     /// Stage the §7.3.8 cumulative-counter reserve into the durable streaming
     /// prepared slot (ADR-061 seal phase; SCP-OUT-046). Runs on the LOCAL target

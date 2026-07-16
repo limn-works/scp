@@ -1587,6 +1587,13 @@ pub async fn settle_outlet_stream(
     deps: &ActorDeps,
     settlement: crate::context::outlets::invoke::StreamSettlement,
     generation: u64,
+    // SCP-OUT-046 CRITICAL — the cross-context streaming-saga witness key. `Some`
+    // ⇒ this settle also flips `xctx_committed_stream_outputs[saga_id].settled` to
+    // `true` in the SAME Class-S persist as the money move (atomic money+flag; the
+    // flag is the xctx double-refund guard), AND — on a generation mismatch —
+    // DEFERS the entire settlement (no capture) so crash recovery completes it
+    // exactly once against the restored instance rather than double-billing.
+    witness_saga_id: Option<&crate::context::supervisor::saga_journal::SagaId>,
 ) -> StreamSettleOutcome {
     // Destructure up front so the Fix-D generation-mismatch branch below can
     // read the settlement for its snapshot-policy capture. `reserved`
@@ -1657,6 +1664,23 @@ pub async fn settle_outlet_stream(
     // replaced state (the record is stripped on export). Either way this path
     // does NOT clear the record.
     if generation != cell.generation {
+        // SCP-OUT-046 CRITICAL — a witness-bearing cross-context streaming
+        // settlement DEFERS ENTIRELY on a generation mismatch: touch no owned
+        // state AND do NOT capture. The durable witness stays `settled == false`,
+        // so crash recovery completes the WHOLE settlement (refund + release +
+        // capture) exactly once against the restored instance. Capturing here and
+        // letting recovery re-capture would double-bill the invoker (the xctx path
+        // has no `stream_reservations` reconcile net to dedup the capture).
+        if witness_saga_id.is_some() {
+            tracing::debug!(
+                context_id = %context_id,
+                reserved_generation = generation,
+                live_generation = cell.generation,
+                "outlet stream settlement (xctx saga) landed on a replaced instance — \
+                 deferring the whole settlement to crash recovery (witness left unsettled)"
+            );
+            return StreamSettleOutcome::CapturedWithoutMutation(None);
+        }
         tracing::debug!(
             context_id = %context_id,
             reserved_generation = generation,
@@ -1757,7 +1781,11 @@ pub async fn settle_outlet_stream(
     // only the crash-recovery figure a clean settle supersedes.
     let request_key = hex::encode(request_id);
     let has_record = cell.class_s.stream_reservations.contains_key(&request_key);
-    if should_release || refund_amount.value() > 0 || has_record {
+    // SCP-OUT-046 CRITICAL: a witness-bearing xctx settle ALWAYS persists (even a
+    // zero-money settle) so the `settled` flag is flipped atomically with any
+    // money move — recovery reads the flag to know the settlement completed.
+    let witness_for_commit = witness_saga_id.cloned();
+    if should_release || refund_amount.value() > 0 || has_record || witness_for_commit.is_some() {
         let invoker_for_commit = invoker_did.clone();
         let ucan_for_commit = ucan_cid.clone();
         let commit_result = cell
@@ -1780,6 +1808,15 @@ pub async fn settle_outlet_stream(
                 // Unconditionally drop the crash-recovery record on the clean
                 // terminal (no-op if absent) — the double-release guard.
                 state.class_s.stream_reservations.remove(&request_key);
+                // SCP-OUT-046 CRITICAL — flip the streaming-saga witness `settled`
+                // flag in the SAME Class-S persist as the money move, so money+flag
+                // are atomic and the flag is the durable double-refund guard for
+                // the xctx path (a no-op if the witness is somehow already gone).
+                if let Some(sid) = witness_for_commit.as_ref()
+                    && let Some(w) = state.class_s.xctx_committed_stream_outputs.get_mut(sid)
+                {
+                    w.settled = true;
+                }
                 Ok(())
             })
             .await;

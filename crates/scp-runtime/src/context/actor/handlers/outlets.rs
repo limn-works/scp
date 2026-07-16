@@ -210,8 +210,12 @@ pub(crate) async fn dispatch(
         OutletsCommand::SettleOutletStream {
             settlement,
             generation,
+            witness_saga_id,
             reply,
-        } => handle_settle_outlet_stream(cell, deps, settlement, generation, reply).await,
+        } => {
+            handle_settle_outlet_stream(cell, deps, settlement, generation, witness_saga_id, reply)
+                .await
+        }
         OutletsCommand::PersistStreamReservation {
             context_id,
             request_id,
@@ -388,22 +392,39 @@ async fn handle_settle_outlet_stream(
     deps: &ActorDeps,
     settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
     generation: u64,
-    reply: oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
+    witness_saga_id: Option<crate::context::supervisor::saga_journal::SagaId>,
+    reply: oneshot::Sender<
+        Result<crate::context::actor::commands::StreamSettleApplication, ContextError>,
+    >,
 ) -> Outcome<()> {
+    use crate::context::actor::commands::StreamSettleApplication;
     use crate::context::outlets_helpers::StreamSettleOutcome;
-    match crate::context::outlets_helpers::settle_outlet_stream(cell, deps, *settlement, generation)
-        .await
+    match crate::context::outlets_helpers::settle_outlet_stream(
+        cell,
+        deps,
+        *settlement,
+        generation,
+        witness_saga_id.as_ref(),
+    )
+    .await
     {
         StreamSettleOutcome::CapturedWithoutMutation(receipt) => {
-            // Fix-D: generation mismatch — a receipt may have been captured for
-            // rendered service, but NO owned state was touched (the durable
-            // reserves are left for the restore-time reconcile sweep). Reply the
-            // receipt WITHOUT flagging a mutation (no coalesced persist).
-            let _ = reply.send(Ok(receipt));
+            // Fix-D / SCP-OUT-046: generation mismatch — DEFERRED. No owned state
+            // was touched (durable reserves left for the restore-time reconcile
+            // sweep / crash recovery), and for a witness-bearing xctx settle no
+            // capture ran either. Reply `applied: false` so the caller leaves the
+            // journal `Committing` for recovery to complete exactly once.
+            let _ = reply.send(Ok(StreamSettleApplication {
+                receipt,
+                applied: false,
+            }));
             Outcome::ok(())
         }
         StreamSettleOutcome::Settled(receipt) => {
-            let _ = reply.send(Ok(receipt));
+            let _ = reply.send(Ok(StreamSettleApplication {
+                receipt,
+                applied: true,
+            }));
             Outcome::ok_mutated(())
         }
     }

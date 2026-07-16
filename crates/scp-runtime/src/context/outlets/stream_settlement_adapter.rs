@@ -135,8 +135,11 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
         let supervisor = Arc::clone(&self.supervisor);
         let generation = self.generation;
         self.runtime.spawn(async move {
+            // Same-context streaming pump: no cross-context witness (its double-
+            // release guard is the `stream_reservations` record), so
+            // `witness_saga_id: None`. The captured receipt is fire-and-forget.
             if let Err(e) = supervisor
-                .settle_outlet_stream_via_actor(settlement, generation)
+                .settle_outlet_stream_via_actor(settlement, generation, None)
                 .await
             {
                 // A dispatch failure (reply channel closed / residual not-
@@ -518,6 +521,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 50, None),
             live_gen,
+            None,
         )
         .await;
 
@@ -580,8 +584,14 @@ mod tests {
 
         // reserved = 0 (open reserved nothing; the grant's apply rejected so the
         // ledger never extended), billed = 0, refund = 0, cumulative = 0.
-        let outcome =
-            settle_outlet_stream(&mut cell, &deps, settlement(0, 0, 0, 0, 0, None), live_gen).await;
+        let outcome = settle_outlet_stream(
+            &mut cell,
+            &deps,
+            settlement(0, 0, 0, 0, 0, None),
+            live_gen,
+            None,
+        )
+        .await;
 
         assert!(
             matches!(outcome, StreamSettleOutcome::Settled(None)),
@@ -619,6 +629,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 50, None),
             live_gen.wrapping_add(1),
+            None,
         )
         .await;
 
@@ -667,6 +678,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 50, Some(snapshot)),
             live_gen.wrapping_add(1),
+            None,
         )
         .await;
 
@@ -726,6 +738,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 50, None),
             live_gen,
+            None,
         )
         .await;
 
@@ -814,6 +827,7 @@ mod tests {
             &deps,
             settlement(0, 0, 10, 10, 40, None),
             live_gen,
+            None,
         )
         .await;
         assert!(matches!(outcome, StreamSettleOutcome::Settled(None)));
@@ -830,6 +844,7 @@ mod tests {
             &deps,
             settlement(0, 0, 2, u64::MAX, 40, None),
             live_gen,
+            None,
         )
         .await;
         assert!(matches!(outcome, StreamSettleOutcome::Settled(None)));
@@ -886,6 +901,7 @@ mod tests {
             &deps,
             settlement(30, 70, 3, 10, 0, None),
             live_gen,
+            None,
         )
         .await;
 
@@ -925,11 +941,13 @@ mod tests {
         );
 
         let snap = EconomicPolicySnapshot { policy: policy() };
-        let receipt = supervisor
-            .settle_outlet_stream_via_actor(settlement(30, 70, 3, 10, 50, Some(snap)), 0)
+        let application = supervisor
+            .settle_outlet_stream_via_actor(settlement(30, 70, 3, 10, 50, Some(snap)), 0, None)
             .await
             .expect("the no-actor fallback never errors");
-        let receipt = receipt.expect("captured against the open-time snapshot");
+        let receipt = application
+            .receipt
+            .expect("captured against the open-time snapshot");
         assert_eq!(receipt.amount, Amount::new(30));
         assert_eq!(receipt.action_type, PaidActionType::OutletCall);
         assert_eq!(captured.load(Ordering::SeqCst), 1);

@@ -2241,21 +2241,72 @@ async fn prepare_b_streaming(
 
 /// [`SagaPhaseMessage::StreamSettleCheckWitness`] handler (ADR-061 seal phase;
 /// §17.16.4 crash recovery). Runs on the LOCAL target (B) actor. READ-ONLY: no
-/// mutation, no Class-S persist. Reports whether this `SagaId` is already
-/// durably sealed (present in `xctx_committed_stream_outputs`) — the streaming
-/// sibling of [`commit_a_check_witness`]. The autonomous crash-recovery sweep
-/// uses it to resolve an already-sealed streaming saga to `Committed` without a
-/// signing key.
+/// mutation, no Class-S persist. Reports the durable witness recovery status for
+/// this `SagaId` — present / `settled` / the rebuilt money settlement (when
+/// unsettled) / the A-side dual-log leaf inputs / B's current generation. The
+/// autonomous keyless crash-recovery sweep uses it to (a) resolve an
+/// already-settled streaming saga to `Committed` idempotently, (b) COMPLETE the
+/// money move for a witness-present-but-unsettled saga (crash / eviction in the
+/// seal→settle window — money ops need no signing key), or (c) mark a
+/// witness-absent saga `NeedsRepair` for the key-bearing truncated close.
 fn stream_settle_check_witness(
     cell: &crate::context::actor::class_s::ClassSCell,
     saga_id: &SagaId,
-    reply: tokio::sync::oneshot::Sender<Result<bool, ContextError>>,
+    reply: tokio::sync::oneshot::Sender<
+        Result<crate::context::actor::commands::StreamWitnessRecoveryStatus, ContextError>,
+    >,
 ) -> Outcome<()> {
-    let recorded = cell
+    use crate::context::actor::commands::StreamWitnessRecoveryStatus;
+    let generation = cell.generation;
+    let status = cell
         .class_s
         .xctx_committed_stream_outputs
-        .contains_key(saga_id);
-    let _ = reply.send(Ok(recorded));
+        .get(saga_id)
+        .map_or_else(
+            || StreamWitnessRecoveryStatus {
+                present: false,
+                settled: false,
+                generation,
+                settlement: None,
+                a_event: None,
+            },
+            |committed| {
+                // Rebuild the money settlement iff the witness is unsettled (the money
+                // move never landed) — money ops need no signing key.
+                let settlement = if committed.settled {
+                    None
+                } else {
+                    Some(Box::new(rebuild_stream_settlement(committed)))
+                };
+                // Reconstruct the A-side dual-log leaf inputs (SCP-OUT-046 #135) so
+                // recovery can complete the best-effort `CrossContextOutletInvoked`
+                // leaf the seal task records BEFORE the money move (and may miss on a
+                // crash). A receipt that will not re-serialize simply omits the leaf.
+                let a_event = jcs_stream_receipt_bytes(&committed.receipt)
+                    .ok()
+                    .map(|receipt| {
+                        Box::new(CommitBStreamSettleOutcome {
+                            receipt,
+                            stream_manifest_hash: committed.stream_manifest_hash,
+                            billed: committed.billed,
+                            refund: committed.refund,
+                            billed_count: committed.billed_count,
+                            stream_chunk_count: committed.stream_chunk_count,
+                            outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
+                            settlement: None,
+                            generation,
+                        })
+                    });
+                StreamWitnessRecoveryStatus {
+                    present: true,
+                    settled: committed.settled,
+                    generation,
+                    settlement,
+                    a_event,
+                }
+            },
+        );
+    let _ = reply.send(Ok(status));
     Outcome::ok(())
 }
 
@@ -2409,7 +2460,7 @@ async fn stream_stage_counter_reserve(
 /// Merkle root — never a per-chunk 2PC.
 ///
 /// On the FIRST settle: finalizes `stream_manifest_hash = frontier.root()` (the
-/// real 32-byte root, NEVER `[0u8; 32]`), signs the
+/// RFC-6962 root — `[0u8; 32]` for an honest empty/zero-chunk prefix), signs the
 /// [`CrossContextOutletStreamReceipt`] (`SCP-XCTX-STREAM-RECEIPT-V1`) over the
 /// STAGED `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms` +
 /// the root + the `SagaId`-stable event id, durably captures the
@@ -2463,9 +2514,46 @@ async fn commit_b_stream_settle(
     }
 }
 
+/// Rebuild the close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+/// from a durable committed-streaming witness (SCP-OUT-046 CRITICAL). The seal
+/// copies every settlement input into the witness at seal (the prepared slot is
+/// removed there), so keyless crash recovery — and an idempotent re-driven
+/// `CommitBStreamSettle` — can reconstruct the EXACT settlement with no live pump
+/// and no staged slot. Money ops need no signing key, so this needs none.
+fn rebuild_stream_settlement(
+    committed: &CommittedStreamingOutletInvocation,
+) -> crate::context::outlets::invoke::StreamSettlement {
+    crate::context::outlets::invoke::StreamSettlement {
+        context_id: hex_context_id(&committed.target_context_id),
+        invoker_did: committed.invoker_did.clone(),
+        reserved: committed.reserved,
+        billed_amount: committed.billed,
+        refund_amount: committed.refund,
+        billed_count: committed.billed_count,
+        request_id: committed.request_id,
+        outlet_id: committed.outlet_registration_id.clone(),
+        economic_policy_snapshot: committed
+            .economic_policy
+            .clone()
+            .map(|policy| crate::context::outlets::invoke::EconomicPolicySnapshot { policy }),
+        amount_cumulative_reserved: committed.amount_cumulative_reserved,
+        reserved_chunks: committed.reserved_chunks,
+        ucan_cid: committed.ucan_cid.clone(),
+        cost_per_chunk: committed.cost_per_chunk,
+    }
+}
+
 /// Re-emit a durably-captured streaming seal on a replay (ADR-061; §17.16.4):
 /// the stored receipt + sealed root are returned verbatim; the outlet is NOT
 /// re-invoked and nothing is re-signed.
+///
+/// SCP-OUT-046 CRITICAL — the re-emit is fully idempotent AND completing: it
+/// returns the rebuilt `settlement` iff the witness is NOT yet `settled` (the
+/// money move never landed — a crash / eviction in the seal→settle window), so a
+/// re-driven `CommitBStreamSettle` completes the money move exactly once
+/// (`settle_outlet_stream_via_actor` flips `settled` atomically with the money).
+/// Once `settled`, `settlement` is `None` (the money already moved) so no replay
+/// double-settles.
 fn reemit_committed_stream_settle(
     committed: &CommittedStreamingOutletInvocation,
     generation: u64,
@@ -2473,6 +2561,11 @@ fn reemit_committed_stream_settle(
 ) -> Outcome<()> {
     match jcs_stream_receipt_bytes(&committed.receipt) {
         Ok(receipt) => {
+            let settlement = if committed.settled {
+                None
+            } else {
+                Some(Box::new(rebuild_stream_settlement(committed)))
+            };
             let _ = reply.send(Ok(CommitBStreamSettleOutcome {
                 receipt,
                 stream_manifest_hash: committed.stream_manifest_hash,
@@ -2481,9 +2574,7 @@ fn reemit_committed_stream_settle(
                 billed_count: committed.billed_count,
                 stream_chunk_count: committed.stream_chunk_count,
                 outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
-                // REPLAY: the money already moved on the first settle — the seal
-                // task must NOT re-apply it (idempotent seal-close).
-                settlement: None,
+                settlement,
                 generation,
             }));
             Outcome::ok(())
@@ -2548,8 +2639,10 @@ async fn commit_b_stream_first_settle(
             )));
         };
 
-        // Seal the manifest root from the durable frontier prefix (the REAL
-        // 32-byte root — never `[0u8; 32]`) + finalize the §5.4.5 counts.
+        // Seal the manifest root from the durable frontier prefix (the RFC-6962
+        // `frontier.root()`) + finalize the §5.4.5 counts. An EMPTY / zero-chunk
+        // sealed prefix legitimately yields `[0u8; 32]` — an honest zero-billed
+        // empty-stream attestation, not a placeholder.
         let stream_manifest_hash = prepared.frontier.root();
         let billed_count = u32::try_from(prepared.frontier.billed_count()).unwrap_or(u32::MAX);
         let stream_chunk_count = prepared.frontier.leaf_count();
@@ -2571,6 +2664,18 @@ async fn commit_b_stream_first_settle(
             escrow.accrue_one_chunk();
         }
         let (billed, refund, _settled_count) = escrow.settle_at_close();
+
+        // Defense-in-depth (crypto): the escrow's credit ceiling guarantees
+        // `billed ≤ reserved` by construction (the pump never accrues past the
+        // reserve). Assert it at the seal so a future upstream pump bug that
+        // over-accrued is caught here rather than silently over-charging the
+        // invoker — a cheap self-defense, no release-build cost.
+        debug_assert!(
+            billed.value() <= prepared.reserved.value(),
+            "SCP-OUT-046 seal: billed {} must not exceed reserved {} (upstream pump over-accrued)",
+            billed.value(),
+            prepared.reserved.value(),
+        );
 
         // Sign the streaming receipt over the STAGED provenance + the sealed root.
         // A signing failure leaves state as found (re-insert the owned original).
@@ -2623,6 +2728,13 @@ async fn commit_b_stream_first_settle(
 
         // Durable capture keyed by SagaId (AC7 replay witness) — BEFORE the
         // `OutletInvoked` append, so a persist failure leaves no orphan log entry.
+        // SCP-OUT-046 CRITICAL: `settled = false` — the money move is a SEPARATE
+        // off-mailbox `settle_outlet_stream_via_actor` the seal task runs next, so
+        // a crash / eviction in that window leaves this witness present but
+        // unsettled. Crash recovery reads `settled` to complete the settlement
+        // (money ops need no signing key), rebuilding the `StreamSettlement` from
+        // the durable fields copied here from the prepared slot (which is REMOVED
+        // above at seal).
         view.class_s_mut().xctx_committed_stream_outputs.insert(
             saga_id.clone(),
             CommittedStreamingOutletInvocation {
@@ -2633,6 +2745,17 @@ async fn commit_b_stream_first_settle(
                 billed_count,
                 stream_chunk_count,
                 outlet_invoked_event_id: event_id.clone(),
+                settled: false,
+                target_context_id: prepared.target_context_id,
+                invoker_did: prepared.caller_did.clone(),
+                reserved: prepared.reserved,
+                request_id: prepared.request_id,
+                outlet_registration_id: prepared.outlet_registration_id.clone(),
+                economic_policy: prepared.economic_policy.clone(),
+                amount_cumulative_reserved: prepared.amount_cumulative_reserved,
+                reserved_chunks: prepared.reserved_chunks,
+                ucan_cid: prepared.ucan_cid.clone(),
+                cost_per_chunk: prepared.cost_per_chunk,
             },
         );
 

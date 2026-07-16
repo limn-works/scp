@@ -4940,11 +4940,6 @@ pub(crate) async fn run_streaming_saga_seal_task(
     target_context_hex: String,
     saga_id: crate::context::supervisor::saga_journal::SagaId,
     target_signing_key: crate::context::actor::commands::SigningKeyBytes,
-    // The reservation's spawn-generation (SCP-OUT-046) — passed to
-    // `settle_outlet_stream_via_actor` so the close-time settlement is dropped
-    // if B respawned between reserve and seal (the same confused-deputy guard
-    // the same-context settlement sink holds).
-    settlement_generation: u64,
     mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
     outer_tx: mpsc::Sender<ForwardedStreamFrame>,
     escrow_ticket: crate::context::outlets::dispatch::StreamEscrowTicket,
@@ -5159,6 +5154,13 @@ pub(crate) async fn run_streaming_saga_seal_task(
     // is `None` — this task processes no cross-context `OutletCancel` (the pump
     // already drops above-cancel-ack `Data`, so the frontier reflects the correct
     // §5.4.5 billing boundary).
+    //
+    // SCOPE (§6.2.5): live mid-stream cross-context `OutletCancel` is NOT in
+    // SCP-OUT-046 (none of its 9 ACs mention it). §6.2.5 uses `cancel_ack` for
+    // truncated-close REPRODUCIBILITY (the billing boundary a cancel pins so a
+    // replayed close re-derives the same root), NOT a live cancel channel — hence
+    // `cancel_ack_ceiling = u64::MAX` (no cancel) + `cancel_ack_seq: None` here.
+    // Wiring a live cancel is a separate, later story.
     let terminal_status = terminal.terminal_status.clone();
     let seal_result = match supervisor.lookup(&target_context_hex) {
         Some(actor) => {
@@ -5209,36 +5211,67 @@ pub(crate) async fn run_streaming_saga_seal_task(
             // read — B's durable frontier is the authoritative manifest.
             record_streaming_saga_a_event(&a_event_log, &saga_id, &outcome).await;
 
-            // Apply the ACTUAL budget movement (SCP-OUT-046): the seal handler
-            // built the complete `StreamSettlement` from the durable ledger but
-            // CANNOT dispatch to its own actor mailbox (re-entrant deadlock), so
-            // the off-mailbox seal task applies it here — the escrow refund is
-            // credited, the billed `PaymentReceipt` captured, and the §7.3.8
-            // cumulative counter released by exactly the billed spend. `None` on
-            // a replay (the money already moved). A zero-cost / Query stream
-            // still settles (refund = billed = 0; no payment fabricated).
-            if let Some(settlement) = outcome.settlement
-                && let Err(err) = supervisor
-                    .settle_outlet_stream_via_actor(*settlement, settlement_generation)
-                    .await
-            {
-                tracing::error!(
-                    saga_id = %saga_id.0,
-                    %err,
-                    "streaming-saga seal task: close-time escrow settlement failed — the \
-                     crash-recovery sweep reconciles the durable reserve"
-                );
-            }
+            // Apply the ACTUAL budget movement (SCP-OUT-046 CRITICAL): the seal
+            // handler durably inserted the `settled = false` witness and built the
+            // complete `StreamSettlement`, but CANNOT dispatch to its own actor
+            // mailbox (re-entrant deadlock), so the off-mailbox seal task applies
+            // it here against B's SEAL-TIME generation (`outcome.generation`, the
+            // instance the seal just ran on — NOT the reserve-time generation,
+            // which would falsely mismatch after a mid-stream respawn and strand
+            // the refund). `witness_saga_id: Some` flips `settled` atomically with
+            // the money move, so the money+flag are crash-atomic and the flag is
+            // the double-refund guard.
+            //
+            // Only resolve the journal `Committed` when the settlement ACTUALLY
+            // applied (`applied == true`). If it was DEFERRED (target evicted /
+            // replaced between the seal and the settle) or errored, the witness
+            // stays unsettled and the journal is LEFT `Committing` so the keyless
+            // crash-recovery sweep completes the money move exactly once (money
+            // ops need no signing key). `settlement == None` means a replay (the
+            // witness is already settled) — resolve `Committed` idempotently.
+            let settlement_applied = match outcome.settlement {
+                None => true,
+                Some(settlement) => {
+                    match supervisor
+                        .settle_outlet_stream_via_actor(
+                            *settlement,
+                            outcome.generation,
+                            Some(saga_id.clone()),
+                        )
+                        .await
+                    {
+                        Ok(application) => application.applied,
+                        Err(err) => {
+                            tracing::error!(
+                                saga_id = %saga_id.0,
+                                %err,
+                                "streaming-saga seal task: close-time escrow settlement failed — \
+                                 journal left Committing; the crash-recovery sweep completes the \
+                                 refund + counter release from the durable witness"
+                            );
+                            false
+                        }
+                    }
+                }
+            };
 
-            // Resolve the journal to `Committed` so crash recovery does not
-            // redrive a completed saga. Non-secret (the streaming saga journals
-            // public metadata only).
-            if let Err(err) = supervisor.resolve_saga_committed(&saga_id).await {
-                tracing::error!(
+            if settlement_applied {
+                // Resolve the journal to `Committed` so crash recovery does not
+                // redrive a completed saga. Non-secret (the streaming saga journals
+                // public metadata only).
+                if let Err(err) = supervisor.resolve_saga_committed(&saga_id).await {
+                    tracing::error!(
+                        saga_id = %saga_id.0,
+                        %err,
+                        "streaming-saga seal task: journal resolve-to-Committed failed — the \
+                         crash recovery sweep will reconcile from the durable committed witness"
+                    );
+                }
+            } else {
+                tracing::warn!(
                     saga_id = %saga_id.0,
-                    %err,
-                    "streaming-saga seal task: journal resolve-to-Committed failed — the crash \
-                     recovery sweep will reconcile from the durable committed witness"
+                    "streaming-saga seal task: settlement DEFERRED (target evicted/replaced at \
+                     settle) — journal left Committing; keyless crash recovery completes it"
                 );
             }
         }

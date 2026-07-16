@@ -4,6 +4,9 @@ Persistent notes for the inquisitor review agent. Each entry: the decision inter
 premise it rested on, whether that premise held, and the root-cause decision when rot was
 found — so future passes can spot expired premises and compounding drift faster.
 
+## Interrogations
+- [SCP-OUT-046 streaming-saga seal FSM](scp-out-046-streaming-saga-seal-fsm.md) — SOUND; custody split is architecture-forced (ADR-049 no-autonomous-key), consistent w/ unary keyless recovery. Do not re-litigate.
+
 ## Operating reminders
 - The code is evidence, not the defendant. Cite code to prove a claim about a *decision*;
   keep the verdict about the decision's soundness.
