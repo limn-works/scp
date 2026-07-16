@@ -50,7 +50,9 @@ NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076"
 
 #: Extracts a ``[SCP-CAT-NNNN]`` code from a bridge exception's string form. The
 #: PyO3 bridge formats native exceptions as ``[{code}] {category} error: ...``.
-_SCP_CODE_RE = re.compile(r"\[(SCP-[A-Z]+-\d+)\]")
+#: Anchored to the start so a code-like substring embedded in {message} cannot
+#: masquerade as the real code (same discipline as the TS mapBridgeError anchor).
+_SCP_CODE_RE = re.compile(r"^\s*\[(SCP-[A-Z]+-\d+)\]")
 
 
 def _coded_bridge_error(exc: Exception) -> ScpError:
