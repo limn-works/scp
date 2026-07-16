@@ -6790,9 +6790,13 @@ impl Supervisor {
     /// Key-bearing streaming-saga crash-recovery truncated close (SCP-OUT-046
     /// #136 AC7). The REAL seal path for a saga that crashed with only a durable
     /// prefix (witness absent): given the target's Active Signing Key (supplied
-    /// per-call — the runtime holds none autonomously; FFI-reconnect surfaces it,
-    /// deferred to SCP-OUT-047; the unit test supplies it), it seals the RESTORED
-    /// durable prefix and resolves the saga `Committed`.
+    /// per-call — the runtime holds none autonomously). This seal driver lives
+    /// here; the FFI-reconnect surface that AUTHENTICATES the caller and supplies
+    /// the key is the FFI saga surface, whose deferral is authorized by ADR-049
+    /// §3a (the general FFI-surface deferral authority; the concrete key-bearing
+    /// reconnect driver + `caller_did` channel-auth binding are enumerated as ACs
+    /// of SCP-OUT-047). The unit test supplies the key directly. It seals the
+    /// RESTORED durable prefix and resolves the saga `Committed`.
     ///
     /// The target (B) actor rehydrated the `SagaId`-keyed frontier from its
     /// Class-S snapshot at respawn
@@ -7774,8 +7778,10 @@ impl Supervisor {
     ///   terminal and HOLD the escrow (never auto-void — B may have rendered
     ///   service). The key-bearing
     ///   [`Self::recover_streaming_saga_truncated_close`] is the seal path
-    ///   (FFI-reconnect surfaces the key; deferred to SCP-OUT-047). An
-    ///   unreachable / non-resident target is treated as unsealed (NeedsRepair).
+    ///   (the FFI-reconnect surface authenticates the caller + supplies the key;
+    ///   the deferral of that FFI surface is authorized by ADR-049 §3a and the
+    ///   driver is enumerated as an AC of SCP-OUT-047). An unreachable /
+    ///   non-resident target is treated as unsealed (NeedsRepair).
     async fn recover_streaming_committing_entry(&self, entry: &JournalEntry, target_hex: &str) {
         use crate::context::actor::commands::SagaPhaseMessage;
         let saga_id = &entry.saga_id;
