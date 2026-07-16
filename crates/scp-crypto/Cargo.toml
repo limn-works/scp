@@ -12,6 +12,13 @@ categories = ["cryptography"]
 
 [dependencies]
 ed25519-dalek = { workspace = true }
+# Pseudonym derivation (§9.10.4.A): HKDF-SHA-256 pseudonym secret + HMAC-SHA-256
+# per-context keypair derivation. All pure RustCrypto primitives already in the
+# wasm tree, so `scp-crypto` stays wasm-safe with the derivation moved here.
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
