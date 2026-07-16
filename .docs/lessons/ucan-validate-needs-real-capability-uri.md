@@ -142,13 +142,18 @@ then inferred "everything before this stage must have passed" via the `__PASSED_
 Rust Display-string change was a silent regression in SDK trust reporting. Typed results
 from `ucan_evaluate` are stable and don't couple SDKs to prose.
 
-## Multi-att limitation: only att[0] is validated
+## Historical: multi-att limitation in the `_PASSED_BEFORE` era (superseded by ADR-059)
 
-`evaluateLayer1` validates only the first declared capability URI (`att[0].with`). If a token declares multiple capabilities (e.g. `att = [{with: "scp:ctx:A"}, {with: "scp:ctx:B"}]`), only `att[0]` is sent to `ucanValidate`. `att[1]` and later entries are not checked.
+> **Note:** This limitation applied to the old `evaluateLayer1` SDK implementation
+> that extracted `att[0].with` client-side and passed it to `ucanValidate`. ADR-059
+> replaced that approach with a single `ucanEvaluate` / `ucan_evaluate` bridge call
+> that returns a `CapabilityValidation` struct directly. The bridge now owns att
+> enumeration; the SDK no longer does client-side per-att iteration. This section
+> is preserved as historical context for the trap.
 
-This means a token with an out-of-ceiling `att[1]` and an in-ceiling `att[0]` will produce `withinCeiling: true`. Full multi-att ceiling validation requires bridge-level support (a single `ucanValidate` call that verifies ALL att entries against the ceiling, consuming the nonce only once). Until that support lands, the SDK validates att[0] only.
+The old `evaluateLayer1` validated only the first declared capability URI (`att[0].with`). If a token declared multiple capabilities (e.g. `att = [{with: "scp:ctx:A"}, {with: "scp:ctx:B"}]`), only `att[0]` was sent to `ucanValidate`. `att[1]` and later entries were not checked.
 
-The bridge (SCP production) always mints single-att tokens, so this limitation does not affect normal operation.
+This meant a token with an out-of-ceiling `att[1]` and an in-ceiling `att[0]` would produce `withinCeiling: true`. The fix was bridge-level: a single call that verifies ALL att entries against the ceiling, consuming the nonce only once. ADR-059's `ucan_evaluate` provides exactly that — the `withinCeiling` boolean reflects the bridge's full evaluation, not the SDK's partial extraction.
 
 ## Revocation prefix narrowing: only `"token revoked:"` is a pipeline result
 
