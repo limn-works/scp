@@ -659,6 +659,7 @@ pub async fn block_broadcast_subscriber(
         deps.event_tx.as_ref(),
     );
 
+    let block_ts = deps.clock.now_secs();
     deps.event_log
         .append_context_event(
             &context_id_bytes,
@@ -667,9 +668,46 @@ pub async fn block_broadcast_subscriber(
             // Committer-assigned: the blocking author's clock — the source of the
             // `created_at` on its outgoing block message, copied by every member
             // (§7.3.1, §9.9.3).
-            deps.clock.now_secs(),
+            block_ts,
         )
         .await?;
+
+    // ADR-007 §5: blocking a subscriber rotates the author's sender-key epoch.
+    // Append the KeyEpochAdvance leaf immediately after MemberBlocked so the
+    // two leaves are always co-located in the Merkle log. rotate_sender_key_for_block
+    // always increments by exactly 1, so old = new.saturating_sub(1) is exact.
+    let old_epoch = result.new_epoch.saturating_sub(1);
+    match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancedPayload {
+        old_epoch,
+        new_epoch: result.new_epoch,
+    }) {
+        Ok(payload) => {
+            if let Err(e) = deps
+                .event_log
+                .append_context_event_with_payload(
+                    &context_id_bytes,
+                    scp_event_log::EventType::KeyEpochAdvance,
+                    author_did.as_ref(),
+                    payload,
+                    block_ts,
+                )
+                .await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "KeyEpochAdvance event-log append failed (best-effort)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "KeyEpochAdvance payload encode failed (best-effort)"
+            );
+        }
+    }
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)

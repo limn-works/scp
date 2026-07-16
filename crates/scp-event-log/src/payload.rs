@@ -165,6 +165,22 @@ pub struct RecoveryEpochAdvancedPayload {
     pub new_epoch: u64,
 }
 
+/// Payload for [`EventType::KeyEpochAdvance`](crate::EventType::KeyEpochAdvance)
+/// (ADR-007 §5 sender-key epoch rotation triggered by blocking a subscriber).
+///
+/// Distinct from [`RecoveryEpochAdvancedPayload`], which covers the MLS group
+/// epoch advance during trust recovery (§9.12). This struct tracks the
+/// **sender-key** epoch for the ADR-007 Broadcast / Encrypted sender-key modes.
+/// Field order is the wire contract under positional `MessagePack` —
+/// **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyEpochAdvancedPayload {
+    /// The sender-key epoch before the advance.
+    pub old_epoch: u64,
+    /// The sender-key epoch after the advance.
+    pub new_epoch: u64,
+}
+
 /// Payload for [`EventType::AccessRevoked`](crate::EventType::AccessRevoked)
 /// (`RevokeReadAccess` / `RevokeWriteAccess`; ADR-031 §3, §5).
 ///
@@ -579,6 +595,20 @@ mod tests {
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 2);
         let decoded: RecoveryEpochAdvancedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn key_epoch_advanced_round_trip() {
+        // ADR-007 §5 sender-key epoch advance (distinct from MLS group recovery epoch).
+        let p = KeyEpochAdvancedPayload {
+            old_epoch: 5,
+            new_epoch: 6,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 2-field struct → fixarray of length 2
+        assert_positional_array(&encoded.data, 2);
+        let decoded: KeyEpochAdvancedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 
