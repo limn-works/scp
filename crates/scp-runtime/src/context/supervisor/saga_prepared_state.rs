@@ -725,12 +725,17 @@ pub struct CommittedStreamingOutletInvocation {
     /// the staged slot, BEFORE the off-mailbox money move runs (the money move is
     /// a separate off-mailbox
     /// [`settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)).
-    /// The on-actor `SettleOutletStream` handler flips it to `true` in the SAME
-    /// Class-S persist as the money move (refund + counter release), so `settled`
-    /// is the durable, atomic record that the escrow refund + §7.3.8 counter
-    /// release actually landed. It is the double-refund guard for the xctx path
-    /// (which has NO `stream_reservations` reconcile net — the streaming saga runs
-    /// with `settlement_sink = None`). Crash recovery reads it: witness present &
+    /// The on-actor `SettleOutletStream` handler READS this flag FIRST (in the
+    /// `commit_class_s_keep` closure, actor-serialized so the read is authoritative)
+    /// and skips the ENTIRE money move if it is already `true`; otherwise it moves
+    /// the money AND flips this to `true` in the SAME Class-S persist (refund +
+    /// counter release), so `settled` is the durable, atomic record that the escrow
+    /// refund + §7.3.8 counter release actually landed. Because the handler READS it
+    /// to gate the money move, it is the authoritative double-refund guard for the
+    /// xctx path (which has NO `stream_reservations` reconcile net — the streaming
+    /// saga runs with `settlement_sink = None`) — it closes the concurrent-double-
+    /// settle race, not merely a recovery-time hint. Crash recovery also reads it:
+    /// witness present &
     /// `settled == false` ⇒ the money move never ran (crash / eviction in the
     /// seal→settle window) ⇒ rebuild the settlement from the durable fields below
     /// and APPLY it (money ops need NO signing key); `settled == true` ⇒ resolve

@@ -2512,10 +2512,13 @@ pub enum OutletsCommand {
         generation: u64,
         /// SCP-OUT-046 CRITICAL — the streaming-saga witness key. `Some` for the
         /// cross-context streaming saga (the seal task + crash recovery): on a
-        /// clean matching-instance settle the handler flips
-        /// `xctx_committed_stream_outputs[saga_id].settled = true` in the SAME
-        /// Class-S persist as the money move, making the money+flag atomic and the
-        /// flag the double-refund guard (the xctx path has no `stream_reservations`
+        /// clean matching-instance settle the handler READS
+        /// `xctx_committed_stream_outputs[saga_id].settled` FIRST (in the
+        /// commit closure, actor-serialized ⇒ authoritative) and skips the whole
+        /// money move if already `true`; otherwise it moves the money AND flips the
+        /// flag `= true` in the SAME Class-S persist, making money+flag atomic. The
+        /// flag is thus the authoritative double-refund guard closing the
+        /// concurrent-double-settle race (the xctx path has no `stream_reservations`
         /// reconcile net). `None` for the same-context streaming pump (whose double
         /// -release guard is the `stream_reservations` record).
         witness_saga_id: Option<crate::context::supervisor::saga_journal::SagaId>,
@@ -3181,28 +3184,43 @@ pub struct StreamSettleApplication {
 /// CRITICAL; §17.16.4 crash recovery). READ-ONLY snapshot of the durable
 /// streaming seal witness the keyless recovery sweep needs to decide how to
 /// resolve a `Committing` streaming saga.
+///
+/// Modeled as an ENUM so illegal states are unrepresentable: only the
+/// [`Unsettled`](Self::Unsettled) case carries the money settlement + generation +
+/// A-leaf (they are meaningless when the witness is absent or already settled), so
+/// there is no "present-but-no-generation" or "settled-with-a-pending-settlement"
+/// combination to guard against, and no synthetic sentinel `generation: 0` on the
+/// absent path.
 #[derive(Debug)]
-pub struct StreamWitnessRecoveryStatus {
-    /// `true` iff the `SagaId` is durably captured in
-    /// `xctx_committed_stream_outputs` (the seal-close landed before any crash).
-    pub present: bool,
-    /// The witness's `settled` flag — `true` iff the money move (refund + counter
-    /// release) already landed. Meaningful only when `present`.
-    pub settled: bool,
-    /// B's CURRENT spawn-generation — the generation the recovery settlement must
-    /// target so the confused-deputy guard admits it against the restored hold.
-    pub generation: u64,
-    /// The close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
-    /// rebuilt from the witness's durable fields — `Some` iff `present && !settled`
-    /// (the money still needs to move). Money ops need NO signing key, so keyless
-    /// recovery applies it directly.
-    pub settlement: Option<Box<crate::context::outlets::invoke::StreamSettlement>>,
-    /// The A-side dual-log leaf reconstruction inputs (JCS receipt bytes + sealed
-    /// root + counts + event id) — `Some` iff `present` and the stored receipt
-    /// parses. Recovery records the `CrossContextOutletInvoked` leaf from this so
-    /// the dual-log is completed even if the seal task crashed before recording it
-    /// (SCP-OUT-046 #135; best-effort, convergent leaf).
-    pub a_event: Option<Box<CommitBStreamSettleOutcome>>,
+pub enum StreamWitnessRecoveryStatus {
+    /// The `SagaId` is NOT durably captured in `xctx_committed_stream_outputs` —
+    /// the seal-close never landed, OR the witness could not be read (send failure
+    /// / non-resident target). Recovery treats this as unsealed → `NeedsRepair`
+    /// with the escrow HELD for the key-bearing truncated close.
+    Absent,
+    /// The witness is durably captured AND its `settled` flag is set — the money
+    /// move (escrow refund + §7.3.8 counter release) already landed on the first
+    /// settle. Recovery resolves the journal `Committed` idempotently, moving no
+    /// money.
+    Settled,
+    /// The witness is durably captured but NOT settled — B sealed, then crashed /
+    /// was evicted in the seal→settle window, so the money move never ran.
+    /// Recovery completes it KEYLESSLY (money ops need no signing key).
+    Unsettled {
+        /// B's CURRENT spawn-generation — the generation the recovery settlement
+        /// must target so the confused-deputy guard admits it against the restored
+        /// hold.
+        generation: u64,
+        /// The close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+        /// rebuilt from the witness's durable fields — the money to move.
+        settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+        /// The A-side dual-log leaf reconstruction inputs (JCS receipt bytes +
+        /// sealed root + counts + event id) — `Some` iff the stored receipt parses.
+        /// Recovery records the `CrossContextOutletInvoked` leaf from this so the
+        /// dual-log is completed even if the seal task crashed before recording it
+        /// (SCP-OUT-046 #135; best-effort, convergent leaf).
+        a_event: Option<Box<CommitBStreamSettleOutcome>>,
+    },
 }
 
 /// Boxed field set for [`SagaPhaseMessage::PrepareBStreaming`] (ADR-061 seal

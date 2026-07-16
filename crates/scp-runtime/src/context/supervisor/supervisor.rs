@@ -7671,10 +7671,13 @@ impl Supervisor {
     /// side / non-reconstructible entry) stays `NeedsRepair` for operator repair.
     async fn recover_committing_entry(&self, entry: &JournalEntry) {
         // Streaming saga (SCP-OUT-046 #136): keyless witness-based resolution. The
-        // runtime holds NO signing key autonomously, so it cannot seal a truncated
-        // prefix on the startup sweep — it can only confirm an already-sealed saga
-        // (witness present ⇒ Committed) or hold it for the key-bearing recovery
-        // surface (witness absent ⇒ NeedsRepair, escrow held).
+        // runtime holds NO signing key autonomously, so it cannot SEAL a truncated
+        // prefix on the startup sweep. Three cases (see
+        // `recover_streaming_committing_entry`): witness present & settled ⇒ confirm
+        // Committed (money already moved); witness present & UNSETTLED ⇒ complete the
+        // money move KEYLESSLY (pure budget/counter ops — refund + §7.3.8 release +
+        // capture — flip `settled` atomically) then Committed; witness absent ⇒ hold
+        // for the key-bearing recovery surface (NeedsRepair, escrow held).
         if let Some(target_hex) = Self::streaming_saga_target_hex(entry) {
             self.recover_streaming_committing_entry(entry, &target_hex)
                 .await;
@@ -7801,7 +7804,7 @@ impl Supervisor {
         use crate::context::actor::commands::{SagaPhaseMessage, StreamWitnessRecoveryStatus};
         let saga_id = &entry.saga_id;
         // Read the durable witness. A send failure / non-resident target is
-        // treated as "unsealed" (a synthetic absent status) → NeedsRepair.
+        // treated as `Absent` (unsealed) → NeedsRepair.
         let status = if let Some(actor) = self.lookup(target_hex) {
             let check_saga_id = saga_id.clone();
             match actor
@@ -7821,70 +7824,69 @@ impl Supervisor {
                         "streaming saga recovery — StreamSettleCheckWitness send failed; \
                          treating as unsealed (NeedsRepair, escrow held)"
                     );
-                    StreamWitnessRecoveryStatus {
-                        present: false,
-                        settled: false,
-                        generation: 0,
-                        settlement: None,
-                        a_event: None,
-                    }
+                    StreamWitnessRecoveryStatus::Absent
                 }
             }
         } else {
+            // Permanent-eviction case: a target that is not resident (evicted and
+            // never respawned) cannot have its witness read, so recovery treats it
+            // as `Absent` → NeedsRepair with the escrow HELD. The invoker's refund is
+            // held (never lost, never double-moved) until the context is restored and
+            // a subsequent sweep can read the durable witness and complete the money
+            // move keylessly — the conservative fail-closed posture, identical to the
+            // witness-absent NeedsRepair arm below.
             tracing::warn!(
                 saga_id = %saga_id,
                 target = %target_hex,
                 "streaming saga recovery — target actor not resident; treating as unsealed \
-                 (NeedsRepair, escrow held)"
+                 (NeedsRepair, escrow held until the context is restored)"
             );
-            StreamWitnessRecoveryStatus {
-                present: false,
-                settled: false,
-                generation: 0,
-                settlement: None,
-                a_event: None,
-            }
+            StreamWitnessRecoveryStatus::Absent
         };
 
-        if !status.present {
-            // Witness absent → NeedsRepair, escrow HELD for the key-bearing close.
-            let _ = self
-                .saga_journal
-                .append(JournalEntry {
-                    saga_id: saga_id.clone(),
-                    state: SagaState::NeedsRepair,
-                    participants: entry.participants.clone(),
-                    evidence: Zeroizing::new(Vec::new()),
-                    timestamp_ms: current_timestamp_ms(),
-                    seq_per_saga: entry.seq_per_saga.saturating_add(1),
-                })
-                .await;
-            crate::metrics::record_saga_repair_needed();
-            tracing::error!(
-                saga_id = %saga_id,
-                "streaming saga recovery — seal witness ABSENT; no autonomous signing key to \
-                 seal the truncated prefix — NeedsRepair, escrow HELD for the key-bearing close"
-            );
-            return;
+        match status {
+            StreamWitnessRecoveryStatus::Absent => {
+                // Witness absent → NeedsRepair, escrow HELD for the key-bearing close.
+                let _ = self
+                    .saga_journal
+                    .append(JournalEntry {
+                        saga_id: saga_id.clone(),
+                        state: SagaState::NeedsRepair,
+                        participants: entry.participants.clone(),
+                        evidence: Zeroizing::new(Vec::new()),
+                        timestamp_ms: current_timestamp_ms(),
+                        seq_per_saga: entry.seq_per_saga.saturating_add(1),
+                    })
+                    .await;
+                crate::metrics::record_saga_repair_needed();
+                tracing::error!(
+                    saga_id = %saga_id,
+                    "streaming saga recovery — seal witness ABSENT; no autonomous signing key to \
+                     seal the truncated prefix — NeedsRepair, escrow HELD for the key-bearing close"
+                );
+            }
+            StreamWitnessRecoveryStatus::Settled => {
+                // Money already moved on the first settle — resolve Committed.
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
+                    .await;
+                tracing::info!(
+                    saga_id = %saga_id,
+                    "streaming saga recovery — seal witness present + settled; resolved Committed \
+                     (idempotent, no re-invoke, no money move)"
+                );
+            }
+            StreamWitnessRecoveryStatus::Unsettled {
+                generation,
+                settlement,
+                a_event,
+            } => {
+                // Witness present but UNSETTLED — complete the money move keylessly.
+                self.complete_unsettled_streaming_saga(saga_id, generation, settlement, a_event)
+                    .await;
+            }
         }
-
-        if status.settled {
-            // Money already moved on the first settle — resolve Committed.
-            let _ = self
-                .saga_journal
-                .mark_resolved(saga_id.clone(), SagaTerminalState::Committed, false)
-                .await;
-            tracing::info!(
-                saga_id = %saga_id,
-                "streaming saga recovery — seal witness present + settled; resolved Committed \
-                 (idempotent, no re-invoke, no money move)"
-            );
-            return;
-        }
-
-        // Witness present but UNSETTLED — complete the money move keylessly.
-        self.complete_unsettled_streaming_saga(saga_id, status)
-            .await;
     }
 
     /// Complete a witness-present-but-UNSETTLED streaming saga on the keyless
@@ -7901,13 +7903,22 @@ impl Supervisor {
     async fn complete_unsettled_streaming_saga(
         &self,
         saga_id: &SagaId,
-        status: crate::context::actor::commands::StreamWitnessRecoveryStatus,
+        generation: u64,
+        settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+        a_event: Option<Box<crate::context::actor::commands::CommitBStreamSettleOutcome>>,
     ) {
         // First reconstruct the A-side dual-log leaf best-effort (#135) — the seal
         // task records it BEFORE the money move, so a crash in that window can
-        // leave it absent; the leaf is convergent (byte-identical), dedup-able.
+        // leave it absent. On the DEFER-then-recover path (the seal task recorded
+        // the A-leaf, then deferred the settle, and recovery now re-records it) this
+        // appends a byte-identical A-leaf TWICE. That double-append is BENIGN: the
+        // leaves are convergent (same nonce, chain-depth, timestamp, and sealed
+        // root), and the §9.9.3 per-sender `(count, root)` equivocation-dedup
+        // substrate collapses them — a repeated (count, root) from the same sender
+        // is de-duplicated, not treated as equivocation. So recovery may safely
+        // re-record without a conditional "did the seal task already append?" check.
         if let (Some(a_event), Some(a_event_log)) =
-            (status.a_event.as_ref(), self.event_log_ref().cloned())
+            (a_event.as_ref(), self.event_log_ref().cloned())
         {
             crate::context::outlets::invoke::record_streaming_saga_a_event(
                 &a_event_log,
@@ -7917,20 +7928,10 @@ impl Supervisor {
             .await;
         }
 
-        let Some(settlement) = status.settlement else {
-            // Defensive: unsettled but no rebuilt settlement (the stored receipt
-            // did not reconstruct) — leave the journal Committing for the next
-            // sweep rather than resolving on incomplete state.
-            tracing::warn!(
-                saga_id = %saga_id,
-                "streaming saga recovery — witness unsettled but settlement could not be \
-                 rebuilt; left Committing for the next sweep"
-            );
-            return;
-        };
-
+        // The `Unsettled` variant always carries a rebuilt settlement, so there is
+        // no "unsettled but nothing to settle" state to defend against here.
         match self
-            .settle_outlet_stream_via_actor(*settlement, status.generation, Some(saga_id.clone()))
+            .settle_outlet_stream_via_actor(*settlement, generation, Some(saga_id.clone()))
             .await
         {
             Ok(application) if application.applied => {
@@ -31606,7 +31607,7 @@ mod streaming_saga_tests {
         // The seal durably captured the streaming witness (sealed = Committed).
         let witness = {
             let sid = saga_id.clone();
-            actor
+            let status = actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
                         saga_id: sid,
@@ -31614,8 +31615,11 @@ mod streaming_saga_tests {
                     })
                 })
                 .await
-                .expect("witness check")
-                .present
+                .expect("witness check");
+            !matches!(
+                status,
+                crate::context::actor::commands::StreamWitnessRecoveryStatus::Absent
+            )
         };
         assert!(witness, "the seal durably captured the streaming witness");
 
@@ -31827,7 +31831,7 @@ mod streaming_saga_tests {
         );
         let witness_before = {
             let sid = saga_id.clone();
-            actor
+            let status = actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
                         saga_id: sid,
@@ -31835,8 +31839,11 @@ mod streaming_saga_tests {
                     })
                 })
                 .await
-                .expect("witness check")
-                .present
+                .expect("witness check");
+            !matches!(
+                status,
+                crate::context::actor::commands::StreamWitnessRecoveryStatus::Absent
+            )
         };
         assert!(
             !witness_before,
@@ -31895,7 +31902,7 @@ mod streaming_saga_tests {
         // The witness is now present and the journal resolved.
         let witness_after = {
             let sid = saga_id.clone();
-            actor
+            let status = actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::StreamSettleCheckWitness {
                         saga_id: sid,
@@ -31903,8 +31910,11 @@ mod streaming_saga_tests {
                     })
                 })
                 .await
-                .expect("witness check")
-                .present
+                .expect("witness check");
+            !matches!(
+                status,
+                crate::context::actor::commands::StreamWitnessRecoveryStatus::Absent
+            )
         };
         assert!(
             witness_after,
@@ -32181,12 +32191,12 @@ mod streaming_saga_tests {
                 .expect("witness re-check")
         };
         assert!(
-            status.present && status.settled,
-            "witness present + settled"
-        );
-        assert!(
-            status.settlement.is_none(),
-            "a settled witness rebuilds NO settlement — recovery moves no money"
+            matches!(
+                status,
+                crate::context::actor::commands::StreamWitnessRecoveryStatus::Settled
+            ),
+            "witness present + settled — a settled witness carries NO rebuilt settlement, \
+             so recovery moves no money"
         );
 
         // A SECOND recovery sweep is a no-op — the money never moves twice.
@@ -32421,12 +32431,12 @@ mod streaming_saga_tests {
                 .expect("witness re-check")
         };
         assert!(
-            status.present && status.settled,
-            "witness present + settled"
-        );
-        assert!(
-            status.settlement.is_none(),
-            "a settled witness rebuilds NO settlement — no further money moves"
+            matches!(
+                status,
+                crate::context::actor::commands::StreamWitnessRecoveryStatus::Settled
+            ),
+            "witness present + settled — a settled witness carries NO rebuilt settlement, \
+             so no further money moves"
         );
 
         // A THIRD settle (a late straggler) is still a total no-op.

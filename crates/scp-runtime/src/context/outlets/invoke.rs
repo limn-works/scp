@@ -4704,7 +4704,7 @@ pub(crate) async fn run_cross_context_bridge(
             let next_seq = reassembled
                 .last()
                 .map_or(chunk.sequence, |c| c.sequence.saturating_add(1));
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
                 &mut terminal,
@@ -4712,11 +4712,11 @@ pub(crate) async fn run_cross_context_bridge(
                 next_seq,
                 payload,
             )
-            .await
-            .is_some_and(|chunk| {
-                reassembled.push(chunk);
-                true
-            });
+            .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(sent) = forwarded {
+                reassembled.push(sent);
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -4736,7 +4736,7 @@ pub(crate) async fn run_cross_context_bridge(
                 ),
                 terminal: true,
             };
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
                 &mut terminal,
@@ -4744,11 +4744,11 @@ pub(crate) async fn run_cross_context_bridge(
                 chunk.sequence,
                 payload,
             )
-            .await
-            .is_some_and(|chunk| {
-                reassembled.push(chunk);
-                true
-            });
+            .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(sent) = forwarded {
+                reassembled.push(sent);
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -4762,7 +4762,7 @@ pub(crate) async fn run_cross_context_bridge(
                 message: format!("{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: {detail}"),
                 terminal: true,
             };
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
                 &mut terminal,
@@ -4770,11 +4770,11 @@ pub(crate) async fn run_cross_context_bridge(
                 chunk.sequence,
                 payload,
             )
-            .await
-            .is_some_and(|chunk| {
-                reassembled.push(chunk);
-                true
-            });
+            .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(sent) = forwarded {
+                reassembled.push(sent);
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -4803,7 +4803,7 @@ pub(crate) async fn run_cross_context_bridge(
                 message: format!("{SLUG_OUTPUT_SCHEMA_VIOLATION}: {message}"),
                 terminal: true,
             };
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
                 &mut terminal,
@@ -4811,11 +4811,11 @@ pub(crate) async fn run_cross_context_bridge(
                 chunk.sequence,
                 payload,
             )
-            .await
-            .is_some_and(|chunk| {
-                reassembled.push(chunk);
-                true
-            });
+            .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(sent) = forwarded {
+                reassembled.push(sent);
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -4995,7 +4995,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 ),
                 terminal: true,
             };
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
                 &mut terminal,
@@ -5003,11 +5003,11 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 chunk.sequence,
                 payload,
             )
-            .await
-            .is_some_and(|term| {
+            .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(term) = forwarded {
                 last_sequence = Some(term.sequence);
-                true
-            });
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -5033,7 +5033,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 message: format!("{SLUG_OUTPUT_SCHEMA_VIOLATION}: {message}"),
                 terminal: true,
             };
-            delivered_terminal = forward_bridge_terminal(
+            let forwarded = forward_bridge_terminal(
                 &outer_tx,
                 &mut send_tracker,
                 &mut terminal,
@@ -5041,11 +5041,11 @@ pub(crate) async fn run_streaming_saga_seal_task(
                 chunk.sequence,
                 payload,
             )
-            .await
-            .is_some_and(|term| {
+            .await;
+            delivered_terminal = forwarded.is_some();
+            if let Some(term) = forwarded {
                 last_sequence = Some(term.sequence);
-                true
-            });
+            }
             outer_open = delivered_terminal;
             break;
         }
@@ -5160,7 +5160,11 @@ pub(crate) async fn run_streaming_saga_seal_task(
     // truncated-close REPRODUCIBILITY (the billing boundary a cancel pins so a
     // replayed close re-derives the same root), NOT a live cancel channel — hence
     // `cancel_ack_ceiling = u64::MAX` (no cancel) + `cancel_ack_seq: None` here.
-    // Wiring a live cancel is a separate, later story.
+    // This no-live-cancel scope is spec-sanctioned (§6.2.5 / §5.4.5). A live
+    // cross-context cancel control-plane channel, if specced, is wired through the
+    // SCP-OUT-047 streaming-saga FFI control surface (which owns the caller-side
+    // control plane), NOT here — see SCP-OUT-047's live-cancel control-plane
+    // action item.
     let terminal_status = terminal.terminal_status.clone();
     let seal_result = match supervisor.lookup(&target_context_hex) {
         Some(actor) => {

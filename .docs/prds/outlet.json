@@ -3113,6 +3113,7 @@
         "WASM (crates/scp-client-wasm) exposes NO streaming-saga open/poll \u2014 the saga pump/capture/escrow/receipt-signing is scp-runtime node-side per the ADR-057 scope fence; WASM's streaming-saga surface is invoker-side pure predicates only (delegated to SCP-OUT-048) \u2014 grep confirms no outlet_streaming_saga_open in crates/scp-client-wasm/src/lib.rs",
         "Each non-WASM bridge's streaming-saga open requires a caller_did parameter and binds it to the authenticated channel before returning the receiver (\u00a73a forward obligation + \u00a75.4.5 CRITICAL #1) \u2014 grep -n 'caller_did' returns the binding in each bridge; a mismatch between caller_did and the authenticated principal is rejected",
         "The streaming-saga export does NOT block-until-Committed: a test drives a slow (>1 chunk, delayed-terminal) streaming saga and asserts the FFI open call returns while the saga FSM is still pre-Committed (sealing)",
+        "Before the streaming-saga FFI surface ships, ADR-049 §3a carries the written wait-model companion amendment: its block-until-terminal / no-async-poll rule is scoped to the UNARY saga, while the STREAMING saga returns the mpsc::Receiver PROMPTLY at the Commit-transition and reaches Committed ASYNCHRONOUSLY at seal-close (per the ADR-061 'Streaming-saga mechanism' §3a-reconciliation clause 2 — 'the §3a wait model must be amended before that surface ships, not silently broken') — grep -n 'streaming' .docs/adrs/ADR-049-actor-per-context.md under '### 3a. FFI Saga Surface' returns the amendment clause naming the streaming receiver-prompt-return + async-commit-at-seal wait model; the streaming-saga FFI export is NOT marked done until this ADR-049 text lands",
         "The FFI-reconnect surface drives the key-bearing crash-recovery truncated close: on reconnect it authenticates the caller, surfaces the target's Active Signing Key (never envelope-asserted, per the \u00a73a forward obligation), and calls Supervisor::recover_streaming_saga_truncated_close to seal a witness-absent durable prefix (SCP-OUT-046 #136) \u2014 grep -n 'recover_streaming_saga_truncated_close' across the FFI bridge files returns the driver call; a test drives a crashed streaming saga left NeedsRepair (witness absent) through reconnect and asserts it resolves Committed with billed_count matching the durable prefix",
         "A pipeline_wiring assertion covers the new streaming-saga FFI path \u2014 grep -n 'streaming_saga' crates/scp-testing/tests/integration/pipeline_wiring.rs returns an include_str!/assertion for the export",
         "The SDK capability matrix has rows for the streaming-saga verb across the applicable bindings \u2014 grep -n 'streaming.saga\\|streamingSaga' .docs/standards/sdk-capability-matrix.json returns the rows (WASM row marked node-delegated per the fence)",
@@ -3125,7 +3126,9 @@
         "Leave WASM open/poll unimplemented per the ADR-057 fence (invoker-side predicates are SCP-OUT-048)",
         "Add the pipeline_wiring assertion and the capability-matrix rows",
         "Wire the FFI-reconnect key-bearing recovery driver: authenticate the caller, surface the target's Active Signing Key, and call Supervisor::recover_streaming_saga_truncated_close to seal witness-absent truncated closes",
-        "Add the non-blocking-open test, the caller_did-mismatch-rejection test, and the reconnect-driven truncated-close recovery test"
+        "Add the non-blocking-open test, the caller_did-mismatch-rejection test, and the reconnect-driven truncated-close recovery test",
+        "Amend ADR-049 §3a IN THE ADR TEXT to add the streaming-saga wait-model companion clause (unary = block-until-terminal; streaming = receiver-prompt-return at Commit + async-commit-at-seal, per ADR-061) BEFORE exposing the streaming-saga FFI open — do not ship the surface against an unamended §3a",
+        "Own the live-cancel control-plane: if/when a live mid-stream cross-context OutletCancel channel is specced (beyond §6.2.5's truncated-close cancel_ack reproducibility, which SCP-OUT-046 already implements with cancel_ack_ceiling=u64::MAX / no live cancel), wire its caller→target control message through this streaming-saga FFI control surface — this story is the named owner referenced by the invoke.rs run_streaming_saga_seal_task no-live-cancel scope comment"
       ],
       "blockedBy": [
         "SCP-OUT-046",
@@ -3147,6 +3150,10 @@
         {
           "file": ".docs/adrs/ADR-057-in-browser-client-over-shared-mls.md",
           "section": "### Scope fence (mandatory)"
+        },
+        {
+          "file": ".docs/adrs/ADR-061-outlet-invocation-modes.md",
+          "section": "## Streaming-saga mechanism (the seal phase)"
         }
       ],
       "details": {}

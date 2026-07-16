@@ -2258,54 +2258,41 @@ fn stream_settle_check_witness(
 ) -> Outcome<()> {
     use crate::context::actor::commands::StreamWitnessRecoveryStatus;
     let generation = cell.generation;
-    let status = cell
-        .class_s
-        .xctx_committed_stream_outputs
-        .get(saga_id)
-        .map_or_else(
-            || StreamWitnessRecoveryStatus {
-                present: false,
-                settled: false,
+    let status = match cell.class_s.xctx_committed_stream_outputs.get(saga_id) {
+        // Witness absent — seal never landed (or was rolled back).
+        None => StreamWitnessRecoveryStatus::Absent,
+        // Witness present + settled — the money already moved on the first settle.
+        Some(committed) if committed.settled => StreamWitnessRecoveryStatus::Settled,
+        // Witness present + UNSETTLED — the money move never ran; rebuild it (money
+        // ops need no signing key) plus the A-side dual-log leaf inputs.
+        Some(committed) => {
+            let settlement = Box::new(rebuild_stream_settlement(committed));
+            // Reconstruct the A-side dual-log leaf inputs (SCP-OUT-046 #135) so
+            // recovery can complete the best-effort `CrossContextOutletInvoked`
+            // leaf the seal task records BEFORE the money move (and may miss on a
+            // crash). A receipt that will not re-serialize simply omits the leaf.
+            let a_event = jcs_stream_receipt_bytes(&committed.receipt)
+                .ok()
+                .map(|receipt| {
+                    Box::new(CommitBStreamSettleOutcome {
+                        receipt,
+                        stream_manifest_hash: committed.stream_manifest_hash,
+                        billed: committed.billed,
+                        refund: committed.refund,
+                        billed_count: committed.billed_count,
+                        stream_chunk_count: committed.stream_chunk_count,
+                        outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
+                        settlement: None,
+                        generation,
+                    })
+                });
+            StreamWitnessRecoveryStatus::Unsettled {
                 generation,
-                settlement: None,
-                a_event: None,
-            },
-            |committed| {
-                // Rebuild the money settlement iff the witness is unsettled (the money
-                // move never landed) — money ops need no signing key.
-                let settlement = if committed.settled {
-                    None
-                } else {
-                    Some(Box::new(rebuild_stream_settlement(committed)))
-                };
-                // Reconstruct the A-side dual-log leaf inputs (SCP-OUT-046 #135) so
-                // recovery can complete the best-effort `CrossContextOutletInvoked`
-                // leaf the seal task records BEFORE the money move (and may miss on a
-                // crash). A receipt that will not re-serialize simply omits the leaf.
-                let a_event = jcs_stream_receipt_bytes(&committed.receipt)
-                    .ok()
-                    .map(|receipt| {
-                        Box::new(CommitBStreamSettleOutcome {
-                            receipt,
-                            stream_manifest_hash: committed.stream_manifest_hash,
-                            billed: committed.billed,
-                            refund: committed.refund,
-                            billed_count: committed.billed_count,
-                            stream_chunk_count: committed.stream_chunk_count,
-                            outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
-                            settlement: None,
-                            generation,
-                        })
-                    });
-                StreamWitnessRecoveryStatus {
-                    present: true,
-                    settled: committed.settled,
-                    generation,
-                    settlement,
-                    a_event,
-                }
-            },
-        );
+                settlement,
+                a_event,
+            }
+        }
+    };
     let _ = reply.send(Ok(status));
     Outcome::ok(())
 }
@@ -2478,9 +2465,12 @@ async fn commit_b_stream_settle(
     reply: CommitBStreamSettleReply,
 ) -> Outcome<()> {
     // B's CURRENT spawn-generation (Class-C, read via Deref) — carried on the
-    // outcome so the key-bearing crash-recovery close settles against the
-    // respawned instance's restored hold (SCP-OUT-046 #136). The normal seal
-    // task ignores it (it uses the reserve-time generation).
+    // outcome so BOTH the normal off-mailbox seal task AND the key-bearing
+    // crash-recovery close settle against THIS (seal-time) instance's hold
+    // (SCP-OUT-046 #136). The seal task settles against `outcome.generation` (this
+    // value), NOT the reserve-time generation — using the reserve-time generation
+    // would falsely mismatch after a mid-stream respawn and strand the refund +
+    // counter release.
     let generation = cell.generation;
     // Replay: re-emit the stored capture byte-for-byte; never re-seal / re-sign.
     if let Some(committed) = cell.class_s.xctx_committed_stream_outputs.get(saga_id) {
