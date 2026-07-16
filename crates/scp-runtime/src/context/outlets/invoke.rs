@@ -4828,12 +4828,12 @@ pub(crate) async fn run_cross_context_bridge(
 /// reassembly it drives the SAGA seal:
 ///
 /// - After each successfully-forwarded operator chunk it sends
-///   [`SagaPhaseMessage::StreamCaptureAppend`] to the target (B) actor, folding
+///   [`SagaPhaseMessage::StreamCaptureAppend`](crate::context::actor::commands::SagaPhaseMessage::StreamCaptureAppend) to the target (B) actor, folding
 ///   the chunk into the DURABLE `SagaId`-keyed Merkle frontier staged at
 ///   Prepare-B (the O(log n) replay snapshot the seal reads to finalize the
 ///   manifest root). Forwarding is NEVER gated on the capture persist (§6.2.5):
 ///   the chunk is delivered first, captured second.
-/// - At stream-close it sends [`SagaPhaseMessage::CommitBStreamSettle`] ONCE
+/// - At stream-close it sends [`SagaPhaseMessage::CommitBStreamSettle`](crate::context::actor::commands::SagaPhaseMessage::CommitBStreamSettle) ONCE
 ///   (AC8 — commit once over the bounded root, never a per-chunk 2PC): the B
 ///   actor seals `stream_manifest_hash = frontier.root()`, signs the streaming
 ///   receipt (SCP-OUT-043), settles the escrow from the durable ledger, appends

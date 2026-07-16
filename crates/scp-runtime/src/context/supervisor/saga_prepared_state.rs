@@ -683,7 +683,7 @@ pub struct CommittedOutletInvocation {
 /// (streaming)").
 ///
 /// **Class S** — held in
-/// [`PerContextState.xctx_committed_stream_outputs`](crate::context::actor::state::PerContextState::xctx_committed_stream_outputs)
+/// [`ClassSState::xctx_committed_stream_outputs`](crate::context::actor::state::ClassSState::xctx_committed_stream_outputs)
 /// and synchronously persisted fail-closed (ADR-049 §9), the same discipline as
 /// [`CommittedOutletInvocation`]: a crash that rolled the capture back behind an
 /// acked seal-close would re-invoke the outlet on replay, breaking exactly-once.

@@ -6845,7 +6845,7 @@ impl Supervisor {
 
     /// Roll back a streaming saga whose durable Prepare-B slot was staged but
     /// whose Commit-transition then aborted (SCP-OUT-046 #134): clear B's staged
-    /// `saga_pending` slot via [`SagaPhaseMessage::Abort`] (target side ⇒
+    /// `saga_pending` slot via [`SagaPhaseMessage::Abort`](crate::context::actor::commands::SagaPhaseMessage::Abort) (target side ⇒
     /// `reservation: None`) and resolve the journal to `Aborted`. Best-effort —
     /// a missing actor / failed write leaves the slot for the crash-recovery
     /// sweep, which clears an unresolved `Committing`/`PreparingB` saga with no
@@ -6885,7 +6885,7 @@ impl Supervisor {
     /// Class-S snapshot at respawn
     /// ([`CrossContextStreamingOutletInvocationSnapshot::into_prepared`](crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot::into_prepared)),
     /// so `frontier.root()` / `billed_count()` reproduce bit-identically over the
-    /// durable prefix. This method dispatches [`SagaPhaseMessage::CommitBStreamSettle`]
+    /// durable prefix. This method dispatches [`SagaPhaseMessage::CommitBStreamSettle`](crate::context::actor::commands::SagaPhaseMessage::CommitBStreamSettle)
     /// (seal over the restored prefix, settle at the prefix `billed_count`), then
     /// APPLIES the settlement off-mailbox (recovery holds `Arc<Supervisor>`, so no
     /// re-entrant self-dispatch) against B's CURRENT generation, records the A-side
@@ -7859,7 +7859,7 @@ impl Supervisor {
 
     /// Keyless streaming-saga `Committing` resolution on the startup sweep
     /// (SCP-OUT-046 CRITICAL; #136 AC7). Reads the durable witness via a READ-ONLY
-    /// [`SagaPhaseMessage::StreamSettleCheckWitness`] to the target (B) actor and
+    /// [`SagaPhaseMessage::StreamSettleCheckWitness`](crate::context::actor::commands::SagaPhaseMessage::StreamSettleCheckWitness) to the target (B) actor and
     /// resolves the saga per the witness state:
     ///
     /// - **witness present & `settled`** — B durably sealed AND the money move
@@ -10140,7 +10140,7 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// [`ContextError::InvalidState`] wrapping the [`JournalError`] if the
+    /// [`ContextError::InvalidState`] wrapping the [`JournalError`](crate::context::supervisor::saga_journal::JournalError) if the
     /// durable `mark_resolved` write fails; the caller logs and defers to the
     /// crash-recovery sweep (the durable committed witness on B's actor is the
     /// authoritative resolution regardless).

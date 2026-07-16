@@ -2816,7 +2816,7 @@ struct CommitBStreamCaptured {
 /// `OutletInvoked` (streaming shape — real root, `chunks_billed`,
 /// `stream_chunk_count`, terminal status), and on append failure roll the capture
 /// back + re-stage the owned slot + re-persist via
-/// [`ClassSCell::commit_class_s_keep`]. Mirrors [`commit_b_settle_finalize`].
+/// [`ClassSCell::commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep). Mirrors [`commit_b_settle_finalize`].
 #[allow(clippy::too_many_arguments)]
 async fn commit_b_stream_settle_finalize(
     cell: &mut crate::context::actor::class_s::ClassSCell,
