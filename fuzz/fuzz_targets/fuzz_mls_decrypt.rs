@@ -10,13 +10,22 @@
 //! malformed ciphertext must surface a **typed** `MlsError::DecryptionFailed`
 //! (→ browser `[SCP-CRYPTO-4010]`), never abort the tab.
 //!
-//! The only attacker-reachable panic on the openmls 0.8.1 decrypt path is a
-//! `debug_assert!` (`"Ciphertext decryption failed"`,
-//! `openmls-0.8.1/src/framing/private_message_in.rs`), which is **compiled out
+//! No release-mode panic has been *found* on the openmls 0.8.1 decrypt path
+//! (this target is that standing evidence, pinned to openmls 0.8.1; a version
+//! bump could introduce one, caught by the nightly fuzz job). The one known
+//! debug-build panic is an openmls `debug_assert!` (`"Ciphertext decryption
+//! failed"`, `openmls-0.8.1/src/framing/private_message_in.rs`), **compiled out
 //! of `--release` builds**. This target drives arbitrary and tampered-AEAD
-//! ciphertext through the `scp-mls` decrypt entry points and asserts they never
-//! panic. libFuzzer treats any panic/abort as a crash, so "no panic" is the
-//! invariant (I1) — returning `Ok` or `Err` are both acceptable.
+//! ciphertext through the browser/relay-reachable `scp-mls` decrypt entry points
+//! and asserts they never panic. libFuzzer treats any panic/abort as a crash,
+//! so "no panic" is the invariant (I1) — returning `Ok` or `Err` are both
+//! acceptable.
+//!
+//! Scope is the **untrusted-relay** threat model: a relay cannot forge an
+//! AEAD-passing frame, so the deeper StagedCommit / tree-KEM (HPKE path-secret)
+//! panic surface — reachable only *after* outer AEAD succeeds, i.e. only by a
+//! malicious authenticated **member** (insider) — is a distinct threat model,
+//! out of scope here.
 //!
 //! # CRITICAL: run with `-O` (debug-assertions OFF)
 //!
@@ -34,13 +43,22 @@
 //! A real 2-member MLS group (Alice → Bob) is built once per fuzzer process
 //! (thread-local; libFuzzer runs single-threaded, and a crash reproducer
 //! rebuilds fresh — the panic property is independent of the specific group
-//! secrets). Each fuzz input is fed to every decrypt entry point two ways:
+//! secrets). Each fuzz input is fed to every browser/relay-reachable decrypt
+//! entry point two ways:
 //!   1. straight in as ciphertext bytes (garbage / malformed-framing path);
 //!   2. XOR-ed over the tail of a genuinely valid ciphertext, so openmls parses
 //!      the frame and reaches AEAD-tag verification (the tampered-AEAD path that
 //!      trips the debug_assert in a debug build).
 //!
-//! Decrypting arbitrary or tampered bytes never advances Bob's ratchet
+//! Path 2 is guaranteed to tamper: an empty / all-zero `data` would XOR to a
+//! no-op and leave a *pristine* valid ciphertext, which `decrypt` would accept
+//! and thereby advance Bob's secret-tree ratchet (consuming generation 0), after
+//! which every generation-0 ciphertext is rejected at the secret-tree stage
+//! **before** AEAD verification — making the AEAD `debug_assert` path this target
+//! exists to stress unreachable. The guard below (flip the last byte when the
+//! XOR was a no-op) ensures a genuine tamper on every input, so the pristine
+//! ciphertext is never replayed and generation 0 is never consumed. With that,
+//! neither garbage nor tampered bytes ever advance Bob's ratchet
 //! (`process_message` is atomic and rejects before merging), so reusing the
 //! group across inputs is sound.
 
@@ -61,7 +79,8 @@ use std::cell::RefCell;
 struct FuzzState {
     /// Bob's group — the receiver whose decrypt path is under test.
     receiver: ScpMlsGroup,
-    /// A genuinely valid application ciphertext from Alice at the joined epoch.
+    /// A genuinely valid application ciphertext from Alice, decryptable by Bob at
+    /// the current epoch (the base for the guaranteed-tamper Path-2 mutation).
     valid_ciphertext: Vec<u8>,
 }
 
@@ -92,8 +111,8 @@ fn build_state() -> Option<FuzzState> {
     .ok()?;
     let bob = join_group(&add.welcome, bob_provider, bob_signer).ok()?;
 
-    // One valid application ciphertext at the joined epoch, to be tampered by the
-    // fuzz body. We do NOT feed it unmutated to `bob` here.
+    // One valid application ciphertext Bob can decrypt at the current epoch, to be
+    // tampered by the fuzz body. We do NOT feed it unmutated to `bob` here.
     let ct_msg = encrypt(&mut alice, b"fuzz-valid-template").ok()?;
     let valid_ciphertext = serialize_ciphertext(&ct_msg).ok()?;
 
@@ -107,9 +126,15 @@ thread_local! {
     static STATE: RefCell<Option<FuzzState>> = const { RefCell::new(None) };
 }
 
-/// Feeds `ciphertext` to every attacker-reachable decrypt entry point. The
-/// invariant is implicit: any panic/abort is a libFuzzer crash. `Ok`/`Err` are
-/// both fine.
+/// Feeds `ciphertext` to every browser/relay-reachable `scp-mls` decrypt entry
+/// point. The invariant is implicit: any panic/abort is a libFuzzer crash.
+/// `Ok`/`Err` are both fine.
+///
+/// The fourth decrypt entry point, `encrypt::decrypt_with_sender_key`, is a
+/// NATIVE-path fn (driven by `scp-runtime`, not the browser/relay surface), so
+/// it is deliberately out of this target's threat model. It shares the identical
+/// `process_message` + `catch_unwind` panic surface as the three below, so the
+/// panic-free property is evidenced for it transitively.
 fn drive_decrypt(receiver: &mut ScpMlsGroup, ciphertext: &[u8]) {
     let _ = decrypt(receiver, ciphertext);
     let _ = decrypt_with_sender_did(receiver, ciphertext, &SystemClock);
@@ -139,6 +164,17 @@ fuzz_target!(|data: &[u8]| {
         let start = tampered.len() - n;
         for (b, m) in tampered[start..].iter_mut().zip(data.iter()) {
             *b ^= *m;
+        }
+        // Guarantee a GENUINE tamper: an empty / all-zero `data` XORs to a no-op,
+        // leaving a pristine valid ciphertext that `decrypt` would accept and so
+        // advance Bob's ratchet (consuming generation 0), after which the AEAD
+        // path becomes unreachable (see the module docs). If the XOR changed
+        // nothing, flip the last byte. An MLS PrivateMessage is never empty, so
+        // `last_mut()` is always `Some`.
+        if tampered == state.valid_ciphertext {
+            if let Some(last) = tampered.last_mut() {
+                *last ^= 0xff;
+            }
         }
         drive_decrypt(&mut state.receiver, &tampered);
     });
