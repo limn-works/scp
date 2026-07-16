@@ -9,6 +9,7 @@ members = [
     "crates/scp-identity",
     "crates/scp-event-log",
     "crates/scp-protocol",
+    "crates/scp-relay-client",
     "crates/scp-mls",
     "crates/scp-client",
     "crates/scp-client-wasm",

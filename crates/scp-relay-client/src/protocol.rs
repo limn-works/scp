@@ -1,4 +1,5 @@
-//! Native relay protocol message types and `MessagePack` wire format.
+//! Relay wire protocol message types and `MessagePack` wire format (shared by
+//! the native relay and the in-browser client).
 //!
 //! Defines [`ClientMessage`] (client-to-relay) and [`RelayMessage`]
 //! (relay-to-client) enums with `serde` support for `MessagePack`
@@ -27,7 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::error::NativeProtocolError;
+use super::error::RelayProtocolError;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -156,7 +157,7 @@ pub enum ClientMessage {
 
         /// The opaque blob content. 1--262144 bytes (256 KB).
         /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
-        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
+        #[serde(with = "scp_protocol::serde_util::serde_bounded_bytes")]
         blob: Vec<u8>,
     },
 
@@ -315,7 +316,7 @@ pub enum ClientMessage {
 
         /// Opaque payload to forward. The bridge does NOT inspect this.
         /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
-        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
+        #[serde(with = "scp_protocol::serde_util::serde_bounded_bytes")]
         payload: Vec<u8>,
     },
 }
@@ -328,11 +329,11 @@ impl ClientMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::SerializationFailed`] if serialization
+    /// Returns [`RelayProtocolError::SerializationFailed`] if serialization
     /// fails.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, NativeProtocolError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, RelayProtocolError> {
         rmp_serde::to_vec_named(self)
-            .map_err(|e| NativeProtocolError::SerializationFailed(e.to_string()))
+            .map_err(|e| RelayProtocolError::SerializationFailed(e.to_string()))
     }
 
     /// Deserializes a `ClientMessage` from `MessagePack` binary format.
@@ -341,19 +342,19 @@ impl ClientMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::MessageTooLarge`] if `bytes.len()` exceeds
+    /// Returns [`RelayProtocolError::MessageTooLarge`] if `bytes.len()` exceeds
     /// [`MAX_MESSAGE_SIZE`].
-    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes are
+    /// Returns [`RelayProtocolError::DeserializationFailed`] if the bytes are
     /// not a valid `MessagePack`-encoded `ClientMessage`.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeProtocolError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RelayProtocolError> {
         if bytes.len() > MAX_MESSAGE_SIZE {
-            return Err(NativeProtocolError::MessageTooLarge {
+            return Err(RelayProtocolError::MessageTooLarge {
                 size: bytes.len(),
                 max: MAX_MESSAGE_SIZE,
             });
         }
         rmp_serde::from_slice(bytes)
-            .map_err(|e| NativeProtocolError::DeserializationFailed(e.to_string()))
+            .map_err(|e| RelayProtocolError::DeserializationFailed(e.to_string()))
     }
 
     /// Validates this message against protocol constraints.
@@ -366,9 +367,9 @@ impl ClientMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::ValidationFailed`] describing the first
+    /// Returns [`RelayProtocolError::ValidationFailed`] describing the first
     /// constraint violation found.
-    pub fn validate(&self) -> Result<(), NativeProtocolError> {
+    pub fn validate(&self) -> Result<(), RelayProtocolError> {
         match self {
             Self::Publish {
                 ref_id,
@@ -391,7 +392,7 @@ impl ClientMessage {
                 if let Some(l) = limit
                     && (*l == 0 || *l > MAX_QUERY_LIMIT)
                 {
-                    return Err(NativeProtocolError::ValidationFailed(format!(
+                    return Err(RelayProtocolError::ValidationFailed(format!(
                         "limit must be 1-{MAX_QUERY_LIMIT}, got {l}"
                     )));
                 }
@@ -403,7 +404,7 @@ impl ClientMessage {
                 validate_ref_id(ref_id)?;
                 // Bridge payload has the same max size as a blob.
                 if payload.is_empty() || payload.len() > MAX_BLOB_SIZE {
-                    return Err(NativeProtocolError::ValidationFailed(format!(
+                    return Err(RelayProtocolError::ValidationFailed(format!(
                         "bridge payload must be 1-{MAX_BLOB_SIZE} bytes, got {}",
                         payload.len()
                     )));
@@ -507,7 +508,7 @@ pub enum RelayMessage {
 
         /// The opaque blob content.
         /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
-        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
+        #[serde(with = "scp_protocol::serde_util::serde_bounded_bytes")]
         blob: Vec<u8>,
     },
 
@@ -562,11 +563,11 @@ impl RelayMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::SerializationFailed`] if serialization
+    /// Returns [`RelayProtocolError::SerializationFailed`] if serialization
     /// fails.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, NativeProtocolError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, RelayProtocolError> {
         rmp_serde::to_vec_named(self)
-            .map_err(|e| NativeProtocolError::SerializationFailed(e.to_string()))
+            .map_err(|e| RelayProtocolError::SerializationFailed(e.to_string()))
     }
 
     /// Deserializes a `RelayMessage` from `MessagePack` binary format.
@@ -575,19 +576,19 @@ impl RelayMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::MessageTooLarge`] if `bytes.len()` exceeds
+    /// Returns [`RelayProtocolError::MessageTooLarge`] if `bytes.len()` exceeds
     /// [`MAX_MESSAGE_SIZE`].
-    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes are
+    /// Returns [`RelayProtocolError::DeserializationFailed`] if the bytes are
     /// not a valid `MessagePack`-encoded `RelayMessage`.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeProtocolError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RelayProtocolError> {
         if bytes.len() > MAX_MESSAGE_SIZE {
-            return Err(NativeProtocolError::MessageTooLarge {
+            return Err(RelayProtocolError::MessageTooLarge {
                 size: bytes.len(),
                 max: MAX_MESSAGE_SIZE,
             });
         }
         rmp_serde::from_slice(bytes)
-            .map_err(|e| NativeProtocolError::DeserializationFailed(e.to_string()))
+            .map_err(|e| RelayProtocolError::DeserializationFailed(e.to_string()))
     }
 }
 
@@ -597,11 +598,11 @@ impl RelayMessage {
 
 /// Validates a `ref_id` value against the maximum length constraint.
 #[allow(clippy::ref_option)]
-fn validate_ref_id(ref_id: &Option<String>) -> Result<(), NativeProtocolError> {
+fn validate_ref_id(ref_id: &Option<String>) -> Result<(), RelayProtocolError> {
     if let Some(id) = ref_id
         && id.len() > MAX_REF_ID_LEN
     {
-        return Err(NativeProtocolError::ValidationFailed(format!(
+        return Err(RelayProtocolError::ValidationFailed(format!(
             "ref_id must be at most {MAX_REF_ID_LEN} bytes, got {}",
             id.len()
         )));
@@ -610,9 +611,9 @@ fn validate_ref_id(ref_id: &Option<String>) -> Result<(), NativeProtocolError> {
 }
 
 /// Validates a `blob_ttl` value against the allowed range.
-fn validate_blob_ttl(ttl: u32) -> Result<(), NativeProtocolError> {
+fn validate_blob_ttl(ttl: u32) -> Result<(), RelayProtocolError> {
     if !(MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&ttl) {
-        return Err(NativeProtocolError::ValidationFailed(format!(
+        return Err(RelayProtocolError::ValidationFailed(format!(
             "blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {ttl}"
         )));
     }
@@ -620,9 +621,9 @@ fn validate_blob_ttl(ttl: u32) -> Result<(), NativeProtocolError> {
 }
 
 /// Validates a blob payload against the allowed size range.
-fn validate_blob(blob: &[u8]) -> Result<(), NativeProtocolError> {
+fn validate_blob(blob: &[u8]) -> Result<(), RelayProtocolError> {
     if blob.is_empty() || blob.len() > MAX_BLOB_SIZE {
-        return Err(NativeProtocolError::ValidationFailed(format!(
+        return Err(RelayProtocolError::ValidationFailed(format!(
             "blob must be 1-{MAX_BLOB_SIZE} bytes, got {}",
             blob.len()
         )));
@@ -1493,7 +1494,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(NativeProtocolError::MessageTooLarge { size, max })
+                Err(RelayProtocolError::MessageTooLarge { size, max })
                     if size == MAX_MESSAGE_SIZE + 1 && max == MAX_MESSAGE_SIZE
             ),
             "expected MessageTooLarge, got: {result:?}"
@@ -1507,7 +1508,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(NativeProtocolError::MessageTooLarge { size, max })
+                Err(RelayProtocolError::MessageTooLarge { size, max })
                     if size == MAX_MESSAGE_SIZE + 1 && max == MAX_MESSAGE_SIZE
             ),
             "expected MessageTooLarge, got: {result:?}"
@@ -1522,7 +1523,7 @@ mod tests {
         let at_limit = vec![0xFFu8; MAX_MESSAGE_SIZE];
         let result = ClientMessage::from_bytes(&at_limit);
         assert!(
-            matches!(result, Err(NativeProtocolError::DeserializationFailed(_))),
+            matches!(result, Err(RelayProtocolError::DeserializationFailed(_))),
             "expected DeserializationFailed at limit (not MessageTooLarge), got: {result:?}"
         );
     }
@@ -1532,7 +1533,7 @@ mod tests {
         let at_limit = vec![0xFFu8; MAX_MESSAGE_SIZE];
         let result = RelayMessage::from_bytes(&at_limit);
         assert!(
-            matches!(result, Err(NativeProtocolError::DeserializationFailed(_))),
+            matches!(result, Err(RelayProtocolError::DeserializationFailed(_))),
             "expected DeserializationFailed at limit (not MessageTooLarge), got: {result:?}"
         );
     }

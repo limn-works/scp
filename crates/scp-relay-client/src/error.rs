@@ -1,12 +1,13 @@
-//! Protocol-specific error types for the SCP native relay.
+//! Protocol-specific error types for the SCP relay wire protocol (shared by the
+//! native relay and the in-browser client).
 //!
 //! Defines `ProtocolErrorCode` constants covering client errors (4xxx) and
-//! server errors (5xxx), plus the [`NativeProtocolError`] type for protocol
+//! server errors (5xxx), plus the [`RelayProtocolError`] type for protocol
 //! violations detected during serialization, deserialization, or validation.
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full error code specification.
 
-/// Protocol error codes for the SCP native relay.
+/// Protocol error codes for the SCP relay wire protocol.
 ///
 /// Client errors (4xxx) indicate the request is invalid and MUST NOT be
 /// retried as-is. Server errors (5xxx) indicate a transient condition and
@@ -95,12 +96,12 @@ pub mod code {
     }
 }
 
-/// Protocol-level errors for the SCP native relay.
+/// Protocol-level errors for the SCP relay wire protocol.
 ///
 /// These errors occur during message validation, serialization, or
 /// deserialization -- before or after the message reaches the wire.
 #[derive(Debug, Clone, thiserror::Error)]
-pub enum NativeProtocolError {
+pub enum RelayProtocolError {
     /// A message failed serialization to `MessagePack`.
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
@@ -216,15 +217,15 @@ mod tests {
 
     #[test]
     fn native_protocol_error_display() {
-        use super::NativeProtocolError;
+        use super::RelayProtocolError;
 
-        let err = NativeProtocolError::SerializationFailed("bad data".to_string());
+        let err = RelayProtocolError::SerializationFailed("bad data".to_string());
         assert_eq!(err.to_string(), "serialization failed: bad data");
 
-        let err = NativeProtocolError::DeserializationFailed("corrupt".to_string());
+        let err = RelayProtocolError::DeserializationFailed("corrupt".to_string());
         assert_eq!(err.to_string(), "deserialization failed: corrupt");
 
-        let err = NativeProtocolError::ValidationFailed("blob too large".to_string());
+        let err = RelayProtocolError::ValidationFailed("blob too large".to_string());
         assert_eq!(err.to_string(), "validation failed: blob too large");
     }
 }
