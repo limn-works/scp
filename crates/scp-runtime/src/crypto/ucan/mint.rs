@@ -96,7 +96,7 @@ fn verify_attestation_ceiling_compliance(
     verify_ceiling_compliance(&cap_uris, ceiling)
 }
 
-/// Infers the [`OutletKind`] of a delegation from the stem family of its
+/// Infers the [`OutletKind`](scp_protocol::context::outlets::OutletKind) of a delegation from the stem family of its
 /// delegated capability URIs, mirroring the root-mint inference in
 /// [`scp_protocol::trust::caveats::InvocationCaveats::try_new_for_root`].
 ///
@@ -107,8 +107,8 @@ fn verify_attestation_ceiling_compliance(
 /// pins the inferred value into the child's signed caveats so every
 /// downstream hop sees an explicit, equality-checked value.
 ///
-/// - `outlet_query:*` / `outlet_query:{id}` ⇒ [`OutletKind::Query`].
-/// - `outlet_call:*` / `outlet_call:{id}` ⇒ [`OutletKind::Action`].
+/// - `outlet_query:*` / `outlet_query:{id}` ⇒ [`OutletKind::Query`](scp_protocol::context::outlets::OutletKind::Query).
+/// - `outlet_call:*` / `outlet_call:{id}` ⇒ [`OutletKind::Action`](scp_protocol::context::outlets::OutletKind::Action).
 /// - Non-outlet stems contribute nothing (returns `None` when no outlet
 ///   stems are present — there is no outlet kind to materialize).
 ///
@@ -177,7 +177,7 @@ fn infer_origin_kind_from_capabilities(
 ///   parent when present, otherwise inferred from the delegated capability
 ///   stems (the first delegation off an unconstrained single-family root pins
 ///   the kind). The materialized child is then run through
-///   [`InvocationCaveats::try_new`] (mint limits) and narrowed against the
+///   [`InvocationCaveats::try_new`](scp_protocol::trust::caveats::InvocationCaveats::try_new) (mint limits) and narrowed against the
 ///   parent (`parent.narrow(child)` — rejects widening / field removal /
 ///   `origin_kind` change; `empty().narrow(child)` when the parent is a
 ///   caveat-free root, which still enforces rule-4's explicit-`origin_kind`
@@ -264,7 +264,7 @@ fn build_delegated_caveats(
 ///
 /// SCOPE (PR-3): no caveat params exist on `MintParams`, so this never emits a
 /// populated caveat set — it exists to run the UNCONDITIONAL root stem/kind
-/// agreement gate ([`InvocationCaveats::try_new_for_root`]) so a mixed-family
+/// agreement gate ([`InvocationCaveats::try_new_for_root`](scp_protocol::trust::caveats::InvocationCaveats::try_new_for_root)) so a mixed-family
 /// outlet root can never be signed, then returns `None` (a single-family outlet
 /// root legitimately carries `nb = None`; the first delegation materializes the
 /// kind). Value-caveat routing on the root is a DEFERRED slice.

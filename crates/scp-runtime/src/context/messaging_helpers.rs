@@ -6,9 +6,8 @@
 //! This module hosts messaging-domain helpers that operate on actor-owned
 //! [`PerContextState`](crate::context::actor::state::PerContextState) and
 //! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::messaging_helpers_legacy`] until Phase 2A
-//! finalization removes the shim fallback.
+//! The pre-migration `&Supervisor` lock-and-call bodies have been removed
+//! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
 //! # Pipeline shape
 //!
@@ -330,7 +329,7 @@ pub fn enforce_send_economy(
     })
 }
 
-/// Discharge a deferred spending-nonce [`ClassSCommitToken`] on a `send_message`
+/// Discharge a deferred spending-nonce [`ClassSCommitToken`](crate::context::actor::class_s::ClassSCommitToken) on a `send_message`
 /// EARLY-ABORT path (ADR-049 §9, keep-direction) and return the error to
 /// propagate.
 ///
@@ -362,7 +361,7 @@ pub fn enforce_send_economy(
 ///
 /// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
 ///
-/// SYNC fn returning a future: [`ClassSCommitToken::commit`] is itself a
+/// SYNC fn returning a future: [`ClassSCommitToken::commit`](crate::context::actor::class_s::ClassSCommitToken::commit) is itself a
 /// sync-returns-future that consumes the `&PerContextState` in its prelude, so
 /// the returned future here captures only the (already state-free) commit future
 /// plus the owned `abort_err`. An `async fn` would keep the `&PerContextState`
@@ -1739,7 +1738,7 @@ pub async fn encrypt_and_send(
 // 9b. send_checkpoint (§9.9.3, §23.7)
 // ---------------------------------------------------------------------------
 
-/// Broadcasts a signed [`ConsistencyCheckpoint`] to context peers so they can
+/// Broadcasts a signed [`ConsistencyCheckpoint`](scp_event_log::checkpoint::ConsistencyCheckpoint) to context peers so they can
 /// compare Merkle roots at equal event counts and detect relay equivocation
 /// (§9.9.3, §23.7).
 ///
@@ -2917,7 +2916,7 @@ pub(in crate::context) fn xctx_committed_stream_outputs_snapshot(
 /// Build the Class-S snapshot projection of the actor's caller-side (A-owned)
 /// COMMITTED cross-context outlet-invocation witness set (spec §6.2.4 "Commit",
 /// caller side; §17.16.4 crash recovery; ADR-049 §9). The live
-/// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations)
+/// [`ClassSState::xctx_committed_invocations`](crate::context::actor::state::ClassSState::xctx_committed_invocations)
 /// is a `{SagaId}` idempotency-witness set carrying no §9.4.3 bearer bytes, so —
 /// like [`xctx_committed_outputs_snapshot`] — the snapshot stores it directly
 /// via `Clone`. Exists so EVERY snapshot builder projects this Class-S saga
@@ -2936,7 +2935,7 @@ pub(in crate::context) fn xctx_committed_invocations_snapshot(
 /// Build the Class-S snapshot projection of the actor's caller-side durable
 /// reservation reversal records (spec §6.2.4 "Reservation release on every
 /// terminal path"; §17.16.4 crash recovery; ADR-049 §9). The live
-/// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations)
+/// [`ClassSState::xctx_caller_reservations`](crate::context::actor::state::ClassSState::xctx_caller_reservations)
 /// is a `{SagaId → CallerReservationRecord}` map whose values carry no §9.4.3
 /// bearer bytes (public economy metadata), so — like
 /// [`xctx_committed_invocations_snapshot`] — the snapshot stores it directly via
@@ -3187,7 +3186,7 @@ pub fn decrypt_and_dispatch(
 /// from the actor's `PerContextState::local_sender_key_epoch()` (read inside the
 /// same `commit_class_s_keep` closure that durably persisted the bump) and
 /// not-yet-flipped sites source it from the retained
-/// [`MlsCryptoProvider::local_sender_key_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::local_sender_key_epoch)
+/// [`PerContextState::local_sender_key_epoch`](crate::context::actor::state::PerContextState::local_sender_key_epoch)
 /// — the read-authority follows the write-authority coherently.
 ///
 /// The floor is advanced in the supervisor registry keyed by the local DID.

@@ -22,8 +22,8 @@
 //!
 //! Per-context (actor-shape `(&mut PerContextState, &ActorDeps, ...)`):
 //!
-//! 1. [`export_context`] — read-only state borrow + persistence-side
-//!    snapshot construction; produces a signed [`ContextExport`].
+//! 1. [`export_context_blocks`] — read-only state borrow + persistence-side
+//!    snapshot construction; produces a signed [`ContextExport`](crate::context::export_import::ContextExport).
 //! 2. [`leave_context`] — capability check + MLS remove + sender-key
 //!    cleanup + membership removal + close-on-empty.
 //! 3. [`drain_and_deliver_sender_keys`] — drain pending sender-key
@@ -1430,7 +1430,7 @@ pub fn join_context_membership(
 /// budget (H8 — service was rendered).
 ///
 /// ADR-049 §9 Class-S cell seam: takes the `&mut ClassSCell` so the escrow
-/// capture+verify `.await` ([`capture_and_verify_paid_action`]) runs OUTSIDE any
+/// capture+verify `.await` ([`capture_and_verify_paid_action`](crate::context::economy_helpers::capture_and_verify_paid_action)) runs OUTSIDE any
 /// view borrow, and the Class-C surfacing of the receipt (or the failure event)
 /// is applied afterward through a short-lived `class_c_view()` — no
 /// whole-`&mut PerContextState`, no `state_mut()`.
@@ -1813,11 +1813,11 @@ pub async fn create_context(
 /// `create`/`restore` bootstrap paths register through
 /// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state)
 /// (owned-state spawn — no legacy contexts `DashMap` write); `import`
-/// still registers through
-/// [`SupervisorHandle::replace_context`](crate::context::supervisor::handle::SupervisorHandle::replace_context)
-/// +
-/// [`SupervisorHandle::spawn_actor_for_context`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_for_context)
-/// pending its actor-native replaceability primitive. Every surface
+/// registers through the actor-native replacement gate
+/// [`SupervisorHandle::dispatch_prepare_for_replace`](crate::context::supervisor::handle::SupervisorHandle::dispatch_prepare_for_replace)
+/// followed by
+/// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state).
+/// Every surface
 /// `finalize_create` touches is mailbox-based — gauges, the
 /// governance-timeout interval task, persistence/broadcast, and the TTL
 /// timer all reach the freshly-spawned actor through the supervisor

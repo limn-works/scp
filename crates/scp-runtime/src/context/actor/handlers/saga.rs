@@ -88,7 +88,7 @@ use crate::context::supervisor::saga_prepared_state::{
 };
 
 /// Eviction TTL for B's per-target cross-context-saga nonce-dedup cache
-/// ([`PerContextState::xctx_nonce_dedup`]).
+/// ([`ClassSState::xctx_nonce_dedup`](crate::context::actor::state::ClassSState::xctx_nonce_dedup)).
 ///
 /// Set to **strictly more than** the §9.14 clock-skew tolerance the Prepare-B
 /// freshness check applies (`DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`) — here exactly
@@ -572,7 +572,7 @@ fn misrouted<T>(
 /// [`reserve_outlet_economy`] derives it from the caller context's economy policy
 /// / outlet registry via `economy_pre_check`, NEVER from any caller-asserted
 /// value (a caller must not declare its own cheaper cost; spec §6.2.4 / §19.3).
-/// The resulting `Send` [`OutletEconomyReservation`] is a `#[must_use]` RAII
+/// The resulting `Send` [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation) is a `#[must_use]` RAII
 /// carrier the FSM holds — its drop releases the held escrow/rate-limit on every
 /// terminal non-commit path. The staged saga state is Class-S sync-persisted
 /// fail-closed BEFORE the reply, so a crash in the coalesce window cannot
@@ -1943,7 +1943,7 @@ async fn commit_b_first_settle(
 
 /// Post-capture half of [`commit_b_first_settle`] (step 2): append the
 /// `OutletInvoked` event-log leaf, and on append failure roll the capture back +
-/// re-stage the owned slot + RE-PERSIST via [`ClassSCell::commit_class_s_keep`].
+/// re-stage the owned slot + RE-PERSIST via [`ClassSCell::commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep).
 /// Split out of [`commit_b_first_settle`] only to stay within the per-function
 /// line budget — the behaviour is exactly the prior inline append path. See
 /// FLAG-COMMIT-B on the capture side for why this is a two-combinator

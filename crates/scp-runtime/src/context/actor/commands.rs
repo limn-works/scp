@@ -1155,7 +1155,7 @@ pub enum LifecycleCommand {
     /// Issue an MLS Update proposal + self-Commit for post-compromise
     /// security (§9.12 step 2). Mutating — ratchets the group to a new
     /// epoch with fresh key material via
-    /// [`MlsCryptoProvider::advance_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::advance_epoch)
+    /// [`PerContextState::advance_epoch`](crate::context::actor::state::PerContextState::advance_epoch)
     /// (which calls `ratchet::propose_update_with_wrapping_key`,
     /// preserving the `scp_wrapping_key` leaf extension per §9.16.1).
     ///
@@ -1290,7 +1290,8 @@ pub struct ExecuteGovernanceActionPayload {
 /// themselves.
 pub enum GovernanceCommand {
     /// Submits a governance proposal — unchecked variant. Mirrors
-    /// [`Supervisor::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action).
+    /// `Supervisor::propose_governance_action` (a `testing`-gated convenience
+    /// wrapper over the checked path).
     /// Accepts the proposer DID + action + signing key without a
     /// capability pre-check (the governance engine enforces eligibility
     /// internally). For `SingleAdmin` contexts the proposal is auto-
@@ -1317,7 +1318,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a vote on a pending proposal. Mirrors
-    /// [`Supervisor::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal).
+    /// `Supervisor::vote_on_proposal` (a `testing`-gated helper).
     /// `approve == true` is an approval vote; `false` is rejection.
     VoteOnProposal {
         /// Boxed owned payload.

@@ -17,9 +17,8 @@
 //! This module hosts query-domain helpers that operate on actor-owned
 //! [`PerContextState`](crate::context::actor::state::PerContextState) and
 //! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::queries_helpers_legacy`] until Phase 2A
-//! finalization removes the shim fallback.
+//! The pre-migration `&Supervisor` lock-and-call bodies have been removed
+//! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
 //! # Pipeline shape
 //!
@@ -52,9 +51,9 @@
 //! - [`generate_context_access_key`], [`revoke_context_access_key`],
 //!   [`restore_context_access_key`], [`set_access_key`],
 //!   [`remove_access_key`] — access-key store mutations.
-//! - [`inject_access_key`], [`get_access_key`], [`get_all_access_keys`],
-//!   [`grant_budget_for_test`], [`remaining_budget_for_test`],
-//!   [`velocity_for_test`] — `#[cfg(feature = "testing")]` accessors.
+//! - `inject_access_key`, `get_access_key`, `get_all_access_keys`,
+//!   `grant_budget_for_test`, `remaining_budget_for_test`,
+//!   `velocity_for_test` — `#[cfg(feature = "testing")]` accessors.
 //! - [`compare_remote_checkpoint`] — equivocation detection (§9.9.3).
 //!   Reads membership and mutates `last_seen_remote_checkpoint` +
 //!   `receive_buffer` (via a `ClassCMut` view) on divergent compare.
@@ -823,7 +822,7 @@ fn verify_remote_checkpoint_authenticity(
 /// membership + signature gate and the Merkle-root/count comparison WITHOUT
 /// touching per-context state. `sender_is_member` is read by the caller (so the
 /// caller chooses how it borrows the roster — a [`ClassCMut`] view accessor or a
-/// bare-state field). Returns the [`CheckpointComparison`] plus
+/// bare-state field). Returns the [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison) plus
 /// `Some(local_root)` when the result is `Divergent` (the caller then applies
 /// the two Class-C field mutations — dedup + receive-buffer emit — in whatever
 /// borrow shape it holds). This split is what lets BOTH the actor handler

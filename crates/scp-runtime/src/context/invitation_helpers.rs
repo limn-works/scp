@@ -9,9 +9,9 @@
 //! - [`build_metadata_snapshot`] — projects the genesis [`ContextParams`] into
 //!   the visibility-filtered [`MetadataSnapshot`] carried in the bundle. Its
 //!   `structural` fields are copied verbatim from `params` so the bundle always
-//!   passes [`InvitationBundle::verify_structural_consistency`]; its
+//!   passes [`InvitationBundle::verify_structural_consistency`](scp_protocol::context::InvitationBundle::verify_structural_consistency); its
 //!   `operational` fields are filtered by the context's
-//!   [`MetadataVisibilityPolicy`] exactly as
+//!   [`MetadataVisibilityPolicy`](scp_protocol::context::MetadataVisibilityPolicy) exactly as
 //!   [`ContextParams::public_metadata`](scp_protocol::context::ContextParams::public_metadata)
 //!   filters `PublicMetadata` (§5.7).
 //! - [`SealedInvitation`] — the on-wire delivery envelope published to the

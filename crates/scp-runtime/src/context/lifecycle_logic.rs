@@ -10,7 +10,7 @@ use scp_protocol::context::builder::ContextCreationError;
 
 use scp_did::DID;
 
-/// Builds an [`IdentityDepthAssessment`] for a member in a context.
+/// Builds an [`IdentityDepthAssessment`](scp_protocol::trust::sybil::IdentityDepthAssessment) for a member in a context.
 ///
 /// Shared by `evaluate_sybil_resistance` (join path) and `check_proposer_eligibility`
 /// (governance path). Populates trust signals from available context state:
@@ -195,9 +195,9 @@ pub fn derive_message_pricing(
 ///
 /// Reads the `sybil_policy` directly so callers may pass
 /// `state.handle.params().sybil_policy.as_ref()` from the unified
-/// [`PerContextState`] (ADR-049 §Decision 1). When `None`, passes
+/// [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1). When `None`, passes
 /// unconditionally. When `Some`, constructs an
-/// [`IdentityDepthAssessment`] from the member's available trust signals
+/// [`IdentityDepthAssessment`](scp_protocol::trust::sybil::IdentityDepthAssessment) from the member's available trust signals
 /// and delegates to [`scp_protocol::trust::sybil::evaluate_sybil_resistance`].
 ///
 /// # Errors
@@ -229,7 +229,7 @@ pub fn evaluate_sybil_resistance(
 /// into `participation_cache`. Budget spend is NOT recorded here — that is
 /// `enforce_join_economy`'s responsibility (#1537). Takes the `&mut participation_cache` field and a
 /// `&ReceiveBuffer` directly so callers may pass disjoint sub-borrows of the
-/// unified [`PerContextState`] (ADR-049 §Decision 1) — a cell-holder supplies
+/// unified [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1) — a cell-holder supplies
 /// the cache via `governance_class_c_mut().participation_cache_mut()` and the
 /// buffer via `receive_buffer_mut()`, so no whole `&mut GovernanceState` (and no
 /// `state_mut()`) is needed.
@@ -282,7 +282,7 @@ pub fn post_join_bookkeeping(
 /// AND-composition (spec §19.5), and records spend against the joiner's
 /// budget. Takes a `&mut GovernanceState` and `member_count` directly so
 /// callers may pass disjoint sub-borrows of the unified
-/// [`PerContextState`] (ADR-049 §Decision 1).
+/// [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1).
 ///
 /// # Errors
 ///

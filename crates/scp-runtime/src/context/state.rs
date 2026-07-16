@@ -984,11 +984,11 @@ pub struct ContextSnapshot {
     ///
     /// Encrypted contexts persist the member's pseudonym routing ID and the
     /// learned peer registry; broadcast contexts persist
-    /// [`ContextRouting::Broadcast`] and carry no pseudonym state.
+    /// [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) and carry no pseudonym state.
     ///
     /// Degraded / pre-routing-field snapshots (those persisted before this
     /// field existed, or `strip_snapshot_for_public` redactions) default to
-    /// [`ContextRouting::Broadcast`] via [`default_context_routing`] — a
+    /// [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) via [`default_context_routing`] — a
     /// no-pseudonym placeholder that carries no routing secret.
     ///
     /// The restore path does NOT silently coerce this placeholder onto an
@@ -1060,7 +1060,7 @@ pub struct ContextSnapshot {
     /// fail-closed, mirroring [`Self::saga_pending`].
     ///
     /// The live actor-side slot is
-    /// [`PerContextState::xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs).
+    /// [`ClassSState::xctx_committed_outputs`](crate::context::actor::state::ClassSState::xctx_committed_outputs).
     /// Commit-B captures the outlet output + signed receipt here BEFORE acking, so
     /// a Commit replayed after a crash (§17.16.4) re-emits the stored output and
     /// re-signs nothing — it returns the IDENTICAL receipt. A coalesce-window
@@ -1111,7 +1111,7 @@ pub struct ContextSnapshot {
     /// [`Self::saga_pending`].
     ///
     /// The live slot is
-    /// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations).
+    /// [`ClassSState::xctx_committed_invocations`](crate::context::actor::state::ClassSState::xctx_committed_invocations).
     /// Commit-A inserts the `SagaId` here as the idempotency witness BEFORE
     /// acking; a replayed Commit-A re-acks as a no-op. A coalesce-window
     /// rollback would let a replay double-settle the escrow, the exact hazard
@@ -1128,7 +1128,7 @@ pub struct ContextSnapshot {
     /// synchronously-persisted, fail-closed, mirroring [`Self::saga_pending`].
     ///
     /// The live slot is
-    /// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations).
+    /// [`ClassSState::xctx_caller_reservations`](crate::context::actor::state::ClassSState::xctx_caller_reservations).
     /// Prepare-A inserts a record here in the same Class-S snapshot as the
     /// deduction it reverses; on a `PreparingB`-window crash the recovery sweep's
     /// clean abort (`Abort { reservation: None }`) reverses the caller's
@@ -1156,7 +1156,7 @@ pub struct ContextSnapshot {
     /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
     /// outlet invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
     /// projection of
-    /// [`PerContextState::xctx_nonce_dedup`](crate::context::actor::state::PerContextState::xctx_nonce_dedup):
+    /// [`ClassSState::xctx_nonce_dedup`](crate::context::actor::state::ClassSState::xctx_nonce_dedup):
     /// `{16-byte nonce → first-seen Unix secs}`.
     ///
     /// **Class S** — synchronously-persisted, fail-closed, mirroring
@@ -1235,7 +1235,7 @@ pub struct ContextSnapshot {
 
 /// Default routing variant for degraded / pre-routing-field snapshots.
 ///
-/// Returns [`ContextRouting::Broadcast`] — a placeholder that carries no
+/// Returns [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) — a placeholder that carries no
 /// pseudonym secret. The restore path requires this to agree with the
 /// reconstructed mode (§9.10.4): a degraded *broadcast* snapshot restores
 /// fine, but a degraded *encrypted* snapshot fails closed
@@ -1364,7 +1364,7 @@ pub(crate) struct GovernanceState {
     /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
     ///
     /// Consulted by `enforce_economy` via the
-    /// [`super::economy::ContextRevocationChecker`] adapter when validating
+    /// [`ContextRevocationChecker`](crate::context::economy_logic::ContextRevocationChecker) adapter when validating
     /// spending UCANs through the full cryptographic pipeline. Currently
     /// empty in steady state — spending UCAN revocation lists have not been
     /// wired through governance — but the field exists so the only change
@@ -1713,7 +1713,7 @@ pub(crate) struct TtlState {
 
 /// Wire wrapper for a consistency-checkpoint exchange message (§9.9.3, §23.7).
 ///
-/// Carries the canonical signed [`ConsistencyCheckpoint`] behind a magic tag
+/// Carries the canonical signed [`ConsistencyCheckpoint`](scp_event_log::checkpoint::ConsistencyCheckpoint) behind a magic tag
 /// so the receive path can positively identify it. Although the inner envelope
 /// already discriminates checkpoints via
 /// [`MessageType::ConsistencyCheckpoint`](scp_protocol::envelope::inner::MessageType::ConsistencyCheckpoint),

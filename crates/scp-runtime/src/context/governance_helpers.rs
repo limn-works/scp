@@ -6,9 +6,8 @@
 //! This module hosts governance-domain helpers that operate on
 //! actor-owned [`PerContextState`](crate::context::actor::state::PerContextState)
 //! and capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::governance_helpers_legacy`] until Phase 2A
-//! finalization removes the shim fallback.
+//! The pre-migration `&Supervisor` lock-and-call bodies have been removed
+//! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
 //! # Migration shape
 //!

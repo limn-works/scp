@@ -620,7 +620,7 @@ type DivergenceMarkerPlan = (
 ///   Prepare-A and held across the saga (RAII-released on any abort, settled
 ///   at Commit-A),
 /// - `prepared_b` — B's recorded provenance from Prepare-B (B's clock / nonce /
-///   re-derived chain depth). Read by [`Self::xctx_prepared_evidence_bytes`] at
+///   re-derived chain depth). Read by [`Supervisor::xctx_prepared_evidence_bytes`] at
 ///   Committing-evidence time: once recorded, B's values OVERRIDE the
 ///   caller-asserted nonce / depth / timestamp in the journaled prepared
 ///   evidence (the §17.16.4 replay/crash-recovery surface), so a recovered saga
@@ -680,7 +680,7 @@ struct CrossContextSagaCtx<'a> {
     /// Prepare-A's held reservation (settled at Commit-A, released on abort).
     prepared_a: Option<crate::context::actor::commands::PreparedAFields>,
     /// Prepare-B's recorded provenance (B's clock / nonce / re-derived depth).
-    /// Read by [`Self::xctx_prepared_evidence_bytes`]: once `Some`, these values
+    /// Read by [`Supervisor::xctx_prepared_evidence_bytes`]: once `Some`, these values
     /// override the caller-asserted nonce / depth / timestamp in the journaled
     /// prepared evidence (the §17.16.4 replay surface).
     prepared_b: Option<crate::context::actor::commands::PreparedBFields>,
@@ -690,18 +690,18 @@ struct CrossContextSagaCtx<'a> {
     /// lands (reserve `AlreadyCommitted` OR a first execution settle). `Some`
     /// proves the TARGET committed its `OutletInvoked` record even when the saga
     /// later diverges (Commit-A fails → `NeedsRepair`): the
-    /// [`CrossContextDivergenceMarker`] then records
+    /// [`CrossContextDivergenceMarker`](scp_protocol::context::outlets::cross_context_saga::CrossContextDivergenceMarker) then records
     /// `committed_side = Target` and this event id (spec §6.2.4
     /// "Dual event-log recording"). `None` means Commit-B never landed, so no
     /// side committed and a `NeedsRepair` cannot have diverged the logs.
     committed_b_outlet_invoked_event_id: Option<String>,
     /// Set by the FSM when the saga reaches `NeedsRepair` (commit-retry
-    /// exhaustion). It tells the [`Self::run_saga`] tail to LEAVE any held
+    /// exhaustion). It tells the [`Supervisor::run_saga`] tail to LEAVE any held
     /// Prepare-A escrow reservation RESERVED rather than voiding it (spec
     /// §6.2.4 "`NeedsRepair` reservation semantics": the escrow is NOT
     /// auto-voided — only the concurrency slot is released — because the
     /// operation may have partially committed; the signed
-    /// [`CrossContextDivergenceMarker`] + operator repair settles the escrow).
+    /// [`CrossContextDivergenceMarker`](scp_protocol::context::outlets::cross_context_saga::CrossContextDivergenceMarker) + operator repair settles the escrow).
     /// Every other terminal leaves this `false`, so the tail's void-or-settle
     /// behaviour is unchanged on Aborted / unreachable-Commit-A paths.
     reached_needs_repair: bool,
@@ -1282,7 +1282,7 @@ pub struct StreamingSagaHandle {
 /// binds the two together: [`Self::signing_key_id`] is derived from the same
 /// variant that carries the key, so the stamp and the key are one source of
 /// truth. The single stamp+sign site
-/// ([`build_encrypted_envelope`](crate::context::messaging_helpers::build_encrypted_envelope))
+/// ([`build_encrypted_envelope_actor`](crate::context::messaging_helpers::build_encrypted_envelope_actor))
 /// takes the `MessageSigner` directly.
 #[derive(Clone, Copy)]
 pub enum MessageSigner<'a> {
@@ -1336,7 +1336,7 @@ pub struct Supervisor {
     /// Local identities. Grows once per `identity_add`; read-heavy.
     ///
     /// Wrapped in `Arc<ArcSwap<_>>` (not a bare `ArcSwap`) so that every
-    /// per-context actor shares the SAME swap cell: [`ActorDeps`] receives
+    /// per-context actor shares the SAME swap cell: [`ActorDeps`](crate::context::actor::deps::ActorDeps) receives
     /// an `Arc::clone` of this field, not a snapshot copy. A bare
     /// `ArcSwap` would force the actor-deps builder to take a point-in-time
     /// `load_full()` snapshot, and any DID registered AFTER an actor is
@@ -1395,7 +1395,7 @@ pub struct Supervisor {
     /// `DashMap` per ADR-049 §Decision 12.
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
     /// ADR-049 (read-authority switch) — supervisor-owned Class-M **floor
-    /// registry**. Keyed by the 32-byte context id. Each [`ContextFloors`]
+    /// registry**. Keyed by the 32-byte context id. Each [`ContextFloors`](crate::context::supervisor::floors::ContextFloors)
     /// bundles the per-sender epoch high-water and the receive-side
     /// `(epoch, sequence)` anti-replay floor. This is the AUTHORITATIVE Class-M
     /// home: the live receive seams gate on it fail-closed, the durable-blob
@@ -1807,7 +1807,7 @@ impl Supervisor {
 
     /// Internal constructor reachable from production builds. The public
     /// surface goes through [`Self::with_providers`]; the test-only
-    /// [`Self::new`] alias forwards here so the same body services both
+    /// `Self::new` alias forwards here so the same body services both
     /// the production factory and the test integration suites.
     #[must_use]
     pub(crate) fn new_inner(
@@ -2240,7 +2240,7 @@ impl Supervisor {
     /// Cheap reference to the supervisor's shared
     /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
     /// Returns `None` if [`Self::with_providers`] was not used (e.g. a
-    /// supervisor built via [`Self::for_query_shim`] / [`Self::new`]).
+    /// supervisor built via `Self::for_query_shim` / `Self::new`).
     #[must_use]
     pub(crate) fn crypto_ref(
         &self,
@@ -2372,7 +2372,7 @@ impl Supervisor {
     ///
     /// Returns `None` if no event channel was configured (the FFI bridges enable
     /// it unconditionally for production supervisors; a supervisor built without
-    /// the `event_tx` argument — e.g. via [`Self::for_query_shim`] — yields
+    /// the `event_tx` argument — e.g. via `Self::for_query_shim` — yields
     /// `None`). This is the public surface used by FFI node-startup paths to
     /// drive the outbound webhook dispatcher (spec §12.10.5).
     ///
@@ -2402,7 +2402,7 @@ impl Supervisor {
     /// Cheap reference to the supervisor's OpenMLS storage adapter
     /// (lock-free read per ADR-049 §Decision 12). Returns `None` if
     /// [`Self::with_providers`] was not used (e.g. a supervisor built
-    /// via [`Self::for_query_shim`] / [`Self::new`]).
+    /// via `Self::for_query_shim` / `Self::new`).
     // Non-test callers land when `dispatch_lifecycle_direct` switches to
     // actor-shape (storage-foundation Step 5); until then this accessor is
     // reached only from `build_actor_deps`' test fixtures.
@@ -2426,7 +2426,7 @@ impl Supervisor {
     /// `Arc<HashSet>`); write sites acquire [`Self::write_lock`] then
     /// clone-update-store on the snapshot. The accessor returns the inner
     /// `&ArcSwap` so callers see the same read/write surface regardless of
-    /// the outer `Arc` (which exists only so [`ActorDeps`] can share the
+    /// the outer `Arc` (which exists only so [`ActorDeps`](crate::context::actor::deps::ActorDeps) can share the
     /// swap cell via `Arc::clone`).
     #[must_use]
     pub(crate) fn local_dids_ref(&self) -> &ArcSwap<HashSet<DID>> {
@@ -2434,7 +2434,7 @@ impl Supervisor {
     }
 
     /// Cheap `Arc::clone` of the shared `local_dids` swap cell, handed to
-    /// [`ActorDeps`] so every per-context actor reads from the SAME cell
+    /// [`ActorDeps`](crate::context::actor::deps::ActorDeps) so every per-context actor reads from the SAME cell
     /// the supervisor writes to via [`Self::local_dids_ref`]. Sharing the
     /// `Arc` (rather than snapshotting `load_full()` at spawn) is what lets
     /// a DID registered after an actor spawns become visible to that actor.
@@ -4417,7 +4417,7 @@ impl Supervisor {
     ///
     /// The returned [`ContextActorHandle`] is registered in the
     /// supervisor's `actors` map under the same `write_lock` that
-    /// [`Self::spawn_actor`] uses. The handle's mailbox capacity
+    /// [`Self::spawn_actor_with_state`] uses. The handle's mailbox capacity
     /// matches [`ACTOR_MAILBOX_CAPACITY`] (256, plan §"Mailbox
     /// parameters").
     ///
@@ -4474,7 +4474,7 @@ impl Supervisor {
         Box::pin(self.spawn_actor_with_watchdog(state, deps, owning_did, mailbox_capacity)).await
     }
 
-    /// Spawn a state-owning [`ContextActor`], register its handle, and
+    /// Spawn a state-owning [`ContextActor`](crate::context::actor::ContextActor), register its handle, and
     /// attach a per-actor *watchdog* task that observes the actor's
     /// `JoinHandle` (ADR-049 §10).
     ///
@@ -4486,7 +4486,7 @@ impl Supervisor {
     /// respawns from the persisted snapshot when the budget is not yet
     /// exhausted.
     ///
-    /// `owning_did` is the DID the actor's [`ActorDeps`] were scoped to;
+    /// `owning_did` is the DID the actor's [`ActorDeps`](crate::context::actor::deps::ActorDeps) were scoped to;
     /// the watchdog reuses it to rebuild deps on respawn.
     ///
     /// # Errors
@@ -4576,7 +4576,7 @@ impl Supervisor {
 
     /// Per-actor watchdog (ADR-049 §10).
     ///
-    /// Awaits the actor task's [`JoinHandle`] and reacts to how it
+    /// Awaits the actor task's [`JoinHandle`](tokio::task::JoinHandle) and reacts to how it
     /// finished:
     ///
     /// - **Clean exit** (`Ok(())`) — the actor's `run()` loop returned
@@ -4604,7 +4604,7 @@ impl Supervisor {
     /// hook, but a *process-global* "last panic location" store is
     /// inherently racy: with multiple `Supervisor`s and concurrent actor
     /// panics across threads, the stored location cannot be reliably
-    /// correlated to the specific [`JoinError`] observed here, and would
+    /// correlated to the specific [`JoinError`](tokio::task::JoinError) observed here, and would
     /// also be a mutable global (forbidden by the workspace
     /// `check-no-mutable-globals` gate). The plan's stated floor —
     /// "payload-free logging with `panic_location=\"unknown\"`" — is chosen
@@ -5125,7 +5125,7 @@ impl Supervisor {
     /// attempt ONE respawn from the persisted snapshot.
     ///
     /// This is the explicit recovery path for a poisoned context — it is
-    /// surfaced only on [`SupervisorHandle::clear_poison`] for operator use,
+    /// surfaced only on [`SupervisorHandle::clear_poison`](crate::context::supervisor::handle::SupervisorHandle::clear_poison) for operator use,
     /// NOT reachable by ordinary per-context callers. The alternative
     /// recovery path is a process restart, which re-runs
     /// [`crate::context::lifecycle_helpers::restore_all_contexts`] and
@@ -7072,7 +7072,7 @@ impl Supervisor {
     /// identical).
     ///
     /// * `reached_needs_repair == true` — HOLD the escrow reserved for operator
-    ///   repair. The [`OutletEconomyReservation`]'s `#[must_use]` drop guard would
+    ///   repair. The [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)'s `#[must_use]` drop guard would
     ///   normally fire on an unbalanced drop, so
     ///   [`hold_external_for_repair`](crate::context::outlets_helpers::OutletEconomyTicket::hold_external_for_repair)
     ///   marks the carrier consumed WITHOUT voiding the external escrow (the
@@ -8110,7 +8110,7 @@ impl Supervisor {
     /// merely has not been restored into an actor yet is still PRESENT in
     /// storage (`load_context` ⇒ `Ok(Some(_))`). This mirrors the existence
     /// check the actor-respawn path performs before re-hydrating
-    /// ([`Self::respawn_actor`]).
+    /// ([`Self::respawn_from_snapshot`]).
     ///
     /// Conservative on uncertainty — returns `false` (treat as "still present")
     /// when no persistence backend is configured (`persistence_ref` is `None`,
@@ -8206,7 +8206,7 @@ impl Supervisor {
     /// §17.16.4 Commit-in-progress re-drive: re-send the idempotent Commit-B,
     /// which re-acks the existing `OutletInvoked` and re-emits the STORED output —
     /// NEVER re-invoking the outlet (the exactly-once-execution guarantee survives
-    /// a crash). Sends [`SagaPhaseMessage::CommitBReserve`]; on a committed saga
+    /// a crash). Sends [`SagaPhaseMessage::CommitBReserve`](crate::context::actor::commands::SagaPhaseMessage::CommitBReserve); on a committed saga
     /// the actor replies `AlreadyCommitted` with the stored receipt/output, so
     /// the outlet is not re-run.
     ///
@@ -8214,7 +8214,7 @@ impl Supervisor {
     /// idempotency on the Class-S `xctx_committed_invocations` witness (not the
     /// in-memory reservation that died with the crash), so a Commit-A that
     /// durably landed before the crash is observable NOW. This re-drive queries
-    /// the caller actor's witness ([`SagaPhaseMessage::CommitACheckWitness`]); if
+    /// the caller actor's witness ([`SagaPhaseMessage::CommitACheckWitness`](crate::context::actor::commands::SagaPhaseMessage::CommitACheckWitness)); if
     /// BOTH sides are committed (B `AlreadyCommitted` + the A witness present)
     /// the saga is FULLY committed and resolves to `Committed` — not a spurious
     /// `NeedsRepair`. Only a genuinely-unresolvable divergence (B committed but A
@@ -8716,8 +8716,8 @@ impl Supervisor {
     }
 
     /// Prepare-A (caller side, spec §6.2.4): resolve the co-resident caller
-    /// actor, send [`SagaPhaseMessage::PrepareA`], and hold the returned
-    /// [`PreparedAFields`] reservation in `ctx` for Commit-A / abort.
+    /// actor, send [`SagaPhaseMessage::PrepareA`](crate::context::actor::commands::SagaPhaseMessage::PrepareA), and hold the returned
+    /// [`PreparedAFields`](crate::context::actor::commands::PreparedAFields) reservation in `ctx` for Commit-A / abort.
     async fn dispatch_xctx_prepare_a(
         &self,
         saga_id: &SagaId,
@@ -8767,8 +8767,8 @@ impl Supervisor {
     }
 
     /// Prepare-B (target side, spec §6.2.4): resolve the co-resident target
-    /// actor, send [`SagaPhaseMessage::PrepareB`] with the caller-asserted
-    /// envelope, and hold the returned [`PreparedBFields`] in `ctx`.
+    /// actor, send [`SagaPhaseMessage::PrepareB`](crate::context::actor::commands::SagaPhaseMessage::PrepareB) with the caller-asserted
+    /// envelope, and hold the returned [`PreparedBFields`](crate::context::actor::commands::PreparedBFields) in `ctx`.
     async fn dispatch_xctx_prepare_b(
         &self,
         saga_id: &SagaId,
@@ -9065,7 +9065,7 @@ impl Supervisor {
 
     /// First (non-replay) Commit-B: run the supervisor-side executor (off the
     /// actor mailbox per ADR-049 §3) EXACTLY ONCE, stash its output in `ctx`, and
-    /// send [`SagaPhaseMessage::CommitBSettle`] with the captured output and the
+    /// send [`SagaPhaseMessage::CommitBSettle`](crate::context::actor::commands::SagaPhaseMessage::CommitBSettle) with the captured output and the
     /// target's Active Signing Key.
     ///
     /// Retryable settle (review wave-1): the outlet runs only when no output is yet
@@ -9368,7 +9368,7 @@ impl Supervisor {
     ///    a one-sided commit.
     /// 2. For each reachable participant actor (target + caller), resolves that
     ///    side's Active Signing Key (the FSM holds both — supplied per-call,
-    ///    ADR-049) and sends [`SagaPhaseMessage::EmitDivergenceMarker`] so the
+    ///    ADR-049) and sends [`SagaPhaseMessage::EmitDivergenceMarker`](crate::context::actor::commands::SagaPhaseMessage::EmitDivergenceMarker) so the
     ///    actor signs + appends the marker into ITS OWN event log.
     /// 3. If a side is UNREACHABLE (`lookup` miss / actor gone), the signed
     ///    marker cannot be appended into that side's log, so the divergence is
@@ -9686,7 +9686,7 @@ impl Supervisor {
 
     /// Abort the saga (spec §6.2.4 "Reservation release on every terminal
     /// path"): release the staged participant reservations — for a cross-context
-    /// saga, send [`SagaPhaseMessage::Abort`] to whichever side(s) prepared so
+    /// saga, send [`SagaPhaseMessage::Abort`](crate::context::actor::commands::SagaPhaseMessage::Abort) to whichever side(s) prepared so
     /// the staged reservations are released (the caller side hands its held
     /// `PreparedAFields` back to reverse its LOCAL economy; the target side
     /// clears its staged slot) — and THEN, iff the caller-side LOCAL economy
@@ -9781,7 +9781,7 @@ impl Supervisor {
         CallerAbortReversal::ReversalOutstanding
     }
 
-    /// Send [`SagaPhaseMessage::Abort`] to the prepared participant actors of a
+    /// Send [`SagaPhaseMessage::Abort`](crate::context::actor::commands::SagaPhaseMessage::Abort) to the prepared participant actors of a
     /// cross-context saga, reversing the caller-side LOCAL economy on every
     /// reachable leg.
     ///
@@ -12849,7 +12849,7 @@ impl Supervisor {
     /// of [`Self::create_context`]. Local-identity custody is enforced at the
     /// FFI bridge layer, not here (the same trust model as `create_context`).
     /// Get-or-spawns this identity's `KeyPackageStoreActor` and issues a SINGLE
-    /// atomic [`KeyPackageCommand::ReserveAny`] — replenish-if-empty, pick the
+    /// atomic [`KeyPackageCommand::ReserveAny`](crate::context::supervisor::key_package_actor::KeyPackageCommand::ReserveAny) — replenish-if-empty, pick the
     /// first pooled ref, and reserve it, all inside one command handler.
     ///
     /// Folding the reservation into one command (rather than composing
@@ -12898,7 +12898,7 @@ impl Supervisor {
     ///
     /// Steps (all creator-side, no per-identity secret returned):
     ///
-    /// 1. Reads the context's LIVE genesis [`ContextParams`] — the authenticated
+    /// 1. Reads the context's LIVE genesis [`ContextParams`](scp_protocol::context::ContextParams) — the authenticated
     ///    authority source the joiner will enforce from. Encrypted-only: the
     ///    MLS-Welcome invitation flow stands up an encrypted context
     ///    (spawn-from-Welcome builds Encrypted mode and rejects Broadcast), so a
@@ -13322,7 +13322,7 @@ impl Supervisor {
     /// 1. Fuse the join through the joiner's
     ///    [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor)
     ///    (`ConfirmConsume(welcome)`), which produces the joined
-    ///    [`ScpMlsGroup`](crate::crypto::mls::group::ScpMlsGroup) and durably
+    ///    [`ScpMlsGroup`](scp_mls::group::ScpMlsGroup) and durably
     ///    consumes the single-use KeyPackage (two independent single-use
     ///    anchors preserved).
     /// 2. INSTALL the joined group into the live crypto provider
@@ -14307,7 +14307,7 @@ impl Supervisor {
     ///
     /// - [`ContextError::NotInitialized`] if the supervisor's provider
     ///   slots are empty (the supervisor was constructed via
-    ///   [`Self::for_query_shim`]).
+    ///   `Self::for_query_shim`).
     /// - Other [`ContextError`] variants propagated from the handler.
     /// - [`ContextError::TransportFailed`] if the mailbox reply channel
     ///   is dropped before the handler completes (handler crash /
@@ -15577,8 +15577,8 @@ fn current_timestamp_ms() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// No-op saga journal — every operation is a no-op success. Used by
-/// [`Self::with_providers`] until the production saga path lands; also used
-/// by [`Self::for_query_shim`] in tests.
+/// [`Supervisor::with_providers`] until the production saga path lands; also used
+/// by `Supervisor::for_query_shim` in tests.
 struct NoopSagaJournal;
 
 #[async_trait::async_trait]

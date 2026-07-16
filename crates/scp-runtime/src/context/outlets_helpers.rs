@@ -24,10 +24,10 @@
 //! The outlet executor is a non-`Send` generic `FnOnce` closure (FFI
 //! bridges supply GIL-bound / JS-bound closures) that cannot cross the
 //! actor mailbox. The economy bookkeeping, by contrast, is `Send` and
-//! mutates owned [`PerContextState`]. The split therefore runs:
+//! mutates owned [`PerContextState`](crate::context::actor::state::PerContextState). The split therefore runs:
 //!
 //! - **Phase 1 (reserve)** — [`reserve_outlet_economy`] runs INSIDE the
-//!   actor handler ([`OutletsCommand::ReserveOutletEconomy`]) on
+//!   actor handler ([`OutletsCommand::ReserveOutletEconomy`](crate::context::actor::commands::OutletsCommand::ReserveOutletEconomy)) on
 //!   `&mut PerContextState`. It consumes the hard rate limit, records the
 //!   velocity entry, runs the economy pre-check, deducts budget,
 //!   authorizes the payment escrow, and returns a `Send`
@@ -40,7 +40,7 @@
 //!   commands.
 //! - **Phase 3 (settle)** — on executor success
 //!   [`settle_outlet_economy_capture`] runs inside the actor
-//!   ([`OutletsCommand::SettleOutletEconomy`]) to perform post-invocation
+//!   ([`OutletsCommand::SettleOutletEconomy`](crate::context::actor::commands::OutletsCommand::SettleOutletEconomy)) to perform post-invocation
 //!   bookkeeping + consequence enforcement + payment capture; on
 //!   executor failure [`rollback_outlet_economy`] voids the escrow and
 //!   reverses budget / velocity / rate-limit.
@@ -86,7 +86,7 @@ use crate::economy::integration::PreparedAction;
 /// Returns `true` if a token was consumed and `false` when the sender is
 /// over budget. Unknown-context pass-through remains in the supervisor
 /// shim fallback; once a command reaches this helper, the context actor
-/// already owns the target [`PerContextState`].
+/// already owns the target [`PerContextState`](crate::context::actor::state::PerContextState).
 #[must_use]
 pub fn try_consume_hard_rate_limit(
     mut view: crate::context::actor::class_s::ClassCMut<'_>,
@@ -321,7 +321,7 @@ impl OutletEconomyTicket {
     }
 
     /// Project this in-flight ticket onto a durable, serde-safe
-    /// [`CallerReservationRecord`] (spec §6.2.4) so a cross-context saga's
+    /// [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord) (spec §6.2.4) so a cross-context saga's
     /// caller-side Prepare-A reservation can be reversed after an actor crash
     /// WITHOUT the volatile RAII carrier (which dies with the crash).
     ///
@@ -354,7 +354,7 @@ impl OutletEconomyTicket {
 }
 
 /// Reverse a cross-context saga's caller-side Prepare-A reservation from its
-/// durable [`CallerReservationRecord`] (spec §6.2.4 "Reservation release on
+/// durable [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord) (spec §6.2.4 "Reservation release on
 /// every terminal path"), used EXCLUSIVELY by the crash-recovery abort path
 /// (`Abort { None }`) where the in-memory RAII carrier died with the crash.
 /// (The LIVE `Abort { Some }` and Commit-A paths reverse via the carrier
@@ -1549,7 +1549,7 @@ pub enum StreamSettleOutcome {
 /// no owned Class-S state — H8 "service rendered is billed", matching the
 /// no-actor fallback), but SKIPS the cumulative-counter release and the budget
 /// refund. The unspent escrow and counter of the original (crash-restored)
-/// reservation are instead reconciled by the durable [`StreamReservationRecord`]
+/// reservation are instead reconciled by the durable [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
 /// and its restore sweep ([`reconcile_stream_reservations`]), which owns THIS
 /// context's own state. `generation` is a Class-C structural field read through
 /// the cell `Deref`.

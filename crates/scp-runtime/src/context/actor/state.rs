@@ -489,13 +489,14 @@ pub struct ContextCryptoState {
     ///
     /// [`PerContextState::recv_tracker`](PerContextState::recv_tracker)
     /// is the actor-shape per-member WIRE-sequence tracker used by the
-    /// per-context reorder / delivery path. This field is the
-    /// MLS sender-key layer `(epoch, sequence)` pair that [`open`]
-    /// reads in the provider (see provider.rs:1211-1221 for the
-    /// authoritative algorithm). Commit 12b.2 migrates that deliver-
-    /// path read/write onto this field.
-    ///
-    /// [`open`]: crate::crypto::mls::provider::MlsCryptoProvider::open
+    /// per-context reorder / delivery path. This field is a dormant
+    /// per-member MLS sender-key `(epoch, sequence)` receive-floor,
+    /// reserved for the crash-surviving recv-sequence-floor work
+    /// (ADR-049 §9 residual). It is not read or written on any
+    /// production path today: the live sender-key `(epoch, sequence)`
+    /// receive handling has been relocated off the former provider onto
+    /// the actor-owned [`ContextCryptoState`], performed by
+    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open).
     pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
 }
 
@@ -971,7 +972,7 @@ pub struct ClassSState {
     >,
 
     /// §7.3.8 value-caveat runtime enforcement counters, keyed by the
-    /// invocation-authorizing UCAN's CID. One [`CaveatCounters`] record per
+    /// invocation-authorizing UCAN's CID. One [`CaveatCounters`](crate::trust::caveat_counters::CaveatCounters) record per
     /// delegation holds the durable `max_calls` / `amount_max_cumulative` /
     /// `rate_window` accounting the local synchronous caveat check
     /// ([`InvocationCaveats::check_invocation_local`](scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local))
@@ -1055,7 +1056,7 @@ pub struct ClassSStateSnapshot {
         SagaId,
         crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
     >,
-    /// Mirror of [`ClassSState::caveat_counters`]. [`CaveatCounters`] is
+    /// Mirror of [`ClassSState::caveat_counters`]. [`CaveatCounters`](crate::trust::caveat_counters::CaveatCounters) is
     /// `Clone`, so this snapshots by direct clone (no projection needed).
     pub(crate) caveat_counters: HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
     /// Mirror of [`ClassSState::stream_reservations`] (Fix-D). The
@@ -1906,7 +1907,7 @@ impl ContextCryptoState {
 
     /// Answers a §9.16.2 sender-key PULL request (the ANSWER half), moved from
     /// the retained golden oracle
-    /// [`MlsCryptoProvider::handle_sender_key_request`]. Node-resident inputs
+    /// `MlsCryptoProvider::handle_sender_key_request`. Node-resident inputs
     /// (`local_did`, `now_secs`, `blocked_dids`) and the raw `context_id` digest
     /// enter as METHOD PARAMETERS — never stored on [`ContextCryptoState`] (there
     /// is no clock field on the actor).
@@ -2169,7 +2170,7 @@ impl PerContextState {
     }
 
     /// Seed this actor state's encrypted-mode crypto from the owned material
-    /// that [`MlsCryptoProvider::take_crypto_state`] / `build_restored_owned`
+    /// that [`MlsCryptoProvider::take_crypto_state`](crate::crypto::mls::provider::MlsCryptoProvider::take_crypto_state) / `build_restored_owned`
     /// hands out (ADR-049 PR-7 §15). Installs the moved [`OwnedMlsCryptoState`]
     /// into [`Self::mode`] — wrapping the payload's non-optional `mls_group` /
     /// `sender_key` in `Some(..)` (the actor holds them optionally because a
@@ -2298,15 +2299,13 @@ impl PerContextState {
         crypto.mls_encrypt_management(plaintext, routing_id, blob_ttl)
     }
 
-    /// Advances the MLS epoch (Update + self-Commit), verbatim from
-    /// [`MlsCryptoProvider::advance_epoch`]. The X25519 wrapping public key
+    /// Advances the MLS epoch (Update + self-Commit), verbatim from the
+    /// former provider `advance_epoch`. The X25519 wrapping public key
     /// enters as a parameter (node-resident).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or MLS failure.
-    ///
-    /// [`MlsCryptoProvider::advance_epoch`]: crate::crypto::mls::provider::MlsCryptoProvider::advance_epoch
     pub(crate) fn advance_epoch(
         &mut self,
         wrapping_public_key: [u8; 32],
@@ -2466,15 +2465,13 @@ impl PerContextState {
         })
     }
 
-    /// Removes a member from the MLS group, verbatim from
-    /// [`MlsCryptoProvider::remove_member`]. `local_did` (the self-removal
+    /// Removes a member from the MLS group, verbatim from the former
+    /// provider `remove_member`. `local_did` (the self-removal
     /// short-circuit) enters as a parameter (node-resident).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or MLS failure.
-    ///
-    /// [`MlsCryptoProvider::remove_member`]: crate::crypto::mls::provider::MlsCryptoProvider::remove_member
     pub(crate) fn remove_member(
         &mut self,
         local_did: &str,
@@ -2555,8 +2552,8 @@ impl PerContextState {
     }
 
     /// Removes the departed member's sender key AND wrapping key from the local
-    /// crypto sub-state, verbatim from
-    /// [`MlsCryptoProvider::remove_member_sender_key`].
+    /// crypto sub-state, verbatim from the former provider
+    /// `remove_member_sender_key`.
     ///
     /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the actor twin of the provider's
     /// per-member sender-key prune. Prep-A moved most crypto orchestration to the
@@ -2565,14 +2562,12 @@ impl PerContextState {
     /// floor for the departed member is NOT touched here — it lives in the
     /// Supervisor-owned Class-M registry and is pruned by the caller via
     /// `remove_member_floors` (mirroring the provider's PR-6 read-authority switch;
-    /// see [`MlsCryptoProvider::remove_member_sender_key`]).
+    /// see the former provider `remove_member_sender_key`).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] if this context has no encrypted crypto
     /// sub-state (broadcast mode or a nulled group).
-    ///
-    /// [`MlsCryptoProvider::remove_member_sender_key`]: crate::crypto::mls::provider::MlsCryptoProvider::remove_member_sender_key
     pub(crate) fn remove_member_sender_key(
         &mut self,
         member_did: &str,
@@ -2586,15 +2581,13 @@ impl PerContextState {
     }
 
     /// Distributes the local sender key to `member_did` (ADR-007), verbatim from
-    /// [`MlsCryptoProvider::distribute_sender_key`]. `local_did` enters as a
+    /// the former provider `distribute_sender_key`. `local_did` enters as a
     /// parameter (node-resident).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or HPKE /
     /// serialization failure.
-    ///
-    /// [`MlsCryptoProvider::distribute_sender_key`]: crate::crypto::mls::provider::MlsCryptoProvider::distribute_sender_key
     pub(crate) fn distribute_sender_key(
         &mut self,
         local_did: &str,
@@ -2660,16 +2653,14 @@ impl PerContextState {
         Ok(())
     }
 
-    /// Rotates the local sender key (§9.16.4), verbatim from
-    /// [`MlsCryptoProvider::rotate_sender_key`]. `local_did` enters as a
+    /// Rotates the local sender key (§9.16.4), verbatim from the former
+    /// provider `rotate_sender_key`. `local_did` enters as a
     /// parameter (node-resident).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or epoch
     /// overflow.
-    ///
-    /// [`MlsCryptoProvider::rotate_sender_key`]: crate::crypto::mls::provider::MlsCryptoProvider::rotate_sender_key
     pub(crate) fn rotate_sender_key(&mut self, local_did: &str) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(self.context_id);
         let crypto = self.encrypted_crypto_mut()?;
@@ -2766,14 +2757,12 @@ impl PerContextState {
         Ok(())
     }
 
-    /// Drains pending sender-key distribution messages, verbatim from
-    /// [`MlsCryptoProvider::drain_pending_sender_key_messages`].
+    /// Drains pending sender-key distribution messages, verbatim from the
+    /// former provider `drain_pending_sender_key_messages`.
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch.
-    ///
-    /// [`MlsCryptoProvider::drain_pending_sender_key_messages`]: crate::crypto::mls::provider::MlsCryptoProvider::drain_pending_sender_key_messages
     pub(crate) fn drain_pending_sender_key_messages(
         &mut self,
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
@@ -2834,10 +2823,8 @@ impl PerContextState {
     }
 
     /// Installs an AUTHENTICATED sender key WITHOUT epoch gating, verbatim from
-    /// [`MlsCryptoProvider::set_sender_key_unchecked`]. A no-op when this actor
+    /// the former provider `set_sender_key_unchecked`. A no-op when this actor
     /// is not encrypted-mode.
-    ///
-    /// [`MlsCryptoProvider::set_sender_key_unchecked`]: crate::crypto::mls::provider::MlsCryptoProvider::set_sender_key_unchecked
     pub(crate) fn set_sender_key_unchecked(&mut self, sender_did: &str, sender_key: SenderKey) {
         let ctx_id_hex = hex::encode(self.context_id);
         if let ContextModeState::Encrypted(crypto) = &mut self.mode {
@@ -2872,11 +2859,9 @@ impl PerContextState {
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))
     }
 
-    /// Returns the LOCAL sender-key epoch scalar (§9.16.5), verbatim from
-    /// [`MlsCryptoProvider::local_sender_key_epoch`] — `0` when this actor has
+    /// Returns the LOCAL sender-key epoch scalar (§9.16.5), verbatim from the
+    /// former provider `local_sender_key_epoch` — `0` when this actor has
     /// no encrypted crypto state.
-    ///
-    /// [`MlsCryptoProvider::local_sender_key_epoch`]: crate::crypto::mls::provider::MlsCryptoProvider::local_sender_key_epoch
     #[must_use]
     pub(crate) fn local_sender_key_epoch(&self) -> u64 {
         match &self.mode {
@@ -2886,7 +2871,7 @@ impl PerContextState {
     }
 
     /// Exports the per-context crypto state as an opaque, restore-compatible
-    /// byte blob, verbatim from [`MlsCryptoProvider::export_crypto_state`]. The
+    /// byte blob, verbatim from the former provider `export_crypto_state`. The
     /// two floor collections are caller-sourced (authoritative Class-M
     /// registry); the X25519 wrapping keypair enters as parameters
     /// (node-resident). The send-side sequence counter is read from
@@ -2901,8 +2886,6 @@ impl PerContextState {
     ///
     /// [`ContextError::CryptoFailed`] if the group is destroyed or
     /// serialization fails.
-    ///
-    /// [`MlsCryptoProvider::export_crypto_state`]: crate::crypto::mls::provider::MlsCryptoProvider::export_crypto_state
     pub(crate) fn export_crypto_state(
         &self,
         sender_key_epochs: Vec<(String, u64)>,

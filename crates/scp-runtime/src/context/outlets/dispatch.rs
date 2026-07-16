@@ -8,7 +8,7 @@
 //!
 //! The OUT-034 first-commit shipped 1,200 lines of primitives but never
 //! called them from the streaming pump. This module is the missing
-//! integration layer: it owns one [`StreamSession`] per accepted
+//! integration layer: it owns one [`StreamSessionHandle`] per accepted
 //! `OutletStreamOpen` and (i) runs the §5.4.5 round-5 5-step admission
 //! sequence, (ii) reserves escrow at open, (iii) initialises the credit
 //! and cancel-ack trackers, (iv) drives a per-chunk pump that consults
@@ -35,7 +35,7 @@
 //!    [`CreditTracker::grant_with_identity`] under the pinned identity
 //!    and tops up escrow on success.
 //! 5. `OutletCancel` reception goes through
-//!    [`StreamSessionHandle::apply_outlet_cancel`], which records the
+//!    [`StreamSessionHandle::apply_outlet_cancel_signed`], which records the
 //!    cancel-ack-seq, arms the
 //!    `ContextParams::stream_cancel_ack_secs` timer, and propagates the
 //!    cancellation to the pump.
@@ -142,15 +142,15 @@ pub trait StreamEscrowRefundSink: Send + Sync {
 ///
 /// The native bridges debit the open-time hold against the invoker's
 /// `MemberBudgetTracker` via
-/// [`crate::context::manager::ContextManager::outlet_stream_reserve_escrow`]
+/// `outlet_stream_reserve_escrow`
 /// BEFORE the stream pump is spawned. Between that debit and a successful
 /// spawn there are several fallible steps (admission gate, estimate
 /// bound, pump-permit acquisition, `invoke_outlet` launch) — any of which
 /// can early-return. Without a guard, the debited hold would be stranded:
 /// the invoker is charged the full estimate with no refund path.
 ///
-/// This ticket mirrors the [`crate::context::manager::economy`]
-/// `EconomyTicket` Drop-guard discipline: it is `#[must_use]`, and its
+/// This ticket mirrors the [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
+/// Drop-guard discipline: it is `#[must_use]`, and its
 /// `Drop` impl refunds the hold (via [`StreamEscrowRefundSink::refund`])
 /// when the ticket was NOT consumed. The pump-spawn path calls
 /// [`Self::consume`] exactly once the pump is spawned `Ok` — from that
@@ -404,7 +404,7 @@ pub struct OpenStreamParams {
     pub available_balance: Amount,
     /// The open-time escrow hold the caller has ALREADY reserved (DEBITED)
     /// against the invoker's `MemberBudgetTracker` via
-    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_escrow`]
+    /// `outlet_stream_reserve_escrow`
     /// (E2 remediation). `reserve_escrow` builds the
     /// [`crate::context::outlets::stream::StreamEscrow`] directly from this
     /// value (`reserved == reserved_escrow`, `billed == 0`) — the
@@ -778,8 +778,8 @@ pub struct CancelIdentity {
 ///
 /// - [`Self::receiver`] — drains the per-stream chunks.
 /// - [`Self::apply_credit_grant`] — delivers an `OutletStreamCredit`.
-/// - [`Self::apply_outlet_cancel`] — delivers an `OutletCancel`.
-/// - [`Self::settle_summary`] — observes `(billed, refund, billed_count)`
+/// - [`Self::apply_outlet_cancel_signed`] — delivers an `OutletCancel`.
+/// - [`Self::close_summary`] — observes `(billed, refund, billed_count)`
 ///   after the pump flushes (used by the event-log path and tests).
 pub struct StreamSessionHandle {
     /// Receiver returned to the caller.
@@ -944,7 +944,7 @@ impl StreamSessionHandle {
     /// # Errors
     ///
     /// Returns the `(slug, code)` pair for the rejection. The §5.4.5
-    /// slugs are routed via [`grant_error_to_slug`]. A returned error
+    /// slugs are routed via [`grant_error_to_slug`](crate::context::outlets::stream::grant_error_to_slug). A returned error
     /// means NO escrow extension happened — the caller reverses its
     /// reserved top-up.
     pub fn apply_credit_grant(
@@ -1393,7 +1393,7 @@ fn release_admission(
 /// RESERVES
 /// [`super::stream::cumulative_reserve_amount`]
 /// (`cost_per_chunk × effective_max_billable_chunks`, `<= cap` by construction)
-/// against the [`CaveatKind::AmountCumulative`] counter; close-time settlement
+/// against the [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind::AmountCumulative) counter; close-time settlement
 /// releases the unspent `reserved − billed_count × cost_per_chunk` via
 /// [`crate::trust::CaveatCounterApi::release`]. The invariant: a stream can
 /// never bill more cumulative value than it reserved here.
@@ -1702,7 +1702,7 @@ fn verify_caveats_binding_at_open(params: &OpenStreamParams) -> Result<(), OpenS
 /// `MemberBudgetTracker` (E2 remediation).
 ///
 /// The `InsufficientFunds` / `Overflow` balance decision moved entirely into
-/// [`crate::context::manager::ContextManager::outlet_stream_reserve_escrow`]
+/// `outlet_stream_reserve_escrow`
 /// — the only lock holder — so this is now infallible: it records the
 /// pinned `cost_per_chunk` (for per-grant top-ups and per-chunk accrual)
 /// and the manager-debited `reserved_escrow`. For Query / zero-cost
@@ -3412,7 +3412,7 @@ async fn run_stream_pump_v2(
 /// operator-signed chunk manifest supports, never the pump's un-verified
 /// escrow-ledger self-count. The dispatch pump therefore hands this the
 /// frontier-derived `manifest_billed` (the SAME value the event's
-/// [`AuditAnomaly::ChunksBilledSelfMismatch`] check keys off) rather than the
+/// [`AuditAnomaly::ChunksBilledSelfMismatch`](scp_protocol::context::outlets::lifecycle::AuditAnomaly::ChunksBilledSelfMismatch) check keys off) rather than the
 /// ledger's running `billed_count`, and this re-derives the billed/refund split
 /// from it:
 ///

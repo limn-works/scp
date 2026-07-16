@@ -224,9 +224,9 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
 impl MlsCryptoSnapshot {
     /// Zeroizes every field that holds private key material.
     ///
-    /// [`export_crypto_state`](Self::export_crypto_state) calls this once at its
+    /// [`export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state) calls this once at its
     /// end (belt-and-suspenders) after serializing the snapshot.
-    /// [`restore_crypto_state`](Self::restore_crypto_state) does NOT call it:
+    /// [`build_restored_owned`](crate::crypto::mls::provider::MlsCryptoProvider::build_restored_owned) does NOT call it:
     /// restore consumes each secret field incrementally as it moves the material
     /// into the live crypto state (`drain`/`mem::replace`/per-field `zeroize` at
     /// the point of use), so there is no single end-of-function sweep to make. On
@@ -276,7 +276,7 @@ struct ContextCryptoState {
     /// Send-side message sequence counter.
     send_sequence: u64,
     /// Pending sender key distribution messages: `(target_did, serialized_message)`.
-    /// Drained by [`MlsCryptoProvider::drain_pending_sender_key_messages`].
+    /// Drained by [`PerContextState::drain_pending_sender_key_messages`](crate::context::actor::state::PerContextState::drain_pending_sender_key_messages).
     pending_distributions: Vec<(String, Vec<u8>)>,
     /// Nonce deduplication cache for sender key requests (replay protection).
     nonce_dedup: NonceDedup,
@@ -307,7 +307,7 @@ struct ContextCryptoState {
 /// [`crate::context::actor::SendSequenceTracker`] at take-time. After
 /// `take_crypto_state` returns `Ok(OwnedMlsCryptoState)`, the provider's
 /// `contexts[ctx_id]` entry is absent and any subsequent
-/// [`Self::with_context`] access (or provider birth-seam) targeting that
+/// [`MlsCryptoProvider::with_context`](crate::crypto::mls::provider::MlsCryptoProvider::with_context) access (or provider birth-seam) targeting that
 /// context returns [`ContextError::CryptoFailed`] with a "context state owned
 /// by actor" message. The invariant is tracked by
 /// [`MlsCryptoProvider::taken_context_ids`] — a set that distinguishes
@@ -392,7 +392,7 @@ impl std::fmt::Debug for OwnedMlsCryptoState {
 
 /// Per-context Class-M floors reconstructed from a persisted snapshot.
 ///
-/// Returned by [`MlsCryptoProvider::restore_crypto_state`] for the caller to
+/// Returned by [`MlsCryptoProvider::build_restored_owned`](crate::crypto::mls::provider::MlsCryptoProvider::build_restored_owned) for the caller to
 /// merge into the authoritative Supervisor-owned floor registry (ADR-049 PR-6).
 ///
 /// `restore_crypto_state` installs the MLS group + sender-key MATERIAL into the
@@ -533,7 +533,7 @@ pub struct MlsCryptoProvider {
     /// Lock-free [`DashSet`] — the prior `std::sync::Mutex<HashSet>`
     /// wrapper was removed in ADR-049 commit 12c.9f.
     taken_context_ids: DashSet<[u8; 32]>,
-    /// One-shot test seam: when set, the NEXT [`Self::rotate_sender_key`]
+    /// One-shot test seam: when set, the NEXT `rotate_sender_key`
     /// call returns [`ContextError::CryptoFailed`] and resets the flag.
     ///
     /// This exists solely to induce a rotation-call failure that drives the
@@ -622,7 +622,7 @@ impl MlsCryptoProvider {
     }
 
     /// Arms the one-shot [`Self::force_rotation_failure`] seam: the NEXT
-    /// [`Self::rotate_sender_key`] call returns
+    /// `rotate_sender_key` call returns
     /// [`ContextError::CryptoFailed`] and clears the flag.
     ///
     /// Test-only (see the field docs) — used to induce a rotation-call failure
@@ -891,7 +891,7 @@ impl MlsCryptoProvider {
     /// (spec §5.13.3, finding FFI-02).
     ///
     /// This is the production creator write path: the committed
-    /// [`ScpContextExtension`] is folded into the MLS key schedule and read back
+    /// [`ScpContextExtension`](scp_protocol::context::ScpContextExtension) is folded into the MLS key schedule and read back
     /// byte-identically by every joiner. Because the group carries `0xFF02`,
     /// `OpenMLS` (`valn0502`) rejects any Add whose leaf does not declare `0xFF02`
     /// support — pooled key packages therefore MUST be generated via the
@@ -1386,7 +1386,7 @@ impl MlsCryptoProvider {
     /// # ADR-049 PR-7 — test/fixture-only
     ///
     /// The steady-state join-time sender-key PUSH moved onto the actor
-    /// ([`ContextCryptoState::distribute_sender_key`](crate::context::actor::state::ContextCryptoState::distribute_sender_key));
+    /// ([`PerContextState::distribute_sender_key`](crate::context::actor::state::PerContextState::distribute_sender_key));
     /// production is zero-grep clean of this provider copy (a taken, actor-owned
     /// context pushes on the actor). Retained under
     /// `#[cfg(any(test, feature = "testing"))]` solely for provider-level
@@ -1466,7 +1466,7 @@ impl MlsCryptoProvider {
     /// epoch floor — the caller (the `decrypt_and_dispatch` messaging seam)
     /// gates the returned `epoch` against the authoritative Class-M floor
     /// registry and then installs the key via
-    /// [`Self::set_sender_key_unchecked`] (gate-before-install = fail-safe).
+    /// `set_sender_key_unchecked` (gate-before-install = fail-safe).
     ///
     /// # Errors
     ///
@@ -1641,7 +1641,7 @@ impl MlsCryptoProvider {
     /// this provider copy is RETAINED under `#[cfg(any(test, feature =
     /// "testing"))]` as a **test FIXTURE builder** — it stands up the
     /// provider-side answer for the two-party join fixtures
-    /// ([`two_party_test_support`](crate::crypto::mls::two_party_test_support),
+    /// (`two_party_test_support`,
     /// `spawn_from_welcome_tests`) that must return providers still OWNING their
     /// per-context crypto. Production is zero-grep clean of this method — a taken
     /// (actor-owned) context answers on the actor, not here. It is NOT a wire
@@ -1824,7 +1824,7 @@ impl MlsCryptoProvider {
     /// restore seam: the atomic core (SCP-CRYPTOMOVE-001) seeds the per-context
     /// actor directly from the returned material rather than reaching into a
     /// provider-resident `contexts[ctx]` entry. The legacy insert-based
-    /// [`restore_crypto_state`](Self::restore_crypto_state) delegates here and
+    /// `restore_crypto_state` delegates here and
     /// re-wraps the result into the provider-internal `ContextCryptoState`; it
     /// is retained until the atomic core flips the call site.
     ///
@@ -1837,8 +1837,7 @@ impl MlsCryptoProvider {
     /// The X25519 wrapping keypair (§9.16.1) is node-level, NOT per-context and
     /// NOT part of [`OwnedMlsCryptoState`]; the atomic-core actor reads it via
     /// the Prep B `pub(crate)` accessors
-    /// ([`wrapping_public_key`](Self::wrapping_public_key) /
-    /// [`wrapping_secret`](Self::wrapping_secret)). This method restores it into
+    /// ([`wrapping_keypair`](Self::wrapping_keypair)). This method restores it into
     /// the provider's `ArcSwap` slots here, in the same order the legacy insert
     /// path did (before the caller installs the per-context material), so both
     /// restore paths keep byte-parity.
@@ -1847,7 +1846,7 @@ impl MlsCryptoProvider {
     ///
     /// Returns [`ContextError::CryptoFailed`] if `data` is empty (the owned path
     /// must always yield material — unlike the legacy no-op-on-empty
-    /// [`restore_crypto_state`](Self::restore_crypto_state)), if deserialization
+    /// `restore_crypto_state`), if deserialization
     /// fails, or if the data is corrupt.
     pub(crate) fn build_restored_owned(
         &self,

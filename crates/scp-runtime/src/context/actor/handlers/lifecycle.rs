@@ -703,7 +703,7 @@ fn handle_clear_needs_reconnect_actor(
 ///
 /// Issues an MLS Update proposal + self-Commit for post-compromise
 /// security (§9.12 step 2) via
-/// [`MlsCryptoProvider::advance_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::advance_epoch),
+/// [`PerContextState::advance_epoch`](crate::context::actor::state::PerContextState::advance_epoch),
 /// which preserves the `scp_wrapping_key` leaf extension (§9.16.1) and
 /// advances the group epoch locally. Replies with the TLS-serialized MLS
 /// Commit bytes for the caller to distribute to all members. Used by the

@@ -30,7 +30,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// the actor dispatch seam, but this domain reads NOTHING from the owned
 /// state (receipt verification flows entirely through the payment
 /// adapter on `deps`). It is therefore taken as `_cell` — no
-/// [`ClassSCell::state_mut`] escape hatch, no [`Deref`](std::ops::Deref)
+/// `ClassSCell::state_mut` escape hatch, no [`Deref`](std::ops::Deref)
 /// read (ADR-049 §9). The `&mut` referent also keeps the spawned dispatch
 /// future `Send`, which a shared `&ClassSCell` would not (`ClassSCell` is
 /// not `Sync`).

@@ -334,7 +334,7 @@ fn handle_inspect_incoming_inner(
 /// and returns the ephemeral-sealed `SenderKeyResponse` bytes straight back to
 /// the caller (the full-stack harness, which drives the requester side with its
 /// own custody — actor-loop request INITIATION is deferred #2049). Mirrors
-/// [`super::broadcast::handle_handle_broadcast_key_request`]. The answer seals to
+/// `handle_handle_broadcast_key_request`. The answer seals to
 /// the requester's EPHEMERAL wrapping key, so it needs no signing key; only the
 /// Class-C crypto replay cache (`nonce_dedup`) is mutated on a successful answer,
 /// so a produced answer reports `ok_mutated` (an over-mark on the blocked

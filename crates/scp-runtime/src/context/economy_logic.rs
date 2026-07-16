@@ -337,7 +337,7 @@ pub struct EnforceEconomyRequest<'a> {
 /// The cost is composed by (a) evaluating the policy formula (if any) to obtain
 /// a base cost — falling back to `pricing.base_cost` when the formula is absent
 /// — and then (b) layering the per-DID escalation/floor/cap from `pricing` via
-/// [`SenderVelocityTracker::compute_escalated_cost`] (spec §19.7).
+/// [`SenderVelocityTracker::compute_escalated_cost`](scp_protocol::economy::antispam::SenderVelocityTracker::compute_escalated_cost) (spec §19.7).
 ///
 /// Returns the deducted cost for rollback on failure, or `None` if no cost.
 pub fn enforce_economy(

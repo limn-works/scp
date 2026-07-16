@@ -23,7 +23,7 @@
 //!   [`EscrowError::Overflow`]; insufficient invoker balance surfaces as
 //!   [`EscrowError::InsufficientFunds`]. Final settlement returns a
 //!   `(billed_amount, refund_amount)` pair the caller hands to the
-//!   payment adapter for [`PaymentReceipt`] issuance (§19.15.5).
+//!   payment adapter for [`PaymentReceipt`](crate::economy::adapter::PaymentReceipt) issuance (§19.15.5).
 //!
 //! - [`coerce_estimated_chunk_count`] — the §5.4.5:422-432 caveat
 //!   coercion `caveats.max_calls.map(|n| u32::try_from(n)
@@ -844,7 +844,7 @@ impl StreamEscrow {
 
     /// Constructs the escrow ledger from a hold that has ALREADY been
     /// reserved (DEBITED) against the invoker's `MemberBudgetTracker` by
-    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_escrow`].
+    /// `outlet_stream_reserve_escrow`.
     ///
     /// This is the production constructor (E2 remediation). The
     /// InsufficientFunds / Overflow balance decision now lives entirely in
@@ -923,7 +923,7 @@ impl StreamEscrow {
 
     /// Extends the escrow ceiling by a top-up that has ALREADY been
     /// reserved (DEBITED) against the invoker's `MemberBudgetTracker` by
-    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_grant`].
+    /// [`Supervisor::outlet_stream_reserve_grant`](crate::context::supervisor::Supervisor::outlet_stream_reserve_grant).
     ///
     /// This is the production per-grant path (E2 remediation): the
     /// overflow / insufficient-funds decision happened in the manager
@@ -1534,7 +1534,7 @@ pub const fn chunks_billed_error_to_event_log_error(
 // =====================================================================
 
 /// Enforces the §5.4.5 `chunks_billed` wire-invariant that is verifiable
-/// from an [`OutletInvokedEvent`] **alone** — the form the event-log
+/// from an [`OutletInvokedEvent`](scp_protocol::context::outlets::lifecycle::OutletInvokedEvent) **alone** — the form the event-log
 /// appender holds, which does NOT carry the chunk sequence.
 ///
 /// # What §5.4.5 grants an event-local appender
@@ -1545,7 +1545,7 @@ pub const fn chunks_billed_error_to_event_log_error(
 /// sequence." The appender has only the **event**: it holds the manifest
 /// *root* (`stream_manifest_hash`) but neither the chunk *sequence* (needed
 /// to re-hash leaves and count `@type == "data"`) nor the `cancel_ack_seq`
-/// (the event's [`StreamTerminalStatus::Cancelled`] is a bare unit variant
+/// (the event's [`StreamTerminalStatus::Cancelled`](scp_protocol::context::outlets::stream::StreamTerminalStatus::Cancelled) is a bare unit variant
 /// — the cancel-ack sequence is NOT a field of `OutletInvokedEvent`).
 /// Therefore the appender CANNOT re-derive `chunks_billed_ref`; claiming to
 /// would be dishonest.

@@ -14,10 +14,9 @@
 //! Helpers operate on actor-owned
 //! [`PerContextState`](crate::context::actor::state::PerContextState)
 //! and capability-reduced
-//! [`ActorDeps`](crate::context::actor::deps::ActorDeps); the legacy
-//! `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::ttl_close_helpers_legacy`] for the supervisor
-//! shim-fallback path.
+//! [`ActorDeps`](crate::context::actor::deps::ActorDeps). The pre-migration
+//! `&Supervisor` lock-and-call bodies have been removed (Phase 2A
+//! finalization); this module is the sole home for these helpers.
 //!
 //! # TTL deadline ownership (ADR-049 Decision-1 / finding A3)
 //!
@@ -659,7 +658,7 @@ pub const fn start_ttl_timer(
 /// There is deliberately **no** `from_raw` / `Deserialize` (B1/B2): admitting a
 /// `ConvergentDeadline` from arbitrary bytes would reconstruct a "trusted"
 /// deadline from an untrusted scalar and re-open the M3 hole. The arming seam
-/// [`start_ttl_timer`] / [`dispatch_start_ttl_timer`] accept ONLY this type, so
+/// [`start_ttl_timer`] / [`dispatch_start_ttl_timer`](crate::context::supervisor::handle::SupervisorHandle::dispatch_start_ttl_timer) accept ONLY this type, so
 /// every armed deadline is convergent by construction. The type is TRANSIENT —
 /// it lives only on the arming path and is never persisted; the durable
 /// [`TtlTimer::deadline_unix_secs`](crate::context::ttl::TtlTimer) cache stays a

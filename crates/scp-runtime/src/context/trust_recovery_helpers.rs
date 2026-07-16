@@ -457,13 +457,13 @@ pub async fn recovery_send_notification(
 ///
 /// This helper is cross-context but stays actor-shape: the
 /// shared-context lookup goes through
-/// [`SupervisorHandle::find_shared_context`], the only narrow
+/// [`SupervisorHandle::find_shared_context`](crate::context::supervisor::handle::SupervisorHandle::find_shared_context), the only narrow
 /// capability the actor's `deps.supervisor` exposes for cross-context
 /// membership reads. The actor making the call cannot reach the
 /// target context's actor directly (capability-reduced handle, see
 /// ADR-049 §2 / plan §`ActorDeps` and `SupervisorHandle`). Once the
 /// shared context is identified, the notification dispatches through
-/// [`SupervisorHandle::dispatch_recovery_send_notification`] which
+/// [`SupervisorHandle::dispatch_recovery_send_notification`](crate::context::supervisor::handle::SupervisorHandle::dispatch_recovery_send_notification) which
 /// routes a `RecoverySendNotification` command to the target
 /// context's actor mailbox (or falls through to the legacy lock-
 /// shaped handler if no actor is registered yet).

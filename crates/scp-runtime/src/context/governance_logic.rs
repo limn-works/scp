@@ -128,7 +128,7 @@ pub struct EnforceConsequencesCtx<'a> {
 
 /// Enforces a set of pre-evaluated triggered consequences.
 ///
-/// Separated from [`dispatch_consequences`] so callers that need
+/// Separated from the former `dispatch_consequences` so callers that need
 /// `evaluate_consequence_rules` visible in their own file (for pipeline
 /// wiring AST gates) can call evaluate + enforce as two distinct steps.
 ///
@@ -502,8 +502,9 @@ async fn emit_consequence_enforced_success(
 ///    (`SuspendCapability` with a non-empty set, `SuspendAccess`, and the H10
 ///    `SuspendAll` escalation).
 /// 2. **`member_capabilities` REPLACEMENT** — `AssignRole` →
-///    [`roles::system_assign_role`] REPLACES `member_capabilities[member]` with
-///    the new role's capability set (roles.rs `system_assign_role`). On a
+///    [`ConsequenceRoleStateMut::system_assign_role`](crate::context::actor::class_s::ConsequenceRoleStateMut::system_assign_role)
+///    REPLACES `member_capabilities[member]` with
+///    the new role's capability set. On a
 ///    DEMOTION (e.g. admin→member) this is a downward-auth shrink: the member
 ///    loses capabilities they previously held.
 ///
@@ -658,7 +659,7 @@ fn enforce_suspend(
 /// Uses the injected clock (via `now` parameter) instead of `SystemClock` to
 /// keep all governance timing consistent with the `ContextManager`'s clock.
 ///
-/// Uses [`roles::system_assign_role`] which bypasses the `RoleAssign`
+/// Uses [`ConsequenceRoleStateMut::system_assign_role`](crate::context::actor::class_s::ConsequenceRoleStateMut::system_assign_role) which bypasses the `RoleAssign`
 /// capability check — the governance engine must be able to demote members
 /// regardless of which member (if any) currently holds `RoleAssign`.
 fn enforce_assign_role(
@@ -783,7 +784,7 @@ async fn emit_failure_escalation(
 /// only reflect recent activity.
 ///
 /// Takes a borrowed [`ReceiveBuffer`] directly so the caller may build it from
-/// sub-borrows of the unified [`PerContextState`] (ADR-049 §Decision 1) without
+/// sub-borrows of the unified [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1) without
 /// holding the whole state across the merge.
 ///
 /// Returns `(merged_events, convergent_now)` where `convergent_now` is the max

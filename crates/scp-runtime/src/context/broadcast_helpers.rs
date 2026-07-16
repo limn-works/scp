@@ -11,9 +11,8 @@
 //! This module hosts broadcast-domain helpers that operate on actor-owned
 //! [`PerContextState`](crate::context::actor::state::PerContextState) and
 //! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::broadcast_helpers_legacy`] until Phase 2A finalization
-//! removes the shim fallback.
+//! The pre-migration `&Supervisor` lock-and-call bodies have been removed
+//! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
 //! Publish helpers are actor-shaped here for parity with the domain surface,
 //! but the actor mailbox still rejects publish commands: `KeyCustody` uses

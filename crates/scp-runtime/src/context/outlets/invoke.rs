@@ -509,7 +509,7 @@ where
 
 /// Outcome of [`invoke_outlet_execute_and_validate`] — the pure-execution half
 /// of outlet invocation shared between direct callers and the
-/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// wrapper. Captures everything needed to build a [`OutletInvokedEvent`]
 /// without re-running the executor or rehashing the payloads.
 #[derive(Debug)]
@@ -536,7 +536,7 @@ pub(crate) struct InvokeExecuteOutcome {
 /// schema validation, executor dispatch under a bounded timeout, and
 /// output schema validation. It deliberately takes NO economy context
 /// and touches no governance state so that
-/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// can call it with the `contexts` mutex dropped.
 ///
 /// The free [`invoke_outlet`] function also delegates to this helper after
@@ -548,7 +548,7 @@ pub(crate) struct InvokeExecuteOutcome {
 /// Returns [`InvocationError`] on state, capability, schema validation,
 /// timeout, or executor failure. Cancellation is not supported by this
 /// variant — see the inline timeout-plus-select! path in
-/// [`invoke_outlet_with_cancellation`] instead.
+/// [`invoke_outlet_with_cancellation_aggregating`](crate::context::outlets::invoke::invoke_outlet_with_cancellation_aggregating) instead.
 #[allow(clippy::too_many_arguments)] // 8 parameters mirror `invoke_outlet`; lower bound imposed by the execution contract.
 pub(crate) async fn invoke_outlet_execute_and_validate<F, Fut>(
     context: &ContextHandle,
@@ -1978,7 +1978,7 @@ impl<'a> ReadOnlyInvocation<'a> {
 /// holds a manager reference and never directly mutates per-context state.
 /// The runtime is the sole entity that applies mutations, ensuring the
 /// existing locking and rollback contracts in
-/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// still hold.
 ///
 /// **Defense-in-depth runtime check.** Every write method calls
@@ -2804,11 +2804,11 @@ pub struct DispatchedOutletOutcome {
     pub output: serde_json::Value,
     /// Pending mutations from an Action outlet's [`MutableInvocation`]
     /// handle — empty for Query outlets (which can never enqueue
-    /// mutations). The runtime's [`ContextManager`] is the canonical
+    /// mutations). The runtime's [`Supervisor`] is the canonical
     /// applier; direct callers may also drain them for testing or for
     /// custom mutation pipelines.
     ///
-    /// [`ContextManager`]: crate::context::ContextManager
+    /// [`Supervisor`]: crate::context::supervisor::Supervisor
     pub pending_mutations: Vec<MutationIntent>,
     /// `OutletInvokedEvent` ready to be appended to the event log.
     pub event: OutletInvokedEvent,
@@ -2825,7 +2825,7 @@ pub struct DispatchedOutletOutcome {
 /// PRD SCP-OUT-013 AC5: "`ContextManager::invoke_outlet` dispatches to
 /// `exec_query` when `kind == Query` and `exec_action` when `kind ==
 /// Action`." This free function is the underlying dispatcher; the
-/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// wrapper layers the per-context economy/budget pipeline over the same
 /// dispatch.
 ///
@@ -5335,7 +5335,7 @@ pub(crate) async fn record_streaming_saga_a_event(
 ///
 /// # §7.3.8 value-caveat enforcement
 ///
-/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`]
+/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`](crate::context::outlets_helpers::InvocationCaveatBinding)
 /// (`effective_caveats` + `ucan_cid`) bound to the invocation UCAN. It is
 /// threaded verbatim into `open_outlet_stream`, where it drives the §7.3.8
 /// post-input hook AND the durable cross-invocation counter reservation

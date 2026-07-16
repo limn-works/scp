@@ -810,13 +810,13 @@ impl ProductionRecoveryBackend {
         }
     }
 
-    /// Dispatches a [`TrustRecoveryCommand`] through the supervisor's
+    /// Dispatches a [`TrustRecoveryCommand`](crate::context::actor::commands::TrustRecoveryCommand) through the supervisor's
     /// trust-recovery mailbox (ADR-049 Phase 2B) and awaits the typed
     /// reply that the command carries on its embedded oneshot.
     ///
     /// `build_cmd` receives the freshly-created reply sender and returns
     /// the fully-constructed command. Routing decision lives entirely in
-    /// [`Supervisor::dispatch_trust_recovery_command`]: when a context
+    /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command): when a context
     /// actor is registered the command runs against that actor's owned
     /// `&mut PerContextState` (no per-context map lookup); otherwise it
     /// falls through to the supervisor-scoped direct path. Either way the typed
@@ -828,7 +828,7 @@ impl ProductionRecoveryBackend {
     ///
     /// The dispatch error (the `Outcome` channel) and the command's own
     /// typed reply are folded into a single `Result`: a closed reply
-    /// channel surfaces as a [`ContextError::TransportFailed`] so the
+    /// channel surfaces as a [`ContextError::TransportFailed`](scp_protocol::context::ContextError::TransportFailed) so the
     /// caller's [`Self::dispatch_step_error`] maps it to a [`RecoveryStepError`].
     async fn dispatch_trust_recovery<F, T>(
         &self,
@@ -860,7 +860,7 @@ impl ProductionRecoveryBackend {
     /// sequence, signing key) used by every recovery step that sends a
     /// notification to an already-known context (spec §9.12 steps 2–4,
     /// 6). The signing key is copied into the boxed payload via
-    /// [`SigningKeyBytes::from_signing_key`] so it zeroizes on drop while
+    /// [`SigningKeyBytes::from_signing_key`](crate::context::actor::commands::SigningKeyBytes::from_signing_key) so it zeroizes on drop while
     /// the command is in flight.
     async fn dispatch_recovery_send_notification(
         &self,
