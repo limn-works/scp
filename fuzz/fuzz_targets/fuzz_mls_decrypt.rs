@@ -67,14 +67,19 @@
 //!   2. XOR-ed over the tail of a genuinely valid ciphertext (guaranteed to change
 //!      at least one byte — an empty/all-zero `data` would otherwise leave a
 //!      PRISTINE valid ciphertext that decrypts `Ok`; the guard flips the last byte
-//!      when the XOR was a no-op). The tampered tail leaves the frame header — and
-//!      thus sender-data, which samples only the first 32 bytes
+//!      when the XOR was a no-op). A **small-to-medium** tail tamper leaves the
+//!      frame header — and thus sender-data, which samples only the first 32 bytes
 //!      (`openmls-0.8.1/src/schedule/mod.rs`) — intact, so openmls passes
 //!      sender-data and reaches the content-AEAD open, the path that trips the
-//!      debug-only `debug_assert!`. Every tampered decrypt MUST return `Err`
-//!      (asserted): that is the no-forgery invariant AND the proof the content-AEAD
-//!      boundary is genuinely reached on every input (not short-circuited by
-//!      secret-reuse or a pristine-replay `Ok`).
+//!      debug-only `debug_assert!`. libFuzzer favors short inputs, so the
+//!      content-AEAD path is reached on a **large fraction** of the campaign; a
+//!      **large** `data` (tail region `len − n` sliding into the first 32 bytes or
+//!      the frame header) instead fails at sender-data-AEAD / framing *before*
+//!      content-AEAD — still a fail-closed `Err`, just an earlier stage. Either
+//!      way, every tampered decrypt MUST return `Err` (asserted): that is the
+//!      no-forgery invariant, and — because the receiver is a fresh gen-0 group
+//!      each call — the `Err` is never a secret-reuse short-circuit and never a
+//!      pristine-replay `Ok`.
 
 use libfuzzer_sys::fuzz_target;
 use scp_clock::SystemClock;
@@ -219,28 +224,40 @@ fuzz_target!(|data: &[u8]| {
             }
         }
 
-        // Every tampered decrypt MUST reject — this is the no-forgery invariant
-        // AND the proof the content-AEAD boundary is reached on every input (a
-        // fresh gen-0 receiver each time, so never short-circuited by secret-reuse;
-        // a genuine tamper, so never a pristine-replay `Ok`). An `Ok` here would be
-        // a real cryptographic finding (AEAD forgery), surfaced as a crash.
-        if let Some(mut g) = fresh_receiver(snap) {
-            assert!(
-                decrypt(&mut g, &tampered).is_err(),
-                "tampered ciphertext decrypted Ok via decrypt (AEAD forgery?)"
-            );
-        }
-        if let Some(mut g) = fresh_receiver(snap) {
-            assert!(
-                decrypt_with_sender_did(&mut g, &tampered, &SystemClock).is_err(),
-                "tampered ciphertext decrypted Ok via decrypt_with_sender_did (AEAD forgery?)"
-            );
-        }
-        if let Some(mut g) = fresh_receiver(snap) {
-            assert!(
-                decrypt_with_membership_changes(&mut g, &tampered, &SystemClock).is_err(),
-                "tampered ciphertext decrypted Ok via decrypt_with_membership_changes (AEAD forgery?)"
-            );
-        }
+        // Every tampered decrypt MUST reject — the no-forgery invariant. Because
+        // the receiver is a FRESH gen-0 group each call, the `Err` is never a
+        // secret-reuse short-circuit and never a pristine-replay `Ok`; a
+        // small-to-medium tail tamper additionally reaches the content-AEAD open
+        // (a large tamper fails earlier at sender-data / framing — still `Err`).
+        // An `Ok` here would be a real cryptographic finding (AEAD forgery),
+        // surfaced as a crash.
+        //
+        // The restore is `.expect(...)`, not an `if let Some` guard: the startup
+        // positive control already proved `deserialize_state` round-trips this
+        // snapshot, so a restore failure here is a broken harness — fail loudly
+        // rather than silently skip the assert and reduce coverage.
+        let expect_msg = "gen-0 restore must succeed — proven by the startup positive control";
+        assert!(
+            decrypt(&mut fresh_receiver(snap).expect(expect_msg), &tampered).is_err(),
+            "tampered ciphertext decrypted Ok via decrypt (AEAD forgery?)"
+        );
+        assert!(
+            decrypt_with_sender_did(
+                &mut fresh_receiver(snap).expect(expect_msg),
+                &tampered,
+                &SystemClock
+            )
+            .is_err(),
+            "tampered ciphertext decrypted Ok via decrypt_with_sender_did (AEAD forgery?)"
+        );
+        assert!(
+            decrypt_with_membership_changes(
+                &mut fresh_receiver(snap).expect(expect_msg),
+                &tampered,
+                &SystemClock
+            )
+            .is_err(),
+            "tampered ciphertext decrypted Ok via decrypt_with_membership_changes (AEAD forgery?)"
+        );
     });
 });

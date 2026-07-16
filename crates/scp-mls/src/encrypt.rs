@@ -161,9 +161,9 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     // `--release` (a `--dev` build would re-arm the `debug_assert`). This
     // `catch_unwind` remains as DEFENSE-IN-DEPTH for native/debug builds (where
     // the assert can fire) and is a harmless no-op on the release wasm path
-    // (wasm `panic=abort`, so nothing to catch — and nothing panics in release
-    // anyway). It is NOT relied upon for the browser guarantee. This applies to
-    // every `catch_unwind` site in this file.
+    // (wasm `panic=abort`, so nothing to catch — and no release-mode panic has
+    // been *found* on this path). It is NOT relied upon for the browser
+    // guarantee. This applies to every `catch_unwind` site in this file.
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let process_result = catch_unwind(AssertUnwindSafe(|| {
         g.process_message(&group.provider, protocol_message)
