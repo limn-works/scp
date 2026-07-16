@@ -807,6 +807,46 @@ Expected v2 pseudonym public key (epoch = 1):
 
 These vectors are mechanically enforced by the Rust known-answer test `derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-platform/src/pseudonym.rs`.
 
+### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
+
+These vectors pin the on-the-wire **pseudonym announcement** — the `MessagePack` payload a member broadcasts on the shared bootstrap channel to teach peers their per-context routing ID — and the pure §9.10.4 accept/reject classifier that both the native orchestrator and the in-browser client run over an inbound announcement. Because the announcement type and the classifier live in the wasm-safe `scp-protocol::context::pseudonym` module (ADR-057 T-1), native and `wasm32` MUST produce byte-identical wire bytes and identical accept/reject decisions.
+
+**Wire format.** `PseudonymAnnouncement` is serialized with `rmp_serde::to_vec_named` — a name-keyed `MessagePack` map with three fields, in declaration order: `tag` (string), `member_did` (string), `pseudonym` (32-byte `serde_bytes` binary). No `usize`, no float, no map-iteration order, so a fixed value re-encodes deterministically and target-independently.
+
+```
+Input:
+  tag:        "\0scp:pseudonym-announce:v1"   (PSEUDONYM_ANNOUNCEMENT_TAG, 26 bytes, NUL-prefixed)
+  member_did: "did:dht:z6MkPseudonymKatFixtureMemberAAAAAAAAAAAAAA"  (51 bytes)
+  pseudonym:  0x42 × 32
+
+MessagePack layout:
+  0x83                                   fixmap, 3 entries
+  0xa3 "tag"                             key
+  0xba <26 bytes>  "\0scp:pseudonym-announce:v1"   str8 value (NUL-prefixed magic tag)
+  0xaa "member_did"                      key
+  0xd9 0x33 <51 bytes> "did:dht:z6Mk…AA"  str8 value
+  0xa9 "pseudonym"                        key
+  0xc4 0x20 <32 bytes> 0x42×32            bin8 value (serde_bytes)
+
+Expected bytes (hex, single continuous string):
+  83a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7631aa6d656d6265725f646964d9336469643a6468743a7a364d6b50736575646f6e796d4b6174466978747572654d656d6265724141414141414141414141414141a970736575646f6e796dc4204242424242424242424242424242424242424242424242424242424242424242
+```
+
+**Classifier decisions.** `classify_pseudonym_announcement(plaintext, sender_did, context_id, registry)` returns a `PseudonymAnnouncementDecision` over the four-step §9.10.4 validation. The reject `reason` strings are stable `&'static str`s and are part of this vector — a change to any is wire-observable:
+
+| Case | `sender_did` | payload / registry | Decision | `reason` |
+|------|--------------|--------------------|----------|----------|
+| ordinary app data | member | `b"hello world"` / `Some({})` | `NotAnnouncement` | — |
+| legitimate announce | member | golden announce (member, `0x42×32`) / `Some({})` | `Accept { member, 0x42×32 }` | — |
+| sender mismatch | member | announce claims `other` / `Some({})` | `Rejected` (carries `claimed_did = other`) | `pseudonym announcement member_did does not match sender` |
+| reserved value | member | announce with `[0;32]` **or** `context_routing_id(ctx)` **or** `broadcast_routing_id(ctx)` / `Some({})` | `Rejected` | `pseudonym announcement uses a reserved routing ID` |
+| broadcast context | member | golden announce / `None` | `Rejected` | `pseudonym announcement received on broadcast context` |
+| cross-DID collision | member | golden announce / `Some({other → 0x42×32})` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+
+where `member = "did:dht:z6MkPseudonymKatFixtureMemberAAAAAAAAAAAAAA"`, `other = "did:dht:z6MkPseudonymKatFixtureOtherBBBBBBBBBBBBBBB"`, and `ctx = "ctx-adr057-pseudonym-kat"`.
+
+This vector is mechanically enforced on BOTH native and `wasm32` by `pseudonym_wire_and_classifier_match_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs` (native `#[test]` + `#[wasm_bindgen_test]`, run under `wasm-pack test --node`): `native == golden` and `wasm == golden` together prove `native == wasm` (ADR-057 T-1 / Prerequisite 5). The pure predicate + classifier unit tests also live in `crates/scp-protocol/src/context/pseudonym.rs`.
+
 ## 25.20 Trust Attestation Signing Vectors (§7.4.1, §9.5.2)
 
 Domain: `"SCP-ATTESTATION-V1:"`
