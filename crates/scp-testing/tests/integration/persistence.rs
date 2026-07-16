@@ -1,6 +1,6 @@
 // ADR-049 §15: ContextCryptoProvider trait deleted. Tests in this
 // file construct ContextManager with the trait's mock implementations; the
-// rewire path lives in 12c.9f via backend injection. File gated until then.
+// rewire path awaits backend injection. File gated until then.
 #![cfg(any())]
 
 //! SCP-PERSIST-070: End-to-end integration tests for context persistence.

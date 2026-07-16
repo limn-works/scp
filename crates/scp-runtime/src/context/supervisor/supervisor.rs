@@ -2462,7 +2462,7 @@ impl Supervisor {
     // fields) onto the supervisor's per-identity
     // `wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>` map. The
     // following accessors give helper code on `&Supervisor` (the
-    // 12c.9c-d hoisted helper paths) a stable read/write surface
+    // ADR-049 §15 hoisted helper paths) a stable read/write surface
     // without requiring callers to reach for `&self.wrapping_keys`
     // directly.
     //

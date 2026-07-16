@@ -1854,7 +1854,7 @@ mod tests {
         let _hpke = provider.hpke_backend();
     }
 
-    // Unused trait/type imports from the pre-12c.9e test scaffolding
+    // Unused trait/type imports from the pre-ADR-049 §15 test scaffolding
     // must keep compiling: silence the "unused import" lint only where
     // the import truly has no downstream reference in the shrunk test
     // module.

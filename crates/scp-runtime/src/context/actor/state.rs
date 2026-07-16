@@ -28,8 +28,8 @@
 //! The two types coexisted through the commit ladder (commit 6 through
 //! ADR-049 §15); the legacy state struct stayed byte-identical apart from
 //! the `pub(crate)` field elevations ADR-049 §15 added so the actor could
-//! name the sub-struct types. Commits 12b-12c migrated handler bodies to
-//! take `&mut actor::PerContextState`. ADR-049 §15 deleted the legacy
+//! name the sub-struct types. ADR-049 §15 migrated handler bodies to
+//! take `&mut actor::PerContextState`, then deleted the legacy
 //! `ContextManager`; the legacy state type was removed in the same
 //! mechanical pass.
 //!
@@ -1190,10 +1190,9 @@ pub struct PerContextState {
     /// (manager/mod.rs). Legacy used it to detect the confused-deputy
     /// scenario on lock-drop / re-acquire. The actor model does not
     /// rely on a generation counter (each actor IS a generation in
-    /// the supervisor's `DashMap<String, ContextActorHandle>`), but
-    /// 12a carries the field field-for-field so 12b+ handler migrations
-    /// can keep populating it until every consumer is ported. 12d will
-    /// drop the field if no consumer survives the handler migration.
+    /// the supervisor's `DashMap<String, ContextActorHandle>`), but the
+    /// field is carried field-for-field from legacy so consumers that
+    /// still read it keep compiling.
     pub generation: u64,
 
     /// Full-fat context handle (creation params, lifecycle FSM). Mirrors
@@ -1205,11 +1204,9 @@ pub struct PerContextState {
     // -----------------------------------------------------------------
     /// Legacy membership record (per-DID role / tokens / sequence).
     /// Mirrors legacy `state::PerContextState::membership`. Coexists
-    /// with [`Self::members`] during the 12a→12d window: the shim still
-    /// delegates to legacy and reads the rich `MembershipState`; the
-    /// 12b+ handler-body migrations decide per-handler which of the two
-    /// storage sites to authoritatively consolidate onto before 12d
-    /// removes the unused one.
+    /// with [`Self::members`]: this field holds the rich `MembershipState`
+    /// (per-DID role / tokens / sequence), while [`Self::members`] holds
+    /// the simpler active-member DID set.
     pub membership: MembershipState,
 
     /// Active-member DID set — the simpler companion to
@@ -1400,7 +1397,7 @@ pub struct PerContextState {
     /// Send-sequence counter with RAII rollback
     /// ([`SequenceReservation`](crate::context::actor::SequenceReservation)).
     /// Replaces the legacy per-sender `MembershipState::next_sequence_number`
-    /// as authoritative in 12d; coexists until then.
+    /// as the authoritative send-sequence counter.
     pub send_tracker: SendSequenceTracker,
 
     /// Per-sender receive-sequence high-water marks for anti-replay.
@@ -1491,9 +1488,8 @@ impl PerContextState {
 
     /// Construct a fresh encrypted-mode actor state for test use. Populates
     /// every field with a sensible default (empty collections, zero
-    /// counters, `None` optionals). The production construction path for
-    /// 12b+ handler migrations will supply real values from snapshots or
-    /// from governance-config.
+    /// counters, `None` optionals). The production construction path
+    /// supplies real values from snapshots or from governance-config.
     ///
     /// `context_id` is the canonical 32-byte SHA-256; `created_at` is
     /// Unix-ms. `admin_did` seeds the governance engine (`SingleAdminEngine`)
@@ -3244,7 +3240,7 @@ mod tests {
     /// [`PerContextState`] is populated by the test fixture. The
     /// destructuring pattern intentionally does NOT use `..` — adding a
     /// new field on [`PerContextState`] without updating this pattern
-    /// breaks the build, which forward-locks 12b+ against silent field
+    /// breaks the build, which guards against silent field
     /// drops. This is the crate-internal counterpart to
     /// `tests/actor_state_shape.rs`'s accessor-based witness; `pub(crate)`
     /// typed fields (`governance`, `epoch`, `access`, `ttl`) can only be

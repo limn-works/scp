@@ -491,8 +491,8 @@ pub struct MlsCryptoProvider {
     /// Lock-free [`DashMap`] — same migration path as
     /// [`Self::contexts`]. Per ADR-049 the post-actor home for these is
     /// `ContextModeState::Broadcast` on the per-context actor state;
-    /// during the 12c.9f → 12 window the provider continues to hold the
-    /// authoritative copy for non-actor callers.
+    /// the provider currently retains the authoritative copy for
+    /// non-actor callers.
     broadcast_keys: DashMap<[u8; 32], SenderKey>,
     /// Node-resident X25519 wrapping keypair for sender key HPKE (§9.16.1) —
     /// public half published in the MLS `LeafNode` `scp_wrapping_key` extension,
@@ -736,7 +736,7 @@ impl MlsCryptoProvider {
         self.taken_context_ids.insert(*context_id);
         // Map the private struct field-for-field onto the public owned
         // payload. This is the one place where the private-to-public
-        // shape translation happens; 12b.2b downstream consumes
+        // shape translation happens; per ADR-049 PR-7 downstream consumes
         // `OwnedMlsCryptoState` exclusively.
         let ContextCryptoState {
             mls_group,

@@ -22,7 +22,7 @@
 //!
 //! Co-locating them here keeps each domain's helper module focused while
 //! preserving the "one canonical free-function form per legacy method"
-//! invariant the rest of the 12c hoist series established.
+//! invariant the rest of the ADR-049 §15 actor-migration hoists established.
 //!
 //! # Behavior preservation
 //!

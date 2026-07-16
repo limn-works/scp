@@ -1,7 +1,7 @@
 // ADR-049 §15: ContextCryptoProvider trait deleted. MockCrypto
 // here reimplements that trait for unit-test coverage of outlet economy
 // wiring. Rewiring to real `MlsCryptoProvider` requires backend injection
-// (12c.9f). File gated until then.
+// File gated until then.
 #![cfg(any())]
 #![allow(
     clippy::unwrap_used,

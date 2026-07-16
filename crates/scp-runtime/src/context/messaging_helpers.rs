@@ -3182,12 +3182,11 @@ pub fn decrypt_and_dispatch(
 ///
 /// Call AFTER a local `rotate_sender_key` succeeds, passing the post-rotation
 /// local epoch as `epoch`. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the epoch is now a
-/// CALLER-SUPPLIED parameter rather than re-read here, so flipped sites source it
-/// from the actor's `PerContextState::local_sender_key_epoch()` (read inside the
-/// same `commit_class_s_keep` closure that durably persisted the bump) and
-/// not-yet-flipped sites source it from the retained
+/// CALLER-SUPPLIED parameter rather than re-read here: all call sites source it
+/// from the actor's
 /// [`PerContextState::local_sender_key_epoch`](crate::context::actor::state::PerContextState::local_sender_key_epoch)
-/// — the read-authority follows the write-authority coherently.
+/// (read inside the same `commit_class_s_keep` closure that durably persisted the
+/// bump) — the read-authority follows the write-authority coherently.
 ///
 /// The floor is advanced in the supervisor registry keyed by the local DID.
 /// FAIL-CLOSED: a non-monotonic / overshooting local advance surfaces as a
