@@ -1,194 +1,174 @@
 # UCAN Validate Requires a Real Capability URI — Never Pass `"*"`
 
-## What happened
+> **Implementation status:** The client-side `att[0].with` extraction,
+> `ucanValidate`-based Layer-1 evaluation, `__extractFirstCapabilityUri`,
+> and the `_REVOCATION_PREFIXES` / `_PASSED_BEFORE` maps described in the
+> Historical sections below were **superseded by ADR-059** (structured
+> `ucan_evaluate` → `CapabilityValidation`). The bridge now returns six
+> booleans directly; no string parsing or client-side URI extraction occurs.
+>
+> The **enduring principles** (intrinsic-mode vs authorization, closed
+> allowlist over open denylist, bridge error routing, self-consistency not
+> authorization) remain current and apply to the typed path.
 
-`evaluateTrust` in both the TypeScript and Python SDK trust layers was calling `ucanValidate(handle, token, "*")`. This compiled and ran silently, but the bridge rejects `"*"` at URI-parse time (`UcanError::InvalidCapabilityUri`) — before any cryptographic check runs. Layer 1 returned `{ tokensValid: false, ... }` (all-false) for every token, unconditionally.
+## Current approach (ADR-059)
 
-A false "all invalid" verdict looks like a legitimate trust evaluation result rather than a crash, making this a silent correctness bug, not a safe default.
-
-## Root cause
-
-The `capability_uri` argument to `ucanValidate` / `ucan_validate` must be a fully-qualified SCP capability URI: `scp:ctx:{contextId}/{resource}:{action}` (e.g. `scp:ctx:abc123/messages:write`). The bridge validates the token's attestation against this URI after signature verification. Bare wildcards (`"*"`) and bare actions (`"messages:write"`) are rejected.
-
-The correct approach is to extract the URI the token was minted for from its own `att[0].with` field and pass that. This is safe because the bridge cryptographically re-verifies the entire token (signature, expiry, nonce, ceiling, revocation) before using the URI — the unverified read only selects which URI to ask the verifier about.
-
-## Fix
+`evaluateTrust` / `evaluate_trust` calls the bridge in **intrinsic mode** —
+no capability URI, nonce probed read-only (not consumed):
 
 ```ts
-// trust.ts — correct
-const capUri = __extractFirstCapabilityUri(token); // reads att[0].with from unverified JWT payload; returns string | null
-if (capUri === null) return ALL_LAYER1_FIELDS_FALSE;
-await scp.ucanValidate(handle, token, capUri);
+// trust.ts (TypeScript)
+const result = await scp.ucanEvaluate(handle, token, subjectDid);
+// result: CapabilityValidation { tokensValid, signaturesValid, withinCeiling,
+//                                nonceValid, notRevoked, timeBoundsValid }
 ```
 
 ```python
-# trust.py — correct
-cap_uri = _extract_first_capability_uri(token)  # reads att[0]["with"]; returns str | None
-if cap_uri is None:
-    # fail-closed: no valid capabilities declared
-    _set_all_false(cap_validation)
-    break
-await asyncio.to_thread(instance.ucan_validate, context_id, token, cap_uri)
+# trust.py (Python)
+result = instance.ucan_evaluate(context_id, token, None, subject_did)
+# CapabilityValidation: .tokens_valid, .signatures_valid, .within_ceiling,
+#                        .nonce_valid, .not_revoked, .time_bounds_valid
 ```
 
-## PERM-3001 and VALID-* closed allowlists
+`presenting_agent_did` / `subject_did` is **required and non-defaulting** —
+the bridge rejects empty/absent, preventing the audience check from becoming
+a tautology (`aud == aud`). Pass the DID of the participant under assessment.
 
-`validateOneCapUri` (TypeScript) / the `except` handlers in `evaluate_trust` (Python) absorb two categories of errors, both treated as "malformed token — all-false fail-closed":
-
-**`[SCP-PERM-3001]`** — the one code every `UcanError` variant maps to, enforced by an exhaustive Rust match in `ucan_errors.rs`. This covers pipeline failures: bad signature, ceiling violation, nonce reuse, revocation, expiry, etc. Each failure is classified into the failing pipeline stage, and the `__PASSED_BEFORE` / `_PASSED_BEFORE` map yields a narrowed (partially-true) `CapabilityValidation`.
-
-**`[SCP-VALID-*]`** — boundary validation failures emitted by the bridge's `validate_capability_uri` pre-flight **before** the UCAN pipeline runs. Examples: the URI extracted from `att[0].with` contains control characters or HTML-special characters. Because the URI itself is invalid, no pipeline stage runs and the result is all-false (identical to the null-URI path). TypeScript pattern:
-
-```ts
-if (/^\[SCP-PERM-3001\]/.test(msg)) {
-  // narrowed verdict from pipeline stage classification
-} else if (/^\[SCP-VALID-/.test(msg)) {
-  return { ...ALL_LAYER1_FIELDS_FALSE }; // URI invalid → all-false
-} else {
-  throw error; // propagate genuine faults
-}
-```
-
-Re-throws (both TS and Python):
-- `[SCP-PERM-3030]` — handle-affinity misuse (the token's context handle belongs to a different SCP instance). This is a programming error and must propagate visibly.
-- `[SCP-CTX-2023]` — context-state lookup/writeback faults.
-- Any other code — unknown codes are genuine faults, not UCAN pipeline or URI-parse outcomes.
+**Never call `ucanValidate(handle, token, "*")`** — the enforcing path
+(which DOES consume the nonce and gate an action) requires a fully-qualified
+`scp:ctx:{contextId}/{resource}:{action}` URI. Bare `"*"` is rejected at
+URI-parse time before any cryptographic check runs, yielding an all-false
+verdict that looks valid rather than crashing.
 
 ## Closed allowlist, not open denylist — for error absorption
 
-The absorption logic is the security boundary of Layer 1: an absorbed error becomes
-a (partial or all-false) trust verdict; a re-thrown error surfaces a fault. Get the
-direction wrong and a genuine fault is laundered into a plausible-looking verdict.
+The absorption logic is the security boundary of Layer 1: an absorbed error
+becomes a (partial or all-false) trust verdict; a re-thrown error surfaces a
+fault. Get the direction wrong and a genuine fault is laundered into a
+plausible-looking verdict.
 
-Python originally used a **denylist**: absorb every `bridge.UcanError` *except*
-`[SCP-PERM-3030]`. This is unsafe by construction — any future error code the bridge
-learns to emit (a new fault class, a context-state error, a manager error) is
-absorbed by default and silently folded into an all-false verdict. The safe posture
-is TypeScript's **closed allowlist**: absorb **only** `[SCP-PERM-3001]` (plus the
-`[SCP-VALID-*]` URI-boundary case), re-throw everything else. `[SCP-PERM-3030]`
-needs no special carve-out — it simply does not start with `[SCP-PERM-3001]`, so it
-re-raises automatically, and so does every unknown future code.
+Under ADR-059, the Layer-1 absorption surface is narrow:
+- The `ucan_evaluate` bridge op returns booleans on success and only throws
+  for *malformed FFI input* (bad handle / token / presenting-agent DID).
+- Layer 2 (`evaluate_trust`) folds `SCP-CTX-2076` (no participation facts
+  yet) into a zeroed behavioral record; every other error re-throws.
 
-**Rule:** for security-adjacent error absorption, enumerate what you absorb (closed
-allowlist) and default to propagate. Never enumerate what you re-throw (open
-denylist) and default to absorb — the default case is where new/unknown faults land,
-and "absorb by default" turns every unmodeled fault into a false verdict. Keep
-Python and TypeScript in lockstep: Python's `if not error_msg.startswith("[SCP-PERM-3001]"): raise`
-mirrors TS's `if (/^\[SCP-PERM-3001\]/.test(msg)) { ... } ... throw error`.
+**Rule:** for security-adjacent error absorption, enumerate what you absorb
+(closed allowlist) and default to propagate. Never enumerate what you re-throw
+(open denylist) and default to absorb — the default case is where new/unknown
+faults land, and "absorb by default" turns every unmodeled fault into a false
+verdict.
 
 ## Bridge error routing: don't route infrastructure faults to an absorbed code
 
-Because Layer 1 absorbs `[SCP-PERM-3001]` silently, **which code a bridge stamps on a
-failure decides whether that failure is visible.** A UCAN validation entrypoint has (at
-least) two failure classes — *the token failed the protocol* vs *the infrastructure
-failed to evaluate it*. They MUST carry distinct error codes, because a downstream
-absorber keys on the code to decide visible-fault vs trust-verdict.
+A UCAN validation entrypoint has (at least) two failure classes — *the token
+failed the protocol* vs *the infrastructure failed to evaluate it*. They MUST
+carry distinct error codes, because a downstream absorber keys on the code to
+decide visible-fault vs trust-verdict.
 
-Never collapse an infrastructure fault (e.g. context-state lookup/writeback) into the
-protocol-failure code just because it is convenient — always emit `[SCP-CTX-2023]` for
-context-state faults (so they re-throw) and `[SCP-PERM-3001]` only for real pipeline
-errors (so they absorb into a partial or all-false verdict).
+Never collapse an infrastructure fault (e.g. context-state lookup/writeback)
+into the protocol-failure code just because it is convenient — always emit
+`[SCP-CTX-2023]` for context-state faults (so they re-throw) and
+`[SCP-PERM-3001]` only for real pipeline errors.
 
-**Rule:** match the error code to the failure class, not to the convenient catch block.
-
-## Rules
-
-- **Never pass `"*"` to `ucanValidate`** — it always fails, silently.
-- **Never pass a bare action string** (`"messages:write"`) — must include the `scp:ctx:` prefix.
-- **Wildcard context** is `scp:ctx:*/resource:action`, not `"*"`.
-- **Extract from `att[0].with`** via `__extractFirstCapabilityUri(token)` for validation; the bridge re-verifies cryptographically.
-- **Keep TypeScript and Python implementations in lockstep** — this is a cross-SDK trap.
-
-## Detection
-
-Symptom: `evaluateLayer1` / `evaluate_trust` always returns all-false (or `TrustEvaluation` with all fields `False`), even for tokens that were just minted and haven't expired.
+**Rule:** match the error code to the failure class, not to the convenient
+catch block.
 
 ## What Layer 1 measures: self-consistency, NOT authorization
 
-Layer 1 answers "is this token structurally valid, correctly signed, within the
-context ceiling, unexpired, and unrevoked?" — measured against the token's **OWN**
-first declared capability (`att[0].with`). It does **not** answer "does this token
-authorize action X?" There is no caller-supplied target capability in
-`evaluateTrust` / `evaluate_trust`; the URI validated against comes from the token
-itself. A token can therefore be fully Layer-1-valid and still not authorize the
-operation the caller cares about.
+Layer 1 answers "is this token structurally valid, correctly signed, within
+the context ceiling, unexpired, and unrevoked?" — measured against the
+token's own declared capability set. It does **not** answer "does this token
+authorize action X?" The intrinsic-mode `ucan_evaluate` skips the step-6
+grant-match check and probes the nonce without consuming it, so the token
+remains replayable.
 
 Callers that need to verify authority for a specific operation must call
-`scp.ucanValidate(handle, token, uri)` directly with a caller-supplied `uri`.
-Do not treat a green Layer-1 `CapabilityValidation` as an authorization decision.
-Binding a token to a subject (ensuring `aud == subjectDid`) is likewise the
-upstream credential-issuance flow's job, not Layer 1's.
+`scp.ucanValidate(handle, token, uri)` directly with a fully-qualified
+capability URI. Do not treat a green Layer-1 `CapabilityValidation` as an
+authorization decision.
 
-## Historical: `_PASSED_BEFORE` inference (superseded by ADR-059)
+## Historical: the `ucanValidate` + `att[0].with` extraction era (pre-ADR-059)
 
-> **Note:** The Display-string classification approach described in this section was
-> superseded by ADR-059 (structured `ucan_evaluate` → `CapabilityValidation`). The
-> typed bridge op now returns six booleans directly; no string parsing occurs. This
-> section is preserved as historical context explaining the design trap.
+> **Note:** The following sections describe the old client-side implementation
+> superseded by ADR-059. Preserved for context on the design trap.
 
-The old Layer 1 did not receive structured per-step results from the bridge. When a
-token failed, it got one error *message string*, classified it into a pipeline stage
-(`__classifyUcanError` / `_classify_ucan_error` — prefix matching on the Display text),
-then inferred "everything before this stage must have passed" via the `__PASSED_BEFORE`
-/ `_PASSED_BEFORE` map. Two hidden assumptions made this fragile:
+### What happened
 
-1. **Fixed step ordering.** The map hardcoded the 11-step pipeline sequence. If
-   `validate.rs` reordered steps, the inference silently reported wrong `true` fields.
-2. **Message-string stability.** Reword a message in the Rust pipeline and the
-   classifier drops to `"unknown"` → all-false, or misclassifies into a more-passing
-   category.
+`evaluateTrust` / `evaluate_trust` was calling `ucanValidate(handle, token, "*")`.
+This compiled and ran silently, but the bridge rejects `"*"` at URI-parse time
+(`UcanError::InvalidCapabilityUri`) — before any cryptographic check runs.
+Layer 1 returned all-false for every token, unconditionally.
 
-**Why ADR-059 replaced this:** the safe failure mode (all-false on unknown) meant any
-Rust Display-string change was a silent regression in SDK trust reporting. Typed results
-from `ucan_evaluate` are stable and don't couple SDKs to prose.
+### The old fix (now deleted)
 
-## Historical: multi-att limitation in the `_PASSED_BEFORE` era (superseded by ADR-059)
+The correct pre-ADR-059 approach was to extract the URI from `att[0].with`
+and pass it to `ucanValidate`. ADR-059 replaced this entirely — `ucan_evaluate`
+now receives no capability URI for intrinsic-mode evaluation; the bridge owns
+att enumeration and returns six booleans directly.
 
-> **Note:** This limitation applied to the old `evaluateLayer1` SDK implementation
-> that extracted `att[0].with` client-side and passed it to `ucanValidate`. ADR-059
-> replaced that approach with a single `ucanEvaluate` / `ucan_evaluate` bridge call
-> that returns a `CapabilityValidation` struct directly. The bridge now owns att
-> enumeration; the SDK no longer does client-side per-att iteration. This section
-> is preserved as historical context for the trap.
+### PERM-3001 and VALID-* allowlists
 
-The old `evaluateLayer1` validated only the first declared capability URI (`att[0].with`). If a token declared multiple capabilities (e.g. `att = [{with: "scp:ctx:A"}, {with: "scp:ctx:B"}]`), only `att[0]` was sent to `ucanValidate`. `att[1]` and later entries were not checked.
+The old Layer-1 absorbed two categories of errors via `validateOneCapUri`
+(TypeScript) / `except` handlers (Python):
 
-This meant a token with an out-of-ceiling `att[1]` and an in-ceiling `att[0]` would produce `withinCeiling: true`. The fix was bridge-level: a single call that verifies ALL att entries against the ceiling, consuming the nonce only once. ADR-059's `ucan_evaluate` provides exactly that — the `withinCeiling` boolean reflects the bridge's full evaluation, not the SDK's partial extraction.
+- `[SCP-PERM-3001]` — pipeline failures (bad signature, ceiling violation,
+  nonce reuse, etc.), each classified into the failing stage via the
+  `__PASSED_BEFORE` / `_PASSED_BEFORE` map to yield a narrowed
+  `CapabilityValidation`.
+- `[SCP-VALID-*]` — URI boundary validation failures before the pipeline ran
+  (e.g. control characters in `att[0].with`); these produced all-false.
+- Re-throws: `[SCP-PERM-3030]` (handle-affinity misuse), `[SCP-CTX-2023]`
+  (context-state faults), unknown codes.
 
-## Revocation prefix narrowing: only `"token revoked:"` is a pipeline result
+Under ADR-059, `ucan_evaluate` returns booleans directly — no string
+classification occurs, and the error-absorption surface collapsed to Layer 2's
+single `SCP-CTX-2076` fold.
 
-`validate.rs` step 10 emits exactly `UcanError::TokenRevoked` → Display `"token revoked: {cid}"`.
-This is the *only* error a revoked token produces at the UCAN pipeline level.
+### `_PASSED_BEFORE` inference (superseded by ADR-059)
 
-Two other revocation-related messages exist but are **operational** (admin-side
-revocation-management failures emitted by the revocation-store write path, never by
-step-10 validation):
+The old Layer 1 received one error *message string* when a token failed,
+classified it into a pipeline stage by prefix-matching on Display text, then
+inferred "everything before this stage must have passed" via the
+`__PASSED_BEFORE` / `_PASSED_BEFORE` map. Two hidden assumptions made this
+fragile:
 
-- `"revocation unauthorized: ..."` — the caller lacked permission to revoke
-- `"revocation failed: ..."` — the write to the revocation store failed
+1. **Fixed step ordering.** The map hardcoded the 11-step pipeline sequence.
+   If `validate.rs` reordered steps, the inference silently reported wrong
+   `true` fields.
+2. **Message-string stability.** Reword a message and the classifier dropped
+   to `"unknown"` → all-false, or misclassified into a more-passing category.
 
-These operational messages are NOT step-10 results. If they ever surface, they should
-classify as `"unknown"` → all-false (fail-closed). They must be kept **out** of
-`_REVOCATION_PREFIXES` (Python) and `REVOCATION_PREFIXES` (TypeScript) in both SDKs.
+ADR-059 replaced this: the safe failure mode (all-false on unknown) meant any
+Rust Display-string change was a silent regression. Typed results from
+`ucan_evaluate` are stable and don't couple SDKs to prose.
 
-**Rule:** `_REVOCATION_PREFIXES` / `REVOCATION_PREFIXES` must contain exactly one entry:
-`"token revoked:"`. Adding the operational prefixes is a regression — a genuinely-revoked
-token could then be misclassified into a more-passing category if the Rust pipeline
-messages ever changed, narrowing the `not_revoked` verdict incorrectly.
+### Multi-att limitation (superseded by ADR-059)
 
-This cross-SDK invariant was previously pinned by `test_operational_errors_classify_as_unknown`
-in `tests/test_ucan_conformance.py` (removed with ADR-059 — the typed `CapabilityValidation`
-struct enforces the same property structurally). Under the typed path, operational messages
-that don't match UCAN pipeline stages produce a non-`PERM-3001` error code, which the SDK
-re-throws rather than absorbs — the invariant is now enforced by the absorption allowlist
-itself rather than a conformance gate.
+The old `evaluateLayer1` validated only the first declared capability URI
+(`att[0].with`). A token with an out-of-ceiling `att[1]` and an in-ceiling
+`att[0]` would produce `withinCeiling: true`. ADR-059's `ucan_evaluate`
+moves att enumeration into the bridge; `withinCeiling` now reflects the
+bridge's full evaluation.
+
+### Revocation prefix narrowing (superseded by ADR-059)
+
+`validate.rs` step 10 emits exactly `UcanError::TokenRevoked` → Display
+`"token revoked: {cid}"`. Two other revocation-related messages exist but
+are operational (admin-side revocation-management failures, never step-10
+validation): `"revocation unauthorized: ..."`, `"revocation failed: ..."`.
+
+The old `_REVOCATION_PREFIXES` / `REVOCATION_PREFIXES` constant had to
+contain exactly one entry (`"token revoked:"`) to avoid misclassifying
+operational messages as pipeline results. Under ADR-059, operational messages
+produce a non-`PERM-3001` error code, which the SDK re-throws rather than
+absorbs — the invariant is now enforced structurally by the typed path.
 
 ## See also
 
-- `.docs/lessons/typescript-node-only-globals-break-browser.md` — the
-  `__extractFirstCapabilityUri` payload decode used a Node-only `Buffer`, silently
-  breaking `att[0].with` extraction (and thus all of Layer 1) in the browser.
-- `.docs/lessons/delegation-chain-full-validation.md` — every link in a delegation
-  chain needs the full pipeline, not just structural checks.
-- `.docs/lessons/wasm-partial-ucan-validation.md` — the WASM pipeline is structurally
-  partial; document what it actually checks.
+- `.docs/lessons/typescript-node-only-globals-break-browser.md` — a
+  `Buffer`-based decode inside `__extractFirstCapabilityUri` (now deleted)
+  silently broke cross-environment evaluation; the principle of feature-
+  detecting Node globals still applies to any cross-environment utility code.
+- `.docs/lessons/delegation-chain-full-validation.md` — every link in a
+  delegation chain needs the full pipeline, not just structural checks.
