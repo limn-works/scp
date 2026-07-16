@@ -45,6 +45,7 @@ from scp_sdk.errors import (
     StreamAlreadyClosed,
     StreamGap,
     ValidationError,
+    _coded_bridge_error,
     _saga_terminal_from_bridge,
 )
 
@@ -81,6 +82,7 @@ def _translate_bridge_error(exc: Exception) -> Exception:
     match = _LEADING_BRIDGE_CODE.match(message)
     code = match.group(1) if match is not None else None
     return sdk_cls(message, code)
+
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +628,7 @@ class InvocationHandle:
                     # Open rejections (UCAN denial, input-schema violation,
                     # escrow InsufficientFunds/overflow) surface on the first
                     # await / iteration / control call as the matching SDK type.
-                    raise _translate_bridge_error(exc) from exc
+                    raise _coded_bridge_error(exc) from exc
                 self._handle_id = str(handle_id)
             return self._handle_id
 
@@ -651,7 +653,7 @@ class InvocationHandle:
             except Exception as exc:
                 # A mid-drain bridge rejection (unknown handle, transport fault)
                 # surfaces on `async for` / `aggregate` as the matching SDK type.
-                raise _translate_bridge_error(exc) from exc
+                raise _coded_bridge_error(exc) from exc
             if raw is None:
                 # Abnormal terminal: sender dropped without a terminal chunk.
                 self._closed = True
@@ -764,7 +766,7 @@ class InvocationHandle:
                 grant.value,
             )
         except Exception as exc:
-            raise _translate_bridge_error(exc) from exc
+            raise _coded_bridge_error(exc) from exc
 
     async def cancel(self) -> None:
         """Request cancellation of the live stream (§5.4.5 cancellation).
@@ -809,7 +811,7 @@ class InvocationHandle:
                 self._params.caller_did,
             )
         except Exception as exc:
-            raise _translate_bridge_error(exc) from exc
+            raise _coded_bridge_error(exc) from exc
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

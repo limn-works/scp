@@ -690,9 +690,13 @@ class SCP:
 
     async def identity_add_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_add_agent_key`` (returns :class:`Identity`)."""
+        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_attest_device(self, identity_did: str) -> Any:
@@ -865,18 +869,26 @@ class SCP:
         distribute the event to active context members (spec §9.12,
         ADR-003 §4b).
         """
+        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
-        raw_handle, rotation_event_json = await asyncio.to_thread(
-            self._native.identity_migrate, identity
-        )
+        try:
+            raw_handle, rotation_event_json = await asyncio.to_thread(
+                self._native.identity_migrate, identity
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw_handle, rotation_event_json=rotation_event_json)
 
     async def identity_remove_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_remove_agent_key`` (returns :class:`Identity`)."""
+        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_remove(self, did: str) -> None:
@@ -935,16 +947,24 @@ class SCP:
 
     async def identity_rotate_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_rotate_agent_key`` (returns :class:`Identity`)."""
+        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_rotate_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_rotate_key`` (returns :class:`Identity`)."""
+        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_rotate_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_rotate_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_verify_device_attestation(self, did: str, token_base64: str) -> Any:

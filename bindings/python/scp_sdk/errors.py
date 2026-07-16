@@ -346,5 +346,4 @@ __all__ = [
     "TransportError",
     "UcanPermissionError",
     "ValidationError",
-    "_coded_bridge_error",
 ]
