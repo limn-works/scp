@@ -240,6 +240,7 @@ pub async fn unsubscribe_broadcast(
     // Committer-assigned: the unsubscribing author's clock — the source of the
     // `created_at` on its outgoing leave message, copied by every member
     // (§7.3.1, §9.9.3).
+    let unsub_ts = deps.clock.now_secs();
     deps.event_log
         .append_membership_change_leaf(
             &context_id_bytes,
@@ -247,10 +248,56 @@ pub async fn unsubscribe_broadcast(
             subscriber_did.as_ref(),
             subscriber_did.as_ref(),
             "subscriber",
-            deps.clock.now_secs(),
+            unsub_ts,
         )
         .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
+    // ADR-007 §5: when `rotate_keys` was requested, each author's sender-key
+    // epoch was advanced as a consequence of the unsubscription. Emit one
+    // `KeyEpochAdvance` leaf per rotated author so the event log reflects the
+    // new epoch state. Best-effort: a failure here does not roll back the
+    // unsubscription. `rotate_sender_key_for_block` (reused internally by
+    // `unsubscribe`) always increments by exactly 1, so `old_epoch =
+    // new_epoch.saturating_sub(1)` is exact.
+    for rotation in &result.key_rotations {
+        let old_epoch = rotation.new_epoch.saturating_sub(1);
+        match scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::KeyEpochAdvancePayload {
+                old_epoch,
+                new_epoch: rotation.new_epoch,
+            },
+        ) {
+            Ok(payload) => {
+                if let Err(e) = deps
+                    .event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::KeyEpochAdvance,
+                        rotation.author_did.as_str(),
+                        payload,
+                        unsub_ts,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        author_did = %rotation.author_did,
+                        error = %e,
+                        "KeyEpochAdvance event-log append failed on unsubscribe (best-effort)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    author_did = %rotation.author_did,
+                    error = %e,
+                    "KeyEpochAdvance payload encode failed on unsubscribe (best-effort)"
+                );
+            }
+        }
+    }
 
     Ok(result)
 }

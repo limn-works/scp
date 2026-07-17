@@ -3091,6 +3091,15 @@ pub async fn execute_rotate_content_keys(
             require_active(&state.handle)?;
 
             let epoch_output = if let Some(ref mut bc) = state.broadcast_context {
+                // NOTE: `rotate_all_author_keys` returns `Ok(())` — no per-author
+                // (author_did, new_epoch) data is surfaced to the caller. Emitting
+                // `KeyEpochAdvance` leaves for each rotated author would require
+                // changing `rotate_all_author_keys` to return that data AND
+                // threading it out of this sync closure, since async event-log
+                // appends cannot happen inside `commit_class_s_keep`. The
+                // `unsubscribe_broadcast` path (which receives per-author
+                // `BlockResult` data from `bc.unsubscribe`) does emit
+                // `KeyEpochAdvance` leaves correctly — see #1847.
                 bc.rotate_all_author_keys()?;
                 None
             } else {
