@@ -3029,10 +3029,14 @@ async fn governance_deadlock_recovery_appends_both_event_leaves() {
         payload.unavailable_dids, expected_unavailable,
         "payload.unavailable_dids must match justification.unavailable_dids"
     );
+    let expected_missed_windows: Vec<(String, u32)> = justification
+        .missed_windows
+        .iter()
+        .map(|(d, n)| (d.0.clone(), *n))
+        .collect();
     assert_eq!(
-        payload.missed_windows,
-        u32::try_from(justification.missed_windows.len()).unwrap(),
-        "payload.missed_windows must equal the count of missed-window entries in the justification"
+        payload.missed_windows, expected_missed_windows,
+        "payload.missed_windows must carry the full per-DID evidence from the justification"
     );
     assert_eq!(
         payload.detected_at, justification.detected_at,

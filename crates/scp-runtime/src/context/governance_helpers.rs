@@ -3226,6 +3226,10 @@ pub async fn execute_reconfigure_governance(
     // Append the companion GovernanceDeadlockRecovery leaf carrying the
     // structured recovery justification (issue #1847).  The two leaves share
     // the same actor_did and timestamp so verifiers can correlate them.
+    // Fail-closed: the justification evidence (removed signer identities and
+    // missed-window counts) is load-bearing accountability data — making this
+    // best-effort would allow it to be silently absent after a governance
+    // takeover, giving no auditable record of who was removed or why.
     let recovery_payload = scp_event_log::payload::encode_payload(
         &scp_event_log::payload::GovernanceDeadlockRecoveryPayload {
             unavailable_dids: justification
@@ -3233,7 +3237,11 @@ pub async fn execute_reconfigure_governance(
                 .iter()
                 .map(|d| d.0.clone())
                 .collect(),
-            missed_windows: u32::try_from(justification.missed_windows.len()).unwrap_or(u32::MAX),
+            missed_windows: justification
+                .missed_windows
+                .iter()
+                .map(|(d, n)| (d.0.clone(), *n))
+                .collect(),
             detected_at: justification.detected_at,
         },
     )

@@ -127,6 +127,59 @@ fn media_error_to_py(e: scp_media::keys::MediaError) -> PyErr {
 }
 
 // ---------------------------------------------------------------------------
+// Event log helper — ADR-024 AC 8
+// ---------------------------------------------------------------------------
+
+/// Appends a media session event (`MediaSessionStarted` or `MediaSessionEnded`)
+/// to the event log for the given context.
+///
+/// Best-effort: callers log a warning on error rather than failing the
+/// session operation. Mirrors the pattern used by `ProvenanceAttached`/
+/// `ProvenanceReceived` in `provenance.rs`.
+///
+/// `actor_did` is the first session participant (the session initiator). When
+/// the participant list is empty the DID is set to an empty string so the leaf
+/// shape is still uniform.
+fn append_media_session_event_py(
+    bi: &crate::runtime::PyBridgeInstance,
+    context_id: &str,
+    actor_did: &str,
+    event_type: scp_event_log::EventType,
+    payload: scp_event_log::EventPayload,
+) -> PyResult<()> {
+    let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+
+    crate::runtime::with_context(bi, context_id, |rt| {
+        let sequence = scp_event_log::tree::event_count(&rt.event_log);
+        let prev_hash = if rt.event_log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            rt.event_log.leaves()[rt.event_log.leaves().len() - 1]
+        };
+
+        let event = scp_event_log::Event {
+            event_type,
+            actor_did: scp_did::DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence,
+            payload,
+            prev_hash,
+            signature: Vec::new(),
+        };
+
+        scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
+            .map(|_| ())
+            .map_err(|e| {
+                crate::error::ScpPyError::context(format!(
+                    "failed to append media session event: {e}"
+                ))
+            })
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
@@ -560,6 +613,181 @@ pub fn register_media(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Bridge-instance-aware methods — ADR-024 AC 8
+// ---------------------------------------------------------------------------
+//
+// The module-level `py_media_activate_session` / `py_media_end_session`
+// functions above are pure state-machine helpers (no bridge instance access).
+// These `#[pymethods]` on `PyScp` replicate the same logic but additionally
+// append `MediaSessionStarted` / `MediaSessionEnded` events to the context
+// event log, matching the NAPI and UniFFI bridge behaviour.
+//
+// Python names use the `_with_log` suffix to avoid collision with the
+// existing module-level free functions.
+
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Activates a media session and appends a `MediaSessionStarted` event to
+    /// the context event log (ADR-024 AC 8).
+    ///
+    /// The event log append is best-effort: if the context is not registered
+    /// a warning is emitted but the session state transition still succeeds.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_json` – JSON string representing the session (as returned by
+    ///   `media_initiate_session`).
+    ///
+    /// # Returns
+    ///
+    /// A dict with the updated session fields.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the JSON is invalid.
+    /// Raises `ContextError` if the session is not in the `Initiating` state.
+    #[pyo3(name = "media_activate_session_with_log")]
+    pub fn media_activate_session_py<'py>(
+        &self,
+        py: Python<'py>,
+        session_json: String,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let mut session: MediaSession =
+            serde_json::from_str(&session_json).map_err(|e| ScpPyError::ValidationError {
+                message: format!("invalid session JSON: {e}"),
+                code: codes::VALID_7301.to_string(),
+            })?;
+
+        activate_session(&mut session).map_err(media_error_to_py)?;
+
+        // ADR-024 AC 8: record MediaSessionStarted in the context event log.
+        let started_payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::MediaSessionStartedPayload {
+                session_id: session.session_id.clone(),
+                context_id: session.context_id.clone(),
+                participants: session
+                    .participants
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                capabilities: session
+                    .capabilities
+                    .iter()
+                    .map(|c| c.ceiling_name().to_owned())
+                    .collect(),
+                started_at: session.started_at,
+            },
+        )
+        .map_err(|e| ScpPyError::ContextError {
+            message: format!("failed to encode MediaSessionStarted payload: {e}"),
+            code: codes::CTX_2500.to_string(),
+        })?;
+
+        let actor_did = session.participants.first().map_or("", |d| d.as_ref());
+
+        if let Err(e) = append_media_session_event_py(
+            &self.inner,
+            &session.context_id,
+            actor_did,
+            scp_event_log::EventType::MediaSessionStarted,
+            started_payload,
+        ) {
+            tracing::warn!(
+                context = %session.context_id,
+                session = %session.session_id,
+                error = %e,
+                "failed to append MediaSessionStarted event to context event log"
+            );
+        }
+
+        session_to_dict(py, &session)
+    }
+
+    /// Ends a media session and appends a `MediaSessionEnded` event to the
+    /// context event log (ADR-024 AC 8).
+    ///
+    /// The event log append is best-effort: if the context is not registered
+    /// a warning is emitted but the session teardown still succeeds.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_json` – JSON string representing the session.
+    /// * `timestamp` – Unix timestamp (seconds) when the session ended.
+    ///
+    /// # Returns
+    ///
+    /// A dict with two keys: `session` (updated session) and `metadata`
+    /// (session metadata).
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the JSON is invalid.
+    /// Raises `ContextError` if the session has already ended or the timestamp
+    /// is before the session start time.
+    #[pyo3(name = "media_end_session_with_log")]
+    pub fn media_end_session_py<'py>(
+        &self,
+        py: Python<'py>,
+        session_json: String,
+        timestamp: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let mut session: MediaSession =
+            serde_json::from_str(&session_json).map_err(|e| ScpPyError::ValidationError {
+                message: format!("invalid session JSON: {e}"),
+                code: codes::VALID_7301.to_string(),
+            })?;
+
+        let metadata = end_media_session(&mut session, timestamp).map_err(media_error_to_py)?;
+
+        // ADR-024 AC 8: record MediaSessionEnded in the context event log.
+        let ended_payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::MediaSessionEndedPayload {
+                session_id: metadata.session_id.clone(),
+                context_id: metadata.context_id.clone(),
+                participants: metadata
+                    .participants
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                capabilities: metadata
+                    .capabilities
+                    .iter()
+                    .map(|c| c.ceiling_name().to_owned())
+                    .collect(),
+                started_at: metadata.started_at,
+                ended_at: metadata.ended_at,
+            },
+        )
+        .map_err(|e| ScpPyError::ContextError {
+            message: format!("failed to encode MediaSessionEnded payload: {e}"),
+            code: codes::CTX_2500.to_string(),
+        })?;
+
+        let actor_did = metadata.participants.first().map_or("", |d| d.as_ref());
+
+        if let Err(e) = append_media_session_event_py(
+            &self.inner,
+            &metadata.context_id,
+            actor_did,
+            scp_event_log::EventType::MediaSessionEnded,
+            ended_payload,
+        ) {
+            tracing::warn!(
+                context = %metadata.context_id,
+                session = %metadata.session_id,
+                error = %e,
+                "failed to append MediaSessionEnded event to context event log"
+            );
+        }
+
+        let result = PyDict::new(py);
+        result.set_item("session", session_to_dict(py, &session)?)?;
+        result.set_item("metadata", metadata_to_dict(py, &metadata)?)?;
+        Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -567,6 +795,177 @@ pub fn register_media(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── Event log appends — ADR-024 AC 8 ────────────────────────────────────
+
+    const ALICE_DID: &str = "did:dht:z6MkAlice";
+    const TS_START: u64 = 1_700_000_000;
+    const TS_END: u64 = 1_700_003_600;
+
+    fn test_bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
+        std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())
+    }
+
+    fn initiating_session_json(context_id: &str) -> String {
+        serde_json::json!({
+            "session_id": "ms-deadbeef01234567",
+            "context_id": context_id,
+            "participants": [ALICE_DID],
+            "capabilities": [{"Voice": null}],
+            "state": "Initiating",
+            "started_at": TS_START,
+        })
+        .to_string()
+    }
+
+    fn active_session_json(context_id: &str) -> String {
+        // Build in serde's native format (enum-variant `{"Voice": null}`) so
+        // MediaSession deserialises correctly regardless of whether it was
+        // produced by `session_to_dict` (which uses lowercase strings).
+        serde_json::json!({
+            "session_id": "ms-deadbeef01234567",
+            "context_id": context_id,
+            "participants": [ALICE_DID],
+            "capabilities": [{"Voice": null}],
+            "state": "Active",
+            "started_at": TS_START,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn activate_session_with_log_appends_media_session_started_event() {
+        // ADR-024 AC 8: MediaSessionStarted must be recorded in the context
+        // event log when activate_session transitions the session to Active.
+        pyo3::prepare_freethreaded_python();
+
+        let ctx = "ctx-py-media-activate-001";
+        let bi = test_bi();
+        crate::runtime::register_context(&bi, ctx, ALICE_DID, &[]).unwrap();
+
+        let initial_count = crate::runtime::with_context(&bi, ctx, |st| {
+            Ok(scp_event_log::tree::event_count(&st.event_log))
+        })
+        .unwrap();
+        assert_eq!(initial_count, 0, "event log must start empty");
+
+        let scp = crate::scp::PyScp { inner: bi.clone() };
+        pyo3::Python::with_gil(|py| {
+            let result = scp.media_activate_session_py(py, initiating_session_json(ctx));
+            assert!(
+                result.is_ok(),
+                "media_activate_session_with_log should succeed: {result:?}"
+            );
+        });
+
+        let count = crate::runtime::with_context(&bi, ctx, |st| {
+            Ok(scp_event_log::tree::event_count(&st.event_log))
+        })
+        .unwrap();
+        assert_eq!(count, 1, "event log must contain 1 event after activation");
+
+        // Verify the Merkle root is non-zero (leaf was actually hashed in).
+        let root = crate::runtime::with_context(&bi, ctx, |st| {
+            Ok(scp_event_log::tree::root(&st.event_log))
+        })
+        .unwrap();
+        assert_ne!(root, [0u8; 32], "Merkle root must be non-zero after append");
+
+        crate::runtime::remove_context(&bi, ctx);
+    }
+
+    #[test]
+    fn end_session_with_log_appends_media_session_ended_event() {
+        // ADR-024 AC 8: MediaSessionEnded must be recorded in the context
+        // event log when end_media_session is called.
+        pyo3::prepare_freethreaded_python();
+
+        let ctx = "ctx-py-media-end-001";
+        let bi = test_bi();
+        crate::runtime::register_context(&bi, ctx, ALICE_DID, &[]).unwrap();
+
+        let scp = crate::scp::PyScp { inner: bi.clone() };
+
+        // First: append the Started event so the tree is non-empty.
+        pyo3::Python::with_gil(|py| {
+            scp.media_activate_session_py(py, initiating_session_json(ctx))
+                .unwrap();
+        });
+
+        let count_after_start = crate::runtime::with_context(&bi, ctx, |st| {
+            Ok(scp_event_log::tree::event_count(&st.event_log))
+        })
+        .unwrap();
+        assert_eq!(count_after_start, 1, "1 event (Started) after activation");
+
+        // End the session using a fresh Active-state JSON.
+        pyo3::Python::with_gil(|py| {
+            let result = scp.media_end_session_py(py, active_session_json(ctx), TS_END);
+            assert!(
+                result.is_ok(),
+                "media_end_session_with_log should succeed: {result:?}"
+            );
+        });
+
+        let count_after_end = crate::runtime::with_context(&bi, ctx, |st| {
+            Ok(scp_event_log::tree::event_count(&st.event_log))
+        })
+        .unwrap();
+        assert_eq!(
+            count_after_end, 2,
+            "event log must contain 2 events (Started + Ended)"
+        );
+
+        let root = crate::runtime::with_context(&bi, ctx, |st| {
+            Ok(scp_event_log::tree::root(&st.event_log))
+        })
+        .unwrap();
+        assert_ne!(root, [0u8; 32], "Merkle root must be non-zero");
+
+        crate::runtime::remove_context(&bi, ctx);
+    }
+
+    #[test]
+    fn activate_session_with_log_without_registered_context_succeeds() {
+        // Best-effort: missing context -> warning only, session op still succeeds.
+        pyo3::prepare_freethreaded_python();
+
+        let scp = crate::scp::PyScp { inner: test_bi() };
+        pyo3::Python::with_gil(|py| {
+            let result = scp
+                .media_activate_session_py(py, initiating_session_json("ctx-py-unregistered-act"));
+            assert!(
+                result.is_ok(),
+                "activate must succeed without a registered context"
+            );
+        });
+    }
+
+    #[test]
+    fn end_session_with_log_without_registered_context_succeeds() {
+        // Best-effort: missing context -> warning only, session op still succeeds.
+        pyo3::prepare_freethreaded_python();
+
+        let scp = crate::scp::PyScp { inner: test_bi() };
+        let session_json = serde_json::json!({
+            "session_id": "ms-py-noctx",
+            "context_id": "ctx-py-unregistered-end",
+            "participants": [ALICE_DID],
+            "capabilities": [{"Voice": null}],
+            "state": "Initiating",
+            "started_at": TS_START,
+        })
+        .to_string();
+        pyo3::Python::with_gil(|py| {
+            let result = scp.media_end_session_py(py, session_json.clone(), TS_END);
+            assert!(
+                result.is_ok(),
+                "end must succeed without a registered context"
+            );
+        });
+    }
+
+    // ── Existing tests ───────────────────────────────────────────────────────
 
     #[test]
     fn parse_media_capability_valid() {

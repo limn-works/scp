@@ -174,7 +174,7 @@ pub struct RecoveryEpochAdvancedPayload {
 /// Field order is the wire contract under positional `MessagePack` —
 /// **never reorder**.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeyEpochAdvancedPayload {
+pub struct KeyEpochAdvancePayload {
     /// The sender-key epoch before the advance.
     pub old_epoch: u64,
     /// The sender-key epoch after the advance.
@@ -217,12 +217,19 @@ pub struct GovernanceActionExecutedPayload {
 /// [`EventType::GovernanceReconfigured`](crate::EventType::GovernanceReconfigured)
 /// so the recovery evidence is durably anchored in the Merkle log.
 /// The two leaves share the same `actor_did` and `timestamp_secs`.
+/// Field order is the wire contract under positional `MessagePack` —
+/// **never reorder**.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernanceDeadlockRecoveryPayload {
     /// DIDs of signers who were unavailable during deadlock detection.
     pub unavailable_dids: Vec<String>,
-    /// Number of missed voting windows before fallback triggered.
-    pub missed_windows: u32,
+    /// Per-signer missed-window evidence: (DID, consecutive missed voting windows).
+    ///
+    /// Each tuple is the DID of a signer who had evidence of unavailability and
+    /// the number of consecutive voting windows they missed. Distinct from
+    /// `unavailable_dids` (completely absent — no response at all); these signers
+    /// sent some responses but missed enough windows to be declared unavailable.
+    pub missed_windows: Vec<(String, u32)>,
     /// Unix timestamp (seconds) when deadlock was detected.
     pub detected_at: u64,
 }
@@ -303,23 +310,6 @@ pub struct MediaSessionEndedPayload {
     pub started_at: u64,
     /// Unix timestamp (seconds) when the session ended.
     pub ended_at: u64,
-}
-
-/// Payload for [`EventType::TokenRevoked`](crate::EventType::TokenRevoked)
-/// (ADR-011 amendment; issue #1847 Phase 1.3).
-///
-/// Records the UCAN token revocation anchored in the Merkle log immediately
-/// after `RevocationList::revoke()` so the revocation is durably verifiable.
-/// Field order is the wire contract under positional `MessagePack` —
-/// **never reorder**.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenRevokedPayload {
-    /// The revocation CID / marker string (e.g. `"recovery:{ctx}:scopes={s}:before={t}"`).
-    pub revocation_cid: String,
-    /// The key scopes that were revoked (e.g. `["#agent"]`, `["#active", "#agent"]`).
-    pub scopes: Vec<String>,
-    /// Unix timestamp (milliseconds) of the key rotation that triggered revocation.
-    pub revoked_at: u64,
 }
 
 /// Builds the durable Merkle-leaf payload bytes for a consequence-enforcement
@@ -599,16 +589,16 @@ mod tests {
     }
 
     #[test]
-    fn key_epoch_advanced_round_trip() {
+    fn key_epoch_advance_round_trip() {
         // ADR-007 §5 sender-key epoch advance (distinct from MLS group recovery epoch).
-        let p = KeyEpochAdvancedPayload {
+        let p = KeyEpochAdvancePayload {
             old_epoch: 5,
             new_epoch: 6,
         };
         let encoded = encode_payload(&p).unwrap();
         // 2-field struct → fixarray of length 2
         assert_positional_array(&encoded.data, 2);
-        let decoded: KeyEpochAdvancedPayload = decode_payload(&encoded).unwrap();
+        let decoded: KeyEpochAdvancePayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 
@@ -653,22 +643,27 @@ mod tests {
     fn governance_deadlock_recovery_round_trip() {
         let p = GovernanceDeadlockRecoveryPayload {
             unavailable_dids: vec!["did:key:carol".to_owned(), "did:key:dave".to_owned()],
-            missed_windows: 7,
+            missed_windows: vec![
+                ("did:key:carol".to_owned(), 4),
+                ("did:key:dave".to_owned(), 3),
+            ],
             detected_at: 1_700_000_000,
         };
         let encoded = encode_payload(&p).unwrap();
-        // 3 fields: unavailable_dids (Vec), missed_windows (u32), detected_at (u64)
+        // 3 fields: unavailable_dids (Vec<String>), missed_windows (Vec<(String,u32)>),
+        // detected_at (u64)
         assert_positional_array(&encoded.data, 3);
         let decoded: GovernanceDeadlockRecoveryPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 
     #[test]
-    fn governance_deadlock_recovery_empty_unavailable_dids_round_trip() {
-        // Boundary: missed_windows only (no unavailable DIDs).
+    fn governance_deadlock_recovery_missed_windows_only_round_trip() {
+        // Boundary: missed_windows evidence only (unavailable_dids empty — signers
+        // responded but missed enough windows to trigger the fallback threshold).
         let p = GovernanceDeadlockRecoveryPayload {
             unavailable_dids: Vec::new(),
-            missed_windows: 3,
+            missed_windows: vec![("did:key:eve".to_owned(), 5)],
             detected_at: 0,
         };
         let encoded = encode_payload(&p).unwrap();
@@ -929,34 +924,6 @@ mod tests {
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 5);
         let decoded: MediaSessionStartedPayload = decode_payload(&encoded).unwrap();
-        assert_eq!(p, decoded);
-    }
-
-    #[test]
-    fn token_revoked_payload_round_trip() {
-        let p = TokenRevokedPayload {
-            revocation_cid: "recovery:ctx-001:scopes=#agent:before=1700000000".to_owned(),
-            scopes: vec!["#agent".to_owned()],
-            revoked_at: 1_700_000_000,
-        };
-        let encoded = encode_payload(&p).unwrap();
-        // 3-field struct → fixarray of length 3
-        assert_positional_array(&encoded.data, 3);
-        let decoded: TokenRevokedPayload = decode_payload(&encoded).unwrap();
-        assert_eq!(p, decoded);
-    }
-
-    #[test]
-    fn token_revoked_payload_multi_scope_round_trip() {
-        // IdentityKey tier: both #active and #agent scopes revoked together.
-        let p = TokenRevokedPayload {
-            revocation_cid: "recovery:ctx-abc:scopes=#active,#agent:before=1700009999".to_owned(),
-            scopes: vec!["#active".to_owned(), "#agent".to_owned()],
-            revoked_at: 1_700_009_999,
-        };
-        let encoded = encode_payload(&p).unwrap();
-        assert_positional_array(&encoded.data, 3);
-        let decoded: TokenRevokedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 }

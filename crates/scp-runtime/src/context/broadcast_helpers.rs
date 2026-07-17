@@ -677,7 +677,7 @@ pub async fn block_broadcast_subscriber(
     // two leaves are always co-located in the Merkle log. rotate_sender_key_for_block
     // always increments by exactly 1, so old = new.saturating_sub(1) is exact.
     let old_epoch = result.new_epoch.saturating_sub(1);
-    match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancedPayload {
+    match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancePayload {
         old_epoch,
         new_epoch: result.new_epoch,
     }) {
