@@ -161,4 +161,14 @@ pub enum MlsError {
     /// (ADR-057).
     #[error("convergent committer timestamp malformed: {0}")]
     ConvergentTimestampMalformed(String),
+
+    /// The per-context pseudonym could not be derived from this member's MLS
+    /// signing key (ADR-057 Option A, §9.10.4.A). Raised by
+    /// [`ScpMlsGroup::derive_pseudonym`](crate::group::ScpMlsGroup::derive_pseudonym)
+    /// if the signer's private seed cannot be recovered, or is not the expected
+    /// 32-byte Ed25519 seed (a non-Ed25519 or malformed signer — SCP groups are
+    /// Ed25519-only per `SCP_CIPHERSUITE`). Fail-closed: never truncate a
+    /// wrong-size key into the derivation.
+    #[error("pseudonym derivation failed: {0}")]
+    PseudonymDerivationFailed(String),
 }

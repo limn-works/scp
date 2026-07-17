@@ -27,15 +27,17 @@
 //!
 //! # Injected platform dependencies (keys on-device)
 //!
-//! The browser constructor `WasmScpClient::from_js` takes two JS-injected
+//! The browser constructor `WasmScpClient::from_js` takes three JS-injected
 //! objects: a `WebCrypto`-backed key-custody object (its bound DID becomes this
 //! participant's identity; see [`custody`] for the ADR-057 friction note on
-//! where the MLS signing key currently lives) and an `IndexedDB`/OPFS-backed
-//! storage object. The clock is **not** injected: it is the hardened
-//! captured-`Date.now` source ([`time::WasmClock`]) built inside wasm at
-//! construction, closing the override surface an injected JS clock would
-//! reintroduce. The native host-test seam [`WasmScpClient::from_parts`] takes
-//! the three built driver dependencies (signer, storage, clock) directly.
+//! where the MLS signing key currently lives), an `IndexedDB`/OPFS-backed storage
+//! object, and a [`socket::JsSocket`] wrapping the tab's relay WebSocket (the
+//! outbound relay port; inbound frames are pushed back in via
+//! [`WasmScpClient::handle_relay_frame`]). The clock is **not** injected: it is
+//! the hardened captured-`Date.now` source ([`time::WasmClock`]) built inside wasm
+//! at construction, closing the override surface an injected JS clock would
+//! reintroduce. The native host-test seam [`WasmScpClient::from_parts`] takes the
+//! four built driver dependencies (signer, storage, clock, socket) directly.
 //!
 //! # Scope fence (ADR-057, mechanically enforced)
 //!
@@ -47,12 +49,13 @@
 
 pub mod custody;
 pub mod error;
+pub mod socket;
 pub mod storage;
 pub mod time;
 
 use std::sync::Arc;
 
-use scp_client::{ContextStatus, ScpClient, Signer, Storage};
+use scp_client::{ContextStatus, ScpClient, Signer, Socket, Storage};
 use scp_clock::Clock;
 use wasm_bindgen::prelude::*;
 
@@ -284,9 +287,10 @@ impl WasmScpClient {
         signer: Arc<dyn Signer>,
         storage: Arc<dyn Storage>,
         clock: Arc<dyn Clock>,
+        socket: Arc<dyn Socket>,
     ) -> Result<Self, JsValue> {
         Ok(Self {
-            inner: map_err(ScpClient::new(signer, storage, clock))?,
+            inner: map_err(ScpClient::new(signer, storage, clock, socket))?,
         })
     }
 }
@@ -316,11 +320,13 @@ impl WasmScpClient {
     pub fn from_js(
         custody: crate::custody::JsKeyCustody,
         storage: crate::storage::JsStorage,
+        socket: crate::socket::JsSocket,
     ) -> Result<Self, JsValue> {
         let signer: Arc<dyn Signer> = Arc::new(crate::custody::JsSigner::from_custody(custody)?);
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::JsStorageAdapter::new(storage));
         let clock: Arc<dyn Clock> = Arc::new(crate::time::WasmClock::new());
-        Self::from_parts(signer, storage, clock)
+        let socket: Arc<dyn Socket> = Arc::new(crate::socket::JsSocketAdapter::new(socket));
+        Self::from_parts(signer, storage, clock, socket)
     }
 
     /// This participant's DID.
@@ -435,31 +441,50 @@ impl WasmScpClient {
             .collect())
     }
 
-    /// Encrypts and "sends" an application message in `context_id`, returning
-    /// the wire ciphertext (`Uint8Array`).
+    /// Encrypts an application message in `context_id` and **fans it out** over
+    /// the injected socket to every announced peer pseudonym (§9.10.4, ADR-057
+    /// transport slice).
     ///
-    /// The convergent committer timestamp is bound into the ciphertext's
-    /// authenticated MLS AAD (ADR-057) rather than returned separately, so
-    /// the recipient recovers it from the verified frame in
-    /// [`WasmScpClient::receive_message`] — there is no forgeable loose value for
-    /// the caller to relay.
+    /// There is no return value: the ciphertext leaves via the injected `JsSocket`
+    /// as one relay `PUBLISH` per peer, not back to the caller. Inbound delivery is
+    /// the reverse — the embedder pumps relay `BLOB` frames into
+    /// [`WasmScpClient::handle_relay_frame`]. The convergent committer timestamp is
+    /// bound into the ciphertext's authenticated MLS AAD (ADR-057), recovered by
+    /// the recipient from the verified frame.
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, or a `[SCP-CRYPTO-…]`
-    /// error on a crypto / leaf failure. A `[SCP-STORAGE-8010]` on the post-send
-    /// snapshot write **poisons** the context (the message's state advanced in
-    /// memory but was not durably recorded, so no ciphertext is returned), and
+    /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CTX-2040]` if no
+    /// peer has announced a pseudonym yet (retryable — pump peers' announcements in
+    /// first), a `[SCP-CRYPTO-…]` error on a crypto / leaf failure, or
+    /// `[SCP-TRANS-5010]` if the socket rejects a frame. A `[SCP-STORAGE-8010]`
+    /// on the pre-publish snapshot write **poisons** the context, and
     /// `[SCP-STORAGE-8013]` is thrown if the context is already poisoned — either
-    /// way, discard this client and reconstruct it via the [`WasmScpClient`] constructor for your target (see
-    /// [`ContextStatus`](scp_client::ContextStatus)).
+    /// way, discard this client and reconstruct it via the [`WasmScpClient`]
+    /// constructor for your target (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "sendMessage")]
-    pub fn send_message(
-        &mut self,
-        context_id: String,
-        plaintext: Vec<u8>,
-    ) -> Result<Vec<u8>, JsValue> {
+    pub fn send_message(&mut self, context_id: String, plaintext: Vec<u8>) -> Result<(), JsValue> {
         map_err(self.inner.send_message(&context_id, &plaintext))
+    }
+
+    /// Feeds one inbound relay frame (the binary payload of a relay WebSocket
+    /// `onmessage`) into the driver (ADR-057 transport slice).
+    ///
+    /// A relay `BLOB` is resolved to its owning context, unwrapped, and decrypted —
+    /// recording a peer's pseudonym announcement, buffering an application message
+    /// for [`WasmScpClient::drain_events`], or applying a membership Commit. A frame
+    /// for a routing id this client does not track is dropped (not an error).
+    ///
+    /// # Errors
+    ///
+    /// Throws `[SCP-VALID-7010]` if the frame or its wrapped envelope cannot be
+    /// deserialized, `[SCP-TRANS-5010]` if the relay reported an error, or a
+    /// `[SCP-CRYPTO-…]` / `[SCP-CTX-…]` / `[SCP-STORAGE-…]` error if decrypting or
+    /// applying a resolved blob fails (the same failures
+    /// [`WasmScpClient::receive_message`] raises).
+    #[wasm_bindgen(js_name = "handleRelayFrame")]
+    pub fn handle_relay_frame(&mut self, frame: Vec<u8>) -> Result<(), JsValue> {
+        map_err(self.inner.handle_relay_frame(&frame))
     }
 
     /// Receives an inbound MLS message in `context_id`. Returns a

@@ -43,6 +43,19 @@ pub struct PerContextState {
     pub member_sequence_numbers: HashMap<String, u64>,
     /// Pull-based receive buffer. Drained by `ScpClient::drain_events`.
     pub event_buffer: VecDeque<ContextEvent>,
+    /// The §9.10.4 peer-pseudonym registry: `peer_did → 32-byte routing ID`.
+    /// Populated when a peer's `PseudonymAnnouncement` is ingested (§9.10.4). This
+    /// is the address book the app-data fan-out publishes to — each entry is one
+    /// peer's per-context relay routing ID. Excludes this member's own pseudonym
+    /// (that is [`Self::local_pseudonym`]); it is the exact registry
+    /// [`classify_pseudonym_announcement`](scp_protocol::context::pseudonym::classify_pseudonym_announcement)
+    /// consults for the cross-DID collision check.
+    pub peer_pseudonyms: HashMap<DID, [u8; 32]>,
+    /// This member's own per-context pseudonym (its 32-byte relay routing ID),
+    /// derived over the wasm-held MLS signing key (ADR-057 Option A). `None` until
+    /// derived on context entry (create/join). NOT persisted — re-derived on
+    /// restore from the MLS key, which is deterministic (see `snapshot.rs`).
+    pub local_pseudonym: Option<[u8; 32]>,
     /// Poison flag: set when a `Storage` write failed *after* this context's
     /// in-memory state had already advanced irreversibly (see
     /// [`ClientError::ContextPoisoned`](crate::ClientError::ContextPoisoned)). A
@@ -66,6 +79,8 @@ impl PerContextState {
             event_log: EventLog::new(context_id.to_owned()),
             member_sequence_numbers: HashMap::new(),
             event_buffer: VecDeque::new(),
+            peer_pseudonyms: HashMap::new(),
+            local_pseudonym: None,
             poisoned: false,
         };
         // The creator is the sole initial member; record it in the wrapping-key
@@ -85,8 +100,36 @@ impl PerContextState {
             event_log: EventLog::new(context_id.to_owned()),
             member_sequence_numbers: HashMap::new(),
             event_buffer: VecDeque::new(),
+            peer_pseudonyms: HashMap::new(),
+            local_pseudonym: None,
             poisoned: false,
         }
+    }
+
+    /// Records a peer's announced per-context pseudonym in the §9.10.4 registry
+    /// (keyed by the peer's DID). Overwrites a prior value for the same DID (a
+    /// key-rotation re-announce). Never records this member's own DID — the local
+    /// pseudonym is tracked separately in [`Self::local_pseudonym`].
+    pub fn record_peer_pseudonym(&mut self, peer_did: DID, pseudonym: [u8; 32]) {
+        self.peer_pseudonyms.insert(peer_did, pseudonym);
+    }
+
+    /// The app-data fan-out address set: every announced peer pseudonym (the
+    /// registry values), in arbitrary order. Empty until peers announce.
+    #[must_use]
+    pub fn peer_pseudonym_values(&self) -> Vec<[u8; 32]> {
+        self.peer_pseudonyms.values().copied().collect()
+    }
+
+    /// Sets this member's own per-context pseudonym (derived on context entry).
+    pub const fn set_local_pseudonym(&mut self, pseudonym: [u8; 32]) {
+        self.local_pseudonym = Some(pseudonym);
+    }
+
+    /// This member's own per-context pseudonym, or `None` before it is derived.
+    #[must_use]
+    pub const fn local_pseudonym(&self) -> Option<[u8; 32]> {
+        self.local_pseudonym
     }
 
     /// Records a member in the context's wrapping-key directory (the

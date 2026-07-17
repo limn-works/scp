@@ -38,8 +38,17 @@ use scp_mls::{
     InMemoryMlsProvider, ScpCredential, SignatureKeyPair, restore_pending_join,
     serialize_pending_join,
 };
+use scp_protocol::context::context_routing_id;
 use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::pseudonym::{
+    PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement, PseudonymAnnouncementDecision,
+    classify_pseudonym_announcement, is_pseudonym_announcement_payload,
+};
 use scp_protocol::crypto::sender_keys::generate_wrapping_keypair;
+use scp_protocol::envelope::outer::{
+    DEFAULT_APP_DATA_BLOB_TTL_SECS, OuterEnvelope, create_outer_envelope,
+};
+use scp_relay_client::{ClientMessage, RelayMessage};
 use serde::{Deserialize, Serialize};
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use zeroize::Zeroizing;
@@ -49,6 +58,7 @@ use crate::crypto_state::{ContextCryptoState, Inbound, SenderKeyDistribution};
 use crate::error::ClientError;
 use crate::signer::Signer;
 use crate::snapshot::ContextSnapshot;
+use crate::socket::Socket;
 use crate::storage::Storage;
 
 /// Pending join material a prospective member retains between generating its
@@ -201,11 +211,23 @@ pub struct ScpClient {
     /// timestamps; in a browser this is the hardened clock (ADR-057
     /// Prerequisite 1), never an un-captured `Date.now()`.
     clock: Arc<dyn Clock>,
+    /// The injected **outbound** relay port (ADR-057 transport slice). The driver
+    /// hands it serialized relay `ClientMessage` frames (`SUBSCRIBE` on context
+    /// entry, `PUBLISH` on every send/announce); it never reads back through this
+    /// — inbound frames arrive via [`Self::handle_relay_frame`]. In a browser this
+    /// is a `wasm-bindgen` `JsSocket` over the tab's WebSocket.
+    socket: Arc<dyn Socket>,
     /// Per-context participant state, keyed by context id.
     contexts: HashMap<String, PerContextState>,
     /// Retained join material per context id, between key-package generation
     /// and Welcome processing.
     pending_joins: HashMap<String, PendingJoin>,
+    /// Relay `routing_id → context_id` index for the inbound pump. Holds, for
+    /// every live context, BOTH this member's local pseudonym (its app-data
+    /// routing id) and the shared `context_routing_id` (the §9.10.4 announcement
+    /// channel), so [`Self::handle_relay_frame`] can resolve an inbound `BLOB`'s
+    /// routing id back to the context that owns it. Rebuilt on restore.
+    routing_index: HashMap<[u8; 32], String>,
 }
 
 impl ScpClient {
@@ -237,13 +259,16 @@ impl ScpClient {
         signer: Arc<dyn Signer>,
         storage: Arc<dyn Storage>,
         clock: Arc<dyn Clock>,
+        socket: Arc<dyn Socket>,
     ) -> Result<Self, ClientError> {
         let mut client = Self {
             signer,
             storage,
             clock,
+            socket,
             contexts: HashMap::new(),
             pending_joins: HashMap::new(),
+            routing_index: HashMap::new(),
         };
         client.restore_from_storage()?;
         Ok(client)
@@ -382,6 +407,14 @@ impl ScpClient {
 
         self.contexts.insert(context_id.to_owned(), state);
         self.persist_context(context_id)?;
+        // Derive this member's per-context pseudonym over the just-built MLS key,
+        // register it + the shared announcement channel in the routing index, and
+        // subscribe to both (ADR-057 transport slice). No announcement is sent at
+        // creation: a lone creator has no peers, and a §9.16 frame sealed at the
+        // creator's epoch could not be decrypted by a member who later joins at a
+        // higher epoch (MLS forward secrecy) — so the creator (re-)announces at the
+        // membership-change point instead ([`Self::add_member`]).
+        self.install_local_routing(context_id)?;
         Ok(())
     }
 
@@ -565,6 +598,14 @@ impl ScpClient {
         // membership, MemberJoined leaf, advanced send ratchet from the seal)
         // before returning.
         self.persist_context(context_id)?;
+
+        // Re-announce this member's pseudonym at the NEW epoch so the just-added
+        // member can learn it (§9.10.4). The joiner bootstraps at the post-add
+        // epoch, so it cannot decrypt an announcement sealed at any earlier epoch
+        // (MLS forward secrecy) — the add is exactly the point at which an existing
+        // member must (re-)announce to a newcomer. Best-effort over the socket; the
+        // add itself already succeeded and was persisted above.
+        self.announce_pseudonym(context_id)?;
         Ok(output)
     }
 
@@ -724,6 +765,15 @@ impl ScpClient {
                     "deleting consumed pending join for context '{context_id}': {e}"
                 ))
             })?;
+
+        // Derive this joiner's per-context pseudonym, register + subscribe to its
+        // routing id and the shared announcement channel, then announce it so every
+        // existing member learns the joiner's routing id (§9.10.4, ADR-057 transport
+        // slice). The joiner is at the current epoch and existing members already
+        // hold the joiner's sender key (from its join distributions above), so the
+        // announcement is decryptable by its intended audience.
+        self.install_local_routing(context_id)?;
+        self.announce_pseudonym(context_id)?;
         Ok(distributions)
     }
 
@@ -731,64 +781,277 @@ impl ScpClient {
     // Message path
     // ----------------------------------------------------------------------
 
-    /// Encrypts and "sends" an application message in `context_id`, returning the
-    /// wire ciphertext.
+    /// Encrypts an application message in `context_id` and **fans it out** over
+    /// the injected [`Socket`](crate::Socket) to every announced peer pseudonym
+    /// (§9.10.4, ADR-057 transport slice).
     ///
     /// Runs the full §9.16 double-encryption pipeline, increments this sender's
-    /// sequence, records the sent message as **local history** (a `MessageSent`
-    /// [`ContextEvent`] buffered for [`Self::drain_events`], matching the native
-    /// runtime's `finalize_send`), and returns the ciphertext for the transport
-    /// to deliver to peers.
+    /// sequence, wraps the ciphertext in an [`OuterEnvelope`] whose cleartext
+    /// `routing_id` is **zeroed** (the per-peer routing id rides on the relay
+    /// `PUBLISH`, not the envelope — mirroring the native seal step), publishes one
+    /// `PUBLISH` frame per peer pseudonym, and records the sent message as **local
+    /// history** (a `MessageSent` [`ContextEvent`] buffered for
+    /// [`Self::drain_events`], matching the native `finalize_send`).
+    ///
+    /// Inbound delivery is the reverse: the embedder pumps relay `BLOB` frames into
+    /// [`Self::handle_relay_frame`], which unwraps the envelope and drives
+    /// [`Self::receive_message`]. There is no return value — the ciphertext leaves
+    /// via the socket, not back to the caller.
+    ///
+    /// # Addressing
+    ///
+    /// - **Multi-member context, peers announced** → one `PUBLISH` per announced
+    ///   peer pseudonym, identical blob.
+    /// - **Multi-member context, no peer announced yet** →
+    ///   [`ClientError::PseudonymRegistryEmpty`] (retryable — pump peers'
+    ///   announcements in first). Raised *before* the MLS ratchet advances, so a
+    ///   retry is clean.
+    /// - **Lone member (no peers)** → `Ok(())` no-op: nothing is encrypted, sent,
+    ///   or buffered (mirrors the native lone-member no-op).
     ///
     /// # `MessageSent` is not a convergent event-log leaf
     ///
-    /// Per ADR-011 exclusion taxonomy §2 (`.docs/adrs/phase-2.md`), an
-    /// application message is per-author with no total delivery order over a real
-    /// relay, so it is **excluded** from the canonical §9.9.3 Merkle log: it is
-    /// local `ContextEvent` history only (as on the native path, until ADR-051).
-    /// This method therefore appends **no** event-log leaf and binds **no**
-    /// convergent-timestamp AAD — the message is plain MLS-encrypted. The event
-    /// log (and its Merkle root) is unchanged by a send.
-    ///
-    /// There is no relay in the MVP; the returned bytes are handed directly to
-    /// recipients' [`Self::receive_message`] by the test harness "dumb pipe".
+    /// Per ADR-011 exclusion taxonomy §2, an application message is per-author with
+    /// no total delivery order, so it is **excluded** from the §9.9.3 Merkle log:
+    /// it is local `ContextEvent` history only. This method appends **no** leaf and
+    /// binds **no** convergent-timestamp AAD; the event log / Merkle root is
+    /// unchanged by a send.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::UnknownContext`] if the context is not held,
-    /// [`ClientError::ContextPoisoned`] if the context has been poisoned by a
-    /// prior failed persist, or [`ClientError::Mls`] / [`ClientError::SenderKey`]
-    /// on a layer failure. A [`ClientError::StorageBackend`] from the post-send
-    /// persist **poisons** the context: the message's state advanced in memory
-    /// but was not durably recorded, so `Err` (and thus no ciphertext) is returned
-    /// and the context refuses further ops.
-    pub fn send_message(
+    /// [`ClientError::ContextPoisoned`] if the context has been poisoned,
+    /// [`ClientError::PseudonymRegistryEmpty`] if peers have not announced,
+    /// [`ClientError::Mls`] / [`ClientError::SenderKey`] on a crypto-layer failure,
+    /// or [`ClientError::Transport`] if the socket rejects a frame. A
+    /// [`ClientError::StorageBackend`] from the pre-publish persist **poisons** the
+    /// context: the message's state advanced in memory but was not durably
+    /// recorded.
+    pub fn send_message(&mut self, context_id: &str, plaintext: &[u8]) -> Result<(), ClientError> {
+        self.encrypt_and_fanout(context_id, plaintext, true)
+    }
+
+    // ----------------------------------------------------------------------
+    // Transport / routing (ADR-057 transport slice — §9.10.4 pseudonym fan-out)
+    // ----------------------------------------------------------------------
+
+    /// Derives this member's per-context pseudonym over the wasm-held MLS key,
+    /// records it (and the shared announcement channel) in the routing index, and
+    /// subscribes to both routing IDs over the socket. Does **not** announce —
+    /// callers that should announce ([`Self::join_context_encrypted`],
+    /// [`Self::add_member`]) call [`Self::announce_pseudonym`] separately.
+    ///
+    /// Shared by context entry (`create_context` / `join_context_encrypted`) and
+    /// restore (which re-derives the same pseudonym from the restored MLS key and
+    /// re-subscribes, but never re-announces — peers re-announce to it).
+    fn install_local_routing(&mut self, context_id: &str) -> Result<(), ClientError> {
+        let pseudonym = {
+            let state = self.context_mut(context_id)?;
+            let pseudonym = state
+                .crypto
+                .mls_group
+                .derive_pseudonym(context_id.as_bytes(), None)?;
+            state.set_local_pseudonym(pseudonym);
+            pseudonym
+        };
+        let announce_rid = context_routing_id(context_id);
+        self.routing_index.insert(pseudonym, context_id.to_owned());
+        self.routing_index
+            .insert(announce_rid, context_id.to_owned());
+        self.subscribe(pseudonym)?;
+        self.subscribe(announce_rid)?;
+        Ok(())
+    }
+
+    /// Sends a `SUBSCRIBE` for `routing_id` over the socket, so the relay pushes
+    /// this member every `BLOB` published to it.
+    fn subscribe(&self, routing_id: [u8; 32]) -> Result<(), ClientError> {
+        let frame = ClientMessage::Subscribe {
+            ref_id: None,
+            routing_id,
+            since: None,
+        }
+        .to_bytes()
+        .map_err(|e| ClientError::Codec(format!("serializing SUBSCRIBE: {e}")))?;
+        self.socket.send(frame).map_err(ClientError::Transport)
+    }
+
+    /// Builds and publishes this member's `PseudonymAnnouncement` (§9.10.4) so
+    /// peers learn its per-context routing id.
+    ///
+    /// The announcement is a §9.16 double-encrypted management-adjacent payload
+    /// (tagged with [`PSEUDONYM_ANNOUNCEMENT_TAG`]) routed EXCLUSIVELY to the
+    /// shared `context_routing_id` — the one channel every member subscribes to for
+    /// bootstrap — never to peer pseudonyms. It buffers **no** `MessageSent` (an
+    /// announcement is protocol bootstrap, not user history). A no-op (`Ok(())`) if
+    /// the local pseudonym has not been derived yet.
+    fn announce_pseudonym(&mut self, context_id: &str) -> Result<(), ClientError> {
+        let Some(pseudonym) = self.context_ref(context_id)?.local_pseudonym() else {
+            return Ok(());
+        };
+        let announcement = PseudonymAnnouncement {
+            tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: self.signer.did().to_owned(),
+            pseudonym,
+        };
+        let payload = rmp_serde::to_vec_named(&announcement)
+            .map_err(|e| ClientError::Codec(format!("serializing pseudonym announcement: {e}")))?;
+        self.encrypt_and_fanout(context_id, &payload, false)
+    }
+
+    /// The shared §9.16-encrypt → outer-wrap → relay-fan-out core behind both
+    /// [`Self::send_message`] (`record_sent = true`) and
+    /// [`Self::announce_pseudonym`] (`record_sent = false`).
+    ///
+    /// Mirrors the native `messaging_helpers` send fan-out:
+    /// 1. Classify the payload (announcement → the shared `context_routing_id`
+    ///    ONLY; app data → the announced peer pseudonyms).
+    /// 2. For app data, guard the empty registry: `member_count > 1` with no
+    ///    announced peer is a retryable [`ClientError::PseudonymRegistryEmpty`]
+    ///    (raised BEFORE any crypto advance); a lone member with no peers is a
+    ///    silent `Ok(())` no-op (zero frames, zero state advance).
+    /// 3. §9.16 double-encrypt, wrap in an [`OuterEnvelope`] with a **zeroed**
+    ///    cleartext `routing_id` (the routing id rides the `PUBLISH`, not the
+    ///    envelope), and publish one identical `PUBLISH` per routing id.
+    ///
+    /// The advanced MLS ratchet is persisted BEFORE the frames are published, so a
+    /// crash after publish cannot leave durable state behind a frame peers already
+    /// received (the same poison-on-persist-failure contract as every mutating op).
+    fn encrypt_and_fanout(
         &mut self,
         context_id: &str,
         plaintext: &[u8],
-    ) -> Result<Vec<u8>, ClientError> {
+        record_sent: bool,
+    ) -> Result<(), ClientError> {
         let sender_did = self.signer.did().to_owned();
-        let state = self.context_mut(context_id)?;
+        let socket = Arc::clone(&self.socket);
+        let is_announcement = is_pseudonym_announcement_payload(plaintext);
 
+        // Phase 1: routing decision + empty-registry guard, read BEFORE advancing
+        // any crypto state so a registry-empty failure consumes no ratchet.
+        let state = self.context_mut(context_id)?;
+        let routing_ids: Vec<[u8; 32]> = if is_announcement {
+            // Bootstrap channel: announcements go to the shared RID ONLY, never
+            // unioned with peer pseudonyms.
+            vec![context_routing_id(context_id)]
+        } else {
+            let addrs = state.peer_pseudonym_values();
+            let member_count = state.crypto.member_wrapping_keys.len();
+            if member_count > 1 && addrs.is_empty() {
+                return Err(ClientError::PseudonymRegistryEmpty {
+                    context_id: context_id.to_owned(),
+                    member_count,
+                });
+            }
+            addrs
+        };
+
+        // Lone/empty app-data: nobody to address. A true no-op — no encrypt, no
+        // send, no ratchet advance, no MessageSent (mirrors the native lone-member
+        // no-op). Announcements always carry the shared RID, so this only fires for
+        // app data with zero announced peers.
+        if routing_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 2: advance crypto (sender-key + MLS double-encrypt), and — for app
+        // data — buffer the local `MessageSent` history in the SAME borrow so it is
+        // persisted atomically with the ratchet advance below.
         let sequence = state.next_sequence(&sender_did);
         let ciphertext = state
             .crypto
             .encrypt_message(plaintext, &sender_did, sequence)?;
+        if record_sent {
+            state.push_event(ContextEvent::MessageSent {
+                sender_did: sender_did.clone().into(),
+                sequence_number: sequence,
+                payload: plaintext.to_vec(),
+            });
+        }
 
-        // Record the sent message as local history (not a convergent leaf —
-        // ADR-011). This mirrors the native runtime's `finalize_send`, which
-        // returns a local `MessageSent` ContextEvent; the driver buffers it for
-        // `drain_events`.
-        state.push_event(ContextEvent::MessageSent {
-            sender_did: sender_did.into(),
-            sequence_number: sequence,
-            payload: plaintext.to_vec(),
-        });
+        // `state` borrow ends (ciphertext + routing_ids are owned). Wrap in an
+        // OuterEnvelope with a ZEROED cleartext routing_id (§9.10.4 privacy: the
+        // relay-visible routing id is the per-peer PUBLISH address below, not the
+        // envelope; a curious relay reads nothing linkable off the envelope).
+        let blob =
+            create_outer_envelope(&[0u8; 32], None, DEFAULT_APP_DATA_BLOB_TTL_SECS, ciphertext)
+                .map_err(|e| ClientError::Codec(format!("building outer envelope: {e}")))?
+                .to_bytes()
+                .map_err(|e| ClientError::Codec(format!("serializing outer envelope: {e}")))?;
 
-        // The `state` borrow ends above; persist the post-send state (advanced
-        // sender sequence + ratchet, buffered MessageSent) before returning.
+        // Persist the advanced ratchet (+ buffered MessageSent) BEFORE publishing.
         self.persist_context(context_id)?;
-        Ok(ciphertext)
+
+        // Fan out: one PUBLISH per routing id, identical blob. App data is NEVER
+        // published to the shared `context_routing_id` (only announcements are —
+        // enforced by the classification above).
+        for routing_id in routing_ids {
+            let frame = ClientMessage::Publish {
+                ref_id: None,
+                routing_id,
+                recipient_hint: None,
+                blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+                blob: blob.clone(),
+            }
+            .to_bytes()
+            .map_err(|e| ClientError::Codec(format!("serializing PUBLISH: {e}")))?;
+            socket.send(frame).map_err(ClientError::Transport)?;
+        }
+        Ok(())
+    }
+
+    /// The synchronous **inbound pump**: feeds one relay frame the embedder
+    /// received into the driver (ADR-057 transport slice).
+    ///
+    /// A browser's WebSocket `onmessage` handler calls this for every binary frame
+    /// the relay pushes. A [`RelayMessage::Blob`] is resolved through the
+    /// [`Self::routing_index`] to the owning context, its [`OuterEnvelope`] is
+    /// unwrapped, and the inner MLS ciphertext is driven through
+    /// [`Self::receive_message`] — which decrypts, classifies a pseudonym
+    /// announcement (recording the peer's routing id) or an application message
+    /// (buffering it for [`Self::drain_events`]), or applies a membership Commit.
+    ///
+    /// A `BLOB` on an **unknown** routing id (not in the index — e.g. a late frame
+    /// for a closed context) is dropped, not an error: the relay is an untrusted
+    /// pipe and may deliver frames this client no longer tracks. Non-`BLOB` relay
+    /// frames (`OK` / `EVENT` / `PONG`) are control acknowledgements with no driver
+    /// state to advance and are ignored; a relay [`RelayMessage::Err`] is surfaced
+    /// as a [`ClientError::Transport`] diagnostic so the embedder can log it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Codec`] if the frame or the wrapped envelope cannot
+    /// be deserialized, [`ClientError::Transport`] if the relay reported an error,
+    /// or any error [`Self::receive_message`] raises for a resolved blob (a decrypt
+    /// / membership / persist failure). A frame for an unknown routing id is NOT an
+    /// error.
+    pub fn handle_relay_frame(&mut self, frame: &[u8]) -> Result<(), ClientError> {
+        let message = RelayMessage::from_bytes(frame)
+            .map_err(|e| ClientError::Codec(format!("deserializing relay frame: {e}")))?;
+        match message {
+            RelayMessage::Blob {
+                routing_id, blob, ..
+            } => {
+                // Resolve the routing id to the owning context. Unknown → drop.
+                let Some(context_id) = self.routing_index.get(&routing_id).cloned() else {
+                    return Ok(());
+                };
+                let envelope = OuterEnvelope::from_bytes(&blob).map_err(|e| {
+                    ClientError::Codec(format!("deserializing outer envelope: {e}"))
+                })?;
+                self.receive_message(&context_id, &envelope.encrypted_blob)?;
+                Ok(())
+            }
+            RelayMessage::Err { code, msg, .. } => Err(ClientError::Transport(format!(
+                "relay reported error {code}: {msg}"
+            ))),
+            // OK / EVENT / PONG / BridgeData: control acknowledgements with no
+            // driver state to advance in the participant message path.
+            RelayMessage::Ok { .. }
+            | RelayMessage::Event { .. }
+            | RelayMessage::Pong { .. }
+            | RelayMessage::BridgeData { .. } => Ok(()),
+        }
     }
 
     /// Receives an inbound MLS message in `context_id`: decrypts an application
@@ -881,24 +1144,23 @@ impl ScpClient {
         // after the `state` borrow ends. Only the rejected Remove-bearing Commit
         // (which `scp-mls` dropped BEFORE merging, leaving MLS + SCP state
         // unchanged) returns without a write.
+        // Set when this receive applied an add-Commit (a new member joined the
+        // group as seen by this bystander). Drives a post-persist re-announcement so
+        // the newcomer learns THIS member's pseudonym at the new epoch — the
+        // bystander half of the §9.10.4 announce mesh (the adder re-announces in
+        // `add_member`; the joiner announces on join).
+        let mut membership_added = false;
         let outcome = match state.crypto.decrypt_message(ciphertext, clock.as_ref())? {
             Inbound::Application {
                 sender_did,
                 plaintext,
             } => {
-                // ADR-011 exclusion taxonomy §2: a received application message is
-                // NOT a convergent Merkle leaf, so NO event-log leaf is appended —
-                // the message is buffered as local `MessageReceived` history only
-                // (matching the native runtime). The event log / Merkle root is
-                // unchanged by a received message.
-                state.push_event(ContextEvent::MessageReceived {
-                    sender_did: sender_did.into(),
-                    payload: plaintext,
-                });
-                ReceiveOutput {
-                    application: true,
-                    sender_key_distributions: Vec::new(),
-                }
+                // §9.10.4 ingest: an inbound application plaintext may be a peer's
+                // `PseudonymAnnouncement` rather than user data. Delegated to
+                // `ingest_application_plaintext`, which runs the shared, wasm-safe
+                // decision core and maps its verdict (record + `PseudonymAnnounced`,
+                // buffer `MessageReceived`, or drop a rejected announcement).
+                ingest_application_plaintext(state, context_id, sender_did, plaintext)
             }
             Inbound::SenderKeyInstalled { .. } => {
                 // A peer's sender key was HPKE-opened and installed into the store
@@ -984,6 +1246,9 @@ impl ScpClient {
                             added_wrapping_key,
                         )?);
                     }
+                    // A member was added: re-announce below so it learns this
+                    // member's pseudonym at the new epoch.
+                    membership_added = true;
                 }
                 ReceiveOutput {
                     application: false,
@@ -995,6 +1260,14 @@ impl ScpClient {
         // `state` borrow ends above. Persist the mutated MLS/log/membership state
         // (including any send-ratchet advance from a bystander re-distribution).
         self.persist_context(context_id)?;
+        // Bystander pseudonym re-announcement (§9.10.4): after applying an
+        // add-Commit, re-announce this member's routing id at the NEW epoch so the
+        // newcomer — which bootstrapped at this epoch and cannot decrypt an
+        // announcement sealed earlier — can learn it. Best-effort; the receive
+        // itself already succeeded and was persisted above.
+        if membership_added {
+            self.announce_pseudonym(context_id)?;
+        }
         Ok(outcome)
     }
 
@@ -1425,6 +1698,19 @@ impl ScpClient {
         for (id, pending) in staged_pending {
             self.pending_joins.insert(id, pending);
         }
+
+        // Rebuild the transport routing state for every restored context (ADR-057
+        // transport slice): re-derive the local pseudonym from the restored,
+        // deterministic MLS key (it is NOT persisted — it is a pure function of the
+        // MLS key, which the snapshot carries), rebuild the routing index, and
+        // re-subscribe over the socket. Peers' announced pseudonyms WERE persisted
+        // (in the snapshot), so no re-announcement is emitted here — a restored
+        // member re-announces only when it next takes part in a membership change,
+        // and peers likewise re-announce to it (matching the native restore model).
+        let restored_ids: Vec<String> = self.contexts.keys().cloned().collect();
+        for context_id in restored_ids {
+            self.install_local_routing(&context_id)?;
+        }
         Ok(())
     }
 
@@ -1441,6 +1727,64 @@ impl ScpClient {
                     "listed key '{key}' vanished before it could be read"
                 ))
             })
+    }
+}
+
+/// Ingests a decrypted application plaintext (§9.10.4): a peer's pseudonym
+/// announcement, ordinary user data, or a rejected announcement.
+///
+/// Runs the shared, wasm-safe [`classify_pseudonym_announcement`] decision core
+/// (identical to the native runtime's, so accept/reject cannot drift) over this
+/// member's peer registry and maps the verdict:
+/// - **Accept** → record the peer's routing id + buffer a `PseudonymAnnounced`
+///   event; NOT an application message (`application: false`).
+/// - **`NotAnnouncement`** → buffer the `MessageReceived` local history. Per
+///   ADR-011 exclusion taxonomy §2 a received application message is NOT a
+///   convergent Merkle leaf, so NO event-log leaf is appended (the event log /
+///   Merkle root is unchanged); `application: true`.
+/// - **Rejected** → a tagged announcement that failed a §9.10.4 security check
+///   (forged `member_did`, reserved/colliding routing id) is dropped without
+///   recording anything or surfacing a payload.
+fn ingest_application_plaintext(
+    state: &mut PerContextState,
+    context_id: &str,
+    sender_did: String,
+    plaintext: Vec<u8>,
+) -> ReceiveOutput {
+    match classify_pseudonym_announcement(
+        &plaintext,
+        &sender_did,
+        context_id,
+        Some(&state.peer_pseudonyms),
+    ) {
+        PseudonymAnnouncementDecision::Accept {
+            member_did,
+            pseudonym,
+        } => {
+            state.record_peer_pseudonym(member_did.clone(), pseudonym);
+            state.push_event(ContextEvent::PseudonymAnnounced {
+                member_did,
+                pseudonym,
+            });
+            ReceiveOutput {
+                application: false,
+                sender_key_distributions: Vec::new(),
+            }
+        }
+        PseudonymAnnouncementDecision::NotAnnouncement => {
+            state.push_event(ContextEvent::MessageReceived {
+                sender_did: sender_did.into(),
+                payload: plaintext,
+            });
+            ReceiveOutput {
+                application: true,
+                sender_key_distributions: Vec::new(),
+            }
+        }
+        PseudonymAnnouncementDecision::Rejected { .. } => ReceiveOutput {
+            application: false,
+            sender_key_distributions: Vec::new(),
+        },
     }
 }
 

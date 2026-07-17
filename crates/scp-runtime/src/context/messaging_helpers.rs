@@ -91,8 +91,13 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 /// long enough to absorb transient relay outages.
 ///
 /// Public so the lifecycle path can re-use the same value when sealing
-/// welcome envelopes.
-pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
+/// welcome envelopes. Sourced from the wasm-safe
+/// [`scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS`] so the
+/// native runtime and the in-browser `scp-client` driver request the identical
+/// relay-storage window for the same message (ADR-057 "share, don't fork") — the
+/// value is unchanged (300s); only its single source of truth moved.
+pub const DEFAULT_BLOB_TTL_SECS: u32 =
+    scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS;
 
 // ---------------------------------------------------------------------------
 // 1. build_inner_wire (shared inner-envelope construction)

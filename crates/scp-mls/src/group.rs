@@ -105,6 +105,61 @@ impl Deref for EagerDropSigner {
     }
 }
 
+/// Recovers the 32-byte Ed25519 private **seed** from an MLS `SignatureKeyPair`
+/// (ADR-057 Option A pseudonym derivation).
+///
+/// `openmls_basic_credential::SignatureKeyPair` stores the ED25519 private key as
+/// `ed25519_dalek::SigningKey::to_bytes()` — the 32-byte RFC-8032 seed (see its
+/// `SignatureKeyPair::new` ED25519 arm), exactly the form
+/// [`ed25519_dalek::SigningKey::from_bytes`] consumes. Its `private()` accessor
+/// is `test-utils`-gated (unavailable in a shipped build), so this production
+/// path recovers the seed through the type's own `serde` derive — the identical
+/// name-tagged `MessagePack` form `ProviderSignerDump` already serializes the
+/// signer with (see `snapshot.rs`) — reading back only the `private` field.
+/// (A dedicated `scp-mls` unit test cross-checks this against the `test-utils`
+/// `private()` accessor, so a future upstream serde-shape change fails loudly.)
+///
+/// The intermediate serialized bytes and the extracted seed `Vec` are zeroized;
+/// the returned seed rides home in [`Zeroizing`](zeroize::Zeroizing). Fails
+/// closed if the seed is not exactly 32 bytes, so a non-Ed25519 or malformed
+/// signer can never be silently truncated into a derivation.
+fn extract_ed25519_seed(
+    signer: &SignatureKeyPair,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, MlsError> {
+    use zeroize::Zeroize as _;
+
+    // Only the private seed is read back; `public` / `signature_scheme` are
+    // ignored (serde skips unknown fields for a struct by default). `private` is
+    // a plain `Vec<u8>` on the upstream type (no `serde_bytes`), so it round-trips
+    // through `rmp_serde` as a positional u8 sequence into this `Vec<u8>` — match
+    // that shape exactly.
+    #[derive(serde::Deserialize)]
+    struct Ed25519SeedExtract {
+        private: Vec<u8>,
+    }
+
+    let mut serialized = rmp_serde::to_vec_named(signer)
+        .map_err(|e| MlsError::PseudonymDerivationFailed(format!("serializing MLS signer: {e}")))?;
+    let extract: Result<Ed25519SeedExtract, _> = rmp_serde::from_slice(&serialized);
+    serialized.zeroize();
+    let mut extract = extract.map_err(|e| {
+        MlsError::PseudonymDerivationFailed(format!("recovering MLS signer private seed: {e}"))
+    })?;
+
+    let outcome = if extract.private.len() == 32 {
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        seed.copy_from_slice(&extract.private);
+        Ok(seed)
+    } else {
+        Err(MlsError::PseudonymDerivationFailed(format!(
+            "MLS signer private key is {} bytes, expected a 32-byte Ed25519 seed",
+            extract.private.len()
+        )))
+    };
+    extract.private.zeroize();
+    outcome
+}
+
 /// Wrapper around an `OpenMLS` `MlsGroup` that enforces SCP conventions.
 ///
 /// `ScpMlsGroup` holds the MLS group state, the provider (crypto + storage),
@@ -165,6 +220,49 @@ impl ScpMlsGroup {
     /// (the signer is taken on destruction for eager zeroization).
     pub fn signer_key_pair(&self) -> Result<&SignatureKeyPair, MlsError> {
         self.signer.as_ref().ok_or(MlsError::GroupDestroyed)
+    }
+
+    /// Derives this member's per-context **pseudonym public key** (32 bytes) over
+    /// the wasm-held MLS `SignatureKeyPair` (ADR-057 Option A, §9.10.4.A interim
+    /// deviation).
+    ///
+    /// The browser has no identity key inside wasm; the only wasm-held Ed25519 key
+    /// is this per-context MLS signing keypair. So — per the Alec 2026-07-16
+    /// ruling (ADR-057 planning-session-10, Option A) — the browser derives its
+    /// pseudonym over the MLS key via the single shared
+    /// [`scp_crypto::pseudonym::derive_pseudonym_keypair`] recipe. This is
+    /// **MLS-keyed, not identity-keyed**: it does NOT byte-match a native member's
+    /// identity-keyed pseudonym for the same human. That is acceptable under the
+    /// device-local-pseudonym model (each member announces its own address; peers
+    /// record it) and is a documented, human-ruled deviation from §9.10.4.A,
+    /// pending the #1980 key-to-WebCrypto move that unifies the key boundary.
+    ///
+    /// The private seed NEVER leaves this method: it is extracted, fed to the
+    /// derivation, and dropped (zeroized) here. Only the resulting public
+    /// pseudonym (a routing address, not a secret) is returned.
+    ///
+    /// `context_id` is the raw context-id bytes; `epoch` selects v1 (`None`,
+    /// static) or v2 (`Some(e)`, rotatable) derivation, matching the native
+    /// software-custody derivation exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::GroupDestroyed`] if the group (and thus the signer) has
+    /// been destroyed, or [`MlsError::PseudonymDerivationFailed`] if the signer's
+    /// private seed cannot be recovered or is not the expected 32-byte Ed25519
+    /// seed (a fail-closed guard against a non-Ed25519 or malformed signer — SCP
+    /// groups are Ed25519-only per [`SCP_CIPHERSUITE`]).
+    pub fn derive_pseudonym(
+        &self,
+        context_id: &[u8],
+        epoch: Option<u64>,
+    ) -> Result<[u8; 32], MlsError> {
+        let signer = self.signer_key_pair()?;
+        let seed = extract_ed25519_seed(signer)?;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let pseudonym =
+            scp_crypto::pseudonym::derive_pseudonym_keypair(&signing_key, context_id, epoch);
+        Ok(pseudonym.verifying_key().to_bytes())
     }
 
     /// Reconstructs an `ScpMlsGroup` from its constituent parts.
@@ -1223,6 +1321,96 @@ mod tests {
             scp_did::SigningKeyId::Active,
         )
         .unwrap()
+    }
+
+    /// The `test-utils` `private()` accessor is the ground-truth private seed.
+    /// `derive_pseudonym` recovers that SAME seed via the production serde path
+    /// (`extract_ed25519_seed`) and feeds it to the shared derivation, so the two
+    /// must agree byte-for-byte. This pins the serde-extraction step against the
+    /// upstream `SignatureKeyPair` shape: an upstream serde change (or a wrong
+    /// seed length) breaks this test loudly rather than silently deriving a
+    /// different pseudonym. (ADR-057 Option A, §9.10.4.A.)
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn derive_pseudonym_matches_direct_private_seed_derivation() {
+        let cred = test_credential("alice");
+        let group = create_group(&cred, &SystemClock).unwrap();
+
+        let context_id = b"ctx-derive-pseudonym-crosscheck";
+        let via_method = group.derive_pseudonym(context_id, None).unwrap();
+
+        // Ground truth: read the seed directly through the test-utils accessor and
+        // derive independently via the shared recipe.
+        let signer = group.signer_key_pair().unwrap();
+        // SCP MLS signer is Ed25519 → a 32-byte seed.
+        let seed: [u8; 32] = signer.private().try_into().unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let expected = scp_crypto::pseudonym::derive_pseudonym_keypair(&sk, context_id, None)
+            .verifying_key()
+            .to_bytes();
+
+        assert_eq!(
+            via_method, expected,
+            "derive_pseudonym must recover the exact MLS private seed and derive the same pseudonym"
+        );
+
+        // v2 (epoch) derivation is domain-separated from v1.
+        let v2 = group.derive_pseudonym(context_id, Some(1)).unwrap();
+        assert_ne!(v2, via_method, "v2 (epoch) derivation differs from v1");
+    }
+
+    /// The pseudonym is a deterministic function of the MLS signing key, so it
+    /// survives a state serialize/restore round-trip unchanged (the persisted MLS
+    /// signer is byte-identical after `serialize_state` / `deserialize_state`).
+    /// This is the property the browser relies on: a reopened tab re-derives the
+    /// SAME pseudonym from its restored MLS key (ADR-057 T2).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn derive_pseudonym_is_stable_across_serialize_restore() {
+        let cred = test_credential("alice");
+        let group = create_group(&cred, &SystemClock).unwrap();
+        let context_id = b"ctx-derive-pseudonym-restore";
+        let before = group.derive_pseudonym(context_id, None).unwrap();
+
+        let blob = group.serialize_state().unwrap();
+        let restored = ScpMlsGroup::deserialize_state(&blob).unwrap();
+        let after = restored.derive_pseudonym(context_id, None).unwrap();
+
+        assert_eq!(
+            before, after,
+            "the same MLS key must re-derive the same pseudonym after restore"
+        );
+    }
+
+    /// Two independently-created groups (distinct MLS keys) derive distinct
+    /// pseudonyms for the same context — the pseudonym is keyed on the private
+    /// seed, so it is per-member, not per-context-only.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn derive_pseudonym_distinct_per_group() {
+        let context_id = b"ctx-derive-pseudonym-distinct";
+        let a = create_group(&test_credential("alice"), &SystemClock)
+            .unwrap()
+            .derive_pseudonym(context_id, None)
+            .unwrap();
+        let b = create_group(&test_credential("bob"), &SystemClock)
+            .unwrap()
+            .derive_pseudonym(context_id, None)
+            .unwrap();
+        assert_ne!(a, b, "distinct MLS keys derive distinct pseudonyms");
+    }
+
+    /// A destroyed group has no signer, so pseudonym derivation fails closed
+    /// rather than deriving from absent key material.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn derive_pseudonym_on_destroyed_group_fails_closed() {
+        let mut group = create_group(&test_credential("alice"), &SystemClock).unwrap();
+        destroy_group(&mut group).unwrap();
+        assert!(matches!(
+            group.derive_pseudonym(b"ctx", None),
+            Err(MlsError::GroupDestroyed)
+        ));
     }
 
     #[test]

@@ -1,87 +1,141 @@
 //! Two-party end-to-end exchange driven THROUGH the `#[wasm_bindgen]` surface
-//! (ADR-057 Slice 3, MVP proof).
+//! (ADR-057 Slice 3, transport slice — MVP proof).
 //!
-//! This is the Slice-3 milestone: it proves the *exposed* browser surface and
-//! its dependency-injection wiring work end-to-end, not just the underlying
-//! Slice-2 driver (which `scp-client`'s own `two_party_exchange.rs` already
-//! covers). It drives two [`WasmScpClient`]s — Alice (creator) and Bob (joiner)
-//! — through create / generate-key-package / add-member / join / send / receive
-//! / drain / close, touching ONLY the `#[wasm_bindgen]`-exported methods and the
-//! JS-friendly wrapper types (`WasmAddMemberOutput`, `WasmReceivedEvent`)
-//! exactly as JavaScript would. `sendMessage` returns the ciphertext bytes
-//! directly: an application message is plain-encrypted and is not a convergent
-//! event-log leaf (ADR-011), so there is no `WasmSendOutput` wrapper and no
-//! transported timestamp — `receiveMessage` takes only the ciphertext. The
-//! convergent committer timestamp survives only on the add-Commit path, bound
-//! into that Commit's authenticated AAD (ADR-057 T3).
+//! This is the Slice-3 milestone: it proves the *exposed* browser surface and its
+//! dependency-injection wiring work end-to-end over the injected relay `Socket`,
+//! not just the underlying driver. It drives two [`WasmScpClient`]s — Alice
+//! (creator) and Bob (joiner) — through create / generate-key-package / add-member
+//! / join / send / **relay-route** / receive / drain / close, touching ONLY the
+//! `#[wasm_bindgen]`-exported methods (`sendMessage`, `handleRelayFrame`, …) and
+//! the JS-friendly wrapper types exactly as JavaScript would.
+//!
+//! `sendMessage` no longer returns ciphertext: it fans the message out over the
+//! injected socket as relay `PUBLISH` frames (§9.10.4 per-pseudonym fan-out). A
+//! test loopback captures those frames and routes them into the peer's
+//! `handleRelayFrame` as relay `BLOB`s — the "dumb pipe" a real relay is. Sender
+//! keys and pseudonym announcements bootstrap the pair before app data can flow.
 //!
 //! # Why a native host test, not `wasm-bindgen-test`
 //!
-//! This environment has the `wasm32-unknown-unknown` target and `wasm-pack`,
-//! but **no `wasm-bindgen-test-runner`** (no headless browser/node test
-//! harness wired). Per ADR-057 Slice 3's stated fallback, the strongest proof
-//! available here is a native host test that exercises the wasm-bindgen-exposed
-//! API surface with mock-JS-shaped injected adapters:
-//! - [`scp_client::LocalSigner`] stands in for the `JsKeyCustody`-derived signer
-//!   (same `scp_client::Signer` contract the `JsSigner` satisfies under wasm32);
-//! - [`scp_client::MemoryStorage`] stands in for the `JsStorage`-backed adapter
-//!   (same `scp_client::Storage` contract);
-//! - [`scp_clock::TestClock`] stands in for the hardened `WasmClock` (same
-//!   `scp_clock::Clock` contract).
-//!
-//! The `#[wasm_bindgen]` attribute is inert on native, so `WasmScpClient` and
-//! its wrapper types compile and run here as plain Rust — the host test drives
-//! the identical method bodies and dependency construction
-//! (`WasmScpClient::from_parts`) the browser `from_js` constructor produces. The
-//! JS-extern adapters themselves (captured `Date.now`, `JsStorage`,
-//! `JsKeyCustody`) are wasm32-only and are covered by the build gate
-//! (`cargo build --target wasm32-unknown-unknown`), not this test.
-//!
-//! When a wasm test runner is wired into CI, a `#[wasm_bindgen_test]` driving
-//! the same flow from real JS would be the strongest proof; the build pipeline
-//! gap is reported in the slice write-up.
+//! This environment has the `wasm32-unknown-unknown` target and `wasm-pack`, but
+//! **no `wasm-bindgen-test-runner`**. Per ADR-057 Slice 3's stated fallback, the
+//! strongest proof available here is a native host test that exercises the
+//! wasm-bindgen-exposed surface with mock-JS-shaped injected adapters
+//! ([`LocalSigner`]/[`MemoryStorage`]/[`TestClock`] and a native loopback
+//! [`Socket`](scp_client::Socket) standing in for `JsSigner`/`JsStorage`/
+//! `WasmClock`/`JsSocket`). The `#[wasm_bindgen]` attribute is inert on native, so
+//! the host test drives the identical method bodies the browser `from_js`
+//! constructor produces; the JS-extern adapters are wasm32-only and covered by the
+//! build gate (`cargo build --target wasm32-unknown-unknown`).
 
 // Integration tests assert on happy-path results; `expect`/`panic!` make the
 // failure messages legible. The workspace denies these in production code.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use scp_client::{LocalSigner, MemoryStorage, Signer, Storage};
+use scp_client::{LocalSigner, MemoryStorage, Signer, Socket, Storage};
 use scp_client_wasm::{WasmScpClient, WasmSenderKeyDistribution};
 use scp_clock::{Clock, SystemClock, TestClock};
+use scp_relay_client::{ClientMessage, RelayMessage};
 
 const CTX: &str = "ctx-adr057-slice3-wasm-surface";
 const ALICE_DID: &str = "did:key:z6MkAlice3SurfaceExchangeFixtureKeyAAAAAAA";
 const BOB_DID: &str = "did:key:z6MkBob3SurfaceExchangeFixtureKeyBBBBBBBBBB";
 
-/// A real-time clock seed with a small distinct offset (seconds).
-///
-/// These surface tests run on the native host (`#[test]`), where both
-/// `scp_clock::SystemClock` and openmls's un-injectable internal
-/// `Lifetime::is_valid` read `std::time::SystemTime`. Seeding the stand-in
-/// `TestClock` from the real clock (instead of a fixed past epoch) keeps every
-/// minted `KeyPackage` `Lifetime` valid against openmls's internal check while
-/// remaining pairwise distinct (ADR-057 §Prereq-1 test-clock realism);
-/// convergence rides on transported timestamps, not clock magnitude.
+/// A native loopback [`Socket`] capturing every relay frame the surface publishes.
+#[derive(Clone, Default)]
+struct LoopbackSocket {
+    frames: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl LoopbackSocket {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn take_frames(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *self.frames.lock().expect("loopback lock"))
+    }
+}
+
+impl Socket for LoopbackSocket {
+    fn send(&self, frame: Vec<u8>) -> Result<(), String> {
+        self.frames.lock().expect("loopback lock").push(frame);
+        Ok(())
+    }
+}
+
+/// Converts a captured `PUBLISH` frame into the relay `BLOB` frame `handleRelayFrame`
+/// consumes; `None` for a `SUBSCRIBE` frame.
+fn publish_to_blob(publish_frame: &[u8]) -> Option<Vec<u8>> {
+    match ClientMessage::from_bytes(publish_frame).ok()? {
+        ClientMessage::Publish {
+            routing_id,
+            recipient_hint,
+            blob_ttl,
+            blob,
+            ..
+        } => RelayMessage::Blob {
+            routing_id,
+            blob_id: [0u8; 32],
+            recipient_hint,
+            blob_ttl,
+            stored_at: 0,
+            blob,
+        }
+        .to_bytes()
+        .ok(),
+        _ => None,
+    }
+}
+
+/// Routes every `PUBLISH` `from` captured into `to`'s `handleRelayFrame`.
+fn route_publishes(from: &LoopbackSocket, to: &mut WasmScpClient) {
+    for frame in from.take_frames() {
+        if let Some(blob) = publish_to_blob(&frame) {
+            to.handle_relay_frame(blob).expect("route relay blob");
+        }
+    }
+}
+
 fn seed(offset: u64) -> u64 {
     SystemClock.now_secs() + offset
 }
 
-/// Builds a `WasmScpClient` over mock-JS-shaped in-memory adapters, through the
-/// same `from_parts` seam the wasm32 `from_js` constructor uses.
-fn client_for(did: &str, now_secs: u64) -> WasmScpClient {
+/// Builds a `WasmScpClient` over mock-JS-shaped in-memory adapters + a native
+/// loopback socket, through the same `from_parts` seam the wasm32 `from_js`
+/// constructor uses. Returns the client and a handle to its socket.
+fn client_for(did: &str, now_secs: u64) -> (WasmScpClient, LoopbackSocket) {
+    let socket = LoopbackSocket::new();
     let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    // A fresh store restores nothing, so construction cannot fail here.
-    WasmScpClient::from_parts(signer, storage, clock).expect("construct fresh surface client")
+    let socket_dyn: Arc<dyn Socket> = Arc::new(socket.clone());
+    let client = WasmScpClient::from_parts(signer, storage, clock, socket_dyn)
+        .expect("construct fresh surface client");
+    (client, socket)
+}
+
+/// Builds a `WasmScpClient` over a caller-supplied (shared) storage handle + a
+/// fresh loopback socket. When the storage already holds this identity's
+/// snapshots, the CONSTRUCTOR restores them (ADR-057 T2).
+fn client_over(
+    did: &str,
+    storage: Arc<dyn Storage>,
+    now_secs: u64,
+) -> (WasmScpClient, LoopbackSocket) {
+    let socket = LoopbackSocket::new();
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
+    let socket_dyn: Arc<dyn Socket> = Arc::new(socket.clone());
+    let client = WasmScpClient::from_parts(signer, storage, clock, socket_dyn)
+        .expect("construct/restore surface client");
+    (client, socket)
 }
 
 /// Routes each in-tab §9.16 sender-key distribution to its target client through
-/// the exposed `receiveMessage` surface (§9.16.1/§9.16.2). There is no out-of-band
-/// hand-off — `localSenderKeyBytes` / `installSenderKey` no longer exist on the
-/// surface. Asserts each install is a no-op receive (not an application message).
+/// the exposed `receiveMessage` surface. Sender-key distributions are delivered
+/// DIRECTLY (out-of-band), not over the socket.
 fn deliver(
     dists: Vec<WasmSenderKeyDistribution>,
     alice: &mut WasmScpClient,
@@ -108,9 +162,7 @@ fn deliver(
     }
 }
 
-/// Asserts the §9.9.3 convergence property through the surface: both members'
-/// event logs hold byte-identical leaf hashes and an equal Merkle root. The
-/// leaf-hashes query returns the flat 32-bytes-per-leaf concatenation.
+/// Asserts the §9.9.3 convergence property through the surface.
 fn assert_convergence(alice: &WasmScpClient, bob: &WasmScpClient) {
     let alice_leaves = alice
         .event_log_leaf_hashes(CTX.to_owned())
@@ -130,50 +182,54 @@ fn assert_convergence(alice: &WasmScpClient, bob: &WasmScpClient) {
     );
 }
 
+/// Wires Alice (creator) + Bob (joiner) into a fully-connected pair through the
+/// surface: MLS shared, §9.16 sender keys exchanged both ways, both pseudonym
+/// registries populated. Drains bootstrap events + socket frames before return.
+fn connect(
+    alice: &mut WasmScpClient,
+    alice_sock: &LoopbackSocket,
+    bob: &mut WasmScpClient,
+    bob_sock: &LoopbackSocket,
+) {
+    alice.create_context(CTX.to_owned()).expect("Alice creates");
+    let bob_kp = bob
+        .generate_key_package_for_join(CTX.to_owned())
+        .expect("Bob key package");
+    let add = alice
+        .add_member(CTX.to_owned(), bob_kp)
+        .expect("Alice adds Bob");
+    let bob_dists = bob
+        .join_context_encrypted(
+            CTX.to_owned(),
+            add.welcome(),
+            add.event_log(),
+            add.wrapping_keys(),
+        )
+        .expect("Bob joins");
+
+    deliver(add.sender_key_distributions(), alice, bob);
+    deliver(bob_dists, alice, bob);
+
+    // Pump each side's pseudonym announcement to the other.
+    route_publishes(alice_sock, bob);
+    route_publishes(bob_sock, alice);
+
+    let _ = alice.drain_events(CTX.to_owned());
+    let _ = bob.drain_events(CTX.to_owned());
+    let _ = alice_sock.take_frames();
+    let _ = bob_sock.take_frames();
+}
+
 #[test]
 #[allow(clippy::too_many_lines)] // one end-to-end two-party surface scenario, read top-to-bottom
 fn two_party_exchange_through_wasm_surface() {
-    // Deliberately different local clocks: convergence must depend only on the
-    // convergent timestamp that travels with each message, not on the members'
-    // clocks agreeing (ADR-057 §9.9.3).
-    let mut alice = client_for(ALICE_DID, seed(0));
-    let mut bob = client_for(BOB_DID, seed(100));
+    let (mut alice, alice_sock) = client_for(ALICE_DID, seed(0));
+    let (mut bob, bob_sock) = client_for(BOB_DID, seed(100));
 
     assert_eq!(alice.did(), ALICE_DID, "the surface reports Alice's DID");
 
-    // --- Alice creates the context through the exposed surface. ---
-    alice
-        .create_context(CTX.to_owned())
-        .expect("Alice creates the context");
-    assert_eq!(
-        alice.member_dids(CTX.to_owned()).as_deref(),
-        Some(&[ALICE_DID.to_owned()][..])
-    );
-    assert_eq!(
-        alice.event_log_leaf_count(CTX.to_owned()),
-        Some(1),
-        "creation appends exactly the ContextCreated leaf"
-    );
-
-    // --- Bob generates a KeyPackage; the public bytes go to Alice. ---
-    let bob_key_package = bob
-        .generate_key_package_for_join(CTX.to_owned())
-        .expect("Bob generates a key package");
-    assert!(
-        !bob_key_package.is_empty(),
-        "the surface returns serialized key-package bytes"
-    );
-
-    // --- Alice adds Bob → WasmAddMemberOutput (commit/welcome/timestamp/log). ---
-    let add = alice
-        .add_member(CTX.to_owned(), bob_key_package)
-        .expect("Alice adds Bob");
-    assert!(!add.commit().is_empty(), "commit bytes present");
-    assert!(!add.welcome().is_empty(), "welcome bytes present");
-    assert!(
-        !add.event_log().is_empty(),
-        "serialized event-log stream present for the joiner to replay"
-    );
+    // Wire the pair (create/add/join, sender-key + pseudonym bootstrap).
+    connect(&mut alice, &alice_sock, &mut bob, &bob_sock);
 
     let mut alice_members = alice.member_dids(CTX.to_owned()).expect("alice members");
     alice_members.sort();
@@ -182,62 +238,43 @@ fn two_party_exchange_through_wasm_surface() {
         vec![ALICE_DID.to_owned(), BOB_DID.to_owned()]
     );
     assert_eq!(alice.event_log_leaf_count(CTX.to_owned()), Some(2));
-
-    // --- Bob joins from the Welcome + replays Alice's serialized log. The join
-    // returns Bob's sender-key distributions (Bob → each existing member). ---
-    let bob_join_dists = bob
-        .join_context_encrypted(
-            CTX.to_owned(),
-            add.welcome(),
-            add.event_log(),
-            add.wrapping_keys(),
-        )
-        .expect("Bob joins from the Welcome");
-
-    assert_eq!(
-        bob.event_log_leaf_count(CTX.to_owned()),
-        Some(2),
-        "Bob replayed Alice's log: ContextCreated + MemberJoined"
-    );
     assert_eq!(
         bob.event_log_root(CTX.to_owned()),
         alice.event_log_root(CTX.to_owned()),
         "after replay, Bob's root equals Alice's (full-log convergence)"
     );
 
-    // --- In-tab §9.16 distribution through the surface: route Alice's add-seal
-    // (Alice → Bob) and Bob's join-seals (Bob → Alice). NO out-of-band exchange. ---
-    deliver(add.sender_key_distributions(), &mut alice, &mut bob);
-    deliver(bob_join_dists, &mut alice, &mut bob);
-
-    // --- Alice sends an application message → ciphertext bytes (Uint8Array). ---
+    // --- Alice sends an application message: it fans out over the socket; there is
+    // NO return value. Route it into Bob's handleRelayFrame. ---
     let plaintext = b"hello from Alice through the wasm-bindgen surface".to_vec();
-    let ciphertext = alice
+    alice
         .send_message(CTX.to_owned(), plaintext.clone())
         .expect("Alice sends");
-    assert!(!ciphertext.is_empty(), "ciphertext present");
     assert_eq!(
         alice.event_log_leaf_count(CTX.to_owned()),
         Some(2),
         "a send stamps NO convergent leaf (ADR-011): Alice's log stays created + joined"
     );
+    route_publishes(&alice_sock, &mut bob);
 
-    // --- Bob receives + decrypts a plain application message (no AAD), then
-    // drains. ---
-    let received = bob
-        .receive_message(CTX.to_owned(), ciphertext)
-        .expect("Bob receives the message");
-    assert!(
-        received.application(),
-        "Alice's send is an application message"
-    );
-
+    // --- Bob drains the decrypted application message. ---
     let events = bob.drain_events(CTX.to_owned()).expect("Bob drains events");
-    assert_eq!(events.len(), 1, "exactly one received event is buffered");
-    assert_eq!(events[0].kind(), "MessageReceived");
-    assert_eq!(events[0].sender_did(), ALICE_DID, "the sender DID is Alice");
+    let received: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind() == "MessageReceived")
+        .collect();
     assert_eq!(
-        events[0].payload(),
+        received.len(),
+        1,
+        "exactly one received message is buffered"
+    );
+    assert_eq!(
+        received[0].sender_did(),
+        ALICE_DID,
+        "the sender DID is Alice"
+    );
+    assert_eq!(
+        received[0].payload(),
         plaintext,
         "Bob recovered Alice's exact plaintext through the surface"
     );
@@ -249,8 +286,19 @@ fn two_party_exchange_through_wasm_surface() {
             .is_empty()
     );
 
-    // --- Convergence (§9.9.3): identical leaf hashes AND equal Merkle roots,
-    // despite differing local clocks. ---
+    // --- Reverse direction: Bob → Alice through the surface. ---
+    bob.send_message(CTX.to_owned(), b"hi Alice".to_vec())
+        .expect("Bob sends");
+    route_publishes(&bob_sock, &mut alice);
+    let alice_events = alice.drain_events(CTX.to_owned()).expect("Alice drains");
+    let alice_received: Vec<_> = alice_events
+        .iter()
+        .filter(|e| e.kind() == "MessageReceived")
+        .collect();
+    assert_eq!(alice_received.len(), 1, "Alice receives Bob's message");
+    assert_eq!(alice_received[0].payload(), b"hi Alice");
+
+    // --- Convergence (§9.9.3): identical leaf hashes AND equal Merkle roots. ---
     assert_convergence(&alice, &bob);
 
     // --- MLS epoch is observable through the surface and advanced past 0. ---
@@ -269,49 +317,25 @@ fn two_party_exchange_through_wasm_surface() {
     );
 }
 
-/// Builds a `WasmScpClient` over a caller-supplied (shared) storage handle. When
-/// the storage already holds this identity's snapshots, the CONSTRUCTOR restores
-/// them (ADR-057 T2) — a reopened tab resumes with no explicit "load" call.
-fn client_over(did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> WasmScpClient {
-    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    WasmScpClient::from_parts(signer, storage, clock).expect("construct/restore surface client")
-}
-
 #[test]
 fn restore_through_wasm_surface() {
-    // Alice creates + adds Bob; Bob joins — all through the exposed surface.
-    // Bob's storage is shared so a reopened-tab client can restore from it.
+    // Alice creates + adds Bob; Bob joins — all through the exposed surface, over a
+    // shared storage so a reopened-tab client can restore from it.
     let alice_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 
-    let mut alice = client_over(ALICE_DID, alice_storage, seed(0));
-    let mut bob = client_over(BOB_DID, Arc::clone(&bob_storage), seed(100));
+    let (mut alice, alice_sock) = client_over(ALICE_DID, alice_storage, seed(0));
+    let (mut bob, bob_sock) = client_over(BOB_DID, Arc::clone(&bob_storage), seed(100));
 
-    alice.create_context(CTX.to_owned()).expect("alice creates");
-    let bob_kp = bob
-        .generate_key_package_for_join(CTX.to_owned())
-        .expect("bob key package");
-    let add = alice
-        .add_member(CTX.to_owned(), bob_kp)
-        .expect("alice adds bob");
-    let bob_join_dists = bob
-        .join_context_encrypted(
-            CTX.to_owned(),
-            add.welcome(),
-            add.event_log(),
-            add.wrapping_keys(),
-        )
-        .expect("bob joins");
-    deliver(add.sender_key_distributions(), &mut alice, &mut bob);
-    deliver(bob_join_dists, &mut alice, &mut bob);
+    connect(&mut alice, &alice_sock, &mut bob, &bob_sock);
 
     let expected_root = bob.event_log_root(CTX.to_owned());
     drop(bob); // The tab closes.
 
     // The reopened tab: a fresh surface client over Bob's identity + storage. The
-    // constructor restores the converged context from the shared store.
-    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(150));
+    // constructor restores the converged context (incl. the persisted peer-pseudonym
+    // registry) and re-derives + re-subscribes the local pseudonym.
+    let (mut bob2, _bob2_sock) = client_over(BOB_DID, Arc::clone(&bob_storage), seed(150));
     assert_eq!(
         bob2.member_dids(CTX.to_owned()).map(|mut m| {
             m.sort();
@@ -326,27 +350,26 @@ fn restore_through_wasm_surface() {
         "restored root matches through the surface"
     );
 
-    // The restored surface client decrypts a message Alice sends post-restore.
-    let ciphertext = alice
+    // The restored surface client decrypts a message Alice sends post-restore
+    // (Alice still holds Bob's pseudonym; Bob2 re-derived the same local pseudonym).
+    alice
         .send_message(CTX.to_owned(), b"after restore".to_vec())
         .expect("alice sends");
-    let received = bob2
-        .receive_message(CTX.to_owned(), ciphertext)
-        .expect("bob2 receives");
-    assert!(received.application());
+    route_publishes(&alice_sock, &mut bob2);
     let events = bob2.drain_events(CTX.to_owned()).expect("bob2 drains");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].payload(), b"after restore");
+    let received: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind() == "MessageReceived")
+        .collect();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].payload(), b"after restore");
 }
 
 #[test]
 fn context_ids_lists_contexts_through_the_surface() {
-    // The surface exposes `contextIds` so a reopened tab can enumerate the
-    // conversations the constructor restored. Here we assert it over live contexts
-    // created through the surface (sorted).
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     {
-        let mut c = client_over(ALICE_DID, Arc::clone(&storage), seed(0));
+        let (mut c, _sock) = client_over(ALICE_DID, Arc::clone(&storage), seed(0));
         c.create_context("ctx-surface-b".to_owned())
             .expect("create b");
         c.create_context("ctx-surface-a".to_owned())
@@ -358,7 +381,7 @@ fn context_ids_lists_contexts_through_the_surface() {
         );
     }
     // A reopened surface client over the same storage restores + lists both.
-    let c2 = client_over(ALICE_DID, Arc::clone(&storage), seed(50));
+    let (c2, _sock) = client_over(ALICE_DID, Arc::clone(&storage), seed(50));
     assert_eq!(
         c2.context_ids(),
         vec!["ctx-surface-a".to_owned(), "ctx-surface-b".to_owned()],
@@ -368,76 +391,48 @@ fn context_ids_lists_contexts_through_the_surface() {
 
 #[test]
 fn context_status_reports_live_and_absent_through_the_surface() {
-    // The surface exposes `contextStatus` as a lowercase string ("live"/"poisoned"
-    // /"absent") so a caller can distinguish a held context from an absent one
-    // without the `Option` observers' poisoned/absent ambiguity.
-    let mut c = client_for(ALICE_DID, seed(0));
+    let (mut c, _sock) = client_for(ALICE_DID, seed(0));
 
-    // Absent before creation.
     assert_eq!(c.context_status("ctx-never-existed".to_owned()), "absent");
-
-    // Live after creation.
     c.create_context(CTX.to_owned()).expect("create");
     assert_eq!(c.context_status(CTX.to_owned()), "live");
-
-    // Absent again after close.
     c.close_context(CTX.to_owned()).expect("close");
     assert_eq!(c.context_status(CTX.to_owned()), "absent");
-
-    // The "poisoned" status is unreachable through the wasm surface on the native
-    // host: poisoning requires a mutating op whose persist fails, and that op
-    // returns `Err(JsValue)`, which aborts off-wasm before returning (the same
-    // native-host limitation documented for error-path coverage below). The full
-    // three-state mapping is asserted directly against the driver in `scp-client`'s
-    // `context_status_reports_live_poisoned_and_absent`.
 }
 
-/// ADR-057 at the surface: the convergent-timestamp forgery seam is gone
-/// **by construction**. `sendMessage` returns the raw ciphertext bytes (no
-/// `WasmSendOutput` wrapper carrying a loose `committerTimestampSecs`), and
-/// `receiveMessage` takes ONLY `(context_id, ciphertext)` — there is no third
-/// `u64` timestamp parameter a caller or relay could set to a forged value. This
-/// is a compile-time proof: binding each method to its exact function type only
-/// type-checks if the signature matches, so a re-introduction of a transported
-/// timestamp parameter (or a send-output wrapper) fails the build.
+/// ADR-057 at the surface: the convergent-timestamp forgery seam is gone **by
+/// construction**. `receiveMessage` takes ONLY `(context_id, ciphertext)` — no
+/// third `u64` timestamp a caller/relay could forge — and `sendMessage` returns
+/// `()` (the ciphertext leaves via the socket, not the caller), with the inbound
+/// path being `handleRelayFrame(frame)`. Binding each method to its exact function
+/// type only type-checks if the signature matches, so re-introducing a transported
+/// timestamp parameter or a bare-bytes return fails the build.
 #[test]
 #[allow(clippy::type_complexity)] // the explicit fn-pointer type IS the assertion
 fn convergent_timestamp_forgery_seam_is_gone_by_construction() {
     use scp_client_wasm::WasmReceiveOutput;
     use wasm_bindgen::JsValue;
 
-    // `receiveMessage` accepts only the ciphertext — no timestamp to forge.
     let _: fn(&mut WasmScpClient, String, Vec<u8>) -> Result<WasmReceiveOutput, JsValue> =
         WasmScpClient::receive_message;
-    // `sendMessage` returns the ciphertext bytes directly — the convergent
-    // timestamp rides inside the authenticated AAD, not a separate return value.
-    let _: fn(&mut WasmScpClient, String, Vec<u8>) -> Result<Vec<u8>, JsValue> =
+    // `sendMessage` returns unit — no bare ciphertext, no timestamp.
+    let _: fn(&mut WasmScpClient, String, Vec<u8>) -> Result<(), JsValue> =
         WasmScpClient::send_message;
+    // The inbound path is the relay-frame pump.
+    let _: fn(&mut WasmScpClient, Vec<u8>) -> Result<(), JsValue> =
+        WasmScpClient::handle_relay_frame;
 }
 
 // NOTE on error-path coverage: a `#[wasm_bindgen]` method that returns
 // `Err(JsValue)` cannot be exercised on the native host — constructing the
-// `JsValue` aborts (wasm-bindgen imported calls cannot run off-wasm), before any
-// `Result` is returned. So the surface's error mapping — including the
-// tampered-ciphertext rejection through `receiveMessage` — is NOT asserted in
-// this native happy-path test. It is covered instead by:
-//   * the driver-level tamper test `tampered_ciphertext_produces_no_leaf`
-//     (`scp-client`), which proves a flipped ciphertext byte is rejected and
-//     stamps no leaf — `receiveMessage` is a thin forwarder to that exact path;
-//   * the pure `error::error_code` mapping (native unit tests in `error.rs`),
-//     which proves duplicate-context → `SCP-CTX-2002`, unknown-context →
-//     `SCP-CTX-2001`, and the convergent-timestamp family → `SCP-CRYPTO-4040`;
-//     and
-//   * `error::wasm_tests` (`#[wasm_bindgen_test]`), which proves the wrapped
-//     `JsValue` carries that prefix and the message.
-// This native-host limitation is a real property of testing a wasm-bindgen
-// surface off-target, reported in the slice write-up.
+// `JsValue` aborts (wasm-bindgen imported calls cannot run off-wasm). So the
+// surface's error mapping is NOT asserted here; it is covered by the driver-level
+// adversarial tests (`scp-client`), the pure `error::error_code` mapping (native
+// unit tests in `error.rs`), and `error::wasm_tests` (`#[wasm_bindgen_test]`).
 
 // wasm-target tests: exercises the real `JsStorage` extern against a JS
 // `Map`-backed store — the synchronous-facade shape a browser SDK injects
-// (ADR-057 T2, `storage.rs` module docs). Runs only under a wasm test runner (no
-// `wasm-bindgen-test-runner` is wired here — see the module header — so these are
-// compiled by the `wasm32` build gate and run when a runner is present).
+// (ADR-057 T2, `storage.rs` module docs). Runs only under a wasm test runner.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use scp_client::Storage;
@@ -445,9 +440,6 @@ mod wasm_tests {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    // A synchronous, in-memory `Map`-backed store implementing the `JsStorage`
-    // contract (`get`/`set`/`delete`/`listKeys`) — the shape the TypeScript SDK's
-    // IndexedDB mirror satisfies.
     #[wasm_bindgen(inline_js = "export function makeMapStore() { \
         const m = new Map(); \
         return { \
@@ -466,17 +458,14 @@ mod wasm_tests {
     fn map_backed_js_store_round_trips_through_the_adapter() {
         let store = JsStorageAdapter::new(make_map_store());
 
-        // Absent key → Ok(None), not an error.
         assert_eq!(store.get("scp-client/ctx/a").unwrap(), None);
 
         store.put("scp-client/ctx/a", vec![1, 2, 3]).unwrap();
         store.put("scp-client/ctx/b", vec![4]).unwrap();
         store.put("scp-client/pending/a", vec![9]).unwrap();
 
-        // Values round-trip byte-for-byte.
         assert_eq!(store.get("scp-client/ctx/a").unwrap(), Some(vec![1, 2, 3]));
 
-        // Prefix enumeration returns exactly the matching keys (the restore path).
         let mut ctx_keys = store.list_keys("scp-client/ctx/").unwrap();
         ctx_keys.sort();
         assert_eq!(
@@ -488,7 +477,6 @@ mod wasm_tests {
             vec!["scp-client/pending/a".to_owned()]
         );
 
-        // Delete removes exactly one key.
         store.delete("scp-client/ctx/a").unwrap();
         assert_eq!(store.get("scp-client/ctx/a").unwrap(), None);
         assert_eq!(store.list_keys("scp-client/ctx/").unwrap().len(), 1);
@@ -497,20 +485,8 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn retaining_js_store_survives_wasm_memory_reuse() {
         // Regression pin for the `set(value: Vec<u8>)` owned-copy fix (1af0deb72).
-        // `makeMapStore.set(k, v)` RETAINS the passed value with NO defensive copy —
-        // exactly the embedder shape the fix must be sound for. Because `set` takes
-        // an owned `Vec<u8>`, wasm-bindgen marshals a JS-owned `Uint8Array` copy
-        // detached from wasm linear memory, so a retained value stays intact even as
-        // wasm reuses that memory for later allocations. If `set` took `&[u8]`, the
-        // JS map would instead hold a `subarray` VIEW into wasm memory; the churn
-        // below would overwrite the region and silently corrupt every stored blob.
-        // The existing round-trip test above has no memory reuse, so it only smoke-
-        // covers the copy; THIS test forces the aliasing hazard and asserts intact
-        // reads — pinning the fix through the public `Storage` contract (a future
-        // regression of the extern back to `&[u8]` would flip these asserts).
         let store = JsStorageAdapter::new(make_map_store());
 
-        // Distinct, self-describing blobs so a corrupted read is unambiguous.
         let blob_a = vec![0xA1u8; 96];
         let blob_b = vec![0xB2u8; 512];
         let blob_c: Vec<u8> = (0..256u32).map(|i| (i % 251) as u8).collect();
@@ -518,25 +494,14 @@ mod wasm_tests {
         store.put("scp-client/blob/b", blob_b.clone()).unwrap();
         store.put("scp-client/blob/c", blob_c.clone()).unwrap();
 
-        // Churn (1): marshal many small throwaway values through the SAME `set` path
-        // so the allocator reuses the freed regions the earlier blobs occupied — this
-        // catches an in-place OVERWRITE of a retained view (corruption without a grow).
         for i in 0..64u32 {
             let filler = vec![(i & 0xff) as u8; 4096];
             store.put(&format!("scp-client/churn/{i}"), filler).unwrap();
         }
-        // Churn (2): force wasm `memory.grow` with ONE large value through `set`. A
-        // grow REALLOCATES linear memory and DETACHES every `Uint8Array` that viewed
-        // the old buffer — so a `&[u8]`-view regression would read the earlier blobs
-        // back detached/empty here DETERMINISTICALLY (not just probabilistically),
-        // while the owned-copy store, holding independent JS buffers, is unaffected.
-        // 32 MiB dwarfs the default wasm initial memory, guaranteeing the grow.
         store
             .put("scp-client/churn/grow", vec![0xD4u8; 32 * 1024 * 1024])
             .unwrap();
 
-        // Every original blob reads back byte-for-byte — the retaining store held an
-        // owned copy, never a view into reused wasm memory.
         assert_eq!(
             store.get("scp-client/blob/a").unwrap(),
             Some(blob_a),

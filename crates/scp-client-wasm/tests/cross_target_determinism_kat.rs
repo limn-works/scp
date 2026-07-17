@@ -557,3 +557,98 @@ fn assert_relay_wire_encoding_roundtrips() {
 fn relay_wire_encoding_is_target_deterministic() {
     assert_relay_wire_encoding_roundtrips();
 }
+
+// ---------------------------------------------------------------------------
+// Transport-slice wire + pseudonym-derivation determinism (ADR-057 transport
+// slice — §9.10.4 pseudonym fan-out / announce)
+// ---------------------------------------------------------------------------
+
+/// Golden §9.10.4.A pseudonym public key for the fixed seed `[0x07; 32]`,
+/// `context_id = "scp-transport-kat-ctx"`, v1 (epoch = None), via the SHARED
+/// `scp_crypto::pseudonym::derive_pseudonym_keypair` (ADR-057 Option A). This is
+/// the exact recipe `ScpMlsGroup::derive_pseudonym` feeds the wasm-held MLS seed
+/// into; pinning it here guards that the derivation is byte-identical native vs
+/// wasm32 (an HKDF/HMAC/Ed25519 width or ordering divergence would move it).
+const GOLDEN_PSEUDONYM_V1_HEX: &str =
+    "5d9581b085e90ed07f35b13cb735348e8c567b3eb1d06276993cea8ac7d91bba";
+
+/// Golden `PseudonymAnnouncement` `MessagePack` (`rmp_serde::to_vec_named`)
+/// encoding for a fixed `tag`/`member_did`/`pseudonym` — the §9.10.4 bootstrap payload
+/// members publish to the shared channel.
+const GOLDEN_PSEUDONYM_ANNOUNCEMENT_HEX: &str = "83a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7631aa6d656d6265725f646964bb6469643a6b65793a7a5472616e73706f72744b61744d656d626572a970736575646f6e796dc420abababababababababababababababababababababababababababababababab";
+
+/// Golden `OuterEnvelope` `MessagePack` encoding for a fan-out blob: a **zeroed**
+/// cleartext `routing_id` (§9.10.4 privacy — the per-peer routing id rides the
+/// relay `PUBLISH`, not the envelope), the default 300s `blob_ttl`, and a fixed
+/// inner ciphertext.
+const GOLDEN_OUTER_ENVELOPE_HEX: &str = "84a776657273696f6ecd0100aa726f7574696e675f6964c4200000000000000000000000000000000000000000000000000000000000000000a8626c6f625f74746ccd012cae656e637279707465645f626c6f62c41c7363702d7472616e73706f72742d6b61742d63697068657274657874";
+
+/// Asserts the transport-slice deterministic artifacts equal their committed
+/// goldens on THIS target: (1) the shared §9.10.4.A pseudonym derivation over a
+/// fixed seed, and (2)/(3) the `PseudonymAnnouncement` and zeroed-`routing_id`
+/// `OuterEnvelope` wire encodings (re-serialize round-trip). Run on native AND
+/// wasm32, so `native == golden` and `wasm == golden` together prove the transport
+/// fan-out/announce wire path does not diverge across targets.
+fn assert_transport_wire_and_pseudonym_golden_vectors() {
+    // (1) Pseudonym derivation over the shared recipe (fixed seed).
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[0x07u8; 32]);
+    let derived =
+        scp_crypto::pseudonym::derive_pseudonym_keypair(&sk, b"scp-transport-kat-ctx", None)
+            .verifying_key()
+            .to_bytes();
+    assert_eq!(
+        to_hex(&derived),
+        GOLDEN_PSEUDONYM_V1_HEX,
+        "§9.10.4.A pseudonym derivation diverged from the golden (HKDF/HMAC/Ed25519 \
+         width or ordering bug across targets)"
+    );
+
+    // (2) PseudonymAnnouncement wire encoding (re-serialize the golden).
+    {
+        use scp_protocol::context::pseudonym::PseudonymAnnouncement;
+        let golden = from_hex(GOLDEN_PSEUDONYM_ANNOUNCEMENT_HEX);
+        let ann: PseudonymAnnouncement = rmp_serde::from_slice(&golden)
+            .unwrap_or_else(|e| panic!("PseudonymAnnouncement golden deserializes: {e}"));
+        let reserialized = rmp_serde::to_vec_named(&ann)
+            .unwrap_or_else(|e| panic!("PseudonymAnnouncement re-serializes: {e}"));
+        assert_eq!(
+            to_hex(&reserialized),
+            GOLDEN_PSEUDONYM_ANNOUNCEMENT_HEX,
+            "PseudonymAnnouncement wire encoding is not target-deterministic \
+             (MessagePack codec diverged from the golden)"
+        );
+    }
+
+    // (3) OuterEnvelope wire encoding (re-serialize the golden).
+    {
+        use scp_protocol::envelope::outer::OuterEnvelope;
+        let golden = from_hex(GOLDEN_OUTER_ENVELOPE_HEX);
+        let env = OuterEnvelope::from_bytes(&golden)
+            .unwrap_or_else(|e| panic!("OuterEnvelope golden deserializes: {e}"));
+        let reserialized = env
+            .to_bytes()
+            .unwrap_or_else(|e| panic!("OuterEnvelope re-serializes: {e}"));
+        assert_eq!(
+            to_hex(&reserialized),
+            GOLDEN_OUTER_ENVELOPE_HEX,
+            "OuterEnvelope wire encoding is not target-deterministic (MessagePack \
+             codec diverged from the golden — a width/field-order bug)"
+        );
+        // The fan-out envelope's cleartext routing_id MUST be zeroed (§9.10.4).
+        assert_eq!(
+            env.routing_id,
+            vec![0u8; 32],
+            "the fan-out OuterEnvelope's cleartext routing_id must be zeroed"
+        );
+    }
+}
+
+/// Transport-slice wire + pseudonym-derivation determinism KAT. Runs natively and
+/// under `wasm-pack test --node`, both asserting the SAME committed goldens — the
+/// cross-target byte-parity guard for the §9.10.4 fan-out/announce wire path and
+/// the ADR-057 Option-A shared pseudonym derivation.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn transport_wire_and_pseudonym_are_target_deterministic() {
+    assert_transport_wire_and_pseudonym_golden_vectors();
+}

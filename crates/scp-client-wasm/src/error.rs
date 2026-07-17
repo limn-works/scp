@@ -60,6 +60,13 @@ pub const fn error_code(err: &ClientError) -> &'static str {
         ClientError::UnsupportedMembershipChange(_) => "SCP-CTX-2003",
         // A driver invariant violation (bad argument / missing pending state).
         ClientError::Driver(_) => "SCP-CTX-2004",
+        // An app-data send hit an empty peer-pseudonym registry in a multi-member
+        // context — retryable once peers' announcements are pumped in (§9.10.4,
+        // ADR-057 transport slice). CTX band; distinct from the generic driver code.
+        ClientError::PseudonymRegistryEmpty { .. } => "SCP-CTX-2040",
+        // The injected outbound Socket failed to enqueue a relay frame (the
+        // WebSocket is closed / a JS exception was thrown). Transport band.
+        ClientError::Transport(_) => "SCP-TRANS-5010",
         // A join was attempted with no retained pending key package (never
         // generated, or already consumed by a prior join attempt — single-use per
         // attempt). Distinct from the generic Driver code so a caller can tell an

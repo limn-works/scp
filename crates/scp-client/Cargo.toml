@@ -30,6 +30,13 @@ scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
+# Wasm-safe leaves (ADR-057 transport slice). scp-crypto: the shared §9.10.4.A
+# pseudonym derivation (consumed transitively via scp-mls::derive_pseudonym, and
+# directly in the cross-target KAT). scp-relay-client: the shared relay wire
+# types (ClientMessage / RelayMessage) the injected JsSocket carries — NO tokio,
+# NO scp-runtime, so the wasm fence holds.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
 
 # openmls is needed directly for the wire (de)serialization of KeyPackages and
 # MLS messages at the driver boundary (KeyPackageIn::tls_deserialize and

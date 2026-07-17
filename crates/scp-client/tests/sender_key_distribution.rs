@@ -12,13 +12,24 @@
 //! management-vs-application disjointness, the fail-closed missing-wrapping-key
 //! guard (INVARIANT 3), and that the wrapping keypair + directory survive a
 //! snapshot round-trip (INVARIANT 5).
+//!
+//! Sender-key distributions are still delivered DIRECTLY to a target's
+//! `receive_message` (they are management messages, not app data — the ADR-057
+//! transport slice routes app data + pseudonym announcements over the socket, not
+//! distributions). The final application-message decrypt checks now go over the
+//! injected `Socket`: `send_message` returns `()` and fans the message out as
+//! relay `PUBLISH` frames, which the harness routes into each peer's
+//! `handle_relay_frame`.
 
 // Integration tests assert on happy-path results; `expect`/`panic!` make the
 // failure messages legible. The workspace denies these in production code.
 #![allow(clippy::expect_used, clippy::panic)]
 
+mod common;
+
 use std::sync::Arc;
 
+use common::{CaptureSocket, Party, client_with, new_party, publish_to_blob, route_publishes};
 use scp_client::{LocalSigner, MemoryStorage, ScpClient, SenderKeyDistribution, Storage};
 use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
@@ -28,17 +39,10 @@ const ALICE_DID: &str = "did:key:z6MkAliceSenderKeyDistFixtureAAAAAAAAAAAAA";
 const BOB_DID: &str = "did:key:z6MkBobSenderKeyDistFixtureBBBBBBBBBBBBBBBB";
 const CAROL_DID: &str = "did:key:z6MkCarolSenderKeyDistFixtureCCCCCCCCCCCCC";
 
-fn client_for(did: &str, offset: u64) -> ScpClient {
-    let signer = Arc::new(LocalSigner::active(did));
-    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs() + offset));
-    ScpClient::new(signer, storage, clock).expect("construct fresh client")
-}
-
 /// Routes each distribution to its target client (by DID) and asserts the install
 /// is a no-op receive. Delivering a distribution only decrypts if the recipient is
 /// at the epoch it was sealed at — callers deliver after every member has reached
-/// that epoch.
+/// that epoch. Distributions are delivered DIRECTLY (not over the socket).
 fn deliver(
     dists: &[SenderKeyDistribution],
     alice: &mut ScpClient,
@@ -61,18 +65,41 @@ fn deliver(
     }
 }
 
-/// Asserts `sender` can send a message that `a` and `b` both decrypt to
-/// `plaintext`, draining the buffers so the state is clean for the next hop.
+/// Delivers every captured `PUBLISH` frame in `from` to EACH receiver's
+/// `handle_relay_frame` (each receiver keeps the frame addressed to its own
+/// pseudonym and drops the rest). Unlike [`route_publishes`], which drains a
+/// socket into a SINGLE peer, this fans one send's frames out to multiple peers —
+/// the fan-out addressing an app-data `send_message` produces (one identical blob
+/// per announced peer pseudonym). Drains the socket.
+fn route_to_all(from: &CaptureSocket, receivers: &mut [&mut ScpClient]) {
+    let frames = from.take_frames();
+    for receiver in receivers {
+        for frame in &frames {
+            if let Some(blob) = publish_to_blob(frame) {
+                receiver
+                    .handle_relay_frame(&blob)
+                    .expect("deliver relay blob");
+            }
+        }
+    }
+}
+
+/// Asserts `sender` can send a message that both peers decrypt to `plaintext`,
+/// draining the buffers so the state is clean for the next hop. The send fans out
+/// over the socket to every announced peer; the harness routes those frames into
+/// each peer's `handle_relay_frame`, and a successful `MessageReceived` decrypt
+/// confirms the peer holds the sender's distributed key.
 fn assert_decrypts_at_both(
-    sender: &mut ScpClient,
+    sender: &mut Party,
     plaintext: &[u8],
     a: (&str, &mut ScpClient),
     b: (&str, &mut ScpClient),
 ) {
-    let ct = sender.send_message(CTX, plaintext).expect("send");
-    for (who, client) in [a, b] {
-        let out = client.receive_message(CTX, &ct).expect("receive");
-        assert!(out.application, "{who} decrypts under the distributed key");
+    sender.client.send_message(CTX, plaintext).expect("send");
+    let (who_a, client_a) = a;
+    let (who_b, client_b) = b;
+    route_to_all(&sender.socket, &mut [client_a, client_b]);
+    for (who, client) in [(who_a, client_a), (who_b, client_b)] {
         let drained = client.drain_events(CTX).expect("drain");
         assert_eq!(drained.len(), 1, "{who} buffered one message");
         match &drained[0] {
@@ -80,29 +107,39 @@ fn assert_decrypts_at_both(
                 assert_eq!(
                     payload.as_slice(),
                     plaintext,
-                    "{who} recovered the plaintext"
+                    "{who} recovered the plaintext (decrypts under the distributed key)"
                 );
             }
             other => panic!("{who}: expected MessageReceived, got {other:?}"),
         }
     }
     // The sender buffered its own MessageSent — drain it so its buffer is clean.
-    let _ = sender.drain_events(CTX).expect("sender drains own send");
+    let _ = sender
+        .client
+        .drain_events(CTX)
+        .expect("sender drains own send");
 }
 
 #[test]
 #[allow(clippy::too_many_lines)] // one end-to-end three-party mesh, read top-to-bottom
 fn three_party_bob_adds_carol_full_mesh_via_extension_only() {
-    let mut alice = client_for(ALICE_DID, 0);
-    let mut bob = client_for(BOB_DID, 100);
-    let mut carol = client_for(CAROL_DID, 200);
+    let mut alice = new_party(ALICE_DID, 0);
+    let mut bob = new_party(BOB_DID, 100);
+    let mut carol = new_party(CAROL_DID, 200);
 
-    alice.create_context(CTX).expect("alice creates");
+    alice.client.create_context(CTX).expect("alice creates");
 
     // --- Round 1: Alice adds Bob (epoch 1). Deliver both directions. ---
-    let bob_kp = bob.generate_key_package_for_join(CTX).expect("bob kp");
-    let add_bob = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("bob kp");
+    let add_bob = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("alice adds bob");
     let bob_join = bob
+        .client
         .join_context_encrypted(
             CTX,
             &add_bob.welcome,
@@ -112,16 +149,37 @@ fn three_party_bob_adds_carol_full_mesh_via_extension_only() {
         .expect("bob joins");
     deliver(
         &add_bob.sender_key_distributions,
-        &mut alice,
-        &mut bob,
-        &mut carol,
+        &mut alice.client,
+        &mut bob.client,
+        &mut carol.client,
     );
-    deliver(&bob_join, &mut alice, &mut bob, &mut carol);
+    deliver(
+        &bob_join,
+        &mut alice.client,
+        &mut bob.client,
+        &mut carol.client,
+    );
+
+    // Pump the epoch-1 pseudonym announcements Alice and Bob captured while both
+    // are STILL at epoch 1, so each learns the other (and the epoch-1 frames are
+    // drained before the epoch-2 round — a member that has advanced cannot decrypt
+    // an announcement sealed at an earlier epoch). Registries persist across
+    // epochs (the pseudonym is derived from the stable signing key, epoch-free).
+    route_publishes(&alice.socket, &mut bob.client);
+    route_publishes(&bob.socket, &mut alice.client);
+    let _ = alice.client.drain_events(CTX);
+    let _ = bob.client.drain_events(CTX);
 
     // --- Round 2: BOB adds Carol (epoch 2). Alice is the BYSTANDER (INVARIANT 2:
     // Alice must seal her key to Carol when she processes Bob's Commit). ---
-    let carol_kp = carol.generate_key_package_for_join(CTX).expect("carol kp");
-    let add_carol = bob.add_member(CTX, &carol_kp).expect("bob adds carol");
+    let carol_kp = carol
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("carol kp");
+    let add_carol = bob
+        .client
+        .add_member(CTX, &carol_kp)
+        .expect("bob adds carol");
     assert_eq!(
         add_carol.sender_key_distributions.len(),
         1,
@@ -130,6 +188,7 @@ fn three_party_bob_adds_carol_full_mesh_via_extension_only() {
     assert_eq!(add_carol.sender_key_distributions[0].target_did, CAROL_DID);
 
     let carol_join = carol
+        .client
         .join_context_encrypted(
             CTX,
             &add_carol.welcome,
@@ -139,8 +198,10 @@ fn three_party_bob_adds_carol_full_mesh_via_extension_only() {
         .expect("carol joins");
 
     // Alice (bystander) processes Bob's add-Carol Commit → converges + seals her
-    // key to Carol (the make-or-break third trigger).
+    // key to Carol (the make-or-break third trigger). This also re-announces
+    // Alice's pseudonym at epoch 2.
     let alice_recv = alice
+        .client
         .receive_message(CTX, &add_carol.commit)
         .expect("alice processes bob's add-carol commit");
     assert!(!alice_recv.application);
@@ -154,58 +215,82 @@ fn three_party_bob_adds_carol_full_mesh_via_extension_only() {
     // Membership has converged: capture the root NOW; the distribution round and
     // the message exchange below must NOT change it (distributions/messages are
     // not convergent leaves).
-    let converged_root = alice.event_log_root(CTX).expect("root");
-    assert_eq!(bob.event_log_root(CTX), Some(converged_root));
-    assert_eq!(carol.event_log_root(CTX), Some(converged_root));
-    assert_eq!(alice.event_log_leaf_count(CTX), Some(3));
+    let converged_root = alice.client.event_log_root(CTX).expect("root");
+    assert_eq!(bob.client.event_log_root(CTX), Some(converged_root));
+    assert_eq!(carol.client.event_log_root(CTX), Some(converged_root));
+    assert_eq!(alice.client.event_log_leaf_count(CTX), Some(3));
 
     // Every member is now at epoch 2 — deliver every epoch-2 distribution.
     deliver(
         &add_carol.sender_key_distributions,
-        &mut alice,
-        &mut bob,
-        &mut carol,
+        &mut alice.client,
+        &mut bob.client,
+        &mut carol.client,
     );
-    deliver(&carol_join, &mut alice, &mut bob, &mut carol);
+    deliver(
+        &carol_join,
+        &mut alice.client,
+        &mut bob.client,
+        &mut carol.client,
+    );
     deliver(
         &alice_recv.sender_key_distributions,
-        &mut alice,
-        &mut bob,
-        &mut carol,
+        &mut alice.client,
+        &mut bob.client,
+        &mut carol.client,
     );
 
+    // Pump the epoch-2 pseudonym announcements so every peer registry is complete
+    // (Alice↔Bob learned each other at epoch 1; now everyone learns Carol, and
+    // Carol learns Alice + Bob). Each socket now carries ONLY its epoch-2
+    // announcement — the epoch-1 frames were drained in round 1 — so every routed
+    // frame decrypts at the current epoch. Fan each announcement out to the other
+    // two members.
+    route_to_all(&carol.socket, &mut [&mut alice.client, &mut bob.client]);
+    route_to_all(&alice.socket, &mut [&mut bob.client, &mut carol.client]);
+    route_to_all(&bob.socket, &mut [&mut alice.client, &mut carol.client]);
+    // Clear the resulting PseudonymAnnounced events + any residual frames so the
+    // message mesh below starts from a clean slate.
+    let _ = alice.client.drain_events(CTX);
+    let _ = bob.client.drain_events(CTX);
+    let _ = carol.client.drain_events(CTX);
+    let _ = alice.socket.take_frames();
+    let _ = bob.socket.take_frames();
+    let _ = carol.socket.take_frames();
+
     // === FULL MESH: every member can send a message every other member decrypts,
-    // with keys delivered ONLY over the wrapping-key extension mesh. ===
+    // with keys delivered ONLY over the wrapping-key extension mesh and the
+    // messages fanned out over the injected socket. ===
     assert_decrypts_at_both(
         &mut alice,
         b"from alice",
-        (BOB_DID, &mut bob),
-        (CAROL_DID, &mut carol),
+        (BOB_DID, &mut bob.client),
+        (CAROL_DID, &mut carol.client),
     );
     assert_decrypts_at_both(
         &mut bob,
         b"from bob",
-        (ALICE_DID, &mut alice),
-        (CAROL_DID, &mut carol),
+        (ALICE_DID, &mut alice.client),
+        (CAROL_DID, &mut carol.client),
     );
     assert_decrypts_at_both(
         &mut carol,
         b"from carol",
-        (ALICE_DID, &mut alice),
-        (BOB_DID, &mut bob),
+        (ALICE_DID, &mut alice.client),
+        (BOB_DID, &mut bob.client),
     );
 
     // The convergent event-log root is unchanged by the entire distribution +
     // message round (INVARIANT 4: distributions ride outside the convergent log).
     assert_eq!(
-        alice.event_log_root(CTX),
+        alice.client.event_log_root(CTX),
         Some(converged_root),
         "the event-log root is unchanged across the distribution round"
     );
-    assert_eq!(bob.event_log_root(CTX), Some(converged_root));
-    assert_eq!(carol.event_log_root(CTX), Some(converged_root));
+    assert_eq!(bob.client.event_log_root(CTX), Some(converged_root));
+    assert_eq!(carol.client.event_log_root(CTX), Some(converged_root));
     assert_eq!(
-        alice.event_log_leaf_count(CTX),
+        alice.client.event_log_leaf_count(CTX),
         Some(3),
         "still 3 membership leaves"
     );
@@ -216,22 +301,30 @@ fn receiving_a_distribution_stamps_no_event_and_no_leaf() {
     // Disjointness at the driver level: receiving a sender-key distribution
     // (a management message) returns `application == false`, buffers NO
     // ContextEvent for drain_events, and appends NO event-log leaf.
-    let mut alice = client_for(ALICE_DID, 0);
-    let mut bob = client_for(BOB_DID, 100);
+    let mut alice = new_party(ALICE_DID, 0);
+    let mut bob = new_party(BOB_DID, 100);
 
-    alice.create_context(CTX).expect("alice creates");
-    let bob_kp = bob.generate_key_package_for_join(CTX).expect("bob kp");
-    let add = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
+    alice.client.create_context(CTX).expect("alice creates");
+    let bob_kp = bob
+        .client
+        .generate_key_package_for_join(CTX)
+        .expect("bob kp");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("alice adds bob");
     let bob_join = bob
+        .client
         .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("bob joins");
 
-    let leaf_before = bob.event_log_leaf_count(CTX);
-    let root_before = bob.event_log_root(CTX);
+    let leaf_before = bob.client.event_log_leaf_count(CTX);
+    let root_before = bob.client.event_log_root(CTX);
 
     // Deliver Alice's distribution to Bob.
     assert_eq!(add.sender_key_distributions.len(), 1);
     let out = bob
+        .client
         .receive_message(CTX, &add.sender_key_distributions[0].ciphertext)
         .expect("bob installs alice's key");
     assert!(
@@ -242,24 +335,29 @@ fn receiving_a_distribution_stamps_no_event_and_no_leaf() {
 
     // No leaf, same root, and drain_events yields nothing (no ContextEvent).
     assert_eq!(
-        bob.event_log_leaf_count(CTX),
+        bob.client.event_log_leaf_count(CTX),
         leaf_before,
         "no leaf appended"
     );
-    assert_eq!(bob.event_log_root(CTX), root_before, "root unchanged");
+    assert_eq!(
+        bob.client.event_log_root(CTX),
+        root_before,
+        "root unchanged"
+    );
     assert!(
-        bob.drain_events(CTX).expect("drain").is_empty(),
+        bob.client.drain_events(CTX).expect("drain").is_empty(),
         "a distribution buffers no ContextEvent"
     );
 
     // Alice, in turn, installs Bob's join distribution — also a no-op receive.
     assert_eq!(bob_join.len(), 1);
     let out = alice
+        .client
         .receive_message(CTX, &bob_join[0].ciphertext)
         .expect("alice installs bob's key");
     assert!(!out.application);
     assert!(
-        alice.drain_events(CTX).expect("drain").is_empty(),
+        alice.client.drain_events(CTX).expect("drain").is_empty(),
         "a distribution buffers no ContextEvent on Alice either"
     );
 }
@@ -276,8 +374,8 @@ fn add_with_missing_wrapping_extension_is_rejected_fail_closed() {
     use scp_mls::group::generate_key_package;
     use tls_codec::Serialize as _;
 
-    let mut alice = client_for(ALICE_DID, 0);
-    alice.create_context(CTX).expect("alice creates");
+    let mut alice = new_party(ALICE_DID, 0);
+    alice.client.create_context(CTX).expect("alice creates");
 
     // A plain KeyPackage with NO wrapping extension.
     let bob_cred =
@@ -290,6 +388,7 @@ fn add_with_missing_wrapping_extension_is_rejected_fail_closed() {
         .expect("kp bytes");
 
     let err = alice
+        .client
         .add_member(CTX, &plain_kp)
         .expect_err("an add with no wrapping key must be rejected fail-closed");
     let msg = format!("{err}");
@@ -300,71 +399,107 @@ fn add_with_missing_wrapping_extension_is_rejected_fail_closed() {
 
     // The context is untouched — the rejected add stamped no membership leaf.
     assert_eq!(
-        alice.member_dids(CTX).as_deref(),
+        alice.client.member_dids(CTX).as_deref(),
         Some(&[ALICE_DID.to_owned()][..]),
         "a rejected add must not add a member"
     );
     assert_eq!(
-        alice.event_log_leaf_count(CTX),
+        alice.client.event_log_leaf_count(CTX),
         Some(1),
         "no MemberJoined leaf"
     );
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end restore + rotation scenario
 fn snapshot_v3_persists_wrapping_and_directory_for_post_restore_distribution() {
     // INVARIANT 5: the stable wrapping keypair + the member-wrapping-key directory
     // survive a snapshot round-trip. Proof: after a converged pair, Bob's tab
     // closes; a reopened tab restores and (a) decrypts a message Alice sends under
     // the already-installed key, and (b) HPKE-opens a ROTATED key Alice
     // re-distributes — which only succeeds if Bob's wrapping SECRET survived — then
-    // decrypts a message under the rotated key.
+    // decrypts a message under the rotated key. Alice's sends fan out over the
+    // socket; the harness routes them into the restored client's
+    // `handle_relay_frame`.
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let mut alice = client_for(ALICE_DID, 0);
+    let mut alice = new_party(ALICE_DID, 0);
+
+    // Bob over caller-supplied (shared, restorable) storage + his own socket.
+    let bob_socket = CaptureSocket::new();
     let mut bob = {
         let signer = Arc::new(LocalSigner::active(BOB_DID));
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs() + 100));
-        ScpClient::new(signer, Arc::clone(&bob_storage), clock).expect("bob client")
+        client_with(signer, Arc::clone(&bob_storage), clock, bob_socket.clone())
     };
 
-    alice.create_context(CTX).expect("alice creates");
+    alice.client.create_context(CTX).expect("alice creates");
     let bob_kp = bob.generate_key_package_for_join(CTX).expect("bob kp");
-    let add = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("alice adds bob");
     let bob_join = bob
         .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("bob joins");
-    // Deliver both directions (epoch 1).
+    // Deliver both directions (epoch 1) — distributions go directly.
     bob.receive_message(CTX, &add.sender_key_distributions[0].ciphertext)
         .expect("bob installs alice's key");
     alice
+        .client
         .receive_message(CTX, &bob_join[0].ciphertext)
         .expect("alice installs bob's key");
+
+    // Pump Bob's pseudonym announcement to Alice so Alice's peer registry knows
+    // Bob's (epoch-free, restore-stable) pseudonym — app-data sends fan out only to
+    // announced peers. Drain Alice's resulting event + both sockets so the sends
+    // below are isolated.
+    route_publishes(&bob_socket, &mut alice.client);
+    let _ = alice.client.drain_events(CTX);
+    let _ = alice.socket.take_frames();
+    let _ = bob_socket.take_frames();
 
     drop(bob); // Bob's tab closes; only durable storage survives.
 
     // Reopen: the constructor restores Bob's converged context (incl. the wrapping
-    // keypair + directory + the installed sender-key store).
+    // keypair + directory + the installed sender-key store) and re-subscribes to
+    // his restore-stable pseudonym, so Alice's fan-out reaches him.
     let mut bob2 = {
         let signer = Arc::new(LocalSigner::active(BOB_DID));
         let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs() + 150));
-        ScpClient::new(signer, Arc::clone(&bob_storage), clock).expect("bob2 restore")
+        client_with(
+            signer,
+            Arc::clone(&bob_storage),
+            clock,
+            CaptureSocket::new(),
+        )
     };
 
     // (a) The restored client decrypts a message under the already-installed key.
-    let ct1 = alice
+    // Alice's send fans out over the socket to Bob's pseudonym; route it in.
+    alice
+        .client
         .send_message(CTX, b"before rotation")
         .expect("alice sends");
-    let out = bob2.receive_message(CTX, &ct1).expect("bob2 receives");
-    assert!(
-        out.application,
-        "restored client decrypts under the installed key"
+    let delivered = route_publishes(&alice.socket, &mut bob2);
+    assert_eq!(delivered, 1, "one PUBLISH fanned out to Bob's pseudonym");
+    let events = bob2.drain_events(CTX).expect("drain");
+    assert_eq!(
+        events.len(),
+        1,
+        "restored client buffered one message (decrypts under the installed key)"
     );
-    let _ = bob2.drain_events(CTX).expect("drain");
+    match &events[0] {
+        ContextEvent::MessageReceived { payload, .. } => {
+            assert_eq!(payload.as_slice(), b"before rotation");
+        }
+        other => panic!("expected MessageReceived, got {other:?}"),
+    }
 
     // (b) Alice rotates her sender key and re-distributes it. Bob2 HPKE-opens the
     // rotated key — only possible if its wrapping SECRET survived the restore —
-    // then decrypts a message under the rotated key.
-    let rotations = alice.rotate_sender_key(CTX).expect("alice rotates");
+    // then decrypts a message under the rotated key. The rotation distribution is
+    // delivered DIRECTLY (a management message), like every other distribution.
+    let rotations = alice.client.rotate_sender_key(CTX).expect("alice rotates");
     assert_eq!(rotations.len(), 1, "one distribution to Bob");
     assert_eq!(rotations[0].target_did, BOB_DID);
     let out = bob2
@@ -372,19 +507,21 @@ fn snapshot_v3_persists_wrapping_and_directory_for_post_restore_distribution() {
         .expect("bob2 installs the rotated key (wrapping secret survived restore)");
     assert!(!out.application);
 
-    let ct2 = alice
+    alice
+        .client
         .send_message(CTX, b"after rotation")
         .expect("alice sends 2");
-    let out = bob2.receive_message(CTX, &ct2).expect("bob2 receives 2");
-    assert!(
-        out.application,
-        "restored client decrypts under the rotated key"
-    );
+    let delivered = route_publishes(&alice.socket, &mut bob2);
+    assert_eq!(delivered, 1, "one PUBLISH fanned out under the rotated key");
     let drained = bob2.drain_events(CTX).expect("drain");
     assert_eq!(drained.len(), 1);
     match &drained[0] {
         ContextEvent::MessageReceived { payload, .. } => {
-            assert_eq!(payload.as_slice(), b"after rotation");
+            assert_eq!(
+                payload.as_slice(),
+                b"after rotation",
+                "restored client decrypts under the rotated key"
+            );
         }
         other => panic!("expected MessageReceived, got {other:?}"),
     }

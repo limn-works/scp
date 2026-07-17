@@ -23,6 +23,13 @@ testing = ["scp-protocol/testing", "scp-did/testing"]
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+# Wasm-safe leaf: the single §9.10.4.A pseudonym-derivation source (ADR-057
+# Option A). `derive_pseudonym` derives this member's per-context pseudonym over
+# the wasm-held MLS SignatureKeyPair via this crate — no forked HMAC/HKDF recipe.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+# The Ed25519 seed extracted from the MLS SignatureKeyPair is reconstructed into
+# a `SigningKey` to feed `scp_crypto::pseudonym::derive_pseudonym_keypair`.
+ed25519-dalek = { workspace = true }
 
 openmls = { workspace = true, features = ["libcrux-provider", "js"] }
 openmls_traits = { workspace = true }
