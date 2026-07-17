@@ -75,6 +75,15 @@ check_code() {
                 [[ $num -ge 13000 && $num -le 13999 ]] || { echo "VIOLATION: $file:$line_num: $code — SAGA range is 13000-13999"; VIOLATIONS=$((VIOLATIONS + 1)); }
             fi
             ;;
+        # SCP-CAPSEL is NOT an emitted error code. It is the capability-selection
+        # *classification* taxonomy defined in .docs/specs/17-persistence-and-storage.md
+        # §17.17.1/§17.17.2 (the exact defined set is 8000, 8001, 8002, 8010, 8011,
+        # 8012, 8013). It is cited in source comments/rustdoc for provenance
+        # (ADR-062 capability-injection work) and is deliberately absent from the
+        # error-code registry (error_codes.rs, sdk-common.md; see the "ID note" at
+        # §17.17.2). We validate it for range — a genuinely malformed CAPSEL code is
+        # still caught — but do NOT treat it as a mis-prefixed error code.
+        SCP-CAPSEL)   [[ $num -ge 8000 && $num -le 8099 ]] || { echo "VIOLATION: $file:$line_num: $code — CAPSEL classification range is 8000-8099 (§17.17.2)"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge errors — allowed
         SCP-TEST)     ;; # Test sentinel — allowed
         *)
