@@ -25,6 +25,7 @@ use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // without each caller importing the full `scp_ffi_common` path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle;
+use scp_ffi_common::credentials::FfiCredentialStore;
 use scp_ffi_common::error_codes as codes;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -299,18 +300,16 @@ pub struct NapiBridgeInstance {
 
     /// Per-instance bridge credential store (spec §12.11).
     ///
-    /// Mirrors `PyBridgeInstance::credential_store` — each `Scp` instance
-    /// owns its own `InMemoryCredentialStore` so that OAuth tokens, API
-    /// keys, and bridge credential keys provisioned through one bridge
-    /// instance are isolated from every other instance in the same process
-    /// (ADR-048 §1 multi-instance neutrality). The store is thread-safe via
-    /// its internal `tokio::sync::RwLock`. Production deployments should
-    /// replace this with a `Storage`-backed implementation when it lands
-    /// (spec §12.11.2). Dropping the `Arc` on shutdown zeroizes any retained
-    /// bridge credential keys via the store's `Zeroizing` fields — there is no
-    /// explicit clear step in `bridge_specific_shutdown`, so the store lives
-    /// exactly as long as its last `Arc` reference.
-    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
+    /// The **durable** [`FfiCredentialStore`] selected at construction from the
+    /// SAME storage handle that backs `mls_storage` and the saga journal (spec
+    /// §17.6) — a Sqlite selection persists bridge tokens across restart; an
+    /// encrypted-in-memory selection keeps them encrypted at rest. Per-instance,
+    /// so credentials provisioned through one `Scp` are isolated from every
+    /// other instance in the same process (ADR-048 §1 multi-instance
+    /// neutrality). There is no in-memory arm on this shipped path — the
+    /// in-memory store's `Default` impl that made it a default selection was
+    /// deleted (ADR-062 §Decision 5, SCP-CAPINJECT-009).
+    pub(crate) credential_store: FfiCredentialStore,
 
     /// Per-instance §5.4.5 streaming-outlet registry (SCP-OUT-037, C8a).
     ///
@@ -365,6 +364,10 @@ impl NapiBridgeInstance {
         // The durable saga journal and the `mls_storage` view are bound into one
         // `DurableProviders` derived from the SAME `Arc`, so they cannot diverge
         // by construction (§17.6 / §17.16).
+        // The durable credential store shares the ONE chosen storage handle
+        // with `mls_storage` / the saga journal (spec §17.6) — select it BEFORE
+        // the handle is moved into `durable_providers_from_handle`.
+        let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::new(),
@@ -377,9 +380,7 @@ impl NapiBridgeInstance {
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
-            credential_store: Arc::new(
-                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-            ),
+            credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
@@ -396,6 +397,9 @@ impl NapiBridgeInstance {
             scp_ffi_common::bridge_runtime::build_event_log_provider();
         // Saga journal + `mls_storage` bound into one `DurableProviders` derived
         // from one handle (§17.6 / §17.16).
+        // Durable credential store over the SAME chosen handle (§17.6),
+        // selected before the handle is moved into the durable providers.
+        let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::with_persistence(persistence),
@@ -408,9 +412,7 @@ impl NapiBridgeInstance {
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
-            credential_store: Arc::new(
-                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-            ),
+            credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
@@ -490,6 +492,10 @@ impl NapiBridgeInstance {
                 // and the journal is built over the SAME handle, so saga replay
                 // reads and writes the one `SQLCipher` connection (§17.6 /
                 // §17.16). They cannot diverge by construction.
+                // Durable credential store over the SAME `Arc<SqliteStorage>`
+                // (§17.6) — bridge tokens persist across restart with the DB.
+                let credential_store =
+                    FfiCredentialStore::durable_from_handle(Arc::clone(&arc_storage));
                 let durable_providers = durable_providers_from_handle(Arc::clone(&arc_storage));
                 drop(arc_storage);
 
@@ -497,6 +503,7 @@ impl NapiBridgeInstance {
                     persistence,
                     ProtocolRepoVariant::Sqlite(event_log_repo),
                     durable_providers,
+                    credential_store,
                 ))
             }
         }
@@ -522,6 +529,7 @@ impl NapiBridgeInstance {
         persistence: Arc<dyn ContextPersistence + Send + Sync>,
         protocol_repository: ProtocolRepoVariant,
         durable_providers: scp_core::context::supervisor::DurableProviders,
+        credential_store: FfiCredentialStore,
     ) -> Self {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
@@ -534,9 +542,7 @@ impl NapiBridgeInstance {
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
-            credential_store: Arc::new(
-                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-            ),
+            credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
@@ -585,16 +591,11 @@ impl NapiBridgeInstance {
         &self.mcp_client_registry
     }
 
-    /// Returns a reference to this instance's bridge credential store.
-    ///
-    /// Mirrors `PyBridgeInstance::credential_store`. The returned
-    /// `Arc<InMemoryCredentialStore>` is the same instance the
-    /// `NapiBridgeInstance` holds — thread-safe via internal
-    /// `tokio::sync::RwLock`.
+    /// Returns a reference to this instance's **durable** bridge credential
+    /// store, selected at construction from the chosen storage backend
+    /// (ADR-062 §Decision 5, SCP-CAPINJECT-009).
     #[must_use]
-    pub const fn credential_store(
-        &self,
-    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
+    pub const fn credential_store(&self) -> &FfiCredentialStore {
         &self.credential_store
     }
 

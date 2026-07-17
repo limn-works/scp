@@ -21,7 +21,17 @@ resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-t
 # activated (via the `server` feature): the server.rs auto-generate path calls
 # the testing-gated `ApplicationNode::dev`. The `?` keeps testing usable without
 # `server`. Never in a default/non-testing list (ADR-062 §Decision 1).
-testing = ["resolvers", "scp-did/testing", "scp-dht/testing", "scp-node?/testing"]
+# `scp-core?/testing` makes the testing-gated `FfiCredentialStore::InMemory`
+# arm (which names `scp_core::bridge::credentials::InMemoryCredentialStore`,
+# itself `#[cfg(any(test, feature = "testing"))]`) self-consistent whenever this
+# crate's own `testing` is enabled (ADR-062 §Decision 5, SCP-CAPINJECT-009).
+testing = [
+    "resolvers",
+    "scp-core?/testing",
+    "scp-did/testing",
+    "scp-dht/testing",
+    "scp-node?/testing",
+]
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
 # PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
