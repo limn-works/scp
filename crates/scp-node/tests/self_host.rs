@@ -29,6 +29,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use scp_transport::native::storage::BlobStorageBackend;
+
 use axum::body::Body;
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -182,7 +184,6 @@ async fn build_self_host_node() -> BuiltNode {
         dht: DhtMode::Production,
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-        blob_storage: Some(blob_storage),
         ..NodeConfig::defaults(
             Reach::NatTraversal,
             IdentitySource::Generate {
@@ -190,6 +191,9 @@ async fn build_self_host_node() -> BuiltNode {
                 did_method,
             },
             node_storage,
+            // Explicit durable SQLite blob backend (opened above) as the required
+            // selection (SCP-CAPINJECT-010).
+            blob_storage,
         )
     })
     .await
@@ -815,7 +819,6 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
         dht: DhtMode::Production,
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-        blob_storage: Some(blob_storage),
         ..NodeConfig::defaults(
             Reach::NatTraversal,
             IdentitySource::Generate {
@@ -823,6 +826,9 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
                 did_method,
             },
             Arc::clone(&root_storage),
+            // Explicit durable SQLite blob backend (opened above) as the required
+            // selection (SCP-CAPINJECT-010).
+            blob_storage,
         )
     })
     .await
@@ -978,7 +984,6 @@ async fn build_self_host_node_over_dir(dir: &std::path::Path) -> ApplicationNode
         dht: DhtMode::Production,
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-        blob_storage: Some(blob_storage),
         ..NodeConfig::defaults(
             Reach::NatTraversal,
             IdentitySource::Persisted {
@@ -986,6 +991,9 @@ async fn build_self_host_node_over_dir(dir: &std::path::Path) -> ApplicationNode
                 did_method,
             },
             node_storage,
+            // Explicit durable SQLite blob backend (opened above) as the required
+            // selection (SCP-CAPINJECT-010).
+            blob_storage,
         )
     })
     .await
@@ -1078,6 +1086,7 @@ async fn nat_traversal_disabled_dht_node_starts_without_publishing() {
                 did_method,
             },
             node_storage,
+            BlobStorageBackend::in_memory(),
         )
     })
     .await
@@ -1155,7 +1164,6 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
         nat: NatSlot::Custom(Arc::new(PanicOnProbeNatStrategy)),
         bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
         http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], http_port))),
-        blob_storage: Some(blob_storage),
         ..NodeConfig::defaults(
             Reach::Local,
             IdentitySource::Persisted {
@@ -1163,6 +1171,9 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
                 did_method,
             },
             node_storage,
+            // Explicit durable SQLite blob backend (opened above) as the required
+            // selection (SCP-CAPINJECT-010).
+            blob_storage,
         )
     })
     .await

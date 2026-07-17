@@ -342,7 +342,6 @@ pub async fn start_node_in_memory(
             // in P1 — the in-memory DHT client publishes nothing).
             Node::start_for_testing(NodeConfig {
                 bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-                blob_storage: Some(BlobStorageBackend::in_memory()),
                 dht: DhtMode::Production,
                 ..NodeConfig::defaults(
                     Reach::Domain {
@@ -360,6 +359,10 @@ pub async fn start_node_in_memory(
                         },
                     )),
                     InMemoryStorage::new(),
+                    // Explicit durability-only selection for this in-memory
+                    // server front door (SCP-CAPINJECT-010): the blob backend is
+                    // a required selection, never a runtime default.
+                    BlobStorageBackend::in_memory(),
                 )
             })
             .await?
@@ -455,7 +458,6 @@ pub async fn start_node_local(
     let node = if let Some(id) = identity {
         Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            blob_storage: Some(blob_storage),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -473,6 +475,9 @@ pub async fn start_node_local(
                     },
                 )),
                 storage,
+                // The operator-chosen durable redb blob backend (opened above),
+                // passed as the required selection (SCP-CAPINJECT-010).
+                blob_storage,
             )
         })
         .await?
@@ -506,7 +511,6 @@ pub async fn start_node_local(
 
         Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            blob_storage: Some(blob_storage),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -517,6 +521,9 @@ pub async fn start_node_local(
                     did_method,
                 },
                 storage,
+                // The operator-chosen durable redb blob backend (opened above),
+                // passed as the required selection (SCP-CAPINJECT-010).
+                blob_storage,
             )
         })
         .await?

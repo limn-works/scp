@@ -12,6 +12,7 @@ use scp_node::{
     DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, ReachabilityTier, TlsMode,
 };
 use scp_testing::helpers;
+use scp_transport::native::storage::BlobStorageBackend;
 
 // ---------------------------------------------------------------------------
 // Builder — domain mode
@@ -93,6 +94,7 @@ async fn failing_tls_falls_through_to_nat() {
                 did_method,
             },
             InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
         )
     })
     .await;
@@ -134,6 +136,7 @@ async fn failing_nat_strategy() {
                 did_method,
             },
             InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
         )
     })
     .await;

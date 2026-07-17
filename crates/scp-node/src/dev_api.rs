@@ -615,7 +615,7 @@ mod tests {
             dev_token: Some(token.to_owned()),
             dev_bind_addr: Some("127.0.0.1:9100".parse::<SocketAddr>().unwrap()),
             projected_contexts: RwLock::new(HashMap::new()),
-            blob_storage: Arc::new(BlobStorageBackend::default()),
+            blob_storage: Arc::new(BlobStorageBackend::in_memory()),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),

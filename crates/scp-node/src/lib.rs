@@ -1556,6 +1556,9 @@ impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                // Durability-only blob arm, selected explicitly — `dev()` is a
+                // documented dev/prototyping affordance (SCP-CAPINJECT-010).
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -3794,6 +3797,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         }
     }
@@ -3859,6 +3863,7 @@ mod tests {
                     },
                 )),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -3953,6 +3958,7 @@ mod tests {
                     did_method: counting_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -4106,6 +4112,7 @@ mod tests {
                     did_method: check_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -4177,6 +4184,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         }
     }
@@ -4356,6 +4364,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         };
         (config, publish_attempts)
@@ -4452,6 +4461,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         };
         (config, publish_attempts)
@@ -4587,6 +4597,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -4651,6 +4662,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -4741,6 +4753,7 @@ mod tests {
                     did_method: counting_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -5835,6 +5848,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -5889,6 +5903,7 @@ mod tests {
                     did_method: Arc::clone(&did_method),
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -5937,6 +5952,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -6110,6 +6126,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -6151,6 +6168,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -6189,6 +6207,7 @@ mod tests {
                     did_method: Arc::clone(&did_method),
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -6209,6 +6228,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await

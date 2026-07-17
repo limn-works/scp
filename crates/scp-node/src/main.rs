@@ -29,6 +29,7 @@ use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode};
 use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_transport::native::server::RelayServer;
+use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::startup;
 
 // ---------------------------------------------------------------------------
@@ -300,6 +301,27 @@ async fn run_relay_only() {
 // Full node mode — ephemeral
 // ---------------------------------------------------------------------------
 
+/// The blob backend for ephemeral mode: always in-memory, no persistence, env
+/// overrides deliberately IGNORED.
+///
+/// This is the ephemeral caller's explicit selection at its own boundary
+/// (SCP-CAPINJECT-010). It is a named function — not an inline literal — so the
+/// "ephemeral ⇒ in-memory blob" contract is pinned by a unit test
+/// (`ephemeral_uses_in_memory_blob`) and cannot silently regress to a durable /
+/// env-driven backend (which would violate the all-in-memory contract documented
+/// on [`run_full_node_ephemeral`] and re-persist blobs to disk).
+///
+/// Gated to `any(test, feature = "testing")` because that is exactly where it is
+/// used and nowhere else: the ephemeral entry point [`run_full_node_ephemeral`]
+/// is itself `#[cfg(feature = "testing")]`, and the regression test is
+/// `#[cfg(test)]`. Under a plain default-feature build it would be dead code; the
+/// regression test still runs under `cargo test` (which enables `cfg(test)`).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+fn ephemeral_blob_backend() -> BlobStorageBackend {
+    BlobStorageBackend::in_memory()
+}
+
 /// Runs the full node with all in-memory subsystems (no persistence).
 ///
 /// In ephemeral mode, ALL subsystems use in-memory implementations regardless
@@ -373,6 +395,8 @@ async fn run_full_node_ephemeral() {
         seq_init,
         did_method,
         encrypted_storage,
+        // Ephemeral contract: in-memory blob, no persistence, env ignored.
+        ephemeral_blob_backend(),
     )
     .await;
 }
@@ -508,6 +532,11 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 seq_init,
                 did_method,
                 Arc::clone(&node_storage_arc),
+                // Persistent mode: operator-configured durable blob backend
+                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
+                // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
+                // relay-only mode makes (SCP-CAPINJECT-010).
+                startup::storage_from_env().await,
             )
             .await;
         }
@@ -536,6 +565,10 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 seq_init,
                 did_method,
                 Arc::clone(&node_storage_arc),
+                // Persistent mode: operator-configured durable blob backend
+                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
+                // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
+                startup::storage_from_env().await,
             )
             .await;
         }
@@ -878,6 +911,15 @@ async fn run_node_with<
     seq_init: scp_node::self_host::SeqInitFn,
     did_method: Arc<D>,
     storage: S,
+    // The relay's blob backend, selected by each caller at ITS OWN boundary
+    // (SCP-CAPINJECT-010 / spec §17.17.1). Threaded as a required parameter —
+    // exactly like `storage` — so this shared helper NEVER manufactures a backend
+    // (that would re-introduce the SCP-CAPSEL-8002 anti-pattern the story kills,
+    // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
+    // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
+    // persistent mode passes `startup::storage_from_env()` (durable, default
+    // SQLite, honors env).
+    blob_storage: BlobStorageBackend,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
 
@@ -959,6 +1001,7 @@ async fn run_node_with<
                 did_method,
             },
             storage,
+            blob_storage,
         )
     })
     .await
@@ -1100,6 +1143,22 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
+    /// in-memory blob backend — no persistence, env overrides ignored. This pins
+    /// the ephemeral caller's boundary selection so it cannot silently regress to
+    /// a durable / env-driven backend (`startup::storage_from_env`, which defaults
+    /// to `Sqlite`), which would break the all-in-memory contract documented on
+    /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
+    /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
+    #[test]
+    fn ephemeral_uses_in_memory_blob() {
+        assert!(
+            matches!(ephemeral_blob_backend(), BlobStorageBackend::InMemory(_)),
+            "ephemeral mode must use the in-memory blob backend (no persistence, \
+             env ignored) — see the all-in-memory contract on run_full_node_ephemeral"
+        );
+    }
 
     /// `SCP_NODE_SELF_HOST_NO_NAT` (and every opt-in self-host flag) is truthy
     /// only for the exact values `"1"` and `"true"`. This is the parsing rule
