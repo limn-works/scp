@@ -3226,10 +3226,12 @@ pub async fn execute_reconfigure_governance(
     // Append the companion GovernanceDeadlockRecovery leaf carrying the
     // structured recovery justification (issue #1847).  The two leaves share
     // the same actor_did and timestamp so verifiers can correlate them.
-    // Fail-closed: the justification evidence (removed signer identities and
-    // missed-window counts) is load-bearing accountability data — making this
-    // best-effort would allow it to be silently absent after a governance
-    // takeover, giving no auditable record of who was removed or why.
+    // Fail-closed (error-surfaced, not atomically co-present): the signer
+    // removal and the GovernanceReconfigured leaf above are already durable
+    // by this point, so an append failure here does not roll back the
+    // reconfiguration.  Fail-closed is still preferred over best-effort
+    // because it surfaces the failure to the caller rather than swallowing
+    // it silently, giving operators a concrete error signal to investigate.
     let recovery_payload = scp_event_log::payload::encode_payload(
         &scp_event_log::payload::GovernanceDeadlockRecoveryPayload {
             unavailable_dids: justification
