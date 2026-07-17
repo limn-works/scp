@@ -19,7 +19,7 @@
 //! path signs through. The runtime composes the §5.4.5 chunk / cancel
 //! preimage synchronously (the bytes are byte-identical to round 7) and
 //! awaits the signer only for the 64-byte Ed25519 signature. An
-//! [`InProcessStreamSigner`] backs the trait with an in-memory
+//! `InProcessStreamSigner` (a `testing`-gated adapter) backs the trait with an in-memory
 //! `ed25519_dalek::SigningKey` for tests and for the WASM bridge (where
 //! operator == invoker per ADR-034 §1, single-process bridge); native FFI
 //! bridges supply custody-backed adapters that satisfy the same trait.

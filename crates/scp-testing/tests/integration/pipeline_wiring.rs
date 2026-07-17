@@ -23,7 +23,7 @@
 
 // Production helper modules + domain logic modules. The legacy
 // `manager/<domain>.rs` submodules and `manager/mod.rs` were deleted
-// in ADR-049 commit 12 — every method body that the pipeline-wiring
+// in ADR-049 §15 — every method body that the pipeline-wiring
 // assertions probe now lives in `<domain>_helpers.rs` (forwarder-free),
 // `<domain>_helpers_legacy.rs` during Phase 2A actor migration windows,
 // or in `<domain>_logic.rs` (the free-function logic that used to share
@@ -45,6 +45,14 @@ const MANAGER_SRC: &str = concat!(
 );
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
+
+// Actor per-context state source — owns the `ContextCryptoState::{seal,open}`
+// steady-state crypto seam. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) moved the seal /
+// open bodies off the `MlsCryptoProvider` (deleted) onto the actor-owned
+// `PerContextState` here, so the seal-internal envelope-pipeline assertions scan
+// this source (the moved code), not `PROVIDER_SRC`. This is a repoint to the new
+// home of the same seal/open pipeline, not a weakening.
+const STATE_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
 
 // Supervisor dispatch source — owns `dispatch_lifecycle_direct`, whose
 // bootstrap arms (Create / Import / Restore) moved to the actor-shape
@@ -741,13 +749,16 @@ fn parser_preserves_call_order_through_noncode() {
 // Baseline assertions — currently wired, must pass today
 // ===========================================================================
 
-// Manager level: send_message path calls crypto.seal (full envelope pipeline)
-// seal is in build_encrypted_envelope helper called from send_message
+// Manager level: send_message path calls crypto.seal (full envelope pipeline).
+// ADR-049 PR-7: the seal is invoked from the `build_encrypted_envelope_actor`
+// helper (which calls `crypto_state.seal(...)` on the actor-owned
+// `ContextCryptoState`), reached from `send_message`. Repointed from the deleted
+// `build_encrypted_envelope` provider-twin to its actor successor.
 #[test]
 fn send_message_calls_seal() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", ".seal(")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", ".seal("),
+            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope_actor", ".seal("),
         "send_message path must call crypto.seal (envelope pipeline)"
     );
 }
@@ -1172,13 +1183,15 @@ fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
         ),
         "decrypt_and_dispatch must gate the recv floor on the authoritative registry"
     );
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the KeyResponse install moved off the
+    // emptied provider (`deps.crypto.set_sender_key_unchecked`, a no-op on a taken
+    // context) onto the actor-owned store (`cs.sender_key_store.set_unchecked`).
+    // Track the moved install token; the gate-before-install property is unchanged.
     assert!(
-        fn_body_contains(
-            MANAGER_SRC,
-            "decrypt_and_dispatch",
-            "set_sender_key_unchecked"
-        ),
-        "the remote-epoch seam must install via set_sender_key_unchecked AFTER gating"
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "sender_key_store")
+            && fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "set_unchecked"),
+        "the remote-epoch seam must install onto the actor sender_key_store via \
+         set_unchecked AFTER gating"
     );
     // P1 (white-hat): the remote-epoch seam-2 D1 gate — the registry epoch gate
     // — must be present AND must precede the key install (gate-BEFORE-install =
@@ -1197,12 +1210,14 @@ fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
         let gate = body
             .find("check_and_advance_sender_epoch")
             .expect("seam-2 gate present");
+        // PR-7: the install is now `cs.sender_key_store.set_unchecked` (actor store).
         let install = body
-            .find("set_sender_key_unchecked")
-            .expect("seam-2 install present");
+            .find("sender_key_store")
+            .expect("seam-2 actor-store install present");
         assert!(
             gate < install,
-            "the seam-2 registry epoch gate must PRECEDE set_sender_key_unchecked (gate-before-install)"
+            "the seam-2 registry epoch gate must PRECEDE the actor sender_key_store \
+             install (gate-before-install)"
         );
     }
     assert!(
@@ -1257,6 +1272,53 @@ fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
         ),
         "the restore guard must merge blob floors INTO the registry sink"
     );
+}
+
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2 — the steady-state sender-key ANSWER
+// half moved off the provider onto the actor. These ADDITIVE structural
+// assertions pin the new INBOUND answer wiring so a regression cannot silently
+// route a received PULL request back through the emptied provider (a no-op on a
+// taken context) or drop the enqueued ephemeral-sealed answer before transmit.
+#[test]
+fn adr049_pr7_sender_key_answer_is_actor_native_and_enqueued_for_transmit() {
+    // A1 — `decrypt_and_dispatch` ANSWERS a received §9.16.2 PULL request on the
+    // actor's OWNED crypto state (`cs.handle_sender_key_request`), NOT through the
+    // provider. The answer HPKE-seals to the requester's ephemeral wrapping key,
+    // so it needs no signing key — a clean receive-side answer.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "decrypt_and_dispatch",
+            "handle_sender_key_request"
+        ),
+        "decrypt_and_dispatch must answer a received sender-key PULL request on the \
+         actor's owned crypto state (cs.handle_sender_key_request)"
+    );
+    // A2 — the ephemeral-sealed answer is ENQUEUED onto the actor's
+    // `pending_distributions` for the existing MLS-wrap + transport drain (a blocked
+    // requester returns None → nothing enqueued, §9.16.2 silent drop).
+    assert!(
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "pending_distributions"),
+        "decrypt_and_dispatch must enqueue the ephemeral-sealed answer onto the \
+         actor's pending_distributions for transmit"
+    );
+    // A3 — the actor answer method (moved off the provider) records its nonce-dedup
+    // replay entry on the Class-C crypto cache (`nonce_dedup.record`), NOT the
+    // Class-S cross-context `xctx_nonce_dedup` (coalesced persist is sound: a
+    // still-fresh replay re-seals the SAME key to the SAME ephemeral pubkey).
+    {
+        let body = extract_fn_body(STATE_SRC, "handle_sender_key_request")
+            .expect("actor ContextCryptoState::handle_sender_key_request body must exist");
+        assert!(
+            body.contains("nonce_dedup.record"),
+            "the actor answer must record its replay nonce on the Class-C crypto \
+             nonce_dedup cache"
+        );
+        assert!(
+            !body.contains("xctx_nonce_dedup"),
+            "the actor answer must NOT touch the Class-S cross-context xctx_nonce_dedup"
+        );
+    }
 }
 
 // Timer level (ADR-049 Decision-1 / finding A3 — APPROVED enforcement
@@ -1434,31 +1496,106 @@ fn bridge_resume_path_routes_through_restore_on_startup() {
     }
 }
 
-// Provider level: seal calls create_outer_envelope (envelope construction)
+// First-occurrence binding pin for the seal/open crypto-pipeline gates below.
+//
+// `extract_fn_body` / `extract_fn_signature` bind to the FIRST `fn seal(` /
+// `fn open(` in STATE_SRC. STATE_SRC now defines each name TWICE: the
+// production `ContextCryptoState::seal`/`open` core (whose bodies call
+// `create_outer_envelope` / `encrypt_sender_layer` / `decrypt_sender_layer` /
+// `strip_padding`) AND a `#[cfg(test)]` `PerContextState` delegating wrapper
+// (whose body only forwards to `crypto.seal(...)` / `crypto.open(...)`). The
+// production core is authored first, so first-occurrence binding is correct
+// TODAY — but a future impl-block reorder that placed a wrapper first would
+// silently rebind the gates below to a delegating body. Pin the assumption by a
+// signature token unique to the production core (`aad_sequence` on `seal`; the
+// raw `context_id: &[u8; 32]` digest on `open`), absent from the wrappers, so a
+// reorder fails HERE loudly instead of masking a downstream regression.
+#[test]
+fn state_seal_open_first_binding_is_production_core() {
+    let seal_sig = extract_fn_signature(STATE_SRC, "seal").expect("STATE_SRC defines a `seal`");
+    assert!(
+        seal_sig.contains("aad_sequence"),
+        "the first `fn seal(` in STATE_SRC must be the production \
+         ContextCryptoState core (takes `aad_sequence`), not the #[cfg(test)] \
+         PerContextState delegating wrapper — else the seal gates below rebind \
+         to the wrapper body"
+    );
+    let open_sig = extract_fn_signature(STATE_SRC, "open").expect("STATE_SRC defines an `open`");
+    assert!(
+        open_sig.contains("context_id: &[u8; 32]"),
+        "the first `fn open(` in STATE_SRC must be the production \
+         ContextCryptoState core (takes the raw `context_id` digest), not the \
+         #[cfg(test)] PerContextState delegating wrapper — else the open gates \
+         below rebind to the wrapper body"
+    );
+}
+
+// Actor-state level: `ContextCryptoState::seal` calls create_outer_envelope
+// (envelope construction). Repointed from the deleted provider `seal` to its
+// actor home in `state.rs` (STATE_SRC) — the moved pipeline, not a weakening.
+// First-occurrence binding to the production core is pinned by
+// `state_seal_open_first_binding_is_production_core` above.
 #[test]
 fn seal_calls_create_outer_envelope() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "create_outer_envelope"),
-        "seal (provider) must call create_outer_envelope"
+        fn_body_contains(STATE_SRC, "seal", "create_outer_envelope"),
+        "seal (actor ContextCryptoState) must call create_outer_envelope"
     );
 }
 
-// Provider level: seal calls encrypt_sender_layer (sender key encryption)
+// Actor-state level: `ContextCryptoState::seal` calls encrypt_sender_layer
+// (sender key encryption). Repointed from the deleted provider `seal`.
 #[test]
 fn seal_calls_encrypt_sender_layer() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "encrypt_sender_layer"),
-        "seal (provider) must call encrypt_sender_layer"
+        fn_body_contains(STATE_SRC, "seal", "encrypt_sender_layer"),
+        "seal (actor ContextCryptoState) must call encrypt_sender_layer"
     );
 }
 
-// Provider level: open calls decrypt_sender_layer
+// Actor-state level: `ContextCryptoState::open` calls decrypt_sender_layer.
+// Repointed from the deleted provider `open` to its actor home in STATE_SRC.
 #[test]
 fn open_calls_decrypt_sender_layer() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "open", "decrypt_sender_layer"),
-        "open (provider) must call decrypt_sender_layer"
+        fn_body_contains(STATE_SRC, "open", "decrypt_sender_layer"),
+        "open (actor ContextCryptoState) must call decrypt_sender_layer"
     );
+}
+
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the 11 steady-state crypto methods were
+// MOVED off `MlsCryptoProvider` onto the actor-owned `PerContextState`. This
+// asserts the provider retains ZERO definitions of any of them — a one-way move
+// (no dual-home), so a future refactor cannot silently re-add a provider-resident
+// twin that would seal/open behind the actor's back (double-owner, divergent
+// sequence, resurrected sender key). Birth/restore-seam methods (create_mls_group,
+// add_member, install_joined_group, take_crypto_state, build_restored_owned,
+// with_context, wrapping_keypair, destroy_mls_group, destroy_sender_key,
+// validate_key_package, store_member_sender_key) are RETAINED and deliberately not
+// listed. Additive coverage; weakens nothing.
+#[test]
+fn provider_steady_state_crypto_methods_are_deleted() {
+    const MOVED_METHODS: [&str; 11] = [
+        "seal",
+        "open",
+        "advance_epoch",
+        "rotate_sender_key",
+        "remove_member",
+        "remove_member_sender_key",
+        "mls_encrypt_management",
+        "local_sender_key_epoch",
+        "export_crypto_state",
+        "restore_crypto_state",
+        "drain_pending_sender_key_messages",
+    ];
+    for method in MOVED_METHODS {
+        let def = format!("fn {method}(");
+        assert!(
+            !PROVIDER_SRC.contains(&def),
+            "MlsCryptoProvider must NOT define `{method}` — the steady-state crypto \
+             seam moved onto the actor `PerContextState` (ADR-049 PR-7, one-way move)"
+        );
+    }
 }
 
 // --- Envelope layer (§13) — NOW WIRED ---
@@ -1466,7 +1603,7 @@ fn open_calls_decrypt_sender_layer() {
 #[test]
 fn encrypt_path_calls_create_outer_envelope_or_seal() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "create_outer_envelope")
+        fn_body_contains(STATE_SRC, "seal", "create_outer_envelope")
             || fn_body_contains(MANAGER_SRC, "send_message", "create_outer_envelope"),
         "send/encrypt path must call create_outer_envelope"
     );
@@ -1478,11 +1615,7 @@ fn encrypt_path_calls_create_outer_envelope_or_seal() {
 fn encrypt_path_calls_create_inner_envelope() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope_raw")
-            || fn_body_contains(
-                MANAGER_SRC,
-                "build_encrypted_envelope",
-                "create_inner_envelope_raw"
-            ),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "create_inner_envelope_raw"),
         "send path must call create_inner_envelope_raw"
     );
 }
@@ -1502,7 +1635,7 @@ fn decrypt_path_calls_verify_inner_signature() {
 fn encrypt_path_calls_wrap_content() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "wrap_content")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", "wrap_content"),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "wrap_content"),
         "send path must call wrap_content"
     );
 }
@@ -1521,7 +1654,7 @@ fn decrypt_path_calls_unwrap_content() {
 #[test]
 fn decrypt_path_calls_strip_padding() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "open", "strip_padding")
+        fn_body_contains(STATE_SRC, "open", "strip_padding")
             || fn_body_contains(MANAGER_SRC, "deliver_incoming", "strip_padding")
             || fn_body_contains(MANAGER_SRC, "verify_and_unwrap", "strip_padding"),
         "receive/decrypt path must call strip_padding"
@@ -1529,7 +1662,7 @@ fn decrypt_path_calls_strip_padding() {
 }
 
 // --- Provenance (#1536) — WIRED (conditional on cross-context source) ---
-// attach_provenance is called in build_encrypted_envelope when
+// attach_provenance is called in the `build_inner_wire` helper when
 // source_provenance is Some (cross-context data flow). For intra-context
 // direct messages source_provenance is None and attach_provenance is not
 // invoked. The pipeline test verifies the code path exists.
@@ -1538,7 +1671,7 @@ fn decrypt_path_calls_strip_padding() {
 fn encrypt_path_references_attach_provenance() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "attach_provenance")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", "attach_provenance"),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "attach_provenance"),
         "send path must reference attach_provenance"
     );
 }

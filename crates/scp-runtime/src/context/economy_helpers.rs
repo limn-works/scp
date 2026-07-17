@@ -9,12 +9,11 @@
 //! per-context policy, velocity, and checkpoint state flow through
 //! [`PerContextState`](crate::context::actor::state::PerContextState).
 //!
-//! # Legacy fallback
+//! # Migration status
 //!
-//! The pre-migration `&Supervisor` bodies live in
-//! [`crate::context::economy_helpers_legacy`]. Still-legacy domains
-//! such as messaging and lifecycle call that module until their own
-//! Phase 2A migrations move them to actor-owned state.
+//! The pre-migration `&Supervisor` bodies have been removed (Phase 2A
+//! finalization); all economy-domain callers now operate on actor-owned
+//! state.
 
 #![allow(clippy::needless_pass_by_ref_mut)]
 

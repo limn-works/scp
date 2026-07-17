@@ -207,7 +207,7 @@ async fn dispatch_actor_inner(
             handle_flush_snapshot_actor(&*cell, deps, reply).await
         }
         LifecycleCommand::ShutdownSelf { reply } => {
-            handle_shutdown_self_actor(&*cell, deps, reply).await
+            handle_shutdown_self_actor(cell, deps, reply).await
         }
         LifecycleCommand::ReportBufferLen { reply } => {
             handle_report_buffer_len_actor(&*cell, reply)
@@ -216,7 +216,7 @@ async fn dispatch_actor_inner(
             handle_clear_needs_reconnect_actor(cell, &context_id, reply)
         }
         LifecycleCommand::IssueMlsUpdate { context_id, reply } => {
-            handle_issue_mls_update_actor(cell, deps, &context_id, reply)
+            handle_issue_mls_update_actor(cell, deps, &context_id, reply).await
         }
     }
 }
@@ -517,11 +517,16 @@ fn handle_flush_snapshot_actor<'d>(
     // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
     // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
     // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
-    // durable-blob params. The provider floor mirrors are deleted.
-    match deps.crypto.export_crypto_state(
-        &ctx_id_bytes,
+    // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
+    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
+    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
+    // sequence is read from `state.send_tracker` inside the twin.
+    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    match state.export_crypto_state(
         deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
         deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        wrapping_public_key,
+        &*wrapping_secret_key,
     ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
@@ -581,15 +586,18 @@ fn handle_flush_snapshot_actor<'d>(
 // precise-capture `+ use<>` bound excludes the input lifetimes, so the `&state`
 // borrow ends before the returned `async move`.
 fn handle_shutdown_self_actor(
-    state: &PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> impl std::future::Future<Output = Outcome<()>> + Send + use<> {
     use crate::context::state::context_id_to_bytes;
 
-    let context_id = state.handle.context_id().to_owned();
+    let context_id = cell.handle.context_id().to_owned();
     let ctx_id_bytes = context_id_to_bytes(&context_id);
 
+    // Provider-side teardown (retained): a no-op for an actor-owned (taken)
+    // context, but still covers a context whose crypto never migrated off the
+    // provider (e.g. a birth-window failure before `take_crypto_state`).
     if let Err(e) = deps.crypto.destroy_sender_key(&ctx_id_bytes) {
         tracing::debug!(
             context_id = %context_id,
@@ -603,6 +611,24 @@ fn handle_shutdown_self_actor(
             error = %e,
             "failed to destroy MLS group during shutdown — may already be gone"
         );
+    }
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) H4 — whole-crypto disposal at the actor
+    // destroy seam. Now that the actor is the SOLE owner of the per-context crypto
+    // (the provider `destroy_*` above is a no-op for a taken context), tear the
+    // ACTOR-OWNED material down explicitly through the field-granular Class-C view
+    // (teardown is best-effort, not a fail-closed persist obligation). This
+    // matches the disposal hygiene the deleted provider gave by dropping its whole
+    // `contexts` entry, and — critically — deletes the OpenMLS epoch secrets that a
+    // bare `PerContextState` drop would leave resident in OpenMLS storage. A
+    // broadcast context carries no `ContextCryptoState` (`crypto_mut() == None`) so
+    // this is a clean no-op there. NOT marked `mutated`: shutdown must not persist
+    // an emptied crypto over the durable snapshot (a later respawn rehydrates it).
+    {
+        let mut view = cell.class_c_view();
+        if let Some(crypto) = view.mode_mut().crypto_mut() {
+            crypto.dispose_secrets();
+        }
     }
     // No per-actor background timer tasks to cancel: the TTL + governance
     // timers are ACTOR-OWNED arms reconciled inside `ContextActor::run()`
@@ -677,19 +703,17 @@ fn handle_clear_needs_reconnect_actor(
 ///
 /// Issues an MLS Update proposal + self-Commit for post-compromise
 /// security (§9.12 step 2) via
-/// [`MlsCryptoProvider::advance_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::advance_epoch),
+/// [`PerContextState::advance_epoch`](crate::context::actor::state::PerContextState::advance_epoch),
 /// which preserves the `scp_wrapping_key` leaf extension (§9.16.1) and
 /// advances the group epoch locally. Replies with the TLS-serialized MLS
 /// Commit bytes for the caller to distribute to all members. Used by the
 /// reconnection driver's Phase 5.
-fn handle_issue_mls_update_actor(
+async fn handle_issue_mls_update_actor(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
 ) -> Outcome<()> {
-    use crate::context::state::context_id_to_bytes;
-
     // Broadcast contexts have no MLS group — an Update is meaningless.
     // Pure read via `Deref` on the cell.
     if cell.broadcast_context.is_some() {
@@ -699,34 +723,37 @@ fn handle_issue_mls_update_actor(
         return Outcome::ok(());
     }
 
-    let ctx_id_bytes = context_id_to_bytes(context_id);
-    let result = deps
-        .crypto
-        .advance_epoch(&ctx_id_bytes)
-        .map(|out| out.commit_bytes);
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001, advance_epoch ruling): the MLS epoch
+    // advance is §9 Class-S — the MLS ratchet AND the `mls_epoch` counter that
+    // `LocalMlsEpoch` reads must be durable before ack (a coalesced roll-back
+    // would leave remaining members on a new epoch while this node still reports
+    // the old one). Drive the actor's `advance_epoch` inside `commit_class_s_keep`
+    // -> `rest_mut` so both ride the ONE fail-closed persist. The former SEPARATE
+    // coalesced `epoch.mls_epoch += 1` mirror (an artifact of the old
+    // provider-authoritative arch, where the provider ratcheted and the actor only
+    // shadowed) is subsumed here: the actor `advance_epoch` ratchets the group but
+    // does not itself bump the `mls_epoch` scalar, so the single authoritative bump
+    // now lives in the Class-S closure. `wrapping_public_key` comes from the
+    // retained `deps.crypto.wrapping_keypair()`.
+    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    let result = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            let out = s.advance_epoch(wrapping_public_key)?;
+            s.epoch.mls_epoch = s.epoch.mls_epoch.saturating_add(1);
+            Ok(out.commit_bytes)
+        })
+        .await;
 
-    // advance_epoch ratchets the supervisor-owned MLS group to a new
-    // epoch; mirror the local epoch onto actor-owned state so a
-    // subsequent LocalMlsEpoch query reflects the advance. This is a
-    // COALESCED Class-C mutation (the run loop persists on `mutated`), so it
-    // routes through the non-persisting `class_c_view`.
-    let mutated = if result.is_ok() {
-        let mut view = cell.class_c_view();
-        let epoch = view.epoch_mut();
-        epoch.mls_epoch = epoch.mls_epoch.saturating_add(1);
-        true
-    } else {
-        false
-    };
-
+    let mutated = result.is_ok();
     let _ = reply.send(result);
     if mutated {
         Outcome::ok_mutated(())
     } else {
-        // advance_epoch failed — the early `result.is_ok()` branch did NOT
-        // bump the epoch, so no actor-owned state changed. Report an
-        // unmutated error so the actor's post-dispatch persistence does not
-        // treat this turn as dirtying state.
+        // advance_epoch (or its fail-closed persist) failed — preserve the
+        // handler's existing disposition: report an unmutated error so the
+        // post-dispatch persistence does not treat this turn as dirtying state
+        // (the fail-closed persist inside the combinator is authoritative).
         Outcome::err(ContextError::CryptoFailed(format!(
             "IssueMlsUpdate failed for context {context_id}"
         )))

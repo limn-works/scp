@@ -86,16 +86,30 @@ pub struct RemoveMemberRaw {
     pub group_info: Option<Vec<u8>>,
 }
 
-/// Output of `validate_key_package` — wraps the validated bytes.
+/// Output of `validate_key_package` — the validated bytes plus the identity
+/// the validated leaf credential authenticates.
 ///
-/// `validate_key_package` returns a plain success marker plus the canonical
-/// bytes of the validated `KeyPackage`. The raw bytes are kept on the
-/// successful path so handler code can re-serialize for storage (key package
-/// pool) without re-running validation.
+/// `validate_key_package` runs the full stateless `KeyPackage` validation
+/// (signature / protocol / hardened-clock lifetime / SCP ciphersuite) exactly
+/// once and returns both the canonical bytes of the validated `KeyPackage` and
+/// the credential DID extracted from that same validated leaf. Callers use
+/// `key_package_bytes` to re-serialize for storage (key package pool) and
+/// `credential_did` to bind the `KeyPackage` to an expected identity — both
+/// WITHOUT re-running validation or re-parsing the bytes to re-extract the DID
+/// (which would re-validate the same `KeyPackage` a second time).
 #[derive(Debug, Clone)]
 pub struct ValidatedKeyPackage {
     /// The TLS-serialized `KeyPackage` bytes that passed validation.
     pub key_package_bytes: Vec<u8>,
+    /// The DID authenticated by the validated leaf credential.
+    ///
+    /// Extracted from the SAME validated `KeyPackage` leaf that produced
+    /// `key_package_bytes` (leaf credential → `BasicCredential` → SCP
+    /// credential → `did`), so it is authenticated under the exact validation
+    /// (and hardened-clock lifetime) the bytes passed. Callers compare this
+    /// against the expected owner / member DID to bind the `KeyPackage` to an
+    /// identity, with no second validation pass.
+    pub credential_did: String,
 }
 
 /// Output of `generate_key_package` — pairs the wire bytes with the opaque

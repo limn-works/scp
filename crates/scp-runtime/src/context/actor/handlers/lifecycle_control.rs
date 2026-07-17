@@ -130,23 +130,35 @@ fn handle_prepare_for_replace(
         return Outcome::ok(());
     }
 
-    // §23.17 Invariant 3/4: capture-before-teardown + restore + validate/merge
-    // the per-sender epoch floors (replay-regression guard), via the SINGLE
-    // floor-guarded helper shared with the supervisor-side import branches so
-    // no path can bypass the guard. On any failure (e.g. a
-    // `SnapshotFloorRegression` replay rejection) the helper has already rolled
-    // back the crypto; surface the error and leave the actor live (NO terminal
-    // claim) so a rejected/replayed import cannot terminate a live context.
-    // `PrepareForReplace` is driven by `import_context` — an UNTRUSTED peer
-    // snapshot. Use Invariant 3 (reject-on-regression): `trusted_local = false`.
-    if let Err(e) = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+    // §23.17 Invariant 3/4: run the per-sender epoch-floor validate/merge GATE
+    // (replay-regression guard) via the SINGLE floor-guarded helper shared with
+    // the supervisor-side import flow so no path can bypass the guard. On any
+    // failure (e.g. a `SnapshotFloorRegression` replay rejection) surface the
+    // error and leave the actor live (NO terminal claim) so a rejected/replayed
+    // import cannot terminate this context. `PrepareForReplace` is driven by
+    // `import_context` — an UNTRUSTED peer snapshot. Use Invariant 3
+    // (reject-on-regression): `trusted_local = false`.
+    //
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 seed-vs-terminal: this actor is
+    // TERMINATING (it claims itself `Closed` and exits just below), so it SEEDS
+    // NOTHING — the OWNED crypto material the helper rebuilds here is DROPPED
+    // immediately (the `Ok(_owned)` arm), zeroizing on drop. Its ONLY purpose on
+    // this path is to run the floor gate as the reject-before-terminal barrier.
+    // `import_context` rebuilds + SEEDS the owned crypto onto the fresh
+    // replacement actor after this actor is despawned; the floor merge is
+    // idempotent, so running it here (gate) and there (seed) is safe, and no two
+    // live copies ever seal (the dropped copy never encrypts anything).
+    match crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
         deps,
         &ctx_id_bytes,
         mls_state,
         false,
     ) {
-        let _ = reply.send(Err(e));
-        return Outcome::ok(());
+        Ok(_owned) => { /* terminal actor seeds nothing — drop the owned material */ }
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            return Outcome::ok(());
+        }
     }
 
     // Claim the slot terminal (rejects a racing second PrepareForReplace)

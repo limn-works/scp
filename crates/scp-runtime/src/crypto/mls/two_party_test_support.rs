@@ -2,24 +2,28 @@
 //!
 //! [`stand_up_two_party`] stands up Alice (creator) and Bob (joiner) over the
 //! REAL end-to-end join path — Bob reserves a `KeyPackage` from his own
-//! `KeyPackageStoreActor`, Alice adds that KP and emits a Welcome, Alice signs
-//! and HPKE-seals a §5.12.3 [`InvitationBundle`], and Bob installs the joined
-//! group through [`Supervisor::spawn_actor_from_welcome`]. It replaces the
-//! legacy TEST-ONLY `MlsCryptoProvider::prepare_key_package_for_join` /
-//! `MlsCryptoProvider::join_from_welcome` shortcut the old fixtures used (those
-//! provider methods are being retired).
+//! `KeyPackageStoreActor`, Alice adds that KP and emits a Welcome, and Bob
+//! confirms the join at the PROVIDER level (the real fused `ConfirmConsume` join
+//! → the joined `ScpMlsGroup`) and installs it via `install_joined_group`. It
+//! deliberately does NOT drive the full [`Supervisor::spawn_actor_from_welcome`]
+//! entrypoint, which moves the joiner's crypto ONE-WAY into a spawned actor
+//! (ADR-049 PR-7 C2) — this fixture must return providers that still OWN their
+//! per-context crypto so consumers can `take_crypto_state` each onto an actor.
 //!
 //! Alice is a BARE `MlsCryptoProvider` that hand-seals the bundle (no creator
 //! `Supervisor` needed); Bob is driven through a real joiner `Supervisor`. After
-//! the join, Alice distributes her sender key to Bob (setting Bob's sender-key
-//! high-water for Alice to epoch 1) — the exact behaviour the H9 receive-ceiling
-//! fixtures and the app-data / agent-binding pipeline fixtures depend on.
+//! the join, Bob PULLS Alice's sender key via the §9.16.2 request/response
+//! protocol (the provider PUSH drain is deleted post-ADR-049 PR-7) so Bob can
+//! decrypt Alice's application sends — the exact behaviour the H9
+//! receive-ceiling fixtures and the app-data / agent-binding pipeline fixtures
+//! depend on.
 //!
 //! The helper is SYNC (its callers are sync `#[test]` functions) and drives the
 //! async join on an internal current-thread runtime. After the join the joiner's
-//! MLS group lives in Bob's provider (`install_joined_group`), so the returned
-//! `Arc<MlsCryptoProvider>` pair `seal`/`open`/`export_crypto_state` even after
-//! the `Supervisor` and runtime are dropped.
+//! MLS group lives in Bob's provider (`install_joined_group`), so each returned
+//! `Arc<MlsCryptoProvider>` still owns its per-context crypto material and can be
+//! destructively `take_crypto_state`'d onto the actor seam (where the deleted
+//! steady-state twins now live) even after the `Supervisor` and runtime drop.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // `spawn_actor_from_welcome` returns a deliberately large state-building future;
@@ -29,17 +33,14 @@
 
 use std::sync::Arc;
 
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::SigningKey;
 use scp_did::DID;
 use scp_platform::KeyCustody;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling};
-use scp_protocol::context::{
-    ContextMode, ContextParams, InvitationBundle, InvitationKeyMaterial, ScpContextExtension,
-};
-use scp_protocol::crypto::envelope_seal::{ed25519_pubkey_to_x25519, hpke_seal_invitation};
+use scp_protocol::context::{ContextMode, ContextParams, ScpContextExtension};
 use zeroize::Zeroizing;
 
 use super::provider::MlsCryptoProvider;
@@ -47,11 +48,9 @@ use super::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter}
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
 };
-use crate::context::invitation_helpers::{SnapshotRuntimeFacts, build_metadata_snapshot};
 use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::supervisor::Supervisor;
-use crate::context::supervisor::WelcomeJoinRequest;
-use crate::context::supervisor::key_package_actor::ReservationId;
+use crate::context::supervisor::key_package_actor::KeyPackageCommand;
 
 /// Alice's (creator) fixed bundle-signing key. The bootstrap resolver maps
 /// `alice_did` to its verifying key so the joiner can verify the creator-signed
@@ -66,18 +65,28 @@ pub fn alice_signing_key() -> SigningKey {
 /// Bob's (joiner) fixed #active key. Bob's custody imports THIS seed and the
 /// resolver maps `bob_did` to its verifying key, so a bundle sealed to the
 /// resolved #active opens with the identical private key.
-fn bob_signing_key() -> SigningKey {
+// `pub(crate)` (crate-internal — seam-level e2e tests sign Bob's inner envelopes /
+// sender-key requests with the SAME key the pair resolver maps `bob_did` to). The
+// explicit `pub(crate)` keeps this test helper out of the source-text
+// `check-cross-layer` gate with no PR-body exemption; `redundant_pub_crate` is a
+// false positive because the enclosing `two_party_test_support` module is already
+// `pub(crate)` yet the helper is reached crate-wide.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn bob_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB0; 32])
 }
 
-/// A REAL §9.10.4 local pseudonym (a distinctive non-`[0u8; 32]` constant). The
-/// spawn-from-Welcome entrypoint rejects `None` for the encrypted join surface.
-const PSEUDONYM: [u8; 32] = [0x5a; 32];
-
 /// Resolves `alice_did` / `bob_did` to their fixed verifying keys (all else
 /// `None`). The joiner verifies the creator (`alice`) signature; the seal
-/// addresses the invitee (`bob`) #active key.
-fn pair_resolver(alice_did: &str, bob_did: &str) -> KeyResolver {
+/// addresses the invitee (`bob`) #active key. `pub(crate)` (crate-internal) so
+/// seam-level e2e tests can hand a real DID→key resolver to a production
+/// `ActorDeps` (e.g. to verify a §9.16.2 sender-key request signature). The
+/// explicit `pub(crate)` keeps this test helper out of the source-text
+/// `check-cross-layer` gate with no PR-body exemption; `redundant_pub_crate` is a
+/// false positive (the enclosing module is `pub(crate)`, the helper is reached
+/// crate-wide).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn pair_resolver(alice_did: &str, bob_did: &str) -> KeyResolver {
     let alice = DID::from(alice_did);
     let bob = DID::from(bob_did);
     let alice_vk = alice_signing_key().verifying_key();
@@ -128,118 +137,6 @@ fn honest_ext(context_id: &str, creator_did: &str, params: &ContextParams) -> Sc
     .expect("honest context extension serializes")
 }
 
-/// Builds a signed [`InvitationBundle`] (creator = `signer`) carrying `params`,
-/// `context_id`, and `welcome_bytes`, with a structural snapshot copied verbatim
-/// from `params`. The signature is over the §5.12.3.1 signing hash.
-fn signed_bundle(
-    signer: &SigningKey,
-    creator_did: &DID,
-    context_id: &str,
-    params: &ContextParams,
-    welcome_bytes: Vec<u8>,
-) -> InvitationBundle {
-    let facts = SnapshotRuntimeFacts {
-        member_count: Some(1),
-        creator_did: Some(creator_did.clone()),
-        ..SnapshotRuntimeFacts::default()
-    };
-    let mut bundle = InvitationBundle {
-        context_id: context_id.to_owned(),
-        creator_did: creator_did.clone(),
-        relay_urls: vec![],
-        welcome_message: welcome_bytes,
-        key_material: InvitationKeyMaterial {
-            context_metadata_key: [7u8; 32],
-            sender_key_seed: None,
-        },
-        context_params: params.clone(),
-        metadata_snapshot: build_metadata_snapshot(params, facts),
-        signature: vec![],
-    };
-    let hash = bundle
-        .invitation_bundle_signing_hash()
-        .expect("signing hash");
-    bundle.signature = signer.sign(&hash).to_bytes().to_vec();
-    bundle
-}
-
-/// HPKE-seals a validly-signed bundle into a reshaped [`WelcomeJoinRequest`]
-/// addressed to `recipient_x25519`, with a real pseudonym.
-fn seal_join_request(
-    signer: &SigningKey,
-    creator_did: &DID,
-    context_id: &str,
-    params: &ContextParams,
-    welcome_bytes: Vec<u8>,
-    recipient_x25519: &[u8; 32],
-    reservation_id: ReservationId,
-) -> WelcomeJoinRequest {
-    let bundle = signed_bundle(signer, creator_did, context_id, params, welcome_bytes);
-    let wire = bundle.to_wire_bytes().expect("bundle serializes");
-    let (ct, enc) = hpke_seal_invitation(&wire, recipient_x25519, context_id, creator_did.as_ref())
-        .expect("HPKE seal");
-    WelcomeJoinRequest {
-        context_id: context_id.to_owned(),
-        creator_did: creator_did.clone(),
-        sealed_bundle_enc: enc,
-        sealed_bundle_ct: ct,
-        reservation_id,
-        local_pseudonym: Some(PSEUDONYM),
-    }
-}
-
-/// Parameterized seal for callers that already hold a LIVE creator `Supervisor`
-/// (e.g. the agent-binding pipeline fixture, which drives `sup.send_message`).
-/// Signs a §5.12.3 [`InvitationBundle`] with `creator_signing_key`, seals it to
-/// `recipient_active_verifying_key` (an Ed25519 #active key, mapped to X25519
-/// here), and returns the reshaped [`WelcomeJoinRequest`]. The joiner's
-/// `Supervisor` must carry a resolver that maps `creator_did` to
-/// `creator_signing_key.verifying_key()` so the creator signature verifies.
-///
-/// # Panics
-///
-/// Panics if the Ed25519→X25519 mapping, bundle serialization, or HPKE seal
-/// fails — this is a test-only helper.
-// Gated to `feature = "testing"` to match its sole caller — the
-// `#[cfg(feature = "testing")]` agent-binding pipeline fixture. Under a plain
-// `cfg(test)` build (the provider-level fixtures) it has no caller, so gating it
-// alongside the caller avoids a dead-code warning while keeping the shared
-// `stand_up_two_party` path available to both.
-#[cfg(feature = "testing")]
-#[allow(clippy::too_many_arguments)]
-pub fn seal_welcome_for_joiner(
-    creator_signing_key: &SigningKey,
-    creator_did: &DID,
-    context_id: &str,
-    params: &ContextParams,
-    welcome_bytes: Vec<u8>,
-    recipient_active_verifying_key: &[u8; 32],
-    reservation_id: ReservationId,
-    local_pseudonym: [u8; 32],
-) -> WelcomeJoinRequest {
-    let recipient_x25519 = ed25519_pubkey_to_x25519(recipient_active_verifying_key)
-        .expect("map recipient's #active ed25519 key to x25519");
-    let bundle = signed_bundle(
-        creator_signing_key,
-        creator_did,
-        context_id,
-        params,
-        welcome_bytes,
-    );
-    let wire = bundle.to_wire_bytes().expect("bundle serializes");
-    let (ct, enc) =
-        hpke_seal_invitation(&wire, &recipient_x25519, context_id, creator_did.as_ref())
-            .expect("HPKE seal");
-    WelcomeJoinRequest {
-        context_id: context_id.to_owned(),
-        creator_did: creator_did.clone(),
-        sealed_bundle_enc: enc,
-        sealed_bundle_ct: ct,
-        reservation_id,
-        local_pseudonym: Some(local_pseudonym),
-    }
-}
-
 fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
     Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
         InMemoryStorage::new(),
@@ -277,10 +174,11 @@ pub fn bob_supervisor(
 }
 
 /// Stands up a two-party joined pair (Alice creator, Bob joiner) over the REAL
-/// reserve → creator-add → sign → HPKE-seal → `spawn_actor_from_welcome` path,
-/// then distributes Alice's sender key to Bob (Bob's sender-key high-water for
-/// Alice becomes epoch 1). Returns `(alice, bob, ctx_bytes)` where both
-/// providers `seal`/`open` the group keyed by `context_id_bytes(ctx_str)`.
+/// reserve → creator-add → `ConfirmConsume` → `install_joined_group` path, then
+/// has Bob PULL Alice's sender key via the §9.16.2 request/response protocol
+/// (Bob's sender-key high-water for Alice becomes epoch 1). Returns
+/// `(alice, bob, ctx_bytes)` where both providers still OWN the per-context
+/// crypto for the group keyed by `context_id_bytes(ctx_str)`.
 ///
 /// # Panics
 ///
@@ -302,7 +200,6 @@ pub fn stand_up_two_party(
         .build()
         .unwrap()
         .block_on(async move {
-            let alice = DID::from(alice_did);
             let bob = DID::from(bob_did);
 
             // Bob's joiner supervisor + a clone of his provider (holds the group
@@ -350,54 +247,99 @@ pub fn stand_up_two_party(
                 .expect("alice adds bob's reserved key package");
 
             // Bob's #active custody holds the SAME seed the resolver returns for
-            // `bob_did`, so the bundle sealed to that resolved #active opens.
+            // `bob_did` — used below to sign Bob's §9.16.2 sender-key pull request.
             let bob_custody = InMemoryKeyCustody::new();
             let bob_handle = bob_custody
                 .import_ed25519_signing_key(&Zeroizing::new(bob_signing_key().to_bytes()))
                 .await
                 .expect("import bob's #active seed into custody");
 
-            // Hand-seal the creator-signed §5.12.3 bundle to Bob's #active and
-            // install the joined group into Bob's provider via the real spawn path.
-            let bob_recipient =
-                ed25519_pubkey_to_x25519(bob_signing_key().verifying_key().as_bytes())
-                    .expect("map bob's #active ed25519 key to x25519");
-            let req = seal_join_request(
-                &alice_signing_key(),
-                &alice,
-                ctx_str,
-                &params,
-                add_output.welcome_bytes,
-                &bob_recipient,
-                reservation_id,
-            );
-            bob_sup
-                .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+            // Bob confirms the join at the PROVIDER level (the real fused
+            // `ConfirmConsume` join → the joined `ScpMlsGroup`) and installs it
+            // into his provider via `install_joined_group`, KEEPING the crypto
+            // provider-resident. The full `spawn_actor_from_welcome` entrypoint
+            // moves the crypto ONE-WAY into a spawned actor (ADR-049 PR-7 C2),
+            // which would leave `bob_crypto` empty; this fixture must return
+            // providers that still OWN their per-context crypto so consumers'
+            // `take_crypto_state` seam can move each into an actor exactly once.
+            let bob_deps = bob_sup
+                .build_actor_deps(&bob)
                 .await
-                .expect("bob installs the joined group from alice's real invitation");
+                .expect("build bob's actor deps");
+            let joined_group = bob_deps
+                .key_package_store
+                .send(|reply| KeyPackageCommand::ConfirmConsume {
+                    reservation_id,
+                    welcome_bytes: add_output.welcome_bytes,
+                    reply,
+                })
+                .await
+                .expect("bob confirms the join and receives the joined MLS group");
+            bob_crypto
+                .install_joined_group(&ctx_bytes, joined_group)
+                .expect("install bob's joined group into his provider");
 
-            // Bob mints his own sender key (the install already seeded one at epoch
-            // 1; this rotates it to a fresh value, matching the old fixture), then
-            // Alice distributes HER sender key to Bob so Bob's sender-key high-water
-            // for Alice becomes epoch 1 (the H9 ceiling anchor) and Bob can decrypt
-            // Alice's application sends.
+            // Bob mints his own sender key (the install already seeded one; this
+            // rotates it to a fresh value, matching the old fixture), then Bob
+            // acquires Alice's sender key so he can decrypt her application sends.
             bob_crypto
                 .generate_sender_key(&ctx_bytes)
                 .expect("bob mints his sender key");
-            alice_crypto
-                .distribute_sender_key(&ctx_bytes, bob_did)
-                .expect("alice distributes her sender key to bob");
-            for (_target, msg) in alice_crypto
-                .drain_pending_sender_key_messages(&ctx_bytes)
-                .expect("drain alice's pending sender-key messages")
-            {
-                let (key, _epoch) = bob_crypto
-                    .process_incoming_sender_key(&ctx_bytes, alice_did, &msg)
-                    .expect("bob processes alice's distributed sender key");
-                // ADR-049 PR-6: install the authenticated key (decomposed
-                // process_incoming no longer installs).
-                bob_crypto.set_sender_key_unchecked(&ctx_bytes, alice_did, key);
-            }
+
+            // Bob PULLS Alice's sender key via the §9.16.2 request/response
+            // protocol. Post-ADR-049 PR-7 the provider PUSH `drain_pending_
+            // sender_key_messages` twin is DELETED; the pull path uses only the
+            // retained receive-side provider methods (`handle_sender_key_request`
+            // / `store_member_sender_key` / `set_sender_key_unchecked`) and keeps
+            // BOTH parties as providers so the golden `take_into_actor` seam can
+            // destructively move each into an actor exactly once.
+            let request = crate::crypto::sender_keys::key_protocol::request_sender_key(
+                &bob_custody,
+                &bob_handle,
+                bob_did,
+                alice_did,
+                0, // bob's initial sender-key epoch (not validated by the responder)
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("bob builds a signed sender-key request for alice's key");
+            let blocked = std::collections::HashSet::new();
+            let response_bytes = alice_crypto
+                .handle_sender_key_request(
+                    &ctx_bytes,
+                    &request.request_message,
+                    bob_signing_key().verifying_key().as_bytes(),
+                    &blocked,
+                )
+                .expect("alice accepts bob's sender-key request (H1 membership gate)")
+                .expect("alice returns a response for a non-blocked member");
+            // Decoded as a BARE `SenderKeyResponse` (NOT the tagged
+            // `SenderKeyDistributionMessage` envelope) by design: this fixture
+            // answers via the test-only PROVIDER copy
+            // `MlsCryptoProvider::handle_sender_key_request`, which serializes a
+            // bare `SenderKeyResponse` (`to_vec_named`) and — per its own doc —
+            // carries NO framing obligation to the actor's
+            // `SenderKeyDistributionMessage` wire shape. So `from_bytes` would find
+            // no `msg_type` tag; the bare decode is the correct match here. (The
+            // actor-path fixture in `spawn_from_welcome_tests.rs` decodes the
+            // wrapped envelope instead.)
+            let response: scp_protocol::crypto::sender_keys::SenderKeyResponse =
+                rmp_serde::from_slice(&response_bytes).expect("decode alice's SenderKeyResponse");
+            let ctx_id_hex = hex::encode(ctx_bytes);
+            let alice_key = crate::crypto::sender_keys::key_protocol::open_sender_key_response(
+                &bob_custody,
+                &request.wrapping_key_handle,
+                &ctx_id_hex,
+                &response,
+            )
+            .await
+            .expect("bob opens alice's HPKE-sealed sender key");
+            // ADR-049 PR-6: store returns the authenticated (key, epoch); install
+            // is a separate explicit `set_sender_key_unchecked`.
+            let (alice_key, _epoch) = bob_crypto
+                .store_member_sender_key(&ctx_bytes, alice_did, alice_key, response.epoch)
+                .expect("bob verifies + returns alice's pulled sender key");
+            bob_crypto.set_sender_key_unchecked(&ctx_bytes, alice_did, alice_key);
 
             // Drop the joiner supervisor; the installed group persists in
             // `bob_crypto` (a separate `Arc` clone of the same provider).

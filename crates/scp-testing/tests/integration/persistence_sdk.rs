@@ -15,7 +15,7 @@
 //! - [`scp_core::context::supervisor::Supervisor::with_providers`] — the
 //!   exact wiring point used by `UniffiBridgeInstance::with_storage_uniffi`
 //!   and its `PyO3`/NAPI siblings (see `crates/scp-ffi/**/runtime.rs`).
-//!   ADR-049 commit 12 deleted the legacy `ContextManager` builder; tests
+//!   ADR-049 §15 deleted the legacy `ContextManager` builder; tests
 //!   now compose providers directly through `Supervisor::with_providers`.
 //!
 //! Issues exercised:
@@ -177,7 +177,7 @@ async fn sqlite_storage_rejects_mismatched_key() {
 /// `SqliteStorage::new(dir, key)` → `ProtocolRepository::new(Arc<SqliteStorage>)`
 /// → `ProtocolRepositoryContextBridge::new(repo)` → attached to a
 /// `Supervisor` via `Supervisor::with_providers(.., persistence, ..)`.
-/// ADR-049 commit 12 deleted `ContextManager`; the bridges and tests now
+/// ADR-049 §15 deleted `ContextManager`; the bridges and tests now
 /// compose providers directly through this constructor.
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -198,7 +198,7 @@ async fn context_create_persists_membership_to_sqlite() {
         let repo = Arc::new(ProtocolRepository::new(storage));
         let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
 
-        // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+        // ADR-049 §15 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
             Arc::new(MlsCryptoProvider::new(
@@ -300,7 +300,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         let repo = Arc::new(ProtocolRepository::new(storage));
         let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
 
-        // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+        // ADR-049 §15 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
             Arc::new(MlsCryptoProvider::new(
@@ -369,7 +369,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     let repo2 = Arc::new(ProtocolRepository::new(storage2));
     let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo2)));
 
-    // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+    // ADR-049 §15 — `Supervisor::with_providers` replaces the
     // deleted `ContextManager::with_persistence(..)` constructor.
     let manager2 = Supervisor::with_providers(
         Arc::new(MlsCryptoProvider::new(

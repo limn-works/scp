@@ -3,7 +3,7 @@
 //! criterion.
 //!
 //! `OwnedIdentityDid` is the unforgeable token that proves the bearer's
-//! identity owns a particular [`ContextActor`]. The unforgeability
+//! identity owns a particular [`ContextActor`](crate::context::actor::ContextActor). The unforgeability
 //! guarantee — *a value of `OwnedIdentityDid` for a given DID can only
 //! come into existence via supervisor-module code* — rides on TWO
 //! mechanisms, both of which are real type-system enforcement, not

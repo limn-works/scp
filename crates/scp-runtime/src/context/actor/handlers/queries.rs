@@ -53,7 +53,7 @@ use crate::context::queries_helpers;
 /// run loop owns it; a `&mut` referent keeps the spawned dispatch future
 /// `Send`, which a shared `&ClassSCell` would not because `ClassSCell` is
 /// not `Sync`). The body only READS the owned state through
-/// [`Deref`](std::ops::Deref) — no [`ClassSCell::state_mut`] escape hatch
+/// [`Deref`](std::ops::Deref) — no `ClassSCell::state_mut` escape hatch
 /// (ADR-049 §9). Every helper called here takes `&PerContextState`; the
 /// lifecycle-state read is the lock-free `handle.state()` atomic load,
 /// which takes `&self`, so a shared borrow suffices.

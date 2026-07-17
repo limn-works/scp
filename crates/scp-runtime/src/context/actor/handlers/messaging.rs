@@ -189,7 +189,274 @@ pub(crate) async fn dispatch(
             signing_key,
             reply,
         } => handle_send_heartbeat(cell, deps, &context_id, &sender_did, &signing_key, reply).await,
+        #[cfg(feature = "testing")]
+        MessagingCommand::HandleSenderKeyRequest {
+            context_id,
+            request_bytes,
+            requester_public_key,
+            reply,
+        } => {
+            handle_handle_sender_key_request(
+                cell,
+                deps,
+                &context_id,
+                &request_bytes,
+                &requester_public_key,
+                reply,
+            )
+            .await
+        }
+        #[cfg(feature = "testing")]
+        MessagingCommand::LandSenderKeyResponse {
+            context_id,
+            sender_did,
+            sender_key,
+            epoch,
+            reply,
+        } => {
+            handle_land_sender_key_response(
+                cell,
+                deps,
+                &context_id,
+                &sender_did,
+                sender_key,
+                epoch,
+                reply,
+            )
+            .await
+        }
+        #[cfg(feature = "testing")]
+        MessagingCommand::InspectIncomingInner {
+            context_id,
+            envelope_bytes,
+            reply,
+        } => handle_inspect_incoming_inner(cell, deps, &context_id, &envelope_bytes, reply),
     }
+}
+
+/// Handle [`MessagingCommand::InspectIncomingInner`] (actor-shape, test-only).
+///
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) READ-ONLY inner-envelope inspection: the
+/// actor twin of the deleted provider `open` inspection twin. Drives ONLY
+/// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open)
+/// on the actor's OWNED crypto state and returns the raw decrypted
+/// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope) so the harness
+/// can read the wire-level `message_type` / `sequence` (§9.9.2 heartbeat AC2/AC3).
+///
+/// # Non-mutating receive-state invariant (§9)
+///
+/// This is the whole point of the surface. `cs.open` performs a PURE decrypt and
+/// surfaces `env.receive_floor`; it does NOT run the authoritative anti-replay
+/// gate (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
+/// mutate `nonce_dedup`, or change the epoch — all of which live at the messaging
+/// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+/// which this inspection deliberately does NOT invoke. The ONLY state change is
+/// the MLS decryption-ratchet advance intrinsic to decrypting a message (the
+/// deleted provider inspection twin was non-mutating in exactly this same sense);
+/// a successful open therefore reports `ok_mutated` so the coalesced Class-C
+/// persist captures that ratchet advance. Control / Management results (which
+/// carry no application inner header) and any decrypt failure return an error and
+/// mutate nothing beyond that same intrinsic ratchet step, so they report
+/// `ok_mutated` on a decoded-but-non-application open and `err` on a decrypt
+/// failure.
+///
+/// # Caveat — inspect-then-deliver consumes the MLS receive ratchet
+///
+/// Because a successful open advances the MLS decryption ratchet, inspecting an
+/// envelope and THEN delivering the same envelope through the real receive seam
+/// would fail the second decrypt (the ratchet step for that message is already
+/// spent). This surface is therefore test-only and one-shot per envelope: a
+/// harness inspects OR delivers a given ciphertext, never both. Never wire it
+/// ahead of the production receive path for a message you also intend to deliver.
+#[cfg(feature = "testing")]
+fn handle_inspect_incoming_inner(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    envelope_bytes: &[u8],
+    reply: oneshot::Sender<Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError>>,
+) -> Outcome<()> {
+    use scp_protocol::context::builder::OpenResult;
+
+    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+
+    let mut view = cell.class_c_view();
+    // A `None` crypto state is a context with no MLS group (a broadcast context,
+    // which never carries an MLS-wrapped inner envelope) — fail closed, matching
+    // `decrypt_and_dispatch`'s "no MLS group" error.
+    let Some(cs) = view.mode_mut().crypto_mut() else {
+        let err = ContextError::CryptoFailed(
+            "no MLS crypto state for inner-envelope inspection (context has no group)".to_string(),
+        );
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
+
+    // PURE decrypt: `cs.open` decrypts (outer → MLS → sender-key → inner) and
+    // surfaces `env.receive_floor`, but runs NONE of the receive-side anti-replay
+    // enforcement (that is at the messaging seam, which this path skips). No floor
+    // advance, no `nonce_dedup` mutation, no Class-M registry write, no epoch
+    // change — only the intrinsic MLS decryption-ratchet advance.
+    let (outcome, reply_result) =
+        match cs.open(&*deps.clock, &context_id_bytes, context_id, envelope_bytes) {
+            Ok(OpenResult::Application(env)) => (Outcome::ok_mutated(()), Ok(env.inner)),
+            Ok(OpenResult::Control) => {
+                let err = ContextError::CryptoFailed(
+                    "open_inner_envelope: blob decoded to Control, not an application envelope"
+                        .to_string(),
+                );
+                (Outcome::ok_mutated(()), Err(err))
+            }
+            Ok(OpenResult::Management { .. }) => {
+                let err = ContextError::CryptoFailed(
+                    "open_inner_envelope: blob decoded to Management, not an application envelope"
+                        .to_string(),
+                );
+                (Outcome::ok_mutated(()), Err(err))
+            }
+            Err(e) => {
+                let sketch = outcome_error_sketch(&e);
+                let _ = reply.send(Err(e));
+                return Outcome::err(sketch);
+            }
+        };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`MessagingCommand::HandleSenderKeyRequest`] (actor-shape, test-only).
+///
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2 ANSWER half reached by
+/// `context_id`: drives the actor-owned
+/// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request)
+/// and returns the ephemeral-sealed `SenderKeyResponse` bytes straight back to
+/// the caller (the full-stack harness, which drives the requester side with its
+/// own custody — actor-loop request INITIATION is deferred #2049). Mirrors
+/// `handle_handle_broadcast_key_request`. The answer seals to
+/// the requester's EPHEMERAL wrapping key, so it needs no signing key; only the
+/// Class-C crypto replay cache (`nonce_dedup`) is mutated on a successful answer,
+/// so a produced answer reports `ok_mutated` (an over-mark on the blocked
+/// `Ok(None)` case is a harmless extra coalesced persist; an error mutates
+/// nothing and reports `err`).
+#[cfg(feature = "testing")]
+async fn handle_handle_sender_key_request(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    request_bytes: &[u8],
+    requester_public_key: &[u8; 32],
+    reply: oneshot::Sender<Result<Option<Vec<u8>>, ContextError>>,
+) -> Outcome<()> {
+    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+    let local_did = deps.crypto.local_did().to_owned();
+    let now_secs = deps.clock.now_secs();
+    // No per-context sender-key block list is resident on the actor (the
+    // blocking-flow wiring into the actor answer path is a forward-only follow-up,
+    // tracked in #2146); the §9.16.6 Mitigation-1 membership gate on the MLS group
+    // tree is the live Sybil defense.
+    let blocked = std::collections::HashSet::new();
+
+    let mut view = cell.class_c_view();
+    let answer_fut = async {
+        // A `None` crypto state is a context with no MLS group (a broadcast
+        // context, which never reaches the §9.16.2 sender-key pull path) — fail
+        // closed, matching `decrypt_and_dispatch`'s "no MLS group" error.
+        let cs = view.mode_mut().crypto_mut().ok_or_else(|| {
+            ContextError::CryptoFailed(
+                "no MLS crypto state for sender-key request (context has no group)".to_string(),
+            )
+        })?;
+        cs.handle_sender_key_request(
+            &context_id_bytes,
+            &local_did,
+            now_secs,
+            request_bytes,
+            requester_public_key,
+            &blocked,
+        )
+    };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, answer_fut).await {
+        Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "handle_sender_key_request exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`MessagingCommand::LandSenderKeyResponse`] (actor-shape, test-only).
+///
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2 install-onto-ACTOR
+/// (GATE-BEFORE-INSTALL): GATES the authenticated `(sender_did, epoch)` against
+/// the authoritative Class-M floor registry
+/// (`check_and_advance_sender_epoch`, FAIL-CLOSED) and, only on success, installs
+/// the key onto the actor-owned `cs.sender_key_store` (a Class-C coalesced
+/// mutation). The gate runs before any cell borrow, so a regressing/poisoned
+/// epoch is rejected with the key NEVER reaching the store. The requester
+/// (harness) already HPKE-opened the ephemeral-sealed response with its own
+/// wrapping secret; the provider store is empty on a taken context, so the
+/// install MUST land on the actor.
+#[cfg(feature = "testing")]
+async fn handle_land_sender_key_response(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    sender_did: &str,
+    sender_key: scp_protocol::crypto::sender_keys::SenderKey,
+    epoch: u64,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+
+    // GATE first (FAIL-CLOSED, no cell borrow) — the Class-M registry enforces
+    // epoch monotonicity + the poisoning ceiling and advances the authoritative
+    // in-memory Class-M floor (durable at the next coalesced snapshot, coherently
+    // with the Class-C install below) before we touch the store.
+    if let Err(e) = deps.supervisor.check_and_advance_sender_epoch(
+        &context_id_bytes,
+        sender_did,
+        epoch,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+    ) {
+        let e: ContextError = e.into();
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    // INSTALL onto the actor-owned store (Class-C coalesced).
+    let ctx_id_hex = hex::encode(context_id_bytes);
+    {
+        let mut view = cell.class_c_view();
+        // A `None` crypto state is a context with no MLS group (broadcast); the
+        // §9.16.2 pull-response install never applies there — fail closed.
+        let Some(cs) = view.mode_mut().crypto_mut() else {
+            let err = ContextError::CryptoFailed(
+                "no MLS crypto state for sender-key install (context has no group)".to_string(),
+            );
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Outcome::err(sketch);
+        };
+        cs.sender_key_store
+            .set_unchecked(&ctx_id_hex, sender_did, sender_key);
+    }
+
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
 }
 
 /// Handle [`MessagingCommand::SeedPeerPseudonym`] (actor-shape, test-only).
@@ -573,6 +840,26 @@ async fn handle_deliver_incoming(
         // `view` drops here, releasing the `&mut cell` borrow.
     };
 
+    // ADR-049 PR-7 §9.16.2 answer transmit: a PULL request handled inside
+    // `decrypt_and_dispatch` enqueued its ephemeral-sealed answer on the actor's
+    // `pending_distributions`. The deliver view has dropped; re-acquire the
+    // Class-C crypto view and MLS-wrap + transport-send the queued answer(s)
+    // through the existing drain path (reused verbatim from the join / rotate
+    // transmit). A no-op when nothing was queued (the ordinary case). The drain
+    // is best-effort by construction (per-recipient send failures are logged, the
+    // requester recovers via a fresh request), so its `Result` — which cannot
+    // actually error for the actor's in-memory `std::mem::take` drain — is not
+    // allowed to fail the just-completed delivery ack.
+    {
+        let mut view = cell.class_c_view();
+        let _ = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            view.mode_mut().crypto_mut(),
+            context_id,
+        )
+        .await;
+    }
+
     // Fail-closed persist of an applied downward-auth mutation (ADR-049 §9,
     // keep-direction): the mutation (suspension or `AssignRole` demotion) is
     // already in memory; committing the obligation's token makes it durable before
@@ -791,10 +1078,12 @@ async fn handle_build_local_checkpoint(
     // failure is logged but never fails the build (the reconnection driver
     // still receives + records the local checkpoint). Mirrors the
     // periodic `create_and_broadcast_checkpoint_if_due` contract.
-    // `send_checkpoint` takes a SHARED `&PerContextState`, reachable via `&*cell`.
+    // ADR-049 PR-7: `send_checkpoint` takes `&mut ClassSCell` (Send) and seals on
+    // the actor crypto view; `cell` is free here (the checkpoint-build view borrow
+    // above ended) and `checkpoint` is owned.
     if let Err(e) = crate::context::messaging_helpers::send_checkpoint(
         deps,
-        &*cell,
+        cell,
         context_id,
         sender_did,
         &sk,
@@ -861,11 +1150,17 @@ fn handle_compare_remote_checkpoint(
 /// per-call — the signing key is not actor-owned state. Routing the send
 /// through the actor serializes it with the context's other sends.
 ///
-/// Synchronous (the send body has no awaits); no `tokio::time::timeout`
-/// wrapper required. Forwards the `send_heartbeat` result verbatim:
-/// `Ok(())` on success, or the transport error if every fan-out send fails.
-/// The send does not mutate per-context state (it uses sequence `0` and
-/// touches no counters), so this reports [`Outcome::ok`] / [`Outcome::err`].
+/// Forwards the `send_heartbeat` result verbatim: `Ok(())` on success, or the
+/// transport error if every fan-out send fails. Although a heartbeat does not
+/// consume the application content SEQUENCE (it uses sequence `0`), sealing the
+/// encrypted `Heartbeat` envelope advances the actor-owned MLS group's
+/// send-ratchet GENERATION — per-context crypto state (Class-C, coalesced at the
+/// next snapshot) that a `mutated: false` would silently drop on a ≤50ms crash.
+/// This handler therefore reports [`Outcome::ok_mutated`] / [`Outcome::err_mutated`]
+/// (the seal runs BEFORE the fan-out, so even an empty-routing no-op and a
+/// post-seal transport failure have already advanced the generation), matching
+/// [`handle_send_message`] and `handle_build_local_checkpoint`. See ADR-049 §9
+/// (the MLS own-leaf send-generation residual, tracked in #2149).
 // `needless_pass_by_ref_mut`: the `&mut ClassSCell` is only read (`&*cell`), but
 // the `&mut` is load-bearing for Send — this async handler holds the cell borrow
 // across the `send_heartbeat` await, and `&mut ClassSCell` is Send whereas
@@ -889,19 +1184,30 @@ async fn handle_send_heartbeat(
     // actor future. `send_heartbeat` reads the shared `&*cell` in its sync
     // prelude (ADR-049 Decision 7).
     let sk = signing_key.to_signing_key();
-    let result = crate::context::messaging_helpers::send_heartbeat(
-        deps, &*cell, context_id, sender_did, &sk,
-    )
-    .await;
+    let result =
+        crate::context::messaging_helpers::send_heartbeat(deps, cell, context_id, sender_did, &sk)
+            .await;
     match result {
         Ok(()) => {
             let _ = reply.send(Ok(()));
-            Outcome::ok(())
+            // The encrypted-context heartbeat SEALS an MLS `Heartbeat` envelope,
+            // advancing the actor-owned MLS group's send-ratchet generation
+            // (Class-C; coalesced with the next snapshot). Report `mutated` so the
+            // actor coalesces that advance — the seal in `encrypt_and_send` runs
+            // BEFORE the empty-routing no-op check, so even a peerless heartbeat
+            // has already advanced the generation. (A broadcast-context heartbeat
+            // seals nothing; over-marking `mutated` there is harmless — it only
+            // triggers a redundant coalesced snapshot of unchanged state.)
+            Outcome::ok_mutated(())
         }
         Err(e) => {
+            // A fan-out transport failure can occur AFTER the seal already advanced
+            // the generation, so report `mutated` on the error path too (the seal's
+            // ratchet advance must still be coalesced) — same disposition as
+            // `handle_send_message`'s `err_mutated` failure arm.
             let sketch = outcome_error_sketch(&e);
             let _ = reply.send(Err(e));
-            Outcome::err(sketch)
+            Outcome::err_mutated(sketch)
         }
     }
 }
@@ -916,7 +1222,7 @@ async fn handle_send_heartbeat(
 /// dispatch loop) — the `result` field carries a representative
 /// variant (preserving the `TransportTimeout` / `TransportFailed` /
 /// `CryptoFailed` classification when recoverable from the
-/// `Display` string). This is a shim workaround; commit 12 deletes
+/// `Display` string). This is a shim workaround; ADR-049 §15 deletes
 /// the two-channel pattern by making `Outcome`'s `Err` consumption
 /// the sole error path.
 fn outcome_error_sketch(err: &ContextError) -> ContextError {

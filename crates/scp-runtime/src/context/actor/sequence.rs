@@ -132,15 +132,15 @@ impl SendSequenceTracker {
     /// fail-loud error: `reserve_next` itself does not signal overflow.
     ///
     /// Callers that need behavioral parity with the legacy
-    /// [`MlsCryptoProvider::seal`] overflow semantics (`send_sequence
+    /// [`ContextCryptoState::seal`] overflow semantics (`send_sequence
     /// .checked_add(1)?` — fail-closed, emit nothing at `u64::MAX`) MUST guard
     /// the boundary at their own call site by checking [`Self::last_issued`]
     /// `== u64::MAX` BEFORE reserving and erroring if so. The seal path
-    /// ([`crate::context::actor::PerContextState::seal`]) does exactly this;
+    /// ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)) does exactly this;
     /// the saturating behavior here is the RAII-rollback substrate, deliberately
     /// non-erroring so `reserve` / `commit` stay infallible for the common path.
     ///
-    /// [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider::seal
+    /// [`ContextCryptoState::seal`]: crate::context::actor::state::ContextCryptoState::seal
     pub const fn reserve_next(&mut self) -> u64 {
         self.last_issued = self.last_issued.saturating_add(1);
         self.last_issued

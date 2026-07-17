@@ -440,7 +440,7 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 /// the full log, so the caller's constant-time compare against the signed
 /// `snapshot.event_log_merkle_root` (in `import_context` /
 /// `validate_export_for_import`) rejects it. A legitimately pruned log is
-/// accepted because [`MerkleEventLogProvider::prune_before_checkpoint`]
+/// accepted because [`MerkleEventLogProvider::prune_before_checkpoint`](crate::context::providers::event_log::MerkleEventLogProvider::prune_before_checkpoint)
 /// re-anchors the retained tail to genesis and renumbers sequences from 0, so
 /// the exported pruned log is itself a valid genesis-rooted prefix.
 ///

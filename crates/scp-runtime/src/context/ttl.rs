@@ -1132,11 +1132,11 @@ mod tests {
     ///
     /// The prior `MockCrypto` / `FailingMlsCrypto` / `TransientFailCrypto`
     /// scaffolds are deleted along with the `ContextCryptoProvider`
-    /// trait in ADR-049 commit 12c.9e. Success-path tests now build a
+    /// trait in ADR-049 §15. Success-path tests now build a
     /// real [`MlsCryptoProvider::new(TEST_DID.to_owned())`]; tests that
     /// asserted mock trackers (`mls_destroyed` counts, sender-key-destroyed
     /// counts) or fail-injection semantics are `#[ignore]`d pending
-    /// `MlsBackend`-level fail-injection in commit 12c.9f.
+    /// `MlsBackend`-level fail-injection in ADR-049 §15.
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
     fn mk_crypto() -> std::sync::Arc<MlsCryptoProvider> {
@@ -1534,7 +1534,7 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Smoke tests — just exercise the real MlsCryptoProvider path.
     // Deeper behaviour was covered by mock trackers that no longer exist;
-    // those tests are deferred to commit 12c.9f (MlsBackend injection).
+    // those tests are deferred to ADR-049 §15 (MlsBackend injection).
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1629,12 +1629,11 @@ mod tests {
             .expect("generate_sender_key under the digest");
 
         // The group MUST be present under the digest before expiry — proves this
-        // is a real destroy, not a phantom no-op against an empty slot.
-        let before = crypto
-            .export_crypto_state(&digest, Vec::new(), Vec::new())
-            .expect("export under the decoded digest must not error");
+        // is a real destroy, not a phantom no-op against an empty slot. Probe via
+        // the retained `context_crypto_present` (the serializing `export_crypto_
+        // state` twin is deleted post-ADR-049 PR-7).
         assert!(
-            !before.is_empty(),
+            crypto.context_crypto_present(&digest),
             "precondition: crypto state must be keyed under the digest before TTL expiry"
         );
 
@@ -1673,11 +1672,8 @@ mod tests {
         // resolved via the raw `SHA-256(id)` primitive, `destroy_mls_group`
         // would have addressed an unkeyed slot (a silent no-op) and the digest
         // slot would still be populated — this assertion FAILS in that case.
-        let after_digest = crypto
-            .export_crypto_state(&digest, Vec::new(), Vec::new())
-            .expect("export under the decoded digest must not error");
         assert!(
-            after_digest.is_empty(),
+            !crypto.context_crypto_present(&digest),
             "ADR-056 FAIL-OPEN: the MLS group SURVIVED under the digest after TTL \
              expiry — destruction keyed off the wrong slot (raw SHA-256(id) \
              instead of the chokepoint digest)"
@@ -1830,7 +1826,7 @@ mod tests {
         assert_eq!(ext.active_remaining(&active), 1);
     }
 
-    // ADR-049 commit 12c.9f: backend-injection seam landed via
+    // ADR-049 §15: backend-injection seam landed via
     // `MlsCryptoProvider::with_backends`. Pre-existing tests that
     // asserted `MockCrypto` tracker behaviour (mls_destroyed counters,
     // sender-key-destroyed counters, fail-injection retry semantics)
@@ -1858,7 +1854,7 @@ mod tests {
         let _hpke = provider.hpke_backend();
     }
 
-    // Unused trait/type imports from the pre-12c.9e test scaffolding
+    // Unused trait/type imports from the pre-ADR-049 §15 test scaffolding
     // must keep compiling: silence the "unused import" lint only where
     // the import truly has no downstream reference in the shrunk test
     // module.

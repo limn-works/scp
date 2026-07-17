@@ -451,6 +451,104 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Answer a §9.16.2 sender-key PULL request on the actor's OWNED crypto
+    /// state (ADR-049 PR-7 / SCP-CRYPTOMOVE-001). The steady-state ANSWER half
+    /// moved off the provider onto
+    /// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request);
+    /// a taken (actor-owned) context can no longer answer through the emptied
+    /// provider, so this mailbox entry lets the full-stack harness reach the
+    /// actor answer by `context_id` (the requester side is driven externally with
+    /// the harness's own custody — actor-loop request INITIATION is deferred
+    /// #2049). Mirrors [`BroadcastCommand::HandleBroadcastKeyRequest`].
+    ///
+    /// The answer HPKE-seals to the EPHEMERAL wrapping key carried in the
+    /// request, so it needs NO signing key — a clean receive-side answer. Only
+    /// mutates the Class-C crypto replay cache (`nonce_dedup`), so the handler
+    /// reports `ok_mutated`.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    HandleSenderKeyRequest {
+        /// Context identifier string.
+        context_id: String,
+        /// The serialized [`SenderKeyRequest`](scp_protocol::crypto::sender_keys::SenderKeyRequest).
+        request_bytes: Vec<u8>,
+        /// The requester's Ed25519 verification key (the responder verifies the
+        /// request signature against it). Exactly 32 bytes — an Ed25519 public key
+        /// — encoded in the type so a mis-sized key cannot cross the mailbox.
+        requester_public_key: [u8; 32],
+        /// Oneshot reply channel. `Ok(Some(sealed_response))` for a member
+        /// requester, `Ok(None)` when the requester is blocked.
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, ContextError>>,
+    },
+
+    /// Land a §9.16.2 pull-response sender key onto the actor's OWNED sender-key
+    /// store (ADR-049 PR-7 / SCP-CRYPTOMOVE-001). The requester (harness)
+    /// already HPKE-opened the ephemeral-sealed response with its own wrapping
+    /// secret; this mailbox entry GATES the authenticated `(sender_did, epoch)`
+    /// against the authoritative Class-M floor registry
+    /// (`check_and_advance_sender_epoch`, FAIL-CLOSED) and then installs the key
+    /// onto `cs.sender_key_store` — gate-before-install. The provider store is
+    /// empty on a taken context, so the install MUST land on the actor.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    LandSenderKeyResponse {
+        /// Context identifier string.
+        context_id: String,
+        /// The sender whose key this is (the key's owner / responder).
+        sender_did: String,
+        /// The authenticated sender key recovered by the requester.
+        sender_key: scp_protocol::crypto::sender_keys::SenderKey,
+        /// The key's epoch (gated for monotonicity + the poisoning ceiling).
+        epoch: u64,
+        /// Oneshot reply channel. `Ok(())` once gated + installed.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// READ-ONLY inner-envelope inspection: decrypt a received outer-envelope
+    /// blob on the actor's OWNED crypto state and return the raw decrypted
+    /// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope)
+    /// (`message_type` / `sequence` / `payload`) WITHOUT unwrapping the §9.17
+    /// access-key content layer — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
+    ///
+    /// This is the actor twin of the deleted provider `open` inspection twin: it
+    /// lets the full-stack harness assert on the wire-level inner header (e.g. a
+    /// sent heartbeat is tagged `MessageType::Heartbeat` and carries sequence
+    /// `0`, and that a heartbeat does NOT advance the per-sender application
+    /// sequence — §9.9.2).
+    ///
+    /// # Non-mutating receive-state invariant (§9)
+    ///
+    /// The handler drives ONLY
+    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open),
+    /// which performs a PURE decrypt + surfaces `env.receive_floor` — it does
+    /// NOT run the authoritative anti-replay gate
+    /// (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
+    /// mutate `nonce_dedup`, or change the epoch. Those live at the messaging
+    /// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+    /// which this inspection deliberately skips. The sole state change is the
+    /// unavoidable MLS decryption-ratchet advance inherent to any decrypt (the
+    /// deleted provider inspection twin was likewise non-mutating in exactly this
+    /// sense); the handler reports `ok_mutated` so that ratchet advance persists.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    InspectIncomingInner {
+        /// Context identifier string.
+        context_id: String,
+        /// The serialized [`OuterEnvelope`](scp_protocol::envelope::outer::OuterEnvelope)
+        /// (captured ciphertext) to decrypt for inspection.
+        envelope_bytes: Vec<u8>,
+        /// Oneshot reply channel carrying the raw decrypted inner envelope. Errors
+        /// if the blob decodes to a Control / Management result rather than an
+        /// application envelope, or on any MLS / sender-key / decode failure.
+        reply: oneshot::Sender<Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError>>,
+    },
+
     /// Record that a received envelope triggered degraded-mode (spec
     /// §13.6) for a context. Emits a `DegradedMode` event into the
     /// per-context receive buffer (and the supervisor's optional event
@@ -761,7 +859,7 @@ pub struct RestoreContextPayload {
 /// [`Supervisor`](crate::context::supervisor::Supervisor) lifecycle
 /// surface one-to-one: the handler shim delegates to the legacy method
 /// under the hood while the command shape fixes the post-refactor
-/// dispatch envelope. Commit 12 deletes the shim; the handler bodies
+/// dispatch envelope. ADR-049 §15 deletes the shim; the handler bodies
 /// keep their current shape (input types + reply channels) but route
 /// state mutations to the actor's owned
 /// [`PerContextState`](crate::context::actor::state::PerContextState).
@@ -1057,7 +1155,7 @@ pub enum LifecycleCommand {
     /// Issue an MLS Update proposal + self-Commit for post-compromise
     /// security (§9.12 step 2). Mutating — ratchets the group to a new
     /// epoch with fresh key material via
-    /// [`MlsCryptoProvider::advance_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::advance_epoch)
+    /// [`PerContextState::advance_epoch`](crate::context::actor::state::PerContextState::advance_epoch)
     /// (which calls `ratchet::propose_update_with_wrapping_key`,
     /// preserving the `scp_wrapping_key` leaf extension per §9.16.1).
     ///
@@ -1178,8 +1276,8 @@ pub struct ExecuteGovernanceActionPayload {
     pub proposal_id: scp_protocol::context::governance::ProposalId,
 }
 
-/// See [`ContextCommand::Governance`]. Real variants land in commit 10
-/// of the ADR-049 commit ladder (see `handlers/governance.rs`).
+/// See [`ContextCommand::Governance`]. Real variants land in a later slice of
+/// the ADR-049 actor migration (ADR-049 §15; see `handlers/governance.rs`).
 /// Variants mirror the public surface of
 /// [`crate::context::governance_helpers`] one-to-one: propose, vote,
 /// approve/reject/withdraw, execute, read proposals, apply pending
@@ -1192,7 +1290,8 @@ pub struct ExecuteGovernanceActionPayload {
 /// themselves.
 pub enum GovernanceCommand {
     /// Submits a governance proposal — unchecked variant. Mirrors
-    /// [`Supervisor::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action).
+    /// `Supervisor::propose_governance_action` (a `testing`-gated convenience
+    /// wrapper over the checked path).
     /// Accepts the proposer DID + action + signing key without a
     /// capability pre-check (the governance engine enforces eligibility
     /// internally). For `SingleAdmin` contexts the proposal is auto-
@@ -1219,7 +1318,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a vote on a pending proposal. Mirrors
-    /// [`Supervisor::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal).
+    /// `Supervisor::vote_on_proposal` (a `testing`-gated helper).
     /// `approve == true` is an approval vote; `false` is rejection.
     VoteOnProposal {
         /// Boxed owned payload.
@@ -1798,16 +1897,16 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
     >,
 >;
 
-/// See [`ContextCommand::Economy`]. Real variants land in commit 10 of
-/// the ADR-049 commit ladder (see `handlers/economy.rs`). The public
+/// See [`ContextCommand::Economy`]. Real variants land in a later slice of
+/// the ADR-049 actor migration (ADR-049 §15; see `handlers/economy.rs`). The public
 /// surface of [`crate::context::economy_helpers`] currently consists
 /// of a single method, [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
 /// all other economy methods (`authorize_paid_action`,
 /// `complete_paid_action`, `void_paid_action`,
 /// `rollback_economy_ticket_inline_view`)
-/// are `pub(super)` helpers invoked by the messaging path. Commit 12
+/// are `pub(super)` helpers invoked by the messaging path. ADR-049 §15
 /// rewires the sender-side pipeline to construct economy commands
-/// internally rather than calling the helpers directly; commit 10
+/// internally rather than calling the helpers directly; ADR-049 §15
 /// lands only the public surface.
 pub enum EconomyCommand {
     /// Verifies a batch of payment receipts against the configured
@@ -3652,7 +3751,7 @@ pub enum SagaPhaseMessage {
 
 /// See [`ContextCommand::LifecycleControl`]. The supervisor's suspend /
 /// resume / shutdown path sends these; real variants land with the
-/// BridgeInstance integration in commit 11. Commit 6 only carries the
+/// BridgeInstance integration in ADR-049 §15. Commit 6 only carries the
 /// two Pause / PersistSync variants that the
 /// `BridgeInstanceCore` (in `scp_ffi_common::bridge_instance`)'s
 /// default `suspend()` body calls, plus the terminal `Shutdown`.

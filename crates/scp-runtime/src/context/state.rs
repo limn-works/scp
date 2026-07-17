@@ -3,7 +3,7 @@
 //! result types, plus pseudonym + commit-retry primitives.
 //!
 //! This module is the canonical home for context state types. Hoisted
-//! out of the deleted `manager/` directory in ADR-049 commit 12.
+//! out of the deleted `manager/` directory in ADR-049 §15.
 //!
 //! # Visibility
 //!
@@ -984,11 +984,11 @@ pub struct ContextSnapshot {
     ///
     /// Encrypted contexts persist the member's pseudonym routing ID and the
     /// learned peer registry; broadcast contexts persist
-    /// [`ContextRouting::Broadcast`] and carry no pseudonym state.
+    /// [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) and carry no pseudonym state.
     ///
     /// Degraded / pre-routing-field snapshots (those persisted before this
     /// field existed, or `strip_snapshot_for_public` redactions) default to
-    /// [`ContextRouting::Broadcast`] via [`default_context_routing`] — a
+    /// [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) via [`default_context_routing`] — a
     /// no-pseudonym placeholder that carries no routing secret.
     ///
     /// The restore path does NOT silently coerce this placeholder onto an
@@ -1060,7 +1060,7 @@ pub struct ContextSnapshot {
     /// fail-closed, mirroring [`Self::saga_pending`].
     ///
     /// The live actor-side slot is
-    /// [`PerContextState::xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs).
+    /// [`ClassSState::xctx_committed_outputs`](crate::context::actor::state::ClassSState::xctx_committed_outputs).
     /// Commit-B captures the outlet output + signed receipt here BEFORE acking, so
     /// a Commit replayed after a crash (§17.16.4) re-emits the stored output and
     /// re-signs nothing — it returns the IDENTICAL receipt. A coalesce-window
@@ -1111,7 +1111,7 @@ pub struct ContextSnapshot {
     /// [`Self::saga_pending`].
     ///
     /// The live slot is
-    /// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations).
+    /// [`ClassSState::xctx_committed_invocations`](crate::context::actor::state::ClassSState::xctx_committed_invocations).
     /// Commit-A inserts the `SagaId` here as the idempotency witness BEFORE
     /// acking; a replayed Commit-A re-acks as a no-op. A coalesce-window
     /// rollback would let a replay double-settle the escrow, the exact hazard
@@ -1128,7 +1128,7 @@ pub struct ContextSnapshot {
     /// synchronously-persisted, fail-closed, mirroring [`Self::saga_pending`].
     ///
     /// The live slot is
-    /// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations).
+    /// [`ClassSState::xctx_caller_reservations`](crate::context::actor::state::ClassSState::xctx_caller_reservations).
     /// Prepare-A inserts a record here in the same Class-S snapshot as the
     /// deduction it reverses; on a `PreparingB`-window crash the recovery sweep's
     /// clean abort (`Abort { reservation: None }`) reverses the caller's
@@ -1156,7 +1156,7 @@ pub struct ContextSnapshot {
     /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
     /// outlet invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
     /// projection of
-    /// [`PerContextState::xctx_nonce_dedup`](crate::context::actor::state::PerContextState::xctx_nonce_dedup):
+    /// [`ClassSState::xctx_nonce_dedup`](crate::context::actor::state::ClassSState::xctx_nonce_dedup):
     /// `{16-byte nonce → first-seen Unix secs}`.
     ///
     /// **Class S** — synchronously-persisted, fail-closed, mirroring
@@ -1235,7 +1235,7 @@ pub struct ContextSnapshot {
 
 /// Default routing variant for degraded / pre-routing-field snapshots.
 ///
-/// Returns [`ContextRouting::Broadcast`] — a placeholder that carries no
+/// Returns [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) — a placeholder that carries no
 /// pseudonym secret. The restore path requires this to agree with the
 /// reconstructed mode (§9.10.4): a degraded *broadcast* snapshot restores
 /// fine, but a degraded *encrypted* snapshot fails closed
@@ -1262,7 +1262,7 @@ pub struct VelocityTrackerSnapshot {
 }
 
 // `ContextPersistence` trait moved to `crate::context::persistence` in
-// ADR-049 commit 12.
+// ADR-049 §15.
 
 // ---------------------------------------------------------------------------
 // PerContextState -- internal per-context tracking
@@ -1270,10 +1270,10 @@ pub struct VelocityTrackerSnapshot {
 
 /// Governance-related per-context state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
 /// actor's [`crate::context::actor::state::PerContextState`] can carry a
 /// field of this type while the handler-body migration is under way.
-/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
 pub(crate) struct GovernanceState {
     /// The governance engine for this context (ADR-031, spec §5.9).
@@ -1335,7 +1335,7 @@ pub(crate) struct GovernanceState {
     pub(crate) velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
     /// Per-member participation record cache for proposer eligibility (#1530).
     ///
-    /// Widened to `pub(crate)` in ADR-049 commit 12c.1b so the hoisted
+    /// Widened to `pub(crate)` in ADR-049 §15 so the hoisted
     /// [`crate::context::messaging_helpers::finalize_send`] free function
     /// can refresh the cache after a successful send (matches the legacy
     /// behavior — the legacy method body lived in `manager/messaging.rs`
@@ -1364,7 +1364,7 @@ pub(crate) struct GovernanceState {
     /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
     ///
     /// Consulted by `enforce_economy` via the
-    /// [`super::economy::ContextRevocationChecker`] adapter when validating
+    /// [`ContextRevocationChecker`](crate::context::economy_logic::ContextRevocationChecker) adapter when validating
     /// spending UCANs through the full cryptographic pipeline. Currently
     /// empty in steady state — spending UCAN revocation lists have not been
     /// wired through governance — but the field exists so the only change
@@ -1532,10 +1532,10 @@ impl GovernanceState {
 
 /// MLS epoch and reconnection state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
 /// actor's [`crate::context::actor::state::PerContextState`] can carry a
 /// field of this type while the handler-body migration is under way.
-/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
 pub(crate) struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
@@ -1572,10 +1572,10 @@ pub(crate) struct EpochState {
 /// Capability suspension is now handled by `ContextRoleState::suspended_capabilities`.
 /// This struct retains the CEK exclusion list and per-member access key store.
 ///
-/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
 /// actor's [`crate::context::actor::state::PerContextState`] can carry a
 /// field of this type while the handler-body migration is under way.
-/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
 pub(crate) struct AccessControlState {
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`,
@@ -1591,8 +1591,8 @@ pub(crate) struct AccessControlState {
 impl AccessControlState {
     /// Construct a fresh, empty `AccessControlState`. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
-    /// fixture (commit 12a of ADR-049) to populate the corresponding field
-    /// without peeking at private fields. Deleted in commit 12d alongside
+    /// fixture (ADR-049 §15) to populate the corresponding field
+    /// without peeking at private fields. Deleted in ADR-049 §15 alongside
     /// the rest of the legacy manager module.
     #[must_use]
     pub(crate) fn new_empty_for_actor() -> Self {
@@ -1608,7 +1608,7 @@ impl EpochState {
     /// coordinator scoped to the given context, a fresh grace store, and
     /// `needs_reconnect = false`. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
-    /// fixture (commit 12a of ADR-049). Deleted in commit 12d alongside
+    /// fixture (ADR-049 §15). Deleted in ADR-049 §15 alongside
     /// the rest of the legacy manager module.
     #[must_use]
     pub(crate) fn new_fresh_for_actor(context_id: &str) -> Self {
@@ -1629,7 +1629,7 @@ impl TtlState {
     /// Construct a fresh `TtlState` with a clock-less `TtlTimer` and no
     /// active extension. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
-    /// fixture (commit 12a of ADR-049). Deleted in commit 12d alongside
+    /// fixture (ADR-049 §15). Deleted in ADR-049 §15 alongside
     /// the rest of the legacy manager module.
     #[must_use]
     pub(crate) fn new_fresh_for_actor() -> Self {
@@ -1645,9 +1645,9 @@ impl GovernanceState {
     /// `SingleAdminEngine` for `admin_did`, a no-op key resolver, and the
     /// given clock. Intended exclusively as the default fixture for the
     /// actor's [`crate::context::actor::state::PerContextState`]
-    /// default-for-test helper (commit 12a of ADR-049). Production paths
+    /// default-for-test helper (ADR-049 §15). Production paths
     /// continue to construct the struct inline from the lifecycle handler.
-    /// Deleted in commit 12d alongside the rest of the legacy manager
+    /// Deleted in ADR-049 §15 alongside the rest of the legacy manager
     /// module.
     #[must_use]
     pub(crate) fn new_fresh_for_actor(
@@ -1699,10 +1699,10 @@ impl GovernanceState {
 
 /// TTL timer and extension state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
 /// actor's [`crate::context::actor::state::PerContextState`] can carry a
 /// field of this type while the handler-body migration is under way.
-/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
 pub(crate) struct TtlState {
     /// TTL timer management (SCP-021).
@@ -1713,7 +1713,7 @@ pub(crate) struct TtlState {
 
 /// Wire wrapper for a consistency-checkpoint exchange message (§9.9.3, §23.7).
 ///
-/// Carries the canonical signed [`ConsistencyCheckpoint`] behind a magic tag
+/// Carries the canonical signed [`ConsistencyCheckpoint`](scp_event_log::checkpoint::ConsistencyCheckpoint) behind a magic tag
 /// so the receive path can positively identify it. Although the inner envelope
 /// already discriminates checkpoints via
 /// [`MessageType::ConsistencyCheckpoint`](scp_protocol::envelope::inner::MessageType::ConsistencyCheckpoint),
@@ -1737,7 +1737,7 @@ pub(crate) struct CheckpointMessage {
 /// `MessagePack`-decoded, so the tag cannot collide.
 pub(crate) const CHECKPOINT_PAYLOAD_TAG: &str = "\0scp:checkpoint:v1";
 
-// ADR-049 Phase 2A finalization keystone (commit 12 phase 2A finalization
+// ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A finalization
 // — type unification, single PerContextState): the legacy
 // `state::PerContextState` struct + its `impl` block are deleted here. The
 // single surviving `PerContextState` lives at
@@ -2205,7 +2205,7 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
 // submodules' `impl ContextManager` blocks. The active alternative
 // (`create_governance_engine` above) covers the same surface for the
 // hoisted `lifecycle_helpers::create_context` path. Removed in
-// ADR-049 commit 12 alongside the rest of the manager-only code.
+// ADR-049 §15 alongside the rest of the manager-only code.
 
 /// Resolves a context-ID string to the canonical 32-byte value that keys its
 /// MLS group, sender keys, and event log.

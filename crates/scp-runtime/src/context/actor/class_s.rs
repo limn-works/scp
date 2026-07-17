@@ -59,7 +59,7 @@
 //!   `suspended_capabilities` Class-S pair is now privatized to `pub(crate)` and
 //!   GROW-confined to the consequence-only view — see the dedicated section below.)
 //! - **Mutation through a combinator** — every combinator hands `f` a *view*
-//!   ([`ClassSMut`] for the Class-S-capable combinators, [`ClassCMut`] for the
+//!   (`ClassSMut` for the Class-S-capable combinators, `ClassCMut` for the
 //!   Class-C best-effort combinator) rather than the bare `&mut PerContextState`.
 //!   The view chooses which slice of the state `f` can reach `&mut`. The
 //!   Class-S-capable combinators ([`commit_class_s_keep`](ClassSCell::commit_class_s_keep),
@@ -120,7 +120,7 @@
 //! whole-struct `&mut` if one were ever handed out — but none is). Field
 //! privatization (`PerContextState.class_s` / `GovernanceState.class_s` are now
 //! `pub(in crate::context)`) closes the LAST whole-`&mut` reach that DID exist —
-//! the deleted `ClassSCell::state_mut` escape hatch and [`ClassSMut`]'s
+//! the deleted `ClassSCell::state_mut` escape hatch and `ClassSMut`'s
 //! `pub(crate)` reach — NOT this view, which was already airtight.
 //! - `*_then_append` — persist fail-closed AFTER `f`, then run an async `after`
 //!   step that appends a derived record to an EXTERNAL durable sink (the event
@@ -224,7 +224,7 @@
 //!     the applied GROW FAIL-CLOSED (RED-CS3), not that the GROW is unreachable.
 //!   - **(B) the inherent `pub` GROW.** `ContextRoleState::suspend_capabilities` /
 //!     `suspend_all` are inherent `pub` methods reachable through ANY whole
-//!     `&mut ContextRoleState` — e.g. [`ClassSMut::rest_mut`], used by the
+//!     `&mut ContextRoleState` — e.g. `ClassSMut::rest_mut`, used by the
 //!     governance helpers. That whole-`&mut` is handed out only by a
 //!     fail-closed-PERSISTING combinator, so the GROW it can reach is persisted
 //!     fail-closed by construction.
@@ -468,7 +468,7 @@ impl Deref for ClassSMut<'_> {
 ///
 /// Holds the actor's Class-S sub-struct as a PRIVATE shared reference. It exposes
 /// ONLY [`Self::get`] (a `&ClassSState` read) — there is NO `&mut` accessor and
-/// NO [`DerefMut`]. [`ClassCMut`] stores its Class-S reach as a `SharedClassS`
+/// NO [`DerefMut`](std::ops::DerefMut). [`ClassCMut`] stores its Class-S reach as a `SharedClassS`
 /// rather than a bare `&'a ClassSState` so that re-arming a `&mut` to Class-S on
 /// the best-effort view requires THREE conspicuous central edits — the
 /// `ClassCMut.class_s` field type, this wrapper's private field, AND
@@ -539,7 +539,7 @@ impl<'a> SharedClassS<'a> {
 /// # The Class-S reach is the read-only [`SharedClassS`] wrapper (BLACK-CS-01)
 ///
 /// `ClassCMut.class_s` is a [`SharedClassS`] — a wrapper holding a PRIVATE
-/// `&ClassSState`, with NO `&mut` accessor and NO [`DerefMut`]. So the only Class-S
+/// `&ClassSState`, with NO `&mut` accessor and NO [`DerefMut`](std::ops::DerefMut). So the only Class-S
 /// reach on this best-effort view is the shared read [`Self::class_s`]
 /// (`self.class_s.get()`); there is no `&mut` to the actor's `ClassSState`
 /// anywhere, and a Class-S mutation from this view is a COMPILE error by
@@ -2689,7 +2689,7 @@ pub(crate) struct AppendOutcomeError {
 /// Owns one [`PerContextState`] and gates every mutation behind a
 /// persistence combinator (ADR-049 §9 Class S).
 ///
-/// Reads go through [`Deref`]; there is intentionally no [`DerefMut`] (see the
+/// Reads go through [`Deref`]; there is intentionally no [`DerefMut`](std::ops::DerefMut) (see the
 /// module docs). Mutations go through the view-typed combinators
 /// ([`Self::commit_class_s_keep`] / `_restore` / `_compensating` /
 /// `_keep_compensating` / `_then_append` for fail-closed persist,
@@ -3395,7 +3395,7 @@ impl ClassSCell {
 /// reversal (escrow void, economy-ticket rollback, sequence rollback) while the
 /// consume stays consumed.
 ///
-/// # The `#[must_use]` + `Drop` backstop is parity with [`EconomyTicket`]
+/// # The `#[must_use]` + `Drop` backstop is parity with [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
 ///
 /// Like [`crate::context::economy_logic::EconomyTicket`], this handle carries a
 /// `consumed` flag set true by [`Self::commit`], and a [`Drop`] guard that

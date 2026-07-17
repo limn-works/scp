@@ -275,7 +275,7 @@ pub struct ContextActor {
 
 impl ContextActor {
     /// Construct a fresh actor that owns [`PerContextState`] and
-    /// [`ActorDeps`] directly (introduced by ADR-049 commit 12b.2a).
+    /// [`ActorDeps`] directly (introduced by ADR-049 §15).
     ///
     /// This is the production constructor. The owned-state spawn path
     /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`]
@@ -1106,12 +1106,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // ADR-049 commit 12b.2a — state-carrying `ContextActor::new` tests
+    // ADR-049 §15 — state-carrying `ContextActor::new` tests
     // -----------------------------------------------------------------
 
     /// Minimal event log provider for the `ContextActor::new` test.
     /// Accepts every call, returns OK for every append, never appends
-    /// anything to a real log — the 12b.2a dispatch does not exercise
+    /// anything to a real log — the ADR-049 §15 actor dispatch does not exercise
     /// the event-log path, so the stub is never actually touched.
     /// The convergent creation instant the TTL-expiry actor tests use — matches
     /// the `1_700_000_000` passed to `new_for_test_encrypted` / the past-deadline

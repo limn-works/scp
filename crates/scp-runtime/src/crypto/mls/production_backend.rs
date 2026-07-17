@@ -491,6 +491,18 @@ impl MlsBackend for ProductionMlsBackend {
             )));
         }
 
+        // Extract the authenticated credential DID from the SAME already-
+        // validated leaf. This is the single validate-and-bind that replaces
+        // the caller-side re-parse + `scp_mls::group::key_package_in_did`
+        // re-validation: it mirrors that primitive's extraction exactly
+        // (leaf credential → `BasicCredential` → `ScpCredential` → `did`) but
+        // reuses `validated` instead of re-running `.validate` on the bytes.
+        let credential = validated.leaf_node().credential().clone();
+        let basic = BasicCredential::try_from(credential).map_err(|e| {
+            MlsError::CredentialSerializationFailed(format!("extracting BasicCredential: {e}"))
+        })?;
+        let credential_did = ScpCredential::from_bytes(basic.identity())?.did;
+
         // Re-serialize to return the canonical validated bytes. Functionally
         // equivalent to the input (OpenMLS does not mutate on validate), but
         // we construct via the validated type so downstream persistence is
@@ -498,6 +510,7 @@ impl MlsBackend for ProductionMlsBackend {
         let bytes = key_package_bytes.to_vec();
         Ok(ValidatedKeyPackage {
             key_package_bytes: bytes,
+            credential_did,
         })
     }
 
@@ -991,6 +1004,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(validated.key_package_bytes, bob_gen.key_package_bytes);
+        // The single validate-and-bind extracts the authenticated credential DID
+        // from the SAME validated leaf — it MUST equal the DID the KeyPackage was
+        // minted for (this is the binding the join/add call sites now rely on
+        // instead of a second `key_package_in_did` pass).
+        assert_eq!(validated.credential_did, bob_cred.did);
     }
 
     #[tokio::test]

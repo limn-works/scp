@@ -509,7 +509,7 @@ where
 
 /// Outcome of [`invoke_outlet_execute_and_validate`] — the pure-execution half
 /// of outlet invocation shared between direct callers and the
-/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// wrapper. Captures everything needed to build a [`OutletInvokedEvent`]
 /// without re-running the executor or rehashing the payloads.
 #[derive(Debug)]
@@ -536,7 +536,7 @@ pub(crate) struct InvokeExecuteOutcome {
 /// schema validation, executor dispatch under a bounded timeout, and
 /// output schema validation. It deliberately takes NO economy context
 /// and touches no governance state so that
-/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// can call it with the `contexts` mutex dropped.
 ///
 /// The free [`invoke_outlet`] function also delegates to this helper after
@@ -548,7 +548,7 @@ pub(crate) struct InvokeExecuteOutcome {
 /// Returns [`InvocationError`] on state, capability, schema validation,
 /// timeout, or executor failure. Cancellation is not supported by this
 /// variant — see the inline timeout-plus-select! path in
-/// [`invoke_outlet_with_cancellation`] instead.
+/// [`invoke_outlet_with_cancellation_aggregating`](crate::context::outlets::invoke::invoke_outlet_with_cancellation_aggregating) instead.
 #[allow(clippy::too_many_arguments)] // 8 parameters mirror `invoke_outlet`; lower bound imposed by the execution contract.
 pub(crate) async fn invoke_outlet_execute_and_validate<F, Fut>(
     context: &ContextHandle,
@@ -1978,7 +1978,7 @@ impl<'a> ReadOnlyInvocation<'a> {
 /// holds a manager reference and never directly mutates per-context state.
 /// The runtime is the sole entity that applies mutations, ensuring the
 /// existing locking and rollback contracts in
-/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// still hold.
 ///
 /// **Defense-in-depth runtime check.** Every write method calls
@@ -2804,11 +2804,11 @@ pub struct DispatchedOutletOutcome {
     pub output: serde_json::Value,
     /// Pending mutations from an Action outlet's [`MutableInvocation`]
     /// handle — empty for Query outlets (which can never enqueue
-    /// mutations). The runtime's [`ContextManager`] is the canonical
+    /// mutations). The runtime's [`Supervisor`] is the canonical
     /// applier; direct callers may also drain them for testing or for
     /// custom mutation pipelines.
     ///
-    /// [`ContextManager`]: crate::context::ContextManager
+    /// [`Supervisor`]: crate::context::supervisor::Supervisor
     pub pending_mutations: Vec<MutationIntent>,
     /// `OutletInvokedEvent` ready to be appended to the event log.
     pub event: OutletInvokedEvent,
@@ -2825,7 +2825,7 @@ pub struct DispatchedOutletOutcome {
 /// PRD SCP-OUT-013 AC5: "`ContextManager::invoke_outlet` dispatches to
 /// `exec_query` when `kind == Query` and `exec_action` when `kind ==
 /// Action`." This free function is the underlying dispatcher; the
-/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 /// wrapper layers the per-context economy/budget pipeline over the same
 /// dispatch.
 ///
@@ -4828,12 +4828,12 @@ pub(crate) async fn run_cross_context_bridge(
 /// reassembly it drives the SAGA seal:
 ///
 /// - After each successfully-forwarded operator chunk it sends
-///   [`SagaPhaseMessage::StreamCaptureAppend`] to the target (B) actor, folding
+///   [`SagaPhaseMessage::StreamCaptureAppend`](crate::context::actor::commands::SagaPhaseMessage::StreamCaptureAppend) to the target (B) actor, folding
 ///   the chunk into the DURABLE `SagaId`-keyed Merkle frontier staged at
 ///   Prepare-B (the O(log n) replay snapshot the seal reads to finalize the
 ///   manifest root). Forwarding is NEVER gated on the capture persist (§6.2.5):
 ///   the chunk is delivered first, captured second.
-/// - At stream-close it sends [`SagaPhaseMessage::CommitBStreamSettle`] ONCE
+/// - At stream-close it sends [`SagaPhaseMessage::CommitBStreamSettle`](crate::context::actor::commands::SagaPhaseMessage::CommitBStreamSettle) ONCE
 ///   (AC8 — commit once over the bounded root, never a per-chunk 2PC): the B
 ///   actor seals `stream_manifest_hash = frontier.root()`, signs the streaming
 ///   receipt (SCP-OUT-043), settles the escrow from the durable ledger, appends
@@ -5335,7 +5335,7 @@ pub(crate) async fn record_streaming_saga_a_event(
 ///
 /// # §7.3.8 value-caveat enforcement
 ///
-/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`]
+/// `caveat_binding` is the validated-narrowed [`InvocationCaveatBinding`](crate::context::outlets_helpers::InvocationCaveatBinding)
 /// (`effective_caveats` + `ucan_cid`) bound to the invocation UCAN. It is
 /// threaded verbatim into `open_outlet_stream`, where it drives the §7.3.8
 /// post-input hook AND the durable cross-invocation counter reservation
@@ -8728,8 +8728,6 @@ mod tests {
     #[cfg(test)]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     mod cross_context_036_seal {
-        use std::sync::Arc;
-
         use ed25519_dalek::{Signer as _, SigningKey};
 
         use scp_protocol::context::outlets::stream::{
@@ -8764,12 +8762,14 @@ mod tests {
         /// against B's pinned `context_id` — never re-signed by the bridge.
         #[test]
         fn ac10_seal_for_a_preserves_operator_sig() {
+            use crate::context::actor::state::PerContextState;
             use crate::crypto::mls::provider::MlsCryptoProvider;
             use crate::crypto::mls::two_party_test_support::stand_up_two_party;
             use crate::envelope::inner::sign::create_inner_envelope_raw;
             use crate::envelope::inner::{
                 InnerEnvelopeParams, MessageType, SCP_INNER_ENVELOPE_VERSION,
             };
+            use scp_did::DID;
             use scp_protocol::context::builder::OpenResult;
 
             let a_ctx_str = "a-ctx-036-seal";
@@ -8779,6 +8779,26 @@ mod tests {
             // group for the receiving context A.
             let (alice, bob, a_ctx_bytes) = stand_up_two_party(a_ctx_str, alice_did, bob_did);
             let routing_id = a_ctx_bytes.to_vec();
+
+            // ADR-049 PR-7 moved seal/open off the `MlsCryptoProvider` onto the
+            // per-context actor. Destructively take each party's provider-resident
+            // crypto onto an actor `PerContextState` (the production seed
+            // primitive) so this bridge test drives the actor seal/open seam
+            // exactly as every other two-party crypto test now does.
+            let take_into_actor = |provider: &MlsCryptoProvider, did: &str| -> PerContextState {
+                let owned = provider
+                    .take_crypto_state(&a_ctx_bytes)
+                    .expect("take owned crypto material off the provider");
+                let mut state = PerContextState::new_for_test_encrypted(
+                    a_ctx_bytes,
+                    0,
+                    DID::from(did.to_owned()),
+                );
+                state.seed_encrypted_crypto_from_owned(owned);
+                state
+            };
+            let mut alice_a = take_into_actor(alice.as_ref(), alice_did);
+            let mut bob_a = take_into_actor(bob.as_ref(), bob_did);
 
             let chunk = operator_signed_chunk();
             let operator_pk = SigningKey::from_bytes(&[0x5c; 32]).verifying_key();
@@ -8807,30 +8827,35 @@ mod tests {
             };
 
             // Two independently-sealed copies (MLS forward secrecy consumes the
-            // per-message secret on first open of a given ciphertext).
-            let sealed_for_outsider = alice
-                .seal(&a_ctx_bytes, &build_inner(0), &routing_id, 300)
+            // per-message secret on first open of a given ciphertext). Each actor
+            // `seal` advances the send tracker exactly as the provider's
+            // `send_sequence` did (AAD sequence 0 then 1).
+            let sealed_for_outsider = alice_a
+                .seal(alice_did, &build_inner(0), &routing_id, 300)
                 .unwrap();
-            let sealed_for_member = alice
-                .seal(&a_ctx_bytes, &build_inner(1), &routing_id, 300)
+            let sealed_for_member = alice_a
+                .seal(alice_did, &build_inner(1), &routing_id, 300)
                 .unwrap();
 
-            // (a) A non-A-member (fresh provider, no A group key) CANNOT decrypt.
-            let outsider = Arc::new(MlsCryptoProvider::new(
-                "did:dht:z6MkOutsiderOutsiderOutsiderOutsiderOut".to_owned(),
-                Arc::new(scp_clock::SystemClock),
-            ));
+            // (a) A non-A-member (fresh actor, no A group key) CANNOT decrypt:
+            // an empty encrypted-mode `PerContextState` holds no MLS group, so
+            // `open` fails closed with "no MLS group for this context".
+            let mut outsider_a = PerContextState::new_for_test_encrypted(
+                a_ctx_bytes,
+                0,
+                DID::from("did:dht:z6MkOutsiderOutsiderOutsiderOutsiderOut".to_owned()),
+            );
             assert!(
-                outsider
-                    .open(&a_ctx_bytes, a_ctx_str, &sealed_for_outsider)
+                outsider_a
+                    .open(&scp_clock::SystemClock, a_ctx_str, &sealed_for_outsider)
                     .is_err(),
                 "a non-A-member holding no A group key must not decrypt the sealed chunk"
             );
 
             // (b) An A member decrypts and recovers the chunk with B's operator
             // signature intact and verifying against B's PINNED context_id.
-            let opened = bob
-                .open(&a_ctx_bytes, a_ctx_str, &sealed_for_member)
+            let opened = bob_a
+                .open(&scp_clock::SystemClock, a_ctx_str, &sealed_for_member)
                 .unwrap();
             let recovered_bytes = match opened {
                 OpenResult::Application(env) => env.inner.payload,

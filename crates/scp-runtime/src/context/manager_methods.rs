@@ -8,7 +8,7 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Cross-domain `ContextManager` infrastructure helpers with explicit-
-//! collaborator signatures (ADR-049 commit 12).
+//! collaborator signatures (ADR-049 §15).
 //!
 //! # Purpose
 //!
@@ -22,7 +22,7 @@
 //!
 //! Co-locating them here keeps each domain's helper module focused while
 //! preserving the "one canonical free-function form per legacy method"
-//! invariant the rest of the 12c hoist series established.
+//! invariant the rest of the ADR-049 §15 actor-migration hoists established.
 //!
 //! # Behavior preservation
 //!
@@ -34,7 +34,7 @@
 //!   [`Supervisor`](crate::context::supervisor::Supervisor), or
 //! - `supervisor.X_ref()` accessor calls for the provider slots already
 //!   lifted to [`Supervisor`](crate::context::supervisor::Supervisor) in
-//!   ADR-049 commit 12c.9a/9b.
+//!   ADR-049 §15.
 //!
 //! The legacy inherent methods on
 //! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
@@ -42,7 +42,7 @@
 //! through the `Weak<Supervisor>` back-pointer installed by
 //! [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
 //! during bridge construction. The forwarders are deleted alongside the
-//! outer shim in commit 12c.9g.4.
+//! outer shim in ADR-049 §15.
 //!
 //! # Hoisted methods
 //!
@@ -79,7 +79,7 @@ use crate::context::supervisor::Supervisor;
 // ---------------------------------------------------------------------------
 
 /// Canonical diagnostic message for the
-/// [`ContextError::NotInitialized`] error variant returned when a
+/// [`ContextError::NotInitialized`](crate::context::ContextError::NotInitialized) error variant returned when a
 /// helper consults a provider slot that has not been populated by
 /// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers).
 ///
@@ -97,8 +97,8 @@ pub const PROVIDER_NOT_INITIALIZED: &str =
 /// Returns `true` if a persistence provider is configured.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::has_persistence`](crate::context::supervisor::Supervisor::has_persistence)
-/// (ADR-049 commit 12). Byte-identical behavior — uses the
+/// [`has_persistence`](crate::context::manager_methods::has_persistence)
+/// (ADR-049 §15). Byte-identical behavior — uses the
 /// supervisor's lifted persistence slot
 /// (`Supervisor::persistence_ref`) which already collapses the
 /// "not attached" + "attached but no persistence" cases to a single
@@ -173,8 +173,8 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
 /// for crash recovery.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::init_broadcast_context`](crate::context::supervisor::Supervisor::init_broadcast_context)
-/// (ADR-049 commit 12). Byte-identical behavior.
+/// [`init_broadcast_context`](crate::context::supervisor::handle::SupervisorHandle::init_broadcast_context)
+/// (ADR-049 §15). Byte-identical behavior.
 pub fn init_broadcast_context(
     supervisor: &Supervisor,
     context_id: &str,
@@ -257,8 +257,8 @@ pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: 
 /// Takes a [`ContextSnapshot`] from the current [`PerContextState`].
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::snapshot_context`](crate::context::supervisor::Supervisor::snapshot_context)
-/// (ADR-049 commit 12). Byte-identical behavior.
+/// [`snapshot_context`](crate::context::manager_methods::snapshot_context)
+/// (ADR-049 §15). Byte-identical behavior.
 ///
 /// Must be called while the contexts mutex is held (snapshot under lock).
 pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {

@@ -547,8 +547,8 @@ impl SupervisorHandle {
     ///
     /// `pub(in crate::context)` — only lifecycle bootstrap callers
     /// (`crate::context::lifecycle_helpers`) reach this. The
-    /// `private_interfaces` allow mirrors the discipline used by
-    /// [`Self::insert_context`] / [`Self::replace_context`]:
+    /// `private_interfaces` allow mirrors the discipline used by the other
+    /// owned-state `pub(in crate::context)` registry methods on this handle:
     /// `PerContextState` and `ActorDeps` are `pub(crate)` while the
     /// method itself is reachable from inside the `context` module
     /// tree.
@@ -583,7 +583,7 @@ impl SupervisorHandle {
     // (context state), so §5's "no `&DID` method returning identity state" rule
     // is not triggered.
 
-    /// Dispatch [`LifecycleControlCommand::PrepareForReplace`] to the
+    /// Dispatch [`LifecycleControlCommand::PrepareForReplace`](crate::context::actor::commands::LifecycleControlCommand::PrepareForReplace) to the
     /// actor currently registered for `context_id`, awaiting its verdict.
     ///
     /// This is the actor-native replacement gate for

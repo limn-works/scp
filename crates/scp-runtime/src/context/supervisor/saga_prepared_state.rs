@@ -408,7 +408,7 @@ pub struct CrossContextStreamingOutletInvocationPrepared {
 /// therefore CANNOT serialize the live enum directly. This mirror carries
 /// ONLY the public, non-bearer projection of each variant (the same public
 /// fields the per-variant `*Wire` mirrors already journal), so `saga_pending`
-/// can ride [`ContextSnapshot`] across an actor crash without the live enum
+/// can ride [`ContextSnapshot`](crate::context::state::ContextSnapshot) across an actor crash without the live enum
 /// ever gaining a serialization impl. A future bearer-bearing variant would
 /// have to add its own explicit, audited mirror branch here (under
 /// `Zeroizing` discipline) — the barrier holds.
@@ -420,7 +420,7 @@ pub struct CrossContextStreamingOutletInvocationPrepared {
 ///
 /// The variant carries its OWN public-field payload struct rather than
 /// reusing the `pub(in crate::context)` journal `*Wire` mirror: the
-/// snapshot rides the fully-`pub` [`ContextSnapshot`] surface, while the
+/// snapshot rides the fully-`pub` [`ContextSnapshot`](crate::context::state::ContextSnapshot) surface, while the
 /// journal wire stays crate-context-internal to the evidence path. The two
 /// projections cover the identical public fields but have independent
 /// visibility. A future saga type would add its own branch here under the
@@ -629,14 +629,14 @@ impl SagaPreparedStateSnapshot {
 /// execution with durable output capture").
 ///
 /// The outlet executes **exactly once**; its output + the signed
-/// [`CrossContextOutletReceipt`] are captured here so a Commit replayed after a
+/// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt) are captured here so a Commit replayed after a
 /// crash (§17.16.4) re-emits the STORED output and re-emits the IDENTICAL
 /// signed receipt — **never re-invoking the outlet** and never minting a fresh
 /// `outlet_invoked_event_id`. Both the receipt and the raw output are reproduced
 /// byte-for-byte from this record.
 ///
 /// **Class S.** Held in
-/// [`PerContextState.xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs)
+/// [`ClassSState::xctx_committed_outputs`](crate::context::actor::state::ClassSState::xctx_committed_outputs)
 /// and synchronously persisted fail-closed (ADR-049 §9) the same way
 /// `saga_pending` is — a crash that rolled the capture back behind an acked
 /// Commit-B would let a replayed Commit re-invoke the outlet, breaking the
@@ -683,7 +683,7 @@ pub struct CommittedOutletInvocation {
 /// (streaming)").
 ///
 /// **Class S** — held in
-/// [`PerContextState.xctx_committed_stream_outputs`](crate::context::actor::state::PerContextState::xctx_committed_stream_outputs)
+/// [`ClassSState::xctx_committed_stream_outputs`](crate::context::actor::state::ClassSState::xctx_committed_stream_outputs)
 /// and synchronously persisted fail-closed (ADR-049 §9), the same discipline as
 /// [`CommittedOutletInvocation`]: a crash that rolled the capture back behind an
 /// acked seal-close would re-invoke the outlet on replay, breaking exactly-once.

@@ -295,7 +295,7 @@ async fn handle_execute_ttl_close(
 ///
 /// No forced `transition_to(Closing)` on a detached handle: per the documented
 /// FFI contract the context must ALREADY be in `Closing` (a prior
-/// `close_context`), and [`ttl_close_helpers::finalize_close`] —
+/// `close_context`), and [`ttl_close_helpers::finalize_close`](crate::context::ttl_close_helpers::finalize_close) —
 /// via [`ttl::finalize_close`](crate::context::ttl::finalize_close) — performs
 /// the `Closing → Closed` transition itself, returning `InvalidTransition` if
 /// the context is not in `Closing`, exactly the FFI error contract.

@@ -10,8 +10,8 @@
 //! External dependencies (transport, event log) are injected via traits
 //! ([`ContextTransportProvider`], [`ContextEventLogProvider`]). The crypto
 //! layer is the concrete [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
-//! — the old `ContextCryptoProvider` trait was deleted in ADR-049 commit
-//! 12c.9e; the builder names the concrete type directly.
+//! — the old `ContextCryptoProvider` trait was deleted in ADR-049 §15;
+//! the builder names the concrete type directly.
 
 use super::ContextHandle;
 use crate::crypto::mls::provider::MlsCryptoProvider;
@@ -1123,7 +1123,7 @@ pub async fn create_context(
     clippy::panic,
     clippy::significant_drop_tightening,
     dead_code,
-    reason = "ADR-049 commit 12c.9e: scaffolding for tests ignored pending 12c.9f MlsBackend injection"
+    reason = "ADR-049 §15: scaffolding for tests ignored pending MlsBackend injection"
 )]
 mod tests {
     use super::*;
@@ -1132,10 +1132,9 @@ mod tests {
     /// Test DID for the real [`MlsCryptoProvider`].
     ///
     /// The prior `MockCryptoProvider` fail-injection scaffold was deleted
-    /// along with the `ContextCryptoProvider` trait in ADR-049 commit
-    /// 12c.9e. Success-path tests bind a real provider; fail-injection
-    /// tests are `#[ignore]`d pending `MlsBackend` injection in commit
-    /// 12c.9f.
+    /// along with the `ContextCryptoProvider` trait in ADR-049 §15.
+    /// Success-path tests bind a real provider; fail-injection tests are
+    /// `#[ignore]`d pending `MlsBackend` injection.
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
     struct TestTransport;
@@ -1190,7 +1189,7 @@ mod tests {
         assert!(validate_params(&params).is_ok());
     }
 
-    /// Smoke verifying that ADR-049 commit 12c.9f's
+    /// Smoke verifying that ADR-049 §15's
     /// [`MlsCryptoProvider::with_backends`] seam compiles and that
     /// inherent backend accessors return the injected pointers.
     /// Functional fail-injection tests (one per orchestration path)
@@ -1280,18 +1279,12 @@ mod tests {
         // `create_context` lives under the DECODED digest. `export_crypto_state`
         // returns the serialized state for a keyed context and an EMPTY vec for
         // an unkeyed one (no entry under that key).
-        let under_digest = crypto
-            .export_crypto_state(&digest, Vec::new(), Vec::new())
-            .expect("export under the decoded digest must not error");
         assert!(
-            !under_digest.is_empty(),
+            crypto.context_crypto_present(&digest),
             "crypto state MUST be keyed under the decoded digest"
         );
-        let under_sha256 = crypto
-            .export_crypto_state(&sha256_of_id, Vec::new(), Vec::new())
-            .expect("export under SHA-256(id) must not error");
         assert!(
-            under_sha256.is_empty(),
+            !crypto.context_crypto_present(&sha256_of_id),
             "crypto state MUST NOT be keyed under SHA-256(id) — that would be the \
              pre-ADR-056 double-hash, diverging from state.context_id and the §6.2.4 wire digest"
         );

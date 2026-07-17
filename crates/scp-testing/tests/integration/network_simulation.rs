@@ -1,6 +1,6 @@
-// ADR-049 commit 12c.9e: ContextCryptoProvider trait deleted; DemoCrypto
+// ADR-049 §15: ContextCryptoProvider trait deleted; DemoCrypto
 // was a bespoke mock with `seal`/`open` overrides that bypassed encryption
-// for demo purposes. ADR-049 commit 12c.9f introduces backend injection on
+// for demo purposes. ADR-049 §15 introduces backend injection on
 // `MlsCryptoProvider::with_backends`, which is the seam this file should
 // rewire to. The full rewire (every test scenario re-expressed via mock
 // `MlsBackend` / `HpkeBackend` impls and the real
@@ -13,7 +13,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::cast_possible_truncation,
-    // ADR-049 commit 12c.2: lifecycle hoist inflates some test-path
+    // ADR-049 §15: lifecycle hoist inflates some test-path
     // futures past clippy's 16 KB stack budget.
     clippy::large_futures
 )]
@@ -1127,7 +1127,7 @@ async fn application_layer_demo() {
     let transport_for_manager: Box<dyn scp_core::context::builder::ContextTransportProvider> =
         Box::new(DemoTransport::new());
 
-    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor` so
+    // ADR-049 §15 — wrap with `attach_test_supervisor` so
     // `ContextManager`'s messaging/governance/broadcast/economy
     // forwarders can resolve their `Weak<Supervisor>` back-pointer.
     let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
