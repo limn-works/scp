@@ -138,6 +138,21 @@ fn extract_ed25519_seed(
         private: Vec<u8>,
     }
 
+    // Defense-in-depth (C1): confirm the signer is Ed25519 BEFORE interpreting its
+    // private bytes as a 32-byte Ed25519 seed. A different scheme could carry a
+    // 32-byte key of another kind that would pass the length guard below but derive
+    // a meaningless pseudonym. SCP groups are Ed25519-only ([`SCP_CIPHERSUITE`]), so
+    // this can only fail on a corrupt/foreign signer — fail closed. Uses the public
+    // `signature_scheme()` accessor (no `test-utils` gate).
+    let expected_scheme = SCP_CIPHERSUITE.signature_algorithm();
+    if signer.signature_scheme() != expected_scheme {
+        return Err(MlsError::PseudonymDerivationFailed(format!(
+            "MLS signer signature scheme is {:?}, expected the SCP ciphersuite scheme {:?} (Ed25519)",
+            signer.signature_scheme(),
+            expected_scheme
+        )));
+    }
+
     let mut serialized = rmp_serde::to_vec_named(signer)
         .map_err(|e| MlsError::PseudonymDerivationFailed(format!("serializing MLS signer: {e}")))?;
     let extract: Result<Ed25519SeedExtract, _> = rmp_serde::from_slice(&serialized);
@@ -241,9 +256,11 @@ impl ScpMlsGroup {
     /// derivation, and dropped (zeroized) here. Only the resulting public
     /// pseudonym (a routing address, not a secret) is returned.
     ///
-    /// `context_id` is the raw context-id bytes; `epoch` selects v1 (`None`,
-    /// static) or v2 (`Some(e)`, rotatable) derivation, matching the native
-    /// software-custody derivation exactly.
+    /// `context_id` is the raw context-id bytes. This derives the **v1 (static)**
+    /// pseudonym — the only form the transport slice wires today; v2 epoch-scoped
+    /// (rotatable) derivation (§9.10.4.1) is not yet driven, so the epoch is fixed
+    /// to `None` internally (see the body note) rather than exposed as an
+    /// always-`None` parameter.
     ///
     /// # Errors
     ///
@@ -252,16 +269,16 @@ impl ScpMlsGroup {
     /// private seed cannot be recovered or is not the expected 32-byte Ed25519
     /// seed (a fail-closed guard against a non-Ed25519 or malformed signer — SCP
     /// groups are Ed25519-only per [`SCP_CIPHERSUITE`]).
-    pub fn derive_pseudonym(
-        &self,
-        context_id: &[u8],
-        epoch: Option<u64>,
-    ) -> Result<[u8; 32], MlsError> {
+    pub fn derive_pseudonym(&self, context_id: &[u8]) -> Result<[u8; 32], MlsError> {
         let signer = self.signer_key_pair()?;
         let seed = extract_ed25519_seed(signer)?;
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        // v1 (static) derivation. The epoch is fixed to `None` internally rather
+        // than exposed as an always-`None` parameter — v2 epoch-scoped (rotatable)
+        // pseudonyms (§9.10.4.1) are not yet driven by the transport slice, and the
+        // shared recipe gains the epoch when rotation is wired.
         let pseudonym =
-            scp_crypto::pseudonym::derive_pseudonym_keypair(&signing_key, context_id, epoch);
+            scp_crypto::pseudonym::derive_pseudonym_keypair(&signing_key, context_id, None);
         Ok(pseudonym.verifying_key().to_bytes())
     }
 
@@ -1337,7 +1354,7 @@ mod tests {
         let group = create_group(&cred, &SystemClock).unwrap();
 
         let context_id = b"ctx-derive-pseudonym-crosscheck";
-        let via_method = group.derive_pseudonym(context_id, None).unwrap();
+        let via_method = group.derive_pseudonym(context_id).unwrap();
 
         // Ground truth: read the seed directly through the test-utils accessor and
         // derive independently via the shared recipe.
@@ -1353,10 +1370,9 @@ mod tests {
             via_method, expected,
             "derive_pseudonym must recover the exact MLS private seed and derive the same pseudonym"
         );
-
-        // v2 (epoch) derivation is domain-separated from v1.
-        let v2 = group.derive_pseudonym(context_id, Some(1)).unwrap();
-        assert_ne!(v2, via_method, "v2 (epoch) derivation differs from v1");
+        // (v2 epoch-scoped derivation is not exposed by `derive_pseudonym` yet — the
+        // epoch is fixed to `None` internally; the v1-vs-v2 domain separation is
+        // covered by `scp_crypto::pseudonym`'s own KAT.)
     }
 
     /// The pseudonym is a deterministic function of the MLS signing key, so it
@@ -1370,11 +1386,11 @@ mod tests {
         let cred = test_credential("alice");
         let group = create_group(&cred, &SystemClock).unwrap();
         let context_id = b"ctx-derive-pseudonym-restore";
-        let before = group.derive_pseudonym(context_id, None).unwrap();
+        let before = group.derive_pseudonym(context_id).unwrap();
 
         let blob = group.serialize_state().unwrap();
         let restored = ScpMlsGroup::deserialize_state(&blob).unwrap();
-        let after = restored.derive_pseudonym(context_id, None).unwrap();
+        let after = restored.derive_pseudonym(context_id).unwrap();
 
         assert_eq!(
             before, after,
@@ -1391,11 +1407,11 @@ mod tests {
         let context_id = b"ctx-derive-pseudonym-distinct";
         let a = create_group(&test_credential("alice"), &SystemClock)
             .unwrap()
-            .derive_pseudonym(context_id, None)
+            .derive_pseudonym(context_id)
             .unwrap();
         let b = create_group(&test_credential("bob"), &SystemClock)
             .unwrap()
-            .derive_pseudonym(context_id, None)
+            .derive_pseudonym(context_id)
             .unwrap();
         assert_ne!(a, b, "distinct MLS keys derive distinct pseudonyms");
     }
@@ -1408,7 +1424,7 @@ mod tests {
         let mut group = create_group(&test_credential("alice"), &SystemClock).unwrap();
         destroy_group(&mut group).unwrap();
         assert!(matches!(
-            group.derive_pseudonym(b"ctx", None),
+            group.derive_pseudonym(b"ctx"),
             Err(MlsError::GroupDestroyed)
         ));
     }

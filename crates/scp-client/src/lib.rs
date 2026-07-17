@@ -44,7 +44,7 @@
 //!   client,
 //! - a [`scp_clock::Clock`] — the hardened time source for
 //!   committer-assigned event-log leaf timestamps (ADR-057 Prerequisite 1),
-//! - a [`Socket`] — the injected **outbound** relay port. The driver hands it
+//! - a [`RelaySink`] — the injected **outbound** relay port. The driver hands it
 //!   serialized relay `ClientMessage` frames (a `SUBSCRIBE` on context entry, a
 //!   `PUBLISH` per §9.10.4 fan-out address on send/announce); inbound relay
 //!   frames flow the other way, pushed by the embedder into
@@ -83,21 +83,19 @@ mod client;
 mod context;
 mod crypto_state;
 mod error;
+mod relay_sink;
 mod signer;
 mod snapshot;
-mod socket;
 mod storage;
-#[cfg(test)]
-mod transport_tests;
 
 pub use client::{AddMemberOutput, ContextStatus, ReceiveOutput, ScpClient};
 pub use context::{EVENT_BUFFER_CAP, PerContextState};
 pub use crypto_state::{
-    ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound, SenderKeyDistribution,
+    ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound, RecvChannel, SenderKeyDistribution,
 };
 pub use error::ClientError;
+pub use relay_sink::RelaySink;
 pub use signer::{LocalSigner, Signer};
-pub use socket::Socket;
 // `ContextSnapshot` / `SNAPSHOT_FORMAT_VERSION` are intentionally NOT re-exported:
 // the snapshot blob format is a crate-internal persistence detail (captured/
 // restored only inside this driver), so it stays `crate`-visible in the private

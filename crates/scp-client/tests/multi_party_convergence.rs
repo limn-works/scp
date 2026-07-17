@@ -1,6 +1,7 @@
 //! Multi-party event-log convergence over the single-threaded SCP participant
-//! driver (ADR-057 Slice 2), delivered over the injected `Socket` transport
-//! (ADR-057 transport slice).
+//! driver (ADR-057 Slice 2), with application-message delivery over the REALISTIC
+//! relay mock (`tests/common`) — the shipped relay's subscribe-timing, self-echo,
+//! and reciprocal-announce semantics (ADR-057 transport slice).
 //!
 //! SCP contexts are inherently multi-party. This test exercises the property a
 //! 2-party test cannot: when an EXISTING member processes an MLS Commit that
@@ -28,11 +29,14 @@
 //! Membership-log convergence (adds/joins/commits + the §9.16 sender-key
 //! distributions that seal them) is unaffected by the transport change and is
 //! still driven directly through the returned structs. Only application-message
-//! DELIVERY moved onto the socket: `send_message` now fans out relay `PUBLISH`
+//! DELIVERY moved onto the relay: `send_message` now fans out relay `PUBLISH`
 //! frames to each peer's pseudonym instead of returning a ciphertext, so a send
 //! requires the recipients' pseudonyms in the sender's registry (populated by
-//! pumping the §9.10.4 announcement mesh), and receipt is observed by routing the
-//! captured frames back in and draining the recipient's buffers.
+//! pumping the §9.10.4 reciprocal-announce mesh to quiescence with
+//! [`Relay::pump`]), and receipt is observed by pumping the relay and draining the
+//! recipient's buffers. The §9.16 sender-key distributions are still delivered
+//! DIRECTLY via `receive_message` (the out-of-band model — never over the relay,
+//! which carries only app data + announcements).
 
 // Integration tests assert on happy-path results; `expect`/`panic!` make the
 // failure messages legible. The workspace denies these in production code.
@@ -43,6 +47,7 @@ mod common;
 use common::*;
 use scp_client::{ClientError, ContextStatus, ScpClient, SenderKeyDistribution};
 use scp_clock::{Clock, SystemClock};
+use scp_protocol::context::context_routing_id;
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-slice2-multi-party";
@@ -54,7 +59,7 @@ const CAROL_DID: &str = "did:key:z6MkCarolMultiPartyFixtureKeyCCCCCCCCCCCCCC";
 // small (seconds) so every minted KeyPackage `Lifetime` stays valid against
 // openmls's un-injectable internal (real) clock, while remaining pairwise
 // distinct — the convergence property depends only on the clocks *differing*,
-// not on their magnitude (ADR-057 §Prereq-1 test-clock realism). `new_party`
+// not on their magnitude (ADR-057 §Prereq-1 test-clock realism). `Relay::new_party`
 // seeds each clock from `SystemClock.now_secs()` (instead of a fixed past epoch),
 // keeping the minted KeyPackages inside openmls's acceptance window at test time.
 const ALICE_OFFSET: u64 = 0;
@@ -64,7 +69,7 @@ const CAROL_OFFSET: u64 = 200;
 /// Routes each in-tab sender-key distribution to its target client and asserts
 /// the install is a no-op receive (no application payload, no cascade). This is
 /// the real §9.16.1/§9.16.2 distribution path — delivered DIRECTLY via
-/// `receive_message` (not over the socket, which carries only app data +
+/// `receive_message` (not over the relay, which carries only app data +
 /// announcements). There is no out-of-band exchange (`install_sender_key` /
 /// `local_sender_key_bytes` no longer exist on `ScpClient`).
 fn deliver3(
@@ -92,37 +97,18 @@ fn deliver3(
     }
 }
 
-/// Delivers every `PUBLISH` frame `from` captured to EACH `recipients` client,
-/// simulating the relay fanning a shared-channel (announcement) or fan-out
-/// (app-data) frame to all subscribers. Each recipient drops frames addressed to
-/// a routing id it does not track (e.g. a peer's pseudonym), so a member only
-/// ingests what is meant for it. Non-`PUBLISH` frames (e.g. `SUBSCRIBE`) are
-/// skipped. Drains `from`.
-fn fan_frames(from: &CaptureSocket, recipients: &mut [&mut ScpClient]) {
-    for frame in from.take_frames() {
-        if let Some(blob) = publish_to_blob(&frame) {
-            for client in recipients.iter_mut() {
-                client
-                    .handle_relay_frame(&blob)
-                    .expect("deliver relay blob");
-            }
-        }
-    }
-}
-
-/// Populates `sender`'s §9.10.4 peer registry by routing each other party's
-/// captured announcements into it (in emission order — a per-sender ratchet is
-/// monotone), then discards `sender`'s own announcements and its buffered
-/// `PseudonymAnnounced` events, so a subsequent fan-out send addresses every peer
-/// and the sender starts from a clean buffer. Mirrors the proven `transport_tests`
-/// pattern: for a one-way send only the sender needs a populated registry, and
-/// routing every party's frames into every other party would replay a member's
-/// announcements to a peer out of the ratchet order MLS accepts.
-fn populate_sender_registry(sender: &mut Party, peer_a: &Party, peer_b: &Party) {
-    route_publishes(&peer_a.socket, &mut sender.client);
-    route_publishes(&peer_b.socket, &mut sender.client);
-    let _ = sender.socket.take_frames();
-    let _ = sender.client.drain_events(CTX);
+/// Extracts the inner MLS ciphertext of the last app-data `PUBLISH` `conn`
+/// published to `relay` — the exact wire bytes a peer's `receive_message`
+/// consumes. App data fans out to peer pseudonyms, so it filters out the shared
+/// announcement channel. Drains the relay's publish log.
+fn last_app_ciphertext(relay: &Relay, conn: ConnId, ctx: &str) -> Vec<u8> {
+    relay
+        .drain_publish_log()
+        .into_iter()
+        .rev()
+        .find(|p| p.conn == conn && p.routing_id != context_routing_id(ctx))
+        .expect("an app-data PUBLISH from this connection")
+        .inner_ciphertext()
 }
 
 #[test]
@@ -131,9 +117,10 @@ fn three_party_add_commit_converges_across_all_members() {
     // Three deliberately different local clocks: convergence must NOT depend on
     // them agreeing — only on the convergent timestamp transported with each
     // commit/message.
-    let mut alice = new_party(ALICE_DID, ALICE_OFFSET);
-    let mut bob = new_party(BOB_DID, BOB_OFFSET);
-    let mut carol = new_party(CAROL_DID, CAROL_OFFSET);
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, ALICE_OFFSET);
+    let mut bob = relay.new_party(BOB_DID, BOB_OFFSET);
+    let mut carol = relay.new_party(CAROL_DID, CAROL_OFFSET);
 
     // --- Alice creates the context. ---
     alice.client.create_context(CTX).expect("Alice creates");
@@ -176,6 +163,16 @@ fn three_party_add_commit_converges_across_all_members() {
         "after the first add, Bob converges to Alice"
     );
 
+    // Complete the epoch-1 (Alice+Bob) reciprocal-announce mesh BEFORE the next
+    // add advances the MLS epoch: a §9.16 announcement sealed at this epoch is a
+    // dead frame once its recipient ratchets past it (MLS forward secrecy), so the
+    // pump must consume the queued join-announcements now. Draining the bootstrap
+    // `PseudonymAnnounced` events + the publish log leaves a clean baseline.
+    relay.pump(&mut [&mut alice, &mut bob]);
+    let _ = alice.client.drain_events(CTX);
+    let _ = bob.client.drain_events(CTX);
+    let _ = relay.drain_publish_log();
+
     // --- Alice adds Carol. This is the multi-party case: Alice's add-Carol
     // Commit must be processed by the EXISTING member Bob, who has to append the
     // identical MemberJoined(Carol) leaf — not silently drop it. ---
@@ -208,7 +205,7 @@ fn three_party_add_commit_converges_across_all_members() {
     // effects — appending the convergent MemberJoined leaf, recording Carol, AND
     // sealing Bob's OWN sender key to Carol (the bystander re-distribution,
     // INVARIANT 2) — are what make Bob converge and let Carol decrypt Bob. (The
-    // Commit is delivered directly, not over the socket, which carries only app
+    // Commit is delivered directly, not over the relay, which carries only app
     // data + announcements.)
     let bob_recv = bob
         .client
@@ -320,16 +317,20 @@ fn three_party_add_commit_converges_across_all_members() {
     // multi-member app-data send requires the recipients' pseudonyms in the
     // sender's registry (else `PseudonymRegistryEmpty`). A message Alice sends then
     // fans out to BOTH Bob and Carol and decrypts under the distributed key at
-    // each. ===
-    populate_sender_registry(&mut alice, &bob, &carol);
+    // each. Draining every buffer + the publish log leaves a clean baseline. ===
+    relay.pump(&mut [&mut alice, &mut bob, &mut carol]);
+    let _ = alice.client.drain_events(CTX);
+    let _ = bob.client.drain_events(CTX);
+    let _ = carol.client.drain_events(CTX);
+    let _ = relay.drain_publish_log();
 
     alice
         .client
         .send_message(CTX, b"post-convergence chatter")
         .expect("Alice sends");
-    // The fan-out published one frame per peer to Alice's socket; route both back
-    // in (each recipient ingests only the frame addressed to its pseudonym).
-    fan_frames(&alice.socket, &mut [&mut bob.client, &mut carol.client]);
+    // The fan-out published one frame per peer; pump the relay so each peer
+    // receives only the frame addressed to its pseudonym.
+    relay.pump(&mut [&mut alice, &mut bob, &mut carol]);
 
     // Both recipients recovered Alice's exact plaintext via the pull buffers — the
     // socket-path equivalent of the old `receive_message(..).application` assertion:
@@ -390,9 +391,10 @@ fn reciprocal_send_does_not_perturb_the_convergent_log() {
     // local history, delivered via the pull-based buffers, not a leaf. This is the
     // corrected T3 property: the send-side event-log convergence the pre-reframe
     // test asserted was itself a §9.9.3 violation (per-author, no total order).
-    let mut alice = new_party(ALICE_DID, ALICE_OFFSET);
-    let mut bob = new_party(BOB_DID, BOB_OFFSET);
-    let mut carol = new_party(CAROL_DID, CAROL_OFFSET);
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, ALICE_OFFSET);
+    let mut bob = relay.new_party(BOB_DID, BOB_OFFSET);
+    let mut carol = relay.new_party(CAROL_DID, CAROL_OFFSET);
 
     alice.client.create_context(CTX).expect("Alice creates");
 
@@ -425,6 +427,14 @@ fn reciprocal_send_does_not_perturb_the_convergent_log() {
         &mut bob.client,
         &mut carol.client,
     );
+
+    // Complete the epoch-1 announce mesh before advancing the epoch (see the
+    // sibling test): a §9.16 announcement sealed here is dead once its recipient
+    // ratchets past it. Drain to a clean baseline.
+    relay.pump(&mut [&mut alice, &mut bob]);
+    let _ = alice.client.drain_events(CTX);
+    let _ = bob.client.drain_events(CTX);
+    let _ = relay.drain_publish_log();
 
     let carol_kp = carol
         .client
@@ -482,16 +492,20 @@ fn reciprocal_send_does_not_perturb_the_convergent_log() {
     assert_eq!(alice.client.event_log_leaf_count(CTX), Some(3));
 
     // Pump the §9.10.4 announcements so Bob's registry holds Alice + Carol — the
-    // prerequisite for his fan-out send below.
-    populate_sender_registry(&mut bob, &alice, &carol);
+    // prerequisite for his fan-out send below. Drain to a clean baseline.
+    relay.pump(&mut [&mut alice, &mut bob, &mut carol]);
+    let _ = alice.client.drain_events(CTX);
+    let _ = bob.client.drain_events(CTX);
+    let _ = carol.client.drain_events(CTX);
+    let _ = relay.drain_publish_log();
 
     // --- BOB sends (plain-encrypted; no AAD, no leaf). Every member holds Bob's
     // sender key via the in-tab distribution mesh above, and Bob's registry holds
     // both peers, so the send fans out to Alice and Carol. ---
     let plaintext = b"hello from Bob, not a convergent leaf";
     bob.client.send_message(CTX, plaintext).expect("Bob sends");
-    // Route Bob's fan-out (one frame per peer) back into Alice and Carol.
-    fan_frames(&bob.socket, &mut [&mut alice.client, &mut carol.client]);
+    // Pump Bob's fan-out (one frame per peer) into Alice and Carol.
+    relay.pump(&mut [&mut alice, &mut bob, &mut carol]);
 
     // NO member's log changed: the send stamped no leaf on Bob, and the receives
     // stamped no leaf on Alice/Carol. Every root is exactly the pre-send root.
@@ -586,14 +600,15 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // The raw Alice group and Bob's client share a real-time base so every
     // KeyPackage `Lifetime` stays valid against openmls's internal (real) clock
     // and the hardened SCP checks (ADR-057 §Prereq-1). The raw group uses
-    // `SystemClock` directly; Bob's client (via `new_party`) uses a TestClock
+    // `SystemClock` directly; Bob's client (via `Relay::new_party`) uses a TestClock
     // seeded from the same real-time base.
     let base = SystemClock.now_secs();
     let alice_cred = ScpCredential::new(ALICE_DID.to_owned(), None, SigningKeyId::Active)
         .expect("alice credential");
     let mut alice_group = create_group(&alice_cred, &SystemClock).expect("Alice's raw MLS group");
 
-    let mut bob = new_party(BOB_DID, BOB_OFFSET);
+    let relay = Relay::new();
+    let mut bob = relay.new_party(BOB_DID, BOB_OFFSET);
 
     // Bob's ScpClient mints its join KeyPackage (private half retained inside the
     // client). Alice (raw group) adds Bob from that KeyPackage and Bob joins via
@@ -746,8 +761,9 @@ fn tampered_ciphertext_is_rejected_and_stamps_no_leaf() {
     //
     // `connect_two` wires a fully-connected 2-party context (MLS group shared,
     // §9.16 sender keys exchanged both ways, both pseudonym registries populated),
-    // draining buffers and sockets so we start clean.
-    let (mut alice, mut bob) = connect_two(CTX, ALICE_DID, BOB_DID);
+    // draining buffers and the publish log so we start clean.
+    let relay = Relay::new();
+    let (mut alice, mut bob) = connect_two(&relay, CTX, ALICE_DID, BOB_DID);
 
     let bob_leaf_before = bob.client.event_log_leaf_count(CTX);
     let bob_root_before = bob.client.event_log_root(CTX);
@@ -761,7 +777,7 @@ fn tampered_ciphertext_is_rejected_and_stamps_no_leaf() {
         .client
         .send_message(CTX, b"tamper target")
         .expect("alice sends");
-    let mut ciphertext = last_ciphertext(&alice.socket);
+    let mut ciphertext = last_app_ciphertext(&relay, alice.conn, CTX);
     // Flip the last byte (corrupts the AEAD tag covering the AAD + payload).
     if let Some(byte) = ciphertext.last_mut() {
         *byte ^= 0xFF;

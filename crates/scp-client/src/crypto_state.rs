@@ -259,6 +259,28 @@ impl std::fmt::Debug for Inbound {
     }
 }
 
+/// The relay channel an inbound frame arrived on (§9.10.4).
+///
+/// App data and pseudonym announcements are §9.16 application messages that share
+/// one per-sender sequence counter, but they travel on **different** relay
+/// routing IDs — app data on a peer's pseudonym, announcements on the shared
+/// `context_routing_id`. Because those two channels are unordered relative to each
+/// other, a single shared per-sender replay floor would let a higher-sequence app
+/// message, arriving first, drop a lower-sequence announcement as a "replay" — so
+/// the peer would never learn the announced pseudonym. The channel selects a
+/// **separate** per-sender replay floor for each, so the two never interfere
+/// (§9.10.4 announcement reorder). Announcements are idempotent registry updates,
+/// so their floor is in-memory-only (a restart re-processes a backfilled
+/// announcement harmlessly — the static pseudonym is re-recorded identically; the
+/// durable routing state is the persisted peer registry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvChannel {
+    /// A peer's application data, addressed to this member's pseudonym.
+    App,
+    /// A pseudonym announcement, on the shared `context_routing_id`.
+    Announcement,
+}
+
 /// Combined MLS + sender-key state for a single context.
 ///
 /// Owns the MLS group and this participant's sender key, plus the store of
@@ -283,10 +305,18 @@ pub struct ContextCryptoState {
     pub sender_key_epoch: u64,
     /// Other participants' sender keys, keyed by `(context_id, sender_did)`.
     pub sender_key_store: SenderKeyStore,
-    /// Receive-side replay detection: `sender_did → (last_epoch,
-    /// last_sequence)`. A message with `epoch < last_epoch` or `(epoch ==
-    /// last_epoch && sequence <= last_sequence)` is rejected (§9.16.1).
+    /// Receive-side replay detection for **app data** (the [`RecvChannel::App`]
+    /// channel): `sender_did → (last_epoch, last_sequence)`. A message with
+    /// `epoch < last_epoch` or `(epoch == last_epoch && sequence <= last_sequence)`
+    /// is rejected (§9.16.1).
     pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
+    /// Receive-side replay detection for **pseudonym announcements** (the
+    /// [`RecvChannel::Announcement`] channel), kept SEPARATE from the app-data
+    /// floor so the two unordered channels do not drop each other's messages
+    /// (§9.10.4 announcement reorder — see [`RecvChannel`]). In-memory only:
+    /// announcements are idempotent and the durable routing state is the persisted
+    /// peer registry, so this floor is not snapshotted.
+    pub recv_announcement_tracker: HashMap<String, (u64, u64)>,
     /// This participant's **stable wrapping public key** (X25519, §9.16.1). Peers
     /// HPKE-seal their sender keys to it; it is published in this member's MLS
     /// leaf `scp_wrapping_key` extension and transported in the member-wrapping-key
@@ -355,6 +385,7 @@ impl ContextCryptoState {
             sender_key_epoch: INITIAL_SENDER_KEY_EPOCH,
             sender_key_store: SenderKeyStore::new(),
             recv_sequence_tracker: HashMap::new(),
+            recv_announcement_tracker: HashMap::new(),
             wrapping_public,
             wrapping_secret: Zeroizing::new(wrapping_secret),
             member_wrapping_keys: HashMap::new(),
@@ -703,6 +734,7 @@ impl ContextCryptoState {
         &mut self,
         ciphertext: &[u8],
         clock: &dyn Clock,
+        channel: RecvChannel,
     ) -> Result<Inbound, ClientError> {
         // Layer 2 (outer): MLS decrypt + classify. `scp-mls` merges any staged
         // commit internally (recovering its Add/Remove DIDs before the merge)
@@ -782,10 +814,17 @@ impl ContextCryptoState {
             )));
         }
 
-        // Replay/reorder detection. Reject epoch/sequence <= last seen for this
-        // sender (§9.16.1). Consulted BEFORE insert so a duplicate or older
-        // (epoch, sequence) is refused.
-        if let Some(&(last_epoch, last_seq)) = self.recv_sequence_tracker.get(&sender_did)
+        // Replay/reorder detection against the PER-CHANNEL floor (§9.16.1,
+        // §9.10.4). App data and announcements track separately (see
+        // [`RecvChannel`]) so a higher-seq app message cannot drop a lower-seq
+        // announcement (or vice versa) across the two unordered relay channels.
+        // Consulted BEFORE insert so a duplicate or older `(epoch, sequence)` is
+        // refused.
+        let channel_tracker = match channel {
+            RecvChannel::App => &self.recv_sequence_tracker,
+            RecvChannel::Announcement => &self.recv_announcement_tracker,
+        };
+        if let Some(&(last_epoch, last_seq)) = channel_tracker.get(&sender_did)
             && (epoch < last_epoch || (epoch == last_epoch && sequence <= last_seq))
         {
             return Err(ClientError::Driver("replay or reorder detected".to_owned()));
@@ -812,10 +851,13 @@ impl ContextCryptoState {
             sequence,
         )?;
 
-        // Record the tracker only after a SUCCESSFUL decrypt, so a
-        // forged-but-undecryptable header cannot advance the replay floor.
-        self.recv_sequence_tracker
-            .insert(sender_did.clone(), (epoch, sequence));
+        // Record the PER-CHANNEL floor only after a SUCCESSFUL decrypt, so a
+        // forged-but-undecryptable header cannot advance it.
+        match channel {
+            RecvChannel::App => &mut self.recv_sequence_tracker,
+            RecvChannel::Announcement => &mut self.recv_announcement_tracker,
+        }
+        .insert(sender_did.clone(), (epoch, sequence));
 
         Ok(Inbound::Application {
             sender_did,
@@ -876,7 +918,10 @@ mod tests {
     fn full_double_encryption_round_trip() {
         let (mut alice, mut bob) = alice_and_bob();
         let ct = alice.encrypt_message(b"hello bob", ALICE, 0).unwrap();
-        match bob.decrypt_message(&ct, &SystemClock).unwrap() {
+        match bob
+            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
+            .unwrap()
+        {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -936,7 +981,10 @@ mod tests {
                 .unwrap();
         let commit_bytes = add_bob.commit.tls_serialize_detached().unwrap();
 
-        match carol.decrypt_message(&commit_bytes, &SystemClock).unwrap() {
+        match carol
+            .decrypt_message(&commit_bytes, &SystemClock, RecvChannel::App)
+            .unwrap()
+        {
             Inbound::Commit {
                 sender_did,
                 added_dids,
@@ -969,16 +1017,66 @@ mod tests {
         let ct1_dup = alice.encrypt_message(b"first-again", ALICE, 1).unwrap();
 
         assert!(
-            bob.decrypt_message(&ct2, &SystemClock).is_ok(),
+            bob.decrypt_message(&ct2, &SystemClock, RecvChannel::App)
+                .is_ok(),
             "newer seq accepted first"
         );
         assert!(
-            bob.decrypt_message(&ct1, &SystemClock).is_err(),
+            bob.decrypt_message(&ct1, &SystemClock, RecvChannel::App)
+                .is_err(),
             "older (epoch,seq) rejected as reorder/replay"
         );
         assert!(
-            bob.decrypt_message(&ct1_dup, &SystemClock).is_err(),
+            bob.decrypt_message(&ct1_dup, &SystemClock, RecvChannel::App)
+                .is_err(),
             "duplicate (epoch,seq) rejected"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn announcement_and_app_channels_have_independent_replay_floors() {
+        // S2 (§9.10.4 channel reorder): app data and announcements share the
+        // per-sender sequence but travel on different, unordered relay channels. A
+        // SHARED replay floor would drop a lower-sequence announcement that arrives
+        // after a higher-sequence app message. With per-channel floors, it is
+        // accepted on the Announcement channel even though the same sequence is
+        // rejected on the App channel (whose floor already advanced).
+        let (mut alice, mut bob) = alice_and_bob();
+
+        // App message at seq 5 → advances Bob's APP floor for Alice to 5.
+        let app5 = alice.encrypt_message(b"app-5", ALICE, 5).unwrap();
+        assert!(
+            bob.decrypt_message(&app5, &SystemClock, RecvChannel::App)
+                .is_ok()
+        );
+
+        // A message at seq 3 (LOWER) arriving on the ANNOUNCEMENT channel is
+        // ACCEPTED — the announcement floor is independent of the app floor.
+        let ann3 = alice.encrypt_message(b"ann-3", ALICE, 3).unwrap();
+        assert!(
+            bob.decrypt_message(&ann3, &SystemClock, RecvChannel::Announcement)
+                .is_ok(),
+            "a lower-seq message on the announcement channel is accepted despite the \
+             higher app-channel floor"
+        );
+
+        // The SAME seq-3 message on the APP channel is REJECTED (app floor is 5) —
+        // confirming the app floor is untouched by the announcement.
+        let ann3_on_app = alice.encrypt_message(b"ann-3-app", ALICE, 3).unwrap();
+        assert!(
+            bob.decrypt_message(&ann3_on_app, &SystemClock, RecvChannel::App)
+                .is_err(),
+            "seq 3 on the app channel is a replay/reorder (app floor already at 5)"
+        );
+
+        // And a replay of the announcement (seq 3 again on Announcement) is rejected
+        // by the announcement floor, which advanced to 3.
+        let ann3_dup = alice.encrypt_message(b"ann-3-dup", ALICE, 3).unwrap();
+        assert!(
+            bob.decrypt_message(&ann3_dup, &SystemClock, RecvChannel::Announcement)
+                .is_err(),
+            "the announcement channel still rejects its own replay"
         );
     }
 
@@ -1001,7 +1099,8 @@ mod tests {
 
         let ct = alice.encrypt_message(b"one", ALICE, 1).unwrap();
         assert!(
-            bob.decrypt_message(&ct, &SystemClock).is_err(),
+            bob.decrypt_message(&ct, &SystemClock, RecvChannel::App)
+                .is_err(),
             "no sender key → fails"
         );
         assert!(
@@ -1012,7 +1111,10 @@ mod tests {
         // After receiving the key out-of-band, a fresh send at seq 1 decrypts.
         bob.insert_sender_key(ALICE, SenderKey::from_bytes(alice.local_sender_key_bytes()));
         let ct_b = alice.encrypt_message(b"one-b", ALICE, 1).unwrap();
-        assert!(bob.decrypt_message(&ct_b, &SystemClock).is_ok());
+        assert!(
+            bob.decrypt_message(&ct_b, &SystemClock, RecvChannel::App)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1023,7 +1125,8 @@ mod tests {
         alice.sender_key_epoch = u64::MAX;
         let poisoned = alice.encrypt_message(b"poison", ALICE, 0).unwrap();
         assert!(
-            bob.decrypt_message(&poisoned, &SystemClock).is_err(),
+            bob.decrypt_message(&poisoned, &SystemClock, RecvChannel::App)
+                .is_err(),
             "epoch beyond store.epoch + MAX_EPOCH_ADVANCE must be rejected"
         );
         assert!(
@@ -1171,7 +1274,10 @@ mod tests {
         assert_eq!(dist.target_did, BOB);
 
         // Bob receives it: HPKE-opens + installs, returning SenderKeyInstalled.
-        match bob.decrypt_message(&dist.ciphertext, &SystemClock).unwrap() {
+        match bob
+            .decrypt_message(&dist.ciphertext, &SystemClock, RecvChannel::App)
+            .unwrap()
+        {
             Inbound::SenderKeyInstalled { sender_did, epoch } => {
                 assert_eq!(sender_did, ALICE);
                 assert_eq!(epoch, INITIAL_SENDER_KEY_EPOCH);
@@ -1183,7 +1289,10 @@ mod tests {
         // distributed key — the sender key was delivered ONLY over the wrapping-key
         // extension mesh, never out-of-band.
         let ct = alice.encrypt_message(b"hi bob", ALICE, 0).unwrap();
-        match bob.decrypt_message(&ct, &SystemClock).unwrap() {
+        match bob
+            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
+            .unwrap()
+        {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -1228,7 +1337,9 @@ mod tests {
             request_nonce: [0u8; 16],
         };
         let ct = frame_distribution(&mut alice, response);
-        let err = bob.decrypt_message(&ct, &SystemClock).unwrap_err();
+        let err = bob
+            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
+            .unwrap_err();
         assert!(
             matches!(err, ClientError::Driver(ref m) if m.contains("DID mismatch")),
             "a sender-DID mismatch must be rejected, got {err:?}"
@@ -1261,7 +1372,9 @@ mod tests {
             request_nonce: [0u8; 16],
         };
         let ct = frame_distribution(&mut alice, response);
-        let err = bob.decrypt_message(&ct, &SystemClock).unwrap_err();
+        let err = bob
+            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
+            .unwrap_err();
         assert!(
             matches!(err, ClientError::Driver(ref m) if m.contains("ceiling")),
             "a u64::MAX epoch must be rejected by the poisoning ceiling, got {err:?}"
@@ -1286,7 +1399,9 @@ mod tests {
         tagged.extend(std::iter::repeat_n(0u8, MAX_MANAGEMENT_PAYLOAD_SIZE + 1));
         let mls_out = encrypt(&mut alice.mls_group, &tagged).unwrap();
         let ct = serialize_ciphertext(&mls_out).unwrap();
-        let err = bob.decrypt_message(&ct, &SystemClock).unwrap_err();
+        let err = bob
+            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
+            .unwrap_err();
         assert!(
             matches!(err, ClientError::Driver(ref m) if m.contains("MAX_MANAGEMENT_PAYLOAD_SIZE")),
             "an oversized management payload must be rejected, got {err:?}"
@@ -1316,7 +1431,9 @@ mod tests {
             request_nonce: [0u8; 16],
         };
         let ct = frame_distribution(&mut alice, response);
-        let err = bob.decrypt_message(&ct, &SystemClock).unwrap_err();
+        let err = bob
+            .decrypt_message(&ct, &SystemClock, RecvChannel::App)
+            .unwrap_err();
         assert!(
             matches!(err, ClientError::SenderKey(_)),
             "a distribution sealed to another recipient must fail to open, got {err:?}"
@@ -1332,7 +1449,7 @@ mod tests {
         let dist1 = alice
             .seal_sender_key_distribution(ALICE, BOB, &bob_wk)
             .unwrap();
-        bob.decrypt_message(&dist1.ciphertext, &SystemClock)
+        bob.decrypt_message(&dist1.ciphertext, &SystemClock, RecvChannel::App)
             .unwrap();
 
         // Capture an epoch-1 ciphertext BEFORE rotation.
@@ -1343,12 +1460,15 @@ mod tests {
         assert_eq!(alice.sender_key_epoch, INITIAL_SENDER_KEY_EPOCH + 1);
         assert_eq!(rotations.len(), 1, "one distribution to Bob (self skipped)");
         assert_eq!(rotations[0].target_did, BOB);
-        bob.decrypt_message(&rotations[0].ciphertext, &SystemClock)
+        bob.decrypt_message(&rotations[0].ciphertext, &SystemClock, RecvChannel::App)
             .unwrap();
 
         // A message under the NEW key/epoch decrypts at Bob.
         let fresh_ct = alice.encrypt_message(b"epoch-2 msg", ALICE, 0).unwrap();
-        match bob.decrypt_message(&fresh_ct, &SystemClock).unwrap() {
+        match bob
+            .decrypt_message(&fresh_ct, &SystemClock, RecvChannel::App)
+            .unwrap()
+        {
             Inbound::Application { plaintext, .. } => assert_eq!(plaintext, b"epoch-2 msg"),
             other => panic!("expected Application under the rotated key, got {other:?}"),
         }
@@ -1356,7 +1476,8 @@ mod tests {
         // The pre-rotation (epoch-1) ciphertext is now stale: Bob's replay tracker
         // advanced to epoch 2, so an epoch-1 header is rejected as a reorder.
         assert!(
-            bob.decrypt_message(&stale_ct, &SystemClock).is_err(),
+            bob.decrypt_message(&stale_ct, &SystemClock, RecvChannel::App)
+                .is_err(),
             "a stale pre-rotation (epoch-1) message must be rejected after rotation"
         );
     }

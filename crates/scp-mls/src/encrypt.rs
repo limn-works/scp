@@ -31,6 +31,27 @@ use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTra
 use crate::convergent_timestamp::decode_convergent_timestamp_aad;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
+
+/// Maps an openmls `process_message` error to an [`MlsError`], distinguishing the
+/// **own-message** case — a self-authored frame the untrusted relay echoed back to
+/// its author (ADR-057) — from a genuine decryption failure.
+///
+/// The relay delivers a PUBLISH to ALL subscribers of a routing id, INCLUDING the
+/// publisher, so every member receives the echo of its own
+/// `PseudonymAnnouncement` on the shared `context_routing_id` it publishes to and
+/// subscribes to. openmls returns [`ValidationError::CannotDecryptOwnMessage`] for
+/// that echo; this maps it to the typed [`MlsError::CannotDecryptOwnMessage`] so
+/// the receive loop can DROP it benignly (symmetric with an unknown-routing_id
+/// drop) rather than surfacing a spurious decrypt error. Every other
+/// `process_message` failure remains a [`MlsError::DecryptionFailed`].
+fn classify_process_message_error<S: std::fmt::Display>(e: ProcessMessageError<S>) -> MlsError {
+    match e {
+        ProcessMessageError::ValidationError(ValidationError::CannotDecryptOwnMessage) => {
+            MlsError::CannotDecryptOwnMessage
+        }
+        other => MlsError::DecryptionFailed(other.to_string()),
+    }
+}
 use crate::lifetime::validate_key_package_lifetime;
 use crate::wrapping_extension::extract_wrapping_key;
 
@@ -171,7 +192,7 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
 
     let processed = match process_result {
         Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Ok(Err(e)) => return Err(classify_process_message_error(e)),
         Err(_) => {
             return Err(MlsError::DecryptionFailed(
                 "OpenMLS panicked during message processing".to_string(),
@@ -246,7 +267,7 @@ pub fn decrypt_with_sender_key(
 
     let processed = match process_result {
         Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Ok(Err(e)) => return Err(classify_process_message_error(e)),
         Err(_) => {
             return Err(MlsError::DecryptionFailed(
                 "OpenMLS panicked during message processing".to_string(),
@@ -354,7 +375,7 @@ pub fn decrypt_with_sender_did(
 
     let processed = match process_result {
         Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Ok(Err(e)) => return Err(classify_process_message_error(e)),
         Err(_) => {
             return Err(MlsError::DecryptionFailed(
                 "OpenMLS panicked during message processing".to_string(),
@@ -733,7 +754,7 @@ pub fn decrypt_with_membership_changes(
 
     let processed = match process_result {
         Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return Err(MlsError::DecryptionFailed(e.to_string())),
+        Ok(Err(e)) => return Err(classify_process_message_error(e)),
         Err(_) => {
             return Err(MlsError::DecryptionFailed(
                 "OpenMLS panicked during message processing".to_string(),

@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use openmls::prelude::{KeyPackageBundle, KeyPackageIn, MlsMessageOut, ProtocolVersion};
 use scp_clock::Clock;
+use scp_did::DID;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
     add_member_with_convergent_timestamp, create_group_with_wrapping_key, destroy_group,
@@ -35,7 +36,7 @@ use scp_mls::group::{
     key_package_in_wrapping_key,
 };
 use scp_mls::{
-    InMemoryMlsProvider, ScpCredential, SignatureKeyPair, restore_pending_join,
+    InMemoryMlsProvider, MlsError, ScpCredential, SignatureKeyPair, restore_pending_join,
     serialize_pending_join,
 };
 use scp_protocol::context::context_routing_id;
@@ -54,11 +55,11 @@ use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use zeroize::Zeroizing;
 
 use crate::context::PerContextState;
-use crate::crypto_state::{ContextCryptoState, Inbound, SenderKeyDistribution};
+use crate::crypto_state::{ContextCryptoState, Inbound, RecvChannel, SenderKeyDistribution};
 use crate::error::ClientError;
+use crate::relay_sink::RelaySink;
 use crate::signer::Signer;
 use crate::snapshot::ContextSnapshot;
-use crate::socket::Socket;
 use crate::storage::Storage;
 
 /// Pending join material a prospective member retains between generating its
@@ -216,7 +217,7 @@ pub struct ScpClient {
     /// entry, `PUBLISH` on every send/announce); it never reads back through this
     /// — inbound frames arrive via [`Self::handle_relay_frame`]. In a browser this
     /// is a `wasm-bindgen` `JsSocket` over the tab's WebSocket.
-    socket: Arc<dyn Socket>,
+    relay_sink: Arc<dyn RelaySink>,
     /// Per-context participant state, keyed by context id.
     contexts: HashMap<String, PerContextState>,
     /// Retained join material per context id, between key-package generation
@@ -259,13 +260,13 @@ impl ScpClient {
         signer: Arc<dyn Signer>,
         storage: Arc<dyn Storage>,
         clock: Arc<dyn Clock>,
-        socket: Arc<dyn Socket>,
+        relay_sink: Arc<dyn RelaySink>,
     ) -> Result<Self, ClientError> {
         let mut client = Self {
             signer,
             storage,
             clock,
-            socket,
+            relay_sink,
             contexts: HashMap::new(),
             pending_joins: HashMap::new(),
             routing_index: HashMap::new(),
@@ -599,13 +600,12 @@ impl ScpClient {
         // before returning.
         self.persist_context(context_id)?;
 
-        // Re-announce this member's pseudonym at the NEW epoch so the just-added
-        // member can learn it (§9.10.4). The joiner bootstraps at the post-add
-        // epoch, so it cannot decrypt an announcement sealed at any earlier epoch
-        // (MLS forward secrecy) — the add is exactly the point at which an existing
-        // member must (re-)announce to a newcomer. Best-effort over the socket; the
-        // add itself already succeeded and was persisted above.
-        self.announce_pseudonym(context_id)?;
+        // No pseudonym announcement is emitted here. The just-added member learns
+        // this member's pseudonym via the RECIPROCAL mesh: the joiner announces on
+        // its own join (the seed), this member records it as a NEW peer in
+        // `receive_message`, and reciprocates then. Announcing at add time would
+        // seal at an epoch the joiner has already ratcheted past by the time it
+        // processes the frame (MLS forward secrecy) — a dead frame (§9.10.4 mesh).
         Ok(output)
     }
 
@@ -782,7 +782,7 @@ impl ScpClient {
     // ----------------------------------------------------------------------
 
     /// Encrypts an application message in `context_id` and **fans it out** over
-    /// the injected [`Socket`](crate::Socket) to every announced peer pseudonym
+    /// the injected [`RelaySink`](crate::RelaySink) to every announced peer pseudonym
     /// (§9.10.4, ADR-057 transport slice).
     ///
     /// Runs the full §9.16 double-encryption pipeline, increments this sender's
@@ -850,30 +850,58 @@ impl ScpClient {
             let pseudonym = state
                 .crypto
                 .mls_group
-                .derive_pseudonym(context_id.as_bytes(), None)?;
+                .derive_pseudonym(context_id.as_bytes())?;
             state.set_local_pseudonym(pseudonym);
             pseudonym
         };
+        // INVARIANT: every `routing_index` key belongs to a context currently held
+        // in `self.contexts`. Entries are added here (on create/join/restore) and
+        // there is no eviction path yet — `close_context` leaves stale entries,
+        // which the inbound pump tolerates (a `BLOB` on a closed context's routing
+        // id resolves to an absent context and `receive_message` returns
+        // `UnknownContext`, which `handle_relay_frame` drops as benign).
         let announce_rid = context_routing_id(context_id);
         self.routing_index.insert(pseudonym, context_id.to_owned());
         self.routing_index
             .insert(announce_rid, context_id.to_owned());
-        self.subscribe(pseudonym)?;
-        self.subscribe(announce_rid)?;
+        // Best-effort (never fails entry — see `subscribe`).
+        self.subscribe(pseudonym);
+        self.subscribe(announce_rid);
         Ok(())
     }
 
-    /// Sends a `SUBSCRIBE` for `routing_id` over the socket, so the relay pushes
-    /// this member every `BLOB` published to it.
-    fn subscribe(&self, routing_id: [u8; 32]) -> Result<(), ClientError> {
-        let frame = ClientMessage::Subscribe {
+    /// Sends a `SUBSCRIBE` for `routing_id` over the relay sink so the relay pushes
+    /// this member every `BLOB` published to it. **Best-effort**: a send failure
+    /// (the sink is not yet open, the WebSocket is closed) is swallowed, NOT
+    /// propagated — context entry and client construction must not fail because a
+    /// SUBSCRIBE could not be enqueued (ADR-057, api-design F-API1/R1). The context
+    /// is already durably created; the subscription is re-driven on the embedder's
+    /// reconnect via [`Self::resubscribe_all`]. Serialization of a fixed-shape
+    /// SUBSCRIBE cannot fail, so nothing is lost silently.
+    fn subscribe(&self, routing_id: [u8; 32]) {
+        if let Ok(frame) = (ClientMessage::Subscribe {
             ref_id: None,
             routing_id,
             since: None,
-        }
+        })
         .to_bytes()
-        .map_err(|e| ClientError::Codec(format!("serializing SUBSCRIBE: {e}")))?;
-        self.socket.send(frame).map_err(ClientError::Transport)
+        {
+            let _ = self.relay_sink.send(frame);
+        }
+    }
+
+    /// Re-drives a `SUBSCRIBE` for every routing id this client tracks — its local
+    /// pseudonym and each context's shared announcement channel.
+    ///
+    /// The embedder MUST call this after the relay sink reconnects/resumes: because
+    /// entry-time [`Self::subscribe`] is best-effort (it never fails context entry),
+    /// a subscription enqueued while the sink was closed was silently dropped, and
+    /// this is how the client re-establishes delivery. Idempotent and best-effort —
+    /// safe to call any time the sink is (re)opened.
+    pub fn resubscribe_all(&self) {
+        for routing_id in self.routing_index.keys() {
+            self.subscribe(*routing_id);
+        }
     }
 
     /// Builds and publishes this member's `PseudonymAnnouncement` (§9.10.4) so
@@ -896,7 +924,15 @@ impl ScpClient {
         };
         let payload = rmp_serde::to_vec_named(&announcement)
             .map_err(|e| ClientError::Codec(format!("serializing pseudonym announcement: {e}")))?;
-        self.encrypt_and_fanout(context_id, &payload, false)
+        // Best-effort delivery (ADR-057, api-design F-API1): a pure TRANSPORT
+        // failure to publish the announcement must NOT fail context entry or the
+        // triggering receive — the peer will (re-)learn this member's pseudonym via
+        // the reciprocal-announce mesh on a later announcement. A crypto/codec error
+        // is a real bug and still propagates.
+        match self.encrypt_and_fanout(context_id, &payload, false) {
+            Err(ClientError::Transport(_)) => Ok(()),
+            other => other,
+        }
     }
 
     /// The shared §9.16-encrypt → outer-wrap → relay-fan-out core behind both
@@ -924,7 +960,7 @@ impl ScpClient {
         record_sent: bool,
     ) -> Result<(), ClientError> {
         let sender_did = self.signer.did().to_owned();
-        let socket = Arc::clone(&self.socket);
+        let relay_sink = Arc::clone(&self.relay_sink);
         let is_announcement = is_pseudonym_announcement_payload(plaintext);
 
         // Phase 1: routing decision + empty-registry guard, read BEFORE advancing
@@ -985,6 +1021,18 @@ impl ScpClient {
         // Fan out: one PUBLISH per routing id, identical blob. App data is NEVER
         // published to the shared `context_routing_id` (only announcements are —
         // enforced by the classification above).
+        //
+        // ATOMICITY (api-design M1): the ratchet already advanced and persisted ONCE
+        // above, so this send must NOT prompt a caller retry that would re-fan the
+        // message with a NEW sequence (duplicate delivery). Mirroring the native
+        // `messaging_helpers` fan-out, a per-peer send failure is collected and the
+        // loop CONTINUES; the call returns `Ok` if AT LEAST ONE send succeeded
+        // (partial delivery is not retried — peers who missed it re-sync via later
+        // traffic), and only a TOTAL failure surfaces `Transport` (a retry then
+        // re-fans a NEW message, producing a tolerable sequence GAP, never a
+        // duplicate).
+        let mut any_success = false;
+        let mut last_transport_err: Option<String> = None;
         for routing_id in routing_ids {
             let frame = ClientMessage::Publish {
                 ref_id: None,
@@ -995,9 +1043,21 @@ impl ScpClient {
             }
             .to_bytes()
             .map_err(|e| ClientError::Codec(format!("serializing PUBLISH: {e}")))?;
-            socket.send(frame).map_err(ClientError::Transport)?;
+            match relay_sink.send(frame) {
+                Ok(()) => any_success = true,
+                Err(e) => last_transport_err = Some(e),
+            }
         }
-        Ok(())
+        if any_success {
+            Ok(())
+        } else {
+            // No addressee received the frame. (`routing_ids` was non-empty — the
+            // lone/empty no-op returned earlier — so a `None` here is unreachable,
+            // but map it to a typed transport error rather than a silent success.)
+            Err(ClientError::Transport(
+                last_transport_err.unwrap_or_else(|| "all fan-out sends failed".to_owned()),
+            ))
+        }
     }
 
     /// The synchronous **inbound pump**: feeds one relay frame the embedder
@@ -1036,11 +1096,28 @@ impl ScpClient {
                 let Some(context_id) = self.routing_index.get(&routing_id).cloned() else {
                     return Ok(());
                 };
+                // The channel is the routing id it arrived on: the shared
+                // `context_routing_id` carries pseudonym ANNOUNCEMENTS; this
+                // member's own pseudonym carries APP data. This selects the
+                // per-channel replay floor (§9.10.4 reorder — see `RecvChannel`).
+                let channel = if routing_id == context_routing_id(&context_id) {
+                    RecvChannel::Announcement
+                } else {
+                    RecvChannel::App
+                };
                 let envelope = OuterEnvelope::from_bytes(&blob).map_err(|e| {
                     ClientError::Codec(format!("deserializing outer envelope: {e}"))
                 })?;
-                self.receive_message(&context_id, &envelope.encrypted_blob)?;
-                Ok(())
+                // A `BLOB` for a routing id whose context was closed (a stale
+                // routing_index entry — there is no eviction path yet) resolves to
+                // an absent context; drop it benignly rather than surfacing
+                // `UnknownContext` (the relay is an untrusted pipe that may deliver
+                // frames this client no longer tracks — symmetric with the
+                // unknown-routing_id drop above).
+                match self.receive_on_channel(&context_id, &envelope.encrypted_blob, channel) {
+                    Ok(_) | Err(ClientError::UnknownContext(_)) => Ok(()),
+                    Err(e) => Err(e),
+                }
             }
             RelayMessage::Err { code, msg, .. } => Err(ClientError::Transport(format!(
                 "relay reported error {code}: {msg}"
@@ -1129,12 +1206,33 @@ impl ScpClient {
         context_id: &str,
         ciphertext: &[u8],
     ) -> Result<ReceiveOutput, ClientError> {
+        // Direct delivery (sender-key distributions, the test dumb-pipe) uses the
+        // APP replay channel. Relay-pumped frames select their channel by routing
+        // id in [`Self::handle_relay_frame`].
+        self.receive_on_channel(context_id, ciphertext, RecvChannel::App)
+    }
+
+    /// [`Self::receive_message`] with an explicit [`RecvChannel`] (the relay
+    /// routing id it arrived on — see [`Self::handle_relay_frame`]).
+    ///
+    /// The channel selects the per-sender replay floor (§9.10.4 announcement
+    /// reorder). A **self-echo** — this member's own frame delivered back by the
+    /// untrusted relay (which has no publisher exclusion) — surfaces as
+    /// [`MlsError::CannotDecryptOwnMessage`] and is DROPPED benignly (no state
+    /// change, no persist), symmetric with the unknown-routing_id drop.
+    fn receive_on_channel(
+        &mut self,
+        context_id: &str,
+        ciphertext: &[u8],
+        channel: RecvChannel,
+    ) -> Result<ReceiveOutput, ClientError> {
         // ADR-057 §Prereq-1: captured before the `state` mutable borrow so the
         // hardened clock (used to re-validate any add-Commit's KeyPackage
         // `Lifetime`) and the mutable context borrow do not alias `self`.
         let clock = Arc::clone(&self.clock);
-        // This member's own DID — needed as the `local_did` when it seals its own
-        // sender key to a member a bystander add introduces (INVARIANT 2).
+        // This member's own DID — needed for the self-collision check in the
+        // §9.10.4 ingest, and as the `local_did` when it seals its own sender key to
+        // a member a bystander add introduces (INVARIANT 2).
         let self_did = self.signer.did().to_owned();
         let state = self.context_mut(context_id)?;
         // Any successful `decrypt_message` mutates persistent MLS state — it
@@ -1144,13 +1242,27 @@ impl ScpClient {
         // after the `state` borrow ends. Only the rejected Remove-bearing Commit
         // (which `scp-mls` dropped BEFORE merging, leaving MLS + SCP state
         // unchanged) returns without a write.
-        // Set when this receive applied an add-Commit (a new member joined the
-        // group as seen by this bystander). Drives a post-persist re-announcement so
-        // the newcomer learns THIS member's pseudonym at the new epoch — the
-        // bystander half of the §9.10.4 announce mesh (the adder re-announces in
-        // `add_member`; the joiner announces on join).
-        let mut membership_added = false;
-        let outcome = match state.crypto.decrypt_message(ciphertext, clock.as_ref())? {
+        // Set when this receive recorded a NEW peer pseudonym (a DID not previously
+        // in the registry). Drives a post-persist RECIPROCAL announcement so that
+        // peer learns THIS member's pseudonym — the mesh-completion half of the
+        // §9.10.4 announce mesh (the joiner announces on join as the seed; every
+        // member reciprocates on learning a new peer, guarded per-DID so the cascade
+        // converges — see the module docs).
+        let mut learned_new_peer = false;
+        let decrypted = match state
+            .crypto
+            .decrypt_message(ciphertext, clock.as_ref(), channel)
+        {
+            Ok(inbound) => inbound,
+            // Self-echo of a frame this member published to a routing id it also
+            // subscribes to (the shared `context_routing_id` for announcements).
+            // Benign DROP — no state advanced, nothing to persist.
+            Err(ClientError::Mls(MlsError::CannotDecryptOwnMessage)) => {
+                return Ok(ReceiveOutput::default());
+            }
+            Err(e) => return Err(e),
+        };
+        let outcome = match decrypted {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -1158,9 +1270,14 @@ impl ScpClient {
                 // §9.10.4 ingest: an inbound application plaintext may be a peer's
                 // `PseudonymAnnouncement` rather than user data. Delegated to
                 // `ingest_application_plaintext`, which runs the shared, wasm-safe
-                // decision core and maps its verdict (record + `PseudonymAnnounced`,
-                // buffer `MessageReceived`, or drop a rejected announcement).
-                ingest_application_plaintext(state, context_id, sender_did, plaintext)
+                // decision core (with this member's OWN pseudonym included in the
+                // collision check — S1) and maps its verdict; it reports whether a
+                // NEW peer was recorded, to drive the reciprocal announce below.
+                let (out, new_peer) = ingest_application_plaintext(
+                    state, context_id, &self_did, sender_did, plaintext,
+                );
+                learned_new_peer = new_peer;
+                out
             }
             Inbound::SenderKeyInstalled { .. } => {
                 // A peer's sender key was HPKE-opened and installed into the store
@@ -1246,9 +1363,13 @@ impl ScpClient {
                             added_wrapping_key,
                         )?);
                     }
-                    // A member was added: re-announce below so it learns this
-                    // member's pseudonym at the new epoch.
-                    membership_added = true;
+                    // No pseudonym re-announcement is triggered here: the newcomer
+                    // learns this member's pseudonym via the RECIPROCAL mesh — when
+                    // the newcomer announces (on its own join) and this member
+                    // records it as a new peer, this member reciprocates. Announcing
+                    // at add/bystander-Commit time instead would seal at an epoch the
+                    // newcomer has already ratcheted past by the time it processes
+                    // the frame (MLS forward secrecy), producing a dead frame.
                 }
                 ReceiveOutput {
                     application: false,
@@ -1260,12 +1381,13 @@ impl ScpClient {
         // `state` borrow ends above. Persist the mutated MLS/log/membership state
         // (including any send-ratchet advance from a bystander re-distribution).
         self.persist_context(context_id)?;
-        // Bystander pseudonym re-announcement (§9.10.4): after applying an
-        // add-Commit, re-announce this member's routing id at the NEW epoch so the
-        // newcomer — which bootstrapped at this epoch and cannot decrypt an
-        // announcement sealed earlier — can learn it. Best-effort; the receive
-        // itself already succeeded and was persisted above.
-        if membership_added {
+        // RECIPROCAL pseudonym announcement (§9.10.4 mesh completion): if this
+        // receive recorded a NEW peer, re-announce this member's own pseudonym so
+        // that peer learns it. The guard (`ingest` reports `new_peer` only the first
+        // time a DID is recorded) makes the cascade converge — a re-announce of an
+        // already-known peer never fires. `announce_pseudonym` is best-effort on the
+        // transport, so a publish failure does not fail this receive.
+        if learned_new_peer {
             self.announce_pseudonym(context_id)?;
         }
         Ok(outcome)
@@ -1745,46 +1867,78 @@ impl ScpClient {
 /// - **Rejected** → a tagged announcement that failed a §9.10.4 security check
 ///   (forged `member_did`, reserved/colliding routing id) is dropped without
 ///   recording anything or surfacing a payload.
+///
+/// Returns `(ReceiveOutput, learned_new_peer)`. `learned_new_peer` is `true` only
+/// when an announcement was **accepted for a DID not previously in the registry**,
+/// so the caller can reciprocal-announce exactly once per new peer (§9.10.4 mesh
+/// completion, converges).
+///
+/// # Own-pseudonym collision guard (S1)
+///
+/// The classifier is run over the peer registry **augmented with this member's own
+/// `self_did → local_pseudonym` mapping**, so a forged
+/// `attacker_did → victim_pseudonym` announcement is rejected by the cross-DID
+/// collision check (the victim's pseudonym is already claimed by the victim's own
+/// DID). Without self in the registry the victim would accept the forgery and
+/// misroute honest senders addressing the attacker to the victim's own address.
 fn ingest_application_plaintext(
     state: &mut PerContextState,
     context_id: &str,
+    self_did: &str,
     sender_did: String,
     plaintext: Vec<u8>,
-) -> ReceiveOutput {
+) -> (ReceiveOutput, bool) {
+    // Build the collision-check registry: the peer registry plus THIS member's own
+    // (self_did → local_pseudonym). `peer_pseudonyms` deliberately excludes self
+    // (it is the fan-out address set), so self is added only for this check.
+    let mut classify_registry = state.peer_pseudonyms.clone();
+    if let Some(local) = state.local_pseudonym() {
+        classify_registry.insert(DID(self_did.to_owned()), local);
+    }
     match classify_pseudonym_announcement(
         &plaintext,
         &sender_did,
         context_id,
-        Some(&state.peer_pseudonyms),
+        Some(&classify_registry),
     ) {
         PseudonymAnnouncementDecision::Accept {
             member_did,
             pseudonym,
         } => {
+            let learned_new_peer = !state.peer_pseudonyms.contains_key(&member_did);
             state.record_peer_pseudonym(member_did.clone(), pseudonym);
             state.push_event(ContextEvent::PseudonymAnnounced {
                 member_did,
                 pseudonym,
             });
-            ReceiveOutput {
-                application: false,
-                sender_key_distributions: Vec::new(),
-            }
+            (
+                ReceiveOutput {
+                    application: false,
+                    sender_key_distributions: Vec::new(),
+                },
+                learned_new_peer,
+            )
         }
         PseudonymAnnouncementDecision::NotAnnouncement => {
             state.push_event(ContextEvent::MessageReceived {
                 sender_did: sender_did.into(),
                 payload: plaintext,
             });
-            ReceiveOutput {
-                application: true,
-                sender_key_distributions: Vec::new(),
-            }
+            (
+                ReceiveOutput {
+                    application: true,
+                    sender_key_distributions: Vec::new(),
+                },
+                false,
+            )
         }
-        PseudonymAnnouncementDecision::Rejected { .. } => ReceiveOutput {
-            application: false,
-            sender_key_distributions: Vec::new(),
-        },
+        PseudonymAnnouncementDecision::Rejected { .. } => (
+            ReceiveOutput {
+                application: false,
+                sender_key_distributions: Vec::new(),
+            },
+            false,
+        ),
     }
 }
 

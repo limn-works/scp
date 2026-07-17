@@ -4,14 +4,16 @@
 //! This is the Slice-2 milestone test: it drives two `ScpClient`s — Alice
 //! (creator) and Bob (joiner) — through the full participant message path with
 //! NO tokio, NO actors, NO `scp-runtime`. Everything runs synchronously on one
-//! thread; the "relay" is the test harness (`common`) capturing one client's
-//! outbound relay `PUBLISH` frames and routing them back into the other's
-//! `handle_relay_frame` as relay `BLOB`s (the "dumb pipe" a real relay is).
+//! thread over the REALISTIC in-memory relay mock (`tests/common`): each client's
+//! injected `RelaySink` forwards its `SUBSCRIBE`/`PUBLISH` frames into the shared
+//! `Relay`, and `Relay::pump` delivers the queued `BLOB`s back into each party's
+//! `handle_relay_frame` — iteratively until quiescent, so the §9.10.4
+//! reciprocal-announce cascade completes exactly as it would over a live relay.
 //!
 //! It proves three properties:
 //! 1. **End-to-end exchange works single-threaded over `scp-mls`** — Bob
 //!    recovers Alice's exact plaintext through the §9.16 double-encryption
-//!    pipeline, fanned out over the injected `Socket` (ADR-057 transport slice).
+//!    pipeline, fanned out over the relay (ADR-057 transport slice).
 //! 2. **Membership-log convergence by shared code, unperturbed by messages** —
 //!    after the joiner replays the adder's log, both members hold a byte-identical
 //!    membership sequence [`ContextCreated`, `MemberJoined`] (every leaf hash AND
@@ -32,7 +34,8 @@
 
 mod common;
 
-use common::{new_party, route_publishes};
+use common::Relay;
+use scp_protocol::context::context_routing_id;
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-slice2-two-party";
@@ -42,16 +45,17 @@ const BOB_DID: &str = "did:key:z6MkBob2PartyExchangeFixtureKeyBBBBBBBBBBBB";
 #[test]
 #[allow(clippy::too_many_lines)] // one end-to-end two-party scenario, read top-to-bottom
 fn two_party_message_exchange_end_to_end() {
-    // `new_party` seeds each client's fixed clock from real `now` + the given
+    // `relay.new_party` seeds each client's fixed clock from real `now` + the given
     // offset, so every minted KeyPackage `Lifetime` stays valid against openmls's
     // un-injectable internal (real) clock (ADR-057 §Prereq-1 test-clock realism);
     // a fixed past epoch would produce already-expired KeyPackages. Bob gets a
     // DIFFERENT offset (a small distinct value) to prove convergence does not
     // depend on the two members' clocks agreeing — only on the convergent
     // timestamp that travels with each message.
+    let relay = Relay::new();
 
     // --- Alice creates the context (MLS group + first event-log leaf). ---
-    let mut alice = new_party(ALICE_DID, 0);
+    let mut alice = relay.new_party(ALICE_DID, 0);
     alice
         .client
         .create_context(CTX)
@@ -69,7 +73,7 @@ fn two_party_message_exchange_end_to_end() {
 
     // --- Bob generates a KeyPackage for joining and hands the public bytes to
     // Alice (the matching private join material stays inside Bob's client). ---
-    let mut bob = new_party(BOB_DID, 100);
+    let mut bob = relay.new_party(BOB_DID, 100);
     let bob_key_package = bob
         .client
         .generate_key_package_for_join(CTX)
@@ -77,8 +81,8 @@ fn two_party_message_exchange_end_to_end() {
 
     // --- Alice adds Bob → Commit (existing members) + Welcome (Bob) + a
     // MemberJoined leaf. The convergent committer timestamp rides on the
-    // returned output. `add_member` also re-announces Alice's pseudonym over the
-    // socket at the new epoch. ---
+    // returned output. `add_member` does NOT announce (new semantics — the mesh
+    // completes via joiner-seed + reciprocal, pumped below). ---
     let add = alice
         .client
         .add_member(CTX, &bob_key_package)
@@ -96,7 +100,7 @@ fn two_party_message_exchange_end_to_end() {
     // log reconstructs byte-identically (§7.3.1 context-state import). In a
     // two-member group Alice's Commit has no existing recipient to process. The
     // join returns Bob's sender-key distributions (Bob → each existing member)
-    // and announces Bob's pseudonym over the socket. ---
+    // and announces Bob's pseudonym over the relay (the reciprocal-announce seed). ---
     let bob_distributions = bob
         .client
         .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
@@ -116,7 +120,7 @@ fn two_party_message_exchange_end_to_end() {
     // --- In-tab sender-key distribution (§9.16.1/§9.16.2): NO out-of-band
     // exchange. Alice's add sealed her key to Bob; Bob's join sealed his key to
     // Alice. Each distribution is delivered DIRECTLY to its target's
-    // receive_message (not over the socket — the transport slice routes app data
+    // receive_message (not over the relay — the transport slice routes app data
     // + pseudonym announcements, not sender-key distributions), which HPKE-opens
     // and installs it. ---
     assert_eq!(add.sender_key_distributions.len(), 1, "Alice → Bob");
@@ -143,19 +147,18 @@ fn two_party_message_exchange_end_to_end() {
     assert!(!alice_install.application);
     assert!(alice_install.sender_key_distributions.is_empty());
 
-    // --- Pump each side's pseudonym announcement to the other so both peer
+    // --- Pump the reciprocal-announce cascade to quiescence so both peer
     // registries populate: app-data `send_message` in a multi-member context
-    // fans out ONLY to announced peers (an empty registry fails closed). The
-    // announcements were captured over each socket during add/join above.
-    // Routing them is decryptable now that both sender keys are installed. ---
-    route_publishes(&alice.socket, &mut bob.client);
-    route_publishes(&bob.socket, &mut alice.client);
-    // Drain the resulting PseudonymAnnounced events + residual captured frames so
-    // the message exchange below is the ONLY thing each buffer/socket carries.
+    // fans out ONLY to announced peers (an empty registry fails closed). Bob's
+    // join-announce (captured over the relay above) reaches Alice, who records it
+    // and reciprocates; Bob then records Alice. Both sender keys are installed, so
+    // every announcement decrypts at its intended audience. ---
+    relay.pump(&mut [&mut alice, &mut bob]);
+    // Drain the resulting PseudonymAnnounced events + residual publish records so
+    // the message exchange below is the ONLY thing each buffer carries.
     let _ = alice.client.drain_events(CTX);
     let _ = bob.client.drain_events(CTX);
-    let _ = alice.socket.take_frames();
-    let _ = bob.socket.take_frames();
+    let _ = relay.drain_publish_log();
 
     // === The convergent membership log is now settled: both members hold
     // [ContextCreated, MemberJoined] (2 leaves) with equal roots. Capture that
@@ -172,11 +175,10 @@ fn two_party_message_exchange_end_to_end() {
     );
 
     // --- Alice sends an application message: sender-layer encrypt + plain MLS
-    // encrypt (no AAD — ADR-011), then fan out over the injected `Socket` as one
-    // relay `PUBLISH` per announced peer (here: Bob). The message is recorded as
-    // Alice's local `MessageSent` history (buffered for drain), NOT as a
-    // convergent leaf, so `send_message` returns `()` and the event log is
-    // unchanged. ---
+    // encrypt (no AAD — ADR-011), then fan out over the relay as one `PUBLISH`
+    // per announced peer (here: Bob). The message is recorded as Alice's local
+    // `MessageSent` history (buffered for drain), NOT as a convergent leaf, so
+    // `send_message` returns `()` and the event log is unchanged. ---
     let plaintext = b"hello from Alice over a single-threaded SCP client";
     alice
         .client
@@ -194,15 +196,23 @@ fn two_party_message_exchange_end_to_end() {
         "a send leaves the Merkle root unchanged (MessageSent is excluded from the log)"
     );
 
-    // --- Bob receives + decrypts by routing Alice's captured PUBLISH frame into
-    // his `handle_relay_frame` as a relay BLOB. This buffers a MessageReceived
-    // (local history), NOT a convergent leaf, so Bob's event log is likewise
-    // unchanged. ---
-    let delivered = route_publishes(&alice.socket, &mut bob.client);
+    // Alice's app-data send fanned out exactly one PUBLISH to Bob's pseudonym (one
+    // announced peer), and NEVER to the shared announcement channel.
+    let app_publish_count = relay
+        .drain_publish_log()
+        .into_iter()
+        .filter(|p| p.conn == alice.conn && p.routing_id != context_routing_id(CTX))
+        .count();
     assert_eq!(
-        delivered, 1,
+        app_publish_count, 1,
         "Alice's app-data send fanned out exactly one PUBLISH to Bob's pseudonym"
     );
+
+    // --- Bob receives + decrypts by pumping Alice's queued PUBLISH into his
+    // `handle_relay_frame` as a relay BLOB. This buffers a MessageReceived
+    // (local history), NOT a convergent leaf, so Bob's event log is likewise
+    // unchanged. ---
+    relay.pump(&mut [&mut alice, &mut bob]);
 
     assert_eq!(
         bob.client.event_log_leaf_count(CTX),
@@ -256,12 +266,13 @@ fn two_party_message_exchange_end_to_end() {
         } => {
             assert_eq!(sender_did.0, ALICE_DID, "the sender DID is Alice");
             // Alice's per-sender sequence counter is drawn by EVERY fan-out,
-            // including the §9.10.4 pseudonym announcement `add_member` emitted
-            // (which consumed sequence 0). So her first app-data `MessageSent` is
-            // sequence 1 — the counter is monotonic across announcements + app data.
+            // including the §9.10.4 RECIPROCAL pseudonym announcement Alice emitted
+            // when she learned Bob during the pump above (which consumed sequence 0).
+            // So her first app-data `MessageSent` is sequence 1 — the counter is
+            // monotonic across announcements + app data.
             assert_eq!(
                 *sequence_number, 1,
-                "Alice's first app-data send is sequence 1 (the announcement took 0)"
+                "Alice's first app-data send is sequence 1 (the reciprocal announcement took 0)"
             );
             assert_eq!(payload.as_slice(), plaintext, "Alice's own sent plaintext");
         }

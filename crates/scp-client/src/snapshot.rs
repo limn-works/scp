@@ -464,6 +464,9 @@ impl ContextSnapshot {
             sender_key_epoch: self.sender_key_epoch,
             sender_key_store,
             recv_sequence_tracker,
+            // In-memory only (idempotent announcements; not snapshotted). A restored
+            // context starts with an empty announcement floor — see `RecvChannel`.
+            recv_announcement_tracker: HashMap::new(),
             wrapping_public: self.wrapping_public,
             wrapping_secret: Zeroizing::new(wrapping_secret),
             member_wrapping_keys,

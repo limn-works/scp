@@ -19,19 +19,23 @@
 //! *before* the hostile input and asserts byte-for-byte equality *after*, plus that
 //! no phantom receive event was buffered.
 //!
-//! # Transport-slice notes (ADR-057)
+//! # Transport-slice notes (ADR-057) — recovering the wire ciphertext
 //!
 //! `send_message` no longer returns the ciphertext: it fans the message out over
-//! the injected [`Socket`](scp_client::Socket) as relay `PUBLISH` frames. The
-//! `common` harness's [`CaptureSocket`](common::CaptureSocket) records those; the
-//! adversarial tests recover the inner MLS ciphertext from the last captured frame
-//! via [`common::last_ciphertext`] and feed it to `receive_message` (possibly
-//! tampered) — exactly the hostile-relay wire bytes the old tests fabricated. An
-//! app-data send needs the peer registry populated first (else
-//! `PseudonymRegistryEmpty`), so senders are wired via [`common::connect_two`],
-//! which exchanges §9.16 sender keys AND pumps both pseudonym announcements. A LONE
-//! member cannot send (fan-out is a no-op), so the "foreign group" adversary is a
-//! genuine 2-member group.
+//! the injected [`RelaySink`](scp_client::RelaySink) as relay `PUBLISH` frames. The
+//! `common` [`Relay`](common::Relay) mock records those; the adversarial tests
+//! recover the inner MLS ciphertext from the recorded app-data `PUBLISH` via
+//! [`common::PublishRecord::inner_ciphertext`] (which decodes the wire
+//! `OuterEnvelope` and returns its `encrypted_blob`) and feed it to
+//! `receive_message` — possibly tampered — exactly the hostile-relay wire bytes the
+//! old tests fabricated. The [`app_ciphertext`] helper drains the relay's publish
+//! log and picks the app-data frame (the one NOT on the shared announcement
+//! `context_routing_id`). An app-data send needs the peer registry populated first
+//! (else `PseudonymRegistryEmpty`), so senders are wired via
+//! [`common::connect_two`], which exchanges §9.16 sender keys AND — via the
+//! reciprocal-announce cascade pumped to quiescence — populates both pseudonym
+//! registries. A LONE member cannot send (fan-out is a no-op), so the "foreign
+//! group" adversary is a genuine 2-member group on a SEPARATE relay.
 
 // Integration tests assert on results; `expect`/`panic!`/`unwrap` make the
 // failure messages legible. The workspace denies these in production code.
@@ -41,9 +45,10 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{CaptureSocket, connect_two, last_ciphertext, route_publishes};
+use common::{ConnId, Party, Relay, connect_two};
 use scp_client::{ClientError, EVENT_BUFFER_CAP, LocalSigner, MemoryStorage, ScpClient, Storage};
 use scp_clock::{Clock, SystemClock, TestClock};
+use scp_protocol::context::context_routing_id;
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-driver-adversarial";
@@ -52,37 +57,22 @@ const BOB_DID: &str = "did:key:z6MkBobDriverAdversarialFixtureBBBBBBBBBBBB";
 const CAROL_DID: &str = "did:key:z6MkCarolDriverAdversarialFixtureCCCCCCCCCC";
 const DAVE_DID: &str = "did:key:z6MkDaveDriverAdversarialFixtureDDDDDDDDDDDD";
 
-/// Builds a fresh client for `did` over a real-time-seeded clock, with a
-/// throwaway capture socket (for tests that never inspect the wire).
-fn client_for(did: &str, now_secs: u64) -> ScpClient {
-    let signer = Arc::new(LocalSigner::active(did));
-    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    ScpClient::new(signer, storage, clock, Arc::new(CaptureSocket::new()))
-        .expect("construct fresh client")
-}
-
-/// Like [`client_for`] but returns the capture socket too (for tests that must
-/// recover the wire ciphertext a send produced).
-fn client_and_socket(did: &str, now_secs: u64) -> (ScpClient, CaptureSocket) {
-    let socket = CaptureSocket::new();
-    let signer = Arc::new(LocalSigner::active(did));
-    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    let client = ScpClient::new(signer, storage, clock, Arc::new(socket.clone()))
-        .expect("construct fresh client");
-    (client, socket)
-}
-
-/// Builds a client for `did` over a CALLER-SUPPLIED storage handle (throwaway
-/// socket). When the store already holds this identity's snapshots or pending-join
-/// blobs, the constructor restores them (ADR-057 T2) — the reconstruct-from-durable
-/// recovery path a failed join relies on.
-fn client_for_with_storage(did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> ScpClient {
-    let signer = Arc::new(LocalSigner::active(did));
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    ScpClient::new(signer, storage, clock, Arc::new(CaptureSocket::new()))
-        .expect("construct/restore client")
+/// Recovers the inner MLS ciphertext of the single app-data `PUBLISH` a
+/// `send_message` fanned out over `relay` from connection `conn`.
+///
+/// App data is fanned to peer pseudonyms, NEVER to the shared announcement
+/// `context_routing_id`, so the app-data frame is the recorded `PUBLISH` whose
+/// routing id is not the shared channel. [`common::PublishRecord::inner_ciphertext`]
+/// decodes the wire `OuterEnvelope` and returns its `encrypted_blob` — the exact
+/// inner MLS frame the old tests captured via `last_ciphertext`. Drains the log, so
+/// call it once per send.
+fn app_ciphertext(relay: &Relay, conn: ConnId, ctx: &str) -> Vec<u8> {
+    relay
+        .drain_publish_log()
+        .into_iter()
+        .find(|p| p.conn == conn && p.routing_id != context_routing_id(ctx))
+        .expect("an app-data PUBLISH was fanned out")
+        .inner_ciphertext()
 }
 
 /// A snapshot of the full observable per-context driver state, used to assert
@@ -112,24 +102,28 @@ impl StateSnapshot {
     }
 }
 
-/// Builds Alice (creator) and Bob (joined), converged, with sender keys exchanged
-/// both ways AND both pseudonym registries populated, so application messages
-/// decrypt AND fan out each direction. Returns each client with its capture socket.
-fn converged_pair() -> (ScpClient, CaptureSocket, ScpClient, CaptureSocket) {
-    let (alice, bob) = connect_two(CTX, ALICE_DID, BOB_DID);
-    (alice.client, alice.socket, bob.client, bob.socket)
+/// Builds Alice (creator) and Bob (joined) over a fresh relay, converged, with
+/// sender keys exchanged both ways AND both pseudonym registries populated, so
+/// application messages decrypt AND fan out each direction. Returns the shared
+/// relay plus each party (client + relay connection id).
+fn converged_pair() -> (Relay, Party, Party) {
+    let relay = Relay::new();
+    let (alice, bob) = connect_two(&relay, CTX, ALICE_DID, BOB_DID);
+    (relay, alice, bob)
 }
 
 /// One well-formed application MLS ciphertext from a DIFFERENT group (foreign to
 /// `CTX`). A lone member cannot send (fan-out is a no-op), so the foreign group is
-/// a genuine 2-member context; its creator's send produces the frame.
+/// a genuine 2-member context on a SEPARATE relay; its creator's send produces the
+/// frame, recovered from that relay's publish log.
 fn foreign_group_ciphertext() -> Vec<u8> {
-    let (mut mallory, _dave) = connect_two("ctx-foreign-group", CAROL_DID, DAVE_DID);
+    let relay = Relay::new();
+    let (mut mallory, _dave) = connect_two(&relay, "ctx-foreign-group", CAROL_DID, DAVE_DID);
     mallory
         .client
         .send_message("ctx-foreign-group", b"not for Bob")
         .expect("Mallory sends in her own group");
-    last_ciphertext(&mallory.socket)
+    app_ciphertext(&relay, mallory.conn, "ctx-foreign-group")
 }
 
 // ===========================================================================
@@ -141,12 +135,13 @@ fn foreign_group_frame_is_rejected_without_mutation() {
     // A ciphertext that IS a well-formed MLS frame but was produced by a DIFFERENT
     // MLS group (so it decrypts under none of Bob's group keys) must be rejected
     // with NO state mutation — distinct from the undecodable-bytes path (test 10).
-    let (_alice, _alice_sock, mut bob, _bob_sock) = converged_pair();
+    let (_relay, _alice, mut bob) = converged_pair();
 
     let foreign = foreign_group_ciphertext();
 
-    let before = StateSnapshot::capture(&bob, CTX);
+    let before = StateSnapshot::capture(&bob.client, CTX);
     let err = bob
+        .client
         .receive_message(CTX, &foreign)
         .expect_err("a foreign-group MLS frame must be rejected");
     assert!(
@@ -154,13 +149,13 @@ fn foreign_group_frame_is_rejected_without_mutation() {
         "a foreign-group MLS frame fails at the MLS decrypt layer, got: {err:?}"
     );
     assert_eq!(
-        StateSnapshot::capture(&bob, CTX),
+        StateSnapshot::capture(&bob.client, CTX),
         before,
         "a rejected foreign-group ciphertext must leave epoch, membership, leaf \
          count, root, and leaf hashes UNCHANGED"
     );
     assert!(
-        bob.drain_events(CTX).expect("drain").is_empty(),
+        bob.client.drain_events(CTX).expect("drain").is_empty(),
         "no receive event is buffered for a rejected foreign ciphertext"
     );
 }
@@ -175,7 +170,9 @@ fn operations_on_unknown_context_error_cleanly_no_panic() {
     // UnknownContext (a clean error), never panic; the infallible observers return
     // None. This is the "not a member / unknown context" fail-closed path.
     const MISSING: &str = "ctx-never-created";
-    let mut client = client_for(ALICE_DID, SystemClock.now_secs());
+    let relay = Relay::new();
+    let mut party = relay.new_party(ALICE_DID, 0);
+    let client = &mut party.client;
 
     macro_rules! assert_unknown {
         ($e:expr, $what:literal) => {{
@@ -214,16 +211,17 @@ fn create_context_twice_errors_and_preserves_the_first() {
     // Re-creating an existing context must fail closed without disturbing the
     // established context's state (no silent re-init that would wipe the log or
     // rotate group keys under a live context).
-    let mut alice = client_for(ALICE_DID, SystemClock.now_secs());
-    alice.create_context(CTX).expect("first create");
-    let before = StateSnapshot::capture(&alice, CTX);
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, 0);
+    alice.client.create_context(CTX).expect("first create");
+    let before = StateSnapshot::capture(&alice.client, CTX);
 
-    match alice.create_context(CTX) {
+    match alice.client.create_context(CTX) {
         Err(ClientError::ContextAlreadyExists(id)) => assert_eq!(id, CTX),
         other => panic!("expected ContextAlreadyExists, got {other:?}"),
     }
     assert_eq!(
-        StateSnapshot::capture(&alice, CTX),
+        StateSnapshot::capture(&alice.client, CTX),
         before,
         "a rejected duplicate create must not re-initialize the live context"
     );
@@ -243,55 +241,72 @@ fn replay_floor_survives_a_failed_decrypt_at_the_driver() {
     // Asymmetric setup: Alice must be able to SEND (so she needs BOB's pseudonym,
     // which requires BOB's sender key on Alice's side) but Bob must LACK ALICE's
     // sender key (the property under test — his inner decrypt fails). So we install
-    // Bob→Alice and pump Bob's announcement to Alice, but deliberately HOLD the
-    // Alice→Bob distribution.
-    let base = SystemClock.now_secs();
-    let (mut alice, alice_sock) = client_and_socket(ALICE_DID, base);
-    let (mut bob, bob_sock) = client_and_socket(BOB_DID, base + 100);
+    // Bob→Alice and pump Bob's announcement to Alice ONLY, but deliberately HOLD the
+    // Alice→Bob distribution. Pumping only Alice keeps Bob from ever processing
+    // Alice's reciprocal announcement (which he could not decrypt without her key).
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, 0);
+    let mut bob = relay.new_party(BOB_DID, 100);
 
-    alice.create_context(CTX).expect("Alice creates");
+    alice.client.create_context(CTX).expect("Alice creates");
     let bob_kp = bob
+        .client
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
-    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
     let bob_dists = bob
+        .client
         .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("Bob joins");
     // Install Bob's key on Alice + pump Bob's announcement so Alice learns Bob's
-    // pseudonym and can send. Bob still LACKS Alice's key.
+    // pseudonym and can send. Bob still LACKS Alice's key (the add's Alice→Bob
+    // distribution is held) and is NOT pumped, so he never processes Alice's
+    // reciprocal announcement.
     alice
+        .client
         .receive_message(CTX, &bob_dists[0].ciphertext)
         .expect("Alice installs Bob's key");
-    route_publishes(&bob_sock, &mut alice);
-    let _ = alice.drain_events(CTX);
-    let _ = alice_sock.take_frames();
+    relay.pump(&mut [&mut alice]);
+    let _ = alice.client.drain_events(CTX);
+    let _ = relay.drain_publish_log();
 
-    let before = StateSnapshot::capture(&bob, CTX);
-    alice.send_message(CTX, b"first attempt").expect("send 1");
-    let msg1 = last_ciphertext(&alice_sock);
+    let before = StateSnapshot::capture(&bob.client, CTX);
+    alice
+        .client
+        .send_message(CTX, b"first attempt")
+        .expect("send 1");
+    let msg1 = app_ciphertext(&relay, alice.conn, CTX);
     assert!(
-        bob.receive_message(CTX, &msg1).is_err(),
+        bob.client.receive_message(CTX, &msg1).is_err(),
         "no installed sender key for Alice → the inner sender-layer decrypt fails"
     );
     assert_eq!(
-        StateSnapshot::capture(&bob, CTX),
+        StateSnapshot::capture(&bob.client, CTX),
         before,
         "a failed decrypt must not mutate epoch, membership, or the event log"
     );
     assert!(
-        bob.drain_events(CTX).expect("drain").is_empty(),
+        bob.client.drain_events(CTX).expect("drain").is_empty(),
         "a failed decrypt buffers no receive event"
     );
 
     // Now deliver Alice's key (the held add distribution) and a fresh message
     // decrypts — the earlier failure did not corrupt or wedge Bob's receive state.
     assert_eq!(add.sender_key_distributions.len(), 1);
-    bob.receive_message(CTX, &add.sender_key_distributions[0].ciphertext)
+    bob.client
+        .receive_message(CTX, &add.sender_key_distributions[0].ciphertext)
         .expect("Bob installs Alice's key");
-    alice.send_message(CTX, b"second attempt").expect("send 2");
-    let msg2 = last_ciphertext(&alice_sock);
+    alice
+        .client
+        .send_message(CTX, b"second attempt")
+        .expect("send 2");
+    let msg2 = app_ciphertext(&relay, alice.conn, CTX);
     assert!(
-        bob.receive_message(CTX, &msg2)
+        bob.client
+            .receive_message(CTX, &msg2)
             .expect("now decrypts")
             .application,
         "after installing the key the message decrypts — the floor was not wedged"
@@ -300,7 +315,7 @@ fn replay_floor_survives_a_failed_decrypt_at_the_driver() {
     // A genuine replay of the accepted message is rejected — the floor advanced on
     // the SUCCESSFUL decrypt, not on the earlier failure.
     assert!(
-        bob.receive_message(CTX, &msg2).is_err(),
+        bob.client.receive_message(CTX, &msg2).is_err(),
         "replaying the accepted message is rejected"
     );
 }
@@ -314,15 +329,19 @@ fn out_of_order_event_log_replay_is_rejected_fail_closed() {
     // The join path replays the adder's event-log stream through the canonical
     // chain-validating append. Handing it an OUT-OF-ORDER stream must fail closed,
     // and Bob must NOT be left holding a half-built context.
-    let base = SystemClock.now_secs();
-    let mut alice = client_for(ALICE_DID, base);
-    let mut bob = client_for(BOB_DID, base + 100);
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, 0);
+    let mut bob = relay.new_party(BOB_DID, 100);
 
-    alice.create_context(CTX).expect("Alice creates");
+    alice.client.create_context(CTX).expect("Alice creates");
     let bob_kp = bob
+        .client
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
-    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
     assert_eq!(add.event_log.len(), 2, "ContextCreated + MemberJoined");
 
     // Corrupt the ordering: swap the two leaves so sequence 1 arrives before
@@ -331,6 +350,7 @@ fn out_of_order_event_log_replay_is_rejected_fail_closed() {
     reordered.swap(0, 1);
 
     let err = bob
+        .client
         .join_context_encrypted(CTX, &add.welcome, &reordered, &add.wrapping_keys)
         .expect_err("an out-of-order replay stream must be rejected");
     assert!(
@@ -340,13 +360,13 @@ fn out_of_order_event_log_replay_is_rejected_fail_closed() {
 
     // Fail-closed: Bob holds no half-built context from the rejected join.
     assert_eq!(
-        bob.member_dids(CTX),
+        bob.client.member_dids(CTX),
         None,
         "a rejected out-of-order join must leave Bob holding NO context (no \
          partially-replayed log)"
     );
-    assert_eq!(bob.event_log_root(CTX), None);
-    assert_eq!(bob.event_log_leaf_count(CTX), None);
+    assert_eq!(bob.client.event_log_root(CTX), None);
+    assert_eq!(bob.client.event_log_leaf_count(CTX), None);
 }
 
 // ===========================================================================
@@ -362,23 +382,27 @@ fn receive_buffer_evicts_oldest_at_capacity_without_corrupting_state() {
     const EXTRA: usize = 5;
     let cap = EVENT_BUFFER_CAP;
 
-    let (mut alice, alice_sock, mut bob, _bob_sock) = converged_pair();
+    let (relay, mut alice, mut bob) = converged_pair();
 
     // Baseline: both converged on 2 membership leaves with equal roots.
-    let leaves_before = bob.event_log_leaf_count(CTX).expect("count");
+    let leaves_before = bob.client.event_log_leaf_count(CTX).expect("count");
     assert_eq!(leaves_before, 2, "ContextCreated + MemberJoined");
-    let root_before = bob.event_log_root(CTX).expect("root");
+    let root_before = bob.client.event_log_root(CTX).expect("root");
 
     let total = cap + EXTRA;
     let first_payload = b"msg-0".to_vec();
     let last_payload = format!("msg-{}", total - 1).into_bytes();
     for i in 0..total {
         let payload = format!("msg-{i}").into_bytes();
-        alice.send_message(CTX, &payload).expect("alice sends");
-        let ct = last_ciphertext(&alice_sock);
+        alice
+            .client
+            .send_message(CTX, &payload)
+            .expect("alice sends");
+        let ct = app_ciphertext(&relay, alice.conn, CTX);
         // Bob receives every message but NEVER drains — the buffer must self-cap.
         assert!(
-            bob.receive_message(CTX, &ct)
+            bob.client
+                .receive_message(CTX, &ct)
                 .expect("bob receives")
                 .application,
             "each is an application message"
@@ -389,13 +413,13 @@ fn receive_buffer_evicts_oldest_at_capacity_without_corrupting_state() {
     // excluded from the convergent Merkle log — the cap bounds the UNDRAINED
     // receive buffer, never the log).
     assert_eq!(
-        bob.event_log_leaf_count(CTX),
+        bob.client.event_log_leaf_count(CTX),
         Some(leaves_before),
         "received application messages append no convergent leaf"
     );
 
     // The buffer holds exactly EVENT_BUFFER_CAP events (the EXTRA oldest evicted).
-    let drained = bob.drain_events(CTX).expect("drain");
+    let drained = bob.client.drain_events(CTX).expect("drain");
     assert_eq!(
         drained.len(),
         cap,
@@ -419,13 +443,13 @@ fn receive_buffer_evicts_oldest_at_capacity_without_corrupting_state() {
 
     // Convergence intact despite eviction: the convergent log/root never moved.
     assert_eq!(
-        bob.event_log_root(CTX),
+        bob.client.event_log_root(CTX),
         Some(root_before),
         "buffer eviction does not corrupt the convergent event-log root"
     );
     assert_eq!(
-        alice.event_log_root(CTX),
-        bob.event_log_root(CTX),
+        alice.client.event_log_root(CTX),
+        bob.client.event_log_root(CTX),
         "Alice and Bob still agree after the flood"
     );
 }
@@ -440,48 +464,49 @@ fn operations_after_close_error_cleanly_and_close_destroys_the_group() {
     // lose-device-lose-history). After close, every op naming that context must
     // return a clean UnknownContext error (never panic), and the group must be
     // truly gone — Alice can no longer process inbound traffic for it.
-    let (mut alice, _alice_sock, mut bob, bob_sock) = converged_pair();
+    let (relay, mut alice, mut bob) = converged_pair();
 
     // A message Bob sends BEFORE Alice closes — used to prove Alice's group is
     // genuinely destroyed after close (she can no longer process it).
-    bob.send_message(CTX, b"sent before Alice closes")
+    bob.client
+        .send_message(CTX, b"sent before Alice closes")
         .expect("Bob sends");
-    let pre_close = last_ciphertext(&bob_sock);
+    let pre_close = app_ciphertext(&relay, bob.conn, CTX);
 
-    alice.close_context(CTX).expect("Alice closes");
+    alice.client.close_context(CTX).expect("Alice closes");
 
     // The context is gone: observers report absence, not stale data.
     assert_eq!(
-        alice.member_dids(CTX),
+        alice.client.member_dids(CTX),
         None,
         "after close the context is absent"
     );
-    assert_eq!(alice.event_log_root(CTX), None);
-    assert_eq!(alice.event_log_leaf_count(CTX), None);
-    assert!(!alice.context_ids().contains(&CTX.to_owned()));
+    assert_eq!(alice.client.event_log_root(CTX), None);
+    assert_eq!(alice.client.event_log_leaf_count(CTX), None);
+    assert!(!alice.client.context_ids().contains(&CTX.to_owned()));
 
     // Every fallible op errors cleanly (UnknownContext), no panic — including a
     // receive of the pre-close ciphertext, proving the group is truly destroyed.
     assert!(matches!(
-        alice.send_message(CTX, b"after close"),
+        alice.client.send_message(CTX, b"after close"),
         Err(ClientError::UnknownContext(_))
     ));
     assert!(matches!(
-        alice.receive_message(CTX, &pre_close),
+        alice.client.receive_message(CTX, &pre_close),
         Err(ClientError::UnknownContext(_))
     ));
     assert!(matches!(
-        alice.drain_events(CTX),
+        alice.client.drain_events(CTX),
         Err(ClientError::UnknownContext(_))
     ));
     assert!(matches!(
-        alice.mls_epoch(CTX),
+        alice.client.mls_epoch(CTX),
         Err(ClientError::UnknownContext(_))
     ));
 
     // Closing again is a clean error, not a double-free panic.
     assert!(matches!(
-        alice.close_context(CTX),
+        alice.client.close_context(CTX),
         Err(ClientError::UnknownContext(_))
     ));
 }
@@ -494,28 +519,39 @@ fn operations_after_close_error_cleanly_and_close_destroys_the_group() {
 fn successful_join_consumes_pending_material_no_reuse() {
     // A SUCCESSFUL join must CONSUME the retained private join material so it cannot
     // be silently reused into a second, resurrected context.
-    let base = SystemClock.now_secs();
-    let mut alice = client_for(ALICE_DID, base);
-    let mut bob = client_for(BOB_DID, base + 100);
-    alice.create_context(CTX).expect("Alice creates");
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, 0);
+    let mut bob = relay.new_party(BOB_DID, 100);
+    alice.client.create_context(CTX).expect("Alice creates");
 
     let bob_kp = bob
+        .client
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
-    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
-    bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
+    bob.client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("Bob joins");
 
     // A second join for the SAME context id short-circuits on the already-held guard.
-    match bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys) {
+    match bob
+        .client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+    {
         Err(ClientError::ContextAlreadyExists(_)) => {}
         other => panic!("expected ContextAlreadyExists on re-join, got {other:?}"),
     }
 
     // Close CTX, then attempt a join with NO fresh key-package generation. The prior
     // material was consumed by the first join, so nothing is pending.
-    bob.close_context(CTX).expect("Bob closes CTX");
-    match bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys) {
+    bob.client.close_context(CTX).expect("Bob closes CTX");
+    match bob
+        .client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+    {
         Err(ClientError::NoPendingJoinMaterial { context_id }) => assert_eq!(
             context_id, CTX,
             "the join reports absent pending material for the named context"
@@ -535,23 +571,27 @@ fn successful_join_consumes_pending_material_no_reuse() {
 fn close_context_clears_pending_join_material() {
     // close_context must drop any pending join material keyed by that context.
     const CTX_JOIN: &str = "ctx-adr057-pending-cleanup-target";
-    let mut carol = client_for(CAROL_DID, SystemClock.now_secs());
+    let relay = Relay::new();
+    let mut carol = relay.new_party(CAROL_DID, 0);
 
     carol
+        .client
         .create_context(CTX_JOIN)
         .expect("Carol creates the slot");
     let _abandoned = carol
+        .client
         .generate_key_package_for_join(CTX_JOIN)
         .expect("Carol generates (then abandons) join material");
 
     // Close drops both the context AND its pending join material.
     carol
+        .client
         .close_context(CTX_JOIN)
         .expect("Carol closes the slot");
 
     // A join now finds no pending material — the abandoned private key material was
     // cleared by close, not left dangling to be replayed.
-    match carol.join_context_encrypted(CTX_JOIN, &[], &[], &[]) {
+    match carol.client.join_context_encrypted(CTX_JOIN, &[], &[], &[]) {
         Err(ClientError::NoPendingJoinMaterial { context_id }) => assert_eq!(
             context_id, CTX_JOIN,
             "close must have cleared the pending material for the named context"
@@ -569,25 +609,28 @@ fn malformed_or_truncated_ciphertext_leaves_replay_floor_intact() {
     // A garbage / truncated / empty blob is not a decodable MLS wire frame, so
     // `receive_message` must error at the MLS-deserialize/decrypt boundary BEFORE
     // touching the event log, membership, epoch, or replay floor.
-    let (mut alice, alice_sock, mut bob, _bob_sock) = converged_pair();
+    let (relay, mut alice, mut bob) = converged_pair();
 
     // Settle Bob's state with one honest message first.
     alice
+        .client
         .send_message(CTX, b"honest before attack")
         .expect("send");
-    let honest = last_ciphertext(&alice_sock);
+    let honest = app_ciphertext(&relay, alice.conn, CTX);
     assert!(
-        bob.receive_message(CTX, &honest)
+        bob.client
+            .receive_message(CTX, &honest)
             .expect("bob receives honest")
             .application
     );
-    let _ = bob.drain_events(CTX);
+    let _ = bob.client.drain_events(CTX);
 
-    let before = StateSnapshot::capture(&bob, CTX);
+    let before = StateSnapshot::capture(&bob.client, CTX);
 
     // (a) A pile of bytes that is not a valid MLS wire frame.
     let garbage = vec![0xADu8; 24];
     let err = bob
+        .client
         .receive_message(CTX, &garbage)
         .expect_err("malformed ciphertext must be rejected");
     assert!(
@@ -597,40 +640,43 @@ fn malformed_or_truncated_ciphertext_leaves_replay_floor_intact() {
 
     // (b) An EMPTY buffer (degenerate truncation).
     assert!(
-        bob.receive_message(CTX, &[]).is_err(),
+        bob.client.receive_message(CTX, &[]).is_err(),
         "an empty ciphertext is rejected"
     );
 
     // (c) A prefix-truncated copy of a real ciphertext (valid framing, cut short).
     alice
+        .client
         .send_message(CTX, b"a real message to truncate")
         .expect("send");
-    let real = last_ciphertext(&alice_sock);
+    let real = app_ciphertext(&relay, alice.conn, CTX);
     let truncated = &real[..real.len() / 2];
     assert!(
-        bob.receive_message(CTX, truncated).is_err(),
+        bob.client.receive_message(CTX, truncated).is_err(),
         "a truncated ciphertext is rejected"
     );
 
     // None of the malformed inputs mutated any observable state.
     assert_eq!(
-        StateSnapshot::capture(&bob, CTX),
+        StateSnapshot::capture(&bob.client, CTX),
         before,
         "rejected malformed/truncated ciphertexts must leave epoch, membership, \
          leaf count, root, and leaf hashes UNCHANGED"
     );
     assert!(
-        bob.drain_events(CTX).expect("drain").is_empty(),
+        bob.client.drain_events(CTX).expect("drain").is_empty(),
         "no phantom receive event was buffered for a rejected ciphertext"
     );
 
     // The replay floor is intact: a fresh honest message from Alice still decrypts.
     alice
+        .client
         .send_message(CTX, b"honest after attack")
         .expect("send");
-    let after_attack = last_ciphertext(&alice_sock);
+    let after_attack = app_ciphertext(&relay, alice.conn, CTX);
     assert!(
-        bob.receive_message(CTX, &after_attack)
+        bob.client
+            .receive_message(CTX, &after_attack)
             .expect("post-attack honest message decrypts")
             .application,
         "an honest message still decrypts — the malformed inputs left the replay \
@@ -647,23 +693,29 @@ fn malformed_key_package_add_member_is_rejected_without_mutation() {
     // Hostile INPUT to `add_member`: a garbage or wrong-wire-type KeyPackage must be
     // rejected at the `KeyPackageIn` deserialize boundary — BEFORE the mutable
     // context borrow — so the adder's full state is left byte-for-byte identical.
-    let base = SystemClock.now_secs();
-    let mut alice = client_for(ALICE_DID, base);
-    let mut bob = client_for(BOB_DID, base + 100);
-    alice.create_context(CTX).expect("Alice creates");
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, 0);
+    let mut bob = relay.new_party(BOB_DID, 100);
+    alice.client.create_context(CTX).expect("Alice creates");
 
     let bob_kp = bob
+        .client
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
-    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
-    bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
+    bob.client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("Bob joins");
 
-    let before = StateSnapshot::capture(&alice, CTX);
+    let before = StateSnapshot::capture(&alice.client, CTX);
 
     // (a) Pure garbage — not a decodable MLS/TLS wire object at all.
     let garbage = vec![0xABu8; 40];
     let err = alice
+        .client
         .add_member(CTX, &garbage)
         .expect_err("a garbage KeyPackage must be rejected");
     assert!(
@@ -671,7 +723,7 @@ fn malformed_key_package_add_member_is_rejected_without_mutation() {
         "a non-decodable KeyPackage fails at the codec/MLS boundary, got: {err:?}"
     );
     assert_eq!(
-        StateSnapshot::capture(&alice, CTX),
+        StateSnapshot::capture(&alice.client, CTX),
         before,
         "a rejected garbage KeyPackage must leave the adder's epoch, membership, \
          leaf count, root, and leaf hashes UNCHANGED"
@@ -679,6 +731,7 @@ fn malformed_key_package_add_member_is_rejected_without_mutation() {
 
     // (b) A VALID MLS wire object of the WRONG TYPE: the add's own Welcome bytes.
     let err = alice
+        .client
         .add_member(CTX, &add.welcome)
         .expect_err("a foreign (wrong-type) MLS object must be rejected as a KeyPackage");
     assert!(
@@ -686,18 +739,18 @@ fn malformed_key_package_add_member_is_rejected_without_mutation() {
         "a wrong-type MLS wire object fails the KeyPackage deserialize, got: {err:?}"
     );
     assert_eq!(
-        StateSnapshot::capture(&alice, CTX),
+        StateSnapshot::capture(&alice.client, CTX),
         before,
         "a rejected wrong-type KeyPackage must leave the adder's state UNCHANGED"
     );
 
     // (c) An empty buffer (degenerate truncation).
     assert!(
-        alice.add_member(CTX, &[]).is_err(),
+        alice.client.add_member(CTX, &[]).is_err(),
         "an empty KeyPackage is rejected"
     );
     assert_eq!(
-        StateSnapshot::capture(&alice, CTX),
+        StateSnapshot::capture(&alice.client, CTX),
         before,
         "a rejected empty KeyPackage must leave the adder's state UNCHANGED"
     );
@@ -711,18 +764,23 @@ fn malformed_key_package_add_member_is_rejected_without_mutation() {
 fn malformed_welcome_join_leaves_no_half_built_context() {
     // A bad/foreign Welcome handed to `join_context_encrypted` must fail closed with
     // Bob holding NO context at all.
-    let base = SystemClock.now_secs();
-    let mut alice = client_for(ALICE_DID, base);
-    let mut bob = client_for(BOB_DID, base + 100);
-    alice.create_context(CTX).expect("Alice creates");
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, 0);
+    let mut bob = relay.new_party(BOB_DID, 100);
+    alice.client.create_context(CTX).expect("Alice creates");
 
     let bob_kp = bob
+        .client
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
-    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob");
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob");
 
     let garbage_welcome = vec![0xEEu8; 48];
     let err = bob
+        .client
         .join_context_encrypted(CTX, &garbage_welcome, &add.event_log, &add.wrapping_keys)
         .expect_err("a malformed Welcome must be rejected");
     assert!(
@@ -732,13 +790,13 @@ fn malformed_welcome_join_leaves_no_half_built_context() {
 
     // Fail-closed: Bob holds NO half-built context.
     assert_eq!(
-        bob.member_dids(CTX),
+        bob.client.member_dids(CTX),
         None,
         "a rejected Welcome must leave Bob holding NO context"
     );
-    assert_eq!(bob.event_log_root(CTX), None);
-    assert_eq!(bob.event_log_leaf_count(CTX), None);
-    assert_eq!(bob.event_log_leaf_hashes(CTX), None);
+    assert_eq!(bob.client.event_log_root(CTX), None);
+    assert_eq!(bob.client.event_log_leaf_count(CTX), None);
+    assert_eq!(bob.client.event_log_leaf_hashes(CTX), None);
 }
 
 // ===========================================================================
@@ -752,20 +810,30 @@ fn failed_join_consumes_pending_and_recovers_only_via_reconstruct() {
     // in-tab attempt gets `NoPendingJoinMaterial`; (2) recovery is via the PRISTINE
     // durable pending blob a failed join never deletes.
     let base = SystemClock.now_secs();
-    let mut alice = client_for(ALICE_DID, base);
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE_DID, 0);
+    // Bob over a CALLER-SUPPLIED storage handle, shared with the reconstructed
+    // client below (the reconstruct-from-durable recovery path ADR-057 T2).
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let mut bob = client_for_with_storage(BOB_DID, Arc::clone(&bob_storage), base + 100);
+    let bob_signer = Arc::new(LocalSigner::active(BOB_DID));
+    let bob_clock: Arc<dyn Clock> = Arc::new(TestClock::new(base + 100));
+    let mut bob = relay.party_with(bob_signer, Arc::clone(&bob_storage), bob_clock);
 
-    alice.create_context(CTX).expect("Alice creates");
+    alice.client.create_context(CTX).expect("Alice creates");
     let bob_kp = bob
+        .client
         .generate_key_package_for_join(CTX)
         .expect("Bob key package"); // persists the durable pending blob
-    let add = alice.add_member(CTX, &bob_kp).expect("Alice adds Bob"); // a GOOD Welcome
+    let add = alice
+        .client
+        .add_member(CTX, &bob_kp)
+        .expect("Alice adds Bob"); // a GOOD Welcome
 
     // First attempt: a BAD Welcome. It fails at Welcome processing AFTER the
     // in-memory pending was removed.
     let garbage_welcome = vec![0xEEu8; 48];
     let err = bob
+        .client
         .join_context_encrypted(CTX, &garbage_welcome, &add.event_log, &add.wrapping_keys)
         .expect_err("the bad Welcome must be rejected");
     assert!(
@@ -773,14 +841,17 @@ fn failed_join_consumes_pending_and_recovers_only_via_reconstruct() {
         "bad Welcome, got: {err:?}"
     );
     assert_eq!(
-        bob.member_dids(CTX),
+        bob.client.member_dids(CTX),
         None,
         "the failed join left no half-built context"
     );
 
     // Second in-tab attempt with the GOOD Welcome: the in-memory pending was
     // CONSUMED, so this reports absent pending material — NOT a retry.
-    match bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys) {
+    match bob
+        .client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+    {
         Err(ClientError::NoPendingJoinMaterial { context_id }) => assert_eq!(
             context_id, CTX,
             "the failed join burned the in-memory pending material (single-use per \
@@ -794,15 +865,18 @@ fn failed_join_consumes_pending_and_recovers_only_via_reconstruct() {
     // RECOVERY: a fresh client over Bob's SAME storage restores the still-durable
     // pending blob and the join now SUCCEEDS with the good Welcome.
     drop(bob);
-    let mut bob2 = client_for_with_storage(BOB_DID, Arc::clone(&bob_storage), base + 150);
+    let recovered_signer = Arc::new(LocalSigner::active(BOB_DID));
+    let recovered_clock: Arc<dyn Clock> = Arc::new(TestClock::new(base + 150));
+    let mut bob2 = relay.party_with(recovered_signer, Arc::clone(&bob_storage), recovered_clock);
     assert_eq!(
-        bob2.member_dids(CTX),
+        bob2.client.member_dids(CTX),
         None,
         "the reconstructed client has not joined yet"
     );
-    bob2.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+    bob2.client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("reconstruct-from-durable restores pending material; the join succeeds");
-    let mut members = bob2.member_dids(CTX).expect("bob2 is now a member");
+    let mut members = bob2.client.member_dids(CTX).expect("bob2 is now a member");
     members.sort();
     assert_eq!(
         members,
@@ -810,8 +884,8 @@ fn failed_join_consumes_pending_and_recovers_only_via_reconstruct() {
         "the recovered join converged Bob into the two-member context"
     );
     assert_eq!(
-        bob2.event_log_root(CTX),
-        alice.event_log_root(CTX),
+        bob2.client.event_log_root(CTX),
+        alice.client.event_log_root(CTX),
         "the recovered join replayed Alice's log to the same Merkle root"
     );
 }
@@ -827,16 +901,21 @@ fn misdirected_sender_key_distribution_is_rejected_without_mutation() {
     // key; `target_did` is only an in-tab delivery hint. Delivering a distribution
     // sealed for Carol to the WRONG member (Bob) must fail closed at the HPKE-open
     // step and leave NO OBSERVABLE state change.
-    let (mut alice, alice_sock, mut bob, _bob_sock) = converged_pair();
+    let (relay, mut alice, mut bob) = converged_pair();
 
     // Alice adds Carol; Bob (bystander) processes the add-Commit so he reaches the
     // post-add epoch at which Alice's distributions were sealed.
-    let mut carol = client_for(CAROL_DID, SystemClock.now_secs() + 200);
+    let mut carol = relay.new_party(CAROL_DID, 200);
     let carol_kp = carol
+        .client
         .generate_key_package_for_join(CTX)
         .expect("Carol key package");
-    let add_carol = alice.add_member(CTX, &carol_kp).expect("Alice adds Carol");
+    let add_carol = alice
+        .client
+        .add_member(CTX, &carol_kp)
+        .expect("Alice adds Carol");
     carol
+        .client
         .join_context_encrypted(
             CTX,
             &add_carol.welcome,
@@ -844,10 +923,11 @@ fn misdirected_sender_key_distribution_is_rejected_without_mutation() {
             &add_carol.wrapping_keys,
         )
         .expect("Carol joins");
-    bob.receive_message(CTX, &add_carol.commit)
+    bob.client
+        .receive_message(CTX, &add_carol.commit)
         .expect("Bob processes the add-Carol Commit");
-    let _ = bob.drain_events(CTX); // clear any buffered events from the commit processing
-    let _ = alice_sock.take_frames(); // clear Alice's add re-announce frame
+    let _ = bob.client.drain_events(CTX); // clear any buffered events from the commit processing
+    let _ = relay.drain_publish_log(); // clear Alice's add re-announce frame
 
     // Alice's own add-seal targets Carol (sealed to Carol's wrapping key).
     assert_eq!(add_carol.sender_key_distributions.len(), 1);
@@ -858,8 +938,9 @@ fn misdirected_sender_key_distribution_is_rejected_without_mutation() {
     );
 
     // Snapshot Bob's post-Commit state, then MISDIRECT Alice→Carol's seal to Bob.
-    let before = StateSnapshot::capture(&bob, CTX);
+    let before = StateSnapshot::capture(&bob.client, CTX);
     let err = bob
+        .client
         .receive_message(CTX, &alice_to_carol.ciphertext)
         .expect_err("a distribution sealed to Carol must not open under Bob's key");
     // The outer MLS frame decrypts (Bob is at the sealing epoch), so the rejection is
@@ -870,13 +951,13 @@ fn misdirected_sender_key_distribution_is_rejected_without_mutation() {
         "the misdirected seal fails at the HPKE-open (sender-key) layer, got: {err:?}"
     );
     assert_eq!(
-        StateSnapshot::capture(&bob, CTX),
+        StateSnapshot::capture(&bob.client, CTX),
         before,
         "a rejected misdirected distribution must leave epoch, membership, leaf \
          count, root, and leaf hashes UNCHANGED"
     );
     assert!(
-        bob.drain_events(CTX).expect("drain").is_empty(),
+        bob.client.drain_events(CTX).expect("drain").is_empty(),
         "a rejected misdirected distribution buffers no event"
     );
 
@@ -885,11 +966,13 @@ fn misdirected_sender_key_distribution_is_rejected_without_mutation() {
     // did not wedge Bob's receive path. (Alice fans this out to Bob's pseudonym,
     // which Alice already knows; Carol was NOT pumped, so the send addresses Bob.)
     alice
+        .client
         .send_message(CTX, b"honest after misdirection")
         .expect("Alice sends");
-    let honest = last_ciphertext(&alice_sock);
+    let honest = app_ciphertext(&relay, alice.conn, CTX);
     assert!(
-        bob.receive_message(CTX, &honest)
+        bob.client
+            .receive_message(CTX, &honest)
             .expect("Bob still decrypts Alice's message")
             .application,
         "the misdirected distribution installed no key and did not wedge Bob's \

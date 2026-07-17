@@ -1,10 +1,10 @@
 //! JS-injected outbound relay socket, adapted to the driver's
-//! [`scp_client::Socket`] (ADR-057 transport slice).
+//! [`scp_client::RelaySink`] (ADR-057 transport slice).
 //!
 //! The browser owns the relay WebSocket; the TypeScript SDK injects a small
 //! `JsSocket` object whose one method, `send(frame)`, writes a serialized relay
 //! `ClientMessage` frame to that socket. This module adapts it to the driver's
-//! synchronous [`scp_client::Socket`] outbound port. Inbound relay frames flow
+//! synchronous [`scp_client::RelaySink`] outbound port. Inbound relay frames flow
 //! the other way: the SDK's WebSocket `onmessage` handler calls
 //! [`WasmScpClient::handle_relay_frame`](crate::WasmScpClient::handle_relay_frame),
 //! so the socket itself is **outbound-only** — it is never read through.
@@ -17,7 +17,7 @@ pub use wasm_impl::{JsSocket, JsSocketAdapter};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
-    use scp_client::Socket;
+    use scp_client::RelaySink;
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen]
@@ -43,7 +43,7 @@ mod wasm_impl {
         fn send(this: &JsSocket, frame: Vec<u8>) -> Result<(), JsValue>;
     }
 
-    /// Adapts an injected [`JsSocket`] to the driver's [`Socket`] trait.
+    /// Adapts an injected [`JsSocket`] to the driver's [`RelaySink`] trait.
     pub struct JsSocketAdapter {
         inner: JsSocket,
     }
@@ -60,15 +60,15 @@ mod wasm_impl {
     // `storage::JsStorageAdapter` — see those modules' "Single-thread soundness"
     // notes. The wrapped `JsSocket` handle is a JS-heap index that cannot cross a
     // worker-agent boundary; under the single-tab driver model it is never sent to
-    // another agent, so the driver's `Send + Sync` bound on `Socket` is satisfied.
-    // Compiled ONLY for wasm32; does not relax the shared `scp_client::Socket`
+    // another agent, so the driver's `Send + Sync` bound on `RelaySink` is satisfied.
+    // Compiled ONLY for wasm32; does not relax the shared `scp_client::RelaySink`
     // bound. The embedder must keep one client pinned to one agent if it ever wires
     // shared-memory threads.
     unsafe impl Send for JsSocketAdapter {}
     // SAFETY: as above (see storage.rs module docs).
     unsafe impl Sync for JsSocketAdapter {}
 
-    impl Socket for JsSocketAdapter {
+    impl RelaySink for JsSocketAdapter {
         fn send(&self, frame: Vec<u8>) -> Result<(), String> {
             self.inner.send(frame).map_err(|e| {
                 e.as_string()

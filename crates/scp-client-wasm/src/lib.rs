@@ -55,7 +55,7 @@ pub mod time;
 
 use std::sync::Arc;
 
-use scp_client::{ContextStatus, ScpClient, Signer, Socket, Storage};
+use scp_client::{ContextStatus, RelaySink, ScpClient, Signer, Storage};
 use scp_clock::Clock;
 use wasm_bindgen::prelude::*;
 
@@ -272,25 +272,33 @@ impl WasmScpClient {
     /// Constructs the facade from already-built driver dependencies, **restoring**
     /// any persisted contexts and pending joins from `storage` (ADR-057 T2).
     ///
-    /// This is the cross-target seam: the `wasm32` constructor
-    /// ([`WasmScpClient::from_js`]) builds the JS-injected adapters and calls
-    /// this; the native host test builds in-memory adapters and calls this
-    /// directly. Keeping the dependency wiring here (not duplicated per target)
-    /// means the host test exercises the exact same driver construction the
-    /// browser path uses.
+    /// This is the native-host test seam: the host test builds in-memory adapters
+    /// (including a soft [`TestClock`](scp_clock::TestClock)) and calls this
+    /// directly, exercising the same driver construction the browser path uses.
+    ///
+    /// **Gated off the `wasm32` target** (`#[cfg(not(target_arch = "wasm32"))]`):
+    /// on a browser build the ONLY constructor is [`WasmScpClient::from_js`], which
+    /// builds the hardened captured-`Date.now` [`WasmClock`](crate::time::WasmClock)
+    /// internally. Exposing `from_parts` (which accepts an INJECTED clock) on the
+    /// wasm surface would let a caller substitute a soft/attacker-controllable clock
+    /// and bypass the `WasmClock` hardening (ADR-057 §Prereq-1, api-design minor).
+    /// `from_js` therefore constructs the driver inline rather than through this
+    /// seam. Available on native for the host tests (which run off-target — see
+    /// `wasm_surface_exchange`, itself native-only).
     ///
     /// # Errors
     ///
     /// Returns the mapped `[SCP-STORAGE-…]` / `[SCP-CRYPTO-…]` error if restore
     /// fails closed (corrupt/foreign/unreadable snapshot).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_parts(
         signer: Arc<dyn Signer>,
         storage: Arc<dyn Storage>,
         clock: Arc<dyn Clock>,
-        socket: Arc<dyn Socket>,
+        relay_sink: Arc<dyn RelaySink>,
     ) -> Result<Self, JsValue> {
         Ok(Self {
-            inner: map_err(ScpClient::new(signer, storage, clock, socket))?,
+            inner: map_err(ScpClient::new(signer, storage, clock, relay_sink))?,
         })
     }
 }
@@ -324,9 +332,14 @@ impl WasmScpClient {
     ) -> Result<Self, JsValue> {
         let signer: Arc<dyn Signer> = Arc::new(crate::custody::JsSigner::from_custody(custody)?);
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::JsStorageAdapter::new(storage));
+        // The clock is built HERE, hardened, and never injected — see `from_parts`
+        // (which is gated off the shipped wasm target so no soft clock can be
+        // substituted). Construct the driver inline rather than through `from_parts`.
         let clock: Arc<dyn Clock> = Arc::new(crate::time::WasmClock::new());
-        let socket: Arc<dyn Socket> = Arc::new(crate::socket::JsSocketAdapter::new(socket));
-        Self::from_parts(signer, storage, clock, socket)
+        let relay_sink: Arc<dyn RelaySink> = Arc::new(crate::socket::JsSocketAdapter::new(socket));
+        Ok(Self {
+            inner: map_err(ScpClient::new(signer, storage, clock, relay_sink))?,
+        })
     }
 
     /// This participant's DID.
@@ -565,6 +578,18 @@ impl WasmScpClient {
                     kind: "MessageSent".to_owned(),
                     sender_did: sender_did.0,
                     payload,
+                },
+                // A peer's pseudonym announcement (§9.10.4 — parity with the native
+                // event stream): surfaced with the announcer's DID as `senderDid`
+                // and the 32-byte routing id as `payload`, so a JS caller can act on
+                // "peer X is now reachable at routing id Y" (api-design F-API2).
+                ContextEvent::PseudonymAnnounced {
+                    member_did,
+                    pseudonym,
+                } => WasmReceivedEvent {
+                    kind: "PseudonymAnnounced".to_owned(),
+                    sender_did: member_did.0,
+                    payload: pseudonym.to_vec(),
                 },
                 // Any other variant is surfaced with its name and an empty payload
                 // rather than dropped, so the surface is forward-safe.
@@ -894,6 +919,7 @@ fn event_kind(event: &scp_protocol::context::membership::ContextEvent) -> &'stat
     match event {
         ContextEvent::MessageReceived { .. } => "MessageReceived",
         ContextEvent::MessageSent { .. } => "MessageSent",
+        ContextEvent::PseudonymAnnounced { .. } => "PseudonymAnnounced",
         ContextEvent::MemberJoined { .. } => "MemberJoined",
         ContextEvent::MemberLeft { .. } => "MemberLeft",
         _ => "Other",

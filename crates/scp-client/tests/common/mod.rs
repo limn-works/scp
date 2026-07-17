@@ -1,167 +1,389 @@
-//! Shared harness for the ADR-057 transport-slice integration tests.
+//! Realistic in-memory relay mock for the ADR-057 transport-slice integration
+//! tests.
 //!
-//! Provides a loopback [`Socket`] that captures every relay `ClientMessage` frame
-//! the driver publishes, plus helpers to route captured `PUBLISH` frames back into
-//! a peer's [`ScpClient::handle_relay_frame`] as relay `BLOB`s (the "dumb pipe" a
-//! real relay is) and to extract the inner MLS ciphertext from a captured frame
-//! (for the adversarial tests that tamper with it).
+//! This models the **shipped** relay's client-facing semantics faithfully — the
+//! properties the earlier naive loopback ignored and that hid two blockers:
 //!
-//! Every integration test builds its clients over this harness — there is no real
-//! relay and no tokio; delivery is synchronous and test-controlled.
+//! - a **subscription table** (`routing_id → subscribers`), populated by
+//!   `SUBSCRIBE` frames, so a `PUBLISH` reaches only those subscribed AT PUBLISH
+//!   TIME (subscribe-before-publish timing — `scp-transport/src/relay/subscription.rs`);
+//! - delivery of a `PUBLISH` to **ALL current subscribers of its routing id,
+//!   INCLUDING the publisher** — the relay has no publisher exclusion
+//!   (`deliver_to_subscribers`), so a member receives the echo of its own
+//!   announcement on the shared `context_routing_id` it publishes to and
+//!   subscribes to (the **self-echo** the driver must drop benignly);
+//! - **backfill on `since: Some`** only — stored blobs newer than `since` are
+//!   delivered on subscribe; with `since: None` (what the client uses) there is NO
+//!   backfill (`scp-transport/src/webtransport/session.rs`).
+//!
+//! Each [`Party`] owns a connection into the shared [`Relay`]; the client's
+//! injected [`RelaySink`] forwards its `SUBSCRIBE`/`PUBLISH` frames into the relay,
+//! and [`Relay::pump`] delivers queued `BLOB`s back into each party's
+//! `handle_relay_frame` **iteratively until quiescent**, so the reciprocal-announce
+//! cascade (§9.10.4 mesh completion) runs to completion exactly as it would over a
+//! live relay.
 
 #![allow(dead_code)] // not every integration test uses every helper
+#![allow(clippy::significant_drop_tightening)] // test-harness Mutex; early-drop restructuring adds noise, not value
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use scp_client::{LocalSigner, MemoryStorage, ScpClient, Socket, Storage};
+use scp_client::{LocalSigner, MemoryStorage, RelaySink, ScpClient, Storage};
 use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::envelope::outer::OuterEnvelope;
 use scp_relay_client::{ClientMessage, RelayMessage};
 
-/// A loopback socket recording every frame the driver publishes, in order. Cheap
-/// to clone (an `Arc` handle over the shared buffer): hold one handle to inspect
-/// frames while the driver holds another as its injected `Arc<dyn Socket>`.
-#[derive(Clone, Default)]
-pub struct CaptureSocket {
-    frames: Arc<Mutex<Vec<Vec<u8>>>>,
+/// A relay connection id (one per client).
+pub type ConnId = u64;
+
+/// A blob the relay stored (for `since:Some` backfill) + who published it.
+#[derive(Clone)]
+struct StoredBlob {
+    routing_id: [u8; 32],
+    blob_id: [u8; 32],
+    recipient_hint: Option<[u8; 32]>,
+    blob_ttl: u32,
+    stored_at: u64,
+    blob: Vec<u8>,
 }
 
-impl CaptureSocket {
+/// A record of one `PUBLISH` for test assertions.
+#[derive(Clone)]
+pub struct PublishRecord {
+    pub conn: ConnId,
+    pub routing_id: [u8; 32],
+    pub blob_ttl: u32,
+    /// The wire `OuterEnvelope` bytes (the `blob` field of the `PUBLISH`).
+    pub blob: Vec<u8>,
+}
+
+impl PublishRecord {
+    /// The inner MLS ciphertext (the `OuterEnvelope.encrypted_blob`) — for the
+    /// adversarial tests that tamper with the wire ciphertext.
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn inner_ciphertext(&self) -> Vec<u8> {
+        OuterEnvelope::from_bytes(&self.blob)
+            .expect("PUBLISH blob is an OuterEnvelope")
+            .encrypted_blob
+    }
+
+    /// The `OuterEnvelope`'s cleartext `routing_id` (must be zeroed — §9.10.4).
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn envelope_routing_id(&self) -> Vec<u8> {
+        OuterEnvelope::from_bytes(&self.blob)
+            .expect("PUBLISH blob is an OuterEnvelope")
+            .routing_id
+    }
+}
+
+#[derive(Default)]
+struct RelayState {
+    /// `routing_id` → connections currently subscribed (subscribe-time membership).
+    subscriptions: HashMap<[u8; 32], Vec<ConnId>>,
+    /// `routing_id` → stored blobs, for `since:Some` backfill.
+    stored: HashMap<[u8; 32], Vec<StoredBlob>>,
+    /// Per-connection inbound queue of serialized `RelayMessage` frames.
+    queues: HashMap<ConnId, VecDeque<Vec<u8>>>,
+    /// Every `PUBLISH` seen, in order — for test assertions.
+    publish_log: Vec<PublishRecord>,
+    /// Per-connection: fail a conn's `PUBLISH` sends after this many succeed (for
+    /// the M1 partial-fan-out test). `SUBSCRIBE`s always succeed.
+    fail_publish_after: HashMap<ConnId, usize>,
+    /// Per-connection count of `PUBLISH` sends attempted (drives `fail_publish_after`).
+    publish_attempts: HashMap<ConnId, usize>,
+    next_conn: ConnId,
+    /// Monotonic `stored_at` + `blob_id` source.
+    clock: u64,
+}
+
+/// A faithful in-memory relay shared across all [`Party`]s in a test.
+#[derive(Clone)]
+pub struct Relay {
+    state: Arc<Mutex<RelayState>>,
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Relay {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: Arc::new(Mutex::new(RelayState::default())),
+        }
     }
 
-    /// Drains and returns every captured frame in insertion order.
+    /// Allocates a new connection + its injected [`RelaySink`].
     #[allow(clippy::expect_used)]
-    pub fn take_frames(&self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut *self.frames.lock().expect("capture frame lock"))
+    fn connect(&self) -> (ConnId, Arc<dyn RelaySink>) {
+        let mut st = self.state.lock().expect("relay lock");
+        let conn = st.next_conn;
+        st.next_conn += 1;
+        st.queues.entry(conn).or_default();
+        let sink = RelayConn {
+            conn,
+            state: Arc::clone(&self.state),
+        };
+        (conn, Arc::new(sink))
     }
-}
 
-impl Socket for CaptureSocket {
+    /// Builds a fresh [`Party`] connected to this relay, over a fixed clock seeded
+    /// from real `now + offset` (so minted `KeyPackage` `Lifetime`s stay valid
+    /// against openmls's un-injectable internal clock) and an in-memory store.
     #[allow(clippy::expect_used)]
-    fn send(&self, frame: Vec<u8>) -> Result<(), String> {
-        self.frames.lock().expect("capture frame lock").push(frame);
-        Ok(())
+    #[must_use]
+    pub fn new_party(&self, did: &str, offset: u64) -> Party {
+        let (conn, sink) = self.connect();
+        let signer = Arc::new(LocalSigner::active(did));
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs() + offset));
+        let client = ScpClient::new(signer, storage, clock, sink).expect("construct client");
+        Party { client, conn }
     }
-}
 
-/// A client plus a handle to its capture socket.
-pub struct Party {
-    pub client: ScpClient,
-    pub socket: CaptureSocket,
-}
+    /// Builds a [`Party`] over CALLER-SUPPLIED deps (for restore/poison tests that
+    /// share a storage handle or inject a failing store), connected to this relay.
+    #[allow(clippy::expect_used)]
+    #[must_use]
+    pub fn party_with(
+        &self,
+        signer: Arc<LocalSigner>,
+        storage: Arc<dyn Storage>,
+        clock: Arc<dyn Clock>,
+    ) -> Party {
+        let (conn, sink) = self.connect();
+        let client = ScpClient::new(signer, storage, clock, sink).expect("construct client");
+        Party { client, conn }
+    }
 
-/// Builds a fresh client over a fixed clock (seeded from real `now` + `offset`, so
-/// minted `KeyPackage` `Lifetime`s stay valid against openmls's un-injectable
-/// internal clock) and an in-memory store, with a capture socket.
-#[allow(clippy::expect_used)]
-#[must_use]
-pub fn new_party(did: &str, offset: u64) -> Party {
-    let socket = CaptureSocket::new();
-    let signer = Arc::new(LocalSigner::active(did));
-    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(SystemClock.now_secs() + offset));
-    let client = ScpClient::new(signer, storage, clock, Arc::new(socket.clone()))
-        .expect("construct fresh client");
-    Party { client, socket }
-}
+    /// Drains this relay's per-connection queues into the given parties'
+    /// `handle_relay_frame`, **iteratively until quiescent** — so a receive that
+    /// triggers a reciprocal `PUBLISH` (which enqueues more `BLOB`s) is itself
+    /// pumped, running the §9.10.4 announce cascade to completion. Panics on a
+    /// `handle_relay_frame` error (tests want a loud failure on an unexpected
+    /// relay-path error) or if the cascade fails to converge within a generous
+    /// bound (a non-converging reciprocal cascade is a bug).
+    #[allow(clippy::expect_used)]
+    pub fn pump(&self, parties: &mut [&mut Party]) {
+        // A converged mesh quiesces in O(members) rounds; bound generously so a
+        // real non-convergence fails loudly instead of hanging.
+        let max_rounds = 64 + parties.len() * parties.len() * 4;
+        for _ in 0..max_rounds {
+            let mut delivered_any = false;
+            for party in parties.iter_mut() {
+                loop {
+                    // Take ONE frame with the lock held, then RELEASE before calling
+                    // handle_relay_frame (which re-locks to publish reciprocals).
+                    let frame = {
+                        let mut st = self.state.lock().expect("relay lock");
+                        st.queues.get_mut(&party.conn).and_then(VecDeque::pop_front)
+                    };
+                    let Some(frame) = frame else { break };
+                    delivered_any = true;
+                    party
+                        .client
+                        .handle_relay_frame(&frame)
+                        .expect("handle_relay_frame");
+                }
+            }
+            if !delivered_any {
+                return; // quiescent
+            }
+        }
+        panic!("relay pump did not converge within the round bound (reciprocal cascade bug?)");
+    }
 
-/// Builds a client over CALLER-SUPPLIED dependencies (for tests that need to share
-/// a storage backend across a restore, or inject a failing storage). Returns the
-/// client; the caller keeps its own socket handle.
-#[allow(clippy::expect_used)]
-#[must_use]
-pub fn client_with(
-    signer: Arc<LocalSigner>,
-    storage: Arc<dyn Storage>,
-    clock: Arc<dyn Clock>,
-    socket: CaptureSocket,
-) -> ScpClient {
-    ScpClient::new(signer, storage, clock, Arc::new(socket)).expect("construct client")
-}
+    /// Drains and returns every recorded `PUBLISH` in order (for assertions).
+    #[allow(clippy::expect_used)]
+    #[must_use]
+    pub fn drain_publish_log(&self) -> Vec<PublishRecord> {
+        std::mem::take(&mut self.state.lock().expect("relay lock").publish_log)
+    }
 
-/// Converts a captured `PUBLISH` frame into the relay `BLOB` frame a peer's
-/// `handle_relay_frame` consumes. `None` for a non-`PUBLISH` frame (e.g. a
-/// `SUBSCRIBE`).
-#[allow(clippy::expect_used)]
-#[must_use]
-pub fn publish_to_blob(publish_frame: &[u8]) -> Option<Vec<u8>> {
-    match ClientMessage::from_bytes(publish_frame).ok()? {
-        ClientMessage::Publish {
-            routing_id,
-            recipient_hint,
-            blob_ttl,
-            blob,
-            ..
-        } => RelayMessage::Blob {
+    /// The number of frames currently queued for `conn` (undelivered).
+    #[allow(clippy::expect_used)]
+    #[must_use]
+    pub fn queued(&self, conn: ConnId) -> usize {
+        self.state
+            .lock()
+            .expect("relay lock")
+            .queues
+            .get(&conn)
+            .map_or(0, VecDeque::len)
+    }
+
+    /// Makes `conn`'s NEXT `n` `PUBLISH` sends succeed and every one after that
+    /// FAIL (a partial fan-out — M1). Resets the attempt counter so `n` is relative
+    /// to this call, not to publishes already made during setup. `SUBSCRIBE`s are
+    /// unaffected.
+    #[allow(clippy::expect_used)]
+    pub fn fail_publish_after(&self, conn: ConnId, n: usize) {
+        let mut st = self.state.lock().expect("relay lock");
+        st.fail_publish_after.insert(conn, n);
+        st.publish_attempts.insert(conn, 0);
+    }
+
+    /// Injects a raw `RelayMessage::Blob` frame directly into `conn`'s queue,
+    /// bypassing the subscription table — for adversarial tests that deliver a
+    /// crafted/foreign/tampered blob to a specific victim.
+    #[allow(clippy::expect_used)]
+    pub fn inject_blob(&self, conn: ConnId, routing_id: [u8; 32], blob: Vec<u8>) {
+        let frame = RelayMessage::Blob {
             routing_id,
             blob_id: [0u8; 32],
-            recipient_hint,
-            blob_ttl,
+            recipient_hint: None,
+            blob_ttl: 300,
             stored_at: 0,
             blob,
         }
         .to_bytes()
-        .ok(),
-        _ => None,
+        .expect("serialize injected blob");
+        self.state
+            .lock()
+            .expect("relay lock")
+            .queues
+            .entry(conn)
+            .or_default()
+            .push_back(frame);
     }
 }
 
-/// Drains every `PUBLISH` `from` captured and delivers each as a relay `BLOB` into
-/// `to` via `handle_relay_frame`. Returns the number delivered. Panics if delivery
-/// errors (the tests want a loud failure on an unexpected relay-path error).
-#[allow(clippy::expect_used)]
-pub fn route_publishes(from: &CaptureSocket, to: &mut ScpClient) -> usize {
-    let mut delivered = 0;
-    for frame in from.take_frames() {
-        if let Some(blob) = publish_to_blob(&frame) {
-            to.handle_relay_frame(&blob).expect("deliver relay blob");
-            delivered += 1;
+impl RelayState {
+    /// Applies a client's outbound `ClientMessage` (from a [`RelayConn`] send).
+    fn apply(&mut self, conn: ConnId, msg: ClientMessage) {
+        match msg {
+            ClientMessage::Subscribe {
+                routing_id, since, ..
+            } => {
+                let subs = self.subscriptions.entry(routing_id).or_default();
+                if !subs.contains(&conn) {
+                    subs.push(conn);
+                }
+                // Backfill on `since: Some` only (the relay's session semantics).
+                if let Some(since) = since {
+                    let backfill: Vec<StoredBlob> = self
+                        .stored
+                        .get(&routing_id)
+                        .map(|blobs| {
+                            blobs
+                                .iter()
+                                .filter(|b| b.stored_at > since)
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for b in backfill {
+                        self.enqueue_blob(conn, &b);
+                    }
+                }
+            }
+            ClientMessage::Publish {
+                routing_id,
+                recipient_hint,
+                blob_ttl,
+                blob,
+                ..
+            } => {
+                self.clock += 1;
+                let mut blob_id = [0u8; 32];
+                blob_id[..8].copy_from_slice(&self.clock.to_be_bytes());
+                let stored = StoredBlob {
+                    routing_id,
+                    blob_id,
+                    recipient_hint,
+                    blob_ttl,
+                    stored_at: self.clock,
+                    blob: blob.clone(),
+                };
+                self.publish_log.push(PublishRecord {
+                    conn,
+                    routing_id,
+                    blob_ttl,
+                    blob,
+                });
+                self.stored
+                    .entry(routing_id)
+                    .or_default()
+                    .push(stored.clone());
+                // Deliver to ALL current subscribers INCLUDING the publisher (no
+                // publisher exclusion — the self-echo the relay actually performs).
+                let subs = self
+                    .subscriptions
+                    .get(&routing_id)
+                    .cloned()
+                    .unwrap_or_default();
+                for sub in subs {
+                    self.enqueue_blob(sub, &stored);
+                }
+            }
+            // The driver never sends these; ignore.
+            ClientMessage::Unsubscribe { .. }
+            | ClientMessage::Query { .. }
+            | ClientMessage::Delete { .. }
+            | ClientMessage::Ack { .. }
+            | ClientMessage::Ping { .. }
+            | ClientMessage::BridgeRegister { .. }
+            | ClientMessage::BridgeData { .. } => {}
         }
     }
-    delivered
+
+    #[allow(clippy::expect_used)]
+    fn enqueue_blob(&mut self, conn: ConnId, b: &StoredBlob) {
+        let frame = RelayMessage::Blob {
+            routing_id: b.routing_id,
+            blob_id: b.blob_id,
+            recipient_hint: b.recipient_hint,
+            blob_ttl: b.blob_ttl,
+            stored_at: b.stored_at,
+            blob: b.blob.clone(),
+        }
+        .to_bytes()
+        .expect("serialize blob");
+        self.queues.entry(conn).or_default().push_back(frame);
+    }
 }
 
-/// The inner MLS ciphertext of the LAST captured `PUBLISH` frame — decoded from its
-/// `OuterEnvelope`. For adversarial tests that tamper with the wire ciphertext.
-/// Drains the socket.
-#[allow(clippy::expect_used)]
-#[must_use]
-pub fn last_ciphertext(socket: &CaptureSocket) -> Vec<u8> {
-    socket
-        .take_frames()
-        .into_iter()
-        .rev()
-        .find_map(|frame| match ClientMessage::from_bytes(&frame).ok()? {
-            ClientMessage::Publish { blob, .. } => {
-                Some(OuterEnvelope::from_bytes(&blob).ok()?.encrypted_blob)
+/// The injected [`RelaySink`] for one connection: forwards the client's outbound
+/// `ClientMessage` frames into the shared [`Relay`].
+struct RelayConn {
+    conn: ConnId,
+    state: Arc<Mutex<RelayState>>,
+}
+
+impl RelaySink for RelayConn {
+    fn send(&self, frame: Vec<u8>) -> Result<(), String> {
+        let msg = ClientMessage::from_bytes(&frame).map_err(|e| format!("relay decode: {e}"))?;
+        let mut st = self.state.lock().map_err(|e| format!("relay lock: {e}"))?;
+        // Simulated partial-fan-out failure (M1): a conn's PUBLISHes fail after its
+        // configured limit. SUBSCRIBEs always succeed.
+        if matches!(msg, ClientMessage::Publish { .. }) {
+            let attempt = {
+                let n = st.publish_attempts.entry(self.conn).or_default();
+                *n += 1;
+                *n
+            };
+            if let Some(&limit) = st.fail_publish_after.get(&self.conn)
+                && attempt > limit
+            {
+                return Err("simulated publish failure".to_owned());
             }
-            _ => None,
-        })
-        .expect("a PUBLISH frame was captured")
+        }
+        st.apply(self.conn, msg);
+        Ok(())
+    }
 }
 
-/// All `(routing_id, inner_ciphertext)` pairs from the captured `PUBLISH` frames.
-/// Drains the socket.
-#[allow(clippy::expect_used)]
-#[must_use]
-pub fn published_ciphertexts(socket: &CaptureSocket) -> Vec<([u8; 32], Vec<u8>)> {
-    socket
-        .take_frames()
-        .into_iter()
-        .filter_map(|frame| match ClientMessage::from_bytes(&frame).ok()? {
-            ClientMessage::Publish {
-                routing_id, blob, ..
-            } => Some((
-                routing_id,
-                OuterEnvelope::from_bytes(&blob).ok()?.encrypted_blob,
-            )),
-            _ => None,
-        })
-        .collect()
+/// A client plus its relay connection id.
+pub struct Party {
+    pub client: ScpClient,
+    pub conn: ConnId,
 }
 
 /// The first `MessageReceived` payload in a drained event list, if any.
@@ -173,19 +395,37 @@ pub fn first_received(events: &[ContextEvent]) -> Option<Vec<u8>> {
     })
 }
 
-/// Connects Alice (creator) and Bob (joiner) into a fully wired 2-party context:
-/// MLS group shared, §9.16 sender keys exchanged both ways, and both pseudonym
-/// registries populated (each pumped the other's announcement). Buffers and socket
-/// frames are DRAINED before return, so callers start clean.
-///
-/// `ctx` is the context id; `alice_did` / `bob_did` the identities.
+/// Delivers the in-tab §9.16 sender-key distributions to their targets (directly
+/// via `receive_message`, the out-of-band model — not over the relay). Maps
+/// `target_did` to the matching party.
+#[allow(clippy::expect_used)]
+pub fn deliver_distributions(
+    ctx: &str,
+    dists: &[scp_client::SenderKeyDistribution],
+    parties: &mut [(&str, &mut ScpClient)],
+) {
+    for d in dists {
+        for (did, client) in parties.iter_mut() {
+            if *did == d.target_did {
+                client
+                    .receive_message(ctx, &d.ciphertext)
+                    .expect("install sender-key distribution");
+            }
+        }
+    }
+}
+
+/// Connects Alice (creator) + Bob (joiner) into a fully-wired 2-party context over
+/// the realistic relay: MLS group shared, §9.16 sender keys exchanged both ways,
+/// and — via the reciprocal-announce cascade pumped to quiescence — BOTH pseudonym
+/// registries populated. Both parties' buffers are drained before return.
 #[allow(clippy::expect_used)]
 #[must_use]
-pub fn connect_two(ctx: &str, alice_did: &str, bob_did: &str) -> (Party, Party) {
-    let mut alice = new_party(alice_did, 0);
+pub fn connect_two(relay: &Relay, ctx: &str, alice_did: &str, bob_did: &str) -> (Party, Party) {
+    let mut alice = relay.new_party(alice_did, 0);
     alice.client.create_context(ctx).expect("alice creates");
 
-    let mut bob = new_party(bob_did, 100);
+    let mut bob = relay.new_party(bob_did, 100);
     let bob_kp = bob
         .client
         .generate_key_package_for_join(ctx)
@@ -199,37 +439,22 @@ pub fn connect_two(ctx: &str, alice_did: &str, bob_did: &str) -> (Party, Party) 
         .join_context_encrypted(ctx, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("bob joins");
 
-    // Exchange §9.16 sender keys out-of-band (the in-tab distribution model).
-    bob.client
-        .receive_message(ctx, &add.sender_key_distributions[0].ciphertext)
-        .expect("bob installs alice key");
-    alice
-        .client
-        .receive_message(ctx, &bob_dists[0].ciphertext)
-        .expect("alice installs bob key");
-
-    // Pump each side's announcement to the other so both registries populate.
-    route_publishes(&alice.socket, &mut bob.client);
-    route_publishes(&bob.socket, &mut alice.client);
+    // Exchange §9.16 sender keys out-of-band, THEN pump the announce cascade (Bob's
+    // join-announce → Alice reciprocates → Bob reciprocates → quiescent).
+    deliver_distributions(
+        ctx,
+        &add.sender_key_distributions,
+        &mut [(alice_did, &mut alice.client), (bob_did, &mut bob.client)],
+    );
+    deliver_distributions(
+        ctx,
+        &bob_dists,
+        &mut [(alice_did, &mut alice.client), (bob_did, &mut bob.client)],
+    );
+    relay.pump(&mut [&mut alice, &mut bob]);
 
     let _ = alice.client.drain_events(ctx);
     let _ = bob.client.drain_events(ctx);
-    let _ = alice.socket.take_frames();
-    let _ = bob.socket.take_frames();
+    let _ = relay.drain_publish_log();
     (alice, bob)
-}
-
-/// Sends `plaintext` from `from` and routes the resulting fan-out into `to`,
-/// returning `to`'s drained events. A convenience for the common
-/// send→route→drain triple.
-#[allow(clippy::expect_used)]
-pub fn send_and_route(
-    ctx: &str,
-    from: &mut Party,
-    to: &mut ScpClient,
-    plaintext: &[u8],
-) -> Vec<ContextEvent> {
-    from.client.send_message(ctx, plaintext).expect("send");
-    route_publishes(&from.socket, to);
-    to.drain_events(ctx).expect("drain")
 }

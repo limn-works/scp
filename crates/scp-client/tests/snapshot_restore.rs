@@ -10,14 +10,15 @@
 //! truncated, foreign-owned, or unreadable snapshot fails the whole construction,
 //! and forward secrecy (close deletes the durable state).
 //!
-//! ADR-057 transport slice: `ScpClient::new` now takes an injected `Socket`, a
-//! send fans out over that socket (returning `()`, not the ciphertext) to the
+//! ADR-057 transport slice: `ScpClient::new` now takes an injected `RelaySink`, a
+//! send fans out over that sink (returning `()`, not the ciphertext) to the
 //! announced peer pseudonyms, and a snapshot is **v4** — it persists the
 //! §9.10.4 peer-pseudonym registry so a restored client can address its peers
 //! again, while re-deriving its OWN pseudonym from the restored MLS key and
-//! re-subscribing in the constructor. Delivery here uses the shared harness: a
-//! send publishes a frame the test extracts (`last_ciphertext`) and feeds to the
-//! peer's `receive_message`, exactly as the in-tab §9.16 distribution model does.
+//! re-subscribing in the constructor. Delivery here uses the realistic relay
+//! mock (`tests/common`): a send publishes a frame the test extracts from the
+//! relay's publish log (`last_app_ciphertext`) and feeds to the peer's
+//! `receive_message`, exactly as the in-tab §9.16 distribution model does.
 
 // Integration tests assert on happy-path results; `expect`/`panic!` make the
 // failure messages legible. The workspace denies these in production code.
@@ -26,8 +27,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_client::{ClientError, ContextStatus, LocalSigner, MemoryStorage, ScpClient, Storage};
+use scp_client::{
+    ClientError, ContextStatus, LocalSigner, MemoryStorage, RelaySink, ScpClient, Storage,
+};
 use scp_clock::{Clock, SystemClock, TestClock};
+use scp_protocol::context::context_routing_id;
 use scp_protocol::context::membership::ContextEvent;
 
 mod common;
@@ -50,42 +54,67 @@ fn seed(offset: u64) -> u64 {
     SystemClock.now_secs() + offset
 }
 
-/// Builds a client for `did` over the given (shared) storage and a fixed clock,
-/// restoring whatever the storage holds for that identity (the constructor is the
-/// restore path). The injected socket is a throwaway capture handle — this helper
-/// is for tests that reconstruct-and-observe, not tests that send afterwards.
-fn client_over(did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> ScpClient {
-    party_over(did, storage, now_secs).client
+/// A throwaway [`RelaySink`] for the fail-closed construction tests: restore on
+/// construct fails before any frame is sent, so the sink is never exercised. (A
+/// successfully-constructed client re-subscribes through it best-effort; the
+/// swallowed subscribe is harmless — those tests never send.)
+struct NullSink;
+
+impl RelaySink for NullSink {
+    fn send(&self, _frame: Vec<u8>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
-/// Like [`client_over`], but keeps the capture [`Socket`] handle alongside the
-/// client so the caller can extract published ciphertext for delivery to a peer.
-/// Use this when the restored (or freshly built) client must SEND afterwards.
-fn party_over(did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> Party {
-    let socket = CaptureSocket::new();
+/// Builds a client for `did` over the given (shared) storage and a fixed clock,
+/// connected to `relay`, restoring whatever the storage holds for that identity
+/// (the constructor is the restore path).
+fn client_over(relay: &Relay, did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> ScpClient {
+    party_over(relay, did, storage, now_secs).client
+}
+
+/// Like [`client_over`], but returns the whole [`Party`] (keeping its relay
+/// connection id alongside the client) so the caller can extract a send's
+/// published ciphertext from the relay for delivery to a peer. Use this when the
+/// restored (or freshly built) client must SEND afterwards.
+fn party_over(relay: &Relay, did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> Party {
     let signer = Arc::new(LocalSigner::active(did));
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    let client = client_with(signer, storage, clock, socket.clone());
-    Party { client, socket }
+    relay.party_with(signer, storage, clock)
+}
+
+/// Extracts the inner MLS ciphertext of the last app-data `PUBLISH` `conn`
+/// published to `relay` — the exact wire bytes a peer's `receive_message`
+/// consumes. App data fans out to peer pseudonyms, so this filters out the shared
+/// announcement channel. Drains the relay's publish log.
+fn last_app_ciphertext(relay: &Relay, conn: ConnId, ctx: &str) -> Vec<u8> {
+    relay
+        .drain_publish_log()
+        .into_iter()
+        .rev()
+        .find(|p| p.conn == conn && p.routing_id != context_routing_id(ctx))
+        .expect("an app-data PUBLISH from this connection")
+        .inner_ciphertext()
 }
 
 /// Drives Alice (creator) and Bob (joiner) through create / add / join / key
-/// exchange over CALLER-SUPPLIED storage backends, so both hold a converged
-/// two-member context with populated peer-pseudonym registries and no messages
-/// yet. Buffers and socket frames are drained before return, so callers start
-/// from a clean baseline.
+/// exchange over CALLER-SUPPLIED storage backends and a shared `relay`, so both
+/// hold a converged two-member context with populated peer-pseudonym registries
+/// and no messages yet. Buffers and the relay publish log are drained before
+/// return, so callers start from a clean baseline.
 ///
-/// Each side keeps its capture [`Socket`] handle in the returned [`Party`], so a
-/// caller can extract a send's published ciphertext (`last_ciphertext`) and feed
-/// it to the other side's `receive_message` — the in-tab §9.16 distribution model.
+/// Each side keeps its relay connection id in the returned [`Party`], so a caller
+/// can extract a send's published ciphertext (`last_app_ciphertext`) and feed it
+/// to the other side's `receive_message` — the in-tab §9.16 distribution model.
 fn converge(
+    relay: &Relay,
     alice_storage: Arc<dyn Storage>,
     alice_now: u64,
     bob_storage: Arc<dyn Storage>,
     bob_now: u64,
 ) -> (Party, Party) {
-    let mut alice = party_over(ALICE_DID, alice_storage, alice_now);
-    let mut bob = party_over(BOB_DID, bob_storage, bob_now);
+    let mut alice = party_over(relay, ALICE_DID, alice_storage, alice_now);
+    let mut bob = party_over(relay, BOB_DID, bob_storage, bob_now);
 
     alice.client.create_context(CTX).expect("alice creates");
     let bob_kp = bob
@@ -102,7 +131,9 @@ fn converge(
         .expect("bob joins");
 
     // In-tab §9.16 distribution: Alice's add sealed her key to Bob; Bob's join
-    // sealed his key to Alice. Route each to its target's receive_message.
+    // sealed his key to Alice. Route each DIRECTLY to its target's
+    // receive_message (never over the relay, which carries only app data +
+    // announcements).
     for d in &add.sender_key_distributions {
         assert_eq!(d.target_did, BOB_DID);
         bob.client
@@ -117,27 +148,26 @@ fn converge(
             .expect("alice installs bob's key");
     }
 
-    // Pump each side's §9.10.4 pseudonym announcement to the other so both
+    // Pump the §9.10.4 reciprocal-announce mesh to quiescence so both
     // peer-pseudonym registries populate — the prerequisite for app-data fan-out
     // (an empty registry in a >1-member context is a retryable
     // `PseudonymRegistryEmpty`).
-    route_publishes(&alice.socket, &mut bob.client);
-    route_publishes(&bob.socket, &mut alice.client);
+    relay.pump(&mut [&mut alice, &mut bob]);
 
     // Clean baseline: drop the bootstrap `PseudonymAnnounced` events and every
-    // captured frame so callers start from an empty buffer and socket.
+    // recorded PUBLISH so callers start from an empty buffer and publish log.
     let _ = alice.client.drain_events(CTX);
     let _ = bob.client.drain_events(CTX);
-    let _ = alice.socket.take_frames();
-    let _ = bob.socket.take_frames();
+    let _ = relay.drain_publish_log();
 
     (alice, bob)
 }
 
 /// Convenience over [`converge`]: Alice on a fresh in-memory store, Bob on the
 /// caller's shared storage (so the caller can drop Bob and reopen over it).
-fn converged_pair(bob_storage: Arc<dyn Storage>) -> (Party, Party) {
+fn converged_pair(relay: &Relay, bob_storage: Arc<dyn Storage>) -> (Party, Party) {
     converge(
+        relay,
         Arc::new(MemoryStorage::new()),
         seed(0),
         bob_storage,
@@ -148,8 +178,9 @@ fn converged_pair(bob_storage: Arc<dyn Storage>) -> (Party, Party) {
 #[test]
 #[allow(clippy::too_many_lines)] // one end-to-end restore scenario, read top-to-bottom
 fn restore_resumes_a_converged_context_from_storage() {
+    let relay = Relay::new();
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let (mut alice, mut bob) = converged_pair(Arc::clone(&bob_storage));
+    let (mut alice, mut bob) = converged_pair(&relay, Arc::clone(&bob_storage));
 
     // Alice sends; the fan-out publishes one frame whose inner ciphertext the test
     // extracts and feeds to Bob's receive_message (mutating + persisting Bob's
@@ -159,7 +190,7 @@ fn restore_resumes_a_converged_context_from_storage() {
         .client
         .send_message(CTX, b"before restore")
         .expect("alice sends");
-    let pre = last_ciphertext(&alice.socket);
+    let pre = last_app_ciphertext(&relay, alice.conn, CTX);
     let received = bob.client.receive_message(CTX, &pre).expect("bob receives");
     assert!(received.application);
 
@@ -176,7 +207,7 @@ fn restore_resumes_a_converged_context_from_storage() {
     // A fresh client (the reopened tab) over Bob's identity + the SAME storage.
     // The constructor restores the converged context (and re-derives Bob's
     // pseudonym + re-subscribes; the v4 snapshot restored his peer registry).
-    let mut bob2 = party_over(BOB_DID, Arc::clone(&bob_storage), seed(199));
+    let mut bob2 = party_over(&relay, BOB_DID, Arc::clone(&bob_storage), seed(199));
 
     // Restored state matches what Bob held before the tab closed.
     let mut members = bob2.client.member_dids(CTX).expect("restored members");
@@ -194,7 +225,8 @@ fn restore_resumes_a_converged_context_from_storage() {
     );
 
     // The undrained buffered message survived the round-trip and is delivered
-    // exactly once.
+    // exactly once. (The bootstrap `PseudonymAnnounced` events were drained by
+    // `converge`, so only the one buffered `MessageReceived` round-trips.)
     let buffered = bob2.client.drain_events(CTX).expect("bob2 drains buffered");
     assert_eq!(
         buffered.len(),
@@ -231,7 +263,7 @@ fn restore_resumes_a_converged_context_from_storage() {
         .client
         .send_message(CTX, b"after restore")
         .expect("alice sends 2");
-    let send2 = last_ciphertext(&alice.socket);
+    let send2 = last_app_ciphertext(&relay, alice.conn, CTX);
     let received = bob2
         .client
         .receive_message(CTX, &send2)
@@ -256,7 +288,7 @@ fn restore_resumes_a_converged_context_from_storage() {
     bob2.client
         .send_message(CTX, b"from restored bob")
         .expect("bob2 sends");
-    let send3 = last_ciphertext(&bob2.socket);
+    let send3 = last_app_ciphertext(&relay, bob2.conn, CTX);
     let received = alice
         .client
         .receive_message(CTX, &send3)
@@ -306,8 +338,9 @@ fn buffer_with_sent_and_received_round_trips_through_restore() {
     // history alongside received `MessageReceived` messages (neither is a
     // convergent leaf — ADR-011). A client that has both SENT and RECEIVED without
     // draining must restore BOTH from its snapshot's variant-aware buffer.
+    let relay = Relay::new();
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let (mut alice, mut bob) = converged_pair(Arc::clone(&bob_storage));
+    let (mut alice, mut bob) = converged_pair(&relay, Arc::clone(&bob_storage));
 
     // Bob sends (buffers his own MessageSent); Alice consumes it so her ratchet
     // stays usable. Then Alice sends and Bob receives (buffers a MessageReceived).
@@ -315,7 +348,7 @@ fn buffer_with_sent_and_received_round_trips_through_restore() {
     bob.client
         .send_message(CTX, b"bob's own send")
         .expect("bob sends");
-    let bob_ct = last_ciphertext(&bob.socket);
+    let bob_ct = last_app_ciphertext(&relay, bob.conn, CTX);
     alice
         .client
         .receive_message(CTX, &bob_ct)
@@ -324,14 +357,14 @@ fn buffer_with_sent_and_received_round_trips_through_restore() {
         .client
         .send_message(CTX, b"alice to bob")
         .expect("alice sends");
-    let alice_ct = last_ciphertext(&alice.socket);
+    let alice_ct = last_app_ciphertext(&relay, alice.conn, CTX);
     bob.client
         .receive_message(CTX, &alice_ct)
         .expect("bob receives alice");
     drop(bob); // tab closes with an undrained Sent + Received in the buffer.
 
     // A reopened tab restores both buffered events, in FIFO order.
-    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(199));
+    let mut bob2 = client_over(&relay, BOB_DID, Arc::clone(&bob_storage), seed(199));
     let drained = bob2.drain_events(CTX).expect("bob2 drains");
     assert_eq!(
         drained.len(),
@@ -366,13 +399,14 @@ fn pending_join_completes_after_restore() {
     // Bob generates a key package (persisting the private pending material) and
     // the tab closes BEFORE joining. A reopened tab restores the pending material
     // and completes the join.
+    let relay = Relay::new();
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let alice_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let mut alice = client_over(ALICE_DID, alice_storage, seed(0));
+    let mut alice = client_over(&relay, ALICE_DID, alice_storage, seed(0));
     alice.create_context(CTX).expect("alice creates");
 
     let bob_kp = {
-        let mut bob = client_over(BOB_DID, Arc::clone(&bob_storage), seed(100));
+        let mut bob = client_over(&relay, BOB_DID, Arc::clone(&bob_storage), seed(100));
         let kp = bob
             .generate_key_package_for_join(CTX)
             .expect("bob key package");
@@ -384,7 +418,7 @@ fn pending_join_completes_after_restore() {
     let add = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
 
     // The reopened tab restores the pending material and joins with it.
-    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(150));
+    let mut bob2 = client_over(&relay, BOB_DID, Arc::clone(&bob_storage), seed(150));
     bob2.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
         .expect("restored bob completes the join");
 
@@ -400,8 +434,9 @@ fn pending_join_completes_after_restore() {
 
 #[test]
 fn restore_of_absent_store_is_a_fresh_client() {
+    let relay = Relay::new();
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let client = client_over(BOB_DID, storage, seed(100));
+    let client = client_over(&relay, BOB_DID, storage, seed(100));
     assert!(
         client.member_dids(CTX).is_none(),
         "an empty store yields a fresh client with no contexts"
@@ -500,8 +535,9 @@ impl Storage for GatedFailOnPut {
 
 /// Persists one converged context to `underlying` (as Bob) and returns the store.
 fn persisted_single_context() -> Arc<dyn Storage> {
+    let relay = Relay::new();
     let underlying: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let (_alice, _bob) = converged_pair(Arc::clone(&underlying));
+    let (_alice, _bob) = converged_pair(&relay, Arc::clone(&underlying));
     underlying
 }
 
@@ -510,9 +546,9 @@ fn persisted_single_context() -> Arc<dyn Storage> {
 fn expect_construction_error_as(did: &str, storage: Arc<dyn Storage>) -> ClientError {
     let signer = Arc::new(LocalSigner::active(did));
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(seed(200)));
-    // The injected socket is irrelevant: restore-on-construct fails before any
-    // frame is sent. A throwaway capture socket satisfies the signature.
-    match ScpClient::new(signer, storage, clock, Arc::new(CaptureSocket::new())) {
+    // The injected sink is irrelevant: restore-on-construct fails before any
+    // frame is sent. A throwaway null sink satisfies the signature.
+    match ScpClient::new(signer, storage, clock, Arc::new(NullSink)) {
         Ok(_) => panic!("construction must fail closed"),
         Err(e) => e,
     }
@@ -595,7 +631,8 @@ fn one_of_two_corrupt_contexts_fails_whole_construction() {
     let ctx_good = "ctx-atomic-good";
     let ctx_bad = "ctx-atomic-corrupt";
     {
-        let mut b = client_over(BOB_DID, Arc::clone(&underlying), seed(100));
+        let relay = Relay::new();
+        let mut b = client_over(&relay, BOB_DID, Arc::clone(&underlying), seed(100));
         b.create_context(ctx_good).expect("create good");
         b.create_context(ctx_bad).expect("create corrupt");
     }
@@ -623,8 +660,10 @@ fn failing_put_during_send_poisons_context_and_reconstruction_recovers() {
     // sender (Alice, on the gated store) is converged with a peer (Bob) first; the
     // gate is armed only afterwards, so convergence's writes succeed and the FIRST
     // armed write is the send's post-mutation persist.
+    let relay = Relay::new();
     let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
     let (mut alice, _bob) = converge(
+        &relay,
         Arc::clone(&gated) as Arc<dyn Storage>,
         seed(0),
         Arc::new(MemoryStorage::new()),
@@ -674,7 +713,12 @@ fn failing_put_during_send_poisons_context_and_reconstruction_recovers() {
     // the last durable snapshot (post-convergence) — a restored context is
     // unpoisoned by construction. (`gated` is still armed, but reconstruction only
     // reads.)
-    let alice2 = client_over(ALICE_DID, Arc::clone(&gated) as Arc<dyn Storage>, seed(50));
+    let alice2 = client_over(
+        &relay,
+        ALICE_DID,
+        Arc::clone(&gated) as Arc<dyn Storage>,
+        seed(50),
+    );
     assert_eq!(
         alice2.event_log_root(CTX),
         Some(durable_root),
@@ -693,9 +737,10 @@ fn failing_put_during_send_poisons_context_and_reconstruction_recovers() {
 
 #[test]
 fn context_ids_lists_restored_contexts_sorted() {
+    let relay = Relay::new();
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     {
-        let mut b = client_over(BOB_DID, Arc::clone(&storage), seed(100));
+        let mut b = client_over(&relay, BOB_DID, Arc::clone(&storage), seed(100));
         b.create_context("ctx-b-two").expect("create 2");
         b.create_context("ctx-a-one").expect("create 1");
         assert_eq!(
@@ -706,7 +751,7 @@ fn context_ids_lists_restored_contexts_sorted() {
     }
     // A reopened tab restores both contexts and can enumerate them (without this,
     // a fresh client would hold its restored conversations but expose no listing).
-    let b2 = client_over(BOB_DID, Arc::clone(&storage), seed(150));
+    let b2 = client_over(&relay, BOB_DID, Arc::clone(&storage), seed(150));
     assert_eq!(
         b2.context_ids(),
         vec!["ctx-a-one".to_owned(), "ctx-b-two".to_owned()],
@@ -721,7 +766,8 @@ fn context_snapshot_under_mismatched_key_fails_construction_closed() {
     // id is A → the whole construction fails closed as corrupt/mislabeled.
     let src: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     {
-        let mut b = client_over(BOB_DID, Arc::clone(&src), seed(100));
+        let relay = Relay::new();
+        let mut b = client_over(&relay, BOB_DID, Arc::clone(&src), seed(100));
         b.create_context("ctx-embedded-A").expect("create A");
     }
     let blob = src
@@ -741,8 +787,9 @@ fn context_snapshot_under_mismatched_key_fails_construction_closed() {
 /// Generates and persists Bob's pending-join material for `ctx` into a fresh
 /// store, then returns the raw pending blob (bound to Bob's DID + `ctx`).
 fn bob_pending_blob(ctx: &str) -> Vec<u8> {
+    let relay = Relay::new();
     let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let mut bob = client_over(BOB_DID, Arc::clone(&store), seed(100));
+    let mut bob = client_over(&relay, BOB_DID, Arc::clone(&store), seed(100));
     bob.generate_key_package_for_join(ctx)
         .expect("bob key package");
     store
@@ -788,8 +835,10 @@ fn context_status_reports_live_poisoned_and_absent() {
     // `Option` observers (which collapse poisoned into `None`). Alice is converged
     // with a peer so her send has an addressee (a lone send is a no-op that could
     // not poison); the gate arms only after convergence.
+    let relay = Relay::new();
     let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
     let (mut alice, _bob) = converge(
+        &relay,
         Arc::clone(&gated) as Arc<dyn Storage>,
         seed(0),
         Arc::new(MemoryStorage::new()),
@@ -828,8 +877,10 @@ fn closing_a_poisoned_context_forfeits_recovery() {
     // `failing_put_during_send_poisons_context_and_reconstruction_recovers`, which
     // does NOT close and so keeps the durable snapshot). Alice is converged with a
     // peer so her send has an addressee; the gate arms only after convergence.
+    let relay = Relay::new();
     let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
     let (mut alice, _bob) = converge(
+        &relay,
         Arc::clone(&gated) as Arc<dyn Storage>,
         seed(0),
         Arc::new(MemoryStorage::new()),
@@ -857,7 +908,12 @@ fn closing_a_poisoned_context_forfeits_recovery() {
 
     // Reconstruction from the SAME storage finds nothing — close deleted the last
     // durable snapshot, so the context cannot be recovered.
-    let alice2 = client_over(ALICE_DID, Arc::clone(&gated) as Arc<dyn Storage>, seed(50));
+    let alice2 = client_over(
+        &relay,
+        ALICE_DID,
+        Arc::clone(&gated) as Arc<dyn Storage>,
+        seed(50),
+    );
     assert_eq!(
         alice2.context_status(CTX),
         ContextStatus::Absent,
@@ -867,14 +923,15 @@ fn closing_a_poisoned_context_forfeits_recovery() {
 
 #[test]
 fn close_deletes_durable_state_forward_secrecy() {
+    let relay = Relay::new();
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let (_alice, mut bob) = converged_pair(Arc::clone(&bob_storage));
+    let (_alice, mut bob) = converged_pair(&relay, Arc::clone(&bob_storage));
     bob.client.close_context(CTX).expect("bob closes");
     drop(bob);
 
     // A fresh client over the same storage finds nothing to restore — the closed
     // context is not resurrected (forward secrecy).
-    let bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(200));
+    let bob2 = client_over(&relay, BOB_DID, Arc::clone(&bob_storage), seed(200));
     assert!(
         bob2.member_dids(CTX).is_none(),
         "the closed context's snapshot was deleted and is not restored"
