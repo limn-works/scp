@@ -191,7 +191,7 @@ impl Default for InMemoryKeyCustody {
     }
 }
 
-use crate::pseudonym::derive_pseudonym_keypair;
+use scp_crypto::pseudonym::derive_pseudonym_keypair;
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
@@ -525,8 +525,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::pseudonym::derive_pseudonym_secret;
     use hmac::{Hmac, Mac};
+    use scp_crypto::pseudonym::derive_pseudonym_secret;
     use sha2::Sha256;
 
     #[tokio::test]

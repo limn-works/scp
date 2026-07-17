@@ -88,6 +88,12 @@ scp-did = { path = "../scp-did", features = ["testing"] }
 # so it stays inside the D5 fence.
 scp-relay-client = { path = "../scp-relay-client" }
 
+# The pseudonym-derivation cross-target KAT exercises the wasm-safe
+# `scp-crypto::pseudonym` derivation (§9.10.4.A, ADR-057 Option A) on BOTH native
+# and wasm32, asserting byte-parity against the §25.19 golden vectors. A
+# types-only dev edge to a leaf already in the wasm tree — inside the fence.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+
 # The cross-target determinism KAT round-trips committed golden MLS wire blobs
 # (Commit / Welcome / KeyPackage) through openmls's canonical TLS codec on BOTH
 # targets (ADR-057 Prerequisite 5 (i)/(iii)): deserialize the golden blob, then

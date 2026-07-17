@@ -1,5 +1,12 @@
-//! Shared pseudonym secret derivation and keypair derivation for all
-//! [`KeyCustody`](crate::traits::KeyCustody) backends.
+//! Shared pseudonym secret derivation and per-context keypair derivation.
+//!
+//! This is the single wasm-safe source of the §9.10.4.A software-custody
+//! pseudonym derivation. It is consumed by every native `KeyCustody` backend
+//! in `scp-platform` and — per ADR-057 Option A (planning-session-10) — by the
+//! in-browser client, which derives its own per-context pseudonym in Rust over
+//! the wasm-held signing key. Because the algorithm lives here, unforked, and
+//! is exercised by a cross-target byte-parity KAT, software pseudonyms agree
+//! byte-for-byte across platforms (§25.19 vectors 30/31).
 //!
 //! CRITICAL PRIVACY REQUIREMENT (§9.10.4.A): Using public key bytes as the
 //! HMAC key for pseudonym derivation would be a membership enumeration oracle —
@@ -37,6 +44,14 @@ const PSEUDONYM_V2_DOMAIN: &[u8] = b"scp-pseudonym-v2";
 /// All three Rust custody backends (`InMemory`, `File`, `SQLite`) use this function
 /// to ensure consistent pseudonym derivation. The derived secret is then used
 /// as the HMAC key in `derive_pseudonym` and `derive_rotatable_pseudonym`.
+///
+/// # Panics
+///
+/// Never in practice. The single `assert!` guards an infallible invariant:
+/// HKDF-Expand with a 32-byte output length cannot fail (32 ≤ 255 · `HashLen`).
+/// The assertion documents that invariant rather than propagating an
+/// unreachable error.
+#[must_use]
 pub fn derive_pseudonym_secret(signing_key: &SigningKey) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(PSEUDONYM_SECRET_SALT), signing_key.as_bytes());
     let mut secret = Zeroizing::new([0u8; 32]);
@@ -75,6 +90,13 @@ pub fn derive_pseudonym_secret(signing_key: &SigningKey) -> Zeroizing<[u8; 32]> 
 ///
 /// The output is byte-identical to the prior inline derivation blocks: same domain
 /// separators, same `mac.update` ordering, same `from_bytes(&hmac[..32])`.
+///
+/// # Panics
+///
+/// Never in practice. The single `assert!` guards an infallible invariant:
+/// HMAC-SHA-256 accepts a key of any length, so keyed initialization from the
+/// derived `pseudonym_secret` cannot fail. The assertion documents that
+/// invariant rather than propagating an unreachable error.
 #[must_use]
 pub fn derive_pseudonym_keypair(
     signing_key: &SigningKey,

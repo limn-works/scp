@@ -6,7 +6,7 @@
 //
 // The pseudonym derivation known-answer test verifies cross-platform
 // determinism with the canonical Rust reference implementation
-// (`derive_pseudonym_keypair` in `scp-platform/src/pseudonym.rs`), asserting
+// (`derive_pseudonym_keypair` in `scp-crypto/src/pseudonym.rs`), asserting
 // the literal spec §25.19 vectors for both the static (v1) and rotatable (v2)
 // derivations.
 //
@@ -411,7 +411,7 @@
         /// Asserts the Swift `AppleKeyCustody` pseudonym derivations reproduce
         /// the canonical spec §25.19 vectors byte-for-byte, proving the Swift
         /// adapter is wire-compatible with the Rust `derive_pseudonym_keypair`
-        /// reference (`scp-platform/src/pseudonym.rs`) across all SDKs.
+        /// reference (`scp-crypto/src/pseudonym.rs`) across all SDKs.
         ///
         /// Both vectors use `context_id = "context-alpha"` (ASCII). For each
         /// identity seed the test asserts:

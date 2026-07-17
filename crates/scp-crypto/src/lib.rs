@@ -15,6 +15,8 @@
 //!
 //! See GitHub issues #81, #509, #609.
 
+pub mod pseudonym;
+
 /// Verifies an Ed25519 signature against a public key and message bytes.
 ///
 /// This is the sole verification entry point for SCP. Module-specific
