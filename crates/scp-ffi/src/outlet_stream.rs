@@ -1101,6 +1101,486 @@ fn outlet_stream_compute_caveats_binding_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Cross-context streaming saga (§5.4.5, §6.2.4, SCP-OUT-047) — open / poll /
+// recover. The streaming ANALOG of the unary cross-context saga export in
+// `outlets.rs`, sharing its `enforce_caller_principal_binding`,
+// `resolve_context_signing_key`, `validate_outlet_ucan`, and `map_saga_error`
+// verbatim, and the SAME `BridgeStreamExecutor` / `resolve_stream_signer` /
+// `BridgeStreamRevocationChecker` this module already defines.
+// ---------------------------------------------------------------------------
+
+/// The control-plane "no active cross-context streaming saga" rejection for an
+/// unknown, stale, typo'd, or already-evicted saga id. Shared by
+/// [`outlet_streaming_saga_poll_next_impl`] and
+/// [`outlet_streaming_saga_recover_truncated_close_impl`]. DISTINCT from a
+/// genuine terminal (which `poll_next` reports as `None`) so a bad handle is
+/// never mistaken for a clean stream end.
+fn no_active_saga_err(saga_id: &str) -> ScpPyError {
+    ScpPyError::context(format!(
+        "no active cross-context streaming saga '{saga_id}'"
+    ))
+}
+
+/// §5.4.5 / §6.2.4 cross-context streaming-saga open (SCP-OUT-047). The
+/// streaming sibling of [`outlet_invoke_cross_context_saga`](crate::outlets)
+/// and [`outlet_stream_open_impl`]: it validates the invocation UCAN at the
+/// bridge (once, at open), drives
+/// [`Supervisor::start_cross_context_streaming_outlet_invocation_saga`](scp_core::context::supervisor::Supervisor::start_cross_context_streaming_outlet_invocation_saga)
+/// to the Commit-transition, and stores the promptly-returned receiver in the
+/// per-instance saga registry keyed by the durable `saga_id`. Returns the
+/// `saga_id` string PROMPTLY (AC1 — the Commit-transition, NOT a
+/// block-until-terminal; the seal pumps off-mailbox).
+///
+/// Body ORDER is security-critical:
+///   (a) validate inputs;
+///   (b) `enforce_caller_principal_binding` on the CALLER axis (§6.2.4 Caller
+///       authentication / ADR-049 §3a channel-auth) BEFORE anything
+///       irreversible — the saga never observes an unauthenticated caller;
+///   (c) `validate_outlet_ucan` against the TARGET context B (where the outlet
+///       is registered), then resolve the effective §7.3.8 caveats + `ucan_cid`
+///       and compute the §5.4.5 `caveats_binding` from a FRESH `request_id`;
+///   (d) resolve `SagaSigningKeys { target, caller }` from each context's
+///       Active Signing Key (via custody — the key never enters the runtime,
+///       ADR-006);
+///   (e) build the executor over the TARGET handler;
+///   (f) drive the saga to the Commit-transition;
+///   (g) register the receiver and return the `saga_id`.
+///
+/// SECURITY: the §5.4.5 `CrossContextVerificationDescriptor`
+/// (`operator_pk` / `operating_context_id` / `outlet_id` / `caveats_binding` /
+/// `expected_request_id`) is built RUNTIME-SIDE inside the saga method from
+/// `phase1.params` — this bridge passes NONE of those from the caller/envelope.
+/// `operator_signer` is resolved from the TARGET operator's custody,
+/// `caveats_binding` is recomputed from the VALIDATED UCAN, and `request_id` is
+/// freshly minted here (the runtime rejects a binding that does not match its
+/// own recompute).
+#[allow(clippy::too_many_arguments)] // Flat §6.2.4 streaming envelope — agent-first named params.
+#[allow(clippy::needless_pass_by_value)] // PyO3 owned Option params.
+#[allow(clippy::too_many_lines)] // UCAN validate + caveat binding + full OpenStreamParams + saga drive.
+fn outlet_streaming_saga_open_impl(
+    bi: &PyBridgeInstance,
+    caller_context_id: &str,
+    target_context_id: &str,
+    caller_did: &str,
+    outlet_registration_id: &str,
+    input: &Bound<'_, pyo3::types::PyDict>,
+    asserted_nonce_hex: &str,
+    timestamp_ms: u64,
+    chain_depth: u8,
+    ucan_token: &str,
+    proof_tokens: Option<Vec<String>>,
+    ucan_proof_id: Option<String>,
+    timeout_ms: Option<u32>,
+    estimated_chunk_count: Option<u32>,
+) -> PyResult<String> {
+    // ----- (a) validate inputs ------------------------------------------------
+    validate::validate_context_id(caller_context_id)?;
+    validate::validate_context_id(target_context_id)?;
+    validate::validate_outlet_id(outlet_registration_id)?;
+    validate::validate_did(caller_did)?;
+    validate::validate_ucan_token(ucan_token)?;
+    // NOTE (SCP-OUT-047 review F3): the streaming-saga open carries NO
+    // `spending_ucan`. The cross-context streaming escrow is B-side (§5.4.5
+    // "Cross-context economy" — the invoker pays via the TARGET context's stream
+    // escrow), and spending authorization for the outlet is carried by
+    // `ucan_proof_id` (resolved target-side at Prepare-B), exactly as the unary
+    // `outlet_invoke_cross_context_saga` sibling does. A `spending_ucan` JWT here
+    // was validated-then-dropped — genuinely inert on this path — so it is not
+    // accepted (no footgun in the streaming-saga template).
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
+    let asserted_nonce = crate::outlets::decode_asserted_nonce(asserted_nonce_hex)?;
+    let input_json = crate::types::py_dict_to_json(input)?;
+
+    // ----- (b) caller-principal binding (CALLER axis) — BEFORE the saga runs --
+    let supervisor = crate::runtime::supervisor(bi)?;
+    let rt = crate::runtime()?;
+    crate::outlets::enforce_caller_principal_binding(
+        bi,
+        supervisor,
+        rt,
+        caller_context_id,
+        caller_did,
+    )?;
+
+    // ----- (c) validate the invocation UCAN against the TARGET context --------
+    //
+    // The outlet lives in the operating context B, so its registered kind +
+    // per-context UCAN state (revocation list, nonce tracker, ceiling, proof
+    // chain) are B's — IDENTICAL to `outlet_stream_open_impl`, just rebased onto
+    // `target_context_id`. Validated ONCE at open (§5.4.5 "UCAN check locus").
+    crate::outlets::validate_outlet_ucan(
+        bi,
+        target_context_id,
+        outlet_registration_id,
+        ucan_token,
+        caller_did,
+        proof_tokens.as_ref(),
+    )?;
+
+    let invocation_ucan =
+        scp_core::crypto::ucan::validate::parse_ucan(ucan_token).map_err(|e| {
+            ScpPyError::ucan(format!(
+                "invalid invocation UCAN for '{outlet_registration_id}': {e}"
+            ))
+        })?;
+    let ucan_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&invocation_ucan.encoded);
+    let caveats = {
+        use scp_core::crypto::ucan::validate::CaveatResolver as _;
+        scp_core::crypto::ucan::validate::TokenNbCaveatResolver
+            .resolve_caveats(&invocation_ucan)
+            .unwrap_or_else(scp_core::trust::caveats::InvocationCaveats::empty)
+    };
+    let has_caveats = caveats != scp_core::trust::caveats::InvocationCaveats::empty();
+
+    // §5.4.5 caveats binding. The runtime RECOMPUTES this at open from
+    // `(ucan_cid, request_id, invoker_did, declared_estimate.unwrap_or(0),
+    // JCS(caveats))` and rejects a mismatch — so every input MUST agree with
+    // what we pin here (identical to the same-context open).
+    let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+    let caveats_jcs = caveats.to_canonical_json_bytes().map_err(|e| {
+        ScpPyError::context(format!("failed to canonicalize effective caveats: {e}"))
+    })?;
+    let caveats_binding = compute_caveats_binding(
+        ucan_cid.as_bytes(),
+        &request_id,
+        caller_did,
+        estimated_chunk_count.unwrap_or(0),
+        &caveats_jcs,
+    );
+
+    // ----- Outlet registration data (from the TARGET context B) ---------------
+    let cost_per_chunk = crate::runtime::with_context(bi, target_context_id, |rt| {
+        let registration = rt.outlet_registry.get(outlet_registration_id).ok_or_else(|| {
+            ScpPyError::context(format!(
+                "outlet '{outlet_registration_id}' not registered in context '{target_context_id}'"
+            ))
+        })?;
+        Ok(registration
+            .cost
+            .as_ref()
+            .map_or(scp_core::economy::Amount::new(0), |c| c.amount))
+    })?;
+    let operator_did = crate::runtime::with_context(bi, target_context_id, |rt| {
+        rt.outlet_registry
+            .get(outlet_registration_id)
+            .map(|r| r.operator_did.0.clone())
+            .ok_or_else(|| {
+                ScpPyError::context(format!("outlet '{outlet_registration_id}' not registered"))
+            })
+    })?;
+    let (registry, handler) = crate::runtime::with_context(bi, target_context_id, |rt| {
+        Ok((
+            rt.outlet_registry.clone(),
+            rt.outlet_handlers.get(outlet_registration_id).cloned(),
+        ))
+    })?;
+
+    // The OPERATOR (of the target outlet) signs every chunk that crosses the
+    // outer wire; the INVOKER (caller) pubkey verifies grants + cancels. Both
+    // resolved through this instance's custody (co-resident single-tenant).
+    let operator_signer: Arc<dyn StreamSigner> =
+        Arc::new(resolve_stream_signer(bi, &operator_did)?);
+    let invoker_pk = *resolve_stream_signer(bi, caller_did)?.verifying_key();
+
+    let stream_epoch = {
+        let supervisor = crate::runtime::supervisor(bi)?;
+        let rt = crate::runtime()?;
+        rt.block_on(supervisor.local_mls_epoch(target_context_id))
+            .unwrap_or(0)
+    };
+
+    let executor: Arc<dyn OutletExecutor> = Arc::new(BridgeStreamExecutor {
+        handler,
+        outlet_id: outlet_registration_id.to_owned(),
+        context_id: target_context_id.to_owned(),
+        invoker_did: caller_did.to_owned(),
+    });
+
+    // LIVE revocation view (B's per-context list) for the runtime pump's
+    // authoritative re-check timer.
+    let revocation_checker: Arc<
+        dyn scp_core::crypto::ucan::validate::RevocationChecker + Send + Sync,
+    > = Arc::new(BridgeStreamRevocationChecker {
+        states: Arc::clone(&bi.ffi_bridge_state),
+        context_id: target_context_id.to_owned(),
+    });
+
+    let identity = StreamIdentity {
+        context_id: target_context_id.to_owned(),
+        outlet_id: outlet_registration_id.to_owned(),
+        stream_epoch,
+        caveats_binding,
+    };
+
+    // The caps + the four timing/window policy fields are SERVER POLICY: the
+    // saga's `open_outlet_stream_phase1` OVERWRITES them AUTHORITATIVELY from the
+    // TARGET context's `ContextParams` (§5.4.5 / SCP-OUT-034), so the values here
+    // are placeholders the runtime discards — identical to the same-context open.
+    let params = OpenStreamParams {
+        identity,
+        caps: AdmissionCaps {
+            per_invoker: 0,
+            per_origin_invoker: 0,
+            per_outlet: 0,
+        },
+        invoker_did: caller_did.to_owned(),
+        // The immediate invoker IS the origin invoker on this co-resident open
+        // (parity with the same-context path + the saga's co-resident constraint).
+        origin_invoker_did: caller_did.to_owned(),
+        cost_per_chunk,
+        available_balance: scp_core::economy::Amount::new(0),
+        reserved_escrow: scp_core::economy::Amount::new(0),
+        declared_estimated_chunk_count: estimated_chunk_count,
+        credit_window: 0,
+        caveats: caveats.clone(),
+        invoker_pk,
+        operator_signer,
+        stream_credit_stall_secs: 0,
+        stream_cancel_ack_secs: 0,
+        stream_ucan_recheck_secs: 0,
+        ucan_cid: ucan_cid.clone(),
+        request_id,
+        revocation_checker,
+        economic_policy_snapshot: None,
+    };
+
+    // §7.3.8 value-caveat binding — `Some` iff the token carries caveats (do NOT
+    // pass `None` when caveats are present: that would drop the per-edge narrow +
+    // counter reservation the pump enforces). `ucan_cid` present iff caveats are,
+    // by construction.
+    let value_caveat_binding = if has_caveats {
+        Some(scp_core::context::outlets::InvocationCaveatBinding { caveats, ucan_cid })
+    } else {
+        None
+    };
+
+    // ----- (d) signing keys: each co-resident context's Active Signing Key ----
+    let target_signing_key = crate::outlets::resolve_context_signing_key(bi, target_context_id)?;
+    let caller_signing_key = crate::outlets::resolve_context_signing_key(bi, caller_context_id)?;
+
+    // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
+    let caller_context_bytes = scp_core::context::state::context_id_to_bytes(caller_context_id);
+    let target_context_bytes = scp_core::context::state::context_id_to_bytes(target_context_id);
+
+    let outlet_id_typed: scp_core::context::outlets::OutletId = outlet_registration_id.to_owned();
+    let caller_did_typed: scp_did::DID = caller_did.to_owned().into();
+
+    // ----- (f) drive the saga to the Commit-transition ------------------------
+    //
+    // `block_on` resolves at the Commit-transition (AC1) — the seal task is
+    // SPAWNED, so this returns the receiver PROMPTLY, before the stream drains.
+    // PyO3 calls are sync and the Python SDK wrapper invokes us off
+    // `asyncio.to_thread`, so we are not inside a tokio context (matches the
+    // unary saga export).
+    let supervisor = crate::runtime::supervisor(bi)?.clone();
+    let rt = crate::runtime()?;
+    let handle = rt
+        .block_on(async {
+            supervisor
+                .start_cross_context_streaming_outlet_invocation_saga(
+                    caller_context_bytes,
+                    target_context_bytes,
+                    caller_did_typed,
+                    outlet_registration_id.to_owned(),
+                    ucan_proof_id,
+                    &registry,
+                    &outlet_id_typed,
+                    input_json,
+                    chain_depth,
+                    asserted_nonce,
+                    timestamp_ms,
+                    timeout_ms,
+                    executor,
+                    value_caveat_binding,
+                    scp_core::context::supervisor::SagaSigningKeys {
+                        target: &target_signing_key,
+                        caller: &caller_signing_key,
+                    },
+                    params,
+                )
+                .await
+        })
+        .map_err(crate::outlets::map_saga_error)?;
+
+    // ----- (g) register the promptly-returned receiver ------------------------
+    //
+    // Destructured by field (the fields are `pub`) so the runtime type need not
+    // be named. The registry key is the durable `saga_id` string.
+    let saga_id = handle.saga_id;
+    let receiver = handle.receiver;
+    let handle_id = saga_id.0.clone();
+    bi.outlet_streaming_saga_registry.insert(
+        handle_id.clone(),
+        scp_ffi_common::streaming_saga::StreamingSagaEntry {
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            saga_id,
+            target_context_id: target_context_id.to_owned(),
+            invoker_did: caller_did.to_owned(),
+            request_id,
+        },
+    );
+    Ok(handle_id)
+}
+
+/// Drains one chunk from a live cross-context streaming saga, blocking on the
+/// global runtime until a chunk arrives or the stream closes. Returns the
+/// JSON-serialized [`OutletStreamChunk`] bytes (A's plaintext operator-signed
+/// chunk, forwarded verbatim), or `None` at the channel-closed sentinel.
+///
+/// Mirrors [`outlet_stream_poll_next_impl`]: the GIL is RELEASED across the
+/// blocking `recv()` (the seal task runs the Python outlet handler, which
+/// reacquires the GIL to produce the chunk this call awaits — holding the GIL
+/// here would deadlock), an unknown/evicted saga id is a DISTINCT
+/// [`no_active_saga_err`] (never `None`), and a terminal chunk EVICTS the entry
+/// so a run-to-terminal caller cannot leak it.
+///
+/// The chunk is A's plaintext operator-signed frame. A downstream SDK consumer
+/// composes this with the EXISTING A-context messaging to re-seal it for A's
+/// other members (§5.4.5:568); no new primitive is introduced here.
+///
+/// Takes NO `caller_did`: the receiver is a single-consumer channel handed to
+/// the opener at the Commit-transition, so possession of the `saga_id` handle IS
+/// the read capability — there is no per-poll principal to re-authorize (mirrors
+/// the same-context [`outlet_stream_poll_next_impl`]).
+fn outlet_streaming_saga_poll_next_impl(
+    py: Python<'_>,
+    bi: &PyBridgeInstance,
+    saga_id: &str,
+) -> PyResult<Option<Vec<u8>>> {
+    // Clone the receiver `Arc` OUT of the DashMap shard guard BEFORE the blocking
+    // recv — never hold a DashMap ref across the `.await`.
+    let receiver = {
+        let Some(entry) = bi.outlet_streaming_saga_registry.get(saga_id) else {
+            return Err(no_active_saga_err(saga_id).into());
+        };
+        Arc::clone(&entry.receiver)
+    };
+    let rt = crate::runtime()?;
+    // Release the GIL across the blocking recv (see the deadlock note above).
+    let chunk = py.allow_threads(|| rt.block_on(async { receiver.lock().await.recv().await }));
+    if let Some(chunk) = chunk {
+        let (bytes, terminal) = scp_ffi_common::streaming_saga::serialize_saga_chunk(&chunk)
+            .map_err(|e| {
+                ScpPyError::context(format!("failed to serialize saga stream chunk: {e}"))
+            })?;
+        if terminal {
+            bi.outlet_streaming_saga_registry.remove(saga_id);
+        }
+        Ok(Some(bytes))
+    } else {
+        // Abnormal terminal: the seal task dropped the sender without a terminal
+        // chunk. Evict so the receiver + entry drop.
+        bi.outlet_streaming_saga_registry.remove(saga_id);
+        Ok(None)
+    }
+}
+
+// NO live control plane for the cross-context saga stream. Unlike the
+// same-context surface (which has `grant_credit` / `cancel` / `terminate`), the
+// cross-context saga stream has NO live mid-stream grant/cancel channel: per
+// §6.2.5 / SCP-OUT-046 the cross-context stream runs with
+// `cancel_ack_ceiling = u64::MAX` and no live-cancel is specced. If/when a live
+// mid-stream `OutletCancel` channel is specced for the cross-context path,
+// SCP-OUT-047 owns adding the corresponding control-plane exports here; until
+// then the only lifecycle operations are open → poll → (crash-recovery) recover.
+
+/// Key-bearing crash-recovery truncated-close for a cross-context streaming saga
+/// (SCP-OUT-046 #136 AC7). The FFI-reconnect surface that AUTHENTICATES the
+/// caller and supplies the TARGET's Active Signing Key to
+/// [`Supervisor::recover_streaming_saga_truncated_close`](scp_core::context::supervisor::Supervisor::recover_streaming_saga_truncated_close)
+/// via the shared [`drive_recover_truncated_close`](scp_ffi_common::streaming_saga::drive_recover_truncated_close)
+/// driver. Seals B's durable prefix and resolves the saga `Committed` WITHOUT
+/// re-opening the stream or re-invoking the executor.
+///
+/// Auth (TWO gates, both required):
+///   1. `caller_did` MUST be an identity THIS bridge instance hosts (the
+///      co-resident channel-authenticated principal, §6.2.4) — the reconnect leg
+///      is not a free envelope assertion.
+///   2. `caller_did` MUST equal the `invoker_did` pinned at open (CRITICAL #1).
+///      Recovery is MONEY-MOVING — it bills the invoker / credits the operator
+///      over B's durable prefix and marks the saga `Committed` — so it carries
+///      the SAME invoker gate as the same-context `grant_credit` / `cancel` /
+///      `terminate` siblings (reject `SCP-PERM-3001`). The hosted-identity check
+///      ALONE would let ANY co-resident identity settle a stranger's saga.
+///
+/// The Active Signing Key is resolved PER-CALL from the target context's custody
+/// (the runtime holds none autonomously, ADR-006) — NEVER envelope-asserted, and
+/// never resolved before BOTH gates pass. On success the registry entry is
+/// EVICTED (the saga is now Committed; a second recover surfaces "no active saga"
+/// rather than re-driving the settle).
+fn outlet_streaming_saga_recover_truncated_close_impl(
+    bi: &PyBridgeInstance,
+    saga_id: &str,
+    caller_did: &str,
+) -> PyResult<()> {
+    validate::validate_did(caller_did)?;
+
+    // Authenticate the reconnect caller: it MUST be an identity hosted by this
+    // bridge instance (the co-resident channel-authenticated principal, §6.2.4).
+    if !crate::runtime::identity_registry_contains(bi, caller_did) {
+        return Err(ScpPyError::context(format!(
+            "caller_did '{caller_did}' is not an identity hosted by this bridge instance — the \
+             streaming-saga reconnect recovery caller MUST be the channel-authenticated principal \
+             (§6.2.4 Caller authentication), not an envelope-asserted value"
+        ))
+        .into());
+    }
+
+    // Look up the live saga entry for the durable `saga_id`, pinning its target
+    // context (whose Active Signing Key seals the receipt), the `SagaId`, and the
+    // `invoker_did` pinned at open.
+    let (saga_id_typed, target_context_id, invoker_did) = {
+        let Some(entry) = bi.outlet_streaming_saga_registry.get(saga_id) else {
+            return Err(no_active_saga_err(saga_id).into());
+        };
+        (
+            entry.saga_id.clone(),
+            entry.target_context_id.clone(),
+            entry.invoker_did.clone(),
+        )
+    };
+
+    // CRITICAL #1: recovery is MONEY-MOVING (bills the invoker / credits the
+    // operator over B's durable prefix, marks the saga `Committed`), so ONLY the
+    // invoker pinned at open may drive it — the SAME `SCP-PERM-3001` gate the
+    // same-context grant/cancel/terminate siblings enforce. Rejected BEFORE the
+    // signing key is resolved or the recovery driver runs, so a non-invoker
+    // never triggers a settle.
+    if caller_did != invoker_did {
+        return Err(caller_not_invoker_err(caller_did, &invoker_did).into());
+    }
+
+    // Resolve the TARGET context's Active Signing Key per-call from custody
+    // (never envelope-asserted) and seal via the shared recovery driver.
+    let target_key = crate::outlets::resolve_context_signing_key(bi, &target_context_id)?;
+    let signing_key =
+        scp_core::context::actor::commands::SigningKeyBytes::from_signing_key(&target_key);
+    let supervisor = crate::runtime::supervisor(bi)?.clone();
+    let rt = crate::runtime()?;
+    rt.block_on(async {
+        scp_ffi_common::streaming_saga::drive_recover_truncated_close(
+            &supervisor,
+            saga_id_typed,
+            &target_context_id,
+            signing_key,
+        )
+        .await
+    })
+    .map_err(crate::outlets::map_saga_error)?;
+
+    // Evict on SUCCESS (MUST FIX #2): the saga is now `Committed` and its prefix
+    // sealed. Without this the entry would self-clean only on the next
+    // `poll_next` (a bounded leak), and a stale second recover would re-drive the
+    // settle — after eviction it surfaces "no active saga" instead.
+    bi.outlet_streaming_saga_registry.remove(saga_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // PyScp methods
 // ---------------------------------------------------------------------------
 
@@ -1281,6 +1761,154 @@ impl crate::scp::PyScp {
             estimated_chunk_count,
             effective_caveats_jcs,
         )
+    }
+
+    /// Opens a §5.4.5 / §6.2.4 CROSS-CONTEXT streaming outlet invocation as a
+    /// saga (SCP-OUT-047), returning the durable `saga_id` PROMPTLY (the
+    /// Commit-transition — NOT a block-until-terminal; the seal pumps
+    /// off-mailbox). Drive the stream via `outlet_streaming_saga_poll_next` with
+    /// the returned `saga_id`.
+    ///
+    /// The invocation UCAN is validated ONCE at open via the full 11-step
+    /// ADR-016 pipeline against the TARGET context B. `caller_did` is bound to
+    /// this bridge instance's channel-authenticated principal (§6.2.4) and must
+    /// be a member of `caller_context_id` — a mismatch raises `SagaAbortedError`
+    /// BEFORE the saga runs, so the receiver is never handed out.
+    ///
+    /// # Errors
+    ///
+    /// Raises `SagaAbortedError` (SCP-SAGA-13050) if the caller-principal
+    /// binding fails; `UcanError` if authorization fails; a saga terminal error
+    /// (`SagaAbortedError` / `SagaNeedsRepairError` / `SagaBusyError`) if the
+    /// Prepare/Commit-transition is rejected; `ValidationError` if an
+    /// id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
+    #[pyo3(name = "outlet_streaming_saga_open")]
+    #[pyo3(signature = (
+        caller_context_id, target_context_id, caller_did, outlet_registration_id,
+        input, asserted_nonce_hex, timestamp_ms, chain_depth, ucan_token,
+        proof_tokens=None, ucan_proof_id=None, timeout_ms=None,
+        estimated_chunk_count=None,
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    pub fn outlet_streaming_saga_open(
+        &self,
+        caller_context_id: &str,
+        target_context_id: &str,
+        caller_did: &str,
+        outlet_registration_id: &str,
+        input: &Bound<'_, pyo3::types::PyDict>,
+        asserted_nonce_hex: &str,
+        timestamp_ms: u64,
+        chain_depth: u8,
+        ucan_token: &str,
+        proof_tokens: Option<Vec<String>>,
+        ucan_proof_id: Option<String>,
+        timeout_ms: Option<u32>,
+        estimated_chunk_count: Option<u32>,
+    ) -> PyResult<String> {
+        outlet_streaming_saga_open_impl(
+            &self.inner,
+            caller_context_id,
+            target_context_id,
+            caller_did,
+            outlet_registration_id,
+            input,
+            asserted_nonce_hex,
+            timestamp_ms,
+            chain_depth,
+            ucan_token,
+            proof_tokens,
+            ucan_proof_id,
+            timeout_ms,
+            estimated_chunk_count,
+        )
+    }
+
+    /// Drains one chunk from a live cross-context streaming saga, blocking until
+    /// a chunk arrives or the stream closes. Returns the JSON-serialized
+    /// `OutletStreamChunk` bytes (A's plaintext operator-signed frame), or
+    /// `None` at the terminal (which evicts the saga stream).
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` for an unknown/evicted `saga_id` (DISTINCT from a
+    /// clean terminal, which returns `None`) or if chunk serialization fails.
+    #[pyo3(name = "outlet_streaming_saga_poll_next")]
+    pub fn outlet_streaming_saga_poll_next(
+        &self,
+        py: Python<'_>,
+        saga_id: &str,
+    ) -> PyResult<Option<Vec<u8>>> {
+        outlet_streaming_saga_poll_next_impl(py, &self.inner, saga_id)
+    }
+
+    /// Key-bearing crash-recovery truncated-close for a cross-context streaming
+    /// saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the TARGET
+    /// context's Active Signing Key (resolved per-call from custody) and resolves
+    /// the saga `Committed` WITHOUT re-opening the stream or re-invoking the
+    /// executor. `caller_did` must be an identity hosted by this bridge instance
+    /// (§6.2.4 channel-auth) AND the invoker pinned at open (CRITICAL #1 —
+    /// recovery is money-moving). On success the saga registry entry is evicted.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if `caller_did` is not hosted by this instance or
+    /// the `saga_id` is unknown; `ContextError` with `SCP-PERM-3001` if
+    /// `caller_did` is hosted but is not the pinned invoker; a saga terminal
+    /// error (`SagaNeedsRepairError`) if the seal cannot complete (the saga stays
+    /// unresolved for a later retry).
+    #[pyo3(name = "outlet_streaming_saga_recover_truncated_close")]
+    pub fn outlet_streaming_saga_recover_truncated_close(
+        &self,
+        saga_id: &str,
+        caller_did: &str,
+    ) -> PyResult<()> {
+        outlet_streaming_saga_recover_truncated_close_impl(&self.inner, saga_id, caller_did)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only registry seam (SCP-OUT-047 review — recover invoker gate)
+// ---------------------------------------------------------------------------
+
+/// TEST-ONLY helpers on [`PyScp`](crate::scp::PyScp). NOT a `#[pymethods]` block,
+/// so nothing here is exported to Python or counted by the bridge-symmetry gate.
+/// Gated on the same test/testing features as `PyScp::new_in_memory_for_test`.
+#[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+impl crate::scp::PyScp {
+    /// Injects a live cross-context streaming-saga registry entry pinned to
+    /// `invoker_did`, so the recover invoker-gate (CRITICAL #1) can be exercised
+    /// without driving a full committed cross-context saga (whose
+    /// actor-state/budget injection has no bridge-public wiring — same rationale
+    /// as the unary-saga bridge tests). The receiver's sender is dropped
+    /// immediately (recover never polls it).
+    pub fn insert_test_streaming_saga_entry(
+        &self,
+        saga_id: &str,
+        target_context_id: &str,
+        invoker_did: &str,
+    ) {
+        let (_tx, rx) = mpsc::channel(1);
+        self.inner.outlet_streaming_saga_registry.insert(
+            saga_id.to_owned(),
+            scp_ffi_common::streaming_saga::StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: target_context_id.to_owned(),
+                invoker_did: invoker_did.to_owned(),
+                request_id: [0u8; 16],
+            },
+        );
+    }
+
+    /// TEST-ONLY: reports whether a streaming-saga registry entry for `saga_id`
+    /// is still present — lets a test assert the recover invoker-gate rejection
+    /// did NOT evict a stranger's saga (and that a successful recover DOES evict).
+    #[must_use]
+    pub fn test_streaming_saga_entry_present(&self, saga_id: &str) -> bool {
+        self.inner
+            .outlet_streaming_saga_registry
+            .contains_key(saga_id)
     }
 }
 

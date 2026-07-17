@@ -1788,6 +1788,271 @@ fn xctx_saga_malformed_nonce_rejected_fail_closed() {
     });
 }
 
+// ============================================================================
+// Cross-context STREAMING saga (§5.4.5 / §6.2.4, SCP-OUT-047) — PyO3 export
+// ============================================================================
+//
+// These tests exercise what the PyO3 streaming-saga bridge ADDS on top of the
+// supervisor producer (`start_cross_context_streaming_outlet_invocation_saga` /
+// `recover_streaming_saga_truncated_close`), whose full non-blocking-open,
+// paid-drive, and key-bearing crash-recovery paths are covered in the
+// `crates/scp-runtime` integration tests (the full Committed / truncated-close
+// paths need the actor-state interface + budget injection those tests apply
+// directly, which has no bridge-public wiring — identical to the unary saga
+// export above). At the bridge layer the export's own responsibilities are:
+//
+//   - the §6.2.4 caller-principal binding on the OPEN (caller_did MUST be hosted
+//     by this bridge instance AND a member of caller_context_id) — rejected
+//     BEFORE the saga runs, so the receiver is NEVER handed out;
+//   - the RECOVER reconnect-caller authentication (caller_did MUST be hosted)
+//     and the "no active saga" lookup miss.
+
+/// A placeholder invocation-UCAN JWT. The streaming-saga caller-principal
+/// rejection test fails at the §6.2.4 caller-binding step (b) — BEFORE the UCAN
+/// is validated (step c) — so the token only needs to pass the non-empty /
+/// no-control-char input check at step (a).
+fn placeholder_streaming_ucan() -> String {
+    "eyJhbGciOiJFZERTQSJ9.eyJ0ZXN0Ijp0cnVlfQ.placeholder-not-validated".to_owned()
+}
+
+/// SCP-OUT-047 (a): the cross-context STREAMING saga open applies the SAME
+/// §6.2.4 caller-principal binding as the unary saga — a `caller_did` this
+/// bridge instance does NOT host is rejected with `SagaAbortedError`
+/// (SCP-SAGA-13050) BEFORE the saga runs. The open returns an ERROR, not a
+/// saga-id handle, so the receiver is NEVER handed out.
+#[test]
+fn xctx_streaming_saga_unhosted_caller_rejected_before_saga() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        let owner = create_test_identity(bi);
+        let caller_ctx = random_64hex_context_id();
+        let target_ctx = random_64hex_context_id();
+        create_test_context_with_id(bi, &owner, &caller_ctx);
+        create_test_context_with_id(bi, &owner, &target_ctx);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
+
+        // A syntactically valid DID never created on this instance.
+        let unhosted_caller = "did:dht:z6MkUnhostedStreamingCaller01";
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        let err = scp
+            .outlet_streaming_saga_open(
+                &caller_ctx,
+                &target_ctx,
+                unhosted_caller,
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                &placeholder_streaming_ucan(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("an unhosted caller_did must be rejected before the streaming saga runs");
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::SagaAbortedError>(py),
+            "expected SagaAbortedError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-SAGA-13050"),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        assert!(
+            msg.contains("not an identity hosted by this bridge"),
+            "message must name the hosted-principal mismatch, got: {msg}"
+        );
+    });
+}
+
+/// SCP-OUT-047 (b): a `caller_did` that IS hosted by this bridge but is NOT a
+/// member of `caller_context_id` is rejected with `SagaAbortedError`
+/// (SCP-SAGA-13050) BEFORE the streaming saga runs (the membership axis of the
+/// §6.2.4 caller-principal binding).
+#[test]
+fn xctx_streaming_saga_hosted_non_member_caller_rejected() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        let owner = create_test_identity(bi);
+        // A SECOND hosted identity that is NOT a member of caller_ctx.
+        let stranger = create_test_identity(bi);
+        let caller_ctx = random_64hex_context_id();
+        let target_ctx = random_64hex_context_id();
+        create_test_context_with_id(bi, &owner, &caller_ctx);
+        create_test_context_with_id(bi, &owner, &target_ctx);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        let err = scp
+            .outlet_streaming_saga_open(
+                &caller_ctx,
+                &target_ctx,
+                &stranger, // hosted, but not a member of caller_ctx
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                &placeholder_streaming_ucan(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err(
+                "a hosted non-member caller must be rejected before the streaming saga runs",
+            );
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::SagaAbortedError>(py),
+            "expected SagaAbortedError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-SAGA-13050"),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        // The bridge-unique axis-b substring (the producer never emits this
+        // exact phrasing), so the test fails closed if the membership axis is
+        // removed from the bridge.
+        assert!(
+            msg.contains("is hosted by this bridge but is not a member of"),
+            "message must be the BRIDGE axis-b membership rejection, got: {msg}"
+        );
+    });
+}
+
+/// SCP-OUT-047: the streaming-saga RECOVER (key-bearing truncated-close)
+/// authenticates the reconnect caller — a `caller_did` this bridge instance does
+/// NOT host is rejected with a typed `ContextError` before any seal is attempted
+/// (§6.2.4 channel-auth). No signing key is ever resolved for an unhosted caller.
+#[test]
+fn xctx_streaming_saga_recover_unhosted_caller_rejected() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+
+        let unhosted_caller = "did:dht:z6MkUnhostedStreamingRecover1";
+        let err = scp
+            .outlet_streaming_saga_recover_truncated_close("any-saga-id", unhosted_caller)
+            .expect_err("an unhosted caller_did must be rejected by streaming-saga recover");
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::ContextError>(py),
+            "expected ContextError, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("not an identity hosted by this bridge instance"),
+            "message must name the channel-auth mismatch, got: {err}"
+        );
+    });
+}
+
+/// SCP-OUT-047: the streaming-saga RECOVER surfaces a DISTINCT "no active saga"
+/// rejection for an unknown/evicted saga id (after the reconnect caller is
+/// authenticated) — a typo'd or stale handle must not masquerade as a clean
+/// close.
+#[test]
+fn xctx_streaming_saga_recover_unknown_saga_rejected() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        // A genuinely hosted identity, so recover passes the channel-auth gate
+        // and reaches the registry lookup.
+        let hosted = create_test_identity(bi);
+        let err = scp
+            .outlet_streaming_saga_recover_truncated_close("unknown-saga-id-0001", &hosted)
+            .expect_err("an unknown saga id must be rejected by streaming-saga recover");
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::ContextError>(py),
+            "expected ContextError, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("no active cross-context streaming saga"),
+            "message must name the unknown-saga lookup miss, got: {err}"
+        );
+    });
+}
+
+/// SCP-OUT-047 (SECURITY — review MUST FIX #1): the streaming-saga RECOVER is
+/// MONEY-MOVING (it bills the invoker / credits the operator over the target's
+/// durable prefix and marks the saga `Committed`). A `caller_did` that IS hosted
+/// by this bridge instance but is NOT the invoker pinned at open is rejected with
+/// `SCP-PERM-3001` — the SAME invoker gate the same-context grant/cancel/terminate
+/// siblings enforce — BEFORE any signing key is resolved or seal is driven, and
+/// the (stranger's) saga entry is LEFT INTACT (no settle, not evicted). Without
+/// this gate the earlier "any hosted identity" check would let any co-resident
+/// identity settle a stranger's saga.
+#[test]
+fn xctx_streaming_saga_recover_hosted_non_invoker_rejected() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        // The invoker who "opened" the saga, and a DIFFERENT hosted identity.
+        let invoker = create_test_identity(bi);
+        let stranger = create_test_identity(bi);
+        let target_ctx = random_64hex_context_id();
+        create_test_context_with_id(bi, &invoker, &target_ctx);
+
+        // Inject a live saga entry pinned to `invoker`. The full committed path
+        // needs actor-state/budget injection that has no bridge-public wiring
+        // (identical to the unary-saga bridge tests), so the invoker gate is
+        // exercised against a directly-seeded registry entry.
+        let saga_id = "saga-out047-invoker-gate-0001";
+        scp.insert_test_streaming_saga_entry(saga_id, &target_ctx, &invoker);
+
+        // A hosted-but-not-invoker caller clears the channel-auth gate, reaches
+        // the invoker check, and is rejected there.
+        let err = scp
+            .outlet_streaming_saga_recover_truncated_close(saga_id, &stranger)
+            .expect_err("a hosted non-invoker caller must be rejected by streaming-saga recover");
+
+        assert!(
+            err.is_instance_of::<_scp_core::error::ContextError>(py),
+            "expected ContextError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-PERM-3001"),
+            "expected the invoker-gate SCP-PERM-3001, got: {msg}"
+        );
+        assert!(
+            msg.contains("is not the invoker"),
+            "message must name the pinned-invoker mismatch, got: {msg}"
+        );
+        // No settle: the rejection is BEFORE the recovery driver and does NOT
+        // evict — the invoker's saga entry survives for the legitimate invoker to
+        // recover later.
+        assert!(
+            scp.test_streaming_saga_entry_present(saga_id),
+            "a rejected non-invoker recover must NOT evict the invoker's saga entry"
+        );
+    });
+}
+
 /// Reads a `PyContextHandle`'s `context_id` through its Python getter. The
 /// bridge's `context_create` generates the id internally and the Rust-level
 /// getter is `#[pymethods]`-private, so the id is read the same way a Python

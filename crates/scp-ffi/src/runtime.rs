@@ -471,6 +471,24 @@ pub struct PyBridgeInstance {
     /// terminal (channel-closed) sentinel.
     pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
 
+    /// Per-instance active cross-context streaming-saga registry (§5.4.5,
+    /// SCP-OUT-047).
+    ///
+    /// Maps a saga id (the durable `SagaId` string minted at the
+    /// Commit-transition) to the live
+    /// [`StreamingSagaEntry`](scp_ffi_common::streaming_saga::StreamingSagaEntry)
+    /// that owns A's plaintext operator-signed chunk receiver (handed out
+    /// PROMPTLY at Commit, AC1) plus the pinned target-context id / invoker DID /
+    /// `request_id` a truncated-close recovery keys on. Per-INSTANCE (not a
+    /// process-global) so handle-affinity and no-bridge-globals hold — a saga
+    /// opened on one bridge instance is invisible to another, and instance
+    /// shutdown drops every live saga stream with the `Arc`. Entries are evicted
+    /// when `poll_next` observes the terminal (channel-closed) sentinel. DISTINCT
+    /// from `outlet_stream_registry` (same-context streams) so the two surfaces
+    /// never collide on a handle id.
+    pub(crate) outlet_streaming_saga_registry:
+        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+
     /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
     ///
     /// Migrated from a process-global
@@ -496,6 +514,7 @@ impl PyBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             connected_relay_url: RwLock::new(None),
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
@@ -537,6 +556,7 @@ impl PyBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             connected_relay_url: RwLock::new(None),
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
@@ -626,6 +646,7 @@ impl PyBridgeInstance {
                     mcp_client_registry: Arc::new(DashMap::new()),
                     connected_relay_url: RwLock::new(None),
                     outlet_stream_registry: Arc::new(DashMap::new()),
+                    outlet_streaming_saga_registry: Arc::new(DashMap::new()),
                     #[cfg(feature = "testing")]
                     network: std::sync::Mutex::new(None),
                 };
@@ -786,6 +807,11 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // dropping the receiver closes the channel and lets the off-mailbox
         // pump observe the close and settle out during instance shutdown.
         self.outlet_stream_registry.clear();
+        // Clear the cross-context streaming-saga registry so every live saga
+        // stream's chunk receiver drops — dropping the receiver closes the
+        // channel and lets the off-mailbox seal task observe the close and
+        // settle out during instance shutdown (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
         // Reset lifecycle-owned typed slots so their held URLs / networks
         // do not survive past shutdown. Best-effort: on lock poisoning
         // we swallow the error and leave the slot alone — a poisoned
