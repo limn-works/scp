@@ -27,7 +27,7 @@
  *     through the wrapper unchanged.
  *
  *  2. **Real NAPI addon.** When the platform addon is built (with
- *     `allow_in_memory_custody`), exercises the real reserve → invite → join
+ *     `testing`), exercises the real reserve → invite → join
  *     handshake: the SingleAdmin unilateral invite produces a real sealed bundle
  *     from a `reserveKeyPackage` KeyPackage (the invitee KP declares the 0xFF02
  *     context-binding extension), a malformed/garbage sealed bundle is rejected

@@ -2,7 +2,7 @@
 //!
 //! Tests the `UniFFI` bridge functions directly from Rust, validating the
 //! bridge code path without requiring Swift/Kotlin runtimes. All tests use
-//! the `allow_in_memory_custody` feature for in-memory key custody.
+//! the `testing` feature for in-memory key custody.
 //!
 //! Covers: identity lifecycle, context lifecycle, governance, broadcast,
 //! outlets, UCAN, event log, discovery, sync classification, provenance,
@@ -10,7 +10,7 @@
 //!
 //! Run:
 //! ```bash
-//! cargo test -p scp-ffi-uniffi --test e2e_bridge --features allow_in_memory_custody
+//! cargo test -p scp-ffi-uniffi --test e2e_bridge --features testing
 //! ```
 
 #![allow(

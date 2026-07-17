@@ -200,7 +200,7 @@ pub struct NapiBridgeInstance {
     /// mirroring the `PyO3` bridge. Entries hold an enum-dispatched
     /// [`NapiKeyCustody`](crate::custody::NapiKeyCustody) — the `Callback`
     /// variant in production, the `InMemory` variant only under
-    /// `allow_in_memory_custody`. Cleared on shutdown — dropping the entries
+    /// `testing`. Cleared on shutdown — dropping the entries
     /// zeroizes any retained key material via the custody provider's `Drop`.
     pub(crate) identity_registry: Arc<DashMap<String, NapiIdentityEntry>>,
 
@@ -268,8 +268,8 @@ pub struct NapiBridgeInstance {
     ///
     /// Migrated from a process-global
     /// `std::sync::Mutex<Option<FullStackNetwork>>` singleton in commit 9.
-    /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`.
-    #[cfg(feature = "allow_in_memory_custody")]
+    /// Feature-gated behind `testing` to mirror `testing.rs`.
+    #[cfg(feature = "testing")]
     pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
 
     /// Bounds concurrent compromise-recovery and custody-migration calls.
@@ -374,7 +374,7 @@ impl NapiBridgeInstance {
             durable_providers: Some(durable_providers),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store: Arc::new(
@@ -405,7 +405,7 @@ impl NapiBridgeInstance {
             durable_providers: Some(durable_providers),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store: Arc::new(
@@ -531,7 +531,7 @@ impl NapiBridgeInstance {
             durable_providers: Some(durable_providers),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store: Arc::new(
@@ -599,7 +599,7 @@ impl NapiBridgeInstance {
     }
 
     /// Returns a reference to the shared full-stack test network slot.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[must_use]
     pub const fn network(
         &self,
@@ -646,7 +646,7 @@ impl BridgeInstanceCore for NapiBridgeInstance {
     fn bridge_specific_shutdown(&self) {
         // Clear typed registries. Dropping the `Arc<NapiKeyCustody>` values
         // (callback custody in production, in-memory custody under
-        // `allow_in_memory_custody`) zeroizes any key material they hold via
+        // `testing`) zeroizes any key material they hold via
         // the custody provider's `Drop` impl (matching the behavior of the
         // previous `clear_fn` closures).
         self.ucan_registry.clear();
@@ -674,7 +674,7 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // poisoning we leave the slot alone — a poisoned mutex means
         // another thread panicked while holding it, which is a larger
         // problem than a stale `FullStackNetwork` reference.
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         if let Ok(mut net) = self.network.lock() {
             *net = None;
         }
@@ -926,7 +926,7 @@ impl HandleInstance for crate::server::NapiNodeHandle {
     }
 }
 
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 impl HandleInstance for crate::testing::NapiFullStackNode {
     fn instance_id(&self) -> u64 {
         self.instance_id
@@ -1406,11 +1406,27 @@ pub(crate) struct NapiIdentityEntry {
     /// identity. Returned by `dht.create()` / `dht.migrate_identity()` and
     /// must be presented to the next `migrate_identity` call to reveal the
     /// committed key (spec §9.7.4.1, ADR-003 §4b).
+    ///
+    /// Test-harness-only (`testing`-gated), like `pre_rotation_custody`: the
+    /// handle is only produced and consumed by the in-memory pre-rotation
+    /// nullifier flow, which is severed from every production dependency line.
+    /// On a shipped build no identity can be created, so no entry carrying this
+    /// handle is ever built (ADR-062 §Decision 6).
+    #[cfg(feature = "testing")]
     pub(crate) pre_rotation_handle: scp_platform::PreRotationKeyHandle,
     /// Cold-storage custody provider for the pre-rotation key. Held alongside
     /// the operational `custody` so that migration can hand the old handle
     /// back to the same custody instance that issued it (spec §9.7.4.1 §3:
     /// storage isolation — distinct from operational `KeyCustody`).
+    ///
+    /// Test-harness-only (`testing`-gated). The only `PreRotationCustody`
+    /// implementation is the in-memory nullifier `InMemoryPreRotationCustody`,
+    /// which is severed from every production dependency line (ADR-062 §Decision
+    /// 6). On a shipped (no-`testing`) build no identity can be created — every
+    /// production create path fails closed with `codes::IDENT_1059` before any
+    /// `NapiIdentityEntry` is built — so this field, and the type it names,
+    /// exist only under `testing`.
+    #[cfg(feature = "testing")]
     pub(crate) pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
@@ -1447,6 +1463,13 @@ pub(crate) fn identity_registry_contains(bi: &NapiBridgeInstance, did: &str) -> 
 ///
 /// Overwrites any existing entry for the same DID (idempotent — supports
 /// key rotation where the same DID gets new key material).
+///
+/// Only reached from the `testing`-gated identity-create / rotation / migration
+/// paths: a `NapiIdentityEntry` carries the `testing`-only pre-rotation state,
+/// and on a shipped build every create path fails closed before an entry is
+/// built (ADR-062 §Decision 6), so the registry is never populated in
+/// production.
+#[cfg(feature = "testing")]
 pub(crate) fn register_identity(bi: &NapiBridgeInstance, did: &str, entry: NapiIdentityEntry) {
     identity_registry(bi).insert(did.to_owned(), entry);
 }

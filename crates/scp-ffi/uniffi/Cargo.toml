@@ -17,30 +17,30 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [features]
 default = ["server"]
-# Enables the `"in_memory"` custody path in `identity_create`, which uses
-# `InMemoryKeyCustody` from `scp-platform/testing`. This stores private key
-# material in unprotected heap memory — suitable for testing, CLI, and desktop
-# contexts but NOT for production mobile builds (iOS/Android). Mobile CI MUST
-# NOT enable this feature. See GitHub issue #88 and ADR-006.
-# `scp-core/testing` (→ `scp-runtime/testing`) mirrors the NAPI bridge, where
-# `allow_in_memory_custody` pulls `dep:scp-testing` → `scp-core/testing`. It
-# makes test-only actor affordances (e.g. `Supervisor::test_insert_member`,
-# used by the member-but-unhosted axis-a saga test) available whenever this
-# feature is on, so per-test `#[cfg(feature = "allow_in_memory_custody")]`
-# gating compiles AND runs under the documented per-crate test invocation
-# (`cargo test -p scp-ffi-uniffi --features allow_in_memory_custody`).
-allow_in_memory_custody = ["scp-platform/testing", "scp-core/testing"]
 # Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
 server = ["scp-ffi-common/server", "dep:scp-node"]
-# Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
-# be enabled in production mobile builds; the parity harness (ADR-046)
-# enables it.
-testing = ["scp-core/testing", "scp-dht/testing", "scp-ffi-common/testing"]
+# Single test-harness feature (ADR-062 §Decision 6): folds in every in-memory
+# nullifier double. `scp-platform/testing` compiles `InMemoryKeyCustody`/
+# `InMemoryDeviceAttestation`/`InMemoryPreRotationCustody` (the §17.17.2 security
+# nullifiers, formerly behind the deleted custody switch) and
+# enables the `"in_memory"` custody path in `identity_create`; `scp-dht/testing`
+# makes the `InMemoryDhtClient` resolve nullifier nameable; `scp-ffi-common/testing`
+# makes the shared `FfiDhtClient::InMemory` arm nameable; `scp-core/testing`
+# (→ `scp-runtime/testing`) makes test-only actor affordances (e.g.
+# `Supervisor::test_insert_member`) available. MUST NOT be enabled in production
+# mobile builds (iOS/Android) — G1 proves `scp-platform/testing`/`scp-dht/testing`
+# never reach a shipped artifact. `cargo test -p scp-ffi-uniffi --features testing`.
+testing = [
+    "scp-core/testing",
+    "scp-dht/testing",
+    "scp-ffi-common/testing",
+    "scp-platform/testing",
+]
 # §5.4.5 streaming-outlet live-flow test seam (SCP-OUT-037, C8b). Enables
 # `Supervisor::test_grant_member_capability` — an AUTHORITY-ESCALATION primitive
-# deliberately NOT folded into `testing` (which leaks into every
-# `allow_in_memory_custody` build and would compile the custody-escape-hatch into
-# a released Swift/Kotlin SDK). Mirrors scp-ffi / scp-ffi-napi's
+# deliberately NOT folded into `testing` (which leaks into every bridge test
+# build and would compile the custody-escape-hatch into a released Swift/Kotlin
+# SDK). Mirrors scp-ffi / scp-ffi-napi's
 # `outlet-capability-test-grant`; enabled ONLY by the outlet-stream live-poll
 # test, and the seam has ZERO FFI/SDK exports.
 outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
@@ -72,8 +72,8 @@ rmp-serde = { workspace = true }
 # `scp_platform::in_memory::InMemoryStorage` adapter (ADR-062 §0), pulled via
 # `scp-ffi-common`'s `scp-platform/in-memory-storage` edge and wrapped by
 # `EncryptingAdapter` in `build_event_log_provider` (#1447 / #484). The
-# `allow_in_memory_custody` feature above adds `scp-platform/testing` for
-# dev/test/desktop builds only.
+# `testing` crate-feature above adds `scp-platform/testing` for
+# dev/test/desktop builds only (ADR-062 §Decision 6).
 scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "filesystem", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
@@ -112,15 +112,15 @@ syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
-required-features = ["allow_in_memory_custody"]
+required-features = ["testing"]
 
 # SCP-OUT-039 (§5.4.5) — replays the 7 outlet-streaming conformance vectors
 # through the UniFFI bridge's public pure-wrapper exports. Needs
-# `allow_in_memory_custody` for `Scp::new_in_memory_for_test`.
+# `testing` for `Scp::new_in_memory_for_test`.
 [[test]]
 name = "outlet_stream_vectors_real"
 path = "tests/outlet_stream_vectors_real.rs"
-required-features = ["allow_in_memory_custody"]
+required-features = ["testing"]
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build", "tokio"] }

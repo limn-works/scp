@@ -183,7 +183,7 @@ impl ReceiverSequenceTracker {
 }
 
 // ---------------------------------------------------------------------------
-// Pure tests (no bridge) — run under the binary's `allow_in_memory_custody`.
+// Pure tests (no bridge) — run under the binary's `testing`.
 // ---------------------------------------------------------------------------
 
 #[test]

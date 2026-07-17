@@ -1331,7 +1331,7 @@ export class SCP {
    * this bridge's supervisor, simulating a delivered pseudonym announcement so
    * multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
    *
-   * Only available on builds compiled with the `allow_in_memory_custody`
+   * Only available on builds compiled with the `testing`
    * feature; never present in production builds.
    */
   async contextSeedPeerPseudonym(

@@ -1939,12 +1939,12 @@ mod tests {
 
     /// All §6.2.4 cross-context-outlet saga binding tests and their pure-string /
     /// DHT / governance helpers live in this single submodule gated on
-    /// `allow_in_memory_custody`. Gating the module (rather than each item)
+    /// `testing`. Gating the module (rather than each item)
     /// covers every helper AND every future saga test added here by
     /// construction, closing the no-feature `function is never used` regression
     /// class: a saga test added without an explicit per-item `#[cfg(...)]` can
     /// no longer silently reintroduce the no-feature compile warning.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     mod xctx_saga_tests {
         use super::*;
 

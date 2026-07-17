@@ -28,7 +28,7 @@
  * which uses separate MLS group instances for Alice and Bob.
  *
  * Prerequisites:
- * - NAPI bridge compiled with `allow_in_memory_custody` feature.
+ * - NAPI bridge compiled with `testing` feature.
  * - Platform-specific `@limn-works/scp-ts-napi-*` package loadable.
  *
  * If the native addon is not available, all tests are skipped gracefully.

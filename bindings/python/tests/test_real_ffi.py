@@ -5,7 +5,7 @@ A-grade: All tests run through a real in-process relay (RelayTransportProvider),
 not NotConfiguredTransportProvider. The full encrypt -> sign -> relay publish
 pipeline executes for every py_context_send / py_broadcast_publish call.
 
-Requires: `maturin develop --release --features allow_in_memory_custody`
+Requires: `maturin develop --release --features testing`
 
 Run:
     source .venv/bin/activate
@@ -67,7 +67,7 @@ def session_scp() -> SCP:
     does NOT default storage — without a storage backend the supervisor
     build fails closed and every ``context_create`` raises SCP-CTX-2001.
     We therefore construct via ``SCP.with_storage({"type": "in_memory"})``
-    (the sanctioned test affordance under ``allow_in_memory_custody``) so a
+    (the sanctioned test affordance under ``testing``) so a
     storage backend is present before ``configure_relay_transport`` derives
     the supervisor's ``mls_storage`` view from it.
     """

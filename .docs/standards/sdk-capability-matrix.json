@@ -114,10 +114,10 @@
           "typescript": false,
           "kotlin": true,
           "swift": true,
-          "notes": "Only wired DeviceAttestation backend is the software InMemoryDeviceAttestation; production hardware attestation (Apple App Attest / Android Key Attestation) is unimplemented (ADR-025 stub). PyO3 and NAPI gate identity_attest_device out of production builds entirely; the UniFFI bridge exports it but its impl fails closed (SCP-IDENT-1010) in bare/production builds. Present in the Swift/Kotlin surface but always denies until ADR-025 hardware attestation lands.",
+          "notes": "The only wired DeviceAttestation backend is the test-harness software InMemoryDeviceAttestation, now #[cfg(feature = \"testing\")]-gated (ADR-062 §Decision 3/6); production hardware attestation (Apple App Attest / Android Key Attestation) is unimplemented (ADR-025 stub). On a shipped build the attestation capability is DECLINED with a typed error (spec §9:187 — a conformant scoped decline), never a silent attest-valid: the shipped PyO3, NAPI, and UniFFI attest surfaces all resolve the identity against their instance registry, then return SCP-IDENT-1015. Present in the Swift/Kotlin surface but always denies until ADR-025 hardware attestation lands.",
           "exemptions": {
-            "python": "identity_attest_device #[cfg(allow_in_memory_custody)]-gated out of production PyO3 builds; only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented)",
-            "typescript": "lives in an #[cfg(allow_in_memory_custody)]-gated #[napi] impl block, absent from production NAPI builds (ADR-025)"
+            "python": "InMemoryDeviceAttestation is #[cfg(feature = \"testing\")]-gated; on a shipped PyO3 build identity_attest_device DECLINES with a typed SCP-IDENT-1015 error (spec §9:187 attestation declined), never a silent attest-valid (ADR-025 hardware attestation unimplemented)",
+            "typescript": "InMemoryDeviceAttestation is #[cfg(feature = \"testing\")]-gated out of production NAPI builds; the shipped attestation op declines with a typed error (spec §9:187, ADR-025)"
           }
         },
         {
@@ -126,10 +126,10 @@
           "typescript": false,
           "kotlin": true,
           "swift": true,
-          "notes": "Companion verify for device attestation; same gating as attest_device. Only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented). PyO3/NAPI gate it out of production builds; UniFFI exports it but fails closed in bare builds.",
+          "notes": "Companion verify for device attestation; same classification as attest_device. The only wired backend is the test-harness software InMemoryDeviceAttestation, now #[cfg(feature = \"testing\")]-gated (ADR-062 §Decision 3/6; ADR-025 hardware attestation unimplemented). On a shipped build verification is DECLINED with a typed error (spec §9:187): the shipped PyO3, NAPI, and UniFFI verify surfaces all return SCP-IDENT-1016, never a silent verify-valid. PyO3 exposes verify as a real module-level free #[pyfunction] present in both build configs (the shipped arm declines); it is not merely an SDK-shim absence.",
           "exemptions": {
-            "python": "identity_verify_device_attestation #[cfg(allow_in_memory_custody)]-gated out of production PyO3 builds; only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented)",
-            "typescript": "lives in an #[cfg(allow_in_memory_custody)]-gated #[napi] impl block, absent from production NAPI builds (ADR-025)"
+            "python": "On a shipped PyO3 build identity_verify_device_attestation is a real module-level free #[pyfunction] (InMemoryDeviceAttestation is #[cfg(feature = \"testing\")]-gated out of its body) that DECLINES with a typed SCP-IDENT-1016 error (spec §9:187 attestation declined), never a silent verify-valid (ADR-025 hardware attestation unimplemented)",
+            "typescript": "InMemoryDeviceAttestation is #[cfg(feature = \"testing\")]-gated out of production NAPI builds; the shipped verify op declines with a typed error (spec §9:187, ADR-025)"
           }
         },
         {

@@ -3037,14 +3037,14 @@ impl crate::scp::PyScp {
     /// fan-out instead of failing closed with `SCP-CTX-2095`. Mirrors the
     /// runtime `Supervisor::seed_peer_pseudonym` test helper.
     ///
-    /// Gated behind `allow_in_memory_custody` so it never ships in production
+    /// Gated behind `testing` so it never ships in production
     /// builds.
     ///
     /// # Errors
     ///
     /// Returns `ValueError` if `pseudonym` is not exactly 32 bytes, or
     /// `RuntimeError` if the underlying supervisor call fails.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     pub fn context_seed_peer_pseudonym(
         &self,
         handle: &PyContextHandle,
@@ -6462,7 +6462,7 @@ mod tests {
     /// the malformed `enc` would instead fail deep inside the HPKE open with a
     /// different message, not the exact "expected 32" surfaced here.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_join_from_welcome_rejects_non_32_byte_enc() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
@@ -6514,7 +6514,7 @@ mod tests {
     /// gate). Were the rollback removed, the freshly-registered `FfiBridgeState`
     /// would leak beside a runtime that never committed.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn join_from_welcome_rolls_back_ffi_state_when_runtime_join_fails() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
@@ -6580,7 +6580,7 @@ mod tests {
     /// error at the precheck, with the `KeyPackage` untouched; the pre-existing
     /// entry SURVIVES the failed join.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn join_from_welcome_occupied_ffi_state_fails_before_keypackage_consumption() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
@@ -6647,7 +6647,7 @@ mod tests {
     /// fails EARLIER at signing-key resolution ("not found in registry") — the
     /// two distinct messages prove both seams are exercised, not short-circuited.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn invite_member_rejects_unknown_context_and_non_custodied_inviter() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
@@ -6716,7 +6716,7 @@ mod tests {
     /// post-commit registration removed, `known_contexts_for_member_on` would
     /// return nothing for the joiner and the assertion would fail.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn plain_join_registers_known_context_for_joiner() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
@@ -8048,7 +8048,7 @@ mod tests {
     /// membership map has multiple entries with non-deterministic iteration
     /// order, then exports and re-imports. It must round-trip deterministically.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn multi_member_context_export_round_trips_as_creator() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
@@ -8165,7 +8165,7 @@ mod tests {
     /// `get_public_key`, and `export_signing_key_bytes` are load-bearing here;
     /// the remaining methods exist solely to satisfy the provider protocol
     /// surface (`PyKeyCustodyProvider::REQUIRED_METHODS`).
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     const SIGN_ONLY_PROVIDER_PY: &std::ffi::CStr = c"
 from _scp_core_export_signer import ed25519_sign, ed25519_public_key
 
@@ -8223,7 +8223,7 @@ class SignOnlyCustody:
     /// in Rust, never surfaced to Python — exactly like a keychain), but its
     /// `export_signing_key_bytes` RAISES. Returns the signer's verifying key so
     /// the caller can verify the resulting export signature.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn install_sign_only_custody(
         py: Python<'_>,
         bi: &crate::runtime::PyBridgeInstance,
@@ -8307,7 +8307,7 @@ class SignOnlyCustody:
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn context_export_signs_via_sign_only_custody() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();

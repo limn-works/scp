@@ -69,11 +69,11 @@ CI runs clippy and tests with four feature flags that enable in-memory key custo
 
 ```bash
 cargo clippy --workspace --all-targets \
-  --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing \
+  --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing \
   -- -D warnings
 ```
 
-Production builds for iOS and Android must **never** enable `allow_in_memory_custody`.
+Production builds for iOS and Android must **never** enable `testing`.
 
 ## Lint and Format
 

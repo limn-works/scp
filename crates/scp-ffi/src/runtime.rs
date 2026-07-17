@@ -486,9 +486,9 @@ pub struct PyBridgeInstance {
     ///
     /// Migrated from a process-global
     /// `std::sync::Mutex<Option<FullStackNetwork>>` singleton in commit 9.
-    /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`
+    /// Feature-gated behind `testing` to mirror `testing.rs`
     /// which is only compiled with that feature.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
 }
 
@@ -510,7 +510,7 @@ impl PyBridgeInstance {
             ),
             connected_relay_url: RwLock::new(None),
             outlet_stream_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
     }
@@ -524,7 +524,7 @@ impl PyBridgeInstance {
     /// dev/test in-memory selection (spec §17.6), NOT a silent default —
     /// the public `SCP(config)` constructor still requires an explicit
     /// storage dict.
-    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_in_memory_for_test() -> Self {
         let instance = Self::new_py();
@@ -554,7 +554,7 @@ impl PyBridgeInstance {
             ),
             connected_relay_url: RwLock::new(None),
             outlet_stream_registry: Arc::new(DashMap::new()),
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
     }
@@ -646,7 +646,7 @@ impl PyBridgeInstance {
                     ),
                     connected_relay_url: RwLock::new(None),
                     outlet_stream_registry: Arc::new(DashMap::new()),
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    #[cfg(feature = "testing")]
                     network: std::sync::Mutex::new(None),
                 };
                 let _ = instance
@@ -735,7 +735,7 @@ impl PyBridgeInstance {
     }
 
     /// Returns a reference to the shared full-stack test network slot.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[must_use]
     pub const fn network(
         &self,
@@ -790,7 +790,7 @@ impl BridgeInstanceCore for PyBridgeInstance {
         if let Ok(mut slot) = self.connected_relay_url.write() {
             *slot = None;
         }
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         if let Ok(mut net) = self.network.lock() {
             *net = None;
         }
@@ -2013,6 +2013,13 @@ pub struct IdentityEntry {
     /// from operational `key_custody` (spec §9.7.4.1 §3). The same `Arc` is
     /// preserved across migrations (we don't mint a new custody per
     /// migration — only a new handle).
+    ///
+    /// TEST-HARNESS ONLY (`#[cfg(feature = "testing")]`, ADR-062 §Decision 6):
+    /// the only `PreRotationCustody` backend is the in-memory nullifier. On a
+    /// shipped build, identity creation FAILS CLOSED (`IDENT_1059`) before any
+    /// `IdentityEntry` is constructed, so no production entry ever carries this
+    /// field — the retained-custody + migration machinery is gated with it.
+    #[cfg(feature = "testing")]
     pub pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
@@ -2357,6 +2364,12 @@ pub fn remove_identity_if_present(bi: &PyBridgeInstance, did: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    // Test-harness key-custody nullifier: used only by the `#[cfg(feature =
+    // "testing")]` identity-registry tests below. Gated so the shipped
+    // (no-`testing`) test lane — which exists now that this module carries
+    // `#[cfg(not(feature = "testing"))]` fail-closed proofs elsewhere in the
+    // crate — does not see an unused import (ADR-062 §Decision 6 parity).
+    #[cfg(feature = "testing")]
     use scp_platform::testing::InMemoryKeyCustody;
 
     /// Helper to generate unique context IDs for parallel test isolation.
@@ -2415,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn registry_stats_reflects_identity_registration() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
@@ -2497,7 +2510,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn remove_identity_if_present_returns_true_when_found() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
@@ -2813,7 +2826,14 @@ mod tests {
     // PyBridgeInstance tests (#1549 Phase 4 PR 1)
     // -----------------------------------------------------------------------
 
+    // Gated `#[cfg(feature = "testing")]`: it constructs an `IdentityEntry` whose
+    // `custody` (`FfiKeyCustody::InMemory`) and `pre_rotation_custody`
+    // (`InMemoryPreRotationCustody`) fields are severed to the test harness only
+    // (ADR-062 §Decision 6). Without this gate the shipped (no-`testing`) test
+    // lane fails to compile — the very lane that now runs the crate's
+    // `#[cfg(not(feature = "testing"))]` fail-closed proofs.
     #[test]
+    #[cfg(feature = "testing")]
     fn test_py_bridge_instance_typed_identity_registry_roundtrip() {
         // Verify that the typed identity_registry field is wired correctly:
         // inserting an entry through the field is observable via the same

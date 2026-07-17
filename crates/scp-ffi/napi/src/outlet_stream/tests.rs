@@ -5,7 +5,7 @@
 //! - **Non-gated** — the two pure protocol wrappers round-trip, and the six
 //!   control-plane ops on an UNKNOWN handle return clean, distinct not-found
 //!   errors (never a panic, never a silent `None`).
-//! - **Live-flow** (gated `all(allow_in_memory_custody, testing,
+//! - **Live-flow** (gated `all(testing, testing,
 //!   outlet-capability-test-grant)`) — a REAL member-backed stream driven
 //!   through `poll_next` to its terminal, plus CRITICAL #1 (a non-invoker
 //!   grant → `SCP-PERM-3001`). Unlike the `PyO3` reference this needs no
@@ -176,7 +176,7 @@ async fn terminate_unknown_slug_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Live-flow (gated: allow_in_memory_custody + testing + outlet-capability-test-grant)
+// Live-flow (gated: testing + testing + outlet-capability-test-grant)
 // ---------------------------------------------------------------------------
 
 /// End-to-end §5.4.5 live-stream flow through the NAPI bridge: open a real
@@ -199,7 +199,7 @@ async fn terminate_unknown_slug_is_rejected() {
 /// this test adds is the same regardless: it proves the open path reaches
 /// `Supervisor::open_outlet_stream` and drains a genuine live pump to terminal.
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
@@ -386,7 +386,7 @@ async fn live_poll_next_drains_to_terminal() {
 /// reads from — WITHOUT depending on the process-global `SHARED_DHT_CLIENT`
 /// `OnceLock`. Mirrors the `outlets.rs` xctx-saga test's `install_seedable_resolver`.
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
@@ -409,7 +409,7 @@ fn install_seedable_resolver(
 /// the BEP44 record with the identity's retained in-memory custody. Mirrors the
 /// `outlets.rs` xctx-saga test's `seed_owner_document_into_resolver`.
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
@@ -830,7 +830,7 @@ mod streaming_vectors {
 // alongside the wire-integrity module above.
 // ---------------------------------------------------------------------------
 #[cfg(all(
-    feature = "allow_in_memory_custody",
+    feature = "testing",
     feature = "testing",
     feature = "outlet-capability-test-grant"
 ))]
@@ -853,7 +853,7 @@ mod streaming_vectors_live {
     /// member seeding, `OutletCallAll` grant, delegated UCAN), and returns the opened
     /// stream fixture. `outlet_name` disambiguates the outlet per test.
     #[cfg(all(
-        feature = "allow_in_memory_custody",
+        feature = "testing",
         feature = "testing",
         feature = "outlet-capability-test-grant"
     ))]
@@ -964,7 +964,7 @@ mod streaming_vectors_live {
     /// value equals the vector's first Data, then the framework `End` closes it. The
     /// delivered sequences are monotonic from 0.
     #[cfg(all(
-        feature = "allow_in_memory_custody",
+        feature = "testing",
         feature = "testing",
         feature = "outlet-capability-test-grant"
     ))]
@@ -1020,7 +1020,7 @@ mod streaming_vectors_live {
     /// `error_terminal` (§5.4.5): a faulting single-shot handler maps to a framework
     /// terminal `Error{terminal:true, code:"SCP-OUTLET-6130"}` (execution.handler-panic).
     #[cfg(all(
-        feature = "allow_in_memory_custody",
+        feature = "testing",
         feature = "testing",
         feature = "outlet-capability-test-grant"
     ))]
@@ -1064,7 +1064,7 @@ mod streaming_vectors_live {
     /// the real control plane drives the stream to a framework terminal; a non-invoker
     /// caller is rejected SCP-PERM-3001 (CRITICAL #1).
     #[cfg(all(
-        feature = "allow_in_memory_custody",
+        feature = "testing",
         feature = "testing",
         feature = "outlet-capability-test-grant"
     ))]

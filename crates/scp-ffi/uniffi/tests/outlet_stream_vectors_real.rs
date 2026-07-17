@@ -39,7 +39,7 @@
 //! This file adds the UniFFI bridge's own pure-wrapper wire-integrity tier and
 //! does NOT fake a live drive it cannot mechanically perform.
 
-#![cfg(feature = "allow_in_memory_custody")]
+#![cfg(feature = "testing")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

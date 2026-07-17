@@ -1710,8 +1710,8 @@ pub(crate) async fn context_close_on(
 /// this bridge's `Supervisor`, simulating a delivered `PseudonymAnnouncement`
 /// so multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
 /// Mirrors the runtime `Supervisor::seed_peer_pseudonym` test helper. Gated
-/// behind `allow_in_memory_custody` so it never ships in production builds.
-#[cfg(feature = "allow_in_memory_custody")]
+/// behind `testing` so it never ships in production builds.
+#[cfg(feature = "testing")]
 pub(crate) async fn context_seed_peer_pseudonym_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -5430,9 +5430,9 @@ fn parse_template_id_napi(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use scp_core::context::ContextParams;
-    // Consumed only by the `allow_in_memory_custody`-gated membership helper +
+    // Consumed only by the `testing`-gated membership helper +
     // test; gate the import so the bare/production test target is warning-clean.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
     // The feature-gated economy tests reference `codes::` directly (no
@@ -5441,7 +5441,7 @@ mod tests {
     // alias to its sole direct consumers so the ungated build does not see an
     // unused import.
     use scp_did::DID;
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
 
@@ -5472,9 +5472,9 @@ mod tests {
     }
 
     /// Test helper: dispatch `LifecycleCommand::JoinContext` through the
-    /// supervisor. Only the `allow_in_memory_custody`-gated membership tests
+    /// supervisor. Only the `testing`-gated membership tests
     /// call it, so it is gated to keep the bare test target warning-clean.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn test_dispatch_join_context(
         bi: &crate::runtime::NapiBridgeInstance,
         handle: &scp_core::context::ContextHandle,
@@ -5503,7 +5503,7 @@ mod tests {
     /// `build_scp_with_identity` pattern in `scp.rs` tests — a joiner whose
     /// locally-custodied identity makes the §9.10.4 pseudonym-derivation custody
     /// gate SUCCEED, so a Welcome-join test reaches the register -> spawn seam.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn register_in_memory_joiner(bi: &crate::runtime::NapiBridgeInstance) -> String {
         use crate::identity::OpaqueInMemoryKeyCustody;
         use scp_identity::DidMethod;
@@ -5545,7 +5545,7 @@ mod tests {
     /// The end-to-end reserve -> spawn happy path (which needs wired MLS
     /// providers and a real creator-minted Welcome) is covered at the runtime
     /// layer and by the cross-bridge E2E harness.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reserve_key_package_rejects_non_locally_custodied_identity() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -5574,7 +5574,7 @@ mod tests {
     /// derivation runs before either is touched, so this is not false-green: were
     /// the custody gate removed, the call would proceed past derivation and fail
     /// later for an unrelated reason, not with `SCP-IDENT-1054`.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_from_welcome_rejects_non_locally_custodied_joiner() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -5617,7 +5617,7 @@ mod tests {
     /// SUCCEEDS and control reaches the enc-length check; were that check removed,
     /// the malformed `enc` would instead fail deep inside the HPKE open with a
     /// different message, not the exact "expected 32" surfaced here.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_from_welcome_rejects_non_32_byte_enc() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -5663,7 +5663,7 @@ mod tests {
     /// empty for the context. The explicit "no `SCP-IDENT-1054`" check pins that
     /// the register -> spawn seam was actually exercised (not short-circuited at
     /// the upstream custody gate).
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn join_from_welcome_rolls_back_ffi_state_when_runtime_join_fails() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -5718,7 +5718,7 @@ mod tests {
     /// passes) against a context whose FFI state is already registered. The
     /// register-first ordering surfaces the collision as an `already registered`
     /// error at the precheck; the pre-existing entry SURVIVES the failed join.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn join_from_welcome_occupied_ffi_state_fails_before_keypackage_consumption() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -5783,7 +5783,7 @@ mod tests {
     /// inviter so it fails EARLIER at signing-key resolution ("not found in
     /// registry", `SCP-IDENT-1001`) — the two distinct messages prove both seams
     /// are exercised, not short-circuited.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invite_member_rejects_unknown_context_and_non_custodied_inviter() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -5838,9 +5838,9 @@ mod tests {
     }
 
     /// Test helper: dispatch `QueriesCommand::MemberCount` through the
-    /// supervisor. Only the `allow_in_memory_custody`-gated membership test
+    /// supervisor. Only the `testing`-gated membership test
     /// calls it, so it is gated to keep the bare test target warning-clean.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn test_dispatch_member_count(
         bi: &crate::runtime::NapiBridgeInstance,
         ctx_id: &str,
@@ -5867,7 +5867,7 @@ mod tests {
     /// cannot fabricate an `Approved`
     /// proposal or substitute an action. Used by the direct-execute
     /// trust-boundary tests.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn test_dispatch_execute_by_id(
         bi: &crate::runtime::NapiBridgeInstance,
         ctx_id: &str,
@@ -5893,7 +5893,7 @@ mod tests {
 
     /// Test helper: dispatch `QueriesCommand::ContextParams` through the
     /// supervisor.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     async fn test_dispatch_context_params(
         bi: &crate::runtime::NapiBridgeInstance,
         ctx_id: &str,
@@ -5917,14 +5917,14 @@ mod tests {
     /// count — not a hardcoded value.  After creation the count is 1 (the
     /// creator); after a join it becomes 2.
     ///
-    /// Gated on `allow_in_memory_custody`: this test wires the supervisor with a
+    /// Gated on `testing`: this test wires the supervisor with a
     /// `did:test:` MLS identity (`init_supervisor_for_test_on`) and `did:key:`
     /// member DIDs, which `MlsCryptoProvider::validate_creator_identity` only
     /// accepts under `scp-runtime`'s `testing` feature (pulled in transitively
-    /// via `allow_in_memory_custody` → `dep:scp-testing` → `scp-core/testing`).
+    /// via `testing` → `dep:scp-testing` → `scp-core/testing`).
     /// It is NOT part of the feature-free export surface; the production/bare
     /// test target must not run it.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -5959,7 +5959,7 @@ mod tests {
     /// manager paths (all three call the same decoder) and is asserted with a
     /// real `GovernanceActionExecuted` leaf in those bridges' tests and the
     /// shared decoder unit tests in `scp-event-log`.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_manager_path_omits_target_did_for_non_target_event() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6008,7 +6008,7 @@ mod tests {
     /// `testing`-gated `Supervisor::test_append_event_log`, which delegates to
     /// the supervisor-owned event-log provider's `append_event` — the same
     /// provider `event_log_entries` reads. No production wiring is touched.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_manager_path_projects_role_assigned_subject_did() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6142,7 +6142,7 @@ mod tests {
 
     /// Executing an unknown/fabricated proposal id is rejected (the engine
     /// never tracked it) — the forgery path.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_execute_rejects_untracked_proposal_id() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6172,7 +6172,7 @@ mod tests {
 
     /// A rejected direct-execute leaves context membership/role state unchanged
     /// — the forgery cannot apply a phantom action as a side effect.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_execute_rejection_does_not_mutate_state() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
@@ -6375,7 +6375,7 @@ mod tests {
     /// Verifies that `context_create` parses both `consequenceRules` and
     /// `consequenceConfig` from `params_json` and surfaces a created context
     /// whose stored `ContextParams` reflect both fields.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_threads_consequence_rules_and_config() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -6427,7 +6427,7 @@ mod tests {
     /// rule when `consequenceConfig.allow_automatic_access_revocation` is
     /// `false` (the default), proving the bridge fails closed at create
     /// time rather than deferring to runtime evaluation.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_rejects_revoke_access_when_config_disallows() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -6466,7 +6466,7 @@ mod tests {
 
     /// Verifies that `context_join` parses `spending_ucan_jwt` and rejects
     /// malformed tokens at the bridge boundary with the SCP-ECON-12061 code.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_rejects_malformed_spending_ucan_jwt() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -6508,7 +6508,7 @@ mod tests {
 
     /// Verifies that `context_join` accepts `None` `spending_ucan_jwt` and
     /// reaches the manager (the historical default behaviour stays intact).
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_accepts_none_spending_ucan_jwt() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -6555,7 +6555,7 @@ mod tests {
     /// context, a DISTINCT custodied joiner plain-joins, and the joiner's own
     /// known-context entry is asserted present. Were the post-commit registration
     /// removed, `known_contexts_for_member` would return nothing for the joiner.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plain_join_registers_known_context_for_joiner() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -6610,7 +6610,7 @@ mod tests {
     /// Asserts the creator's own known-context entry is present for each. Were
     /// the post-commit registration removed, `known_contexts_for_member` would
     /// return nothing for the creator.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_registers_known_context_for_creator() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -6858,7 +6858,7 @@ mod tests {
     /// the creator identity's `#active` verifying key, or `import_context`
     /// rejects it with `SnapshotSignatureInvalid` (SCP-CTX-2093). A passing
     /// round-trip proves the custody-`sign` closure emits a spec-valid signature.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_export_signs_via_custody_and_round_trips() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -6911,7 +6911,7 @@ mod tests {
     /// byte inside the serialized export (which lands in the signed snapshot
     /// region) MUST cause `context_import_on` to fail. This proves the signature
     /// produced via `custody.sign` is load-bearing, not decorative.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_import_rejects_tampered_custody_signed_export() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -6953,7 +6953,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Production callback-custody export sign chain (NO `allow_in_memory_custody`)
+    // Production callback-custody export sign chain (NO `testing`)
     //
     // These tests compile and run in the BARE production build. They prove the
     // un-gated §23.16.8 export sign/verify chain works for a non-in-memory,
@@ -7003,7 +7003,7 @@ mod tests {
     /// path that `context_export_on` / `context_import_on` delegate to. Proves a
     /// callback-shaped (non-exportable) signer produces a spec-valid §23.16.8
     /// signature that round-trips, and that a tampered snapshot is rejected.
-    /// Runs WITHOUT `allow_in_memory_custody`.
+    /// Runs WITHOUT `testing`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn callback_custody_export_round_trips_and_rejects_tamper_without_feature() {
         use scp_core::context::export_import::{deserialize_export, serialize_export};
@@ -7091,7 +7091,7 @@ mod tests {
     /// `in_memory_custody` is `None` (e.g. an externally loaded, DID-string-only
     /// creator) is rejected with `CTX_2040` by `resolve_napi_export_signer` —
     /// never with the old build-gate PERM-3001, and never an unsigned export.
-    /// Runs WITHOUT `allow_in_memory_custody`.
+    /// Runs WITHOUT `testing`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_export_fails_closed_without_retained_custody() {
         use super::*;
@@ -7159,7 +7159,7 @@ mod tests {
     /// stopped mapping to `SCP-IDENT-1054` (e.g. reverted to the raw
     /// `with_identity` `SCP-IDENT-1001`, or swallowed the miss to a zero
     /// pseudonym), the `.code` assertion would fail.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn derive_member_pseudonym_required_registry_miss_is_typed_1054() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());

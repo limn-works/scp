@@ -783,7 +783,7 @@ public func FfiConverterTypeContextHandle_lower(_ value: ContextHandle) -> Unsaf
  *
  * - **In-memory custody** (dev/desktop): retained `InMemoryKeyCustody`
  * with key material in heap memory. Only available when the
- * `allow_in_memory_custody` feature is enabled.
+ * `testing` feature is enabled.
  * - **Platform/Software custody** (production mobile): retained
  * `CallbackKeyCustody` adapter wrapping the injected
  * [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private
@@ -945,7 +945,7 @@ public protocol IdentityProtocol: AnyObject, Sendable {
  *
  * - **In-memory custody** (dev/desktop): retained `InMemoryKeyCustody`
  * with key material in heap memory. Only available when the
- * `allow_in_memory_custody` feature is enabled.
+ * `testing` feature is enabled.
  * - **Platform/Software custody** (production mobile): retained
  * `CallbackKeyCustody` adapter wrapping the injected
  * [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private

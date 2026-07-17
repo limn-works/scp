@@ -5,8 +5,8 @@ extension: FullStackNetwork -> E2eCryptoProvider (real MLS + sender keys) ->
 ContextManager -> CapturingTransport -> decrypt.
 
 Prerequisites:
-- The PyO3 bridge must be compiled with `allow_in_memory_custody` feature.
-  Run: `maturin develop --release --features allow_in_memory_custody`
+- The PyO3 bridge must be compiled with `testing` feature.
+  Run: `maturin develop --release --features testing`
 
 If the native extension is not available, all tests are skipped gracefully.
 
@@ -30,13 +30,13 @@ try:
 
     # The fullstack operations were migrated from flat ``py_fullstack_*``
     # module functions to ``SCP`` methods (Phase 4 PR 4 sub-slice E, #1549)
-    # and are feature-gated behind ``allow_in_memory_custody``. Probe a
+    # and are feature-gated behind ``testing``. Probe a
     # throwaway ``_scp_core.SCP`` instance for the migrated method rather than
     # the module — the free functions no longer exist.
     _probe = _scp_core.SCP({"type": "in_memory"})
     if not hasattr(_probe, "fullstack_create_node"):
         pytest.skip(
-            "fullstack methods not available — rebuild with allow_in_memory_custody feature",
+            "fullstack methods not available — rebuild with testing feature",
             allow_module_level=True,
         )
 except (ImportError, AttributeError):

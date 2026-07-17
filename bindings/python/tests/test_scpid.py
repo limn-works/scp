@@ -10,7 +10,7 @@ Phase 4 PR 5 Agent B+C (#1549) moved the free functions
 :meth:`SCP.scpid_sign` / :meth:`SCP.scpid_verify`. This test exercises
 them through the real bridge.
 
-Requires: ``maturin develop --release --features allow_in_memory_custody``
+Requires: ``maturin develop --release --features testing``
 
 Note: :meth:`SCP.scpid_verify` requires DID document resolution via a
 real or in-memory DHT. In-memory identities created through the SDK

@@ -32,7 +32,9 @@ import Foundation
 public extension JSONValue {
     /// Object-member access — `nil` for a non-object or a missing key.
     subscript(_ key: String) -> JSONValue? {
-        if case let .object(members) = self { return members[key] }
+        if case let .object(members) = self {
+            return members[key]
+        }
         return nil
     }
 
@@ -47,13 +49,17 @@ public extension JSONValue {
 
     /// The value as a `String`, or `nil` if it is not a JSON string.
     var stringValue: String? {
-        if case let .string(value) = self { return value }
+        if case let .string(value) = self {
+            return value
+        }
         return nil
     }
 
     /// The value as a `Bool`, or `nil` if it is not a JSON boolean.
     var boolValue: Bool? {
-        if case let .bool(value) = self { return value }
+        if case let .bool(value) = self {
+            return value
+        }
         return nil
     }
 }
@@ -177,8 +183,12 @@ public struct OutletStreamChunk: Sendable, Equatable {
     /// `true` for the chunk that closes the stream (`End`, or an `Error` with
     /// `terminal: true`).
     public var isTerminal: Bool {
-        if kind == "end" { return true }
-        if kind == "error" { return payload["terminal"]?.boolValue ?? false }
+        if kind == "end" {
+            return true
+        }
+        if kind == "error" {
+            return payload["terminal"]?.boolValue ?? false
+        }
         return false
     }
 
@@ -264,7 +274,9 @@ private func outletStreamHexField(_ value: JSONValue?) -> String {
         var bytes = [UInt8]()
         bytes.reserveCapacity(elements.count)
         for element in elements {
-            if let byte = element.intValue { bytes.append(UInt8(byte & 0xFF)) }
+            if let byte = element.intValue {
+                bytes.append(UInt8(byte & 0xFF))
+            }
         }
         return bytes.map { String(format: "%02x", $0) }.joined()
     default:
@@ -467,8 +479,12 @@ public actor InvocationHandle {
     /// Opens the stream exactly once (idempotent), returning the bridge handle
     /// id. Concurrent first-touches await the same open task.
     private func ensureOpen() async throws -> String {
-        if let handleId { return handleId }
-        if let openTask { return try await openTask.value }
+        if let handleId {
+            return handleId
+        }
+        if let openTask {
+            return try await openTask.value
+        }
         let bridge = self.bridge
         let params = self.params
         let task = Task<String, Error> {
@@ -503,7 +519,9 @@ public actor InvocationHandle {
     /// Drains one chunk from the shared single-consumer stream, or `nil` at the
     /// terminal. The concurrent-consumer guard and the terminal cache live here.
     func drainNext() async throws -> OutletStreamChunk? {
-        if closed { return nil }
+        if closed {
+            return nil
+        }
         if draining {
             throw OutletError.protocolViolation(
                 msg: "InvocationHandle is already being drained by another consumer; "
@@ -577,8 +595,12 @@ public actor InvocationHandle {
         while !closed {
             _ = try await drainNext()
         }
-        if let streamGapError { throw streamGapError }
-        if let terminalError { throw terminalError }
+        if let streamGapError {
+            throw streamGapError
+        }
+        if let terminalError {
+            throw terminalError
+        }
         guard let aggregateResult else {
             throw OutletError.protocolViolation(
                 msg: "outlet stream closed without an End chunk",

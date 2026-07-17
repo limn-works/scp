@@ -60,7 +60,7 @@ impl DidResolver for BridgeDidResolver {
         // test-convenience form — but ONLY when `scp-did/testing` is enabled.
         // Crucially, `scp-did/testing` is turned on TRANSITIVELY by *custody*
         // opt-ins (dep:scp-testing → scp-core/testing → scp-protocol/testing →
-        // scp-did/testing). Custody opt-ins (e.g. `allow_in_memory_custody`,
+        // scp-did/testing). Custody opt-ins (e.g. `testing`,
         // which controls where private key material may live) are an
         // ORTHOGONAL concern from "this bridge is compiled for UCAN testing".
         // If we relied solely on scp-did's gate, an in-memory-custody *source*

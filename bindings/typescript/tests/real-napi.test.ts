@@ -10,7 +10,7 @@
  * executes for every contextSend / broadcastPublish call.
  *
  * Prerequisites:
- * - The NAPI bridge must be compiled with `allow_in_memory_custody` feature.
+ * - The NAPI bridge must be compiled with `testing` feature.
  * - The platform-specific `@limn-works/scp-ts-napi-*` package must be loadable.
  *
  * If the native addon is not available, all tests are skipped gracefully.

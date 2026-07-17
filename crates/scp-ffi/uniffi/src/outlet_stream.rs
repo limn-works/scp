@@ -201,7 +201,7 @@ impl StreamSigner for BridgeCustodyStreamSigner {
 /// Resolves a custody-backed [`StreamSigner`] for a locally-hosted identity DID
 /// (its Active Signing Key), reading the per-instance identity custody registry
 /// (typed over [`UniffiKeyCustody`], so this resolves in BARE production builds
-/// over callback custody, not only `allow_in_memory_custody` builds).
+/// over callback custody, not only `testing` builds).
 ///
 /// Clones the custody `Arc` + key handle OUT of the identity-registry shard
 /// guard, then performs the (potentially slow) `public_key` export OFF the guard

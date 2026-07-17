@@ -726,7 +726,9 @@ private func validationError(_ message: String) -> ScpError {
 /// Extracts a nullable ``String`` from a JSON value (accepts ``String`` or ``NSNull``).
 private func extractNullableString(_ value: Any?, field: String) throws -> String? {
     guard let raw = value else { return nil }
-    if raw is NSNull { return nil }
+    if raw is NSNull {
+        return nil
+    }
     guard let str = raw as? String else {
         throw validationError("validation result '\(field)' has unexpected type (expected String or null)")
     }

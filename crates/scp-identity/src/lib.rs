@@ -162,6 +162,29 @@ pub enum IdentityError {
     #[error("pre-rotation custody error: {0}")]
     PreRotation(#[from] scp_platform::PreRotationCustodyError),
 
+    /// No production pre-rotation custody backend is available.
+    ///
+    /// Every identity-creation path commits a pre-rotation commitment at
+    /// creation time (spec §9.7.4.1 §3 — pre-rotation is mandatory, not
+    /// optional), which requires a [`PreRotationCustody`](scp_platform::PreRotationCustody)
+    /// backend. The only implementation that exists today is the in-memory test
+    /// nullifier (`InMemoryPreRotationCustody`), which is now gated to the test
+    /// harness only (ADR-062 §Decision 6). On a shipped (no-`testing`) build
+    /// there is no real backend, so identity creation FAILS CLOSED with this
+    /// typed error rather than silently minting the nullifier — masking a
+    /// missing production backend with a dev stand-in would ship a false
+    /// durability guarantee (CLAUDE.md builder tenet "No dev/test-only stand-ins
+    /// in production"). Absence is honest and detectable; a nullifier lies.
+    ///
+    /// A real, persistent pre-rotation backend is tracked by #1729 / RFC #2130.
+    /// Non-committing creation (Option A) is out of scope (Discussion #1553) and
+    /// would violate spec §9.7.4.1.
+    #[error(
+        "no production pre-rotation custody backend available; pre-rotation \
+         recovery custody is not yet implemented — see #1729 / RFC #2130"
+    )]
+    NoPreRotationBackend,
+
     /// The DID string has an invalid format.
     #[error("invalid DID format: {0}")]
     InvalidDidFormat(String),

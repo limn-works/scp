@@ -2543,6 +2543,10 @@ fn spawn_tier_reevaluation(
 
 /// Resolves the identity from an [`IdentitySource`], returning the identity,
 /// document, and DID method.
+///
+/// On a shipped build the `Generate` arm fails closed with no `.await`; the
+/// `async` signature is kept for the `testing` build and callers' `.await`.
+#[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
 async fn resolve_identity<K: KeyCustody, D: DidMethod>(
     source: IdentitySource<K, D>,
 ) -> Result<(ScpIdentity, DidDocument, Arc<D>), NodeError> {
@@ -2551,29 +2555,35 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             custody,
             did_method,
         } => {
-            // KNOWN LIMITATION: this path drops the `PreRotationKeyHandle`
-            // because `ApplicationNode<K, D, S, Dom, Id>`'s generic
-            // parameter list does not yet carry a `P: PreRotationCustody`
-            // slot. As a consequence, identities produced by this code
-            // path CANNOT be migrated later — the migrate flow needs both
-            // the handle and the custody instance to call
-            // `dht::migrate_identity`. The current shipped backend is
-            // `InMemoryPreRotationCustody` which is process-local
-            // anyway, so the migration capability would be lost on
-            // process restart even if we persisted the handle. Widening
-            // the builder to accept a real `PreRotationCustody` is
-            // tracked alongside the production custody backends.
-            let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
-            let (identity, document, _pre_rotation_handle) =
-                did_method.create(&*custody, &pre_rotation_custody).await?;
-            tracing::warn!(
-                did = %identity.did,
-                "identity created without a persistent PreRotationCustody — migration \
-                 (Layer-2 DID rotation) will be impossible until the builder API is \
-                 widened to accept a real backend. Recovery from `#0` compromise via \
-                 spec §9.7.4.1 is unreachable for this identity."
-            );
-            Ok((identity, document, did_method))
+            // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3), which
+            // requires a `PreRotationCustody` backend. The only implementation
+            // is the test-harness `InMemoryPreRotationCustody` nullifier.
+            #[cfg(feature = "testing")]
+            {
+                // KNOWN LIMITATION (testing builds): this path drops the
+                // `PreRotationKeyHandle` because `ApplicationNode`'s generic
+                // parameter list does not yet carry a `P: PreRotationCustody`
+                // slot, so identities produced here cannot be migrated later.
+                let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+                let (identity, document, _pre_rotation_handle) =
+                    did_method.create(&*custody, &pre_rotation_custody).await?;
+                tracing::warn!(
+                    did = %identity.did,
+                    "identity created without a persistent PreRotationCustody — migration \
+                     (Layer-2 DID rotation) will be impossible until the builder API is \
+                     widened to accept a real backend. Recovery from `#0` compromise via \
+                     spec §9.7.4.1 is unreachable for this identity."
+                );
+                Ok((identity, document, did_method))
+            }
+            #[cfg(not(feature = "testing"))]
+            {
+                // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
+                // backend exists yet (RFC #2130 / #1729). Never mint the in-memory
+                // nullifier on a shipped build — return a typed error instead.
+                let _ = (custody, did_method);
+                Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
+            }
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
         // `Node::start` normalizes `Persisted` to a `Generate` source with
@@ -2750,46 +2760,62 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
             } else {
                 // 3. Generate a new identity and persist it.
                 //
-                // Same KNOWN LIMITATION as `resolve_identity` above: the
-                // `PreRotationKeyHandle` is dropped because the builder
-                // does not yet carry a `P: PreRotationCustody` generic
-                // slot. Identities produced via this persistent path
-                // cannot migrate. With `InMemoryPreRotationCustody` as
-                // the only shipped backend, the handle would be
-                // process-local anyway and lost on restart.
-                let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
-                let (identity, document, _pre_rotation_handle) =
-                    did_method.create(&*custody, &pre_rotation_custody).await?;
-                tracing::warn!(
-                    did = %identity.did,
-                    "persisted identity created without a persistent PreRotationCustody — \
-                     migration (Layer-2 DID rotation) will be impossible after process \
-                     restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
-                     for this identity until the builder API is widened to accept a real \
-                     backend."
-                );
-                let persisted = PersistedIdentity {
-                    identity: identity.clone(),
-                    document: document.clone(),
-                };
-                let envelope = StoredValue {
-                    version: CURRENT_STORE_VERSION,
-                    data: &persisted,
-                };
-                let bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
-                    NodeError::Storage(format!("failed to serialize identity for persistence: {e}"))
-                })?;
-                storage
-                    .store(IDENTITY_STORAGE_KEY, &bytes)
-                    .await
-                    .map_err(|e| {
-                        NodeError::Storage(format!("failed to persist identity to storage: {e}"))
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
+                // which requires a `PreRotationCustody` backend. The only
+                // implementation is the test-harness `InMemoryPreRotationCustody`.
+                #[cfg(feature = "testing")]
+                {
+                    // KNOWN LIMITATION (testing builds): the `PreRotationKeyHandle`
+                    // is dropped because the builder does not yet carry a
+                    // `P: PreRotationCustody` generic slot, so identities produced
+                    // via this persistent path cannot migrate.
+                    let pre_rotation_custody =
+                        scp_platform::testing::InMemoryPreRotationCustody::new();
+                    let (identity, document, _pre_rotation_handle) =
+                        did_method.create(&*custody, &pre_rotation_custody).await?;
+                    tracing::warn!(
+                        did = %identity.did,
+                        "persisted identity created without a persistent PreRotationCustody — \
+                         migration (Layer-2 DID rotation) will be impossible after process \
+                         restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
+                         for this identity until the builder API is widened to accept a real \
+                         backend."
+                    );
+                    let persisted = PersistedIdentity {
+                        identity: identity.clone(),
+                        document: document.clone(),
+                    };
+                    let envelope = StoredValue {
+                        version: CURRENT_STORE_VERSION,
+                        data: &persisted,
+                    };
+                    let bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+                        NodeError::Storage(format!(
+                            "failed to serialize identity for persistence: {e}"
+                        ))
                     })?;
-                tracing::info!(
-                    did = %identity.did,
-                    "created and persisted new identity to storage"
-                );
-                Ok((identity, document, did_method))
+                    storage
+                        .store(IDENTITY_STORAGE_KEY, &bytes)
+                        .await
+                        .map_err(|e| {
+                            NodeError::Storage(format!(
+                                "failed to persist identity to storage: {e}"
+                            ))
+                        })?;
+                    tracing::info!(
+                        did = %identity.did,
+                        "created and persisted new identity to storage"
+                    );
+                    Ok((identity, document, did_method))
+                }
+                #[cfg(not(feature = "testing"))]
+                {
+                    // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
+                    // backend exists yet (RFC #2130 / #1729). Never mint the
+                    // in-memory nullifier on a shipped build — return a typed error.
+                    let _ = (&custody, &did_method, storage);
+                    Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
+                }
             }
         }
         // Explicit identities are never persisted — caller already manages them.
@@ -3646,6 +3672,63 @@ mod tests {
         let cache = Arc::new(DidCache::new());
         let sign_fn = TestDidDht::make_sign_fn(Arc::clone(custody));
         DidDht::with_client_and_signer(dht_client, cache, sign_fn)
+    }
+
+    /// ADR-062 §Decision 6 / SCP-CAPINJECT-006: on a shipped (no-`testing`) build
+    /// the production `Node` / self-host identity-generation path has no
+    /// pre-rotation custody backend, so it FAILS CLOSED with
+    /// [`IdentityError::NoPreRotationBackend`] (surfaced as SCP-IDENT-1059) rather
+    /// than minting the in-memory `InMemoryPreRotationCustody` nullifier.
+    ///
+    /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed behavior only
+    /// holds when the nullifier is severed. `resolve_identity`'s `Generate` arm
+    /// mints under `feature = "testing"`; with the feature off (this crate's
+    /// standalone `cargo test -p scp-node` build) it returns the typed error. The
+    /// test constructs its `Generate` inputs via the dev-dependency in-memory
+    /// custody/DHT (available under `test` cfg) — but the fail-closed arm is
+    /// selected by the FEATURE, not `test` cfg, so the assertion is real.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn pre_rotation_severance_generate_fails_closed() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        let source = IdentitySource::Generate {
+            custody,
+            did_method,
+        };
+        // The Ok type contains `Arc<DidDht<..>>` which is not `Debug`, so match
+        // explicitly rather than `expect_err`.
+        match resolve_identity(source).await {
+            Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
+            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Ok(_) => panic!(
+                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                 pre-rotation nullifier was minted on a shipped-config create path!"
+            ),
+        }
+    }
+
+    /// Companion to the above for the persisting create path
+    /// (`resolve_identity_persistent`'s generate branch): it likewise funnels
+    /// through the pre-rotation commitment and fails closed on a shipped build.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn pre_rotation_severance_persistent_fails_closed() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        let source = IdentitySource::Generate {
+            custody,
+            did_method,
+        };
+        let storage = InMemoryStorage::new();
+        match resolve_identity_persistent(source, true, &storage).await {
+            Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
+            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Ok(_) => panic!(
+                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                 pre-rotation nullifier was minted on a shipped-config persist create path!"
+            ),
+        }
     }
 
     /// Mock TLS provider that succeeds with a self-signed certificate.

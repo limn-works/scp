@@ -80,10 +80,10 @@ pub mod validate;
 #[cfg(feature = "server")]
 pub mod server;
 
-// Full-stack E2E testing module — feature-gated behind allow_in_memory_custody.
+// Full-stack E2E testing module — feature-gated behind testing.
 // Exposes FullStackNetwork/FullStackNode from scp-testing for real
 // encrypt→decrypt roundtrip tests from Python.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 pub mod testing;
 
 /// Global tokio runtime, created once at module import.
@@ -257,7 +257,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     server::register_server(m)?;
 
     // Full-stack E2E testing module — feature-gated.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     testing::register_testing(m)?;
 
     Ok(())

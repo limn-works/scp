@@ -144,7 +144,9 @@ final class OutletStreamingTests: XCTestCase {
         var seen = 0
         for try await _ in handle {
             seen += 1
-            if seen == 1 { break }
+            if seen == 1 {
+                break
+            }
         }
         XCTAssertEqual(seen, 1)
 
@@ -234,7 +236,9 @@ extension OutletStreamingTests {
         var seen = 0
         for try await _ in handle {
             seen += 1
-            if seen == 2 { try await handle.grantCredit(Credit(8)) }
+            if seen == 2 {
+                try await handle.grantCredit(Credit(8))
+            }
         }
         let grantCalls = await native.grantCalls
         XCTAssertEqual(grantCalls.count, 1)
@@ -270,7 +274,9 @@ extension OutletStreamingTests {
         var seen = 0
         for try await _ in handle {
             seen += 1
-            if seen == 1 { try await handle.cancel() }
+            if seen == 1 {
+                try await handle.cancel()
+            }
         }
         let cancelCalls = await native.cancelCalls
         XCTAssertEqual(cancelCalls.count, 1)
@@ -487,11 +493,15 @@ extension OutletStreamingTests {
         var offenders: [String] = []
         for case let url as URL in enumerator {
             guard url.pathExtension == "swift" else { continue }
-            if url.pathComponents.contains("Internal") { continue }
+            if url.pathComponents.contains("Internal") {
+                continue
+            }
             let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
             for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
                 let trimmed = line.drop { $0 == " " || $0 == "\t" }
-                if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") { continue }
+                if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") || trimmed.hasPrefix("/*") {
+                    continue
+                }
                 if line.contains("invokeStream") || line.contains("invoke_stream") {
                     offenders.append("\(url.lastPathComponent): \(line)")
                 }
@@ -598,7 +608,9 @@ extension OutletStreamingTests {
         let handle = invoke(native)
         var idx = 0
         for try await _ in handle {
-            if idx == 1 { try await handle.cancel() }
+            if idx == 1 {
+                try await handle.cancel()
+            }
             idx += 1
         }
         let cancelCalls = await native.cancelCalls
@@ -677,7 +689,9 @@ private extension OutletStreamingTests {
 
     func progressChunk(_ sequence: Int, pct: Int, note: String? = nil) throws -> Data {
         var payload: [String: Any] = ["@type": "progress", "pct": pct]
-        if let note { payload["note"] = note }
+        if let note {
+            payload["note"] = note
+        }
         return try chunk(sequence, payload)
     }
 
@@ -827,13 +841,17 @@ actor FakeNative: OutletStreamNative {
             ucanToken: ucanToken,
             estimatedChunkCount: estimatedChunkCount
         ))
-        if let openError { throw openError }
+        if let openError {
+            throw openError
+        }
         return handleId
     }
 
     func pollNext(handleId _: String) async throws -> Data? {
         pollCount += 1
-        if let failPollAfter, pollCount > failPollAfter, let pollError { throw pollError }
+        if let failPollAfter, pollCount > failPollAfter, let pollError {
+            throw pollError
+        }
         guard index < chunks.count else { return nil }
         let next = chunks[index]
         index += 1

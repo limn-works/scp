@@ -6,7 +6,7 @@ import XCTest
 /// `SCP.inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:relayUrls:)`,
 /// and `Context.joinFromWelcome(scp:identity:sealed:reservationId:)`.
 ///
-/// The suite links the Rust binary built with `allow_in_memory_custody`, so
+/// The suite links the Rust binary built with `testing`, so
 /// reservation, the sealed-invitation producer, and the join-side custody /
 /// validation gates run against the real engine (like `ScpClassTests` /
 /// `OutletSagaTests`). `inviteMember` under a `SingleAdmin` context whose admin

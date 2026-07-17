@@ -17,15 +17,15 @@ categories = ["cryptography", "network-programming"]
 testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing"]
 # Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
 # without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
-# requires `EncryptedStorage`. Follows the `allow_in_memory_custody` pattern
+# requires `EncryptedStorage`. Follows the test-harness feature-gating pattern
 # in scp-ffi. See issue #695.
 allow_unencrypted_storage = []
 # Gates `RestoredContexts::for_test` — the test-only minter for the
 # restore-then-replay ordering witness, used by the saga-FSM / crash-recovery
 # integration suites that drive replay in isolation. Deliberately NOT implied by
-# `testing`: a `testing`-gated minter would leak into every
-# `allow_in_memory_custody` build via `scp-ffi → dep:scp-testing →
-# scp-core{testing} → scp-runtime/testing`, re-opening the forge. This feature is
+# `testing`: a `testing`-gated minter would leak into every bridge test
+# build via `scp-ffi/testing → dep:scp-testing →
+# scp-core/testing → scp-runtime/testing`, re-opening the forge. This feature is
 # enabled ONLY by the `required-features` of the `actor_saga_coordinator` /
 # `actor_saga_crash_recovery` test targets, so no production or FFI build can
 # reach the witness back-door.
@@ -35,9 +35,9 @@ saga-witness-test-mint = []
 # member's `role_state.member_capabilities`, bypassing the governance role-
 # assignment round-trip. This is an AUTHORITY-ESCALATION primitive, so it is
 # deliberately NOT implied by `testing`: a `testing`-gated grant would leak into
-# every `allow_in_memory_custody` build via `scp-ffi → dep:scp-testing →
-# scp-core{testing} → scp-runtime/testing`, compiling a capability-escalation
-# back-door into custody-escape-hatch builds. Enabled ONLY by the
+# every bridge test build via `scp-ffi/testing → dep:scp-testing →
+# scp-core/testing → scp-runtime/testing`, compiling a capability-escalation
+# back-door into test-harness builds. Enabled ONLY by the
 # `required-features` / explicit `--features` of the outlet-stream live-flow test
 # that needs to authorize a member invoker, so no production or FFI build can
 # reach it. Follows the `saga-witness-test-mint` precedent above.
