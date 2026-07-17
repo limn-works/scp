@@ -715,6 +715,26 @@ class SCP:
         ucan_proof_id: Any = ...,
     ) -> SagaResult: ...
     def outlet_register(self, context_id: Any, registration: Any) -> Any: ...
+    def outlet_streaming_saga_open(
+        self,
+        caller_context_id: Any,
+        target_context_id: Any,
+        caller_did: Any,
+        outlet_registration_id: Any,
+        input: Any,
+        asserted_nonce_hex: Any,
+        timestamp_ms: Any,
+        chain_depth: Any,
+        ucan_token: Any,
+        proof_tokens: Any = ...,
+        ucan_proof_id: Any = ...,
+        timeout_ms: Any = ...,
+        estimated_chunk_count: Any = ...,
+    ) -> str: ...
+    def outlet_streaming_saga_poll_next(self, saga_id: Any) -> bytes | None: ...
+    def outlet_streaming_saga_recover_truncated_close(
+        self, saga_id: Any, caller_did: Any
+    ) -> None: ...
     def outlet_stream_open(
         self,
         context_id: Any,
