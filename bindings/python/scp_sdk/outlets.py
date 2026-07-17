@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, final
 
@@ -51,38 +52,35 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Generator
 
     from scp_sdk.identity import Identity
-    from scp_sdk.scp import SCP
-
-try:
-    import _scp_core  # type: ignore[import-not-found]
-except ImportError:
-    _scp_core = None  # type: ignore[assignment]
 
 
-def _resolve_bridge(scp: SCP) -> Any:
-    """Return the effective bridge object for outlet operations.
-
-    Tests patch ``scp_sdk.outlets._scp_core`` with a ``MagicMock`` whose
-    ``outlet_*`` attributes stand in for the live bridge. In production
-    those attributes do not exist on the real ``_scp_core`` module
-    (Phase 4 PR 4 consolidated them onto :class:`SCP`), so we fall
-    through to ``scp._native`` and dispatch on the SCP instance.
-    """
-    mod = _scp_core
-    if mod is not None and hasattr(mod, "_mock_name"):
-        return mod
-    return scp._native
+#: Matches the leading ``[SCP-CAT-NNNN]`` code the bridge's ``ScpPyError``
+#: ``Display`` prepends to its message (``[SCP-PERM-3001] context error: ...``).
+#: Anchored at the start so only the bridge's own code prefix is extracted; an
+#: unbracketed message yields no match and the SDK class default stands.
+_LEADING_BRIDGE_CODE: Final = re.compile(r"^\[(SCP-[A-Z]+-\d+)\]")
 
 
 def _translate_bridge_error(exc: Exception) -> Exception:
     """Translate a ``_scp_core`` bridge exception to an SDK exception.
 
-    Uses :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP` to look up the SDK type
-    by the bridge exception's class name.  Falls back to
-    :class:`~scp_sdk.errors.ContextError` for unmapped types.
+    Uses :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP` to look up the SDK type by
+    the bridge exception's class name (falling back to
+    :class:`~scp_sdk.errors.ContextError` for unmapped types), and preserves
+    the bridge's structured ``SCP-CAT-NNNN`` code as the SDK exception's
+    ``.code`` so a caller can branch on it — not merely read it out of the
+    message text. The bridge's ``ScpPyError`` ``Display`` prepends the code in
+    brackets (``[SCP-PERM-3001] ...``); that leading code is extracted and
+    passed through, so a money-moving rejection (e.g. a non-invoker
+    grant/cancel/recover) surfaces ``.code == "SCP-PERM-3001"`` rather than the
+    receiving SDK class's generic default. An unbracketed bridge message carries
+    no recoverable code, so the SDK class default applies.
     """
     sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
-    return sdk_cls(str(exc))
+    message = str(exc)
+    match = _LEADING_BRIDGE_CODE.match(message)
+    code = match.group(1) if match is not None else None
+    return sdk_cls(message, code)
 
 
 # ---------------------------------------------------------------------------

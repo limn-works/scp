@@ -79,6 +79,33 @@ class TestTranslateBridgeError:
         assert isinstance(result, ContextError)
         assert "unexpected failure" in result.message
 
+    def test_leading_bridge_code_is_extracted_into_structured_code(self) -> None:
+        """The bridge's ``[SCP-CAT-NNNN]`` Display prefix surfaces as ``.code``.
+
+        A money-moving rejection (e.g. a non-invoker grant/cancel/recover) is
+        raised bridge-side as a ``ContextError`` whose message carries
+        ``[SCP-PERM-3001]``; the caller must be able to branch on ``.code``
+        rather than substring-match the message text.
+        """
+        bridge_cls = type("ContextError", (Exception,), {})
+        bridge_exc = bridge_cls("[SCP-PERM-3001] context error: caller is not the pinned invoker")
+
+        result = _translate_bridge_error(bridge_exc)
+
+        assert isinstance(result, ContextError)
+        assert result.code == "SCP-PERM-3001"
+
+    def test_unbracketed_message_keeps_sdk_class_default_code(self) -> None:
+        """A bridge message without a ``[SCP-...]`` prefix carries no recoverable
+        code, so the receiving SDK class's default ``.code`` applies."""
+        bridge_cls = type("ContextError", (Exception,), {})
+        bridge_exc = bridge_cls("no active saga 'x'")
+
+        result = _translate_bridge_error(bridge_exc)
+
+        assert isinstance(result, ContextError)
+        assert result.code == ContextError._default_code == "SCP-CTX-2000"
+
 
 # ---------------------------------------------------------------------------
 # Helpers

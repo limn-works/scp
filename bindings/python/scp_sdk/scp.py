@@ -2714,10 +2714,13 @@ class SCP:
         resolved.
 
         Raises :class:`~scp_sdk.errors.ContextError` if ``caller_did`` is not
-        hosted by this instance or ``saga_id`` is unknown, or with
-        ``SCP-PERM-3001`` if ``caller_did`` is hosted but is not the pinned
-        invoker; :class:`~scp_sdk.errors.SagaNeedsRepairError` if the seal
-        cannot complete (the saga stays unresolved for a later retry).
+        hosted by this instance or ``saga_id`` is unknown, or — when
+        ``caller_did`` is hosted but is not the pinned invoker — a
+        :class:`~scp_sdk.errors.ContextError` whose structured ``.code`` is
+        ``SCP-PERM-3001`` (a caller can branch on ``.code`` for this
+        money-moving gate, not only substring-match the message);
+        :class:`~scp_sdk.errors.SagaNeedsRepairError` if the seal cannot
+        complete (the saga stays unresolved for a later retry).
         """
         from scp_sdk.errors import _saga_terminal_from_bridge
         from scp_sdk.outlets import _translate_bridge_error

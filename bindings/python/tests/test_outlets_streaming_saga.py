@@ -162,7 +162,7 @@ class _FakeSagaNative:
         self.open_calls.append(args)
         return self._saga_id
 
-    def outlet_streaming_saga_poll_next(self, saga_id: str) -> list[int] | None:
+    def outlet_streaming_saga_poll_next(self, _saga_id: str) -> list[int] | None:
         with self._lock:
             self.poll_calls += 1
             if self._i >= len(self._chunks):
@@ -232,7 +232,7 @@ class _GatedTerminalSagaNative(_FakeSagaNative):
         self._terminal = terminal_chunk
         self._gate = threading.Event()
 
-    def outlet_streaming_saga_poll_next(self, saga_id: str) -> list[int] | None:
+    def outlet_streaming_saga_poll_next(self, _saga_id: str) -> list[int] | None:
         with self._lock:
             self.poll_calls += 1
             if self._i < len(self._chunks):
@@ -370,7 +370,7 @@ class TestAc5CallerDidMismatch:
         )
         handle = _open_saga(native)
         with pytest.raises(SagaAbortedError) as excinfo:
-            async for _chunk in handle:  # first __anext__ opens -> rejects
+            async for _ in handle:  # first __anext__ opens -> rejects
                 pass
         assert excinfo.value.code == "SCP-SAGA-13050"
         assert handle.saga_id is None
@@ -403,8 +403,12 @@ class TestAc8ReconnectTruncatedClose:
 
     async def test_recover_non_invoker_rejected_perm_3001(self) -> None:
         # CRITICAL #1: recovery is money-moving, so a hosted-but-non-invoker
-        # caller is rejected with a typed ContextError carrying SCP-PERM-3001
-        # (embedded in the formatted message by the ScpPyError Display impl).
+        # caller is rejected with a typed ContextError whose STRUCTURED ``.code``
+        # is SCP-PERM-3001 — the SAME invoker gate the same-context
+        # grant/cancel/terminate siblings enforce. The bridge's ``ScpPyError``
+        # Display prepends ``[SCP-PERM-3001]``; the SDK extracts that leading
+        # code so a caller can branch on ``.code`` for a money-moving op, not
+        # only substring-match the message text.
         class _NonInvokerNative(_FakeSagaNative):
             def outlet_streaming_saga_recover_truncated_close(
                 self, saga_id: str, caller_did: str
@@ -418,6 +422,7 @@ class TestAc8ReconnectTruncatedClose:
         scp = _make_scp(_NonInvokerNative([]))
         with pytest.raises(ContextError) as excinfo:
             await SCP.recover_streaming_saga_truncated_close(scp, _SAGA_ID, "did:dht:stranger")
+        assert excinfo.value.code == "SCP-PERM-3001"
         assert "SCP-PERM-3001" in str(excinfo.value)
 
     async def test_recover_needs_repair_terminal_translated(self) -> None:
@@ -464,15 +469,33 @@ class TestStreamingSagaHandleContract:
         with pytest.raises(ProtocolError):
             await handle
 
+    async def test_aggregate_idempotent_after_full_iteration(self) -> None:
+        # A full `async for` drains the stream to its End terminal; a subsequent
+        # aggregate() must return the CACHED Aggregate (same instance) WITHOUT
+        # re-draining (no further poll_next round-trips) and WITHOUT raising —
+        # the shared single-drain contract the class docstring promises.
+        native = _FakeSagaNative([_data(0, {"n": 0}), _end(1, {"total": 3}, execution_time_ms=7)])
+        handle = _open_saga(native)
+        chunks = [chunk async for chunk in handle]
+        assert [c.kind for c in chunks] == ["data", "end"]
+        polls_after_iteration = native.poll_calls
+        first = await handle.aggregate()
+        second = await handle.aggregate()
+        assert first is second  # cached terminal, not rebuilt on the second call
+        assert first.value == {"total": 3}
+        assert first.execution_time_ms == 7
+        # No re-drain: aggregate() issued no additional poll_next round-trips.
+        assert native.poll_calls == polls_after_iteration
+
     async def test_unknown_saga_id_poll_surfaces_context_error(self) -> None:
         class _UnknownSagaNative(_FakeSagaNative):
-            def outlet_streaming_saga_poll_next(self, saga_id: str) -> list[int] | None:
+            def outlet_streaming_saga_poll_next(self, _saga_id: str) -> list[int] | None:
                 self.poll_calls += 1
                 raise _bridge_exc("ContextError", "no active saga 'x'")
 
         handle = _open_saga(_UnknownSagaNative([]))
         with pytest.raises(ContextError):
-            async for _chunk in handle:
+            async for _ in handle:
                 pass
 
     async def test_sequence_gap_raises_stream_gap_without_cancel(self) -> None:
@@ -481,10 +504,21 @@ class TestStreamingSagaHandleContract:
         # seq0 then seq2 (seq1 MISSING) — no live cross-context cancel plane, so
         # the gap is a purely local terminal (no bridge cancel round-trip exists).
         native = _FakeSagaNative([_data(0, {"n": 0}), _data(2, {"n": 2})])
+        # Spy every conceivable bridge teardown path. The cross-context saga runs
+        # with cancel_ack_ceiling = u64::MAX (§6.2.5 / SCP-OUT-046: NO live cancel
+        # plane), so a receiver-detected gap is a purely LOCAL terminal — the SDK
+        # must issue NO cancel/terminate round-trip to the bridge, UNLIKE the
+        # same-context handle which signs a receiver OutletCancel on a gap.
+        native.outlet_streaming_saga_cancel = MagicMock()
+        native.outlet_streaming_saga_terminate = MagicMock()
+        native.outlet_stream_cancel = MagicMock()
         handle = _open_saga(native)
         with pytest.raises(StreamGap):
-            async for _chunk in handle:
+            async for _ in handle:
                 pass
+        native.outlet_streaming_saga_cancel.assert_not_called()
+        native.outlet_streaming_saga_terminate.assert_not_called()
+        native.outlet_stream_cancel.assert_not_called()
 
     async def test_second_concurrent_driver_raises_protocol_error(self) -> None:
         native = _FakeSagaNative([_data(i, {"n": i}) for i in range(5)])
