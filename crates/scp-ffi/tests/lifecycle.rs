@@ -15,8 +15,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[cfg(feature = "allow_in_memory_custody")]
 use _scp_core::init_runtime;
+#[cfg(feature = "allow_in_memory_custody")]
 use _scp_core::scp::PyScp;
+#[cfg(feature = "allow_in_memory_custody")]
 use pyo3::Python;
 
 /// Consolidated lifecycle roundtrip — suspend/resume roundtrips on a
@@ -33,6 +36,7 @@ use pyo3::Python;
 /// bridge — tests now drive a freshly constructed `PyScp::new_in_memory_for_test()`
 /// instance through `.suspend()` / `.resume()`.
 #[test]
+#[cfg(feature = "allow_in_memory_custody")]
 fn scp_suspend_resume_roundtrip() {
     // `PyScp::resume` releases the GIL while driving the async
     // `BridgeInstanceCore::resume` default body on the tokio runtime. The test
