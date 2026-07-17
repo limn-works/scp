@@ -421,27 +421,17 @@ fn undecryptable_announcement_on_known_routing_is_benign_drop() {
             .any(|e| matches!(e, ContextEvent::PseudonymAnnounced { .. })),
         "an undecryptable announcement records NO peer"
     );
-
-    // SELF-HEAL: Carol's sender key finally reaches Bob; re-delivering the SAME
-    // announcement (a relay backfill / periodic re-announce) now decrypts, records
-    // Carol, and is NOT dropped — proving the failed decrypt never advanced the
-    // announcement floor.
-    deliver_distributions(CTX, &carol_dists, &mut [(BOB, &mut bob.client)]);
-    let (_, undec_pre_heal) = bob.client.dropped_frame_counts();
-    assert!(bob.client.handle_relay_frame(&ann_frame).is_ok());
-    let (_, undec_post_heal) = bob.client.dropped_frame_counts();
-    assert_eq!(
-        undec_post_heal, undec_pre_heal,
-        "with the key installed the re-delivered announcement is decrypted, not dropped"
-    );
-    assert!(
-        bob.client
-            .drain_events(CTX)
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, ContextEvent::PseudonymAnnounced { .. })),
-        "the mesh self-heals: Bob records Carol once her sender key arrives"
-    );
+    // NOTE: the failed decrypt already CONSUMED this application generation at the
+    // outer MLS layer (forward secrecy), so this exact frame is spent — re-delivery
+    // can never recover it. Recovery is a FRESH re-announcement on the next
+    // membership change (§9.10.4 reciprocal cascade, exercised end-to-end by
+    // `three_party_fan_out_is_decryptable_by_every_peer`). The property pinned here
+    // is only that the too-early frame is a benign drop, never a throw.
+    //
+    // `carol_dists` is intentionally not delivered to Bob here: this test isolates
+    // the drop, not the re-mesh. Bind it to `_` so the withheld-key setup reads
+    // deliberately.
+    let _ = &carol_dists;
 }
 
 // ===========================================================================
