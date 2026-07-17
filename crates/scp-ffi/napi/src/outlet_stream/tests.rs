@@ -1132,3 +1132,188 @@ mod streaming_vectors_live {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Cross-context STREAMING saga (§5.4.5 / §6.2.4, SCP-OUT-047) — NAPI bridge.
+//
+// The behavioral counterparts of the PyO3 reference `e2e_bridge.rs` streaming-
+// saga tests. Like the unary-saga NAPI tests, these exercise what the bridge
+// ADDS on top of the supervisor producer (whose full Committed / truncated-close
+// paths need actor-state + budget injection with no bridge-public wiring):
+//
+//   - the §6.2.4 caller-principal binding on the OPEN (caller_did MUST be hosted
+//     by this instance) — rejected BEFORE the saga runs, so the receiver is
+//     never handed out;
+//   - the RECOVER reconnect-caller authentication (hosted axis) AND the
+//     money-moving invoker gate (SCP-PERM-3001), which must NOT evict a
+//     stranger's saga.
+//
+// MUTATION-RESISTANCE: the OPEN test asserts the BRIDGE-UNIQUE substring the
+// producer never emits, so it fails closed if the binding is removed.
+//
+// Gated on `allow_in_memory_custody` (identity_create + the test-only registry
+// seam), mirroring the `outlets.rs` `xctx_saga_tests` gating.
+#[cfg(feature = "allow_in_memory_custody")]
+mod xctx_streaming_saga_tests {
+    use super::*;
+
+    /// Creates an ephemeral single-admin context owned by `owner_identity` whose
+    /// ceiling carries the saga-relevant capabilities. Mirrors the `outlets.rs`
+    /// saga tests' `create_saga_context`.
+    async fn create_saga_context(
+        bi: &std::sync::Arc<NapiBridgeInstance>,
+        owner_identity: &crate::identity::NapiIdentity,
+    ) -> NapiContextHandle {
+        let params = serde_json::json!({
+            "ceiling": [
+                "governance:propose",
+                "outlet:interface",
+                "outlet:register",
+                "outlet:call:*",
+                "messages:read",
+                "messages:write"
+            ],
+            "governance": "single_admin",
+            "memoryScope": "ephemeral",
+        })
+        .to_string();
+        crate::context::context_create_on(bi, owner_identity, params)
+            .await
+            .expect("context_create should succeed")
+    }
+
+    fn now_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+    }
+
+    /// (a) OPEN caller-principal binding, hosted axis: a `caller_did` this bridge
+    /// instance does NOT host is rejected with `SagaAborted` (SCP-SAGA-13050)
+    /// BEFORE the streaming saga runs. Asserts the bridge-unique axis-(a)
+    /// substring so the test fails if the registry check is removed (the
+    /// producer's gate-1 message never carries this phrasing).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_unhosted_caller_rejected_before_saga() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        let handle_a = create_saga_context(&bi, &owner_identity).await;
+        let handle_b = create_saga_context(&bi, &owner_identity).await;
+        let outlet_id =
+            scp_ffi_common::outlet_id::generate_outlet_id("xctx_streaming_unhosted_probe");
+
+        // A syntactically valid DID that was never created on this instance.
+        let unhosted_caller = "did:dht:z6MkUnhostedStreamingCaller01".to_owned();
+
+        let err = Box::pin(outlet_streaming_saga_open_on(
+            &bi,
+            &handle_a,
+            &handle_b,
+            unhosted_caller,
+            outlet_id,
+            r#"{"a":"x","b":"y"}"#.to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            now_ms(),
+            1,
+            "eyJhbGciOiJFZERTQSJ9.eyJ0ZXN0Ijp0cnVlfQ.placeholder-not-validated".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect_err("an unhosted caller_did must be rejected before the streaming saga runs");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::SAGA_13050),
+            "expected caller-axis SCP-SAGA-13050, got: {msg}"
+        );
+        // BRIDGE-UNIQUE axis-(a) substring — the producer never emits it.
+        assert!(
+            msg.contains("is not an identity hosted by this bridge instance"),
+            "message must be the BRIDGE axis-(a) hosted-principal rejection, got: {msg}"
+        );
+    }
+
+    /// The streaming-saga RECOVER authenticates the reconnect caller: a
+    /// `caller_did` this bridge instance does NOT host is rejected before any
+    /// seal is attempted (§6.2.4 channel-auth). No signing key is ever resolved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_recover_unhosted_caller_rejected() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let unhosted_caller = "did:dht:z6MkUnhostedStreamingRecover1";
+        let err =
+            outlet_streaming_saga_recover_truncated_close_on(&bi, "any-saga-id", unhosted_caller)
+                .await
+                .expect_err("an unhosted caller_did must be rejected by streaming-saga recover");
+
+        assert!(
+            format!("{err}").contains("not an identity hosted by this bridge instance"),
+            "message must name the channel-auth mismatch, got: {err}"
+        );
+    }
+
+    /// (SECURITY) The streaming-saga RECOVER is MONEY-MOVING. A `caller_did` that
+    /// IS hosted by this instance but is NOT the invoker pinned at open is
+    /// rejected with `SCP-PERM-3001` — the SAME invoker gate the same-context
+    /// grant/cancel/terminate siblings enforce — BEFORE any signing key is
+    /// resolved, and the (stranger's) saga entry is LEFT INTACT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_recover_hosted_non_invoker_rejected() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        // The invoker who "opened" the saga, and a DIFFERENT hosted identity.
+        let invoker_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (invoker)");
+        let invoker = invoker_identity.inner.did.clone();
+        let stranger_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (stranger)");
+        let stranger = stranger_identity.inner.did.clone();
+
+        // Inject a live saga entry pinned to `invoker` (the full committed path
+        // needs actor-state/budget injection with no bridge-public wiring —
+        // identical to the unary-saga bridge tests).
+        let saga_id = "saga-out047-napi-invoker-gate-0001";
+        scp.insert_test_streaming_saga_entry(saga_id, "target-ctx-out047", &invoker);
+
+        // A hosted-but-not-invoker caller clears the channel-auth gate, reaches
+        // the invoker check, and is rejected there.
+        let err = outlet_streaming_saga_recover_truncated_close_on(&bi, saga_id, &stranger)
+            .await
+            .expect_err("a hosted non-invoker caller must be rejected by streaming-saga recover");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::PERM_3001),
+            "expected the invoker-gate SCP-PERM-3001, got: {msg}"
+        );
+        assert!(
+            msg.contains("is not the invoker"),
+            "message must name the pinned-invoker mismatch, got: {msg}"
+        );
+        // No settle: the rejection is BEFORE the recovery driver and does NOT
+        // evict — the invoker's saga entry survives for the legitimate invoker.
+        assert!(
+            scp.test_streaming_saga_entry_present(saga_id),
+            "a rejected non-invoker recover must NOT evict the invoker's saga entry"
+        );
+    }
+}

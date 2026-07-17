@@ -324,6 +324,22 @@ pub struct NapiBridgeInstance {
     /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
     /// reference bridge's `PyBridgeInstance::outlet_stream_registry`.
     pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+
+    /// Per-instance §5.4.5 / §6.2.4 cross-context STREAMING-saga registry
+    /// (SCP-OUT-047, pass 3a).
+    ///
+    /// Keyed by the durable `saga_id` string. Each
+    /// [`StreamingSagaEntry`](scp_ffi_common::streaming_saga::StreamingSagaEntry)
+    /// holds the runtime's promptly-returned plaintext operator-signed chunk
+    /// receiver plus the pinned `saga_id`, operating (target) context id,
+    /// invoker DID, and `request_id`. Per-instance (never a `static` —
+    /// `check-no-bridge-globals.sh` / `check-handle-affinity.sh`): a saga opened
+    /// on one instance is invisible to another, and instance shutdown drops every
+    /// live saga stream with the `Arc`. Cleared by
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`]. Mirrors the `PyO3`
+    /// reference bridge's `PyBridgeInstance::outlet_streaming_saga_registry`.
+    pub(crate) outlet_streaming_saga_registry:
+        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 }
 
 /// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
@@ -382,6 +398,7 @@ impl NapiBridgeInstance {
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -414,6 +431,7 @@ impl NapiBridgeInstance {
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -544,6 +562,7 @@ impl NapiBridgeInstance {
             recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -671,6 +690,10 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // `StreamEntry` `Arc`s releases the control handle + chunk receiver, so
         // any parked pump task winds down (SCP-OUT-037, C8a).
         self.outlet_stream_registry.clear();
+        // Drop every live §5.4.5 / §6.2.4 cross-context streaming saga on this
+        // instance — dropping the `StreamingSagaEntry` `Arc`s releases each
+        // saga's chunk receiver (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
         // Reset the full-stack test network slot. Best-effort: on lock
         // poisoning we leave the slot alone — a poisoned mutex means
         // another thread panicked while holding it, which is a larger

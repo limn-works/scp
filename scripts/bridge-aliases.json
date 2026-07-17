@@ -2591,8 +2591,12 @@
       "pyo3": [
         "outlet_streaming_saga_open"
       ],
-      "uniffi": [],
-      "napi": []
+      "uniffi": [
+        "outlet_streaming_saga_open"
+      ],
+      "napi": [
+        "outlet_streaming_saga_open"
+      ]
     },
     {
       "canonical": "outlet_streaming_saga_poll_next",
@@ -2600,8 +2604,12 @@
       "pyo3": [
         "outlet_streaming_saga_poll_next"
       ],
-      "uniffi": [],
-      "napi": []
+      "uniffi": [
+        "outlet_streaming_saga_poll_next"
+      ],
+      "napi": [
+        "outlet_streaming_saga_poll_next"
+      ]
     },
     {
       "canonical": "outlet_streaming_saga_recover_truncated_close",
@@ -2609,8 +2617,12 @@
       "pyo3": [
         "outlet_streaming_saga_recover_truncated_close"
       ],
-      "uniffi": [],
-      "napi": []
+      "uniffi": [
+        "outlet_streaming_saga_recover_truncated_close"
+      ],
+      "napi": [
+        "outlet_streaming_saga_recover_truncated_close"
+      ]
     },
     {
       "canonical": "broadcast_subscriber_count",
@@ -2902,33 +2914,7 @@
   "exemptions": {
     "_comment": "Per-bridge exemptions for operations that are intentionally not implemented in that bridge. This is a MIRROR of the language-level exemptions in .docs/standards/sdk-capability-matrix.json, keyed by bridge name (pyo3 / uniffi / napi) rather than SDK language. The symmetry script consults this map before emitting a finding.",
     "pyo3": [],
-    "uniffi": [
-      {
-        "canonical": "outlet_streaming_saga_open",
-        "reason": "§5.4.5 cross-context streaming saga, ADR-049 §3a. PyO3 reference bridge lands first (SCP-OUT-047 pass 1); the UniFFI wiring lands in pass 3 — remove this exemption then."
-      },
-      {
-        "canonical": "outlet_streaming_saga_poll_next",
-        "reason": "§5.4.5 cross-context streaming saga, ADR-049 §3a. PyO3 reference bridge lands first (SCP-OUT-047 pass 1); the UniFFI wiring lands in pass 3 — remove this exemption then."
-      },
-      {
-        "canonical": "outlet_streaming_saga_recover_truncated_close",
-        "reason": "§5.4.5 cross-context streaming saga, ADR-049 §3a. PyO3 reference bridge lands first (SCP-OUT-047 pass 1); the UniFFI wiring lands in pass 3 — remove this exemption then."
-      }
-    ],
-    "napi": [
-      {
-        "canonical": "outlet_streaming_saga_open",
-        "reason": "§5.4.5 cross-context streaming saga, ADR-049 §3a. PyO3 reference bridge lands first (SCP-OUT-047 pass 1); the NAPI wiring lands in pass 3 — remove this exemption then."
-      },
-      {
-        "canonical": "outlet_streaming_saga_poll_next",
-        "reason": "§5.4.5 cross-context streaming saga, ADR-049 §3a. PyO3 reference bridge lands first (SCP-OUT-047 pass 1); the NAPI wiring lands in pass 3 — remove this exemption then."
-      },
-      {
-        "canonical": "outlet_streaming_saga_recover_truncated_close",
-        "reason": "§5.4.5 cross-context streaming saga, ADR-049 §3a. PyO3 reference bridge lands first (SCP-OUT-047 pass 1); the NAPI wiring lands in pass 3 — remove this exemption then."
-      }
-    ]
+    "uniffi": [],
+    "napi": []
   }
 }

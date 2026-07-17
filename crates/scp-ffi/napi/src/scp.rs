@@ -3069,6 +3069,126 @@ impl Scp {
         .map_err(napi::Error::from)
     }
 
+    // ===== §5.4.5 / §6.2.4 cross-context streaming saga (SCP-OUT-047) =====
+
+    /// Opens a §5.4.5 / §6.2.4 CROSS-CONTEXT streaming outlet invocation as a
+    /// saga (SCP-OUT-047), returning the durable `saga_id` PROMPTLY (the
+    /// Commit-transition — NOT a block-until-terminal; the seal pumps
+    /// off-mailbox). Drive the stream via `outletStreamingSagaPollNext` with the
+    /// returned `saga_id`.
+    ///
+    /// The invocation UCAN is validated ONCE at open via the full 11-step
+    /// ADR-016 pipeline against the TARGET context B. `caller_did` is bound to
+    /// this bridge instance's channel-authenticated principal (§6.2.4) and must
+    /// be a member of `source_handle`'s context — a mismatch rejects with a typed
+    /// `SagaAborted` (SCP-SAGA-13050) BEFORE the saga runs, so the receiver is
+    /// never handed out.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_handle` — The initiating (caller) context handle.
+    /// * `target_handle` — The executing (target) context handle hosting the outlet.
+    /// * `caller_did` — The initiator DID (bound to the bridge principal).
+    /// * `outlet_registration_id` — The outlet to invoke across the interface.
+    /// * `input_json` — Outlet input as a JSON string (schema-checked target-side).
+    /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce (32-char hex).
+    /// * `timestamp_ms` — Caller-asserted send time (Unix ms), passed as a JS `BigInt`.
+    /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory).
+    /// * `ucan_token` — The invocation UCAN authorizing the outlet call.
+    /// * `proof_tokens` — Optional delegation-chain proof tokens.
+    /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+    ///   target-side at Prepare-B.
+    /// * `timeout_ms` / `estimated_chunk_count` — Optional stream policy hints.
+    #[napi(js_name = "outletStreamingSagaOpen")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn outlet_streaming_saga_open(
+        &self,
+        source_handle: &NapiContextHandle,
+        target_handle: &NapiContextHandle,
+        caller_did: String,
+        outlet_registration_id: String,
+        input_json: String,
+        asserted_nonce_hex: String,
+        timestamp_ms: napi::bindgen_prelude::BigInt,
+        chain_depth: u8,
+        ucan_token: String,
+        proof_tokens: Option<Vec<String>>,
+        ucan_proof_id: Option<String>,
+        timeout_ms: Option<u32>,
+        estimated_chunk_count: Option<u32>,
+    ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, source_handle, target_handle);
+
+        // `timestamp_ms` crosses as a JS `BigInt`. Reject a negative or
+        // non-lossless input so a malformed freshness field fails closed at the
+        // boundary rather than wrapping into a bogus skew (parity with the unary
+        // saga export).
+        let (signed, timestamp_ms_u64, lossless) = timestamp_ms.get_u64();
+        if signed || !lossless {
+            return Err(napi::Error::from(ScpNapiError::Validation {
+                message:
+                    "timestamp_ms must fit in an unsigned 64-bit integer (non-negative, no loss)"
+                        .to_owned(),
+                code: codes::VALID_7001.to_owned(),
+            }));
+        }
+
+        Box::pin(crate::outlet_stream::outlet_streaming_saga_open_on(
+            &self.inner,
+            source_handle,
+            target_handle,
+            caller_did,
+            outlet_registration_id,
+            input_json,
+            asserted_nonce_hex,
+            timestamp_ms_u64,
+            chain_depth,
+            ucan_token,
+            proof_tokens,
+            ucan_proof_id,
+            timeout_ms,
+            estimated_chunk_count,
+        ))
+        .await
+    }
+
+    /// Drains one chunk from a live cross-context streaming saga, awaiting until
+    /// a chunk arrives or the stream closes. Returns the JSON-serialized
+    /// `OutletStreamChunk` bytes (A's plaintext operator-signed frame), or `None`
+    /// at the terminal (which evicts the saga stream). An unknown/evicted
+    /// `saga_id` is a DISTINCT error, never `None`.
+    #[napi(js_name = "outletStreamingSagaPollNext")]
+    pub async fn outlet_streaming_saga_poll_next(
+        &self,
+        saga_id: String,
+    ) -> napi::Result<Option<Buffer>> {
+        crate::outlet_stream::outlet_streaming_saga_poll_next_on(&self.inner, &saga_id)
+            .await
+            .map(|opt| opt.map(Buffer::from))
+    }
+
+    /// Key-bearing crash-recovery truncated-close for a cross-context streaming
+    /// saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the TARGET
+    /// context's Active Signing Key (resolved per-call from custody) and resolves
+    /// the saga `Committed` WITHOUT re-opening the stream or re-invoking the
+    /// executor. `caller_did` must be an identity hosted by this bridge instance
+    /// (§6.2.4 channel-auth) AND the invoker pinned at open (CRITICAL #1 —
+    /// recovery is money-moving; rejects `SCP-PERM-3001` otherwise). On success
+    /// the saga registry entry is evicted.
+    #[napi(js_name = "outletStreamingSagaRecoverTruncatedClose")]
+    pub async fn outlet_streaming_saga_recover_truncated_close(
+        &self,
+        saga_id: String,
+        caller_did: String,
+    ) -> napi::Result<()> {
+        crate::outlet_stream::outlet_streaming_saga_recover_truncated_close_on(
+            &self.inner,
+            &saga_id,
+            &caller_did,
+        )
+        .await
+    }
+
     /// Per-instance equivalent of the free-function `outlet_invoke_cross_context`.
     #[napi(js_name = "outletInvokeCrossContext")]
     #[allow(clippy::too_many_arguments)]
