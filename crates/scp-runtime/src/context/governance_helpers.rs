@@ -23,6 +23,7 @@
 
 use scp_clock::Clock;
 use scp_did::DID;
+use scp_protocol::context::broadcast::AuthorKeyRotation;
 use scp_protocol::context::governance::mls_integration::{
     MlsImpact, classify_action, generate_mls_operations,
 };
@@ -876,7 +877,7 @@ pub async fn execute_revoke(
     // (§5.14.8 block-before-serve). The post-persist external work (event-log
     // append, sender-key rotation, the coalesced `checkpoint_events_since` bump)
     // is UNCHANGED and runs after.
-    let (rotated, needs_sender_key_rotation) = cell
+    let (rotated_authors, needs_sender_key_rotation) = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
             require_active(&state.handle)?;
@@ -890,7 +891,7 @@ pub async fn execute_revoke(
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            let mut rotated = 0usize;
+            let mut rotated_authors: Vec<AuthorKeyRotation> = Vec::new();
 
             // Write revocation.
             if matches!(access, AccessScope::Write | AccessScope::Both) {
@@ -930,7 +931,7 @@ pub async fn execute_revoke(
                     // author-not-found safety net (unreachable in practice).
                     match bc.governance_ban_subscriber(&did.0, access) {
                         Ok(r) => {
-                            rotated = r.rotated_authors.len();
+                            rotated_authors = r.rotated_authors;
                         }
                         Err(ContextError::MemberNotFound(_)) => {}
                         Err(e) => return Err(e),
@@ -960,7 +961,7 @@ pub async fn execute_revoke(
                 matches!(access, AccessScope::Write | AccessScope::Both)
                     && state.broadcast_context.is_none();
 
-            Ok((rotated, needs_sender_key_rotation))
+            Ok((rotated_authors, needs_sender_key_rotation))
         })
         .await?;
 
@@ -981,6 +982,49 @@ pub async fn execute_revoke(
     // Coalesced Class-C counter bump (rides the next run-loop persist, exactly
     // as before the combinator migration — NOT covered by the FC persist above).
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
+    // Spec §2008 / §2015: emit one best-effort KeyEpochAdvance leaf per author
+    // whose broadcast key was rotated by the governance ban.  Each rotation
+    // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
+    // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
+    for rotation in &rotated_authors {
+        let old_epoch = rotation.new_epoch.saturating_sub(1);
+        match scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::KeyEpochAdvancePayload {
+                old_epoch,
+                new_epoch: rotation.new_epoch,
+            },
+        ) {
+            Ok(payload) => {
+                if let Err(e) = deps
+                    .event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::KeyEpochAdvance,
+                        rotation.author_did.as_str(),
+                        payload,
+                        timestamp_secs,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        author_did = %rotation.author_did,
+                        error = %e,
+                        "KeyEpochAdvance event-log append failed after governance ban (best-effort)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    author_did = %rotation.author_did,
+                    error = %e,
+                    "KeyEpochAdvance payload encode failed after governance ban (best-effort)"
+                );
+            }
+        }
+    }
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -1035,7 +1079,7 @@ pub async fn execute_revoke(
         }
     }
 
-    Ok(rotated)
+    Ok(rotated_authors.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -3136,6 +3180,12 @@ pub async fn execute_rotate_content_keys(
 // ---------------------------------------------------------------------------
 // execute_reconfigure_governance (per-action leaf helper)
 // ---------------------------------------------------------------------------
+//
+// INVARIANT: This function is exclusively called from the `ReconfigureGovernance`
+// deadlock-resolution action. It always emits a `GovernanceDeadlockRecovery`
+// companion leaf (the justification evidence) paired with `GovernanceReconfigured`.
+// Do NOT reuse this function for non-deadlock governance reconfigurations — it
+// would emit a spurious `GovernanceDeadlockRecovery` leaf with no real justification.
 
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_reconfigure_governance(
