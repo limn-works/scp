@@ -615,11 +615,18 @@ fn ingest_pseudonym_announcement(
     // per-branch `tracing` warn, the registry insert, and the `PseudonymAnnounced`
     // buffer emit — stay HERE and are byte-and-trace-identical to the previous
     // inline implementation.
+    // S1 own-pseudonym guard (centralized in the shared classifier — ADR-057): pass
+    // this member's OWN pseudonym so a forged `attacker_did → our_pseudonym`
+    // announcement is rejected as a collision. `local_pseudonym()` and
+    // `peer_registry()` both read the routing state; capture the local pseudonym
+    // first so the two borrows do not overlap.
+    let local_pseudonym = view.routing_mut().local_pseudonym();
     match classify_pseudonym_announcement(
         plaintext,
         sender_did,
         context_id,
         view.routing_mut().peer_registry(),
+        local_pseudonym,
     ) {
         PseudonymAnnouncementDecision::NotAnnouncement => AnnouncementOutcome::NotAnnouncement,
         PseudonymAnnouncementDecision::Rejected {
@@ -3860,6 +3867,38 @@ mod pseudonym_routing_tests {
         // Registry now maps Alice's DID to her announced routing ID.
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(reg.get(&DID(ALICE.to_owned())), Some(&alice_pseudonym));
+    }
+
+    #[test]
+    fn buffered_forged_own_pseudonym_announcement_is_rejected() {
+        // S1 (centralized in the shared classifier — ADR-057): BOB forges
+        // `BOB → victim_pseudonym`, where `victim_pseudonym` is THIS receiver's own
+        // pseudonym. The sender-mismatch guard passes (BOB announces for BOB) and
+        // the value is not in the peer registry (which excludes self), but the
+        // classifier — given the receiver's own pseudonym via `local_pseudonym()` —
+        // rejects it as a collision, so native does NOT record `BOB → our address`.
+        // Mirrors the browser `classify_rejects_announcement_of_the_receivers_own_pseudonym`.
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let victim_pseudonym = [0x77u8; 32];
+        ClassCMut::from_state(&mut state)
+            .routing_mut()
+            .set_local_pseudonym(victim_pseudonym);
+
+        let result = deliver_plaintext_or_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            BOB,
+            &announcement_bytes(BOB, victim_pseudonym),
+            &ctx,
+            None,
+        );
+        // Rejected → no typed-append and (crucially) no registry insert.
+        assert_eq!(result, None);
+        let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
+        assert!(
+            reg.get(&DID(BOB.to_owned())).is_none(),
+            "a forged own-pseudonym announcement must NOT be recorded (S1)"
+        );
     }
 
     #[test]

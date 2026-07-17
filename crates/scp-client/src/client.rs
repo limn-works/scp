@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use openmls::prelude::{KeyPackageBundle, KeyPackageIn, MlsMessageOut, ProtocolVersion};
 use scp_clock::Clock;
-use scp_did::DID;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
     add_member_with_convergent_timestamp, create_group_with_wrapping_key, destroy_group,
@@ -229,6 +228,19 @@ pub struct ScpClient {
     /// channel), so [`Self::handle_relay_frame`] can resolve an inbound `BLOB`'s
     /// routing id back to the context that owns it. Rebuilt on restore.
     routing_index: HashMap<[u8; 32], String>,
+    /// Observability counter: inbound frames dropped as **self-echoes** — this
+    /// member's own publish delivered back by the relay (which has no publisher
+    /// exclusion) and rejected by openmls as `CannotDecryptOwnMessage`. In-memory
+    /// only; read via [`Self::dropped_frame_counts`]. Expected to be non-zero in
+    /// normal operation (every announcement self-echoes once).
+    dropped_self_echo: u64,
+    /// Observability counter: inbound frames on a KNOWN routing id that could not
+    /// be decrypted/applied and were **benign-dropped** rather than thrown — an
+    /// out-of-order or too-early announcement (before its sender key / at the wrong
+    /// epoch), a replay, a content/channel mismatch, or relay-injected junk that
+    /// MLS-decrypts to garbage. A persistent rise signals a hostile/broken relay
+    /// (error-spam). In-memory only; read via [`Self::dropped_frame_counts`].
+    dropped_undecryptable: u64,
 }
 
 impl ScpClient {
@@ -270,9 +282,25 @@ impl ScpClient {
             contexts: HashMap::new(),
             pending_joins: HashMap::new(),
             routing_index: HashMap::new(),
+            dropped_self_echo: 0,
+            dropped_undecryptable: 0,
         };
         client.restore_from_storage()?;
         Ok(client)
+    }
+
+    /// Observability counts of inbound relay frames the pump **benign-dropped**:
+    /// `(self_echo, undecryptable)`.
+    ///
+    /// - `self_echo` — this member's own publish echoed back by the relay (no
+    ///   publisher exclusion); expected non-zero (each announcement self-echoes).
+    /// - `undecryptable` — a frame on a KNOWN routing id that could not be
+    ///   decrypted/applied (out-of-order/too-early announcement, replay,
+    ///   content/channel mismatch, relay-injected junk). A rising count signals a
+    ///   hostile or broken relay. See [`Self::handle_relay_frame`].
+    #[must_use]
+    pub const fn dropped_frame_counts(&self) -> (u64, u64) {
+        (self.dropped_self_echo, self.dropped_undecryptable)
     }
 
     /// This participant's DID.
@@ -1108,14 +1136,43 @@ impl ScpClient {
                 let envelope = OuterEnvelope::from_bytes(&blob).map_err(|e| {
                     ClientError::Codec(format!("deserializing outer envelope: {e}"))
                 })?;
-                // A `BLOB` for a routing id whose context was closed (a stale
-                // routing_index entry — there is no eviction path yet) resolves to
-                // an absent context; drop it benignly rather than surfacing
-                // `UnknownContext` (the relay is an untrusted pipe that may deliver
-                // frames this client no longer tracks — symmetric with the
-                // unknown-routing_id drop above).
+                // The relay is an untrusted pipe: it may deliver a frame this client
+                // cannot process (a self-echo of its own publish; an out-of-order or
+                // too-early announcement before its sender key / at the wrong epoch;
+                // a replay; a content/channel mismatch; relay-injected junk that
+                // MLS-decrypts to garbage) or a stale frame for a closed context.
+                // Propagating those as `Err` would THROW into the tab's `onmessage`
+                // (a relay error-spam vector — M-C). Categorize instead:
                 match self.receive_on_channel(&context_id, &envelope.encrypted_blob, channel) {
-                    Ok(_) | Err(ClientError::UnknownContext(_)) => Ok(()),
+                    Ok(_) => Ok(()),
+                    // Stale routing_index entry for a closed context — benign.
+                    Err(ClientError::UnknownContext(_)) => Ok(()),
+                    // This member's own publish echoed back (relay has no publisher
+                    // exclusion) — expected, counted separately.
+                    Err(ClientError::Mls(MlsError::CannotDecryptOwnMessage)) => {
+                        self.dropped_self_echo += 1;
+                        Ok(())
+                    }
+                    // Any other DECRYPT-PATH failure on this KNOWN routing id (a junk
+                    // blob that MLS-decrypts to garbage → `Mls`/`Codec`; a
+                    // misdirected sender-key seal → `SenderKey`; a too-early/replayed
+                    // frame or content/channel mismatch → `Driver`/`ChannelContentMismatch`):
+                    // a benign DROP, counted for observability. Excluded (and thus
+                    // still propagated): a persist failure (`StorageBackend` / poison
+                    // / corrupt) is a REAL error, and an `UnsupportedMembershipChange`
+                    // (a Remove-bearing Commit) is a legitimate protocol event, not
+                    // decrypt junk — both must surface, not be silently swallowed.
+                    Err(
+                        ClientError::Mls(_)
+                        | ClientError::SenderKey(_)
+                        | ClientError::Codec(_)
+                        | ClientError::ChannelContentMismatch
+                        | ClientError::Driver(_),
+                    ) => {
+                        self.dropped_undecryptable += 1;
+                        Ok(())
+                    }
+                    // Persist/poison/storage failures + membership events surface.
                     Err(e) => Err(e),
                 }
             }
@@ -1249,19 +1306,13 @@ impl ScpClient {
         // member reciprocates on learning a new peer, guarded per-DID so the cascade
         // converges — see the module docs).
         let mut learned_new_peer = false;
-        let decrypted = match state
+        // Decrypt-path failures (self-echo `CannotDecryptOwnMessage`, replay,
+        // out-of-order/too-early announcement, content/channel mismatch) propagate;
+        // `handle_relay_frame` categorizes them into benign drops + counters, and a
+        // direct caller of `receive_message` sees them.
+        let decrypted = state
             .crypto
-            .decrypt_message(ciphertext, clock.as_ref(), channel)
-        {
-            Ok(inbound) => inbound,
-            // Self-echo of a frame this member published to a routing id it also
-            // subscribes to (the shared `context_routing_id` for announcements).
-            // Benign DROP — no state advanced, nothing to persist.
-            Err(ClientError::Mls(MlsError::CannotDecryptOwnMessage)) => {
-                return Ok(ReceiveOutput::default());
-            }
-            Err(e) => return Err(e),
-        };
+            .decrypt_message(ciphertext, clock.as_ref(), channel)?;
         let outcome = match decrypted {
             Inbound::Application {
                 sender_did,
@@ -1273,9 +1324,8 @@ impl ScpClient {
                 // decision core (with this member's OWN pseudonym included in the
                 // collision check — S1) and maps its verdict; it reports whether a
                 // NEW peer was recorded, to drive the reciprocal announce below.
-                let (out, new_peer) = ingest_application_plaintext(
-                    state, context_id, &self_did, sender_did, plaintext,
-                );
+                let (out, new_peer) =
+                    ingest_application_plaintext(state, context_id, sender_did, plaintext);
                 learned_new_peer = new_peer;
                 out
             }
@@ -1875,31 +1925,23 @@ impl ScpClient {
 ///
 /// # Own-pseudonym collision guard (S1)
 ///
-/// The classifier is run over the peer registry **augmented with this member's own
-/// `self_did → local_pseudonym` mapping**, so a forged
-/// `attacker_did → victim_pseudonym` announcement is rejected by the cross-DID
-/// collision check (the victim's pseudonym is already claimed by the victim's own
-/// DID). Without self in the registry the victim would accept the forgery and
-/// misroute honest senders addressing the attacker to the victim's own address.
+/// The shared classifier is passed this member's own `local_pseudonym`, so a
+/// forged `attacker_did → victim_pseudonym` announcement is rejected as a collision
+/// (the classifier owns the S1 guard centrally — see
+/// [`classify_pseudonym_announcement`]; native passes its own local pseudonym the
+/// same way). No per-frame registry clone is needed.
 fn ingest_application_plaintext(
     state: &mut PerContextState,
     context_id: &str,
-    self_did: &str,
     sender_did: String,
     plaintext: Vec<u8>,
 ) -> (ReceiveOutput, bool) {
-    // Build the collision-check registry: the peer registry plus THIS member's own
-    // (self_did → local_pseudonym). `peer_pseudonyms` deliberately excludes self
-    // (it is the fan-out address set), so self is added only for this check.
-    let mut classify_registry = state.peer_pseudonyms.clone();
-    if let Some(local) = state.local_pseudonym() {
-        classify_registry.insert(DID(self_did.to_owned()), local);
-    }
     match classify_pseudonym_announcement(
         &plaintext,
         &sender_did,
         context_id,
-        Some(&classify_registry),
+        Some(&state.peer_pseudonyms),
+        state.local_pseudonym(),
     ) {
         PseudonymAnnouncementDecision::Accept {
             member_did,
@@ -1907,10 +1949,18 @@ fn ingest_application_plaintext(
         } => {
             let learned_new_peer = !state.peer_pseudonyms.contains_key(&member_did);
             state.record_peer_pseudonym(member_did.clone(), pseudonym);
-            state.push_event(ContextEvent::PseudonymAnnounced {
-                member_did,
-                pseudonym,
-            });
+            // Emit the `PseudonymAnnounced` observability event only the FIRST time
+            // a peer is learned. A re-announce of an already-known peer (the
+            // reciprocal cascade re-sends idempotently, and key rotation re-announces)
+            // updates the registry silently — otherwise an N-party mesh would emit N
+            // noisy duplicates per peer. Matches the reciprocal-announce trigger,
+            // which also fires only on a new peer.
+            if learned_new_peer {
+                state.push_event(ContextEvent::PseudonymAnnounced {
+                    member_did,
+                    pseudonym,
+                });
+            }
             (
                 ReceiveOutput {
                     application: false,

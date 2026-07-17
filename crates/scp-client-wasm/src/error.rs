@@ -54,6 +54,12 @@ pub const fn error_code(err: &ClientError) -> &'static str {
         // Wire (de)serialization of MLS objects is a validation failure on
         // attacker-suppliable bytes.
         ClientError::Codec(_) => "SCP-VALID-7010",
+        // A decrypted frame's content type did not match the relay channel it
+        // arrived on (§9.10.4 defense-in-depth: a mis-routed announcement/app
+        // frame). Benign-dropped in `handle_relay_frame`, so it is not normally
+        // surfaced across the JS boundary; the distinct VALID code exists so it
+        // is legible if it ever is (e.g. a direct `receive_*` call).
+        ClientError::ChannelContentMismatch => "SCP-VALID-7011",
         // Context lifecycle / membership.
         ClientError::UnknownContext(_) => "SCP-CTX-2001",
         ClientError::ContextAlreadyExists(_) => "SCP-CTX-2002",
@@ -175,6 +181,22 @@ mod tests {
     }
 
     #[test]
+    fn channel_content_mismatch_gets_its_own_distinct_valid_code() {
+        // The §9.10.4 mis-routed-frame validation failure has a DISTINCT code
+        // from the generic MLS-wire codec failure, both in the VALID band, so a
+        // caller can tell a channel/content binding rejection apart from a raw
+        // deserialization fault even though the driver benign-drops it internally.
+        assert_eq!(
+            error_code(&ClientError::ChannelContentMismatch),
+            "SCP-VALID-7011"
+        );
+        assert_ne!(
+            error_code(&ClientError::ChannelContentMismatch),
+            error_code(&ClientError::Codec("wire".to_owned())),
+        );
+    }
+
+    #[test]
     fn storage_variants_map_to_distinct_stable_storage_codes() {
         // The four browser storage failure classes each get a distinct, stable
         // code in the SCP-STORAGE-8010+ sub-range (part of the public JS error
@@ -235,6 +257,7 @@ mod tests {
             ClientError::ContextAlreadyExists("c".to_owned()),
             ClientError::UnsupportedMembershipChange("c".to_owned()),
             ClientError::Codec("c".to_owned()),
+            ClientError::ChannelContentMismatch,
             ClientError::Driver("d".to_owned()),
             ClientError::NoPendingJoinMaterial {
                 context_id: "c".to_owned(),

@@ -327,6 +327,191 @@ fn partial_fan_out_returns_ok_but_total_failure_surfaces_transport() {
 }
 
 // ===========================================================================
+// M-C — an undecryptable frame on a RESOLVED routing id is a benign drop
+// ===========================================================================
+
+/// A peer's announcement can reach a member BEFORE that peer's §9.16 sender key
+/// does (the relay reorders the shared announcement channel against the
+/// out-of-band key distribution). The frame resolves to a known context but its
+/// inner sender-key layer cannot be opened. That must be a benign `Ok(())` DROP —
+/// counted in `dropped_frame_counts().1` — NOT a throw into the tab's `onmessage`
+/// (a relay error-spam vector, M-C) and NOT a recorded peer.
+///
+/// The mesh self-heals on the NEXT membership change, not by re-delivering this
+/// exact frame: the outer MLS decrypt (Layer 2) succeeds and CONSUMES this
+/// application generation for forward secrecy even though the inner sender-key
+/// decrypt (Layer 1) then fails, so this specific announcement is spent. Recovery
+/// comes from a FRESH re-announcement (new generation) — every existing member
+/// re-announces when it learns the next joiner (§9.10.4 reciprocal cascade), and
+/// by then the withheld sender key has arrived. The benign drop is what keeps that
+/// window survivable; this test pins the drop semantics (a full re-mesh is covered
+/// by `three_party_fan_out_is_decryptable_by_every_peer`).
+///
+/// Pre-fix (before the M-C categorization) `handle_relay_frame` propagated the
+/// `Driver("no sender key …")` error as `Err`, so this `is_ok()` assertion fails.
+#[test]
+fn undecryptable_announcement_on_known_routing_is_benign_drop() {
+    let relay = Relay::new();
+    let (mut alice, mut bob) = connect_two(&relay, CTX, ALICE, BOB);
+
+    // Add Carol as a real party (real key material), but WITHHOLD her sender key
+    // from Bob so her announcement is undecryptable at Bob when it arrives.
+    let mut carol = relay.new_party(CAROL, 200);
+    let carol_kp = carol.client.generate_key_package_for_join(CTX).unwrap();
+    let add = alice.client.add_member(CTX, &carol_kp).unwrap();
+    let carol_dists = carol
+        .client
+        .join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.wrapping_keys)
+        .unwrap();
+    // Bob (bystander) processes Carol's add-Commit: learns her membership, re-seals
+    // his own key to her. This does NOT give Bob Carol's sender key.
+    let bob_recv = bob.client.receive_message(CTX, &add.commit).unwrap();
+    // Give Carol the keys she needs; give ALICE Carol's key; but NOT Bob.
+    deliver_distributions(
+        CTX,
+        &add.sender_key_distributions,
+        &mut [(CAROL, &mut carol.client)],
+    );
+    deliver_distributions(
+        CTX,
+        &bob_recv.sender_key_distributions,
+        &mut [(CAROL, &mut carol.client)],
+    );
+    deliver_distributions(CTX, &carol_dists, &mut [(ALICE, &mut alice.client)]);
+    let _ = bob.client.drain_events(CTX);
+
+    // Capture Carol's own announcement (published on the shared channel at join).
+    let carol_ann = relay
+        .drain_publish_log()
+        .into_iter()
+        .find(|p| p.conn == carol.conn && p.routing_id == context_routing_id(CTX))
+        .expect("Carol announced her pseudonym on join");
+    let ann_frame = RelayMessage::Blob {
+        routing_id: context_routing_id(CTX),
+        blob_id: [0u8; 32],
+        recipient_hint: None,
+        blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+        stored_at: 0,
+        blob: carol_ann.blob.clone(),
+    }
+    .to_bytes()
+    .unwrap();
+
+    // Bob receives Carol's announcement WITHOUT her sender key → benign drop.
+    let (echo_before, undec_before) = bob.client.dropped_frame_counts();
+    assert!(
+        bob.client.handle_relay_frame(&ann_frame).is_ok(),
+        "an undecryptable frame on a resolved routing id is a benign Ok drop, never a throw"
+    );
+    let (echo_after, undec_after) = bob.client.dropped_frame_counts();
+    assert_eq!(
+        undec_after,
+        undec_before + 1,
+        "the undecryptable frame is counted in dropped_undecryptable"
+    );
+    assert_eq!(
+        echo_after, echo_before,
+        "it is not miscounted as a self-echo"
+    );
+    assert!(
+        !bob.client
+            .drain_events(CTX)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, ContextEvent::PseudonymAnnounced { .. })),
+        "an undecryptable announcement records NO peer"
+    );
+
+    // SELF-HEAL: Carol's sender key finally reaches Bob; re-delivering the SAME
+    // announcement (a relay backfill / periodic re-announce) now decrypts, records
+    // Carol, and is NOT dropped — proving the failed decrypt never advanced the
+    // announcement floor.
+    deliver_distributions(CTX, &carol_dists, &mut [(BOB, &mut bob.client)]);
+    let (_, undec_pre_heal) = bob.client.dropped_frame_counts();
+    assert!(bob.client.handle_relay_frame(&ann_frame).is_ok());
+    let (_, undec_post_heal) = bob.client.dropped_frame_counts();
+    assert_eq!(
+        undec_post_heal, undec_pre_heal,
+        "with the key installed the re-delivered announcement is decrypted, not dropped"
+    );
+    assert!(
+        bob.client
+            .drain_events(CTX)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, ContextEvent::PseudonymAnnounced { .. })),
+        "the mesh self-heals: Bob records Carol once her sender key arrives"
+    );
+}
+
+// ===========================================================================
+// M-E — a mis-routed app frame on the announcement channel is dropped
+// ===========================================================================
+
+/// A hostile/buggy relay re-routes an app-data blob (addressed to a peer's
+/// pseudonym) onto the shared `context_routing_id` (the announcement channel).
+/// The frame decrypts (the receiver has the sender's key), but its DECRYPTED
+/// content is app data on the ANNOUNCEMENT channel — a §9.10.4 content/channel
+/// mismatch (M-E). It is DROPPED (counted), surfaces NO `MessageReceived` (the
+/// app payload does not slip through the announcement path), and — per the
+/// crypto-layer unit test — never advances the announcement floor.
+///
+/// Pre-fix (before the M-E content/channel binding) the app payload decrypted on
+/// the announcement channel and surfaced as a `MessageReceived`, so the
+/// no-`MessageReceived` assertion fails.
+#[test]
+fn misrouted_app_frame_on_announcement_channel_is_dropped_not_received() {
+    let relay = Relay::new();
+    let (mut alice, mut bob) = connect_two(&relay, CTX, ALICE, BOB);
+    let _ = relay.drain_publish_log();
+
+    // Alice fans one app message out to Bob's pseudonym (NEVER the shared channel).
+    alice.client.send_message(CTX, b"app for bob").unwrap();
+    let app_pub = relay
+        .drain_publish_log()
+        .into_iter()
+        .find(|p| p.conn == alice.conn && p.routing_id != context_routing_id(CTX))
+        .expect("Alice fanned app data to Bob's pseudonym");
+    assert_ne!(
+        app_pub.routing_id,
+        context_routing_id(CTX),
+        "sanity: app data is addressed to a pseudonym, not the shared channel"
+    );
+
+    // The relay RE-ROUTES that very blob onto the shared announcement channel.
+    let misrouted = RelayMessage::Blob {
+        routing_id: context_routing_id(CTX),
+        blob_id: [0u8; 32],
+        recipient_hint: None,
+        blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
+        stored_at: 0,
+        blob: app_pub.blob.clone(),
+    }
+    .to_bytes()
+    .unwrap();
+
+    let (_, undec_before) = bob.client.dropped_frame_counts();
+    assert!(
+        bob.client.handle_relay_frame(&misrouted).is_ok(),
+        "a mis-routed app frame on the announcement channel is a benign Ok drop"
+    );
+    let (_, undec_after) = bob.client.dropped_frame_counts();
+    assert_eq!(
+        undec_after,
+        undec_before + 1,
+        "the mis-routed frame is counted as a dropped frame"
+    );
+    assert!(
+        !bob.client
+            .drain_events(CTX)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, ContextEvent::MessageReceived { .. })),
+        "an app payload mis-routed onto the announcement channel must NOT surface as a received message"
+    );
+}
+
+// ===========================================================================
 // Behavior — create does not announce; empty-registry guard; lone no-op
 // ===========================================================================
 

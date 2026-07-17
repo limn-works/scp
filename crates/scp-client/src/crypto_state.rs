@@ -37,6 +37,7 @@ use scp_mls::encrypt::{
 use scp_protocol::context::builder::{
     MANAGEMENT_MSG_MAGIC, MAX_MANAGEMENT_PAYLOAD_SIZE, try_strip_management_prefix,
 };
+use scp_protocol::context::pseudonym::is_pseudonym_announcement_payload;
 use scp_protocol::crypto::sender_keys::encrypt::{
     build_sender_header, decrypt_sender_layer, encrypt_sender_layer, parse_sender_header,
 };
@@ -851,8 +852,30 @@ impl ContextCryptoState {
             sequence,
         )?;
 
-        // Record the PER-CHANNEL floor only after a SUCCESSFUL decrypt, so a
-        // forged-but-undecryptable header cannot advance it.
+        // Content/channel binding (defense-in-depth — M-E). The `channel` was
+        // selected from the RELAY-supplied routing id, so a hostile relay that
+        // re-routes a frame onto the wrong channel could otherwise advance the wrong
+        // per-channel floor (a floor-poisoning refinement) or slip an app message
+        // through the announcement path (or vice versa). The PRIMARY guarantee
+        // against duplicate delivery is openmls's per-generation replay protection
+        // (a re-decrypt of the same MLS generation is rejected at Layer 2 above);
+        // this binds the DECRYPTED content type to its channel as defense-in-depth:
+        //   - the Announcement channel carries ONLY tagged `PseudonymAnnouncement`s;
+        //   - the App channel carries ONLY non-announcement app data.
+        // A mismatch is DROPPED here, BEFORE any floor advance, so a mis-routed
+        // frame cannot poison a floor.
+        let is_announcement = is_pseudonym_announcement_payload(&plaintext);
+        let channel_matches = match channel {
+            RecvChannel::Announcement => is_announcement,
+            RecvChannel::App => !is_announcement,
+        };
+        if !channel_matches {
+            return Err(ClientError::ChannelContentMismatch);
+        }
+
+        // Advance the PER-CHANNEL floor only AFTER a successful decrypt AND a
+        // confirmed content/channel match, so neither a forged-but-undecryptable
+        // header nor a mis-routed frame can advance it.
         match channel {
             RecvChannel::App => &mut self.recv_sequence_tracker,
             RecvChannel::Announcement => &mut self.recv_announcement_tracker,
@@ -878,6 +901,7 @@ mod tests {
         generate_key_package_with_wrapping_key, join_group,
     };
     use scp_mls::{ScpCredential, SignatureKeyPair};
+    use scp_protocol::context::pseudonym::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
     const CTX: &str = "ctx-crypto-state-unit";
@@ -1042,7 +1066,22 @@ mod tests {
         // after a higher-sequence app message. With per-channel floors, it is
         // accepted on the Announcement channel even though the same sequence is
         // rejected on the App channel (whose floor already advanced).
+        //
+        // The Announcement channel now also enforces the M-E content/channel
+        // binding, so its frames MUST carry a real tagged `PseudonymAnnouncement`
+        // (an app payload on that channel is rejected as `ChannelContentMismatch`,
+        // covered separately in `announcement_channel_rejects_app_payload`). This
+        // test keeps the floor concern isolated by sending well-formed
+        // announcements on the Announcement channel.
         let (mut alice, mut bob) = alice_and_bob();
+        let announcement_payload = || -> Vec<u8> {
+            rmp_serde::to_vec_named(&PseudonymAnnouncement {
+                tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+                member_did: ALICE.to_owned(),
+                pseudonym: [7u8; 32],
+            })
+            .unwrap()
+        };
 
         // App message at seq 5 → advances Bob's APP floor for Alice to 5.
         let app5 = alice.encrypt_message(b"app-5", ALICE, 5).unwrap();
@@ -1051,32 +1090,86 @@ mod tests {
                 .is_ok()
         );
 
-        // A message at seq 3 (LOWER) arriving on the ANNOUNCEMENT channel is
-        // ACCEPTED — the announcement floor is independent of the app floor.
-        let ann3 = alice.encrypt_message(b"ann-3", ALICE, 3).unwrap();
+        // A tagged announcement at seq 3 (LOWER) arriving on the ANNOUNCEMENT
+        // channel is ACCEPTED — the announcement floor is independent of the app
+        // floor (and the content/channel binding is satisfied).
+        let ann3 = alice
+            .encrypt_message(&announcement_payload(), ALICE, 3)
+            .unwrap();
         assert!(
             bob.decrypt_message(&ann3, &SystemClock, RecvChannel::Announcement)
                 .is_ok(),
-            "a lower-seq message on the announcement channel is accepted despite the \
-             higher app-channel floor"
+            "a lower-seq announcement on the announcement channel is accepted despite \
+             the higher app-channel floor"
         );
 
-        // The SAME seq-3 message on the APP channel is REJECTED (app floor is 5) —
+        // A seq-3 APP message on the APP channel is REJECTED (app floor is 5) —
         // confirming the app floor is untouched by the announcement.
-        let ann3_on_app = alice.encrypt_message(b"ann-3-app", ALICE, 3).unwrap();
+        let app3_on_app = alice.encrypt_message(b"app-3", ALICE, 3).unwrap();
         assert!(
-            bob.decrypt_message(&ann3_on_app, &SystemClock, RecvChannel::App)
+            bob.decrypt_message(&app3_on_app, &SystemClock, RecvChannel::App)
                 .is_err(),
             "seq 3 on the app channel is a replay/reorder (app floor already at 5)"
         );
 
         // And a replay of the announcement (seq 3 again on Announcement) is rejected
         // by the announcement floor, which advanced to 3.
-        let ann3_dup = alice.encrypt_message(b"ann-3-dup", ALICE, 3).unwrap();
+        let ann3_dup = alice
+            .encrypt_message(&announcement_payload(), ALICE, 3)
+            .unwrap();
         assert!(
             bob.decrypt_message(&ann3_dup, &SystemClock, RecvChannel::Announcement)
                 .is_err(),
             "the announcement channel still rejects its own replay"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn announcement_channel_rejects_app_payload_and_app_channel_rejects_announcement() {
+        // M-E (§9.10.4 content/channel binding, defense-in-depth): the channel is
+        // selected from the RELAY-supplied routing id, so a hostile/buggy relay can
+        // re-route a frame onto the wrong channel. The DECRYPTED content type is
+        // bound to its channel: an app payload delivered on the Announcement channel
+        // — and a tagged announcement delivered on the App channel — are both
+        // DROPPED as `ChannelContentMismatch`, BEFORE any per-channel floor advances.
+        let (mut alice, mut bob) = alice_and_bob();
+
+        // An APP payload mis-routed onto the ANNOUNCEMENT channel is rejected...
+        let app_on_ann = alice.encrypt_message(b"app-data", ALICE, 1).unwrap();
+        assert!(
+            matches!(
+                bob.decrypt_message(&app_on_ann, &SystemClock, RecvChannel::Announcement),
+                Err(ClientError::ChannelContentMismatch)
+            ),
+            "app data on the announcement channel is a content/channel mismatch"
+        );
+        // ...and did NOT poison the announcement floor (no entry recorded for Alice).
+        assert!(
+            !bob.recv_announcement_tracker.contains_key(ALICE),
+            "a mis-routed frame must not advance the announcement floor"
+        );
+
+        // Symmetrically, a tagged ANNOUNCEMENT mis-routed onto the APP channel is
+        // rejected and does not poison the app floor.
+        let ann = PseudonymAnnouncement {
+            tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: ALICE.to_owned(),
+            pseudonym: [9u8; 32],
+        };
+        let ann_on_app = alice
+            .encrypt_message(&rmp_serde::to_vec_named(&ann).unwrap(), ALICE, 2)
+            .unwrap();
+        assert!(
+            matches!(
+                bob.decrypt_message(&ann_on_app, &SystemClock, RecvChannel::App),
+                Err(ClientError::ChannelContentMismatch)
+            ),
+            "an announcement on the app channel is a content/channel mismatch"
+        );
+        assert!(
+            !bob.recv_sequence_tracker.contains_key(ALICE),
+            "a mis-routed frame must not advance the app floor"
         );
     }
 

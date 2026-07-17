@@ -50,7 +50,20 @@ pub enum ClientError {
     #[error("driver error: {0}")]
     Driver(String),
 
-    /// The injected [`Socket`](crate::Socket) failed to enqueue an outbound relay
+    /// A decrypted frame's content type did not match the relay channel it arrived
+    /// on (§9.10.4 defense-in-depth): a tagged `PseudonymAnnouncement` delivered on
+    /// a peer-pseudonym (app-data) routing id, or app data delivered on the shared
+    /// `context_routing_id` (announcement) channel. The channel is chosen from the
+    /// RELAY-supplied routing id, so a hostile/buggy relay re-routing a frame is the
+    /// cause; the frame is DROPPED before advancing any per-channel replay floor
+    /// (the primary duplicate-delivery guarantee is openmls's per-generation replay
+    /// protection — this is defense-in-depth). Benign-dropped by
+    /// [`handle_relay_frame`](crate::ScpClient::handle_relay_frame). Surfaced as
+    /// `SCP-VALID-7011`.
+    #[error("frame content does not match its relay channel (mis-routed; dropped)")]
+    ChannelContentMismatch,
+
+    /// The injected [`RelaySink`](crate::RelaySink) failed to enqueue an outbound relay
     /// frame (the WebSocket is closed, a JS exception was thrown, etc.). Best-effort
     /// transport loss — the relay is an untrusted dumb pipe and the message may be
     /// re-driven — NOT a state-corrupting error: by the time a frame is published

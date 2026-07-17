@@ -208,8 +208,26 @@ pub enum PseudonymAnnouncementDecision {
 ///    [`REJECT_COLLISION`]); otherwise [`PseudonymAnnouncementDecision::Accept`].
 ///
 /// `registry` is the caller's immutable peer registry, or `None` for a
-/// broadcast context (which carries no registry). The function performs NO
-/// side effects: it neither mutates the registry nor logs — the host owns those.
+/// broadcast context (which carries no registry). `local_pseudonym` is the
+/// RECEIVER's OWN per-context pseudonym (or `None` if it has not derived one) —
+/// see the own-pseudonym collision guard below. The function performs NO side
+/// effects: it neither mutates the registry nor logs — the host owns those.
+///
+/// # Own-pseudonym collision guard (S1)
+///
+/// The cross-DID collision check (step 4) also rejects an announcement whose
+/// pseudonym equals the receiver's OWN `local_pseudonym`. Without it a member M
+/// could announce `M → victim's_pseudonym`: the sender-mismatch guard passes (M
+/// announces for its own DID), the value is not reserved, and the victim's own
+/// pseudonym is NOT in its PEER registry (which excludes self) — so the victim
+/// would accept it and misroute every honest sender addressing M to the victim's
+/// own address. Rejecting any claim of the local pseudonym closes this for BOTH
+/// hosts in one place (native + browser), and is sound because a member never
+/// legitimately receives a peer announcement carrying its own pseudonym — its own
+/// announcements are self-echoes dropped at the MLS layer
+/// (`CannotDecryptOwnMessage`) before reaching this classifier, and a distinct
+/// member deriving the identical 32-byte Ed25519 pseudonym is negligible (and,
+/// were it to happen, a genuine collision to reject).
 // `registry` is ALWAYS the default-hasher peer registry the routing state owns;
 // a `BuildHasher` type parameter would leak an unused generic into this shared
 // cross-target decision API without real generality. Keep the concrete signature.
@@ -220,6 +238,7 @@ pub fn classify_pseudonym_announcement(
     sender_did: &str,
     context_id: &str,
     registry: Option<&HashMap<DID, [u8; 32]>>,
+    local_pseudonym: Option<[u8; 32]>,
 ) -> PseudonymAnnouncementDecision {
     // Step 1: tag-decode. A non-announcement (or untagged payload) is ordinary
     // application data.
@@ -264,7 +283,11 @@ pub fn classify_pseudonym_announcement(
             claimed_did: None,
         };
     };
-    if pseudonym_collides_with_other_did(registry, &announced_did, &announcement.pseudonym) {
+    // Cross-DID collision against the PEER registry, OR a claim of the receiver's
+    // OWN pseudonym (the S1 own-pseudonym guard — see the doc comment).
+    if pseudonym_collides_with_other_did(registry, &announced_did, &announcement.pseudonym)
+        || local_pseudonym == Some(announcement.pseudonym)
+    {
         return PseudonymAnnouncementDecision::Rejected {
             reason: REJECT_COLLISION,
             claimed_did: None,
@@ -383,7 +406,13 @@ mod tests {
     #[test]
     fn classify_untagged_payload_is_not_announcement() {
         assert_eq!(
-            classify_pseudonym_announcement(b"hello world", ALICE, CTX, Some(&HashMap::new())),
+            classify_pseudonym_announcement(
+                b"hello world",
+                ALICE,
+                CTX,
+                Some(&HashMap::new()),
+                None
+            ),
             PseudonymAnnouncementDecision::NotAnnouncement,
             "ordinary app data classifies as NotAnnouncement"
         );
@@ -398,7 +427,7 @@ mod tests {
         ann.tag = "not-the-tag".to_owned();
         let mistagged = rmp_serde::to_vec_named(&ann).expect("re-encode fixture");
         assert_eq!(
-            classify_pseudonym_announcement(&mistagged, ALICE, CTX, Some(&HashMap::new())),
+            classify_pseudonym_announcement(&mistagged, ALICE, CTX, Some(&HashMap::new()), None),
             PseudonymAnnouncementDecision::NotAnnouncement,
             "a non-magic tag classifies as NotAnnouncement"
         );
@@ -408,7 +437,7 @@ mod tests {
     fn classify_sender_mismatch_is_rejected_with_claimed_did() {
         let forged = announcement_bytes(BOB, [0x42u8; 32]);
         assert_eq!(
-            classify_pseudonym_announcement(&forged, ALICE, CTX, Some(&HashMap::new())),
+            classify_pseudonym_announcement(&forged, ALICE, CTX, Some(&HashMap::new()), None),
             PseudonymAnnouncementDecision::Rejected {
                 reason: REJECT_SENDER_MISMATCH,
                 claimed_did: Some(DID(BOB.to_owned())),
@@ -426,7 +455,7 @@ mod tests {
         ] {
             let bytes = announcement_bytes(ALICE, reserved);
             assert_eq!(
-                classify_pseudonym_announcement(&bytes, ALICE, CTX, Some(&HashMap::new())),
+                classify_pseudonym_announcement(&bytes, ALICE, CTX, Some(&HashMap::new()), None),
                 PseudonymAnnouncementDecision::Rejected {
                     reason: REJECT_RESERVED,
                     claimed_did: None,
@@ -440,7 +469,7 @@ mod tests {
     fn classify_broadcast_context_is_rejected() {
         let bytes = announcement_bytes(ALICE, [0x42u8; 32]);
         assert_eq!(
-            classify_pseudonym_announcement(&bytes, ALICE, CTX, None),
+            classify_pseudonym_announcement(&bytes, ALICE, CTX, None, None),
             PseudonymAnnouncementDecision::Rejected {
                 reason: REJECT_BROADCAST,
                 claimed_did: None,
@@ -457,7 +486,7 @@ mod tests {
         // BOB tries to claim ALICE's already-registered routing ID.
         let bytes = announcement_bytes(BOB, rid);
         assert_eq!(
-            classify_pseudonym_announcement(&bytes, BOB, CTX, Some(&registry)),
+            classify_pseudonym_announcement(&bytes, BOB, CTX, Some(&registry), None),
             PseudonymAnnouncementDecision::Rejected {
                 reason: REJECT_COLLISION,
                 claimed_did: None,
@@ -467,11 +496,54 @@ mod tests {
     }
 
     #[test]
+    fn classify_rejects_announcement_of_the_receivers_own_pseudonym() {
+        // S1: BOB announces `BOB → victim_pseudonym`, where `victim_pseudonym` is
+        // the RECEIVER's own pseudonym. The sender-mismatch guard passes (BOB
+        // announces for BOB), the value is not reserved, and it is NOT in the peer
+        // registry (which excludes self) — but the shared classifier, given the
+        // receiver's own pseudonym, rejects it as a collision. Without this the
+        // victim would misroute every honest sender addressing BOB to its own
+        // address. Covers BOTH hosts (native + browser) in one place.
+        let victim_pseudonym = [0x77u8; 32];
+        let bytes = announcement_bytes(BOB, victim_pseudonym);
+        assert_eq!(
+            classify_pseudonym_announcement(
+                &bytes,
+                BOB,
+                CTX,
+                Some(&HashMap::new()),
+                Some(victim_pseudonym),
+            ),
+            PseudonymAnnouncementDecision::Rejected {
+                reason: REJECT_COLLISION,
+                claimed_did: None,
+            },
+            "an announcement claiming the receiver's own pseudonym is rejected (S1)"
+        );
+        // A DIFFERENT pseudonym from BOB is still accepted with the local pseudonym set.
+        let other = announcement_bytes(BOB, [0x33u8; 32]);
+        assert_eq!(
+            classify_pseudonym_announcement(
+                &other,
+                BOB,
+                CTX,
+                Some(&HashMap::new()),
+                Some(victim_pseudonym),
+            ),
+            PseudonymAnnouncementDecision::Accept {
+                member_did: DID(BOB.to_owned()),
+                pseudonym: [0x33u8; 32],
+            },
+            "a non-colliding announcement is unaffected by the own-pseudonym guard"
+        );
+    }
+
+    #[test]
     fn classify_legitimate_announcement_is_accepted() {
         let pseudonym = [0x42u8; 32];
         let bytes = announcement_bytes(ALICE, pseudonym);
         assert_eq!(
-            classify_pseudonym_announcement(&bytes, ALICE, CTX, Some(&HashMap::new())),
+            classify_pseudonym_announcement(&bytes, ALICE, CTX, Some(&HashMap::new()), None),
             PseudonymAnnouncementDecision::Accept {
                 member_did: DID(ALICE.to_owned()),
                 pseudonym,
@@ -490,7 +562,7 @@ mod tests {
         // a collision (the collision guard only fires for a DIFFERENT DID).
         let bytes = announcement_bytes(ALICE, rotated);
         assert_eq!(
-            classify_pseudonym_announcement(&bytes, ALICE, CTX, Some(&registry)),
+            classify_pseudonym_announcement(&bytes, ALICE, CTX, Some(&registry), None),
             PseudonymAnnouncementDecision::Accept {
                 member_did: DID(ALICE.to_owned()),
                 pseudonym: rotated,
