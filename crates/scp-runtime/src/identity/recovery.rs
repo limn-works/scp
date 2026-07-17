@@ -986,7 +986,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             "recovery:{}:scopes={}:before={}",
             context_id, scopes, key_rotation.rotated_at,
         );
-        revocation_list.revoke(revocation_cid.clone());
+        revocation_list.revoke(revocation_cid);
 
         // Serialize the revocation list for distribution.
         let revocation_payload =
