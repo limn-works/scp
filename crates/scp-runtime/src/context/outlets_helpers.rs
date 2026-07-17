@@ -491,20 +491,9 @@ impl std::fmt::Debug for OutletEconomyReservation {
 /// `PaymentReceipt` for rendered service even if the context is torn down
 /// mid-stream.
 ///
-/// The per-sender MLS send-sequence (`base_sequence`) is deliberately NOT
-/// carried here: it is allocated at the point of consumption on the send path
-/// (allocate-at-consumption), never at open. A rollback-in-place of a
-/// pre-allocated sequence across the off-mailbox pump window would corrupt a
-/// DIFFERENT message's sequence — the actor's LIFO
-/// [`rollback_sequence_number`](scp_protocol::context::membership::MembershipState::rollback_sequence_number)
-/// `saturating_sub` is not request-scoped, and the off-mailbox bridge cannot
-/// reach the actor's `PerContextState` `send_tracker` under ADR-049 isolation —
-/// so the allocation is deferred to consumption. The cross-context send path
-/// fills this hole (SCP-OUT-044) with a task-scoped `SendSequenceTracker` +
-/// ADR-049 §8 `SequenceReservation` guard in `forward_frame` (which stamps the
-/// anchor onto a
-/// [`ForwardedStreamFrame`](crate::context::outlets::invoke::ForwardedStreamFrame));
-/// see `run_cross_context_bridge`.
+/// This reservation carries no send-sequence; A's re-seal draws A's own
+/// persistent per-sender counter at the §9.16/§5.15.7 encrypt seam (SCP-OUT-047)
+/// — do not mint a bridge-local counter here.
 #[must_use = "a StreamEconomyReservation debits open-time escrow and must be settled or reversed at stream close — dropping leaks the held reservation"]
 pub struct StreamEconomyReservation {
     /// Context handle snapshot — the off-mailbox pump reads lifecycle state
@@ -1076,16 +1065,10 @@ pub async fn reserve_outlet_economy(
 ///
 /// 1. **Membership gate** — the invoker must be on the §9.8.5 membership
 ///    roster ([`MembershipState::contains`](scp_protocol::context::membership::MembershipState::contains));
-///    a non-member has no per-sender stream state and is rejected. The
-///    per-sender `base_sequence` is NOT allocated here — the send path
-///    allocates it at the point of consumption (allocate-at-consumption),
-///    because a rollback-in-place across the off-mailbox pump window would
-///    corrupt a DIFFERENT message's sequence (the actor's LIFO
-///    `saturating_sub` is not request-scoped, and the off-mailbox bridge
-///    cannot reach the actor `send_tracker` under ADR-049 isolation). The
-///    cross-context send path fills this hole (SCP-OUT-044) with a
-///    task-scoped `SendSequenceTracker` in `forward_frame` /
-///    `run_cross_context_bridge`.
+///    a non-member has no per-sender stream state and is rejected. This
+///    reservation carries no send-sequence; A's re-seal draws A's own
+///    persistent per-sender counter at the §9.16/§5.15.7 encrypt seam
+///    (SCP-OUT-047) — do not mint a bridge-local counter here.
 /// 2. **Open-time escrow** — a faithful port of the reference
 ///    `outlet_stream_reserve_escrow`: `reserved = cost_per_chunk ×
 ///    estimated_chunk_count` (checked; overflow → `EscrowOverflow`), gated
@@ -1165,17 +1148,10 @@ pub async fn reserve_outlet_stream_economy(
 
     // --- Membership gate (Class-C membership roster, §9.8.5). A non-member has
     // no per-sender stream state — reject (rolling back the velocity tick +
-    // hard-rate token consumed above). The per-sender `base_sequence` is NOT
-    // allocated here: the send path allocates it at the point of consumption
-    // (allocate-at-consumption). Holding a pre-allocated sequence across the
-    // off-mailbox pump window and rolling it back in place would corrupt a
-    // DIFFERENT message's sequence — the actor's LIFO `saturating_sub` in
-    // `rollback_sequence_number` is not request-scoped, and the off-mailbox
-    // bridge cannot reach the actor `send_tracker` under ADR-049 isolation — so
-    // the allocation is deferred to consumption. The cross-context send path
-    // fills this hole (SCP-OUT-044): a task-scoped `SendSequenceTracker` +
-    // ADR-049 §8 `SequenceReservation` in `forward_frame` /
-    // `run_cross_context_bridge`.
+    // hard-rate token consumed above). This reservation carries no send-sequence;
+    // A's re-seal draws A's own persistent per-sender counter at the
+    // §9.16/§5.15.7 encrypt seam (SCP-OUT-047) — do not mint a bridge-local
+    // counter here.
     let invoker_did_str = invoker_did.to_string();
     if !cell
         .class_c_view()
