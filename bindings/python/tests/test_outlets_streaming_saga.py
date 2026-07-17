@@ -8,17 +8,37 @@ recover wrapper against a scripted mock ``_native`` bridge that plays back the
 arrays) — the SAME mock-``_native`` convention every other Python outlet/saga
 test uses (``test_outlets.py`` / ``test_outlets_streaming.py``).
 
-**Layer boundary (why these are scripted, not live).** The streaming saga's
-full committed / non-blocking / truncated-close paths require the runtime
-actor-state interface + budget injection, which has NO bridge-public wiring
-(identical to the unary saga export). Those runtime assertions —
-non-blocking-open while the saga FSM is genuinely pre-Committed, the durable
-prefix ``billed_count``, and the outlet exec fn being invoked EXACTLY once on a
-replayed truncated close — are owned by the ``scp-runtime`` integration test
-``xctx_streaming_saga_truncated_close_ac7`` and the ``scp-ffi`` Rust
-``e2e_bridge.rs`` bridge tests (``xctx_streaming_saga_*``), NOT re-faked here.
-The FFI recover returns ``()`` and surfaces NO ``billed_count`` to the SDK, so
-that datum is not observable at this layer by construction.
+**Layer boundary (why these are scripted, not live), and where each behavioral
+guarantee is ACTUALLY proven.** These SDK tests own only the wrapper's own
+behavior; the underlying protocol guarantees are proven at the layers that can
+drive them, cited precisely (no false delegation):
+
+- **Non-blocking-open at the FFI boundary** — proven by the ``scp-ffi`` Rust
+  ``e2e_bridge.rs`` test
+  ``xctx_streaming_saga_open_returns_before_committed_non_blocking``: it drives
+  the REAL ``outlet_streaming_saga_open`` to the Commit-transition with the
+  target handler blocked and asserts the open returns a ``saga_id`` while the
+  supervisor's own durable saga journal still reads ``Committing`` (pre-Committed).
+- **Durable-prefix ``billed_count`` + the outlet exec fn invoked EXACTLY once on
+  a replayed truncated close** — proven by the ``scp-runtime`` integration test
+  ``xctx_streaming_saga_truncated_close_ac7`` (the full crash → NeedsRepair →
+  key-bearing recover → ``Committed`` path needs the actor-state interface +
+  budget injection, which has NO bridge-public wiring — identical to the unary
+  saga export). The FFI recover returns ``()`` and surfaces NO ``billed_count``
+  to the SDK, so that datum is not observable at this layer by construction.
+- **FFI caller/reconnect authentication** — proven by the ``scp-ffi``
+  ``e2e_bridge.rs`` rejection tests (``xctx_streaming_saga_unhosted_caller_*``,
+  ``_hosted_non_member_*``, ``_recover_unhosted_caller_*``,
+  ``_recover_unknown_saga_*``, ``_recover_hosted_non_invoker_*``), which drive
+  the real bridge open/recover and assert the typed rejections BEFORE the saga /
+  seal runs.
+
+A genuine FFI-through ``recover`` → ``Committed`` reconnect is NOT proven at the
+FFI boundary: producing a witness-absent NeedsRepair durable prefix requires a
+multi-chunk-then-crash pump the single-shot FFI executor cannot emit, plus
+resident-actor capture state that ``spawn_actor_with_state``
+(``pub(in crate::context)``) deliberately withholds from external test crates —
+so that path is proven at the runtime layer above.
 
 What THESE tests own is the SDK wrapper's own behavior, driven end-to-end
 through the public SDK surface:

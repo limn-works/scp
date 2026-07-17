@@ -2338,6 +2338,308 @@ fn xctx_saga_authenticated_caller_commits_via_governance_established_interface()
 }
 
 // ============================================================================
+// Cross-context STREAMING saga — NON-BLOCKING OPEN at the FFI boundary
+// (§5.4.5 / §6.2.4, SCP-OUT-047 AC6) — PyO3 export
+// ============================================================================
+//
+// The rejection tests above prove the caller-binding gates BEFORE the saga
+// runs. This drives the FULL happy path through the REAL FFI
+// `outlet_streaming_saga_open` to the Commit-transition and asserts the
+// property AC6 names: the open returns a `saga_id` PROMPTLY while the saga FSM
+// is still PRE-Committed (the supervisor's own durable journal reads
+// `Committing`) — i.e. the open did NOT block until the stream terminated. The
+// bridge's `BridgeStreamExecutor` is single-shot by the accepted SCP-OUT-037
+// primitive (handler → one value → one Data chunk + framework terminal); a
+// target handler that BLOCKS before releasing its one value makes the
+// pre-Committed observation race-free (the off-mailbox seal cannot reach
+// stream-close, and thus cannot resolve `Committed`, until the test releases
+// it).
+
+/// Builds and wires the full CROSS-CONTEXT STREAMING saga precondition through
+/// the `PyO3` bridge: an `owner` admin, a delegated `invoker`, caller context A,
+/// target context B, the outlet registered into both B's actor governance state
+/// and the FFI-side registry (with a *controllable* single-shot handler that
+/// BLOCKS until released), the invoker seeded as a capability-bearing member of
+/// BOTH A and B, the bidirectionally-approved `OutletInterface` established in A,
+/// and an `outlet_call:*` invocation UCAN (owner → invoker) minted in B.
+///
+/// Distinct from [`establish_xctx_saga_commit_preconditions`] (the UNARY saga
+/// helper, whose export validates no UCAN at the bridge and needs no delegated
+/// invoker): the streaming-saga open validates the invocation UCAN at the bridge
+/// against the TARGET context B, so B's ceiling MUST admit `outlet:call:*` (else
+/// `ucan_mint`'s mint-time ceiling check rejects) and a delegated invoker
+/// (iss ≠ aud) is required — a self-issued owner → owner token would need a
+/// `key_scope` (ADR-039).
+///
+/// Returns `(scp, ctx_a, ctx_b, invoker, outlet_id, invocation_ucan,
+/// release_tx)`; the `#[test]` body drives the open, asserts the pre-Committed
+/// journal state, then `release_tx.send(())` unblocks the handler so the stream
+/// drains to its terminal.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[allow(clippy::too_many_lines)] // one linear cross-context streaming precondition
+fn establish_xctx_streaming_saga_preconditions(
+    py: Python<'_>,
+) -> (
+    _scp_core::scp::PyScp,
+    String,
+    String,
+    String,
+    String,
+    String,
+    std::sync::mpsc::Sender<()>,
+) {
+    setup();
+    let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+    let bi = scp.bridge_instance();
+
+    // Owner (admin/creator of both contexts) + a SEPARATE delegated invoker,
+    // both PUBLISHED into the resolver so governance vote verification and the
+    // invocation-UCAN signature check resolve their keys. Created BEFORE the
+    // context manager so the supervisor snapshots the real document-VM resolver
+    // (mirrors the unary saga helper's ordering).
+    let owner = published_identity_did(py, &scp);
+    let invoker = published_identity_did(py, &scp);
+
+    runtime::init_context_manager_for_test(bi);
+
+    // Context A (caller/source). Its ceiling carries `governance:propose` (owner
+    // proposes), `outlet:interface` (the interface-establish ceiling check), and
+    // `outlet:call:*` (so the invoker's granted OutletCallAll stays within A's
+    // ceiling).
+    let params_a = PyDict::new(py);
+    let ceiling_a = PyList::new(
+        py,
+        [
+            "governance:propose",
+            "outlet:interface",
+            "outlet:call:*",
+            "messages:read",
+            "messages:write",
+        ],
+    )
+    .unwrap();
+    params_a.set_item("ceiling", ceiling_a).unwrap();
+    let handle_a = scp.context_create(&owner, &params_a.as_borrowed()).unwrap();
+    let ctx_a = handle_context_id(py, &handle_a);
+
+    // Context B (target). Its ceiling carries `governance:propose`,
+    // `outlet:register` (so the saga outlet registers into B's ACTOR governance
+    // state), and `outlet:call:*` — REQUIRED so `ucan_mint` (mint-time ceiling
+    // enforcement) accepts the `outlet_call:*` invocation UCAN issued in B.
+    let params_b = PyDict::new(py);
+    let ceiling_b = PyList::new(
+        py,
+        ["governance:propose", "outlet:register", "outlet:call:*"],
+    )
+    .unwrap();
+    params_b.set_item("ceiling", ceiling_b).unwrap();
+    let handle_b = scp.context_create(&owner, &params_b.as_borrowed()).unwrap();
+    let ctx_b = handle_context_id(py, &handle_b);
+
+    let outlet_name = "xctx_streaming_saga_outlet";
+    let outlet_id = format!("outlet-{outlet_name}");
+
+    // Register the saga outlet into B's ACTOR governance state (saga Prepare-B
+    // reads it) AND the FFI-side registry (the executor snapshots the handler).
+    let register_json = register_outlet_action_json(&outlet_id, outlet_name, &owner);
+    scp.governance_propose(&handle_b, &owner, &register_json)
+        .expect("RegisterOutlet must auto-execute under single_admin");
+    let reg = build_outlet_reg(py, outlet_name, &owner);
+    let ffi_outlet_id = scp.outlet_register(&ctx_b, &reg.as_borrowed()).unwrap();
+    assert_eq!(
+        ffi_outlet_id, outlet_id,
+        "FFI and governance outlet ids must agree (deterministic generate_outlet_id)"
+    );
+
+    // A CONTROLLABLE single-shot handler: it BLOCKS on `release_rx.recv()` until
+    // the test releases it, so the off-mailbox seal cannot reach the terminal
+    // (and thus cannot resolve `Committed`) until the pre-Committed journal state
+    // has been observed. `Arc<Mutex<Receiver>>` is `Send + Sync` (the handler is
+    // `Fn + Send + Sync`); it is invoked exactly once (single-shot).
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(std::sync::Mutex::new(release_rx));
+    let handler: runtime::OutletHandler = Arc::new(move |_input: serde_json::Value| {
+        if let Ok(rx) = gate.lock() {
+            let _ = rx.recv();
+        }
+        Ok(serde_json::json!({ "sum": 42, "ok": 1 }))
+    });
+    runtime::register_outlet_handler(bi, &ctx_b, &outlet_id, handler).unwrap();
+
+    // Seed the invoker as a capability-bearing member of BOTH contexts: member of
+    // A (the §6.2.4 caller-principal binding checks A-membership) with
+    // OutletInterface + OutletCallAll, and member of B (the pump's §9.8.5
+    // membership + role-state capability gate) with OutletCallAll. Mirrors the
+    // runtime fixture `ss_grant_outlet_caps` / the same-context live-stream test.
+    {
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        rt.block_on(supervisor.test_insert_member(&ctx_a, scp_did::DID(invoker.clone()), "member"))
+            .expect("seed invoker as a member of caller context A");
+        rt.block_on(supervisor.test_grant_member_capability(
+            &ctx_a,
+            scp_did::DID(invoker.clone()),
+            "outlet_call:*",
+        ))
+        .expect("grant OutletCallAll to the invoker in A");
+        rt.block_on(supervisor.test_grant_member_capability(
+            &ctx_a,
+            scp_did::DID(invoker.clone()),
+            "outlet:interface",
+        ))
+        .expect("grant OutletInterface to the invoker in A");
+        rt.block_on(supervisor.test_insert_member(&ctx_b, scp_did::DID(invoker.clone()), "member"))
+            .expect("seed invoker as a member of target context B");
+        rt.block_on(supervisor.test_grant_member_capability(
+            &ctx_b,
+            scp_did::DID(invoker.clone()),
+            "outlet_call:*",
+        ))
+        .expect("grant OutletCallAll to the invoker in B");
+    }
+
+    // Establish the bidirectionally-approved interface in A via governance.
+    let action_json = establish_interface_action_json(&ctx_a, &ctx_b, &outlet_id);
+    scp.governance_propose(&handle_a, &owner, &action_json)
+        .expect("EstablishOutletInterface must auto-execute under single_admin");
+
+    // Mint the invocation UCAN in B (issued by B's creator `owner`, delegated to
+    // the `invoker` audience), granting `outlet_call:*`. The streaming-saga open
+    // validates it at the bridge against B (the "UCAN check locus").
+    let ucan = scp
+        .ucan_mint(&ctx_b, &invoker, vec!["outlet_call:*".to_owned()], None)
+        .expect("mint the outlet_call invocation UCAN in B")
+        .encoded;
+
+    (scp, ctx_a, ctx_b, invoker, outlet_id, ucan, release_tx)
+}
+
+/// SCP-OUT-047 AC6 — the streaming-saga FFI open does NOT block until Committed.
+/// Drives the REAL `outlet_streaming_saga_open` to the Commit-transition with a
+/// target handler BLOCKED before releasing its single-shot value, and asserts
+/// the open returned a `saga_id` while the supervisor's own durable saga journal
+/// still reads `Committing` (pre-Committed / sealing). Then releases the handler
+/// and drains to the terminal via `outlet_streaming_saga_poll_next`.
+///
+/// This is the FFI-boundary proof of AC6's INTENT (non-blocking open): the seal
+/// pumps off-mailbox and reaches `Committed` asynchronously at stream-close, NOT
+/// inline on the open call.
+#[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
+#[test]
+#[allow(clippy::too_many_lines)] // one linear §6.2.4 non-blocking-open flow
+fn xctx_streaming_saga_open_returns_before_committed_non_blocking() {
+    use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk};
+    use scp_core::context::supervisor::{SagaId, SagaState};
+
+    Python::with_gil(|py| {
+        let (scp, ctx_a, ctx_b, invoker, outlet_id, ucan, release_tx) =
+            establish_xctx_streaming_saga_preconditions(py);
+
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        // A near-now timestamp: Prepare-B enforces a §9.14 ±5min skew tolerance.
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        // OPEN — the REAL FFI streaming-saga export. It MUST return a `saga_id` at
+        // the Commit-transition (non-blocking); the seal pumps off-mailbox, and
+        // the target handler is BLOCKED, so the stream cannot yet reach terminal.
+        // `estimated_chunk_count = Some(1)` matches the single-shot executor's one
+        // billable Data chunk (an unbounded default would trip the credit-window
+        // bound).
+        let saga_id = scp
+            .outlet_streaming_saga_open(
+                &ctx_a,
+                &ctx_b,
+                &invoker,
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                now_ms,
+                1,
+                &ucan,
+                None,
+                None,
+                None,
+                Some(1),
+            )
+            .expect("the streaming-saga open returns a saga_id at the Commit-transition");
+        assert!(
+            !saga_id.is_empty(),
+            "a Commit-transition streaming saga carries a non-empty saga id"
+        );
+
+        // AC6 — the open returned while the saga FSM is still PRE-Committed: the
+        // supervisor's OWN durable journal reads `Committing`. The off-mailbox seal
+        // has NOT resolved it to `Committed` (the handler is blocked), proving the
+        // FFI open did not block until stream-terminal. Read via the supervisor's
+        // testing journal accessor on the test runtime (a journal read, no mailbox).
+        let bi = scp.bridge_instance();
+        let rt = test_runtime();
+        let supervisor = runtime::supervisor(bi).unwrap().clone();
+        let sid = SagaId(saga_id.clone());
+        let state = rt.block_on(supervisor.test_saga_journal_state(&sid));
+        assert_eq!(
+            state,
+            Some(SagaState::Committing),
+            "AC6: the FFI open returned while the streaming saga is still pre-Committed \
+             (journal Committing / sealing) — a non-blocking open"
+        );
+
+        // Release the blocked handler; the single-shot seal now forwards its one
+        // Data chunk and closes to the terminal.
+        release_tx
+            .send(())
+            .expect("release the blocked target handler so the seal reaches the terminal");
+
+        // Drain to terminal via the REAL FFI poll_next. The single-shot executor
+        // yields exactly one Data chunk plus the framework terminal.
+        let mut saw_data = false;
+        let mut saw_terminal = false;
+        for _ in 0..16 {
+            let Some(bytes) = scp.outlet_streaming_saga_poll_next(py, &saga_id).unwrap() else {
+                // Abnormal terminal (channel closed without a terminal chunk).
+                break;
+            };
+            let chunk: OutletStreamChunk = serde_json::from_slice(&bytes).unwrap();
+            if matches!(chunk.payload, ChunkPayload::Data { .. }) {
+                saw_data = true;
+            }
+            if chunk.payload.is_terminal() {
+                saw_terminal = true;
+                break;
+            }
+        }
+        assert!(
+            saw_data,
+            "the single-shot seal forwarded its one Data chunk"
+        );
+        assert!(
+            saw_terminal,
+            "poll_next drained the streaming saga to its terminal chunk"
+        );
+
+        // The terminal EVICTED the saga registry entry — a further poll is a
+        // DISTINCT not-found error (the saga is genuinely gone), never a silent None.
+        assert!(
+            scp.outlet_streaming_saga_poll_next(py, &saga_id)
+                .unwrap_err()
+                .to_string()
+                .contains("no active cross-context streaming saga"),
+            "the saga entry is evicted at the terminal chunk (no registry leak)"
+        );
+        let _ = ctx_b;
+    });
+}
+
+// ============================================================================
 // Streaming outlets (§5.4.5, SCP-OUT-037 — C7 PyO3 reference bridge)
 // ============================================================================
 
