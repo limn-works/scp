@@ -504,21 +504,21 @@ class TestStreamingSagaHandleContract:
         # seq0 then seq2 (seq1 MISSING) — no live cross-context cancel plane, so
         # the gap is a purely local terminal (no bridge cancel round-trip exists).
         native = _FakeSagaNative([_data(0, {"n": 0}), _data(2, {"n": 2})])
-        # Spy every conceivable bridge teardown path. The cross-context saga runs
-        # with cancel_ack_ceiling = u64::MAX (§6.2.5 / SCP-OUT-046: NO live cancel
-        # plane), so a receiver-detected gap is a purely LOCAL terminal — the SDK
-        # must issue NO cancel/terminate round-trip to the bridge, UNLIKE the
-        # same-context handle which signs a receiver OutletCancel on a gap.
-        native.outlet_streaming_saga_cancel = MagicMock()
-        native.outlet_streaming_saga_terminate = MagicMock()
+        # The cross-context saga runs with cancel_ack_ceiling = u64::MAX (§6.2.5 /
+        # SCP-OUT-046: NO live cancel plane), so a receiver-detected gap is a
+        # purely LOCAL terminal. Guard against a copy-paste re-introducing the
+        # same-context receiver's signed OutletCancel on a gap: the ONLY bridge
+        # cancel method that exists (outlet_stream_cancel — the same-context
+        # plane) must NOT be called here.
         native.outlet_stream_cancel = MagicMock()
         handle = _open_saga(native)
         with pytest.raises(StreamGap):
             async for _ in handle:
                 pass
-        native.outlet_streaming_saga_cancel.assert_not_called()
-        native.outlet_streaming_saga_terminate.assert_not_called()
         native.outlet_stream_cancel.assert_not_called()
+        # The drain pulled seq0 + seq2 and then stopped LOCALLY on the gap: no
+        # further poll round-trip was issued to the bridge after detecting it.
+        assert native.poll_calls == 2
 
     async def test_second_concurrent_driver_raises_protocol_error(self) -> None:
         native = _FakeSagaNative([_data(i, {"n": i}) for i in range(5)])

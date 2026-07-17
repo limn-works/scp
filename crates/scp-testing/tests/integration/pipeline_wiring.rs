@@ -2221,6 +2221,14 @@ fn out047_pyo3_streaming_saga_recover_reaches_truncated_close() {
          (identity-registry check) before sealing — the caller MUST be the \
          channel-authenticated principal (§6.2.4)."
     );
+    assert!(
+        body.contains("resolve_context_signing_key"),
+        "PyO3 streaming-saga recover must SURFACE the target context's Active \
+         Signing Key per-call from custody (resolve_context_signing_key) before \
+         sealing — the recovery receipt is signed with a custody-resolved key, \
+         NEVER an envelope-asserted one (§6.2.4). Structurally pins the \
+         FFI-layer key-surfacing, not just the runtime seal."
+    );
 }
 
 // §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8a). The NAPI
