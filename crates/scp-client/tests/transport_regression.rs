@@ -502,6 +502,57 @@ fn misrouted_app_frame_on_announcement_channel_is_dropped_not_received() {
 }
 
 // ===========================================================================
+// P0 — resubscribe_all re-establishes delivery after a closed-socket entry
+// ===========================================================================
+
+/// Entry-time `SUBSCRIBE`s are best-effort and never fail context entry
+/// (ADR-057 F-API1/R1): if the relay socket is still closed during entry (or a
+/// tab is restored from storage before the socket opens), those subscriptions are
+/// silently dropped and the client is durably present but DEAF — a publish to a
+/// routing id it "holds" reaches it only if the relay's subscription table has it.
+/// `resubscribe_all` (called from the socket's `onopen`) re-drives every tracked
+/// routing id's `SUBSCRIBE`, restoring delivery.
+///
+/// Without the wasm `resubscribeAll` export (P0) the browser could never make this
+/// call, so a reconnected tab would stay deaf. Here we prove the underlying
+/// `ScpClient::resubscribe_all` behaviour over the faithful relay: a publish
+/// before the re-subscribe is NOT delivered; the same publish after IS.
+#[test]
+fn resubscribe_all_restores_delivery_after_entry_time_subscribes_were_dropped() {
+    let relay = Relay::new();
+    let mut alice = relay.new_party(ALICE, 0);
+
+    // Alice's socket is CLOSED for the whole of context entry: `create_context`
+    // issues exactly two best-effort SUBSCRIBEs (local pseudonym + shared channel)
+    // and publishes nothing (a lone creator), so both are dropped. The socket then
+    // "opens" (attempt 3+ succeed).
+    relay.fail_send_until(alice.conn, 2);
+    alice.client.create_context(CTX).unwrap();
+
+    // An external member publishes an (opaque) blob to the shared announcement
+    // channel. Alice is NOT subscribed (her entry SUBSCRIBE was dropped) → nothing
+    // is queued for her.
+    relay.external_publish(context_routing_id(CTX), b"pre-resubscribe blob".to_vec());
+    assert_eq!(
+        relay.queued(alice.conn),
+        0,
+        "a publish before resubscribe_all is not delivered — the entry SUBSCRIBE was dropped"
+    );
+
+    // The socket is open now; the embedder's `onopen` calls resubscribe_all, which
+    // re-drives a SUBSCRIBE for every tracked routing id (now succeeding).
+    alice.client.resubscribe_all();
+
+    // The SAME publish is now delivered: Alice's queue receives the blob.
+    relay.external_publish(context_routing_id(CTX), b"post-resubscribe blob".to_vec());
+    assert_eq!(
+        relay.queued(alice.conn),
+        1,
+        "after resubscribe_all a subsequently-published BLOB is delivered"
+    );
+}
+
+// ===========================================================================
 // Behavior — create does not announce; empty-registry guard; lone no-op
 // ===========================================================================
 

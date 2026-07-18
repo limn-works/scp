@@ -9,6 +9,20 @@
 //! [`WasmScpClient::handle_relay_frame`](crate::WasmScpClient::handle_relay_frame),
 //! so the socket itself is **outbound-only** — it is never read through.
 //!
+//! # Embedder contract: re-subscribe on every socket (re)open
+//!
+//! Entry-time `SUBSCRIBE`s are best-effort and never fail context entry (ADR-057
+//! F-API1/R1). If the socket is not yet open when a context is entered — the first
+//! connect, a reconnect after a drop, or a tab restored from storage before the
+//! socket opens — those `SUBSCRIBE` frames are silently dropped and the client is
+//! durably present but receives nothing. The TypeScript SDK's WebSocket `onopen`
+//! handler (fired on the initial open AND on every reconnect) MUST therefore call
+//! [`WasmScpClient::resubscribe_all`](crate::WasmScpClient::resubscribe_all), which
+//! re-drives a `SUBSCRIBE` for every tracked routing id. It is idempotent and
+//! best-effort, so calling it on every `onopen` is always safe. Omitting it leaves
+//! a reconnected or restored tab deaf — the failure the `resubscribeAll` export
+//! (P0) exists to let the embedder prevent.
+//!
 //! Restores the deleted WASM bridge's JS-injected-extern shape (a JS object the
 //! TypeScript wrapper injects), matching [`crate::custody`] and [`crate::storage`].
 

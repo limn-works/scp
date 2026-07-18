@@ -93,6 +93,14 @@ struct RelayState {
     /// Per-connection: fail a conn's `PUBLISH` sends after this many succeed (for
     /// the M1 partial-fan-out test). `SUBSCRIBE`s always succeed.
     fail_publish_after: HashMap<ConnId, usize>,
+    /// Per-connection: FAIL every `send` (SUBSCRIBE and PUBLISH alike) until the
+    /// connection's total send count reaches this threshold — modelling a sink
+    /// whose WebSocket is still closed during context entry, so the entry-time
+    /// best-effort SUBSCRIBEs are silently dropped (P0 resubscribe test). A later
+    /// `resubscribe_all` re-drives them once the socket is open.
+    fail_send_until: HashMap<ConnId, usize>,
+    /// Per-connection total `send` attempts (drives `fail_send_until`).
+    send_attempts: HashMap<ConnId, usize>,
     /// Per-connection count of `PUBLISH` sends attempted (drives `fail_publish_after`).
     publish_attempts: HashMap<ConnId, usize>,
     next_conn: ConnId,
@@ -230,6 +238,40 @@ impl Relay {
         st.publish_attempts.insert(conn, 0);
     }
 
+    /// Makes EVERY `send` on `conn` (SUBSCRIBE and PUBLISH) FAIL until the
+    /// connection has attempted `n` sends, then succeed — modelling a sink whose
+    /// WebSocket is still closed during context entry (the entry-time best-effort
+    /// SUBSCRIBEs are dropped), then opens. Drives the P0 `resubscribe_all` test.
+    #[allow(clippy::expect_used)]
+    pub fn fail_send_until(&self, conn: ConnId, n: usize) {
+        let mut st = self.state.lock().expect("relay lock");
+        st.fail_send_until.insert(conn, n);
+        st.send_attempts.insert(conn, 0);
+    }
+
+    /// Publishes a blob to `routing_id` from an EXTERNAL peer (a synthetic
+    /// connection), fanning it out through the subscription table exactly like a
+    /// real `PUBLISH` — so it reaches a conn ONLY if that conn is currently
+    /// subscribed to `routing_id`. Models another member publishing while the
+    /// subscribe timing is under test (P0 resubscribe). Returns nothing; assert
+    /// delivery via [`Self::queued`] or by pumping.
+    #[allow(clippy::expect_used)]
+    pub fn external_publish(&self, routing_id: [u8; 32], blob: Vec<u8>) {
+        // A reserved conn id no `Party` is allocated (ids count up from 0).
+        const EXTERNAL_CONN: ConnId = ConnId::MAX;
+        let mut st = self.state.lock().expect("relay lock");
+        st.apply(
+            EXTERNAL_CONN,
+            ClientMessage::Publish {
+                ref_id: None,
+                routing_id,
+                recipient_hint: None,
+                blob_ttl: 300,
+                blob,
+            },
+        );
+    }
+
     /// Injects a raw `RelayMessage::Blob` frame directly into `conn`'s queue,
     /// bypassing the subscription table — for adversarial tests that deliver a
     /// crafted/foreign/tampered blob to a specific victim.
@@ -361,6 +403,22 @@ impl RelaySink for RelayConn {
     fn send(&self, frame: Vec<u8>) -> Result<(), String> {
         let msg = ClientMessage::from_bytes(&frame).map_err(|e| format!("relay decode: {e}"))?;
         let mut st = self.state.lock().map_err(|e| format!("relay lock: {e}"))?;
+        // Simulated closed-socket-during-entry (P0): every send fails until the
+        // conn has attempted `fail_send_until` sends, modelling a WebSocket that is
+        // not yet open. The count advances even on the failed attempts so the sink
+        // "opens" after the threshold.
+        {
+            let attempt = {
+                let n = st.send_attempts.entry(self.conn).or_default();
+                *n += 1;
+                *n
+            };
+            if let Some(&threshold) = st.fail_send_until.get(&self.conn)
+                && attempt <= threshold
+            {
+                return Err("simulated closed socket".to_owned());
+            }
+        }
         // Simulated partial-fan-out failure (M1): a conn's PUBLISHes fail after its
         // configured limit. SUBSCRIBEs always succeed.
         if matches!(msg, ClientMessage::Publish { .. }) {

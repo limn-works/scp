@@ -500,6 +500,22 @@ impl WasmScpClient {
         map_err(self.inner.handle_relay_frame(&frame))
     }
 
+    /// Re-drives a `SUBSCRIBE` for every routing id this client tracks (its local
+    /// pseudonym and each held context's shared announcement channel).
+    ///
+    /// The embedder MUST call this from the relay WebSocket's `onopen` on EVERY
+    /// (re)connect. Entry-time subscription is best-effort and never fails context
+    /// entry (ADR-057 F-API1/R1), so any `SUBSCRIBE` enqueued while the socket was
+    /// closed — including every subscription for a tab restored from storage before
+    /// the socket first opened — was silently dropped. Without this call the client
+    /// is durably present but receives nothing (goes deaf). Idempotent and
+    /// best-effort: safe to call any time the socket is (re)opened; it never throws
+    /// (a failed re-subscribe is retried on the next `onopen`).
+    #[wasm_bindgen(js_name = "resubscribeAll")]
+    pub fn resubscribe_all(&self) {
+        self.inner.resubscribe_all();
+    }
+
     /// Receives an inbound MLS message in `context_id`. Returns a
     /// [`WasmReceiveOutput`]: `application` is `true` if it was an application
     /// message (a `MessageReceived` event is buffered for
