@@ -204,11 +204,25 @@ fn three_party_fan_out_is_decryptable_by_every_peer() {
 // S1 — own-pseudonym forgery is rejected
 // ===========================================================================
 
-/// A member (Bob) forges an announcement claiming `member_did = ALICE_victim`'s...
-/// actually claiming ITS OWN DID mapped to the VICTIM's pseudonym would be caught
-/// by sender-mismatch. The S1 attack is a peer announcing `attacker_did →
-/// victim_pseudonym`; the classifier run over the registry AUGMENTED WITH SELF
-/// rejects it as a cross-DID collision, so the victim does not misroute.
+/// The S1 attack: a peer (Bob) announces `attacker_did → victim_pseudonym`
+/// (Bob's own DID mapped to ALICE's own routing id), trying to hijack the
+/// address every honest sender fans app-data out to. The classifier run over
+/// the registry AUGMENTED WITH THE RECEIVER'S OWN pseudonym
+/// (`classify_pseudonym_announcement`'s `local_pseudonym == announced` clause)
+/// rejects it, so the victim does not misroute.
+///
+/// This test drives the S1 guard SPECIFICALLY (not the M-E content/channel drop
+/// or a benign undecryptable drop). Bob sends the forgery via `send_message`,
+/// but the payload IS a tagged `PseudonymAnnouncement`, so `encrypt_and_fanout`
+/// classifies it (`is_pseudonym_announcement_payload`) and publishes it to the
+/// shared `context_routing_id` — NOT to Alice's App-channel pseudonym. Alice
+/// therefore receives it on `RecvChannel::Announcement`, where the M-E
+/// content/channel check MATCHES (an announcement on the announcement channel),
+/// so the frame is NOT dropped there — it reaches `ingest_application_plaintext`
+/// → the classifier → the S1 `local_pseudonym` guard, which is what rejects it.
+/// Empirically confirmed effective: deleting the S1 clause turns this assertion
+/// RED (the forged mapping is otherwise accepted, since Alice's own pseudonym is
+/// not in her PEER registry for the cross-DID collision check to catch).
 #[test]
 fn forged_announcement_claiming_the_victims_own_pseudonym_is_rejected() {
     let relay = Relay::new();
@@ -229,6 +243,26 @@ fn forged_announcement_claiming_the_victims_own_pseudonym_is_rejected() {
     let _ = alice.client.drain_events(CTX);
     let _ = bob.client.drain_events(CTX);
 
+    // Capture Bob's REAL pseudonym — the non-shared routing id Alice's app-data
+    // fan-out targets — so the behavioral assertion below can prove the forgery
+    // did NOT remap Bob onto Alice's own pseudonym. (Alice's registry maps
+    // BOB → bob_pseudonym from the connect_two mesh.)
+    let _ = relay.drain_publish_log();
+    alice.client.send_message(CTX, b"probe-bob").unwrap();
+    let log = relay.drain_publish_log();
+    let bob_pseudonym = log
+        .iter()
+        .find(|p| p.conn == alice.conn && p.routing_id != context_routing_id(CTX))
+        .expect("Alice addressed Bob's pseudonym")
+        .routing_id;
+    assert_ne!(
+        bob_pseudonym, alice_pseudonym,
+        "Bob's and Alice's pseudonyms must differ for this test to be meaningful"
+    );
+    relay.pump(&mut [&mut alice, &mut bob]);
+    let _ = alice.client.drain_events(CTX);
+    let _ = bob.client.drain_events(CTX);
+
     // Bob forges `BOB → alice_pseudonym` (Bob claims Alice's routing id for HIS own
     // DID). Sent as a normal payload; it routes to the shared channel and Alice
     // receives it. The self-augmented collision check must reject it (Alice's own
@@ -242,9 +276,10 @@ fn forged_announcement_claiming_the_victims_own_pseudonym_is_rejected() {
     bob.client.send_message(CTX, &payload).unwrap();
     relay.pump(&mut [&mut alice, &mut bob]);
 
-    // Alice did NOT re-map Bob's DID onto her own pseudonym: an app-data send from
-    // Alice still addresses Bob's REAL pseudonym (not Alice's own), and the forged
-    // announcement surfaced no PseudonymAnnounced for `alice_pseudonym`.
+    // (a) No PseudonymAnnounced event surfaced for the forged `alice_pseudonym`.
+    // With emit-on-change, an accepted forgery (S1 deleted) would REMAP the known
+    // BOB → alice_pseudonym and thus emit — so this assertion is effective (it
+    // turns RED when the S1 guard is removed).
     let events = alice.client.drain_events(CTX).unwrap();
     assert!(
         !events.iter().any(|e| matches!(
@@ -252,6 +287,28 @@ fn forged_announcement_claiming_the_victims_own_pseudonym_is_rejected() {
             ContextEvent::PseudonymAnnounced { pseudonym, .. } if *pseudonym == alice_pseudonym
         )),
         "a forged own-pseudonym announcement must be rejected, not recorded"
+    );
+
+    // (b) Behavioral proof the registry was NOT corrupted — independent of emit
+    // semantics. Alice's app-data fan-out still targets Bob's REAL pseudonym and
+    // NEVER `alice_pseudonym`. A successful S1 hijack would have remapped
+    // BOB → alice_pseudonym, redirecting this send onto Alice's own routing id.
+    let _ = relay.drain_publish_log();
+    alice.client.send_message(CTX, b"after-forgery").unwrap();
+    let targets: Vec<[u8; 32]> = relay
+        .drain_publish_log()
+        .iter()
+        .filter(|p| p.conn == alice.conn && p.routing_id != context_routing_id(CTX))
+        .map(|p| p.routing_id)
+        .collect();
+    assert!(
+        targets.contains(&bob_pseudonym),
+        "Alice's app-data must still fan out to Bob's REAL pseudonym after the forgery"
+    );
+    assert!(
+        !targets.contains(&alice_pseudonym),
+        "the forged BOB -> alice_pseudonym mapping must NOT have entered Alice's registry \
+         (a hijacked send would redirect app-data onto alice_pseudonym)"
     );
 }
 
