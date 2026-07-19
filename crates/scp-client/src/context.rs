@@ -162,10 +162,18 @@ impl PerContextState {
     /// # Errors
     ///
     /// Fails closed with [`ClientError::Driver`] at `u64::MAX` rather than
-    /// wrapping or saturating. The sequence is a §9.16 AEAD **nonce input**
-    /// (`encrypt_message` binds `epoch || sequence` into the sender-key AEAD): a
-    /// `saturating_add` would stick at `u64::MAX` and hand out the SAME sequence
-    /// twice, reusing a nonce under the same key — a catastrophic AEAD break. The
+    /// wrapping or saturating. The sequence is the §9.16 sender-layer AEAD's
+    /// authenticated **anti-replay input** — NOT a GCM nonce (the AES-256-GCM
+    /// nonce is a fresh 12-byte `OsRng` value per encryption; see
+    /// `scp-protocol::crypto::sender_keys::encrypt`). `encrypt_message` binds
+    /// `epoch || sequence` into the AEAD **AAD**, and the receiver enforces a
+    /// per-sender monotonic `(epoch, sequence)` replay floor
+    /// (`crypto_state.rs`). A `saturating_add` would stick at `u64::MAX` and
+    /// hand out the SAME sequence twice: the duplicate would wedge the
+    /// receiver's replay floor — a re-used `(epoch, sequence)` at or below the
+    /// last-accepted pair is rejected as a replay, silently dropping the
+    /// message and collapsing the anti-replay invariant. (This is distinct from
+    /// GCM nonce reuse, which the per-call random nonce already precludes.) The
     /// send therefore refuses rather than reuse the counter (mirrors
     /// `ContextCryptoState::rotate_sender_key`'s epoch-overflow guard). `u64::MAX`
     /// sends is operationally unreachable, so this never fires in practice; it
@@ -179,7 +187,7 @@ impl PerContextState {
         *entry = entry.checked_add(1).ok_or_else(|| {
             ClientError::Driver(format!(
                 "outgoing sequence number overflow for '{member_did}' (already at u64::MAX); \
-                 refusing to reuse a sequence (§9.16 AEAD nonce input)"
+                 refusing to reuse a sequence (§9.16 AEAD anti-replay AAD input)"
             ))
         })?;
         Ok(seq)
