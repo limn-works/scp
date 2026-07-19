@@ -4739,6 +4739,90 @@ mod pseudonym_routing_tests {
     }
 
     // -----------------------------------------------------------------------
+    // NATIVE-PARITY FOLLOW-UP (#2179): reciprocal-announce mesh completion.
+    //
+    // The browser client (`scp-client`) completes the §9.10.4 pseudonym mesh over
+    // a real relay via RECIPROCAL-ANNOUNCE: when a member records a NEW peer's
+    // pseudonym (a DID not previously in its registry) it re-announces its OWN
+    // pseudonym, guarded first-time-per-peer so the cascade converges
+    // (joiner-announce seed → existing members reciprocate → joiner reciprocates →
+    // quiescent). Native `ingest_pseudonym_announcement` records + emits but does
+    // NOT reciprocate.
+    //
+    // This is a GENUINE external constraint, not a deferral dressed as a decision:
+    // the native runtime wires no live relay-receive PUMP today, so a native
+    // reciprocal has nothing to drive against and is presently untestable
+    // end-to-end. Native must adopt reciprocal-announce in
+    // `ingest_pseudonym_announcement` WHEN it wires that live receive pump (#2179),
+    // so the trigger lands together with the loop that exercises it.
+    //
+    // This scaffold exercises the trigger CONDITION today (a first-time new-peer
+    // recording — the exact event the reciprocal keys on) against the real native
+    // ingest and pins the expected contract. It is #[ignore]d until #2179 wires the
+    // receive pump, at which point it is extended to assert the outbound reciprocal
+    // announcement (this member's own pseudonym, first-time-per-peer guarded) and
+    // un-ignored.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "native reciprocal-announce follow-up — see #2179"]
+    fn native_reciprocal_announce_on_new_peer_is_a_follow_up() {
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        // ALICE (this member) holds her own local pseudonym; BOB is a brand-new
+        // peer whose announcement ALICE is about to ingest for the first time.
+        let alice_pseudonym = [0xA1u8; 32];
+        ClassCMut::from_state(&mut state)
+            .routing_mut()
+            .set_local_pseudonym(alice_pseudonym);
+
+        // Precondition: BOB is NOT yet known — recording him is a FIRST-TIME new
+        // peer, the exact event reciprocal-announce keys on.
+        assert!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .get(&DID(BOB.to_owned()))
+                .is_none(),
+            "BOB must be unknown before the ingest so this is a first-time new-peer recording"
+        );
+
+        let bob_pseudonym = [0xB0u8; 32];
+        let outcome = ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            BOB,
+            &announcement_bytes(BOB, bob_pseudonym),
+            &ctx,
+            None,
+        );
+        assert!(
+            matches!(outcome, AnnouncementOutcome::Recorded),
+            "a legitimate new-peer announcement is recorded"
+        );
+        assert_eq!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .get(&DID(BOB.to_owned())),
+            Some(&bob_pseudonym),
+            "BOB's pseudonym is now recorded (the first-time trigger fired)"
+        );
+
+        // EXPECTED (unmet today — #2179): recording BOB as a NEW peer must drive a
+        // RECIPROCAL announcement of ALICE's own pseudonym so BOB learns ALICE — the
+        // mesh-completion half of §9.10.4. Native produces no reciprocal here because
+        // there is no live receive pump to carry it; when #2179 wires that pump this
+        // test asserts the outbound reciprocal announcement is produced, then is
+        // un-ignored. Fail loudly if run so the gap is never mistaken for closed.
+        panic!(
+            "native reciprocal-announce is not implemented — recording a new peer must \
+             trigger a reciprocal announcement of this member's own pseudonym (#2179)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Consistency-checkpoint wire message (§9.9.3, §23.7)
     // -----------------------------------------------------------------------
 
