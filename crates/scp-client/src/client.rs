@@ -1942,8 +1942,10 @@ impl ScpClient {
 /// Runs the shared, wasm-safe [`classify_pseudonym_announcement`] decision core
 /// (identical to the native runtime's, so accept/reject cannot drift) over this
 /// member's peer registry and maps the verdict:
-/// - **Accept** → record the peer's routing id + buffer a `PseudonymAnnounced`
-///   event; NOT an application message (`application: false`).
+/// - **Accept** → record the peer's routing id; buffer a `PseudonymAnnounced`
+///   event when the recorded pseudonym is new **or changed** (an identical
+///   re-announce is deduped and emits nothing); NOT an application message
+///   (`application: false`).
 /// - **`NotAnnouncement`** → buffer the `MessageReceived` local history. Per
 ///   ADR-011 exclusion taxonomy §2 a received application message is NOT a
 ///   convergent Merkle leaf, so NO event-log leaf is appended (the event log /
@@ -1981,15 +1983,23 @@ fn ingest_application_plaintext(
             member_did,
             pseudonym,
         } => {
-            let learned_new_peer = !state.peer_pseudonyms.contains_key(&member_did);
+            let previous = state.peer_pseudonyms.get(&member_did).copied();
+            let learned_new_peer = previous.is_none();
             state.record_peer_pseudonym(member_did.clone(), pseudonym);
-            // Emit the `PseudonymAnnounced` observability event only the FIRST time
-            // a peer is learned. A re-announce of an already-known peer (the
-            // reciprocal cascade re-sends idempotently, and key rotation re-announces)
-            // updates the registry silently — otherwise an N-party mesh would emit N
-            // noisy duplicates per peer. Matches the reciprocal-announce trigger,
-            // which also fires only on a new peer.
-            if learned_new_peer {
+            // Emit the `PseudonymAnnounced` observability event when the recorded
+            // pseudonym is NEW **or CHANGED** — i.e. a first-contact peer, or a
+            // KNOWN peer that rotated its pseudonym and re-announced a different
+            // value. Emitting on change (not merely first-contact) surfaces the
+            // address rotation to a stream watcher; recording it silently would
+            // hide a live routing change. An IDENTICAL re-announce (the reciprocal
+            // cascade re-sends the same value idempotently) does NOT change the
+            // recorded pseudonym, so no event fires — that dedup keeps an N-party
+            // mesh from emitting N noisy duplicates per peer. NOTE: this is a
+            // strictly wider predicate than `learned_new_peer` (which drives the
+            // reciprocal-announce and must stay first-time-per-peer so the mesh
+            // converges); a rotation emits an event without re-triggering the
+            // cascade.
+            if previous != Some(pseudonym) {
                 state.push_event(ContextEvent::PseudonymAnnounced {
                     member_did,
                     pseudonym,
@@ -2049,4 +2059,109 @@ fn key_package_member_did(
     // the key packages `add_member` accepts.
     let did = key_package_in_did(&key_package_in, ProtocolVersion::Mls10, clock)?;
     Ok(did)
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod ingest_emit_tests {
+    use super::*;
+    use scp_clock::SystemClock;
+    use scp_did::{DID, SigningKeyId};
+    use scp_mls::group::create_group;
+    use scp_protocol::context::membership::ContextEvent;
+    use scp_protocol::context::pseudonym::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+
+    const CTX: &str = "ctx-client-ingest-emit-unit";
+    const ALICE: &str = "did:key:z6MkAliceClientIngestEmitFixtureAAAAAAAAA";
+    const BOB: &str = "did:key:z6MkBobClientIngestEmitFixtureBBBBBBBBBBBB";
+
+    fn credential(did: &str) -> ScpCredential {
+        ScpCredential::new(did.to_owned(), None, SigningKeyId::Active).unwrap()
+    }
+
+    /// A single-member encrypted context for ALICE with a distinct local
+    /// pseudonym (so a peer announcement never collides with ALICE's own).
+    fn alice_state() -> PerContextState {
+        let crypto =
+            crate::crypto_state::ContextCryptoState::from_group(CTX, create_group(&credential(ALICE), &SystemClock).unwrap());
+        let mut state = PerContextState::new(CTX, ALICE, crypto);
+        state.set_local_pseudonym([0x01u8; 32]);
+        state
+    }
+
+    /// BOB's authenticated pseudonym announcement wire bytes (sender == claimed).
+    fn bob_announcement(pseudonym: [u8; 32]) -> Vec<u8> {
+        let announcement = PseudonymAnnouncement {
+            tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: BOB.to_owned(),
+            pseudonym,
+        };
+        rmp_serde::to_vec_named(&announcement).unwrap()
+    }
+
+    fn announced_events(state: &PerContextState) -> usize {
+        state
+            .event_buffer
+            .iter()
+            .filter(|e| matches!(e, ContextEvent::PseudonymAnnounced { .. }))
+            .count()
+    }
+
+    /// Emit-on-CHANGE: a first-contact announcement and a CHANGED (rotated)
+    /// pseudonym each emit a `PseudonymAnnounced` event, but an IDENTICAL
+    /// re-announce (the reciprocal cascade re-sends the same value) emits
+    /// nothing. Guards the silent-rotation gap: a known peer that rotates its
+    /// routing ID must surface the change to a stream watcher, not update the
+    /// registry silently. Mirrors the native `ingest_pseudonym_announcement`
+    /// predicate (share-don't-fork — ADR-057).
+    #[test]
+    fn ingest_emits_pseudonym_announced_on_change_only() {
+        let mut state = alice_state();
+        let first = [0x42u8; 32];
+        let rotated = [0x43u8; 32];
+
+        // (1) First contact — a NEW peer: emits, and records the routing id.
+        let (_, learned) =
+            ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bob_announcement(first));
+        assert!(learned, "a first-contact announcement is a newly-learned peer");
+        assert_eq!(
+            announced_events(&state),
+            1,
+            "a first-contact announcement must emit a PseudonymAnnounced event"
+        );
+        assert_eq!(
+            state.peer_pseudonyms.get(&DID(BOB.to_owned())),
+            Some(&first),
+            "the peer registry records BOB's first pseudonym"
+        );
+
+        // (2) Identical re-announce — SAME value: no new event, not a new peer.
+        let (_, learned) =
+            ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bob_announcement(first));
+        assert!(!learned, "an identical re-announce is not a newly-learned peer");
+        assert_eq!(
+            announced_events(&state),
+            1,
+            "an identical re-announce must NOT emit a duplicate PseudonymAnnounced event"
+        );
+
+        // (3) Rotation — CHANGED value: emits again (surfaces the address change),
+        // but does NOT re-trigger the first-time-per-peer reciprocal cascade.
+        let (_, learned) =
+            ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bob_announcement(rotated));
+        assert!(
+            !learned,
+            "a rotation of a KNOWN peer must not re-arm the reciprocal cascade"
+        );
+        assert_eq!(
+            announced_events(&state),
+            2,
+            "a rotated (changed) pseudonym re-announce must emit a fresh PseudonymAnnounced event"
+        );
+        assert_eq!(
+            state.peer_pseudonyms.get(&DID(BOB.to_owned())),
+            Some(&rotated),
+            "the peer registry now holds BOB's rotated pseudonym"
+        );
+    }
 }

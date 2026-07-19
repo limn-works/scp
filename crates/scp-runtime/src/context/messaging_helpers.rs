@@ -531,8 +531,9 @@ pub fn deliver_plaintext_or_announcement(
             // A received pseudonym announcement is a §9.10.4 routing-bootstrap
             // signal, NOT a durable Merkle event. `ingest_pseudonym_announcement`
             // already inserted the peer's routing ID into the in-memory registry
-            // and emitted `ContextEvent::PseudonymAnnounced` to the receive
-            // buffer (the announcement's entire function). Returning `None`
+            // and — when the value was new or changed (emit-on-change) — emitted
+            // `ContextEvent::PseudonymAnnounced` to the receive buffer (the
+            // announcement's entire function). Returning `None`
             // suppresses any durable append, exactly as for received application
             // messages (`NotAnnouncement` below): a per-receiver, per-arrival-order
             // append cannot converge across honest members (late joiners miss
@@ -573,7 +574,9 @@ pub fn deliver_plaintext_or_announcement(
 /// normal message.
 pub enum AnnouncementOutcome {
     /// The plaintext was a well-formed announcement that passed every check;
-    /// the peer registry was updated and a `PseudonymAnnounced` event emitted.
+    /// the peer registry was updated. A `PseudonymAnnounced` event is emitted
+    /// only when the recorded pseudonym was NEW or CHANGED (emit-on-change) —
+    /// an identical re-announce records the (unchanged) value and emits nothing.
     Recorded,
     /// The plaintext is not a tagged `PseudonymAnnouncement` — deliver it as a
     /// normal application message.
@@ -676,17 +679,29 @@ fn ingest_pseudonym_announcement(
             // insert. The `if let` (rather than a workspace-denied `expect`) is a
             // total match over that proven invariant — the registry presence
             // cannot change between the classify read and this insert (no mutation
-            // occurs in between).
-            if let Some(pseudonym_registry) = view.routing_mut().peer_registry_mut() {
-                pseudonym_registry.insert(member_did.clone(), pseudonym);
+            // occurs in between). `HashMap::insert` returns the PRIOR value, which
+            // drives the emit-on-change predicate below.
+            let previous = view
+                .routing_mut()
+                .peer_registry_mut()
+                .and_then(|registry| registry.insert(member_did.clone(), pseudonym));
+            // Record + emit-ON-CHANGE. Emit the `PseudonymAnnounced` observability
+            // event only when the recorded pseudonym is NEW **or CHANGED** — a
+            // first-contact peer, or a KNOWN peer that rotated its pseudonym and
+            // re-announced a different value (surfacing the routing change to a
+            // stream watcher). An IDENTICAL re-announce leaves the registry value
+            // unchanged and emits nothing, deduping the mesh's reciprocal-cascade
+            // re-sends. This mirrors the browser client's ingest predicate
+            // (`scp-client` `ingest_application_plaintext`) so accept/emit cannot
+            // drift across targets (share-don't-fork). The `routing_mut()` borrow
+            // above has ended (NLL) before this disjoint `receive_buffer` emit.
+            if previous != Some(pseudonym) {
+                let event = ContextEvent::PseudonymAnnounced {
+                    member_did,
+                    pseudonym,
+                };
+                emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
             }
-            // Record + emit. The `routing_mut()` borrow above has ended (NLL)
-            // before this disjoint `receive_buffer` emit.
-            let event = ContextEvent::PseudonymAnnounced {
-                member_did,
-                pseudonym,
-            };
-            emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
             AnnouncementOutcome::Recorded
         }
     }
@@ -3491,8 +3506,9 @@ pub async fn deliver_message_and_drain_buffered(
             // Fall through to the normal-message delivery path below.
         }
         AnnouncementOutcome::Recorded => {
-            // Recorded + emitted by the shared validator (registry insert +
-            // `ContextEvent::PseudonymAnnounced` buffer signal). The remaining
+            // Recorded by the shared validator (registry insert + a
+            // `ContextEvent::PseudonymAnnounced` buffer signal emitted
+            // on-change). The remaining
             // follow-up — sequence-tracker advance, reorder-buffer drain,
             // velocity, and consequence evaluation — is specific to the in-order
             // direct path and runs here only. There is NO durable Merkle append:
@@ -3937,6 +3953,78 @@ mod pseudonym_routing_tests {
             reg.get(&DID(ALICE.to_owned())),
             Some(&rotated),
             "a same-DID re-announce must update (not reject) the registry"
+        );
+    }
+
+    /// Emit-on-CHANGE: the receive buffer surfaces a `PseudonymAnnounced` event
+    /// on a NEW peer and on a CHANGED (rotated) pseudonym, but NOT on an
+    /// identical re-announce (the reciprocal cascade re-sends the same value
+    /// idempotently). Mirrors the browser client's `ingest_application_plaintext`
+    /// predicate so the emit decision cannot drift across targets
+    /// (share-don't-fork — ADR-057). Guards the silent-rotation gap: a known
+    /// peer that rotates its routing ID MUST surface the change to a stream
+    /// watcher, not update the registry silently.
+    #[test]
+    fn ingest_emits_pseudonym_announced_on_change_only() {
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let first = [0x42u8; 32];
+        let rotated = [0x43u8; 32];
+
+        let count_events = |s: &PerContextState| {
+            s.receive_buffer
+                .event_log_entries()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        scp_protocol::context::membership::ContextEvent::PseudonymAnnounced { .. }
+                    )
+                })
+                .count()
+        };
+
+        // (1) First contact — a NEW peer: emits.
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, first),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            1,
+            "a first-contact announcement must emit a PseudonymAnnounced event"
+        );
+
+        // (2) Identical re-announce — SAME value: registry value is unchanged,
+        // so NO new event fires (the reciprocal-cascade dedup).
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, first),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            1,
+            "an identical re-announce must NOT emit a duplicate PseudonymAnnounced event"
+        );
+
+        // (3) Rotation — CHANGED value: emits again, surfacing the address change.
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, rotated),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            2,
+            "a rotated (changed) pseudonym re-announce must emit a fresh PseudonymAnnounced event"
         );
     }
 
