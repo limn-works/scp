@@ -34,7 +34,7 @@
 
 mod common;
 
-use common::Relay;
+use common::{Relay, RelayExt};
 use scp_protocol::context::context_routing_id;
 use scp_protocol::context::membership::ContextEvent;
 

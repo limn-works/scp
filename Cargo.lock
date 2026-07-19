@@ -5094,6 +5094,7 @@ dependencies = [
  "scp-mls",
  "scp-protocol",
  "scp-relay-client",
+ "scp-relay-mock",
  "serde",
  "thiserror 2.0.18",
  "tls_codec",
@@ -5120,6 +5121,7 @@ dependencies = [
  "scp-mls",
  "scp-protocol",
  "scp-relay-client",
+ "scp-relay-mock",
  "serde-wasm-bindgen",
  "serde_json",
  "tls_codec",
@@ -5597,6 +5599,15 @@ dependencies = [
  "serde",
  "serde_bytes",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "scp-relay-mock"
+version = "0.1.0-beta.2"
+dependencies = [
+ "scp-client",
+ "scp-protocol",
+ "scp-relay-client",
 ]
 
 [[package]]

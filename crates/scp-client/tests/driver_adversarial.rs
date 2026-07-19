@@ -45,7 +45,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{ConnId, Party, Relay, connect_two};
+use common::{ConnId, Party, Relay, RelayExt, connect_two};
 use scp_client::{ClientError, EVENT_BUFFER_CAP, LocalSigner, MemoryStorage, ScpClient, Storage};
 use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::context_routing_id;

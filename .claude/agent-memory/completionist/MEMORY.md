@@ -18,3 +18,10 @@ artifact diverged) so future passes trace faster.
   to match code."
 - Never weaken an enforcement file to close a gap (see the enforcement-file list in
   `CLAUDE.md`); the gap is real — fix the gap.
+
+## Reviews
+- [ADR-057 transport wasm-surface parity](adr057_transport_wasm_surface_parity.md) — every
+  embedder-facing `pub fn` on `scp-client::ScpClient` must be mirrored on
+  `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type
+  renames (Socket→RelaySink) leave stray doc refs; native reciprocal-announce is a legit
+  recorded follow-up.

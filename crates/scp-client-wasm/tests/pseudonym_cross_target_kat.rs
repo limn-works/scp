@@ -96,6 +96,7 @@ fn announcement_bytes(member_did: &str, pseudonym: [u8; 32]) -> Vec<u8> {
 // The golden-vector assertion body (called from BOTH targets)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)] // one cross-target decision matrix, read top-to-bottom
 fn assert_pseudonym_cross_target_vectors() {
     // (1) Wire encoding of the fixed announcement matches the golden + round-trips.
     let bytes = announcement_bytes(KAT_MEMBER_DID, KAT_PSEUDONYM);
@@ -114,20 +115,26 @@ fn assert_pseudonym_cross_target_vectors() {
     // (2) Classifier decision matrix — identical decisions + exact reason strings.
     let empty: HashMap<DID, [u8; 32]> = HashMap::new();
 
+    // The fifth arg is the receiver's OWN pseudonym for the S1 self-collision
+    // guard; `None` for every row that does not exercise it (the receiver has no
+    // local pseudonym relevant to the decision under test), so these decisions are
+    // unchanged by the guard's introduction. The dedicated S1 row below passes it.
+
     // NotAnnouncement: ordinary app data.
     assert_eq!(
         classify_pseudonym_announcement(
             b"hello world",
             KAT_MEMBER_DID,
             KAT_CONTEXT_ID,
-            Some(&empty)
+            Some(&empty),
+            None,
         ),
         PseudonymAnnouncementDecision::NotAnnouncement,
     );
 
     // Accept: legitimate announcement (sender == member, honest RID, no collision).
     assert_eq!(
-        classify_pseudonym_announcement(&bytes, KAT_MEMBER_DID, KAT_CONTEXT_ID, Some(&empty)),
+        classify_pseudonym_announcement(&bytes, KAT_MEMBER_DID, KAT_CONTEXT_ID, Some(&empty), None),
         PseudonymAnnouncementDecision::Accept {
             member_did: DID(KAT_MEMBER_DID.to_owned()),
             pseudonym: KAT_PSEUDONYM,
@@ -138,7 +145,13 @@ fn assert_pseudonym_cross_target_vectors() {
     // authenticated sender is KAT_MEMBER_DID; carries the claimed DID.
     let forged = announcement_bytes(KAT_OTHER_DID, KAT_PSEUDONYM);
     assert_eq!(
-        classify_pseudonym_announcement(&forged, KAT_MEMBER_DID, KAT_CONTEXT_ID, Some(&empty)),
+        classify_pseudonym_announcement(
+            &forged,
+            KAT_MEMBER_DID,
+            KAT_CONTEXT_ID,
+            Some(&empty),
+            None
+        ),
         PseudonymAnnouncementDecision::Rejected {
             reason: REJECT_SENDER_MISMATCH,
             claimed_did: Some(DID(KAT_OTHER_DID.to_owned())),
@@ -147,7 +160,7 @@ fn assert_pseudonym_cross_target_vectors() {
 
     // Rejected (broadcast context): no registry.
     assert_eq!(
-        classify_pseudonym_announcement(&bytes, KAT_MEMBER_DID, KAT_CONTEXT_ID, None),
+        classify_pseudonym_announcement(&bytes, KAT_MEMBER_DID, KAT_CONTEXT_ID, None, None),
         PseudonymAnnouncementDecision::Rejected {
             reason: REJECT_BROADCAST,
             claimed_did: None,
@@ -158,7 +171,32 @@ fn assert_pseudonym_cross_target_vectors() {
     let mut registry: HashMap<DID, [u8; 32]> = HashMap::new();
     registry.insert(DID(KAT_OTHER_DID.to_owned()), KAT_PSEUDONYM);
     assert_eq!(
-        classify_pseudonym_announcement(&bytes, KAT_MEMBER_DID, KAT_CONTEXT_ID, Some(&registry)),
+        classify_pseudonym_announcement(
+            &bytes,
+            KAT_MEMBER_DID,
+            KAT_CONTEXT_ID,
+            Some(&registry),
+            None,
+        ),
+        PseudonymAnnouncementDecision::Rejected {
+            reason: REJECT_COLLISION,
+            claimed_did: None,
+        },
+    );
+
+    // Rejected (S1 self-collision): the announcement is otherwise honest (sender ==
+    // member, non-reserved RID, empty peer registry) but announces the RECEIVER's
+    // OWN pseudonym — a forged `member → our address` claim the local-pseudonym
+    // guard rejects as a collision. Asserted cross-target so the S1 branch is
+    // byte-identical on native and wasm32.
+    assert_eq!(
+        classify_pseudonym_announcement(
+            &bytes,
+            KAT_MEMBER_DID,
+            KAT_CONTEXT_ID,
+            Some(&empty),
+            Some(KAT_PSEUDONYM),
+        ),
         PseudonymAnnouncementDecision::Rejected {
             reason: REJECT_COLLISION,
             claimed_did: None,
@@ -190,7 +228,8 @@ fn assert_pseudonym_cross_target_vectors() {
                 &reserved_bytes,
                 KAT_MEMBER_DID,
                 KAT_CONTEXT_ID,
-                Some(&empty)
+                Some(&empty),
+                None,
             ),
             PseudonymAnnouncementDecision::Rejected {
                 reason: REJECT_RESERVED,

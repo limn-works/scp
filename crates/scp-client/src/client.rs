@@ -1145,7 +1145,12 @@ impl ScpClient {
                 // (a relay error-spam vector — M-C). Categorize instead:
                 match self.receive_on_channel(&context_id, &envelope.encrypted_blob, channel) {
                     Ok(_) => Ok(()),
-                    // Stale routing_index entry for a closed context — benign.
+                    // Stale routing_index entry for a closed context — benign. Kept a
+                    // SEPARATE arm from the `Ok` success case (identical body, distinct
+                    // meaning): merging an `Ok(_)` success with an `Err(UnknownContext)`
+                    // benign-drop into one pattern would mix the two categories and lose
+                    // this per-case rationale.
+                    #[allow(clippy::match_same_arms)]
                     Err(ClientError::UnknownContext(_)) => Ok(()),
                     // This member's own publish echoed back (relay has no publisher
                     // exclusion) — expected, counted separately.

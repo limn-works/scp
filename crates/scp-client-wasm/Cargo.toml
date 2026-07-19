@@ -106,6 +106,14 @@ scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 openmls = { workspace = true, features = ["libcrux-provider", "js"] }
 tls_codec = "0.4"
 
+# The single-sourced faithful in-memory relay mock (the fidelity anchor for the
+# surface exchange tests). The `native_host` test module is `cfg(not(wasm32))`
+# (no wasm test runner is wired here), so the mock is a NATIVE-ONLY dev-dep —
+# target-gated so the wasm32 test build never pulls it. Dev-only: it ships
+# nothing, so the ADR-057 wasm fence's shipped-dependency graph is unaffected.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+scp-relay-mock = { path = "../scp-relay-mock" }
+
 # wasm-bindgen-test is only meaningful under wasm32 (it needs a wasm test
 # runner). It is declared so a `wasm-pack test` / `wasm32` `cargo test` can pick
 # up the `#[wasm_bindgen_test]` cases; the host `cargo test` runs the native

@@ -31,9 +31,9 @@
 // Integration tests assert on happy-path results; `expect`/`panic!` make the
 // failure messages legible. The workspace denies these in production code.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-// Test-harness noise: the in-memory relay's `Mutex` guard (early-drop restructuring
-// adds noise, not value) and a couple of similar local names (`bob`/`bob2`).
-#![allow(clippy::significant_drop_tightening, clippy::similar_names)]
+// Test-harness noise: a couple of similar local names (`bob`/`bob2`). The relay
+// mock (and its `Mutex`) now lives in the single-sourced `scp-relay-mock` crate.
+#![allow(clippy::similar_names)]
 
 // The surface exchange + convergence tests are NATIVE-HOST tests (they drive
 // `from_parts` with in-memory adapters and run off-target — no wasm test runner is
@@ -42,166 +42,86 @@
 // wasm32-target portion.
 #[cfg(not(target_arch = "wasm32"))]
 mod native_host {
-    use std::collections::{HashMap, VecDeque};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    use scp_client::{LocalSigner, MemoryStorage, RelaySink, Signer, Storage};
+    use scp_client::{LocalSigner, MemoryStorage, Signer, Storage};
     use scp_client_wasm::{WasmScpClient, WasmSenderKeyDistribution};
     use scp_clock::{Clock, SystemClock, TestClock};
-    use scp_relay_client::{ClientMessage, RelayMessage};
+    // The faithful in-memory relay model is single-sourced in the dev-only
+    // `scp-relay-mock` crate (shared with the `scp-client` suite); this module
+    // adapts the surface's `(client, conn)` convention to its `RelayParty` pump.
+    use scp_relay_mock::{ConnId, Relay, RelayParty};
 
     const CTX: &str = "ctx-adr057-slice3-wasm-surface";
     const ALICE_DID: &str = "did:key:z6MkAlice3SurfaceExchangeFixtureKeyAAAAAAA";
     const BOB_DID: &str = "did:key:z6MkBob3SurfaceExchangeFixtureKeyBBBBBBBBBB";
 
-    type ConnId = u64;
-
-    /// A minimal but FAITHFUL in-memory relay for the surface tests: a subscription
-    /// table populated by `SUBSCRIBE`, delivery of a `PUBLISH` to ALL current
-    /// subscribers of its routing id INCLUDING the publisher (self-echo), and
-    /// `Relay::pump` that delivers queued `BLOB`s into each party's `handleRelayFrame`
-    /// ITERATIVELY until quiescent (so the §9.10.4 reciprocal-announce cascade runs to
-    /// completion). Mirrors `scp-client/tests/common` but drives the wasm surface.
-    #[derive(Default)]
-    struct RelayState {
-        subscriptions: HashMap<[u8; 32], Vec<ConnId>>,
-        queues: HashMap<ConnId, VecDeque<Vec<u8>>>,
-        next_conn: ConnId,
-        clock: u64,
-    }
-
-    #[derive(Clone)]
-    struct Relay {
-        state: Arc<Mutex<RelayState>>,
-    }
-
-    struct RelayConn {
+    /// Drives a [`WasmScpClient`] as a [`RelayParty`] so the single-sourced
+    /// [`Relay::pump`] can pump the surface. The surface's `handle_relay_frame`
+    /// takes owned bytes and returns `Result<(), JsValue>`; on the native host the
+    /// happy path returns `Ok` without constructing a `JsValue` (which would abort
+    /// off-wasm), so the error arm is unreachable here and mapped to a fixed string.
+    struct WasmParty<'a> {
+        client: &'a mut WasmScpClient,
         conn: ConnId,
-        state: Arc<Mutex<RelayState>>,
     }
 
-    impl RelaySink for RelayConn {
-        fn send(&self, frame: Vec<u8>) -> Result<(), String> {
-            let msg =
-                ClientMessage::from_bytes(&frame).map_err(|e| format!("relay decode: {e}"))?;
-            let mut st = self.state.lock().map_err(|e| format!("relay lock: {e}"))?;
-            match msg {
-                ClientMessage::Subscribe { routing_id, .. } => {
-                    let subs = st.subscriptions.entry(routing_id).or_default();
-                    if !subs.contains(&self.conn) {
-                        subs.push(self.conn);
-                    }
-                }
-                ClientMessage::Publish {
-                    routing_id,
-                    recipient_hint,
-                    blob_ttl,
-                    blob,
-                    ..
-                } => {
-                    st.clock += 1;
-                    let stored_at = st.clock;
-                    let subs = st
-                        .subscriptions
-                        .get(&routing_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    for sub in subs {
-                        let f = RelayMessage::Blob {
-                            routing_id,
-                            blob_id: [0u8; 32],
-                            recipient_hint,
-                            blob_ttl,
-                            stored_at,
-                            blob: blob.clone(),
-                        }
-                        .to_bytes()
-                        .map_err(|e| format!("relay blob: {e}"))?;
-                        st.queues.entry(sub).or_default().push_back(f);
-                    }
-                }
-                _ => {}
-            }
-            Ok(())
+    impl RelayParty for WasmParty<'_> {
+        fn conn_id(&self) -> ConnId {
+            self.conn
+        }
+
+        fn deliver(&mut self, frame: Vec<u8>) -> Result<(), String> {
+            self.client
+                .handle_relay_frame(frame)
+                .map_err(|_| "wasm handle_relay_frame error".to_owned())
         }
     }
 
-    impl Relay {
-        fn new() -> Self {
-            Self {
-                state: Arc::new(Mutex::new(RelayState::default())),
-            }
-        }
+    /// Delivers queued `BLOB`s into each party's `handleRelayFrame`, iteratively
+    /// until quiescent (running the §9.10.4 reciprocal-announce cascade), through the
+    /// single-sourced [`Relay::pump`]. Adapts the `(client, conn)` convention the
+    /// surface tests use to the shared [`RelayParty`]-driven pump.
+    fn pump(relay: &Relay, parties: &mut [(&mut WasmScpClient, ConnId)]) {
+        let mut wrapped: Vec<WasmParty> = parties
+            .iter_mut()
+            .map(|(client, conn)| WasmParty {
+                client,
+                conn: *conn,
+            })
+            .collect();
+        let mut refs: Vec<&mut WasmParty> = wrapped.iter_mut().collect();
+        relay.pump(&mut refs);
+    }
 
-        fn connect(&self) -> (ConnId, Arc<dyn RelaySink>) {
-            let mut st = self.state.lock().expect("relay lock");
-            let conn = st.next_conn;
-            st.next_conn += 1;
-            st.queues.entry(conn).or_default();
-            (
-                conn,
-                Arc::new(RelayConn {
-                    conn,
-                    state: Arc::clone(&self.state),
-                }),
-            )
-        }
+    /// Builds a surface client over mock-JS-shaped in-memory adapters + a relay
+    /// connection, through the same `from_parts` seam the wasm32 `from_js`
+    /// constructor uses. Returns the client and its connection id.
+    fn new_party(relay: &Relay, did: &str, now_secs: u64) -> (WasmScpClient, ConnId) {
+        let (conn, sink) = relay.connect();
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
+        let client = WasmScpClient::from_parts(signer, storage, clock, sink)
+            .expect("construct fresh surface client");
+        (client, conn)
+    }
 
-        /// Builds a surface client over mock-JS-shaped in-memory adapters + a relay
-        /// connection, through the same `from_parts` seam the wasm32 `from_js`
-        /// constructor uses. Returns the client and its connection id.
-        fn new_party(&self, did: &str, now_secs: u64) -> (WasmScpClient, ConnId) {
-            let (conn, sink) = self.connect();
-            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
-            let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-            let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-            let client = WasmScpClient::from_parts(signer, storage, clock, sink)
-                .expect("construct fresh surface client");
-            (client, conn)
-        }
-
-        /// Builds a surface client over a caller-supplied (shared) storage handle. When
-        /// the storage already holds this identity's snapshots, the CONSTRUCTOR restores
-        /// them (ADR-057 T2).
-        fn party_over(
-            &self,
-            did: &str,
-            storage: Arc<dyn Storage>,
-            now_secs: u64,
-        ) -> (WasmScpClient, ConnId) {
-            let (conn, sink) = self.connect();
-            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
-            let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-            let client = WasmScpClient::from_parts(signer, storage, clock, sink)
-                .expect("construct/restore surface client");
-            (client, conn)
-        }
-
-        /// Delivers queued `BLOB`s into each party's `handleRelayFrame`, iteratively
-        /// until quiescent (running the reciprocal-announce cascade).
-        fn pump(&self, parties: &mut [(&mut WasmScpClient, ConnId)]) {
-            let max_rounds = 64 + parties.len() * parties.len() * 4;
-            for _ in 0..max_rounds {
-                let mut delivered_any = false;
-                for (client, conn) in parties.iter_mut() {
-                    loop {
-                        let frame = {
-                            let mut st = self.state.lock().expect("relay lock");
-                            st.queues.get_mut(conn).and_then(VecDeque::pop_front)
-                        };
-                        let Some(frame) = frame else { break };
-                        delivered_any = true;
-                        client
-                            .handle_relay_frame(frame)
-                            .expect("handle_relay_frame");
-                    }
-                }
-                if !delivered_any {
-                    return;
-                }
-            }
-            panic!("wasm relay pump did not converge (reciprocal cascade bug?)");
-        }
+    /// Builds a surface client over a caller-supplied (shared) storage handle. When
+    /// the storage already holds this identity's snapshots, the CONSTRUCTOR restores
+    /// them (ADR-057 T2).
+    fn party_over(
+        relay: &Relay,
+        did: &str,
+        storage: Arc<dyn Storage>,
+        now_secs: u64,
+    ) -> (WasmScpClient, ConnId) {
+        let (conn, sink) = relay.connect();
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
+        let client = WasmScpClient::from_parts(signer, storage, clock, sink)
+            .expect("construct/restore surface client");
+        (client, conn)
     }
 
     fn seed(offset: u64) -> u64 {
@@ -286,7 +206,7 @@ mod native_host {
 
         deliver(add.sender_key_distributions(), alice, bob);
         deliver(bob_dists, alice, bob);
-        relay.pump(&mut [(alice, alice_conn), (bob, bob_conn)]);
+        pump(relay, &mut [(alice, alice_conn), (bob, bob_conn)]);
 
         let _ = alice.drain_events(CTX.to_owned());
         let _ = bob.drain_events(CTX.to_owned());
@@ -296,8 +216,8 @@ mod native_host {
     #[allow(clippy::too_many_lines)] // one end-to-end two-party surface scenario, read top-to-bottom
     fn two_party_exchange_through_wasm_surface() {
         let relay = Relay::new();
-        let (mut alice, alice_conn) = relay.new_party(ALICE_DID, seed(0));
-        let (mut bob, bob_conn) = relay.new_party(BOB_DID, seed(100));
+        let (mut alice, alice_conn) = new_party(&relay, ALICE_DID, seed(0));
+        let (mut bob, bob_conn) = new_party(&relay, BOB_DID, seed(100));
 
         assert_eq!(alice.did(), ALICE_DID, "the surface reports Alice's DID");
 
@@ -327,7 +247,10 @@ mod native_host {
             Some(2),
             "a send stamps NO convergent leaf (ADR-011): Alice's log stays created + joined"
         );
-        relay.pump(&mut [(&mut alice, alice_conn), (&mut bob, bob_conn)]);
+        pump(
+            &relay,
+            &mut [(&mut alice, alice_conn), (&mut bob, bob_conn)],
+        );
 
         let events = bob.drain_events(CTX.to_owned()).expect("Bob drains events");
         let received: Vec<_> = events
@@ -359,7 +282,10 @@ mod native_host {
         // --- Reverse direction: Bob → Alice through the surface. ---
         bob.send_message(CTX.to_owned(), b"hi Alice".to_vec())
             .expect("Bob sends");
-        relay.pump(&mut [(&mut alice, alice_conn), (&mut bob, bob_conn)]);
+        pump(
+            &relay,
+            &mut [(&mut alice, alice_conn), (&mut bob, bob_conn)],
+        );
         let alice_events = alice.drain_events(CTX.to_owned()).expect("Alice drains");
         let alice_received: Vec<_> = alice_events
             .iter()
@@ -390,8 +316,8 @@ mod native_host {
         let alice_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 
-        let (mut alice, alice_conn) = relay.party_over(ALICE_DID, alice_storage, seed(0));
-        let (mut bob, bob_conn) = relay.party_over(BOB_DID, Arc::clone(&bob_storage), seed(100));
+        let (mut alice, alice_conn) = party_over(&relay, ALICE_DID, alice_storage, seed(0));
+        let (mut bob, bob_conn) = party_over(&relay, BOB_DID, Arc::clone(&bob_storage), seed(100));
 
         connect(&relay, &mut alice, alice_conn, &mut bob, bob_conn);
 
@@ -400,7 +326,8 @@ mod native_host {
 
         // The reopened tab restores the converged context (incl. the persisted
         // peer-pseudonym registry) and re-derives + re-subscribes the local pseudonym.
-        let (mut bob2, bob2_conn) = relay.party_over(BOB_DID, Arc::clone(&bob_storage), seed(150));
+        let (mut bob2, bob2_conn) =
+            party_over(&relay, BOB_DID, Arc::clone(&bob_storage), seed(150));
         assert_eq!(
             bob2.member_dids(CTX.to_owned()).map(|mut m| {
                 m.sort();
@@ -420,7 +347,10 @@ mod native_host {
         alice
             .send_message(CTX.to_owned(), b"after restore".to_vec())
             .expect("alice sends");
-        relay.pump(&mut [(&mut alice, alice_conn), (&mut bob2, bob2_conn)]);
+        pump(
+            &relay,
+            &mut [(&mut alice, alice_conn), (&mut bob2, bob2_conn)],
+        );
         let events = bob2.drain_events(CTX.to_owned()).expect("bob2 drains");
         let received: Vec<_> = events
             .iter()
@@ -435,7 +365,7 @@ mod native_host {
         let relay = Relay::new();
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         {
-            let (mut c, _conn) = relay.party_over(ALICE_DID, Arc::clone(&storage), seed(0));
+            let (mut c, _conn) = party_over(&relay, ALICE_DID, Arc::clone(&storage), seed(0));
             c.create_context("ctx-surface-b".to_owned())
                 .expect("create b");
             c.create_context("ctx-surface-a".to_owned())
@@ -446,7 +376,7 @@ mod native_host {
                 "the surface lists contexts sorted"
             );
         }
-        let (c2, _conn) = relay.party_over(ALICE_DID, Arc::clone(&storage), seed(50));
+        let (c2, _conn) = party_over(&relay, ALICE_DID, Arc::clone(&storage), seed(50));
         assert_eq!(
             c2.context_ids(),
             vec!["ctx-surface-a".to_owned(), "ctx-surface-b".to_owned()],
@@ -457,7 +387,7 @@ mod native_host {
     #[test]
     fn context_status_reports_live_and_absent_through_the_surface() {
         let relay = Relay::new();
-        let (mut c, _conn) = relay.new_party(ALICE_DID, seed(0));
+        let (mut c, _conn) = new_party(&relay, ALICE_DID, seed(0));
         assert_eq!(c.context_status("ctx-never-existed".to_owned()), "absent");
         c.create_context(CTX.to_owned()).expect("create");
         assert_eq!(c.context_status(CTX.to_owned()), "live");

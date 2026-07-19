@@ -13,6 +13,7 @@ members = [
     "crates/scp-mls",
     "crates/scp-client",
     "crates/scp-client-wasm",
+    "crates/scp-relay-mock",
     "crates/scp-runtime",
     "crates/scp-core",
     "crates/scp-transport",

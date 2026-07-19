@@ -30,7 +30,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{Party, Relay};
+use common::{Party, Relay, RelayExt};
 use scp_client::{LocalSigner, MemoryStorage, ScpClient, SenderKeyDistribution, Storage};
 use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::context_routing_id;

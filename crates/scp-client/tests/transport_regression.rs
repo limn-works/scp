@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{Relay, connect_two, deliver_distributions, first_received};
+use common::{Relay, RelayExt, connect_two, deliver_distributions, first_received};
 use scp_client::ClientError;
 use scp_protocol::context::context_routing_id;
 use scp_protocol::context::membership::ContextEvent;
@@ -392,7 +392,7 @@ fn undecryptable_announcement_on_known_routing_is_benign_drop() {
         recipient_hint: None,
         blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
         stored_at: 0,
-        blob: carol_ann.blob.clone(),
+        blob: carol_ann.blob,
     }
     .to_bytes()
     .unwrap();
@@ -475,7 +475,7 @@ fn misrouted_app_frame_on_announcement_channel_is_dropped_not_received() {
         recipient_hint: None,
         blob_ttl: DEFAULT_APP_DATA_BLOB_TTL_SECS,
         stored_at: 0,
-        blob: app_pub.blob.clone(),
+        blob: app_pub.blob,
     }
     .to_bytes()
     .unwrap();
