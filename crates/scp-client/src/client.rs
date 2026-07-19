@@ -227,6 +227,12 @@ pub struct ScpClient {
     /// routing id) and the shared `context_routing_id` (the §9.10.4 announcement
     /// channel), so [`Self::handle_relay_frame`] can resolve an inbound `BLOB`'s
     /// routing id back to the context that owns it. Rebuilt on restore.
+    ///
+    /// INVARIANT: entries are added on create / join / restore
+    /// (`install_local_routing`) and there is **no eviction path** —
+    /// [`Self::close_context`] intentionally leaves stale entries. They are benign:
+    /// a `BLOB` on a closed context's routing id resolves to an absent context and
+    /// `receive_message` returns `UnknownContext`, which `handle_relay_frame` drops.
     routing_index: HashMap<[u8; 32], String>,
     /// Observability counter: inbound frames dropped as **self-echoes** — this
     /// member's own publish delivered back by the relay (which has no publisher
@@ -390,6 +396,14 @@ impl ScpClient {
     /// or the leaf append fails. A [`ClientError::StorageBackend`] from the
     /// initial persist **poisons** the freshly-created context (its in-memory
     /// state exists but was never durably recorded); reconstruct via [`Self::new`].
+    /// A post-persist [`ClientError::Mls`] / [`ClientError::Codec`] from local
+    /// routing install (pseudonym derivation over the just-built MLS key) returns
+    /// `Err` with the context **already created AND persisted** — routing install
+    /// runs through the shared `install_local_routing` helper, which
+    /// requires the context to be resident, so it necessarily follows the insert.
+    /// The context is live and durable; the caller may retry entry-time routing by
+    /// reopening (restore re-runs `install_local_routing`), not by re-creating
+    /// (which would hit `ContextAlreadyExists`).
     pub fn create_context(&mut self, context_id: &str) -> Result<(), ClientError> {
         if self.contexts.contains_key(context_id) {
             return Err(ClientError::ContextAlreadyExists(context_id.to_owned()));
@@ -669,7 +683,13 @@ impl ScpClient {
     /// persist failure **poisons** the freshly-joined context (its state advanced
     /// in memory but was not durably recorded); reconstruct via [`Self::new`],
     /// which restores the still-present pending material and lets the join be
-    /// retried.
+    /// retried. A post-persist [`ClientError::Mls`] / [`ClientError::Codec`] from
+    /// local routing install (pseudonym derivation over the joined MLS key) returns
+    /// `Err` with the context **already joined AND persisted** — routing install
+    /// runs through the shared `install_local_routing` helper, which
+    /// requires the context to be resident, so it necessarily follows the insert.
+    /// The context is live and durable; reopening (restore re-runs
+    /// `install_local_routing`) re-drives entry-time routing.
     pub fn join_context_encrypted(
         &mut self,
         context_id: &str,
@@ -855,6 +875,15 @@ impl ScpClient {
     /// [`ClientError::StorageBackend`] from the pre-publish persist **poisons** the
     /// context: the message's state advanced in memory but was not durably
     /// recorded.
+    ///
+    /// A [`ClientError::Transport`] is **not safely retryable** by re-calling this
+    /// method. Encryption advances the MLS ratchet **once**, before the fan-out; a
+    /// transport error is raised mid-/post-fan-out, so a frame may already have
+    /// reached some peers (a partial send) while the ratchet has moved on. Calling
+    /// `send_message` again encrypts a *new* message at the advanced ratchet — it
+    /// does not re-deliver the same ciphertext, and peers who received the first
+    /// frame keep it. Recovery is at the transport layer (reconnect + the
+    /// application re-sends new content), not a same-call retry of this frame.
     pub fn send_message(&mut self, context_id: &str, plaintext: &[u8]) -> Result<(), ClientError> {
         self.encrypt_and_fanout(context_id, plaintext, true)
     }

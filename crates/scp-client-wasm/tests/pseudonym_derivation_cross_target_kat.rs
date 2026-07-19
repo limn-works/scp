@@ -152,6 +152,10 @@ fn pseudonym_derivation_matches_golden_vectors() {
 // depends on). The MLS key is random, so this is not a fixed-byte golden; instead
 // it pins determinism + context-separation + restore-stability of the serde path
 // on each target (a `usize`/serde divergence would break one of these).
+// Byte-truth is TRANSITIVE, not direct: C2 never compares native vs wasm bytes (the
+// key is random), but both targets run the ONE shared `derive_pseudonym` over the
+// golden-pinned raw recipe (the KAT above) — so each target reproducing that recipe
+// faithfully through its own serde path implies the two targets agree byte-for-byte.
 // ---------------------------------------------------------------------------
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
