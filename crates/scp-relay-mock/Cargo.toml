@@ -1,0 +1,28 @@
+[package]
+name = "scp-relay-mock"
+version = "0.1.0-beta.2"
+description = "Faithful in-memory relay mock for the ADR-057 transport-slice integration tests — the single-sourced relay-fidelity anchor shared by the scp-client and scp-client-wasm test suites. Ships nothing: referenced only as a [dev-dependency]."
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+# Dev-only test-support crate. It is a workspace member (so it builds + lints
+# with the tree) but is referenced ONLY as a [dev-dependency] by scp-client /
+# scp-client-wasm, so it never ships and stays outside the ADR-057 wasm fence's
+# shipped-dependency graph.
+publish = false
+
+[dependencies]
+# The mock's injected connection implements `scp_client::RelaySink` and drives
+# each suite's client through the `RelayParty` trait. scp-client is wasm-safe
+# (inside the ADR-057 fence); this crate depends on it only to name that trait.
+scp-client = { path = "../scp-client", version = "=0.1.0-beta.2" }
+# The shared relay wire types the injected sink forwards and the pump delivers.
+scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
+# `OuterEnvelope` (de)serialization for `PublishRecord::inner_ciphertext` /
+# `envelope_routing_id`, which the adversarial tests use to reach the inner MLS
+# ciphertext and assert the cleartext routing id is zeroed (§9.10.4).
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+
+[lints]
+workspace = true

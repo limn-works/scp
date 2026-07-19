@@ -91,8 +91,13 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 /// long enough to absorb transient relay outages.
 ///
 /// Public so the lifecycle path can re-use the same value when sealing
-/// welcome envelopes.
-pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
+/// welcome envelopes. Sourced from the wasm-safe
+/// [`scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS`] so the
+/// native runtime and the in-browser `scp-client` driver request the identical
+/// relay-storage window for the same message (ADR-057 "share, don't fork") — the
+/// value is unchanged (300s); only its single source of truth moved.
+pub const DEFAULT_BLOB_TTL_SECS: u32 =
+    scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS;
 
 // ---------------------------------------------------------------------------
 // 1. build_inner_wire (shared inner-envelope construction)
@@ -526,8 +531,9 @@ pub fn deliver_plaintext_or_announcement(
             // A received pseudonym announcement is a §9.10.4 routing-bootstrap
             // signal, NOT a durable Merkle event. `ingest_pseudonym_announcement`
             // already inserted the peer's routing ID into the in-memory registry
-            // and emitted `ContextEvent::PseudonymAnnounced` to the receive
-            // buffer (the announcement's entire function). Returning `None`
+            // and — when the value was new or changed (emit-on-change) — emitted
+            // `ContextEvent::PseudonymAnnounced` to the receive buffer (the
+            // announcement's entire function). Returning `None`
             // suppresses any durable append, exactly as for received application
             // messages (`NotAnnouncement` below): a per-receiver, per-arrival-order
             // append cannot converge across honest members (late joiners miss
@@ -568,7 +574,9 @@ pub fn deliver_plaintext_or_announcement(
 /// normal message.
 pub enum AnnouncementOutcome {
     /// The plaintext was a well-formed announcement that passed every check;
-    /// the peer registry was updated and a `PseudonymAnnounced` event emitted.
+    /// the peer registry was updated. A `PseudonymAnnounced` event is emitted
+    /// only when the recorded pseudonym was NEW or CHANGED (emit-on-change) —
+    /// an identical re-announce records the (unchanged) value and emits nothing.
     Recorded,
     /// The plaintext is not a tagged `PseudonymAnnouncement` — deliver it as a
     /// normal application message.
@@ -610,11 +618,18 @@ fn ingest_pseudonym_announcement(
     // per-branch `tracing` warn, the registry insert, and the `PseudonymAnnounced`
     // buffer emit — stay HERE and are byte-and-trace-identical to the previous
     // inline implementation.
+    // S1 own-pseudonym guard (centralized in the shared classifier — ADR-057): pass
+    // this member's OWN pseudonym so a forged `attacker_did → our_pseudonym`
+    // announcement is rejected as a collision. `local_pseudonym()` and
+    // `peer_registry()` both read the routing state; capture the local pseudonym
+    // first so the two borrows do not overlap.
+    let local_pseudonym = view.routing_mut().local_pseudonym();
     match classify_pseudonym_announcement(
         plaintext,
         sender_did,
         context_id,
         view.routing_mut().peer_registry(),
+        local_pseudonym,
     ) {
         PseudonymAnnouncementDecision::NotAnnouncement => AnnouncementOutcome::NotAnnouncement,
         PseudonymAnnouncementDecision::Rejected {
@@ -664,17 +679,29 @@ fn ingest_pseudonym_announcement(
             // insert. The `if let` (rather than a workspace-denied `expect`) is a
             // total match over that proven invariant — the registry presence
             // cannot change between the classify read and this insert (no mutation
-            // occurs in between).
-            if let Some(pseudonym_registry) = view.routing_mut().peer_registry_mut() {
-                pseudonym_registry.insert(member_did.clone(), pseudonym);
+            // occurs in between). `HashMap::insert` returns the PRIOR value, which
+            // drives the emit-on-change predicate below.
+            let previous = view
+                .routing_mut()
+                .peer_registry_mut()
+                .and_then(|registry| registry.insert(member_did.clone(), pseudonym));
+            // Record + emit-ON-CHANGE. Emit the `PseudonymAnnounced` observability
+            // event only when the recorded pseudonym is NEW **or CHANGED** — a
+            // first-contact peer, or a KNOWN peer that rotated its pseudonym and
+            // re-announced a different value (surfacing the routing change to a
+            // stream watcher). An IDENTICAL re-announce leaves the registry value
+            // unchanged and emits nothing, deduping the mesh's reciprocal-cascade
+            // re-sends. This mirrors the browser client's ingest predicate
+            // (`scp-client` `ingest_application_plaintext`) so accept/emit cannot
+            // drift across targets (share-don't-fork). The `routing_mut()` borrow
+            // above has ended (NLL) before this disjoint `receive_buffer` emit.
+            if previous != Some(pseudonym) {
+                let event = ContextEvent::PseudonymAnnounced {
+                    member_did,
+                    pseudonym,
+                };
+                emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
             }
-            // Record + emit. The `routing_mut()` borrow above has ended (NLL)
-            // before this disjoint `receive_buffer` emit.
-            let event = ContextEvent::PseudonymAnnounced {
-                member_did,
-                pseudonym,
-            };
-            emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
             AnnouncementOutcome::Recorded
         }
     }
@@ -3479,8 +3506,9 @@ pub async fn deliver_message_and_drain_buffered(
             // Fall through to the normal-message delivery path below.
         }
         AnnouncementOutcome::Recorded => {
-            // Recorded + emitted by the shared validator (registry insert +
-            // `ContextEvent::PseudonymAnnounced` buffer signal). The remaining
+            // Recorded by the shared validator (registry insert + a
+            // `ContextEvent::PseudonymAnnounced` buffer signal emitted
+            // on-change). The remaining
             // follow-up — sequence-tracker advance, reorder-buffer drain,
             // velocity, and consequence evaluation — is specific to the in-order
             // direct path and runs here only. There is NO durable Merkle append:
@@ -3858,6 +3886,38 @@ mod pseudonym_routing_tests {
     }
 
     #[test]
+    fn buffered_forged_own_pseudonym_announcement_is_rejected() {
+        // S1 (centralized in the shared classifier — ADR-057): BOB forges
+        // `BOB → victim_pseudonym`, where `victim_pseudonym` is THIS receiver's own
+        // pseudonym. The sender-mismatch guard passes (BOB announces for BOB) and
+        // the value is not in the peer registry (which excludes self), but the
+        // classifier — given the receiver's own pseudonym via `local_pseudonym()` —
+        // rejects it as a collision, so native does NOT record `BOB → our address`.
+        // Mirrors the browser `classify_rejects_announcement_of_the_receivers_own_pseudonym`.
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let victim_pseudonym = [0x77u8; 32];
+        ClassCMut::from_state(&mut state)
+            .routing_mut()
+            .set_local_pseudonym(victim_pseudonym);
+
+        let result = deliver_plaintext_or_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            BOB,
+            &announcement_bytes(BOB, victim_pseudonym),
+            &ctx,
+            None,
+        );
+        // Rejected → no typed-append and (crucially) no registry insert.
+        assert_eq!(result, None);
+        let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
+        assert!(
+            reg.get(&DID(BOB.to_owned())).is_none(),
+            "a forged own-pseudonym announcement must NOT be recorded (S1)"
+        );
+    }
+
+    #[test]
     fn buffered_same_did_reannounce_succeeds_and_updates_registry() {
         let mut state = encrypted_state();
         let ctx = ctx_hex(0x11);
@@ -3893,6 +3953,78 @@ mod pseudonym_routing_tests {
             reg.get(&DID(ALICE.to_owned())),
             Some(&rotated),
             "a same-DID re-announce must update (not reject) the registry"
+        );
+    }
+
+    /// Emit-on-CHANGE: the receive buffer surfaces a `PseudonymAnnounced` event
+    /// on a NEW peer and on a CHANGED (rotated) pseudonym, but NOT on an
+    /// identical re-announce (the reciprocal cascade re-sends the same value
+    /// idempotently). Mirrors the browser client's `ingest_application_plaintext`
+    /// predicate so the emit decision cannot drift across targets
+    /// (share-don't-fork — ADR-057). Guards the silent-rotation gap: a known
+    /// peer that rotates its routing ID MUST surface the change to a stream
+    /// watcher, not update the registry silently.
+    #[test]
+    fn ingest_emits_pseudonym_announced_on_change_only() {
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let first = [0x42u8; 32];
+        let rotated = [0x43u8; 32];
+
+        let count_events = |s: &PerContextState| {
+            s.receive_buffer
+                .event_log_entries()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        scp_protocol::context::membership::ContextEvent::PseudonymAnnounced { .. }
+                    )
+                })
+                .count()
+        };
+
+        // (1) First contact — a NEW peer: emits.
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, first),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            1,
+            "a first-contact announcement must emit a PseudonymAnnounced event"
+        );
+
+        // (2) Identical re-announce — SAME value: registry value is unchanged,
+        // so NO new event fires (the reciprocal-cascade dedup).
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, first),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            1,
+            "an identical re-announce must NOT emit a duplicate PseudonymAnnounced event"
+        );
+
+        // (3) Rotation — CHANGED value: emits again, surfacing the address change.
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, rotated),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            2,
+            "a rotated (changed) pseudonym re-announce must emit a fresh PseudonymAnnounced event"
         );
     }
 
@@ -4691,6 +4823,90 @@ mod pseudonym_routing_tests {
         assert!(
             !saw_any_append.load(AtomicOrdering::SeqCst),
             "a received pseudonym announcement must NOT mint any durable Merkle leaf (§9.9.3)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NATIVE-PARITY FOLLOW-UP (#2179): reciprocal-announce mesh completion.
+    //
+    // The browser client (`scp-client`) completes the §9.10.4 pseudonym mesh over
+    // a real relay via RECIPROCAL-ANNOUNCE: when a member records a NEW peer's
+    // pseudonym (a DID not previously in its registry) it re-announces its OWN
+    // pseudonym, guarded first-time-per-peer so the cascade converges
+    // (joiner-announce seed → existing members reciprocate → joiner reciprocates →
+    // quiescent). Native `ingest_pseudonym_announcement` records + emits but does
+    // NOT reciprocate.
+    //
+    // This is a GENUINE external constraint, not a deferral dressed as a decision:
+    // the native runtime wires no live relay-receive PUMP today, so a native
+    // reciprocal has nothing to drive against and is presently untestable
+    // end-to-end. Native must adopt reciprocal-announce in
+    // `ingest_pseudonym_announcement` WHEN it wires that live receive pump (#2179),
+    // so the trigger lands together with the loop that exercises it.
+    //
+    // This scaffold exercises the trigger CONDITION today (a first-time new-peer
+    // recording — the exact event the reciprocal keys on) against the real native
+    // ingest and pins the expected contract. It is #[ignore]d until #2179 wires the
+    // receive pump, at which point it is extended to assert the outbound reciprocal
+    // announcement (this member's own pseudonym, first-time-per-peer guarded) and
+    // un-ignored.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "native reciprocal-announce follow-up — see #2179"]
+    fn native_reciprocal_announce_on_new_peer_is_a_follow_up() {
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        // ALICE (this member) holds her own local pseudonym; BOB is a brand-new
+        // peer whose announcement ALICE is about to ingest for the first time.
+        let alice_pseudonym = [0xA1u8; 32];
+        ClassCMut::from_state(&mut state)
+            .routing_mut()
+            .set_local_pseudonym(alice_pseudonym);
+
+        // Precondition: BOB is NOT yet known — recording him is a FIRST-TIME new
+        // peer, the exact event reciprocal-announce keys on.
+        assert!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .get(&DID(BOB.to_owned()))
+                .is_none(),
+            "BOB must be unknown before the ingest so this is a first-time new-peer recording"
+        );
+
+        let bob_pseudonym = [0xB0u8; 32];
+        let outcome = ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            BOB,
+            &announcement_bytes(BOB, bob_pseudonym),
+            &ctx,
+            None,
+        );
+        assert!(
+            matches!(outcome, AnnouncementOutcome::Recorded),
+            "a legitimate new-peer announcement is recorded"
+        );
+        assert_eq!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .get(&DID(BOB.to_owned())),
+            Some(&bob_pseudonym),
+            "BOB's pseudonym is now recorded (the first-time trigger fired)"
+        );
+
+        // EXPECTED (unmet today — #2179): recording BOB as a NEW peer must drive a
+        // RECIPROCAL announcement of ALICE's own pseudonym so BOB learns ALICE — the
+        // mesh-completion half of §9.10.4. Native produces no reciprocal here because
+        // there is no live receive pump to carry it; when #2179 wires that pump this
+        // test asserts the outbound reciprocal announcement is produced, then is
+        // un-ignored. Fail loudly if run so the gap is never mistaken for closed.
+        panic!(
+            "native reciprocal-announce is not implemented — recording a new peer must \
+             trigger a reciprocal announcement of this member's own pseudonym (#2179)"
         );
     }
 

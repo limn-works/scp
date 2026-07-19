@@ -142,3 +142,64 @@ fn assert_pseudonym_derivation_cross_target_vectors() {
 fn pseudonym_derivation_matches_golden_vectors() {
     assert_pseudonym_derivation_cross_target_vectors();
 }
+
+// ---------------------------------------------------------------------------
+// C2 — the FULL `ScpMlsGroup::derive_pseudonym` serde-extraction path, driven on
+// BOTH native and wasm32. The KAT above pins the raw `derive_pseudonym_keypair`
+// recipe; this exercises the driver's actual reach into the openmls
+// `SignatureKeyPair` (recovering the 32-byte Ed25519 seed through the type's serde
+// form — the step whose wasm32 32-bit-`usize` behavior the byte-parity claim
+// depends on). The MLS key is random, so this is not a fixed-byte golden; instead
+// it pins determinism + context-separation + restore-stability of the serde path
+// on each target (a `usize`/serde divergence would break one of these).
+// Byte-truth is TRANSITIVE, not direct: C2 never compares native vs wasm bytes (the
+// key is random), but both targets run the ONE shared `derive_pseudonym` over the
+// golden-pinned raw recipe (the KAT above) — so each target reproducing that recipe
+// faithfully through its own serde path implies the two targets agree byte-for-byte.
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn mls_group_derive_pseudonym_serde_path_is_stable_cross_target() {
+    use scp_clock::TestClock;
+    use scp_did::SigningKeyId;
+    use scp_mls::ScpCredential;
+    use scp_mls::group::create_group;
+
+    let clock = TestClock::new(1_900_000_000);
+    let cred = ScpCredential::new(
+        "did:key:z6MkPseudonymDeriveSerdePathKAT".to_owned(),
+        None,
+        SigningKeyId::Active,
+    )
+    .expect("credential");
+    let group = create_group(&cred, &clock).expect("create group");
+    let ctx = b"scp-mls-derive-serde-path-kat";
+
+    // Determinism: the serde seed-extraction recovers the same seed each call.
+    let p1 = group.derive_pseudonym(ctx).expect("derive p1");
+    let p2 = group.derive_pseudonym(ctx).expect("derive p2");
+    assert_eq!(
+        p1, p2,
+        "derive_pseudonym is deterministic (serde seed-extraction stable) on this target"
+    );
+    assert_ne!(p1, [0u8; 32], "a real pseudonym is non-zero");
+
+    // Context separation.
+    let other = group
+        .derive_pseudonym(b"a-different-context")
+        .expect("derive other");
+    assert_ne!(other, p1, "distinct contexts derive distinct pseudonyms");
+
+    // The serde-extraction path survives a state serialize/restore round-trip —
+    // the reopened-tab property, exercised on THIS target.
+    let blob = group.serialize_state().expect("serialize");
+    let restored = scp_mls::ScpMlsGroup::deserialize_state(&blob).expect("restore");
+    assert_eq!(
+        restored
+            .derive_pseudonym(ctx)
+            .expect("derive after restore"),
+        p1,
+        "serde seed-extraction is stable across a state restore on this target"
+    );
+}

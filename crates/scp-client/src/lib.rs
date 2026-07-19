@@ -43,7 +43,14 @@
 //!   convenient one in tests; an `IndexedDB`/OPFS backend backs a durable browser
 //!   client,
 //! - a [`scp_clock::Clock`] — the hardened time source for
-//!   committer-assigned event-log leaf timestamps (ADR-057 Prerequisite 1).
+//!   committer-assigned event-log leaf timestamps (ADR-057 Prerequisite 1),
+//! - a [`RelaySink`] — the injected **outbound** relay port. The driver hands it
+//!   serialized relay `ClientMessage` frames (a `SUBSCRIBE` on context entry, a
+//!   `PUBLISH` per §9.10.4 fan-out address on send/announce); inbound relay
+//!   frames flow the other way, pushed by the embedder into
+//!   [`ScpClient::handle_relay_frame`]. In a browser this is a `wasm-bindgen`
+//!   `JsSocket` over the tab's WebSocket ([`MemoryStorage`] has no transport
+//!   analogue — a no-persistence client still needs a real socket to reach peers).
 //!
 //! # In-tab sender-key distribution (§9.16.1/§9.16.2, ADR-057)
 //!
@@ -76,6 +83,7 @@ mod client;
 mod context;
 mod crypto_state;
 mod error;
+mod relay_sink;
 mod signer;
 mod snapshot;
 mod storage;
@@ -83,9 +91,10 @@ mod storage;
 pub use client::{AddMemberOutput, ContextStatus, ReceiveOutput, ScpClient};
 pub use context::{EVENT_BUFFER_CAP, PerContextState};
 pub use crypto_state::{
-    ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound, SenderKeyDistribution,
+    ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound, RecvChannel, SenderKeyDistribution,
 };
 pub use error::ClientError;
+pub use relay_sink::RelaySink;
 pub use signer::{LocalSigner, Signer};
 // `ContextSnapshot` / `SNAPSHOT_FORMAT_VERSION` are intentionally NOT re-exported:
 // the snapshot blob format is a crate-internal persistence detail (captured/

@@ -19,6 +19,7 @@ use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_protocol::context::membership::ContextEvent;
 
 use crate::crypto_state::ContextCryptoState;
+use crate::error::ClientError;
 
 /// Maximum events held in the pull-based receive buffer before the oldest is
 /// dropped (FIFO overflow).
@@ -43,6 +44,19 @@ pub struct PerContextState {
     pub member_sequence_numbers: HashMap<String, u64>,
     /// Pull-based receive buffer. Drained by `ScpClient::drain_events`.
     pub event_buffer: VecDeque<ContextEvent>,
+    /// The §9.10.4 peer-pseudonym registry: `peer_did → 32-byte routing ID`.
+    /// Populated when a peer's `PseudonymAnnouncement` is ingested (§9.10.4). This
+    /// is the address book the app-data fan-out publishes to — each entry is one
+    /// peer's per-context relay routing ID. Excludes this member's own pseudonym
+    /// (that is [`Self::local_pseudonym`]); it is the exact registry
+    /// [`classify_pseudonym_announcement`](scp_protocol::context::pseudonym::classify_pseudonym_announcement)
+    /// consults for the cross-DID collision check.
+    pub peer_pseudonyms: HashMap<DID, [u8; 32]>,
+    /// This member's own per-context pseudonym (its 32-byte relay routing ID),
+    /// derived over the wasm-held MLS signing key (ADR-057 Option A). `None` until
+    /// derived on context entry (create/join). NOT persisted — re-derived on
+    /// restore from the MLS key, which is deterministic (see `snapshot.rs`).
+    pub local_pseudonym: Option<[u8; 32]>,
     /// Poison flag: set when a `Storage` write failed *after* this context's
     /// in-memory state had already advanced irreversibly (see
     /// [`ClientError::ContextPoisoned`](crate::ClientError::ContextPoisoned)). A
@@ -66,6 +80,8 @@ impl PerContextState {
             event_log: EventLog::new(context_id.to_owned()),
             member_sequence_numbers: HashMap::new(),
             event_buffer: VecDeque::new(),
+            peer_pseudonyms: HashMap::new(),
+            local_pseudonym: None,
             poisoned: false,
         };
         // The creator is the sole initial member; record it in the wrapping-key
@@ -85,8 +101,36 @@ impl PerContextState {
             event_log: EventLog::new(context_id.to_owned()),
             member_sequence_numbers: HashMap::new(),
             event_buffer: VecDeque::new(),
+            peer_pseudonyms: HashMap::new(),
+            local_pseudonym: None,
             poisoned: false,
         }
+    }
+
+    /// Records a peer's announced per-context pseudonym in the §9.10.4 registry
+    /// (keyed by the peer's DID). Overwrites a prior value for the same DID (a
+    /// key-rotation re-announce). Never records this member's own DID — the local
+    /// pseudonym is tracked separately in [`Self::local_pseudonym`].
+    pub fn record_peer_pseudonym(&mut self, peer_did: DID, pseudonym: [u8; 32]) {
+        self.peer_pseudonyms.insert(peer_did, pseudonym);
+    }
+
+    /// The app-data fan-out address set: every announced peer pseudonym (the
+    /// registry values), in arbitrary order. Empty until peers announce.
+    #[must_use]
+    pub fn peer_pseudonym_values(&self) -> Vec<[u8; 32]> {
+        self.peer_pseudonyms.values().copied().collect()
+    }
+
+    /// Sets this member's own per-context pseudonym (derived on context entry).
+    pub const fn set_local_pseudonym(&mut self, pseudonym: [u8; 32]) {
+        self.local_pseudonym = Some(pseudonym);
+    }
+
+    /// This member's own per-context pseudonym, or `None` before it is derived.
+    #[must_use]
+    pub const fn local_pseudonym(&self) -> Option<[u8; 32]> {
+        self.local_pseudonym
     }
 
     /// Records a member in the context's wrapping-key directory (the
@@ -114,14 +158,39 @@ impl PerContextState {
     /// Returns and post-increments this member's next outgoing sequence number.
     ///
     /// Returns 0 (and seeds the counter) if the member has no counter yet.
-    pub fn next_sequence(&mut self, member_did: &str) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with [`ClientError::Driver`] at `u64::MAX` rather than
+    /// wrapping or saturating. The sequence is the §9.16 sender-layer AEAD's
+    /// authenticated **anti-replay input** — NOT a GCM nonce (the AES-256-GCM
+    /// nonce is a fresh 12-byte `OsRng` value per encryption; see
+    /// `scp-protocol::crypto::sender_keys::encrypt`). `encrypt_message` binds
+    /// `epoch || sequence` into the AEAD **AAD**, and the receiver enforces a
+    /// per-sender monotonic `(epoch, sequence)` replay floor
+    /// (`crypto_state.rs`). A `saturating_add` would stick at `u64::MAX` and
+    /// hand out the SAME sequence twice: the duplicate would wedge the
+    /// receiver's replay floor — a re-used `(epoch, sequence)` at or below the
+    /// last-accepted pair is rejected as a replay, silently dropping the
+    /// message and collapsing the anti-replay invariant. (This is distinct from
+    /// GCM nonce reuse, which the per-call random nonce already precludes.) The
+    /// send therefore refuses rather than reuse the counter (mirrors
+    /// `ContextCryptoState::rotate_sender_key`'s epoch-overflow guard). `u64::MAX`
+    /// sends is operationally unreachable, so this never fires in practice; it
+    /// exists so the footgun cannot silently arm.
+    pub fn next_sequence(&mut self, member_did: &str) -> Result<u64, ClientError> {
         let entry = self
             .member_sequence_numbers
             .entry(member_did.to_owned())
             .or_insert(0);
         let seq = *entry;
-        *entry = entry.saturating_add(1);
-        seq
+        *entry = entry.checked_add(1).ok_or_else(|| {
+            ClientError::Driver(format!(
+                "outgoing sequence number overflow for '{member_did}' (already at u64::MAX); \
+                 refusing to reuse a sequence (§9.16 AEAD anti-replay AAD input)"
+            ))
+        })?;
+        Ok(seq)
     }
 
     /// Pushes an event onto the receive buffer, evicting the oldest at capacity.

@@ -153,6 +153,23 @@ pub enum MlsError {
     #[error("convergent committer timestamp missing from MLS AAD")]
     ConvergentTimestampMissing,
 
+    /// The MLS frame is this member's OWN message, echoed back by the relay.
+    ///
+    /// The untrusted relay delivers a PUBLISH to ALL subscribers of a routing id
+    /// — INCLUDING the publisher (`deliver_to_subscribers` has no publisher
+    /// exclusion). Every member publishes its `PseudonymAnnouncement` to the shared
+    /// `context_routing_id` AND subscribes to it, so each announcement is echoed to
+    /// its author, whose MLS state cannot decrypt its own outbound message
+    /// (openmls `ValidationError::CannotDecryptOwnMessage`). This is a **benign,
+    /// expected** outcome under the untrusted-relay model — the receive loop MUST
+    /// treat it as a DROP (symmetric with an unknown-routing_id drop), NOT a
+    /// failure. Distinct from [`Self::DecryptionFailed`] so callers can tell a
+    /// self-echo apart from a genuine bad/tampered frame. (ADR-057; shared by the
+    /// native runtime and the in-browser driver — see the receive paths that map
+    /// this to a benign drop.)
+    #[error("cannot decrypt own message (relay echo of a self-authored frame)")]
+    CannotDecryptOwnMessage,
+
     /// A decrypted-and-verified MLS frame carried an AAD that is not a
     /// well-formed convergent-timestamp blob (wrong length, wrong magic, or an
     /// unrecognized version). Raised by
@@ -161,4 +178,14 @@ pub enum MlsError {
     /// (ADR-057).
     #[error("convergent committer timestamp malformed: {0}")]
     ConvergentTimestampMalformed(String),
+
+    /// The per-context pseudonym could not be derived from this member's MLS
+    /// signing key (ADR-057 Option A, §9.10.4.A). Raised by
+    /// [`ScpMlsGroup::derive_pseudonym`](crate::group::ScpMlsGroup::derive_pseudonym)
+    /// if the signer's private seed cannot be recovered, or is not the expected
+    /// 32-byte Ed25519 seed (a non-Ed25519 or malformed signer — SCP groups are
+    /// Ed25519-only per `SCP_CIPHERSUITE`). Fail-closed: never truncate a
+    /// wrong-size key into the derivation.
+    #[error("pseudonym derivation failed: {0}")]
+    PseudonymDerivationFailed(String),
 }

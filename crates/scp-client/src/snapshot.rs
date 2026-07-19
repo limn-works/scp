@@ -105,7 +105,16 @@ use crate::error::ClientError;
 /// reopened tab could not HPKE-open the next distribution; without the directory
 /// it could not seal on the next add/rotate. Pre-release: no migration, a v2 blob
 /// is rejected as an unknown version.
-pub const SNAPSHOT_FORMAT_VERSION: u16 = 3;
+///
+/// **v4** persists the §9.10.4 **peer-pseudonym registry** (`peer_pseudonyms`, the
+/// `peer_did → routing_id` address book the app-data fan-out publishes to — ADR-057
+/// transport slice). Without it a reopened tab would forget every peer's routing id
+/// and could not send app data until peers re-announced. The member's OWN pseudonym
+/// (`local_pseudonym`) is deliberately NOT persisted: it is a pure, deterministic
+/// function of the MLS signing key (which IS persisted, in `mls_state`), so restore
+/// re-derives it — persisting it would be redundant state that could drift.
+/// Pre-release: no migration, a v3 blob is rejected as an unknown version.
+pub const SNAPSHOT_FORMAT_VERSION: u16 = 4;
 
 /// A buffered, decrypted-but-undrained context event, in serializable form.
 ///
@@ -135,6 +144,18 @@ enum BufferedEvent {
         sender_did: String,
         /// The decrypted plaintext payload.
         payload: Vec<u8>,
+    },
+    /// A peer's pseudonym announcement this participant ingested
+    /// (`PseudonymAnnounced` — §9.10.4, ADR-057 transport slice). Carries no
+    /// secret material (a DID + a public routing id), but is buffered like the
+    /// message variants so `drain_events` delivers it exactly once across a restore.
+    /// The durable routing state is the persisted `peer_pseudonyms` registry; this
+    /// is the (re-learnable) UI notification.
+    Announced {
+        /// The announcing peer's DID.
+        member_did: String,
+        /// The 32-byte routing id the peer announced.
+        pseudonym: [u8; 32],
     },
 }
 
@@ -199,6 +220,12 @@ pub struct ContextSnapshot {
     member_wrapping_keys: Vec<(String, [u8; 32])>,
     /// Per-member next-outgoing message sequence numbers: `(did, sequence)`.
     member_sequence_numbers: Vec<(String, u64)>,
+    /// The §9.10.4 peer-pseudonym registry: `(peer_did, routing_id)` pairs — every
+    /// peer's announced per-context relay routing id (ADR-057 transport slice).
+    /// Persisted so a reopened tab can immediately fan app data out to known peers
+    /// without waiting for them to re-announce. Excludes this member's own
+    /// pseudonym (re-derived from the MLS key on restore, not persisted).
+    peer_pseudonyms: Vec<(String, [u8; 32])>,
     /// The §9.9.3 checkpoint: the event-log Merkle root at snapshot time. On
     /// restore, the root recomputed from `events` MUST equal this, or the blob is
     /// rejected as a torn/corrupt/truncated event stream. This binds the event
@@ -241,6 +268,10 @@ impl std::fmt::Debug for ContextSnapshot {
                 &format_args!("[{} members]", self.member_wrapping_keys.len()),
             )
             .field("member_sequence_numbers", &self.member_sequence_numbers)
+            .field(
+                "peer_pseudonyms",
+                &format_args!("[{} peers]", self.peer_pseudonyms.len()),
+            )
             .field("event_log_root", &hex_root(&self.event_log_root))
             .finish()
     }
@@ -289,6 +320,14 @@ impl ContextSnapshot {
             .map(|(did, seq)| (did.clone(), *seq))
             .collect();
 
+        // §9.10.4 peer-pseudonym registry (ADR-057 transport slice). The own
+        // pseudonym is not captured — it is re-derived from the MLS key on restore.
+        let peer_pseudonyms: Vec<(String, [u8; 32])> = state
+            .peer_pseudonyms
+            .iter()
+            .map(|(did, pseudonym)| (did.0.clone(), *pseudonym))
+            .collect();
+
         // Convert the receive buffer (decrypted-but-undrained local history) into
         // the persisted variant-aware form. The driver buffers `MessageSent` (a
         // sender's own history) and `MessageReceived`; any other variant is an
@@ -313,10 +352,17 @@ impl ContextSnapshot {
                     sender_did: sender_did.0.clone(),
                     payload: payload.clone(),
                 }),
+                ContextEvent::PseudonymAnnounced {
+                    member_did,
+                    pseudonym,
+                } => buffered_events.push(BufferedEvent::Announced {
+                    member_did: member_did.0.clone(),
+                    pseudonym: *pseudonym,
+                }),
                 _ => {
                     return Err(ClientError::Driver(
-                        "receive buffer holds an event that is neither MessageSent nor \
-                         MessageReceived; only those are buffered by the participant driver"
+                        "receive buffer holds an event that is not MessageSent, MessageReceived, \
+                         or PseudonymAnnounced; only those are buffered by the participant driver"
                             .to_owned(),
                     ));
                 }
@@ -339,6 +385,7 @@ impl ContextSnapshot {
             wrapping_secret: *crypto.wrapping_secret,
             member_wrapping_keys: crypto.wrapping_keys_snapshot(),
             member_sequence_numbers,
+            peer_pseudonyms,
             event_log_root: state.event_log_root(),
         })
     }
@@ -417,6 +464,9 @@ impl ContextSnapshot {
             sender_key_epoch: self.sender_key_epoch,
             sender_key_store,
             recv_sequence_tracker,
+            // In-memory only (idempotent announcements; not snapshotted). A restored
+            // context starts with an empty announcement floor — see `RecvChannel`.
+            recv_announcement_tracker: HashMap::new(),
             wrapping_public: self.wrapping_public,
             wrapping_secret: Zeroizing::new(wrapping_secret),
             member_wrapping_keys,
@@ -445,6 +495,15 @@ impl ContextSnapshot {
                 .into_iter()
                 .collect();
 
+        // §9.10.4 peer-pseudonym registry (ADR-057 transport slice). The own
+        // pseudonym is re-derived from the MLS key by the driver after restore
+        // (`ScpClient::install_local_routing`), so `local_pseudonym` starts `None`.
+        let peer_pseudonyms: HashMap<scp_did::DID, [u8; 32]> =
+            std::mem::take(&mut self.peer_pseudonyms)
+                .into_iter()
+                .map(|(did, pseudonym)| (scp_did::DID::from(did), pseudonym))
+                .collect();
+
         // Rebuild the receive buffer (decrypted-but-undrained local history) in
         // FIFO order, so a message sent or decrypted before the tab closed is
         // delivered exactly once after restore (a received message cannot be
@@ -469,6 +528,13 @@ impl ContextSnapshot {
                     sender_did: sender_did.into(),
                     payload,
                 },
+                BufferedEvent::Announced {
+                    member_did,
+                    pseudonym,
+                } => ContextEvent::PseudonymAnnounced {
+                    member_did: member_did.into(),
+                    pseudonym,
+                },
             })
             .collect();
 
@@ -477,6 +543,9 @@ impl ContextSnapshot {
             event_log,
             member_sequence_numbers,
             event_buffer,
+            peer_pseudonyms,
+            // Re-derived from the restored MLS key by the driver after restore.
+            local_pseudonym: None,
             // A restored context IS the last durable state — nothing has diverged,
             // so it is unpoisoned by construction (the poison flag is in-memory
             // session state, never serialized).
@@ -541,6 +610,9 @@ impl ContextSnapshot {
                 BufferedEvent::Sent { payload, .. } | BufferedEvent::Received { payload, .. } => {
                     payload.zeroize();
                 }
+                // A pseudonym announcement carries no secret material (a DID + a
+                // public routing id), so there is nothing to zeroize.
+                BufferedEvent::Announced { .. } => {}
             }
         }
     }

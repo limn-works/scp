@@ -50,6 +50,50 @@ pub enum ClientError {
     #[error("driver error: {0}")]
     Driver(String),
 
+    /// A decrypted frame's content type did not match the relay channel it arrived
+    /// on (§9.10.4 defense-in-depth): a tagged `PseudonymAnnouncement` delivered on
+    /// a peer-pseudonym (app-data) routing id, or app data delivered on the shared
+    /// `context_routing_id` (announcement) channel. The channel is chosen from the
+    /// RELAY-supplied routing id, so a hostile/buggy relay re-routing a frame is the
+    /// cause; the frame is DROPPED before advancing any per-channel replay floor
+    /// (the primary duplicate-delivery guarantee is openmls's per-generation replay
+    /// protection — this is defense-in-depth). Benign-dropped by
+    /// [`handle_relay_frame`](crate::ScpClient::handle_relay_frame). Surfaced as
+    /// `SCP-VALID-7011`.
+    #[error("frame content does not match its relay channel (mis-routed; dropped)")]
+    ChannelContentMismatch,
+
+    /// The injected [`RelaySink`](crate::RelaySink) failed to enqueue an outbound relay
+    /// frame (the WebSocket is closed, a JS exception was thrown, etc.). Best-effort
+    /// transport loss — the relay is an untrusted dumb pipe and the message may be
+    /// re-driven — NOT a state-corrupting error: by the time a frame is published
+    /// the driver's crypto/log state has already advanced and been persisted.
+    /// Surfaced as `SCP-TRANS-5010`.
+    #[error("transport error: {0}")]
+    Transport(String),
+
+    /// An application-data [`send_message`](crate::ScpClient::send_message) was
+    /// attempted in an encrypted multi-member context whose peer-pseudonym registry
+    /// is still empty — no peer has announced its per-context routing ID yet, so
+    /// there is nowhere to fan the ciphertext out to. Fanning out to zero addresses
+    /// would silently drop the payload and mask a bidirectional bootstrap deadlock,
+    /// so the driver returns this typed, **retryable** error instead: the caller
+    /// waits until peers' announcements have been pumped in (via
+    /// [`handle_relay_frame`](crate::ScpClient::handle_relay_frame)) and retries.
+    /// It is raised *before* the MLS ratchet advances, so no crypto state is
+    /// consumed by the failed send. Mirrors the native runtime's
+    /// `ContextError::PseudonymRegistryEmpty`. Surfaced as `SCP-CTX-2040`.
+    #[error(
+        "context '{context_id}' has {member_count} members but no peer has announced a \
+         pseudonym yet; retry after peers' announcements are pumped in"
+    )]
+    PseudonymRegistryEmpty {
+        /// The id of the context with no announced peer pseudonyms.
+        context_id: String,
+        /// The context's current member count (> 1, so peers are expected).
+        member_count: usize,
+    },
+
     /// [`join_context_encrypted`](crate::ScpClient::join_context_encrypted) was
     /// called for a context with no retained pending join material — either
     /// [`generate_key_package_for_join`](crate::ScpClient::generate_key_package_for_join)

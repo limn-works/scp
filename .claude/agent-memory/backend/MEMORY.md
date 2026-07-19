@@ -1,5 +1,7 @@
 # Backend Agent Memory (scoped)
 
+- [project-adr057-transport-jssocket](project_adr057_transport_jssocket.md) — ADR-057 JsSocket relay-transport slice; Step-2 finding: MLS SignatureKeyPair ED25519 private = 32-byte seed, recover via serde (private() is test-utils-gated); send_message()→() break analysis
+
 - [project-eventlog-committer-assigned-timestamp](project_eventlog_committer_assigned_timestamp.md) — event-log convergence: committer-assigned leaf timestamps replace per-member now(); per-class sourcing rules + CommitMeta refactor + chokepoints; spec 2ecfa23fb, impl 88c856360
 
 - [project-convergent-timer-deadline-bases](project_convergent_timer_deadline_bases.md) — timer leaves (TTL/freeze/deferred-change) anchored on convergent bases not local now; new PerContextState::creation_timestamp_secs + anchor flag; restore/import stays local (signed-snapshot creation-time = ADR-051); WASM gov-execute fails loud (CTX-2041) vs silent 0; extension-override gotcha
