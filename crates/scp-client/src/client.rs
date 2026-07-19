@@ -1021,7 +1021,7 @@ impl ScpClient {
         // Phase 2: advance crypto (sender-key + MLS double-encrypt), and — for app
         // data — buffer the local `MessageSent` history in the SAME borrow so it is
         // persisted atomically with the ratchet advance below.
-        let sequence = state.next_sequence(&sender_did);
+        let sequence = state.next_sequence(&sender_did)?;
         let ciphertext = state
             .crypto
             .encrypt_message(plaintext, &sender_did, sequence)?;
