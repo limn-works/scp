@@ -2082,8 +2082,10 @@ mod ingest_emit_tests {
     /// A single-member encrypted context for ALICE with a distinct local
     /// pseudonym (so a peer announcement never collides with ALICE's own).
     fn alice_state() -> PerContextState {
-        let crypto =
-            crate::crypto_state::ContextCryptoState::from_group(CTX, create_group(&credential(ALICE), &SystemClock).unwrap());
+        let crypto = crate::crypto_state::ContextCryptoState::from_group(
+            CTX,
+            create_group(&credential(ALICE), &SystemClock).unwrap(),
+        );
         let mut state = PerContextState::new(CTX, ALICE, crypto);
         state.set_local_pseudonym([0x01u8; 32]);
         state
@@ -2123,7 +2125,10 @@ mod ingest_emit_tests {
         // (1) First contact — a NEW peer: emits, and records the routing id.
         let (_, learned) =
             ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bob_announcement(first));
-        assert!(learned, "a first-contact announcement is a newly-learned peer");
+        assert!(
+            learned,
+            "a first-contact announcement is a newly-learned peer"
+        );
         assert_eq!(
             announced_events(&state),
             1,
@@ -2138,7 +2143,10 @@ mod ingest_emit_tests {
         // (2) Identical re-announce — SAME value: no new event, not a new peer.
         let (_, learned) =
             ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bob_announcement(first));
-        assert!(!learned, "an identical re-announce is not a newly-learned peer");
+        assert!(
+            !learned,
+            "an identical re-announce is not a newly-learned peer"
+        );
         assert_eq!(
             announced_events(&state),
             1,
@@ -2147,8 +2155,12 @@ mod ingest_emit_tests {
 
         // (3) Rotation — CHANGED value: emits again (surfaces the address change),
         // but does NOT re-trigger the first-time-per-peer reciprocal cascade.
-        let (_, learned) =
-            ingest_application_plaintext(&mut state, CTX, BOB.to_owned(), bob_announcement(rotated));
+        let (_, learned) = ingest_application_plaintext(
+            &mut state,
+            CTX,
+            BOB.to_owned(),
+            bob_announcement(rotated),
+        );
         assert!(
             !learned,
             "a rotation of a KNOWN peer must not re-arm the reciprocal cascade"
