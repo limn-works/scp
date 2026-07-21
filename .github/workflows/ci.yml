@@ -34,6 +34,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       python: ${{ steps.filter.outputs.python }}
       typescript: ${{ steps.filter.outputs.typescript }}
+      typescript-wasm: ${{ steps.filter.outputs.typescript-wasm }}
       kotlin: ${{ steps.filter.outputs.kotlin }}
       swift: ${{ steps.filter.outputs.swift }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
@@ -56,6 +57,12 @@ jobs:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
               - 'crates/scp-ffi/common/**'
+            typescript-wasm:
+              - 'bindings/typescript-wasm/**'
+              - 'bindings/typescript/src/errors.ts'
+              - 'crates/scp-client-wasm/**'
+              - 'crates/scp-client/**'
+              - 'crates/scp-mls/**'
             kotlin:
               - 'bindings/kotlin/**'
               - 'crates/scp-ffi/uniffi/**'
@@ -801,6 +808,47 @@ jobs:
           echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
       - name: Run checks
         working-directory: bindings/typescript
+        run: |
+          bun run check
+          bun run lint
+          bun test
+
+  # ── TypeScript (wasm tier) ──────────────────────────────────────────
+  typescript-wasm-check:
+    needs: changes
+    if: needs.changes.outputs.typescript-wasm == 'true'
+    name: TypeScript-wasm / build + check + lint + guards + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Pin wasm-pack for reproducibility (same version as the wasm-test job) —
+      # the --release-only build guard depends on the shipped wasm being a
+      # release build (ADR-057 Prereq-4).
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      - name: Install dependencies
+        working-directory: bindings/typescript-wasm
+        run: bun install
+      - name: Build (wasm-pack release + tsup + wasm asset copy)
+        working-directory: bindings/typescript-wasm
+        run: bun run build
+      - name: Guards (--release-only + node-free bundle isolation)
+        working-directory: bindings/typescript-wasm
+        run: |
+          bun run guard:release-only
+          bun run guard:node-free
+      - name: Check + lint + test (real wasm)
+        working-directory: bindings/typescript-wasm
         run: |
           bun run check
           bun run lint
