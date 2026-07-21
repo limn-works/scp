@@ -229,7 +229,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 - Verify against the PUSHED REMOTE branch (`git show origin/branch:file`), never the local working directory. Local state may be on a different branch.
 - For type deletions: `grep -c "struct TypeName" <file>` must return 0.
 - For imports: `grep -c "scp_protocol::module" <file>` must return >0.
-- Run the exact CI clippy command with ALL features before pushing: `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing -- -D warnings`
+- Run the exact CI clippy command with ALL features before pushing: `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant -- -D warnings`
 - If a cherry-pick resolves to "nothing to commit," the changes DID NOT LAND. Investigate.
 - Never say "done" without showing verification output.
 
