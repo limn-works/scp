@@ -58,7 +58,10 @@ export async function initScp(input?: InitInput): Promise<void> {
   if (initialized) {
     return;
   }
-  await wasmInit(input);
+  // Use the modern single-object init shape when an explicit source is given
+  // (the raw-argument form is deprecated by wasm-bindgen); the no-arg default
+  // path stays untouched so it resolves the shipped `.wasm` sibling.
+  await wasmInit(input === undefined ? undefined : { module_or_path: input });
   // Redacting panic hook (never reads the panic payload — it may hold key
   // material or plaintext). Idempotent on the Rust side.
   scp_init();
