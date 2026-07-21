@@ -2102,6 +2102,356 @@
           }
         }
       ]
+    },
+    {
+      "domain": "BrowserParticipant",
+      "operations": [
+        {
+          "name": "create_context",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Create an encrypted context with the caller as sole member.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "generate_key_package_for_join",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Generate a single-use join KeyPackage.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "add_member",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Add a member from their KeyPackage; returns commit/welcome/replay material.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "join_context_encrypted",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Join from a Welcome, replaying the adder's event-log stream.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "send_message",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Encrypt an app message and fan it out over the injected socket (§9.10.4).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "handle_relay_frame",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Feed one inbound relay frame into the driver.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "resubscribe_all",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Re-drive SUBSCRIBEs for every tracked routing id (on socket (re)open).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "receive_message",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Receive an inbound MLS message (out-of-band delivery path).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "drain_events",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Drain buffered receive events in FIFO order.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "close_context",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Close a context, destroying its crypto state (forward secrecy).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "rotate_sender_key",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Rotate the §9.16 sender key and re-distribute it (§9.16.5).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "context_ids",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "List held context ids (live and poisoned), sorted.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "context_status",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Report a context as live/poisoned/absent (non-throwing).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "member_dids",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's member DIDs, or undefined if not held.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "event_log_root",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's event-log Merkle root (32 bytes).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "event_log_leaf_count",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's event-log leaf count (u64 -> bigint, #1229).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "event_log_leaf_hashes",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's concatenated event-log leaf hashes.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "mls_epoch",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's MLS group epoch (u64 -> bigint, #1229).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "did",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return the participant's bound DID.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "init",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "One-time wasm init + redacting panic hook install.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "version",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return the wasm crate version string.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_compute_caveats_binding",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure caveats-binding predicate (browser invoker).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_verify_chunk_signature",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure chunk operator-signature verify (browser invoker).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        }
+      ]
     }
   ],
   "call_invariants": [
