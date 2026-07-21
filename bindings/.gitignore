@@ -1,0 +1,5 @@
+# Bun workspace root artifacts (ADR-057 Slice 3). The lockfile follows the same
+# convention as the sibling packages' .gitignore — not committed.
+bun.lock
+bun.lockb
+node_modules/
