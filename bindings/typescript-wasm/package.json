@@ -22,7 +22,7 @@
   "scripts": {
     "build:wasm": "bun scripts/build-wasm.ts",
     "build:wasm:test": "bun scripts/build-wasm.ts --test",
-    "build": "bun run build:wasm && tsup",
+    "build": "bun run build:wasm && tsup && bun scripts/copy-wasm-asset.ts",
     "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "lint": "biome check src/ tests/ scripts/ examples/",
     "format": "biome format --write src/ tests/ scripts/ examples/",

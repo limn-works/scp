@@ -8,6 +8,11 @@ export default defineConfig({
   clean: true,
   target: "esnext",
   splitting: false,
+  // Inject the `import.meta.url` shim into the CJS output so the wasm-bindgen
+  // glue's `new URL('./..._bg.wasm', import.meta.url)` resolves to the dist
+  // sibling under `require()` too (ESM has `import.meta.url` natively). Without
+  // this the CJS bundle's default wasm load would break.
+  shims: true,
   // The shared core (`@scp-core/errors`) and the wasm-bindgen glue are bundled
   // in so the PUBLISHED package is self-contained (ADR-057 Amendment 2026-07-15
   // D1 — each package bundles its own copy of the one in-repo core module).

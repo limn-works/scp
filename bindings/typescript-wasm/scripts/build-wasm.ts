@@ -12,13 +12,18 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   buildArgs,
   FORBIDDEN_PROFILE_FLAGS,
+  OUT_NAME,
+  PROD_OUT_DIR,
   packageRootFromScript,
   repoRootFromPackageRoot,
+  TEST_OUT_DIR,
   WASM_PACK_PROFILE_FLAG,
-} from "./wasm-build.ts";
+} from "./wasm-build";
 
 const test = process.argv.includes("--test");
 const packageRoot = packageRootFromScript(import.meta.url);
@@ -52,4 +57,28 @@ if (result.error) {
   console.error(`FATAL: could not launch wasm-pack: ${result.error.message}`);
   process.exit(1);
 }
-process.exit(result.status ?? 1);
+if ((result.status ?? 1) !== 0) {
+  process.exit(result.status ?? 1);
+}
+
+// Normalize the generated glue's wasm reference to a `./`-relative specifier so
+// the bundler (tsup/esbuild) recognizes it as a sibling asset, copies the
+// `.wasm` into dist/, and rewrites the URL to resolve relative to the emitted
+// bundle (ADR-057 Slice-3: ship the `.wasm` as a sibling via
+// `new URL('./..._bg.wasm', import.meta.url)`). wasm-pack emits it without the
+// `./`, which esbuild treats as a bare specifier and would NOT copy.
+const outDir = test ? TEST_OUT_DIR : PROD_OUT_DIR;
+const gluePath = join(packageRoot, outDir, `${OUT_NAME}.js`);
+const glue = readFileSync(gluePath, "utf8");
+const bareRef = `new URL('${OUT_NAME}_bg.wasm', import.meta.url)`;
+const relativeRef = `new URL('./${OUT_NAME}_bg.wasm', import.meta.url)`;
+if (glue.includes(bareRef)) {
+  writeFileSync(gluePath, glue.replace(bareRef, relativeRef));
+  console.log(`patched ${gluePath}: wasm reference is now './'-relative for bundler asset copy`);
+} else if (!glue.includes(relativeRef)) {
+  console.error(
+    `FATAL: expected the wasm-bindgen glue to reference the wasm via \`${bareRef}\` (or the './'-relative form); found neither. wasm-pack output shape changed — the sibling-asset copy would silently break.`,
+  );
+  process.exit(1);
+}
+process.exit(0);
