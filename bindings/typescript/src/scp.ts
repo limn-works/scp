@@ -24,9 +24,11 @@
  * directly (e.g. `scp.identityCreate("in_memory")`).
  *
  * NOTE: `SCP` requires a Node.js or Bun runtime with the native addon.
- * Browser clients connect to a node as remote thin clients over the
- * network (ADR-055); constructing `SCP` outside a Node.js/Bun runtime
- * throws `ValidationError` with `SCP-VALID-7005`.
+ * Browser clients run the full protocol in-tab (keys on-device) via the
+ * sibling `@limn-works/scp-ts-wasm` package over `scp-client-wasm` (ADR-057,
+ * which amends ADR-055's remote-thin-client browser model); constructing
+ * `SCP` outside a Node.js/Bun runtime throws `ValidationError` with
+ * `SCP-VALID-7005`.
  */
 
 // Deferred imports of opaque classes. The classes import `SCP` for
@@ -164,8 +166,8 @@ function loadAddon(): NativeAddon {
   if (typeof process === "undefined" || !process.versions?.node) {
     throw new ValidationError(
       "SCP class requires a Node.js or Bun runtime — @limn-works/scp-ts is a " +
-        "native (napi-rs) SDK (ADR-055). Browser clients connect to a node as " +
-        "remote thin clients over the network.",
+        "native (napi-rs) SDK. Browser clients run the full protocol in-tab via " +
+        "@limn-works/scp-ts-wasm (ADR-057, keys on-device).",
       "SCP-VALID-7005",
     );
   }
@@ -467,7 +469,8 @@ export interface KeyPackageReservation {
  * passed and returned as `Uint8Array`.
  *
  * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the
- * native addon (ADR-048 / ADR-055).
+ * native addon (ADR-048). The browser tier (`@limn-works/scp-ts-wasm`, ADR-057)
+ * runs the full protocol in-tab and does not use this native custody callback.
  */
 export interface KeyCustodyProvider {
   /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
@@ -702,9 +705,9 @@ export class SCP {
    * private key material never crosses into the native core (ADR-006). Use this
    * to back a DID with an OS keychain, hardware token, or HSM wrapper.
    *
-   * Node.js / Bun only: the SDK requires the native addon (ADR-048 / ADR-055),
-   * so calling `new SCP(...)` outside a Node.js/Bun runtime already throws
-   * before this method is reachable.
+   * Node.js / Bun only: the SDK requires the native addon (ADR-048), so calling
+   * `new SCP(...)` outside a Node.js/Bun runtime already throws before this
+   * method is reachable. Browser callers use `@limn-works/scp-ts-wasm` (ADR-057).
    *
    * @throws ValidationError if the provider is missing required methods, or
    *   IdentityError if key/DID creation fails inside the provider.

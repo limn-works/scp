@@ -1,9 +1,11 @@
 /**
  * Unified bridge interface for the SCP TypeScript SDK.
  *
- * The SDK has a single FFI backend: the napi-rs native addon (`./native.js`),
- * which runs in Bun/Node.js. Browser clients connect to a node as remote thin
- * clients over the network (ADR-055) and do not load an in-process bridge.
+ * This SDK (`@limn-works/scp-ts`) has a single FFI backend: the napi-rs native
+ * addon (`./native.js`), which runs in Bun/Node.js. Browser clients run the full
+ * protocol in-tab (keys on-device) via the sibling `@limn-works/scp-ts-wasm`
+ * package over `scp-client-wasm` (ADR-057, which amends ADR-055's remote-thin-
+ * client browser model) — a different package, not this napi bridge.
  *
  * The actual bridge module is loaded lazily on first use via `getBridge()`.
  *
