@@ -39,13 +39,13 @@
     "access": "public"
   },
   "devDependencies": {
-    "@biomejs/biome": "latest",
+    "@biomejs/biome": "2.5.5",
     "@limn-works/scp-ts": "workspace:*",
     "@msgpack/msgpack": "^3.0.0",
     "@types/bun": "^1.3.10",
     "@types/node": "^25.3.2",
     "fake-indexeddb": "^6.0.0",
-    "tsup": "latest",
+    "tsup": "8.5.1",
     "typescript": "^5.7.0"
   }
 }
