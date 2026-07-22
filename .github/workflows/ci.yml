@@ -58,11 +58,21 @@ jobs:
               - 'crates/scp-ffi/napi/**'
               - 'crates/scp-ffi/common/**'
             typescript-wasm:
+              # The full path-dep closure of scp-client-wasm (verified via
+              # `cargo tree -p scp-client-wasm -e no-dev`) — a change to any of
+              # these can break the wasm32 compile / real-wasm e2e / guards, so
+              # each must trigger this job.
               - 'bindings/typescript-wasm/**'
               - 'bindings/typescript/src/errors.ts'
               - 'crates/scp-client-wasm/**'
               - 'crates/scp-client/**'
               - 'crates/scp-mls/**'
+              - 'crates/scp-crypto/**'
+              - 'crates/scp-did/**'
+              - 'crates/scp-clock/**'
+              - 'crates/scp-protocol/**'
+              - 'crates/scp-event-log/**'
+              - 'crates/scp-relay-client/**'
             kotlin:
               - 'bindings/kotlin/**'
               - 'crates/scp-ffi/uniffi/**'
