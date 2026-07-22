@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "In-browser Shared Context Protocol participant SDK — the full MLS protocol runs in-tab over scp-client-wasm, keys on-device (ADR-057). The wasm-mechanism tier of @limn-works/scp-ts: a capability subset (no governance/economy/saga/media/DHT/broadcast hosting — the scp-runtime scope fence). Self-contained: bundles its own shared core.",
   "type": "module",
+  "license": "Apache-2.0",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
