@@ -4266,8 +4266,9 @@ impl Scp {
     //
     // Per-instance equivalents of the PyO3 `bridge_credential_*` methods.
     // Each routes through `&*self.inner` — credentials live in THIS
-    // instance's `InMemoryCredentialStore`, isolated from every other `Scp`
-    // in the process (ADR-048 §1).
+    // instance's durable `FfiCredentialStore`, selected from its chosen
+    // storage backend and isolated from every other `Scp` in the process
+    // (ADR-048 §1; ADR-062 §Decision 5, SCP-CAPINJECT-009).
     // -------------------------------------------------------------------
 
     /// Provisions (stores) an encrypted credential for a bridge instance.

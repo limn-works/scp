@@ -1048,6 +1048,18 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["instanceId"],
         "kotlin": ["instanceId"],
     },
+    # Bridge credential storage backend is bridge-INTERNAL: the durable
+    # `FfiCredentialStore` is selected from the SAME storage config the SDK
+    # already chooses (ADR-062 §Decision 5, SCP-CAPINJECT-009). There is no
+    # dedicated SDK wrapper method — selecting storage (SCP / withStorage /
+    # withSqlite) selects the durable credential backend by construction, so the
+    # matrix cell aliases to the existing storage-selection symbols.
+    ("Bridge", "credential_backend_durable"): {
+        "python": ["SCP"],
+        "typescript": ["SCP"],
+        "swift": ["withStorage", "SCP"],
+        "kotlin": ["withStorage", "withSqlite", "SCP"],
+    },
     ("Lifecycle", "scp_with_storage_in_memory"): {
         "python": ["SCP"],
         "typescript": ["SCP"],

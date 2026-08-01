@@ -307,7 +307,7 @@ pub(crate) fn bridge_create_shadow_on(
 // Credential store operations (§12.11)
 //
 // Per-bridge-instance helpers mirroring the PyO3 `*_impl` functions in
-// `crates/scp-ffi/src/bridge_connector.rs`. Each resolves the credential
+// `crates/scp-ffi/src/bridge_connector.rs`. Each resolves the durable credential
 // store from `bi.credential_store()` and drives the async
 // `BridgeCredentialStore` trait via the shared tokio runtime
 // (`crate::runtime().block_on(...)`) — the napi-rs worker thread has no

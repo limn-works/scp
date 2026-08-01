@@ -20,6 +20,7 @@
 
 pub mod access_keys;
 pub mod context;
+pub mod credentials;
 pub mod economy;
 pub mod event_log;
 pub mod identity;

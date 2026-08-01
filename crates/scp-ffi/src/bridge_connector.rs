@@ -35,7 +35,6 @@
 //! and ADR-023.
 
 use scp_ffi_common::error_codes as codes;
-use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -44,8 +43,7 @@ use crate::runtime::PyBridgeInstance;
 
 use scp_core::bridge::claiming::{ClaimRequest, claim_shadow};
 use scp_core::bridge::credentials::{
-    BridgeCredentialStore, CredentialType, InMemoryCredentialStore, derive_credential_key,
-    generate_bridge_credential_key,
+    BridgeCredentialStore, CredentialType, derive_credential_key, generate_bridge_credential_key,
 };
 use scp_core::bridge::envelope::{
     SealShadowEnvelopeParams, open_shadow_envelope, seal_shadow_envelope,
@@ -66,6 +64,7 @@ use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore};
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_core::trust::attestation::Attestation;
 use scp_ffi_common::bridge_state::BridgeContextState;
+use scp_ffi_common::credentials::FfiCredentialStore;
 use zeroize::Zeroizing;
 
 use crate::error::ScpPyError;
@@ -74,18 +73,25 @@ use crate::error::ScpPyError;
 // Credential store — resolved via explicit PyBridgeInstance
 // ---------------------------------------------------------------------------
 
-/// Returns a reference to the given bridge instance's credential store.
+/// Selects the given bridge instance's **durable** credential store, or fails
+/// closed if storage has not been selected.
 ///
-/// Migrated from a process-global `OnceLock<InMemoryCredentialStore>` onto
-/// the typed `credential_store` field on
-/// [`crate::runtime::PyBridgeInstance`] in #1549 Phase 4 PR 2 commit 5.
-///
-/// The returned [`Arc<InMemoryCredentialStore>`] is the same instance the
-/// `PyBridgeInstance` holds — `InMemoryCredentialStore` is thread-safe via
-/// internal `tokio::sync::RwLock`. Production deployments should replace
-/// this with a `Storage`-backed implementation when it lands (spec §12.11.2).
-const fn credential_store_for(bi: &PyBridgeInstance) -> &Arc<InMemoryCredentialStore> {
-    bi.credential_store()
+/// The store is derived from the instance's chosen [`StorageProvider`]
+/// (ADR-062 §Decision 5, SCP-CAPINJECT-009): a real durable backend that
+/// persists bridge tokens through the same storage the supervisor uses. There
+/// is no in-memory fallback — a missing storage selection is a fail-closed
+/// error (SCP-CAPSEL-8001), never a silent degrade.
+fn credential_store_for(bi: &PyBridgeInstance) -> PyResult<FfiCredentialStore> {
+    bi.credential_store().ok_or_else(|| {
+        ScpPyError::ContextError {
+            message: "bridge credential store unavailable: storage has not been selected for \
+                      this SCP instance (select storage via SCP(config) before bridge \
+                      credential operations)"
+                .to_owned(),
+            code: codes::CTX_2105.to_string(),
+        }
+        .into()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -832,7 +838,7 @@ fn bridge_credential_provision_impl(
     let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
 
     let rt = crate::runtime()?;
-    let store = credential_store_for(bi);
+    let store = credential_store_for(bi)?;
 
     let credential = rt
         .block_on(store.provision(bridge_id, ct, plaintext, &key_bytes))
@@ -875,7 +881,7 @@ fn bridge_credential_retrieve_impl(
     let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
 
     let rt = crate::runtime()?;
-    let store = credential_store_for(bi);
+    let store = credential_store_for(bi)?;
 
     let plaintext = rt
         .block_on(store.retrieve(bridge_id, &ct, &key_bytes))
@@ -917,7 +923,7 @@ fn bridge_credential_rotate_impl(
     let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
 
     let rt = crate::runtime()?;
-    let store = credential_store_for(bi);
+    let store = credential_store_for(bi)?;
 
     let credential = rt
         .block_on(store.rotate(bridge_id, &ct, new_plaintext, &key_bytes))
@@ -947,7 +953,7 @@ fn bridge_credential_rotate_impl(
 /// Raises `ContextError` if the storage backend fails.
 fn bridge_credential_revoke_impl(bi: &PyBridgeInstance, bridge_id: &str) -> PyResult<()> {
     let rt = crate::runtime()?;
-    let store = credential_store_for(bi);
+    let store = credential_store_for(bi)?;
 
     rt.block_on(store.revoke(bridge_id))
         .map_err(|e| ScpPyError::ContextError {
@@ -977,7 +983,7 @@ fn bridge_credential_list_impl(
     bridge_id: &str,
 ) -> PyResult<Py<PyList>> {
     let rt = crate::runtime()?;
-    let store = credential_store_for(bi);
+    let store = credential_store_for(bi)?;
 
     let types = rt
         .block_on(store.list(bridge_id))
@@ -1018,7 +1024,7 @@ fn bridge_credential_store_key_impl(
     let key_bytes = parse_credential_key_bytes(key)?;
 
     let rt = crate::runtime()?;
-    let store = credential_store_for(bi);
+    let store = credential_store_for(bi)?;
 
     rt.block_on(store.store_bridge_credential_key(bridge_id, key_bytes))
         .map_err(|e| ScpPyError::ContextError {
@@ -1044,7 +1050,7 @@ fn bridge_credential_store_key_impl(
 /// Raises `ContextError` if the key is not found.
 fn bridge_credential_get_key_impl(bi: &PyBridgeInstance, bridge_id: &str) -> PyResult<Vec<u8>> {
     let rt = crate::runtime()?;
-    let store = credential_store_for(bi);
+    let store = credential_store_for(bi)?;
 
     let key = rt
         .block_on(store.get_bridge_credential_key(bridge_id))
@@ -1069,7 +1075,7 @@ fn bridge_credential_get_key_impl(bi: &PyBridgeInstance, bridge_id: &str) -> PyR
 /// Raises `ContextError` if storage fails.
 fn bridge_credential_delete_key_impl(bi: &PyBridgeInstance, bridge_id: &str) -> PyResult<()> {
     let rt = crate::runtime()?;
-    let store = credential_store_for(bi);
+    let store = credential_store_for(bi)?;
 
     rt.block_on(store.delete_bridge_credential_key(bridge_id))
         .map_err(|e| ScpPyError::ContextError {
@@ -1698,7 +1704,9 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Credential store operations (via global InMemoryCredentialStore)
+    // Credential store operations (via the durable FfiCredentialStore selected
+    // from the instance's chosen storage backend; here the encrypted-in-memory
+    // dev/test selection — SCP-CAPINJECT-009)
     // -------------------------------------------------------------------
 
     #[test]

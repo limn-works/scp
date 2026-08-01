@@ -1923,6 +1923,13 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "credential_backend_durable",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
         }
       ]
     },
