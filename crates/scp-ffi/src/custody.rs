@@ -32,6 +32,7 @@ use scp_platform::traits::{
 /// Since [`KeyCustody`] uses RPITIT and is not object-safe, we cannot use
 /// `Arc<dyn KeyCustody>`. Instead, this enum wraps the concrete types and
 /// delegates each method to the active variant.
+#[allow(clippy::large_enum_variant)]
 pub enum FfiKeyCustody {
     /// Test/development in-memory custody. Keys are lost on process exit.
     /// Available because `scp-ffi` enables `scp-platform/testing`.

@@ -2382,6 +2382,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "testing")]
     /// Helper to create a minimal `DidDocument` for testing.
     fn test_did_document(did: &str) -> DidDocument {
         DidDocument {

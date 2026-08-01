@@ -76,12 +76,15 @@ pub struct MediaSession {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MediaCapability {
     /// Voice-only media. Maps to ceiling entry `media:voice`.
+    #[serde(alias = "voice")] // bridge serializes lowercase; alias makes round-trip work
     Voice,
 
     /// Video media. Maps to ceiling entry `media:video`.
+    #[serde(alias = "video")]
     Video,
 
     /// Screen sharing. Maps to ceiling entry `media:screen_share`.
+    #[serde(alias = "screen_share")]
     ScreenShare,
 }
 
@@ -117,12 +120,15 @@ impl MediaCapability {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MediaSessionState {
     /// Session is being set up (SDP offer/answer exchange in progress).
+    #[serde(alias = "initiating")] // bridge serializes lowercase; alias makes round-trip work
     Initiating,
 
     /// Session is active with media flowing over WebRTC/DTLS-SRTP.
+    #[serde(alias = "active")]
     Active,
 
     /// Session has ended (graceful `SessionEnd` or member removal).
+    #[serde(alias = "ended")]
     Ended,
 }
 

@@ -7384,6 +7384,60 @@ pub fn media_end_session(session_json: String, timestamp: u64) -> Result<String,
     })
 }
 
+// ---------------------------------------------------------------------------
+// Media event log helper
+// ---------------------------------------------------------------------------
+
+/// Appends a media session event (`MediaSessionStarted` or `MediaSessionEnded`)
+/// to the UCAN event log for the given context on `bi`.
+///
+/// This is the per-instance equivalent of [`uniffi_append_provenance_event_on`].
+/// Best-effort: callers emit a `tracing::warn!` on failure rather than
+/// propagating an error, so the session lifecycle always completes.
+///
+/// `actor_did` is the first session participant (the session initiator).
+fn uniffi_append_media_session_event(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    context_id: &str,
+    actor_did: &str,
+    event_type: scp_event_log::EventType,
+    payload: scp_event_log::EventPayload,
+) -> Result<(), ScpError> {
+    let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+
+    bi.with_ucan_state(context_id, |state| {
+        let sequence = scp_event_log::tree::event_count(&state.event_log);
+        let prev_hash = if state.event_log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            state.event_log.leaves()[state.event_log.leaves().len() - 1]
+        };
+
+        let event = scp_event_log::Event {
+            event_type,
+            actor_did: scp_did::DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence,
+            payload,
+            prev_hash,
+            signature: Vec::new(),
+        };
+
+        scp_event_log::tree::append_unsigned_event(&mut state.event_log, &event)
+            .map(|_| ())
+            .map_err(|e| ScpError::Context {
+                msg: format!("failed to append media session event: {e}"),
+                code: codes::CTX_2500.to_owned(),
+            })
+    })
+    .unwrap_or_else(|| {
+        Err(ScpError::Context {
+            msg: format!("context '{context_id}' not found in UCAN state registry"),
+            code: codes::CTX_2066.to_owned(),
+        })
+    })
+}
+
 /// Creates an SDP offer signaling message.
 ///
 /// Returns a JSON string with `session_id` and `message` keys.
@@ -17639,6 +17693,160 @@ impl Scp {
         serde_json::to_string(&result).map_err(|e| ScpError::Validation {
             msg: format!("failed to serialize provenance: {e}"),
             code: codes::VALID_7042.to_owned(),
+        })
+    }
+
+    // ----- Media session methods (ADR-024 AC 8) -----
+
+    /// Per-instance equivalent of the free-function `media_activate_session`.
+    ///
+    /// Transitions the session from `Initiating` to `Active` and appends a
+    /// `MediaSessionStarted` leaf to the context event log (ADR-024 AC 8).
+    /// The event log append is best-effort: if the context is not registered
+    /// in the UCAN state registry a warning is emitted but the session state
+    /// transition still succeeds.
+    pub fn media_activate_session(&self, session_json: String) -> Result<String, ScpError> {
+        let mut session: scp_media::session::MediaSession = serde_json::from_str(&session_json)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("invalid session JSON: {e}"),
+                code: codes::VALID_7301.to_owned(),
+            })?;
+
+        scp_media::session::activate_session(&mut session).map_err(|e| ScpError::Context {
+            msg: e.to_string(),
+            code: codes::CTX_2500.to_owned(),
+        })?;
+
+        // ADR-024 AC 8: record MediaSessionStarted in the context event log.
+        let started_payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::MediaSessionStartedPayload {
+                session_id: session.session_id.clone(),
+                context_id: session.context_id.clone(),
+                participants: session
+                    .participants
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                capabilities: session
+                    .capabilities
+                    .iter()
+                    .map(|c| c.ceiling_name().to_owned())
+                    .collect(),
+                started_at: session.started_at,
+            },
+        )
+        .map_err(|e| ScpError::Context {
+            msg: format!("failed to encode MediaSessionStarted payload: {e}"),
+            code: codes::CTX_2500.to_owned(),
+        })?;
+
+        let actor_did = session.participants.first().map_or("", |d| d.as_ref());
+
+        if let Err(e) = uniffi_append_media_session_event(
+            &self.inner,
+            &session.context_id,
+            actor_did,
+            scp_event_log::EventType::MediaSessionStarted,
+            started_payload,
+        ) {
+            tracing::warn!(
+                context = %session.context_id,
+                session = %session.session_id,
+                error = %e,
+                "failed to append MediaSessionStarted event to context event log"
+            );
+        }
+
+        media_session_to_json(&session)
+    }
+
+    /// Per-instance equivalent of the free-function `media_end_session`.
+    ///
+    /// Ends the session and appends a `MediaSessionEnded` leaf to the context
+    /// event log (ADR-024 AC 8). The event log append is best-effort: if the
+    /// context is not registered a warning is emitted but the session teardown
+    /// still succeeds.
+    pub fn media_end_session(
+        &self,
+        session_json: String,
+        timestamp: u64,
+    ) -> Result<String, ScpError> {
+        let mut session: scp_media::session::MediaSession = serde_json::from_str(&session_json)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("invalid session JSON: {e}"),
+                code: codes::VALID_7301.to_owned(),
+            })?;
+
+        let metadata =
+            scp_media::session::end_media_session(&mut session, timestamp).map_err(|e| {
+                ScpError::Context {
+                    msg: e.to_string(),
+                    code: codes::CTX_2500.to_owned(),
+                }
+            })?;
+
+        // ADR-024 AC 8: record MediaSessionEnded in the context event log.
+        let ended_payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::MediaSessionEndedPayload {
+                session_id: metadata.session_id.clone(),
+                context_id: metadata.context_id.clone(),
+                participants: metadata
+                    .participants
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                capabilities: metadata
+                    .capabilities
+                    .iter()
+                    .map(|c| c.ceiling_name().to_owned())
+                    .collect(),
+                started_at: metadata.started_at,
+                ended_at: metadata.ended_at,
+            },
+        )
+        .map_err(|e| ScpError::Context {
+            msg: format!("failed to encode MediaSessionEnded payload: {e}"),
+            code: codes::CTX_2500.to_owned(),
+        })?;
+
+        let actor_did = metadata.participants.first().map_or("", |d| d.as_ref());
+
+        if let Err(e) = uniffi_append_media_session_event(
+            &self.inner,
+            &metadata.context_id,
+            actor_did,
+            scp_event_log::EventType::MediaSessionEnded,
+            ended_payload,
+        ) {
+            tracing::warn!(
+                context = %metadata.context_id,
+                session = %metadata.session_id,
+                error = %e,
+                "failed to append MediaSessionEnded event to context event log"
+            );
+        }
+
+        serde_json::to_string(&serde_json::json!({
+            "session": {
+                "session_id": session.session_id,
+                "context_id": session.context_id,
+                "participants": session.participants,
+                "capabilities": session.capabilities.iter().map(media_capability_to_string).collect::<Vec<_>>(),
+                "state": media_state_to_string(&session.state),
+                "started_at": session.started_at,
+            },
+            "metadata": {
+                "session_id": metadata.session_id,
+                "context_id": metadata.context_id,
+                "participants": metadata.participants,
+                "capabilities": metadata.capabilities.iter().map(media_capability_to_string).collect::<Vec<_>>(),
+                "started_at": metadata.started_at,
+                "ended_at": metadata.ended_at,
+            },
+        }))
+        .map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize result: {e}"),
+            code: codes::VALID_7301.to_owned(),
         })
     }
 

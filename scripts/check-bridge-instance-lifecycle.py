@@ -243,7 +243,10 @@ def _trait_methods_with_defaults(trait_name: str) -> tuple[set[str], bool]:
                     nonlocal trait_found
                     if node.type == "trait_item":
                         name_node = node.child_by_field_name("name")
-                        if name_node is not None and node_text(name_node, source) == trait_name:
+                        if (
+                            name_node is not None
+                            and node_text(name_node, source) == trait_name
+                        ):
                             trait_found = True
                             body = node.child_by_field_name("body")
                             if body is not None:
@@ -252,8 +255,13 @@ def _trait_methods_with_defaults(trait_name: str) -> tuple[set[str], bool]:
                                         # function_item WITH a body = default method
                                         fn_name_node = item.child_by_field_name("name")
                                         fn_body = item.child_by_field_name("body")
-                                        if fn_name_node is not None and fn_body is not None:
-                                            defaults.add(node_text(fn_name_node, source))
+                                        if (
+                                            fn_name_node is not None
+                                            and fn_body is not None
+                                        ):
+                                            defaults.add(
+                                                node_text(fn_name_node, source)
+                                            )
                                     # function_signature_item = abstract method (no default)
                     for c in node.children:
                         walk(c)
@@ -318,9 +326,7 @@ def main() -> int:
     # trees. If it is missing entirely, fail loudly — a silent-pass on
     # "trait moved" is a real risk: the trait could be renamed or
     # relocated and the lifecycle-override ban would evaporate.
-    trait_defaults, trait_found = _trait_methods_with_defaults(
-        "BridgeInstanceCore"
-    )
+    trait_defaults, trait_found = _trait_methods_with_defaults("BridgeInstanceCore")
     if not trait_found:
         sys.stderr.write(
             f"{C_RED}error:{C_RESET} trait `BridgeInstanceCore` not found "

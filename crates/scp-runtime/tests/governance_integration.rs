@@ -2940,3 +2940,120 @@ async fn direct_execute_of_genuine_proposal_runs_once_then_replay_rejected() {
         "replay rejection should name the executed proposal: {err}"
     );
 }
+
+// =========================================================================
+// Issue #1847: GovernanceDeadlockRecovery event log append
+//
+// After a successful ReconfigureGovernance action the event log MUST contain
+// BOTH a GovernanceReconfigured leaf (configuration change) AND a
+// GovernanceDeadlockRecovery leaf (structured justification payload).
+// The payload fields must match the DeadlockJustification supplied.
+// =========================================================================
+
+#[tokio::test]
+async fn governance_deadlock_recovery_appends_both_event_leaves() {
+    use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};
+
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-deadlock-recovery-1847";
+
+    // Threshold(1-of-2): alice's auto-vote on propose immediately crosses the
+    // threshold so ReconfigureGovernance executes inline without a second voter.
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec![alice(), bob()],
+        },
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let justification = DeadlockJustification {
+        unavailable_dids: vec![bob()],
+        missed_windows: vec![(bob(), 5)],
+        detected_at: 1_700_000_000,
+    };
+    let action = GovernanceAction::ReconfigureGovernance {
+        changes: vec![GovernanceReconfigAction::RemoveInactiveSigner { did: bob() }],
+        justification: justification.clone(),
+    };
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Proposal auto-executes (threshold=1, alice auto-votes).
+    let (proposal, _events, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "threshold=1: proposer auto-vote must immediately approve and execute"
+    );
+
+    // Query the durable event log.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for the active context");
+
+    // --- Assert GovernanceReconfigured leaf is present ---
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.event_type == scp_event_log::EventType::GovernanceReconfigured),
+        "event log must contain a GovernanceReconfigured leaf after ReconfigureGovernance"
+    );
+
+    // --- Assert GovernanceDeadlockRecovery leaf is present ---
+    let recovery_entry = entries
+        .iter()
+        .find(|e| e.event_type == scp_event_log::EventType::GovernanceDeadlockRecovery)
+        .expect("event log must contain a GovernanceDeadlockRecovery leaf (issue #1847)");
+
+    // --- Decode and verify the payload fields ---
+    let payload: scp_event_log::payload::GovernanceDeadlockRecoveryPayload =
+        scp_event_log::payload::decode_payload(&recovery_entry.payload)
+            .expect("GovernanceDeadlockRecovery payload must decode successfully");
+
+    let expected_unavailable: Vec<String> = justification
+        .unavailable_dids
+        .iter()
+        .map(|d| d.0.clone())
+        .collect();
+    assert_eq!(
+        payload.unavailable_dids, expected_unavailable,
+        "payload.unavailable_dids must match justification.unavailable_dids"
+    );
+    let expected_missed_windows: Vec<(String, u32)> = justification
+        .missed_windows
+        .iter()
+        .map(|(d, n)| (d.0.clone(), *n))
+        .collect();
+    assert_eq!(
+        payload.missed_windows, expected_missed_windows,
+        "payload.missed_windows must carry the full per-DID evidence from the justification"
+    );
+    assert_eq!(
+        payload.detected_at, justification.detected_at,
+        "payload.detected_at must match justification.detected_at"
+    );
+
+    // GovernanceReconfigured and GovernanceDeadlockRecovery must appear
+    // sequentially: the recovery leaf must come after the reconfigured leaf.
+    let reconfigured_seq = entries
+        .iter()
+        .find(|e| e.event_type == scp_event_log::EventType::GovernanceReconfigured)
+        .map(|e| e.sequence)
+        .unwrap();
+    assert!(
+        recovery_entry.sequence > reconfigured_seq,
+        "GovernanceDeadlockRecovery (seq {}) must follow GovernanceReconfigured (seq {})",
+        recovery_entry.sequence,
+        reconfigured_seq
+    );
+}

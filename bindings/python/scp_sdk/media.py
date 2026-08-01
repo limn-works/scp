@@ -10,9 +10,12 @@ See ADR-024 in ``.docs/adrs/phase-5.md``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from scp_sdk.errors import ScpError
+
+if TYPE_CHECKING:
+    from scp_sdk.scp import SCP
 
 
 def _bridge() -> Any:
@@ -89,10 +92,18 @@ def initiate_session(
     )
 
 
-def activate_session(session_json: str) -> dict[str, Any]:
+def activate_session(scp: SCP, session_json: str) -> dict[str, Any]:
     """Activate a media session (transition from Initiating to Active).
 
+    Appends a ``MediaSessionStarted`` leaf to the context event log
+    (ADR-024 AC 8). The event-log write is best-effort: if the context is
+    not registered a warning is emitted but the state transition still
+    succeeds.
+
     Args:
+        scp: The caller-owned :class:`~scp_sdk.SCP` bridge instance. Required
+            so the session transition can record the ``MediaSessionStarted``
+            event in the context event log.
         session_json: JSON string representing the session (as returned
             by :func:`initiate_session` after ``json.dumps``).
 
@@ -101,9 +112,9 @@ def activate_session(session_json: str) -> dict[str, Any]:
 
     Raises:
         ContextError: If the session is not in the ``Initiating`` state.
+        ValidationError: If *session_json* is not valid session JSON.
     """
-    bridge = _bridge()
-    return dict(bridge.media_activate_session(session_json))
+    return dict(scp._native.media_activate_session(session_json))
 
 
 def join_session(session_json: str, participant_did: str) -> dict[str, Any]:
@@ -124,12 +135,21 @@ def join_session(session_json: str, participant_did: str) -> dict[str, Any]:
 
 
 def end_session(
+    scp: SCP,
     session_json: str,
     timestamp: int,
 ) -> dict[str, Any]:
     """End a media session and return metadata for event log recording.
 
+    Appends a ``MediaSessionEnded`` leaf to the context event log
+    (ADR-024 AC 8). The event-log write is best-effort: if the context is
+    not registered a warning is emitted but the session teardown still
+    succeeds.
+
     Args:
+        scp: The caller-owned :class:`~scp_sdk.SCP` bridge instance. Required
+            so the session teardown can record the ``MediaSessionEnded`` event
+            in the context event log.
         session_json: JSON string representing the session.
         timestamp: Unix timestamp (seconds) when the session ended.
 
@@ -140,9 +160,9 @@ def end_session(
     Raises:
         ContextError: If the session has already ended or the timestamp
             is before the session start time.
+        ValidationError: If *session_json* is not valid session JSON.
     """
-    bridge = _bridge()
-    result = bridge.media_end_session(session_json, timestamp)
+    result = scp._native.media_end_session(session_json, timestamp)
     return {
         "session": dict(result["session"]),
         "metadata": dict(result["metadata"]),

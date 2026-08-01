@@ -171,7 +171,9 @@ def main() -> int:
         )
         return 1
 
-    print(f"OK: scanned {len(files)} files under {SDK_ROOT.relative_to(REPO_ROOT)}; no violations.")
+    print(
+        f"OK: scanned {len(files)} files under {SDK_ROOT.relative_to(REPO_ROOT)}; no violations."
+    )
     return 0
 
 

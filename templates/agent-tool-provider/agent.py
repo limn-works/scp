@@ -286,9 +286,7 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
         logger.info("Registering tools in context...")
         tools = [CALCULATOR_TOOL, SEARCH_TOOL]
         for tool in tools:
-            logger.info(
-                "  Registered: %s -- %s", tool.name, tool.description
-            )
+            logger.info("  Registered: %s -- %s", tool.name, tool.description)
 
         # 4. Attach handler functions so tool invocations execute Python code.
         register_tool_handler(ctx, "calculator", handle_calculator)
@@ -303,7 +301,9 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
             capabilities=["outlet_call:*"],
             context=ctx.context_id,
         )
-        logger.info("Minted UCAN token: %s (expires=%s)", token.token_id, token.expires_at)
+        logger.info(
+            "Minted UCAN token: %s (expires=%s)", token.token_id, token.expires_at
+        )
 
         # 6. Invoke tools programmatically.
         logger.info("\n--- Calculator invocations ---")
@@ -340,9 +340,7 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
             token.token_id,
             identity=identity,
         )
-        logger.info(
-            "  'encryption MLS': %d results", search_result.get("total", 0)
-        )
+        logger.info("  'encryption MLS': %d results", search_result.get("total", 0))
         for hit in search_result.get("results", []):
             logger.info("    %.2f  %s", hit["score"], hit["title"])
 

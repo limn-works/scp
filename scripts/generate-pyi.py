@@ -114,7 +114,11 @@ def _leading_attrs(children: list[Node], idx: int, src: bytes) -> list[str]:
     """Return the ``#[...]`` attribute texts immediately preceding ``children[idx]``."""
     attrs: list[str] = []
     j = idx - 1
-    while j >= 0 and children[j].type in ("attribute_item", "line_comment", "block_comment"):
+    while j >= 0 and children[j].type in (
+        "attribute_item",
+        "line_comment",
+        "block_comment",
+    ):
         if children[j].type == "attribute_item":
             attrs.append(_text(src, children[j]))
         j -= 1
@@ -196,7 +200,9 @@ def _top_level_eq(tok: str) -> int | None:
             depth -= 1
         elif ch == "=" and depth == 0:
             # not == or =>
-            if tok[i : i + 2] not in ("==", "=>") and (i == 0 or tok[i - 1] not in "=!<>"):
+            if tok[i : i + 2] not in ("==", "=>") and (
+                i == 0 or tok[i - 1] not in "=!<>"
+            ):
                 return i
         i += 1
     return None
@@ -236,7 +242,9 @@ def collect_rust() -> tuple[dict[str, RustFn], dict[str, RustFn]]:
         for m in re.finditer(rb"wrap_pyfunction!\s*\(\s*([A-Za-z0-9_]+)", src):
             registered.add(m.group(1).decode())
         tree = PARSER.parse(src)
-        _walk_items(tree.root_node.children, src, scp_methods, free_defs, in_scp_impl=False)
+        _walk_items(
+            tree.root_node.children, src, scp_methods, free_defs, in_scp_impl=False
+        )
 
     free_functions: dict[str, RustFn] = {}
     for rust_name in registered:
@@ -244,7 +252,9 @@ def collect_rust() -> tuple[dict[str, RustFn], dict[str, RustFn]]:
         if fn is None:
             # Registered but definition not found by tree-sitter — should not
             # happen; surface loudly rather than silently dropping coverage.
-            raise SystemExit(f"error: wrap_pyfunction!({rust_name}) has no locatable fn definition")
+            raise SystemExit(
+                f"error: wrap_pyfunction!({rust_name}) has no locatable fn definition"
+            )
         free_functions[fn.py_name] = fn
     return scp_methods, free_functions
 
@@ -356,7 +366,12 @@ def reconcile(
 
     def carry(node: ast.FunctionDef, rust: RustFn, has_receiver: bool) -> None:
         # Skip variadic catch-alls: they intentionally opt out of typed arity.
-        if node.args.vararg or node.args.kwarg or node.args.posonlyargs or node.args.kwonlyargs:
+        if (
+            node.args.vararg
+            or node.args.kwarg
+            or node.args.posonlyargs
+            or node.args.kwonlyargs
+        ):
             return
         current = list(node.args.args)
         receiver: list[ast.arg] = []
@@ -390,7 +405,9 @@ def reconcile(
 
         pieces: list[str] = []
         for r in receiver:
-            pieces.append(r.arg + (f": {ast.unparse(r.annotation)}" if r.annotation else ""))
+            pieces.append(
+                r.arg + (f": {ast.unparse(r.annotation)}" if r.annotation else "")
+            )
         for i, name in enumerate(rust.params):
             if name in ann_for:
                 ann = ann_for[name]
@@ -430,7 +447,9 @@ def reconcile(
         pyi_scp_methods.add(name)
         rust = scp_methods.get(name)
         if rust is None:
-            mismatches.append(Mismatch("extra-method", f"SCP.{name} has no PyO3 export"))
+            mismatches.append(
+                Mismatch("extra-method", f"SCP.{name} has no PyO3 export")
+            )
             continue
         carry(node, rust, has_receiver=not rust.is_static)
 
@@ -444,22 +463,34 @@ def reconcile(
         if rust is None:
             if name in STUB_ONLY_FREE_FUNCTIONS:
                 continue
-            mismatches.append(Mismatch("extra-function", f"{name}() has no PyO3 export"))
+            mismatches.append(
+                Mismatch("extra-function", f"{name}() has no PyO3 export")
+            )
             continue
         carry(node, rust, has_receiver=False)
 
     # -- set parity: every export must have a stub --
-    rust_method_names = {n for n, r in scp_methods.items() if not r.is_getter and not r.is_new}
+    rust_method_names = {
+        n for n, r in scp_methods.items() if not r.is_getter and not r.is_new
+    }
     rust_method_names.discard("__repr__")
     rust_getter_names = {n for n, r in scp_methods.items() if r.is_getter}
     for miss in sorted(rust_method_names - pyi_scp_methods):
-        mismatches.append(Mismatch("missing-method", f"SCP.{miss} exported but absent from stub"))
+        mismatches.append(
+            Mismatch("missing-method", f"SCP.{miss} exported but absent from stub")
+        )
     for miss in sorted(rust_getter_names - pyi_scp_props):
-        mismatches.append(Mismatch("missing-property", f"SCP.{miss} getter absent from stub"))
+        mismatches.append(
+            Mismatch("missing-property", f"SCP.{miss} getter absent from stub")
+        )
     for extra in sorted(pyi_scp_props - rust_getter_names):
-        mismatches.append(Mismatch("extra-property", f"SCP.{extra} property has no PyO3 getter"))
+        mismatches.append(
+            Mismatch("extra-property", f"SCP.{extra} property has no PyO3 getter")
+        )
     for miss in sorted(set(free_functions) - pyi_free):
-        mismatches.append(Mismatch("missing-function", f"{miss}() exported but absent from stub"))
+        mismatches.append(
+            Mismatch("missing-function", f"{miss}() exported but absent from stub")
+        )
 
     # Apply edits back-to-front so offsets stay valid.
     out = pyi_text
@@ -478,7 +509,9 @@ def ruff_format(text: str) -> str:
     # ``bindings/python/pyproject.toml`` (line-length 100). The temp file must
     # NOT live in ``scp_sdk/`` — that directory contains a ``types.py`` that
     # shadows the stdlib when it is the process cwd, breaking ``-m ruff``.
-    with tempfile.NamedTemporaryFile("w", suffix=".pyi", delete=False, dir=PY_ROOT) as tf:
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".pyi", delete=False, dir=PY_ROOT
+    ) as tf:
         tf.write(text)
         tmp = Path(tf.name)
     try:
@@ -500,7 +533,9 @@ def build() -> tuple[str, list[Mismatch]]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Regenerate/verify the _scp_core type stub.")
+    ap = argparse.ArgumentParser(
+        description="Regenerate/verify the _scp_core type stub."
+    )
     ap.add_argument(
         "--check",
         action="store_true",
@@ -510,7 +545,9 @@ def main() -> int:
 
     generated, mismatches = build()
     if mismatches:
-        sys.stderr.write("error: _scp_core.pyi is not in signature parity with PyO3 exports:\n")
+        sys.stderr.write(
+            "error: _scp_core.pyi is not in signature parity with PyO3 exports:\n"
+        )
         for m in sorted(mismatches, key=lambda x: (x.kind, x.detail)):
             sys.stderr.write(f"  [{m.kind}] {m.detail}\n")
         sys.stderr.write(

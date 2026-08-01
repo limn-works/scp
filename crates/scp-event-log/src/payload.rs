@@ -165,6 +165,22 @@ pub struct RecoveryEpochAdvancedPayload {
     pub new_epoch: u64,
 }
 
+/// Payload for [`EventType::KeyEpochAdvance`](crate::EventType::KeyEpochAdvance)
+/// (ADR-007 §5 sender-key epoch rotation triggered by blocking a subscriber).
+///
+/// Distinct from [`RecoveryEpochAdvancedPayload`], which covers the MLS group
+/// epoch advance during trust recovery (§9.12). This struct tracks the
+/// **sender-key** epoch for the ADR-007 Broadcast / Encrypted sender-key modes.
+/// Field order is the wire contract under positional `MessagePack` —
+/// **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyEpochAdvancePayload {
+    /// The sender-key epoch before the advance.
+    pub old_epoch: u64,
+    /// The sender-key epoch after the advance.
+    pub new_epoch: u64,
+}
+
 /// Payload for [`EventType::AccessRevoked`](crate::EventType::AccessRevoked)
 /// (`RevokeReadAccess` / `RevokeWriteAccess`; ADR-031 §3, §5).
 ///
@@ -191,6 +207,31 @@ pub struct GovernanceActionExecutedPayload {
     pub target_did: String,
     /// The `GovernanceAction` variant name (e.g. `"RemoveMember"`).
     pub action_type: String,
+}
+
+/// Payload for
+/// [`EventType::GovernanceDeadlockRecovery`](crate::EventType::GovernanceDeadlockRecovery)
+/// (ADR-011 amendment; issue #1847).
+///
+/// Records the deadlock justification evidence emitted **immediately after**
+/// [`EventType::GovernanceReconfigured`](crate::EventType::GovernanceReconfigured)
+/// so the recovery evidence is durably anchored in the Merkle log.
+/// The two leaves share the same `actor_did` and `timestamp_secs`.
+/// Field order is the wire contract under positional `MessagePack` —
+/// **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernanceDeadlockRecoveryPayload {
+    /// DIDs of signers who were unavailable during deadlock detection.
+    pub unavailable_dids: Vec<String>,
+    /// Per-signer missed-window evidence: (DID, consecutive missed voting windows).
+    ///
+    /// Each tuple is the DID of a signer who had evidence of unavailability and
+    /// the number of consecutive voting windows they missed. Distinct from
+    /// `unavailable_dids` (completely absent — no response at all); these signers
+    /// sent some responses but missed enough windows to be declared unavailable.
+    pub missed_windows: Vec<(String, u32)>,
+    /// Unix timestamp (seconds) when deadlock was detected.
+    pub detected_at: u64,
 }
 
 /// Payload for [`EventType::RoleAssigned`](crate::EventType::RoleAssigned)
@@ -226,6 +267,49 @@ pub struct MembershipChangePayload {
     pub subject_did: String,
     /// The role name held by the member at the time of the membership change.
     pub role_name: String,
+}
+
+/// Payload for [`EventType::MediaSessionStarted`](crate::EventType::MediaSessionStarted)
+/// (ADR-024 AC 8 — session metadata recorded in context event log).
+///
+/// Captures the session identity and initial configuration at the point the
+/// session transitions from `Initiating` to `Active`. Field order is the
+/// wire contract under positional `MessagePack` — **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaSessionStartedPayload {
+    /// The media session identifier (e.g. `"ms-<hex>"`).
+    pub session_id: String,
+    /// The context hosting the session.
+    pub context_id: String,
+    /// DIDs of participants at session activation.
+    pub participants: Vec<String>,
+    /// Ceiling names of active media capabilities (e.g. `"media:voice"`).
+    pub capabilities: Vec<String>,
+    /// Unix timestamp (seconds) when the session was created.
+    pub started_at: u64,
+}
+
+/// Payload for [`EventType::MediaSessionEnded`](crate::EventType::MediaSessionEnded)
+/// (ADR-024 AC 8 — session metadata recorded in context event log).
+///
+/// Captures the full session record at teardown: participants, capabilities,
+/// and both timestamps, sufficient for participation-record derivation
+/// (ADR-017 §7.3.2). Field order is the wire contract under positional
+/// `MessagePack` — **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaSessionEndedPayload {
+    /// The media session identifier.
+    pub session_id: String,
+    /// The context hosting the session.
+    pub context_id: String,
+    /// DIDs of participants at session end.
+    pub participants: Vec<String>,
+    /// Ceiling names of active media capabilities (e.g. `"media:voice"`).
+    pub capabilities: Vec<String>,
+    /// Unix timestamp (seconds) when the session started.
+    pub started_at: u64,
+    /// Unix timestamp (seconds) when the session ended.
+    pub ended_at: u64,
 }
 
 /// Builds the durable Merkle-leaf payload bytes for a consequence-enforcement
@@ -505,6 +589,20 @@ mod tests {
     }
 
     #[test]
+    fn key_epoch_advance_round_trip() {
+        // ADR-007 §5 sender-key epoch advance (distinct from MLS group recovery epoch).
+        let p = KeyEpochAdvancePayload {
+            old_epoch: 5,
+            new_epoch: 6,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 2-field struct → fixarray of length 2
+        assert_positional_array(&encoded.data, 2);
+        let decoded: KeyEpochAdvancePayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
     fn access_revoked_round_trip() {
         let p = AccessRevokedPayload {
             target_did: "did:key:alice".to_owned(),
@@ -538,6 +636,39 @@ mod tests {
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 2);
         let decoded: GovernanceActionExecutedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn governance_deadlock_recovery_round_trip() {
+        let p = GovernanceDeadlockRecoveryPayload {
+            unavailable_dids: vec!["did:key:carol".to_owned(), "did:key:dave".to_owned()],
+            missed_windows: vec![
+                ("did:key:carol".to_owned(), 4),
+                ("did:key:dave".to_owned(), 3),
+            ],
+            detected_at: 1_700_000_000,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 3 fields: unavailable_dids (Vec<String>), missed_windows (Vec<(String,u32)>),
+        // detected_at (u64)
+        assert_positional_array(&encoded.data, 3);
+        let decoded: GovernanceDeadlockRecoveryPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn governance_deadlock_recovery_missed_windows_only_round_trip() {
+        // Boundary: missed_windows evidence only (unavailable_dids empty — signers
+        // responded but missed enough windows to trigger the fallback threshold).
+        let p = GovernanceDeadlockRecoveryPayload {
+            unavailable_dids: Vec::new(),
+            missed_windows: vec![("did:key:eve".to_owned(), 5)],
+            detected_at: 0,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 3);
+        let decoded: GovernanceDeadlockRecoveryPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 
@@ -744,5 +875,55 @@ mod tests {
             project_payload(&EventType::MemberLeft, &empty).subject_did,
             None
         );
+    }
+
+    #[test]
+    fn media_session_started_round_trip() {
+        let p = MediaSessionStartedPayload {
+            session_id: "ms-abc123".to_owned(),
+            context_id: "ctx-test-001".to_owned(),
+            participants: vec!["did:dht:zAlice".to_owned(), "did:dht:zBob".to_owned()],
+            capabilities: vec!["media:voice".to_owned()],
+            started_at: 1_700_000_000,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 5-field struct → fixarray of length 5
+        assert_positional_array(&encoded.data, 5);
+        let decoded: MediaSessionStartedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn media_session_ended_round_trip() {
+        let p = MediaSessionEndedPayload {
+            session_id: "ms-abc123".to_owned(),
+            context_id: "ctx-test-001".to_owned(),
+            participants: vec!["did:dht:zAlice".to_owned()],
+            capabilities: vec!["media:voice".to_owned(), "media:video".to_owned()],
+            started_at: 1_700_000_000,
+            ended_at: 1_700_003_600,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 6-field struct → fixarray of length 6
+        assert_positional_array(&encoded.data, 6);
+        let decoded: MediaSessionEndedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn media_session_started_empty_participants_round_trip() {
+        // Boundary: empty participant/capability vectors survive the round-trip
+        // and still produce a 5-element fixarray.
+        let p = MediaSessionStartedPayload {
+            session_id: "ms-empty".to_owned(),
+            context_id: "ctx-x".to_owned(),
+            participants: Vec::new(),
+            capabilities: Vec::new(),
+            started_at: 0,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 5);
+        let decoded: MediaSessionStartedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
     }
 }

@@ -16,6 +16,7 @@ pip install scp-python
 import asyncio
 from scp_sdk import Identity, Context
 
+
 async def main():
     # Create a cryptographic identity (DID)
     identity = await Identity.create(custody="platform")
@@ -36,6 +37,7 @@ async def main():
         break
 
     await ctx.close()
+
 
 asyncio.run(main())
 ```
