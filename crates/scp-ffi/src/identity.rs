@@ -2790,7 +2790,7 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "allow_in_memory_custody"))]
+#[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
