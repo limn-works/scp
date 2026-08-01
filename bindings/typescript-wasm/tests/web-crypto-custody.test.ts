@@ -54,3 +54,16 @@ test("holds a non-extractable on-device identity key by default", async () => {
   const custody = await WebCryptoCustody.create({ did: DID, identityKeyPair: kp });
   expect(custody.did()).toBe(DID);
 });
+
+test("rejects an embedder-supplied EXTRACTABLE identity key (fail-closed, defense-in-depth)", async () => {
+  // An extractable private key would let the key leave WebCrypto — the opposite
+  // of on-device custody. create() must reject it rather than bind it.
+  const extractable = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  expect(extractable.privateKey.extractable).toBe(true);
+  await expect(WebCryptoCustody.create({ did: DID, identityKeyPair: extractable })).rejects.toThrow(
+    /non-extractable/i,
+  );
+});

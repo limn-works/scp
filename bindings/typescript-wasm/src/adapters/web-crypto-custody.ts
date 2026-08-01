@@ -85,7 +85,19 @@ export class WebCryptoCustody implements JsKeyCustody {
     }
 
     let keyPair = options.identityKeyPair;
-    if (!keyPair) {
+    if (keyPair) {
+      // Defense-in-depth: an embedder-supplied key MUST be non-extractable, so
+      // the private key cannot leave WebCrypto — the whole point of on-device
+      // custody. The default generated path below is already non-extractable;
+      // this hardens the inject path against an extractable key slipping in.
+      if (keyPair.privateKey.extractable) {
+        throw new Error(
+          "WebCryptoCustody rejects an extractable identity private key — an " +
+            "on-device custody key MUST be non-extractable (generate it with " +
+            "`crypto.subtle.generateKey(..., /* extractable */ false, ...)`). Fails closed.",
+        );
+      }
+    } else {
       // Non-extractable Ed25519 identity key: the private key never leaves
       // WebCrypto. If the platform lacks Ed25519 in WebCrypto, custody cannot be
       // backed as specified — fail closed rather than hold a weaker key silently.
