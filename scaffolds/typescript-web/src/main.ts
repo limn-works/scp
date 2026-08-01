@@ -37,6 +37,7 @@ const didInput = required<HTMLInputElement>("did");
 const relayInput = required<HTMLInputElement>("relay");
 const contextInput = required<HTMLInputElement>("context");
 const messageInput = required<HTMLInputElement>("message");
+const connectButton = required<HTMLButtonElement>("connect");
 const sendButton = required<HTMLButtonElement>("send");
 const log = required<HTMLElement>("log");
 
@@ -51,32 +52,41 @@ let client: ScpBrowserClient | undefined;
 let contextId = "";
 let pump: ReturnType<typeof setInterval> | undefined;
 
-/** Connects a fully-wired in-browser client and opens a sole-member context. */
-async function connect(): Promise<void> {
-  const did = didInput.value.trim();
-  const url = relayInput.value.trim();
-  contextId = contextInput.value.trim();
-  if (did === "" || url === "" || contextId === "") {
-    append("Provide a pre-provisioned DID, a relay URL, and a context id first.");
-    return;
+/** Tears down the render loop + managed transport before any reconnect (idempotent). */
+function teardown(): void {
+  if (pump !== undefined) {
+    clearInterval(pump);
+    pump = undefined;
   }
+  client?.disconnect();
+  client = undefined;
+}
+
+/** Connects a fully-wired in-browser client and opens a sole-member context. */
+async function connect(params: { did: string; url: string; contextId: string }): Promise<void> {
+  // Defensive: clear any prior client/pump before reassigning, so a repeat
+  // connect never leaks a still-reconnecting WebSocket or a live interval.
+  teardown();
 
   // On-device key custody (WebCrypto) + durable storage (IndexedDB) are explicit,
   // injected ports — the SDK never reaches for a hidden default. `did` is
   // pre-provisioned; the browser tier does not mint DIDs in-tab (ADR-057).
-  const custody = WebCryptoCustody.create({ did });
+  const custody = WebCryptoCustody.create({ did: params.did });
   const storage = await IndexedDbStorage.open();
 
   // The managed transport wires the inbound pump + reconnect for you: on every
   // (re)open it re-drives SUBSCRIBEs; on every relay frame it feeds the driver.
+  // `onError` covers the ONGOING relay pump only — init failures propagate out of
+  // this async function to the submit handler's `.catch` and reach the same log.
   client = await ScpBrowserClient.connect({
     custody,
     storage,
-    url,
+    url: params.url,
     onError: (err) => append(`relay pump error [${err.code}]: ${err.message}`),
   });
 
   // Sole-member context (this tab). Cross-party membership is the #2187 seam below.
+  contextId = params.contextId;
   client.createContext(contextId);
   append(`Connected as ${client.did}; created context "${contextId}".`);
   sendButton.disabled = false;
@@ -96,14 +106,18 @@ async function connect(): Promise<void> {
   }, 500);
 
   // ── PLACEHOLDER seam: relay-mediated cross-party invitation-join (#2187) ─────
-  // A second participant joins here. Native↔browser invitation-join / HPKE-open
-  // custody and the §9.7.1 DID-VM KeyPackage binding are deferred to #2187, so
-  // this scaffold stays single-tab. When #2187 lands the join wires through the
-  // real API the package already exports (illustrative — intentionally NOT run):
-  //   const keyPackage = client.generateKeyPackageForJoin(contextId);
-  //   const add = client.addMember(contextId, peerKeyPackage);
-  //   client.joinContextEncrypted(contextId, add.welcome, add.eventLog, add.wrappingKeys);
-  // No cross-party membership is implemented in this slice.
+  // In a REAL two-party flow the ADDER and the JOINER are DIFFERENT clients, and
+  // the roles do not run on one `client`:
+  //   • ADDER (an existing member): `createContext` then, given the joiner's key
+  //     package, `addMember(contextId, joinerKeyPackage)` → { welcome, eventLog,
+  //     wrappingKeys, … }.
+  //   • JOINER (the newcomer): `generateKeyPackageForJoin(contextId)` to hand to
+  //     the adder, then `joinContextEncrypted(contextId, welcome, eventLog,
+  //     wrappingKeys)` with the adder's returned material.
+  // Those artifacts are exchanged out-of-band today; relay-mediated exchange (and
+  // the §9.7.1 DID-VM KeyPackage binding it needs) is deferred to #2187, so this
+  // scaffold stays single-tab and implements NEITHER role's cross-party half.
+  // See bindings/typescript-wasm/examples/browser-roundtrip.ts for the full flow.
 }
 
 /** Encrypts one message and fans it out over the relay to announced peers (§9.10.4). */
@@ -129,7 +143,30 @@ function send(): void {
 
 connectForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  void connect();
+  const did = didInput.value.trim();
+  const url = relayInput.value.trim();
+  const context = contextInput.value.trim();
+  if (did === "" || url === "" || context === "") {
+    append("Provide a pre-provisioned DID, a relay URL, and a context id first.");
+    return;
+  }
+  // Teach secure transport mechanically: relays are untrusted, so a plaintext
+  // ws:// link (which leaks transport metadata) is refused — wss:// only.
+  if (!url.startsWith("wss://")) {
+    append("Relay URL must use wss:// — relays are untrusted; ws:// leaks transport metadata.");
+    return;
+  }
+  // Guard re-entry: disable Connect while a connect is in flight (and while
+  // connected). A failed connect re-enables it so the user can retry.
+  connectButton.disabled = true;
+  void connect({ did, url, contextId: context }).catch((error: unknown) => {
+    const code = error instanceof ScpError ? error.code : "unknown";
+    const message = error instanceof Error ? error.message : String(error);
+    append(`connect failed [${code}]: ${message}`);
+    teardown();
+    sendButton.disabled = true;
+    connectButton.disabled = false;
+  });
 });
 
 sendForm.addEventListener("submit", (event) => {
@@ -139,8 +176,5 @@ sendForm.addEventListener("submit", (event) => {
 
 // Best-effort cleanup of the render loop + managed transport on unload.
 window.addEventListener("beforeunload", () => {
-  if (pump !== undefined) {
-    clearInterval(pump);
-  }
-  client?.disconnect();
+  teardown();
 });
