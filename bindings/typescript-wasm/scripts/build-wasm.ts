@@ -15,14 +15,13 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  assertReleaseOnly,
   buildArgs,
-  FORBIDDEN_PROFILE_FLAGS,
   OUT_NAME,
   PROD_OUT_DIR,
   packageRootFromScript,
   repoRootFromPackageRoot,
   TEST_OUT_DIR,
-  WASM_PACK_PROFILE_FLAG,
 } from "./wasm-build";
 
 const test = process.argv.includes("--test");
@@ -32,22 +31,14 @@ const repoRoot = repoRootFromPackageRoot(packageRoot);
 const args = buildArgs({ test, repoRoot, packageRoot });
 
 // Defense-in-depth: the argv this process is about to run must itself satisfy
-// the release-only invariant. A drift here (someone editing buildArgs to inject
-// a dev profile) fails the build loudly rather than shipping a debug-assert
-// wasm. This is the same positive invariant the standalone guard asserts.
-if (!args.includes(WASM_PACK_PROFILE_FLAG)) {
-  console.error(
-    `FATAL: wasm-pack argv is missing the required ${WASM_PACK_PROFILE_FLAG} profile flag (ADR-057 Prereq-4).`,
-  );
+// the release-only invariant (the same shared check the standalone guard runs).
+// A drift here (someone editing buildArgs to inject a dev profile) fails the
+// build loudly rather than shipping a debug-assert wasm.
+try {
+  assertReleaseOnly(args);
+} catch (error) {
+  console.error(`FATAL: ${(error as Error).message}.`);
   process.exit(1);
-}
-for (const forbidden of FORBIDDEN_PROFILE_FLAGS) {
-  if (args.includes(forbidden)) {
-    console.error(
-      `FATAL: wasm-pack argv contains the forbidden profile flag ${forbidden} — the shipped wasm must be --release (ADR-057 Prereq-4).`,
-    );
-    process.exit(1);
-  }
 }
 
 console.log(`wasm-pack ${args.join(" ")}`);

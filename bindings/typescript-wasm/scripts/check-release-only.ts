@@ -18,8 +18,8 @@
  */
 
 import {
+  assertReleaseOnly,
   buildArgs,
-  FORBIDDEN_PROFILE_FLAGS,
   packageRootFromScript,
   repoRootFromPackageRoot,
   WASM_PACK_PROFILE_FLAG,
@@ -30,22 +30,15 @@ const repoRoot = repoRootFromPackageRoot(packageRoot);
 
 const errors: string[] = [];
 
+// Assert BOTH build variants through the one shared check (assertReleaseOnly),
+// accumulating any violation across variants so all are reported at once.
 for (const test of [false, true]) {
   const label = test ? "test" : "production";
   const args = buildArgs({ test, repoRoot, packageRoot });
-
-  // (a) The one permitted profile flag is present.
-  if (!args.includes(WASM_PACK_PROFILE_FLAG)) {
-    errors.push(
-      `${label} build argv is missing the required ${WASM_PACK_PROFILE_FLAG} profile flag`,
-    );
-  }
-
-  // (b) No dev/debug/profiling profile flag is present.
-  for (const forbidden of FORBIDDEN_PROFILE_FLAGS) {
-    if (args.includes(forbidden)) {
-      errors.push(`${label} build argv contains the forbidden profile flag ${forbidden}`);
-    }
+  try {
+    assertReleaseOnly(args);
+  } catch (error) {
+    errors.push(`${label} build: ${(error as Error).message}`);
   }
 }
 

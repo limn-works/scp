@@ -29,6 +29,34 @@ export const WASM_PACK_PROFILE_FLAG = "--release" as const;
  */
 export const FORBIDDEN_PROFILE_FLAGS: readonly string[] = ["--dev", "--debug", "--profiling"];
 
+/**
+ * Asserts a wasm-pack argv satisfies the release-only invariant: it contains
+ * exactly the `--release` profile flag and no dev/debug/profiling flag. Throws
+ * an `Error` describing the violation otherwise.
+ *
+ * The single source of the check — called by both the build script (before it
+ * spawns wasm-pack) and the standalone `check-release-only` guard, so the two can
+ * never drift. Together with the root `[profile.release] debug-assertions = false`
+ * pin in `Cargo.toml` (from #1444), `--release` is what guarantees the shipped
+ * wasm has debug-assertions OFF, so openmls's decrypt `debug_assert!` is compiled
+ * out and a tampered ciphertext surfaces a typed `[SCP-CRYPTO-4010]` error rather
+ * than aborting the tab (ADR-057 Prereq-4).
+ */
+export function assertReleaseOnly(args: readonly string[]): void {
+  if (!args.includes(WASM_PACK_PROFILE_FLAG)) {
+    throw new Error(
+      `wasm-pack argv is missing the required ${WASM_PACK_PROFILE_FLAG} profile flag (ADR-057 Prereq-4)`,
+    );
+  }
+  for (const forbidden of FORBIDDEN_PROFILE_FLAGS) {
+    if (args.includes(forbidden)) {
+      throw new Error(
+        `wasm-pack argv contains the forbidden profile flag ${forbidden} — the shipped wasm must be --release (ADR-057 Prereq-4)`,
+      );
+    }
+  }
+}
+
 /** The crate wasm-pack compiles (repo-relative). */
 export const CRATE_PATH = "crates/scp-client-wasm";
 
