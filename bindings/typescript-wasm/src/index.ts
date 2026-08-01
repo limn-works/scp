@@ -14,7 +14,7 @@
  * ```typescript
  * import { ScpBrowserClient, WebCryptoCustody, IndexedDbStorage } from "@limn-works/scp-ts-wasm";
  *
- * const custody = await WebCryptoCustody.create({ did: myDid });
+ * const custody = WebCryptoCustody.create({ did: myDid });
  * const storage = await IndexedDbStorage.open();
  * const client = await ScpBrowserClient.connect({ custody, storage, url: "wss://relay.example" });
  *
