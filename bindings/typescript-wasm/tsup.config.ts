@@ -18,17 +18,11 @@ export default defineConfig({
   // D1 — each package bundles its own copy of the one in-repo core module).
   // `sideEffects:false` (package.json) + a single bundled core chunk bounds the
   // per-package dual-package `instanceof` hazard.
-  loader: {
-    // The `--target web` glue references its sibling wasm as
-    // `new URL('scp_client_wasm_bg.wasm', import.meta.url)`. The `file` loader
-    // copies that binary into dist/ and rewrites the URL to point at it, so the
-    // emitted bundle resolves the wasm relative to itself at runtime.
-    ".wasm": "file",
-  },
-  esbuildOptions(options) {
-    // Keep the copied wasm's basename stable (no content hash) so it lands as
-    // dist/scp_client_wasm_bg.wasm — a 1:1 sibling the `files:["dist/"]`
-    // allowlist ships and the `new URL(...)` reference resolves to.
-    options.assetNames = "[name]";
-  },
+  //
+  // NOTE: the `.wasm` binary is NOT bundled or copied by esbuild. The `--target
+  // web` glue references it as `new URL('./scp_client_wasm_bg.wasm',
+  // import.meta.url)`, which esbuild leaves as a *runtime* reference (verified
+  // empirically: `tsup` alone emits no `dist/*.wasm`). The sibling `.wasm` is
+  // placed into `dist/` by `scripts/copy-wasm-asset.ts` (run after `tsup` in the
+  // `build` script), so the `new URL(...)` resolves to it at runtime.
 });
