@@ -663,16 +663,16 @@ class SCP:
         """Create an identity link attestation (§3.5).
 
         Returns an :class:`~scp_sdk.identity.IdentityAttestation` on success.
-        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge does
+        Raises :class:`~scp_sdk.errors.AttestationError` when the bridge does
         not expose attestation creation (missing FFI feature).
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "create_identity_link_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation creation is not yet available in the bridge",
                 "SCP-ATTEST-9010",
             )
@@ -832,16 +832,16 @@ class SCP:
         """List identity link attestations for *did* (§3.5).
 
         Returns a list of :class:`~scp_sdk.identity.IdentityAttestation`
-        instances. Raises :class:`~scp_sdk.errors.IdentityError` when the
+        instances. Raises :class:`~scp_sdk.errors.AttestationError` when the
         bridge does not expose the endpoint.
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "identity_link_attestations"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation listing is not yet available in the bridge",
                 "SCP-ATTEST-9011",
             )
@@ -917,16 +917,16 @@ class SCP:
 
         Returns an :class:`~scp_sdk.identity.IdentityAttestation` with a
         refreshed ``verified_at`` timestamp. Raises
-        :class:`~scp_sdk.errors.IdentityError` when the bridge does not
+        :class:`~scp_sdk.errors.AttestationError` when the bridge does not
         expose renewal.
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "identity_renew_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation renewal is not yet available in the bridge",
                 "SCP-ATTEST-9013",
             )
@@ -995,10 +995,10 @@ class SCP:
         Returns ``True`` if the attestation existed and was removed,
         ``False`` if no attestation with that ID was present.
         """
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
 
         if not hasattr(self._native, "remove_identity_link_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation removal is not yet available in the bridge",
                 "SCP-ATTEST-9012",
             )
