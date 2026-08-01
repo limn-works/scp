@@ -1434,6 +1434,66 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
     });
 }
 
+/// Creates a registered context whose CREATOR holds the `ContextClose`
+/// capability (the ceiling is seeded with `context:close`), so the creator can
+/// later drive it `Closed` through the REAL supervisor close path. The default
+/// `create_test_context_with_id` uses an EMPTY ceiling, under which even the
+/// creator lacks `context:close` — hence this close-capable variant. Returns the
+/// generated 64-hex context id.
+fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
+    use scp_core::context::roles::Capability;
+
+    setup();
+    let context_id = random_64hex_context_id();
+    runtime::register_context(bi, &context_id, creator_did, &[]).unwrap();
+
+    let rt = test_runtime();
+    let supervisor = runtime::supervisor(bi).unwrap().clone();
+    let creator = scp_did::DID(creator_did.to_owned());
+    let ctx_id = context_id.clone();
+
+    rt.block_on(async move {
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![Capability::ContextClose],
+            ..scp_core::context::ContextParams::default()
+        };
+        supervisor
+            .create_context(ctx_id.clone(), params, creator.clone(), None)
+            .await
+            .unwrap();
+        supervisor.register_local_did(creator).await.unwrap();
+    });
+    context_id
+}
+
+/// Drives a registered context to a NON-active (`Closed`) lifecycle state through
+/// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
+/// dispatch the bridge's `context_close` uses. The per-context actor stays alive
+/// reporting `Closed` (close is non-terminal for the actor; ADR-049 §10), so a
+/// subsequent `supervisor.read_context_state(context_id)` returns
+/// `Some(Closed)` — exactly what the streaming-saga open's active-state guard
+/// reads. `initiator_did` must be the creator of a context created with a
+/// `ContextClose`-bearing ceiling (see `create_closeable_test_context`).
+fn drive_context_closed(bi: &PyBridgeInstance, context_id: &str, initiator_did: &str) {
+    use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+
+    let rt = test_runtime();
+    let supervisor = runtime::supervisor(bi).unwrap().clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::CloseContext {
+        payload: Box::new(CloseContextPayload {
+            context_id: context_id.to_owned(),
+            params: scp_core::context::ContextParams::default(),
+            initiator_did: scp_did::DID(initiator_did.to_owned()),
+        }),
+        reply: tx,
+    };
+    rt.block_on(async move {
+        supervisor.dispatch_lifecycle_command(cmd).await.unwrap();
+        rx.await.unwrap().unwrap();
+    });
+}
+
 /// Registers a minimal `{a,b} -> {sum,ok}` outlet in `context_id`, returning the
 /// outlet registration id. Reuses the shared [`build_outlet_reg`] schema.
 fn register_saga_outlet(
@@ -2049,6 +2109,108 @@ fn xctx_streaming_saga_recover_hosted_non_invoker_rejected() {
         assert!(
             scp.test_streaming_saga_entry_present(saga_id),
             "a rejected non-invoker recover must NOT evict the invoker's saga entry"
+        );
+    });
+}
+
+/// SCP-OUT-047 pass-3a (LIFECYCLE): a money-moving streaming-saga OPEN against a
+/// NON-active source or target context is rejected with `SCP-OUTLET-6010`
+/// (caller axis) / `SCP-OUTLET-6011` (target axis) — parity with the NAPI and
+/// `UniFFI` streaming-open guards — BEFORE the caller-principal binding, the UCAN
+/// check, or the saga drive, so NO saga is started and NO receiver is handed out.
+///
+/// The guard is LOAD-BEARING: the runtime streaming reserve path
+/// (`reserve_outlet_stream_economy`) debits escrow with no context-active gate,
+/// so this bridge check is the sole barrier. `PyO3` is string-keyed (no handle),
+/// so the state is read authoritatively from the supervisor actor via
+/// `read_context_state`; the context is driven to `Closed` through the REAL
+/// supervisor close path.
+#[test]
+fn xctx_streaming_saga_open_rejects_non_active_context() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let bi = scp.bridge_instance();
+
+        let owner = create_test_identity(bi);
+        let input = PyDict::new(py);
+        input.set_item("a", "x").unwrap();
+        input.set_item("b", "y").unwrap();
+
+        // --- source (caller) context non-active → OUTLET_6010 ---------------
+        let caller_ctx = create_closeable_test_context(bi, &owner);
+        let target_ctx = create_closeable_test_context(bi, &owner);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
+        drive_context_closed(bi, &caller_ctx, &owner);
+
+        let err = scp
+            .outlet_streaming_saga_open(
+                &caller_ctx,
+                &target_ctx,
+                &owner,
+                &outlet_id,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                &placeholder_streaming_ucan(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("a non-active source context must be rejected before the saga runs");
+        assert!(
+            err.is_instance_of::<_scp_core::error::ContextError>(py),
+            "expected ContextError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-OUTLET-6010"),
+            "expected caller-axis SCP-OUTLET-6010, got: {msg}"
+        );
+        assert!(
+            scp.test_streaming_saga_registry_is_empty(),
+            "a rejected non-active open must NOT start a saga / hand out a receiver"
+        );
+
+        // --- source active, target context non-active → OUTLET_6011 ---------
+        // Fresh caller (the first is now closed); reuse the still-active target,
+        // then close it so only the TARGET axis is non-active.
+        let caller_ctx2 = create_closeable_test_context(bi, &owner);
+        let target_ctx2 = create_closeable_test_context(bi, &owner);
+        let outlet_id2 = register_saga_outlet(py, &scp, &target_ctx2, &owner);
+        drive_context_closed(bi, &target_ctx2, &owner);
+
+        let err = scp
+            .outlet_streaming_saga_open(
+                &caller_ctx2,
+                &target_ctx2,
+                &owner,
+                &outlet_id2,
+                &input.as_borrowed(),
+                &nonce_hex(),
+                1_700_000_000_000,
+                1,
+                &placeholder_streaming_ucan(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("a non-active target context must be rejected before the saga runs");
+        assert!(
+            err.is_instance_of::<_scp_core::error::ContextError>(py),
+            "expected ContextError, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-OUTLET-6011"),
+            "expected target-axis SCP-OUTLET-6011, got: {msg}"
+        );
+        assert!(
+            scp.test_streaming_saga_registry_is_empty(),
+            "a rejected non-active open must NOT start a saga / hand out a receiver"
         );
     });
 }

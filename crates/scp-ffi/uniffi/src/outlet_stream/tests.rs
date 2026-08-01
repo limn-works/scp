@@ -977,4 +977,150 @@ mod xctx_streaming_saga_tests {
             "a rejected non-invoker recover must NOT evict the invoker's saga entry"
         );
     }
+
+    /// (LIFECYCLE) A money-moving streaming-saga OPEN against a NON-active source
+    /// or target context is rejected with `OUTLET_6010` (caller) / `OUTLET_6011`
+    /// (target) — parity with the UNARY cross-context saga export's two-handle
+    /// guard and the NAPI streaming open — BEFORE any input validation, UCAN
+    /// check, or saga drive, so no saga is started and no receiver is handed out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_open_rejects_non_active_context() {
+        use crate::bridge::ContextState;
+
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let _resolver = install_seedable_resolver(&bi);
+
+        let creator_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (creator) should succeed");
+        let hosted_caller = creator_identity.did.clone();
+        let handle_a = scp
+            .context_create(
+                Arc::clone(&creator_identity),
+                streaming_context_params(STREAMING_CEILING),
+            )
+            .await
+            .expect("context_create (caller) should succeed");
+        let handle_b = scp
+            .context_create(
+                Arc::clone(&creator_identity),
+                streaming_context_params(STREAMING_CEILING),
+            )
+            .await
+            .expect("context_create (target) should succeed");
+        let outlet_id =
+            scp_ffi_common::outlet_id::generate_outlet_id("xctx_streaming_non_active_probe");
+
+        let open_args = |caller: String, outlet: String| {
+            (
+                caller,
+                outlet,
+                r#"{"a":"x","b":"y"}"#.to_owned(),
+                "0123456789abcdef0123456789abcdef".to_owned(),
+                "eyJhbGciOiJFZERTQSJ9.eyJ0ZXN0Ijp0cnVlfQ.placeholder-not-validated".to_owned(),
+            )
+        };
+
+        // --- source (caller) context non-active → OUTLET_6010 ---------------
+        *handle_a.state.lock().await = ContextState::Closing;
+        let (caller, outlet, input, nonce, ucan) =
+            open_args(hosted_caller.clone(), outlet_id.clone());
+        let err = outlet_streaming_saga_open_impl(
+            &bi,
+            &handle_a,
+            &handle_b,
+            caller,
+            outlet,
+            input,
+            nonce,
+            now_ms(),
+            1,
+            ucan,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a non-active source context must be rejected before the saga runs");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::OUTLET_6010),
+            "expected caller-axis SCP-OUTLET-6010, got: {msg}"
+        );
+        assert!(
+            bi.outlet_streaming_saga_registry.is_empty(),
+            "a rejected non-active open must NOT start a saga / hand out a receiver"
+        );
+
+        // --- source active, target context non-active → OUTLET_6011 ---------
+        *handle_a.state.lock().await = ContextState::Active;
+        *handle_b.state.lock().await = ContextState::Expired;
+        let (caller, outlet, input, nonce, ucan) = open_args(hosted_caller, outlet_id);
+        let err = outlet_streaming_saga_open_impl(
+            &bi,
+            &handle_a,
+            &handle_b,
+            caller,
+            outlet,
+            input,
+            nonce,
+            now_ms(),
+            1,
+            ucan,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a non-active target context must be rejected before the saga runs");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::OUTLET_6011),
+            "expected target-axis SCP-OUTLET-6011, got: {msg}"
+        );
+        assert!(
+            bi.outlet_streaming_saga_registry.is_empty(),
+            "a rejected non-active open must NOT start a saga / hand out a receiver"
+        );
+    }
+
+    /// (CRYPTO defense-in-depth, SCP-OUT-047) The streaming-saga RECOVER derives
+    /// the TARGET context's Active Signing Key from the `creator_did` it reads out
+    /// of the UCAN-state registry (`with_ucan_state`), whereas the context handle
+    /// carries its OWN `creator_did`. In the co-resident model these are the SAME
+    /// fact from two sources; this pins that they never diverge for a registered
+    /// context, so a future refactor that lets one drift from the other (letting
+    /// recover seal under a different context's key) is caught here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_ucan_state_creator_did_matches_handle() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let _resolver = install_seedable_resolver(&bi);
+
+        let creator_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let handle = scp
+            .context_create(
+                Arc::clone(&creator_identity),
+                streaming_context_params(STREAMING_CEILING),
+            )
+            .await
+            .expect("context_create should succeed");
+
+        let ucan_creator = bi
+            .with_ucan_state(&handle.context_id, |state| state.creator_did.clone())
+            .expect("a created context must be registered in the UCAN-state registry");
+        assert_eq!(
+            ucan_creator, handle.creator_did,
+            "the UCAN-state creator_did (the recover signing-key source) must equal the handle's \
+             creator_did — a divergence would let streaming-saga recover seal under a different \
+             context's Active Signing Key"
+        );
+    }
 }

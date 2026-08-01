@@ -1147,6 +1147,14 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
 
     // Both contexts must be active (parity with the unary saga export).
+    //
+    // LOAD-BEARING (not defense-in-depth): the runtime streaming-saga reserve
+    // path (`reserve_outlet_stream_economy`) debits the invoker's escrow with NO
+    // context-lifecycle Active gate — its only pre-debit gates are membership
+    // (13050 / 6089), the established interface (13062), and the saga context-set
+    // reservation; it never surfaces SCP-OUTLET-6080 "context not active" the way
+    // the SESSION and send/governance/TTL paths do. This bridge check is the sole
+    // barrier stopping a non-active source/target from debiting escrow.
     let source_state = source_handle.state()?;
     if source_state != "active" {
         return Err(ScpNapiError::Outlet {

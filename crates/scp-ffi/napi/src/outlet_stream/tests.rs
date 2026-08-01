@@ -1316,4 +1316,89 @@ mod xctx_streaming_saga_tests {
             "a rejected non-invoker recover must NOT evict the invoker's saga entry"
         );
     }
+
+    /// (LIFECYCLE) A money-moving streaming-saga OPEN against a NON-active source
+    /// or target context is rejected with `OUTLET_6010` (caller) / `OUTLET_6011`
+    /// (target) — parity with the UNARY cross-context saga export's two-handle
+    /// guard — BEFORE any input validation, UCAN check, or saga drive, so no saga
+    /// is started and no receiver is handed out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_open_rejects_non_active_context() {
+        use scp_core::context::ContextState;
+
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let owner_identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let hosted_caller = owner_identity.inner.did.clone();
+
+        let handle_a = create_saga_context(&bi, &owner_identity).await;
+        let handle_b = create_saga_context(&bi, &owner_identity).await;
+        let outlet_id =
+            scp_ffi_common::outlet_id::generate_outlet_id("xctx_streaming_non_active_probe");
+
+        // --- source (caller) context non-active → OUTLET_6010 ---------------
+        handle_a.set_state_for_test(ContextState::Closing);
+        let err = Box::pin(outlet_streaming_saga_open_on(
+            &bi,
+            &handle_a,
+            &handle_b,
+            hosted_caller.clone(),
+            outlet_id.clone(),
+            r#"{"a":"x","b":"y"}"#.to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            now_ms(),
+            1,
+            "eyJhbGciOiJFZERTQSJ9.eyJ0ZXN0Ijp0cnVlfQ.placeholder-not-validated".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect_err("a non-active source context must be rejected before the saga runs");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::OUTLET_6010),
+            "expected caller-axis SCP-OUTLET-6010, got: {msg}"
+        );
+        assert!(
+            bi.outlet_streaming_saga_registry.is_empty(),
+            "a rejected non-active open must NOT start a saga / hand out a receiver"
+        );
+
+        // --- source active, target context non-active → OUTLET_6011 ---------
+        handle_a.set_state_for_test(ContextState::Active);
+        handle_b.set_state_for_test(ContextState::Expired);
+        let err = Box::pin(outlet_streaming_saga_open_on(
+            &bi,
+            &handle_a,
+            &handle_b,
+            hosted_caller,
+            outlet_id,
+            r#"{"a":"x","b":"y"}"#.to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            now_ms(),
+            1,
+            "eyJhbGciOiJFZERTQSJ9.eyJ0ZXN0Ijp0cnVlfQ.placeholder-not-validated".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect_err("a non-active target context must be rejected before the saga runs");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(codes::OUTLET_6011),
+            "expected target-axis SCP-OUTLET-6011, got: {msg}"
+        );
+        assert!(
+            bi.outlet_streaming_saga_registry.is_empty(),
+            "a rejected non-active open must NOT start a saga / hand out a receiver"
+        );
+    }
 }

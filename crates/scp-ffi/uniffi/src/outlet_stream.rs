@@ -93,9 +93,9 @@ use scp_ffi_common::validate::{
 
 use crate::ScpError;
 use crate::bridge::{
-    ContextHandle, UniffiKeyCustody, decode_asserted_nonce, enforce_caller_principal_binding,
-    identity_custody_registry, map_saga_error, resolve_uniffi_signing_key,
-    validate_outlet_ucan_uniffi,
+    ContextHandle, ContextState, UniffiKeyCustody, decode_asserted_nonce,
+    enforce_caller_principal_binding, identity_custody_registry, map_saga_error,
+    resolve_uniffi_signing_key, validate_outlet_ucan_uniffi,
 };
 use crate::runtime::UniffiBridgeInstance;
 use crate::scp::Scp;
@@ -230,7 +230,10 @@ async fn resolve_stream_signer(
                  requires the operator and invoker identities to be hosted by this bridge \
                  instance (co-resident single-tenant constraint)"
                 ),
-                code: codes::CTX_2040.to_owned(),
+                // Hosted-identity (channel-auth) rejection — SAME code as the NAPI
+                // and PyO3 bridges surface for "identity not hosted here"
+                // (SCP-OUT-047 pass-3a cross-bridge alignment).
+                code: codes::CTX_2001.to_owned(),
             })?;
         let (custody, key_handle) = entry.value();
         (Arc::clone(custody), *key_handle)
@@ -240,14 +243,14 @@ async fn resolve_stream_signer(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-            code: codes::CTX_2040.to_owned(),
+            code: codes::CTX_2001.to_owned(),
         })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
         .ok_or_else(|| ScpError::Context {
         msg: format!(
             "identity '{identity_did}' active signing key is not a valid Ed25519 verifying key"
         ),
-        code: codes::CTX_2040.to_owned(),
+        code: codes::CTX_2001.to_owned(),
     })?;
     Ok(BridgeCustodyStreamSigner {
         custody,
@@ -1118,7 +1121,9 @@ async fn resolve_context_active_signing_key_by_id(
                  crash-recovery requires the target context's creator identity to be hosted by \
                  this bridge instance (co-resident single-tenant constraint)"
             ),
-            code: codes::CTX_2040.to_owned(),
+            // Hosted-identity (channel-auth) rejection — SAME code the NAPI and
+            // PyO3 bridges surface (SCP-OUT-047 pass-3a cross-bridge alignment).
+            code: codes::CTX_2001.to_owned(),
         })?;
         let (custody, key_handle) = entry.value();
         (Arc::clone(custody), *key_handle)
@@ -1174,6 +1179,46 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
 ) -> Result<String, ScpError> {
     let caller_context_id = source_handle.context_id.clone();
     let target_context_id = target_handle.context_id.clone();
+
+    // Both contexts MUST be Active before this money-moving open touches any
+    // state — a Closing/Expired/MigratingOut source or target cannot open a
+    // cross-context streaming saga (§5.3 lifecycle / §6.2.4). Mirrors the UniFFI
+    // UNARY cross-context saga export's two-handle guard and the NAPI streaming
+    // open's OUTLET_6010 (caller) / OUTLET_6011 (target) codes. Checked BEFORE
+    // input validation, the caller-principal binding, and the saga drive, so a
+    // non-active context is rejected before any receiver is ever handed out.
+    //
+    // LOAD-BEARING (not defense-in-depth): the runtime streaming-saga reserve
+    // path (`reserve_outlet_stream_economy`) debits the invoker's escrow with NO
+    // context-lifecycle Active gate — its only pre-debit gates are membership
+    // (13050 / 6089), the established interface (13062), and the saga context-set
+    // reservation; it never surfaces SCP-OUTLET-6080 "context not active" the way
+    // the SESSION and send/governance/TTL paths do. This bridge check is the sole
+    // barrier stopping a non-active source/target from debiting escrow.
+    {
+        let source_state = source_handle.state.lock().await;
+        if !matches!(*source_state, ContextState::Active) {
+            return Err(ScpError::Outlet {
+                msg: format!(
+                    "cannot start cross-context streaming saga: caller context in {:?} state",
+                    *source_state
+                ),
+                code: codes::OUTLET_6010.to_owned(),
+            });
+        }
+    }
+    {
+        let target_state = target_handle.state.lock().await;
+        if !matches!(*target_state, ContextState::Active) {
+            return Err(ScpError::Outlet {
+                msg: format!(
+                    "cannot start cross-context streaming saga: target context in {:?} state",
+                    *target_state
+                ),
+                code: codes::OUTLET_6011.to_owned(),
+            });
+        }
+    }
 
     // ----- (a) validate inputs ------------------------------------------------
     validate_context_id(&caller_context_id)?;
@@ -1497,7 +1542,9 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_impl(
                  the streaming-saga reconnect recovery caller MUST be the channel-authenticated \
                  principal (§6.2.4 Caller authentication), not an envelope-asserted value"
             ),
-            code: codes::CTX_2040.to_owned(),
+            // Hosted-identity (channel-auth) rejection — SAME code the NAPI and
+            // PyO3 bridges surface (SCP-OUT-047 pass-3a cross-bridge alignment).
+            code: codes::CTX_2001.to_owned(),
         });
     }
 

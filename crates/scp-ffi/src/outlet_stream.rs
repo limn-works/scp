@@ -1195,9 +1195,54 @@ fn outlet_streaming_saga_open_impl(
     let asserted_nonce = crate::outlets::decode_asserted_nonce(asserted_nonce_hex)?;
     let input_json = crate::types::py_dict_to_json(input)?;
 
-    // ----- (b) caller-principal binding (CALLER axis) — BEFORE the saga runs --
     let supervisor = crate::runtime::supervisor(bi)?;
     let rt = crate::runtime()?;
+
+    // ----- (a2) lifecycle gate: both contexts MUST be Active ------------------
+    //
+    // LOAD-BEARING (not defense-in-depth): the runtime streaming-saga open path
+    // (`start_cross_context_streaming_outlet_invocation_saga` →
+    // `open_outlet_stream_phase1` → `reserve_outlet_stream_economy`) DEBITS the
+    // invoker's escrow with NO context-lifecycle Active gate — its only pre-debit
+    // gates are membership (SCP-SAGA-13050 / SCP-OUTLET-6089), the established
+    // outlet interface (SCP-SAGA-13062), and the saga context-set reservation.
+    // Unlike the SESSION path (`create_session` / `invoke_session`) and the
+    // send / governance / TTL paths, it does NOT surface `SCP-OUTLET-6080`
+    // "context not active". So THIS bridge check is the only barrier stopping a
+    // Closing / Expired / MigratingOut source or target from opening a
+    // money-moving cross-context streaming saga (§5.3 lifecycle / §6.2.4).
+    //
+    // PyO3 is string-keyed (no `ContextHandle`), so the authoritative lifecycle
+    // state is read from the per-context supervisor actor via
+    // `read_context_state` — the equivalent of the NAPI/UniFFI handle-state
+    // guard. Checked BEFORE the caller-principal binding and the saga drive, so a
+    // non-active context is rejected before any escrow debit or receiver hand-out.
+    // Codes match NAPI/UniFFI: `OUTLET_6010` (caller axis) / `OUTLET_6011`
+    // (target axis). A missing actor (`None`) is treated as non-active.
+    let caller_state = rt.block_on(supervisor.read_context_state(caller_context_id));
+    if !matches!(caller_state, Some(scp_core::context::ContextState::Active)) {
+        return Err(ScpPyError::ContextError {
+            message: format!(
+                "cannot start cross-context streaming saga: caller context in \
+                 {caller_state:?} state"
+            ),
+            code: scp_ffi_common::error_codes::OUTLET_6010.to_owned(),
+        }
+        .into());
+    }
+    let target_state = rt.block_on(supervisor.read_context_state(target_context_id));
+    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
+        return Err(ScpPyError::ContextError {
+            message: format!(
+                "cannot start cross-context streaming saga: target context in \
+                 {target_state:?} state"
+            ),
+            code: scp_ffi_common::error_codes::OUTLET_6011.to_owned(),
+        }
+        .into());
+    }
+
+    // ----- (b) caller-principal binding (CALLER axis) — BEFORE the saga runs --
     crate::outlets::enforce_caller_principal_binding(
         bi,
         supervisor,
@@ -1909,6 +1954,14 @@ impl crate::scp::PyScp {
         self.inner
             .outlet_streaming_saga_registry
             .contains_key(saga_id)
+    }
+
+    /// TEST-ONLY: reports whether the streaming-saga registry has NO live
+    /// entries — lets a test assert a rejected open (e.g. the non-active-context
+    /// guard) started NO saga and handed out NO receiver.
+    #[must_use]
+    pub fn test_streaming_saga_registry_is_empty(&self) -> bool {
+        self.inner.outlet_streaming_saga_registry.is_empty()
     }
 }
 
