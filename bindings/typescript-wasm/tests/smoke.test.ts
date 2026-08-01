@@ -1,24 +1,10 @@
 import { beforeAll, expect, test } from "bun:test";
-import type { JsKeyCustody, JsSocket } from "../src/index";
+import type { JsSocket } from "../src/index";
 import { InMemoryStorage, isScpInitialized, ScpBrowserClient, scpVersion } from "../src/index";
 import { loadRealWasm } from "./support/load-wasm";
+import { stubCustody } from "./support/stubs";
 
 const DID = "did:key:z6MkAlice3SurfaceExchangeFixtureKeyAAAAAAA";
-
-/** A custody stub whose only wired method — did() — the driver actually calls. */
-function stubCustody(did: string): JsKeyCustody {
-  const unused = (): never => {
-    throw new Error("custody seam has no call site in this slice");
-  };
-  return {
-    did: () => did,
-    sign: unused,
-    getPublicKey: unused,
-    generateKeypair: unused,
-    destroyKey: () => {},
-    dhAgree: unused,
-  };
-}
 
 /** A no-op socket: the smoke test issues no cross-client traffic. */
 function nullSocket(): JsSocket {

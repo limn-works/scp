@@ -184,9 +184,21 @@ export class WebSocketRelaySocket implements JsSocket {
       try {
         handlers.onFrame(bytes);
       } catch (error) {
-        // A genuine driver error routes to onError and MUST NOT kill the pump.
-        const mapped = mapBridgeError(error);
-        (handlers.onError ?? this.#onError)?.(mapped);
+        const route = handlers.onError ?? this.#onError;
+        if (error instanceof WebAssembly.RuntimeError) {
+          // A wasm TRAP (unreachable / OOB) poisons the wasm instance — the driver
+          // is dead, and pumping more frames into a dead instance is unsound. Treat
+          // it as FATAL: surface it and close the transport (close() disables
+          // reconnect, so we do not reconnect into the same dead instance). This is
+          // distinct from a normal catchable error below (e.g. a malformed frame),
+          // which must NOT kill the connection.
+          route?.(mapBridgeError(error));
+          this.close();
+          return;
+        }
+        // A normal driver error routes to onError and keeps the pump alive — one
+        // bad frame must not kill the connection.
+        route?.(mapBridgeError(error));
       }
     };
 

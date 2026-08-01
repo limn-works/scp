@@ -36,6 +36,13 @@ import wasmInit, {
   outletStreamVerifyChunkSignature as wasmVerifyChunkSignature,
 } from "./wasm/scp_client_wasm.js";
 
+/**
+ * The wasm source accepted by {@link initScp} and {@link ScpBrowserConnectOptions.wasmModule}:
+ * a `WebAssembly.Module`, bytes, a URL, a `Request`, or a `Response`. Re-exported
+ * so callers can name the type of the wasm source they supply.
+ */
+export type { InitInput } from "./wasm/scp_client_wasm.js";
+
 // ---------------------------------------------------------------------------
 // One-time wasm initialization
 // ---------------------------------------------------------------------------
@@ -107,40 +114,56 @@ function assertInitialized(): void {
 // ---------------------------------------------------------------------------
 
 function marshalDistribution(d: WasmSenderKeyDistribution): SenderKeyDistribution {
-  const out: SenderKeyDistribution = { targetDid: d.targetDid, ciphertext: d.ciphertext };
-  d.free();
-  return out;
+  // Does NOT free — marshalDistributions owns freeing every child handle exactly
+  // once, including on the error path (see its try/finally).
+  return { targetDid: d.targetDid, ciphertext: d.ciphertext };
 }
 
 function marshalDistributions(ds: WasmSenderKeyDistribution[]): SenderKeyDistribution[] {
-  return ds.map(marshalDistribution);
+  try {
+    return ds.map(marshalDistribution);
+  } finally {
+    // Free every child handle exactly once — including when a getter threw
+    // mid-marshal, where later handles would otherwise leak (a bounded
+    // linear-memory leak, not a UAF). Each handle is freed only here, so there is
+    // no double-free.
+    for (const d of ds) {
+      d.free();
+    }
+  }
 }
 
 function marshalAddMemberOutput(o: WasmAddMemberOutput): AddMemberOutput {
-  const out: AddMemberOutput = {
-    commit: o.commit,
-    welcome: o.welcome,
-    eventLog: o.eventLog,
-    wrappingKeys: o.wrappingKeys,
-    senderKeyDistributions: marshalDistributions(o.senderKeyDistributions),
-  };
-  o.free();
-  return out;
+  try {
+    return {
+      commit: o.commit,
+      welcome: o.welcome,
+      eventLog: o.eventLog,
+      wrappingKeys: o.wrappingKeys,
+      senderKeyDistributions: marshalDistributions(o.senderKeyDistributions),
+    };
+  } finally {
+    o.free(); // free the parent handle on both the success and error paths
+  }
 }
 
 function marshalReceiveOutput(o: WasmReceiveOutput): ReceiveOutput {
-  const out: ReceiveOutput = {
-    application: o.application,
-    senderKeyDistributions: marshalDistributions(o.senderKeyDistributions),
-  };
-  o.free();
-  return out;
+  try {
+    return {
+      application: o.application,
+      senderKeyDistributions: marshalDistributions(o.senderKeyDistributions),
+    };
+  } finally {
+    o.free();
+  }
 }
 
 function marshalEvent(e: WasmReceivedEvent): ReceivedEvent {
-  const out: ReceivedEvent = { kind: e.kind, senderDid: e.senderDid, payload: e.payload };
-  e.free();
-  return out;
+  try {
+    return { kind: e.kind, senderDid: e.senderDid, payload: e.payload };
+  } finally {
+    e.free();
+  }
 }
 
 /** Runs a wasm call, re-throwing any thrown exception as a typed {@link ScpError}. */

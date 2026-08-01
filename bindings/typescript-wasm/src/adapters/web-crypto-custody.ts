@@ -2,6 +2,17 @@
  * {@link WebCryptoCustody} — the browser-default {@link JsKeyCustody}: on-device
  * key custody backed by WebCrypto (`SubtleCrypto`), ADR-057 component 3.
  *
+ * ## Security posture in this slice (READ THIS)
+ *
+ * The class NAME describes the #1980 target end-state, NOT the current release.
+ * In THIS slice the MLS signing key still lives in `scp-mls` (wasm linear memory)
+ * and is **EXTRACTABLE**. **Non-extractable on-device WebCrypto key custody is NOT
+ * yet in effect** — it lands with #1980 (the MLS-signing-key → WebCrypto move).
+ * Callers MUST NOT rely on WebCrypto non-extractability for signing-key protection
+ * in this release: the signing key is not in WebCrypto and is not non-extractable.
+ * The custody seams already fail closed (no false code-level guarantee), but the
+ * NAME could mislead — hence this explicit statement.
+ *
  * ## What this slice wires, and what lands with #1980
  *
  * The driver's identity abstraction (`Signer`) reads ONLY `did()` in this slice —

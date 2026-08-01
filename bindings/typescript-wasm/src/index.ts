@@ -43,6 +43,7 @@ export {
 } from "./adapters/websocket-relay-socket";
 // The client façade, one-time init, and the two pure outlet-stream predicates.
 export {
+  type InitInput,
   initScp,
   isScpInitialized,
   outletStreamComputeCaveatsBinding,

@@ -92,6 +92,11 @@ ws.onmessage = (evt) => client.handleRelayFrame(new Uint8Array(evt.data as Array
 
 ## Caveats (as-built)
 
+- **Non-extractable on-device key custody is NOT yet in effect (lands with #1980).** Despite
+  the `WebCryptoCustody` name, in this release the MLS signing key still lives in `scp-mls`
+  (wasm linear memory) and is **extractable** — it is not held in non-extractable WebCrypto
+  storage. Do NOT rely on WebCrypto non-extractability for signing-key protection this
+  release; that property arrives with the MLS-signing-key → WebCrypto move (#1980).
 - **Native↔browser invitation join / HPKE-open custody is deferred to #1980.** Opening an
   `InvitationBundle` needs a DH against the invitee's on-device custody key, which the
   browser does not hold pre-#1980. `WebCryptoCustody`'s `sign` / `dhAgree` /

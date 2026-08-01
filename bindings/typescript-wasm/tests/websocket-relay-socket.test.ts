@@ -174,6 +174,40 @@ test("reconnect after close re-opens and re-fires onOpen (resubscribe)", async (
   socket.close();
 });
 
+test("onopen re-sends the tracked subscriptions on the reconnected socket", async () => {
+  // Focused unit coverage for drop → reopen → resubscribe: the pump's onOpen is
+  // `client.resubscribeAll`, which re-drives the tracked SUBSCRIBE frames on the
+  // CURRENT socket every (re)open. Here onOpen stands in for that by re-sending a
+  // fixed SUBSCRIBE frame, and we assert it lands on the NEW socket after a
+  // reconnect — proving subscriptions resume on the reconnected transport.
+  // (The full client-driven reconnect over the faithful relay mock is an e2e gap,
+  // deliberately not exercised here to avoid ballooning that mock.)
+  const created: StubWebSocket[] = [];
+  const subscribe = new Uint8Array([0x5, 0x5, 0x5]); // a stand-in tracked SUBSCRIBE frame
+  const socket = new WebSocketRelaySocket({
+    url: "ws://test",
+    createWebSocket: () => {
+      const ws = new StubWebSocket();
+      created.push(ws);
+      return ws;
+    },
+    reconnect: { enabled: true, initialDelayMs: 5, maxDelayMs: 20, factor: 2 },
+  });
+  socket.attach({ onOpen: () => socket.send(subscribe), onFrame: () => {} });
+
+  created[0]?.open();
+  expect(created[0]?.sent).toEqual([subscribe]); // subscribed on the initial open
+
+  created[0]?.close();
+  await sleep(30);
+  expect(created.length).toBeGreaterThanOrEqual(2);
+
+  created[1]?.open();
+  expect(created[1]?.sent).toEqual([subscribe]); // RE-subscribed on the reconnected socket
+
+  socket.close();
+});
+
 test("close() disables reconnect", async () => {
   const created: StubWebSocket[] = [];
   const socket = new WebSocketRelaySocket({
