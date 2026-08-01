@@ -97,7 +97,7 @@ class TestCodedBridgeError:
 
         result = _coded_bridge_error(bridge_exc)
 
-        assert result.code != "SCP-CTX-2076"
+        assert result.code is None
 
     def test_already_typed_scperror_returned_unchanged(self) -> None:
         """An already-typed ScpError passthrough must preserve the original instance."""
