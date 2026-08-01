@@ -4,7 +4,12 @@
  */
 
 import { expect, test } from "bun:test";
-import { type RelayPumpHandlers, type WebSocketLike, WebSocketRelaySocket } from "../src/index";
+import {
+  type RelayPumpHandlers,
+  ScpError,
+  type WebSocketLike,
+  WebSocketRelaySocket,
+} from "../src/index";
 
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
@@ -143,6 +148,57 @@ test("a throwing onFrame routes to onError and does not kill the pump", () => {
   ws.deliver(new Uint8Array([2])); // pump survived → delivered
   expect(calls).toBe(2);
   expect(errors).toEqual(["SCP-CRYPTO-4010"]);
+  // Contrast with the fatal wasm-trap path below: a PLAIN error leaves the socket
+  // OPEN (the pump is not killed).
+  expect(ws.readyState).toBe(WS_OPEN);
+});
+
+test("a wasm RuntimeError trap from onFrame is FATAL: surfaces, closes, and does not reconnect", async () => {
+  // A wasm TRAP (WebAssembly.RuntimeError) poisons the wasm instance, so the pump
+  // must NOT keep feeding frames into a dead instance. Unlike a plain Error (which
+  // keeps the pump alive — the test above), a trap is surfaced via onError AND the
+  // transport is closed; close() disables reconnect, so no new socket is created.
+  const created: StubWebSocket[] = [];
+  const errors: unknown[] = [];
+  const socket = new WebSocketRelaySocket({
+    url: "ws://test",
+    createWebSocket: () => {
+      const ws = new StubWebSocket();
+      created.push(ws);
+      return ws;
+    },
+    // Reconnect ENABLED on purpose: if close() failed to disable reconnect, a new
+    // socket would appear after the delay — assertion (c) would catch that.
+    reconnect: { enabled: true, initialDelayMs: 5, maxDelayMs: 20, factor: 2 },
+    onError: (e) => errors.push(e),
+  });
+  socket.attach({
+    onOpen: () => {},
+    onFrame: () => {
+      throw new WebAssembly.RuntimeError("simulated wasm trap (unreachable executed)");
+    },
+  });
+  const ws = created[0];
+  if (!ws) {
+    throw new Error("factory not invoked");
+  }
+  ws.open();
+
+  ws.deliver(new Uint8Array([1])); // onFrame throws a RuntimeError → the fatal branch
+
+  // (a) the trap is surfaced to onError, mapped to a typed ScpError.
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toBeInstanceOf(ScpError);
+
+  // (b) the transport is CLOSED (this.close() ran) — the DISCRIMINATING assertion:
+  // under a "route + keep the pump alive" revert of the fatal branch the socket
+  // would stay OPEN, failing here.
+  expect(ws.readyState).toBe(WS_CLOSED);
+
+  // (c) NO reconnect: close() set #userClosed, so even past the reconnect delay no
+  // new socket is created (a dead wasm instance must not be reconnected into).
+  await sleep(30);
+  expect(created).toHaveLength(1);
 });
 
 test("reconnect after close re-opens and re-fires onOpen (resubscribe)", async () => {
