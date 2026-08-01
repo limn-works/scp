@@ -1560,10 +1560,13 @@ impl ScpClient {
         // the driver sees. Under the browser write-behind model (see the
         // `scp-client-wasm` storage module docs) that store is an in-memory mirror
         // whose deletes are flushed to durable `IndexedDB` asynchronously; the
-        // guarantee holds against the durable store ONLY if the embedder flushes in
-        // FIFO order, so a crash cannot lose these deletes while keeping a later
-        // write. That FIFO flush is the embedder's obligation, not something this
-        // crate can enforce.
+        // guarantee holds against the durable store ONLY if the embedder keeps that
+        // store a strict PREFIX of the issued mutations — which requires BOTH FIFO
+        // ordering AND failing closed stickily on any durable-write fault (halting
+        // the chain so a later op never lands after an earlier one faulted; FIFO
+        // alone leaves a non-uniform fault as a gap). Both are the embedder's
+        // obligation, not something this crate can enforce — see the
+        // `scp-client-wasm` storage module docs.
         self.storage
             .delete(&Self::pending_key(context_id))
             .map_err(|e| {

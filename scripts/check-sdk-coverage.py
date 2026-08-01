@@ -64,6 +64,11 @@ MATRIX_PATH = REPO_ROOT / ".docs" / "standards" / "sdk-capability-matrix.json"
 SDK_PATHS: dict[str, Path] = {
     "python": REPO_ROOT / "bindings" / "python" / "scp_sdk",
     "typescript": REPO_ROOT / "bindings" / "typescript" / "src",
+    # The wasm-mechanism tier (@limn-works/scp-ts-wasm, ADR-057 Slice 3): a
+    # capability SUBSET of `typescript`. It is an OPTIONAL matrix column —
+    # verified where a cell claims it, never forced onto every op — so the
+    # in-browser participant subset is mechanically legible (planning-session-09).
+    "typescript-wasm": REPO_ROOT / "bindings" / "typescript-wasm" / "src",
     "kotlin": (
         REPO_ROOT
         / "bindings"
@@ -83,6 +88,7 @@ SDK_PATHS: dict[str, Path] = {
 SDK_EXTENSIONS: dict[str, str] = {
     "python": "*.py",
     "typescript": "*.ts",
+    "typescript-wasm": "*.ts",
     "kotlin": "*.kt",
     "swift": "*.swift",
 }
@@ -1066,6 +1072,51 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["addRelay"],
         "kotlin": ["addRelay"],
     },
+    # BrowserParticipant (ADR-057 Slice 3): the in-browser wasm participant
+    # subset. Its `typescript-wasm` symbols are ScpBrowserClient methods/getters
+    # and free functions in bindings/typescript-wasm/src (extracted as bare
+    # names). The four core tiers are `false`+exempt on this domain (this is the
+    # in-tab participant DRIVER surface; the node tiers run the full
+    # ContextManager over NAPI, not this surface — see the matrix exemptions).
+    ("BrowserParticipant", "create_context"): {"typescript-wasm": ["createContext"]},
+    ("BrowserParticipant", "generate_key_package_for_join"): {
+        "typescript-wasm": ["generateKeyPackageForJoin"]
+    },
+    ("BrowserParticipant", "add_member"): {"typescript-wasm": ["addMember"]},
+    ("BrowserParticipant", "join_context_encrypted"): {
+        "typescript-wasm": ["joinContextEncrypted"]
+    },
+    ("BrowserParticipant", "send_message"): {"typescript-wasm": ["sendMessage"]},
+    ("BrowserParticipant", "handle_relay_frame"): {
+        "typescript-wasm": ["handleRelayFrame"]
+    },
+    ("BrowserParticipant", "resubscribe_all"): {"typescript-wasm": ["resubscribeAll"]},
+    ("BrowserParticipant", "receive_message"): {"typescript-wasm": ["receiveMessage"]},
+    ("BrowserParticipant", "drain_events"): {"typescript-wasm": ["drainEvents"]},
+    ("BrowserParticipant", "close_context"): {"typescript-wasm": ["closeContext"]},
+    ("BrowserParticipant", "rotate_sender_key"): {
+        "typescript-wasm": ["rotateSenderKey"]
+    },
+    ("BrowserParticipant", "context_ids"): {"typescript-wasm": ["contextIds"]},
+    ("BrowserParticipant", "context_status"): {"typescript-wasm": ["contextStatus"]},
+    ("BrowserParticipant", "member_dids"): {"typescript-wasm": ["memberDids"]},
+    ("BrowserParticipant", "event_log_root"): {"typescript-wasm": ["eventLogRoot"]},
+    ("BrowserParticipant", "event_log_leaf_count"): {
+        "typescript-wasm": ["eventLogLeafCount"]
+    },
+    ("BrowserParticipant", "event_log_leaf_hashes"): {
+        "typescript-wasm": ["eventLogLeafHashes"]
+    },
+    ("BrowserParticipant", "mls_epoch"): {"typescript-wasm": ["mlsEpoch"]},
+    ("BrowserParticipant", "did"): {"typescript-wasm": ["did"]},
+    ("BrowserParticipant", "init"): {"typescript-wasm": ["initScp"]},
+    ("BrowserParticipant", "version"): {"typescript-wasm": ["scpVersion"]},
+    ("BrowserParticipant", "outlet_stream_compute_caveats_binding"): {
+        "typescript-wasm": ["outletStreamComputeCaveatsBinding"]
+    },
+    ("BrowserParticipant", "outlet_stream_verify_chunk_signature"): {
+        "typescript-wasm": ["outletStreamVerifyChunkSignature"]
+    },
 }
 
 
@@ -1107,6 +1158,8 @@ def _get_parser(sdk: str) -> Parser:
         lang_map = {
             "python": Language(tspython.language()),
             "typescript": Language(tstypescript.language_typescript()),
+            # The wasm tier is TypeScript — same grammar, different source tree.
+            "typescript-wasm": Language(tstypescript.language_typescript()),
             "kotlin": Language(tskotlin.language()),
             "swift": Language(tsswift.language()),
         }
@@ -1508,6 +1561,8 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
 _EXTRACTORS: dict[str, Callable[[Node], set[str]]] = {
     "python": _extract_python_symbols,
     "typescript": _extract_typescript_symbols,
+    # Same language, same extractor — a different source tree (the wasm tier).
+    "typescript-wasm": _extract_typescript_symbols,
     "kotlin": _extract_kotlin_symbols,
     "swift": _extract_swift_symbols,
 }
@@ -1630,9 +1685,12 @@ def main() -> int:
         )
         return 1
 
-    # Pre-extract all SDK symbols via tree-sitter
+    # Pre-extract all SDK symbols via tree-sitter. `typescript-wasm` is an
+    # OPTIONAL tier (the ADR-057 in-browser participant subset): it is iterated
+    # so any cell that claims it is statically verified, but it is deliberately
+    # NOT in `expected_sdks` below, so ops that do not name it are unaffected.
     sdk_symbols: dict[str, set[str]] = {}
-    for sdk in ("python", "typescript", "kotlin", "swift"):
+    for sdk in ("python", "typescript", "typescript-wasm", "kotlin", "swift"):
         sdk_symbols[sdk] = _collect_sdk_symbols(sdk)
         if not sdk_symbols[sdk]:
             print(f"  WARNING: No symbols extracted for {sdk} SDK at {SDK_PATHS[sdk]}")
@@ -1644,8 +1702,15 @@ def main() -> int:
     coverage_exempted = 0
     all_exempted_ops = 0
 
-    sdks = ("python", "typescript", "kotlin", "swift")
-    expected_sdks = frozenset(sdks)
+    # `sdks` is the iteration set (every cell present in an op is validated).
+    # `expected_sdks` is the REQUIRED set — the four core tiers that must appear
+    # on every op. `typescript-wasm` is iterated but NOT required: it is an
+    # optional subset tier, present only on the in-browser participant ops
+    # (ADR-057 Slice 3 / planning-session-09). Keeping it out of `expected_sdks`
+    # means adding it never forces a mostly-`false` column onto the other 21
+    # domains — additive coverage, no weakening of the four-tier requirement.
+    sdks = ("python", "typescript", "typescript-wasm", "kotlin", "swift")
+    expected_sdks = frozenset({"python", "typescript", "kotlin", "swift"})
 
     for domain_entry in matrix.get("capabilities", []):
         if not isinstance(domain_entry, dict):

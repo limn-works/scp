@@ -23,30 +23,49 @@
 //! (ADR-057 Slice 3); this crate only defines the synchronous extern contract it
 //! must satisfy.
 //!
-//! ## The write-behind flush MUST be ordered (FIFO) — a crash-safety obligation
+//! ## The write-behind flush is a crash-safety obligation: FIFO **and** fail-closed
 //!
-//! The embedder MUST flush write-behind mutations to the durable store in the
-//! **same order** the driver issued them (FIFO). The driver's crash-consistency
-//! invariants silently depend on it, because they reason about *ordering* between
-//! two writes to different keys:
+//! On a crash the durable store MUST be a strict **prefix** of the mutation
+//! sequence the driver issued — never a **reorder** and never a **gap**. The
+//! driver's crash-consistency invariants silently depend on it, because they
+//! reason about *ordering* between two writes to different keys:
 //!
 //! - **Join** persists the joined-context snapshot (`put ctx/{id}`) and only THEN
 //!   deletes the consumed pending blob (`delete pending/{id}`). If the durable
-//!   flush could reorder these, a crash could land the delete but lose the put,
-//!   leaving neither a context nor its pending material — a join that can be
-//!   neither used nor resumed.
+//!   store landed the delete but lost the put, neither a context nor its pending
+//!   material would survive — a join that can be neither used nor resumed.
 //! - **Close** deletes the durable snapshot (`delete ctx/{id}`) *before* dropping
-//!   in-memory state, so a "closed" context is never durably resurrected. If the
-//!   flush could reorder a later unrelated write ahead of this delete, a crash
-//!   could keep the snapshot and lose the later write — resurrecting the closed
-//!   context.
+//!   in-memory state, so a "closed" context is never durably resurrected. If a
+//!   later unrelated write landed ahead of this delete, the snapshot would survive
+//!   — resurrecting the closed context.
 //!
-//! Losing the un-flushed **tail** of the write-behind queue on a crash is safe —
-//! that is exactly the ADR-057 "lose the last unpersisted mutation" property — but
-//! it is safe *only under FIFO*: the guarantee is that on a crash the durable store
-//! is some **prefix** of the issued mutation sequence, never a reordered subset.
-//! An embedder that flushes out of order breaks these invariants; keeping order is
-//! its obligation, not something this crate can enforce.
+//! The prefix requires the embedder to honor **two** obligations; neither alone is
+//! sufficient:
+//!
+//! 1. **FIFO ordering.** Flush mutations in the order the driver issued them. This
+//!    gives *no reorder*.
+//! 2. **Fail-closed-sticky on any durable-write fault.** On the FIRST durable-write
+//!    failure the embedder MUST (a) stop flushing every *subsequently-issued*
+//!    mutation — never let a later op land after an earlier op faulted — and (b)
+//!    fail every subsequent synchronous call closed (`SCP-STORAGE-8010`), stickily,
+//!    until the store is **re-opened** (a re-open re-preloads the durable prefix
+//!    into a fresh, un-faulted mirror). This gives *no gap*.
+//!
+//! FIFO alone does NOT deliver the prefix: a NON-UNIFORM durable-write fault (no
+//! reorder at all) still breaks it. Concretely, Join's `put ctx/{id}` faults (quota
+//! exceeded) while the subsequent `delete pending/{id}` *succeeds* (it frees space)
+//! — the durable store now holds the delete without the put: a **gap**, the exact
+//! consumed-KeyPackage-with-no-recoverable-context crash the ordering exists to
+//! prevent. Halting the chain on the first fault keeps the store a strict prefix
+//! (up to the first failed op); resuming after a fault produces the gap. So: FIFO
+//! gives ORDERING, sticky-fail-closed gives the PREFIX — the embedder needs BOTH.
+//!
+//! Losing the un-flushed **tail** from the first failed op onward is safe — that is
+//! exactly the ADR-057 "lose the last unpersisted mutations" property. Both
+//! obligations are the embedder's job, not something this crate can enforce; the
+//! TypeScript `IndexedDbStorage` adapter implements them (a sticky `#pendingFault`
+//! plus a `#chainPoisoned` gate that skips every op issued after a fault — see
+//! `bindings/typescript-wasm/src/adapters/indexeddb-storage.ts`).
 //!
 //! Unlike the deleted bridge, the body is **not** a re-implementation of
 //! storage logic — it forwards to the injected JS object and translates the

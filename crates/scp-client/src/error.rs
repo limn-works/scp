@@ -164,9 +164,16 @@ pub enum ClientError {
     ///   construction. The durable snapshot is preserved.
     /// - **ABANDON** — call [`close_context`](crate::ScpClient::close_context), the
     ///   deliberate discard path: it deletes the durable snapshot and drops the
-    ///   context, **permanently forfeiting recovery**. It is the one op that does
-    ///   not go through the poison guard, so a diverged context can always be
-    ///   closed cleanly.
+    ///   context, **permanently forfeiting recovery**. It bypasses the driver's
+    ///   per-context poison GUARD (distinct from the storage backend's *own* fault
+    ///   state), so the poison verdict itself never blocks the discard. If the
+    ///   underlying storage instance is itself sticky-faulted — as it typically is
+    ///   here, since a context is poisoned precisely because a durable write failed
+    ///   (a browser `IndexedDbStorage` whose durable backend is failing throws on
+    ///   every op until re-open) — the snapshot delete surfaces that backend fault
+    ///   (`SCP-STORAGE-8010`) rather than landing. Clean abandonment then composes
+    ///   with a **re-open** over the same durable store: the fresh instance is
+    ///   un-faulted, so the retried `close_context` lands the snapshot delete.
     ///
     /// Surfaced as `SCP-STORAGE-8013`.
     #[error(

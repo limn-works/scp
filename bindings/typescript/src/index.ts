@@ -1,8 +1,10 @@
 /**
  * @limn-works/scp-ts — Shared Context Protocol TypeScript SDK.
  *
- * Runs on Bun/Node.js via the napi-rs native addon. Browser clients connect
- * to a node as remote thin clients over the network (ADR-055).
+ * Runs on Bun/Node.js via the napi-rs native addon. Browser clients run the
+ * full protocol in-tab, keys on-device, via the sibling `@limn-works/scp-ts-wasm`
+ * package (the in-browser SCP client over `scp-client-wasm`, ADR-057 — which
+ * amends ADR-055's earlier remote-thin-client browser model).
  *
  * ## Quick start
  *
