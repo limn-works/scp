@@ -1087,18 +1087,26 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript-wasm": ["joinContextEncrypted"]
     },
     ("BrowserParticipant", "send_message"): {"typescript-wasm": ["sendMessage"]},
-    ("BrowserParticipant", "handle_relay_frame"): {"typescript-wasm": ["handleRelayFrame"]},
+    ("BrowserParticipant", "handle_relay_frame"): {
+        "typescript-wasm": ["handleRelayFrame"]
+    },
     ("BrowserParticipant", "resubscribe_all"): {"typescript-wasm": ["resubscribeAll"]},
     ("BrowserParticipant", "receive_message"): {"typescript-wasm": ["receiveMessage"]},
     ("BrowserParticipant", "drain_events"): {"typescript-wasm": ["drainEvents"]},
     ("BrowserParticipant", "close_context"): {"typescript-wasm": ["closeContext"]},
-    ("BrowserParticipant", "rotate_sender_key"): {"typescript-wasm": ["rotateSenderKey"]},
+    ("BrowserParticipant", "rotate_sender_key"): {
+        "typescript-wasm": ["rotateSenderKey"]
+    },
     ("BrowserParticipant", "context_ids"): {"typescript-wasm": ["contextIds"]},
     ("BrowserParticipant", "context_status"): {"typescript-wasm": ["contextStatus"]},
     ("BrowserParticipant", "member_dids"): {"typescript-wasm": ["memberDids"]},
     ("BrowserParticipant", "event_log_root"): {"typescript-wasm": ["eventLogRoot"]},
-    ("BrowserParticipant", "event_log_leaf_count"): {"typescript-wasm": ["eventLogLeafCount"]},
-    ("BrowserParticipant", "event_log_leaf_hashes"): {"typescript-wasm": ["eventLogLeafHashes"]},
+    ("BrowserParticipant", "event_log_leaf_count"): {
+        "typescript-wasm": ["eventLogLeafCount"]
+    },
+    ("BrowserParticipant", "event_log_leaf_hashes"): {
+        "typescript-wasm": ["eventLogLeafHashes"]
+    },
     ("BrowserParticipant", "mls_epoch"): {"typescript-wasm": ["mlsEpoch"]},
     ("BrowserParticipant", "did"): {"typescript-wasm": ["did"]},
     ("BrowserParticipant", "init"): {"typescript-wasm": ["initScp"]},
