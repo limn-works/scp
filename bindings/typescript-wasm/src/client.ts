@@ -41,31 +41,45 @@ import wasmInit, {
 // ---------------------------------------------------------------------------
 
 let initialized = false;
+let initPromise: Promise<void> | undefined;
 
 /**
  * Loads and initializes the wasm module, installing the redacting panic hook.
  *
  * Call once before constructing any client. {@link ScpBrowserClient.connect}
- * awaits it for you. Idempotent — a second call is a no-op (and ignores its
- * argument), so the first initialization wins.
+ * awaits it for you. Idempotent AND concurrency-safe: concurrent callers (e.g.
+ * two `connect()`s racing at boot) share ONE in-flight initialization via a
+ * promise latch — `wasmInit` is never double-invoked. Once complete it is a
+ * no-op; the first call's `input` wins. If initialization fails the latch is
+ * cleared so a later call can retry.
  *
  * @param input - Optional wasm source (a `WebAssembly.Module`, bytes, URL, or
  *   `Response`). Omit in the browser to load the `.wasm` sibling shipped
  *   alongside the bundle via `new URL(..., import.meta.url)`. An embedder that
  *   fetches the wasm itself (Workers, a custom loader) passes it here.
  */
-export async function initScp(input?: InitInput): Promise<void> {
+export function initScp(input?: InitInput): Promise<void> {
   if (initialized) {
-    return;
+    return Promise.resolve();
   }
-  // Use the modern single-object init shape when an explicit source is given
-  // (the raw-argument form is deprecated by wasm-bindgen); the no-arg default
-  // path stays untouched so it resolves the shipped `.wasm` sibling.
-  await wasmInit(input === undefined ? undefined : { module_or_path: input });
-  // Redacting panic hook (never reads the panic payload — it may hold key
-  // material or plaintext). Idempotent on the Rust side.
-  scp_init();
-  initialized = true;
+  if (!initPromise) {
+    initPromise = (async () => {
+      // Use the modern single-object init shape when an explicit source is given
+      // (the raw-argument form is deprecated by wasm-bindgen); the no-arg default
+      // path stays untouched so it resolves the shipped `.wasm` sibling.
+      await wasmInit(input === undefined ? undefined : { module_or_path: input });
+      // Redacting panic hook (never reads the panic payload — it may hold key
+      // material or plaintext). Idempotent on the Rust side.
+      scp_init();
+      initialized = true;
+    })().catch((error: unknown) => {
+      // Clear the latch on failure so a subsequent call can re-attempt init
+      // (e.g. after supplying a valid wasm source).
+      initPromise = undefined;
+      throw error;
+    });
+  }
+  return initPromise;
 }
 
 /** Whether {@link initScp} has completed. */

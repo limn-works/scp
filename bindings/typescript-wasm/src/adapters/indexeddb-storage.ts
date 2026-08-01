@@ -24,9 +24,13 @@
  *
  * A write-behind flush that faults is captured and re-thrown on the NEXT
  * synchronous call — surfaced as `[SCP-STORAGE-8010]` at the client boundary (the
- * wasm adapter re-codes the thrown exception). The fault is never swallowed: the
- * driver then poisons the affected context rather than believing a lost write
- * durably landed.
+ * wasm adapter re-codes the thrown exception). The interface only promises "on a
+ * LATER call": the fault surfaces on whichever `get`/`set`/`delete`/`listKeys`
+ * comes next, which need NOT belong to the same context whose write failed (the
+ * write-behind queue is a single cross-context chain). The fault is never
+ * swallowed — the driver treats the throw as a durable-write failure and fails
+ * closed (poisoning the context it is operating on) rather than believing a lost
+ * write landed.
  *
  * Restore fail-closed (corrupt / foreign / unreadable snapshot) is the DRIVER's
  * job (`SCP-STORAGE-8011/8012`) over the faithful bytes this adapter serves; a
