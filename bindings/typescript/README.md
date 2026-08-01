@@ -2,7 +2,7 @@
 
 > `@limn-works/scp-ts` -- Shared Context Protocol for TypeScript
 
-Cryptographic identity, encrypted contexts, capability-based auth, and outlet invocation for AI agents. Runs on Bun/Node via a native addon; in the browser, the SDK is a remote thin client.
+Cryptographic identity, encrypted contexts, capability-based auth, and outlet invocation for AI agents. Runs on Bun/Node via a native addon. In the browser, the full protocol runs in-tab via the sibling wasm tier [`@limn-works/scp-ts-wasm`](../typescript-wasm), keys on-device (ADR-057); a remote custodial thin client is now only an optional mode, not the definitive browser story.
 
 ## Install
 
@@ -45,7 +45,7 @@ await ctx.close();
 |--------|-----------|---------|
 | Server | napi-rs (native addon) | Bun >= 1.0, Node >= 22 |
 
-In the browser, the SDK operates as a remote thin client (the protocol engine runs server-side); there is no in-process browser engine.
+In the browser, the full SCP/MLS protocol runs **in-tab** with keys on-device via the sibling wasm tier [`@limn-works/scp-ts-wasm`](../typescript-wasm) (ADR-057, which amends ADR-055's earlier remote-thin-client model) — a capability subset of this package's surface. Running the protocol engine server-side and driving it from the browser as a remote custodial thin client remains available as an optional mode, but is no longer the only browser story. Browser developers should install `@limn-works/scp-ts-wasm`; install exactly one tier per environment.
 
 ## API Reference
 
