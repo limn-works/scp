@@ -1796,6 +1796,107 @@ class SCP internal constructor(
             ucanProofId = ucanProofId,
         )
 
+    /**
+     * Opens the §5.4.5 / §6.2.4 cross-context STREAMING outlet-invocation saga
+     * (SCP-OUT-047) and returns its [StreamingSagaHandle].
+     *
+     * The STREAMING sibling of [outletInvokeCrossContextSaga]. Where the unary
+     * saga BLOCKS until `Committed` and returns the result inline, this returns
+     * its chunk receiver PROMPTLY at the Commit-transition and reaches `Committed`
+     * ASYNCHRONOUSLY at seal-close (the ADR-049 §3a streaming wait-model
+     * amendment) — an LLM stream can exceed the unary bound, so the credit ceiling
+     * bounds chunk COUNT, not wall-clock.
+     *
+     * The returned handle exposes `suspend fun aggregate(): Aggregate` (the
+     * primary drain) and `fun asFlow(): Flow<OutletStreamChunk>` (the same shared
+     * drain); the streaming FFI ops are wrapped BEHIND it. This method performs no
+     * I/O and does not block — the saga opens LAZILY on the first
+     * [StreamingSagaHandle.aggregate] / [StreamingSagaHandle.asFlow] collection,
+     * where an open rejection (the §6.2.4 caller-principal binding, a typed
+     * [ScpException] `Saga*` terminal, or an input/UCAN rejection) surfaces, and
+     * the receiver is never handed out.
+     *
+     * There is NO live control plane (grantCredit / cancel) for the cross-context
+     * saga stream — per §6.2.5 / SCP-OUT-046 the credit window is fixed at open via
+     * [estimatedChunkCount] (cancel_ack_ceiling = u64::MAX). The `u64`/`u8` numeric
+     * bounds are enforced by [ULong]/[UByte] by construction, so all argument
+     * validation lives in the Rust core (mirroring the unary sibling).
+     *
+     * @param sourceHandle The calling (source) context handle.
+     * @param targetHandle The context holding the outlet to invoke.
+     * @param callerDid The invoking principal's DID (bound to the bridge principal).
+     * @param outletRegistrationId The target outlet's cross-context registration id.
+     * @param inputJson JSON-encoded outlet input.
+     * @param assertedNonceHex The asserted replay-protection nonce as hex.
+     * @param timestampMs The invocation timestamp in milliseconds.
+     * @param chainDepth Current cross-context chain depth (0 for first hop).
+     * @param ucanToken The invocation UCAN authorizing the outlet call.
+     * @param proofTokens Optional UCAN delegation-chain proof tokens.
+     * @param ucanProofId Optional id of the spending UCAN proof.
+     * @param timeoutMs Optional per-stream timeout in milliseconds.
+     * @param estimatedChunkCount Optional invoker-declared billable-chunk ceiling.
+     */
+    @Suppress("LongParameterList")
+    fun outletInvokeCrossContextStreamingSaga(
+        sourceHandle: ContextHandle,
+        targetHandle: ContextHandle,
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: ULong,
+        chainDepth: UByte,
+        ucanToken: String,
+        proofTokens: List<String>? = null,
+        ucanProofId: String? = null,
+        timeoutMs: UInt? = null,
+        estimatedChunkCount: UInt? = null,
+    ): StreamingSagaHandle =
+        StreamingSagaHandle(
+            native = ScpStreamingSagaNative(inner, sourceHandle, targetHandle),
+            params =
+                StreamingSagaOpenParams(
+                    callerDid = callerDid,
+                    outletRegistrationId = outletRegistrationId,
+                    inputJson = inputJson,
+                    assertedNonceHex = assertedNonceHex,
+                    timestampMs = timestampMs,
+                    chainDepth = chainDepth,
+                    ucanToken = ucanToken,
+                    proofTokens = proofTokens,
+                    ucanProofId = ucanProofId,
+                    timeoutMs = timeoutMs,
+                    estimatedChunkCount = estimatedChunkCount,
+                ),
+        )
+
+    /**
+     * Drives the key-bearing crash-recovery truncated-close for a cross-context
+     * streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+     *
+     * Forwards 1:1 to [NativeScp.outletStreamingSagaRecoverTruncatedClose] on
+     * [inner]. On FFI reconnect this authenticates the caller, surfaces the target
+     * context's Active Signing Key (resolved per-call from custody), and seals a
+     * witness-absent durable prefix to resolve the saga `Committed` — WITHOUT
+     * re-opening the stream or re-invoking the outlet executor.
+     *
+     * [callerDid] MUST be an identity hosted by this bridge instance (the §6.2.4
+     * channel-authenticated principal) AND the invoker pinned at open — recovery is
+     * money-moving, so a hosted-but-non-invoker caller is rejected with a typed
+     * `ScpException.Permission` (`SCP-PERM-3001`, the SAME invoker gate the
+     * same-context grant/cancel/terminate siblings enforce) BEFORE the signing key
+     * is resolved. An unknown [sagaId] or non-hosted [callerDid] surfaces
+     * `ScpException.Context`; a seal that cannot complete surfaces
+     * `ScpException.SagaNeedsRepair`.
+     *
+     * @param sagaId The durable supervisor-minted saga id to recover.
+     * @param callerDid The invoker DID (channel-authenticated, invoker-pinned).
+     */
+    suspend fun recoverStreamingSagaTruncatedClose(
+        sagaId: String,
+        callerDid: String,
+    ) = inner.outletStreamingSagaRecoverTruncatedClose(sagaId = sagaId, callerDid = callerDid)
+
     /** Forwards to [NativeScp.outletRegister] on [inner]. */
     suspend fun outletRegister(
         handle: ContextHandle,

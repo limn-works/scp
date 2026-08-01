@@ -21,6 +21,7 @@
 import {
   InvalidGrant,
   mapBridgeError,
+  mapSagaError,
   OutletError,
   ProtocolError,
   StreamAlreadyClosed,
@@ -748,5 +749,347 @@ export class Outlets {
       estimatedChunkCount: options.estimatedChunkCount,
     };
     return new InvocationHandle(this.#native, params);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-context STREAMING saga (§5.4.5 / §6.2.4, SCP-OUT-047)
+// ---------------------------------------------------------------------------
+//
+// The STREAMING sibling of the unary block-until-terminal
+// `scp.outletInvokeCrossContextSaga`. Per the ADR-049 §3a streaming wait-model
+// amendment, the streaming saga returns its chunk receiver PROMPTLY at the
+// Commit-transition (the caller consumes chunks as produced) and reaches
+// `Committed` ASYNCHRONOUSLY at seal-close — it MUST NOT block until the stream
+// terminates (an LLM stream can exceed the unary saga's ~95s bound; the credit
+// ceiling bounds chunk COUNT, not wall-clock). The NAPI open
+// (`outletStreamingSagaOpen`) returns a durable `sagaId` promptly, and the SDK
+// drives the stream by polling `outletStreamingSagaPollNext(sagaId)` behind
+// {@link StreamingSagaHandle} — modelled on the same-context
+// {@link InvocationHandle}.
+//
+// There is NO live control plane (grantCredit / cancel) for the cross-context
+// saga stream: per §6.2.5 / SCP-OUT-046 the cross-context stream runs with
+// `cancel_ack_ceiling = u64::MAX` (no live mid-stream OutletCancel channel). The
+// handle is therefore async-iterable + awaitable ONLY — the credit window is
+// fixed at open via `estimatedChunkCount`.
+
+/**
+ * The minimal native cross-context streaming-saga surface the
+ * {@link StreamingSagaHandle} dispatches through — the `outletStreamingSaga*`
+ * methods on the NAPI `SCP` addon (see `crates/scp-ffi/napi/src/scp.rs`).
+ * `outletStreamingSagaOpen` takes the two raw context handle objects plus the
+ * §6.2.4 saga argument set; `outletStreamingSagaPollNext` / `…RecoverTruncatedClose`
+ * take the durable bridge-minted `sagaId` string.
+ *
+ * @internal
+ */
+export interface StreamingSagaNative {
+  outletStreamingSagaOpen(
+    sourceHandle: unknown,
+    targetHandle: unknown,
+    callerDid: string,
+    outletRegistrationId: string,
+    inputJson: string,
+    assertedNonceHex: string,
+    timestampMs: bigint,
+    chainDepth: number,
+    ucanToken: string,
+    proofTokens?: readonly string[],
+    ucanProofId?: string,
+    timeoutMs?: number,
+    estimatedChunkCount?: number,
+  ): Promise<string>;
+  outletStreamingSagaPollNext(sagaId: string): Promise<Uint8Array | number[] | null>;
+  outletStreamingSagaRecoverTruncatedClose(sagaId: string, callerDid: string): Promise<void>;
+}
+
+/**
+ * Named options for {@link SCP.outletInvokeCrossContextStreamingSaga}.
+ *
+ * A single flat config object (agent-first API: no positional soup). TypeScript
+ * is positional-prone with TWO leading opaque handle arguments — an options
+ * object with distinct `sourceHandle` / `targetHandle` fields makes a silent
+ * caller/target handle-swap a NAMED-field mistake the reader can catch, not an
+ * invisible positional transposition (api-design directive, SCP-OUT-047).
+ */
+export interface StreamingSagaOptions {
+  /** The initiating (caller) context's raw bridge handle. */
+  readonly sourceHandle: unknown;
+  /** The executing (target) context's raw bridge handle hosting the outlet. */
+  readonly targetHandle: unknown;
+  /**
+   * The initiator DID, bound to this bridge instance's channel-authenticated
+   * principal (§6.2.4); must be a member of the `sourceHandle` context.
+   */
+  readonly callerDid: string;
+  /** The registration id of the outlet to invoke across the interface. */
+  readonly outletRegistrationId: string;
+  /** JSON-compatible outlet input (schema-checked target-side at open). */
+  readonly input: Readonly<Record<string, unknown>>;
+  /** The 16-byte §6.2.4 envelope nonce as 32 lowercase hex characters. */
+  readonly assertedNonceHex: string;
+  /** Caller-asserted send time (Unix ms) as a non-negative `bigint`. */
+  readonly timestampMs: bigint;
+  /** Caller-asserted inbound provenance depth; an integer in `0..255`. */
+  readonly chainDepth: number;
+  /** The invocation UCAN authorizing the outlet call (required). */
+  readonly ucanToken: string;
+  /** Optional UCAN delegation-chain proof tokens. */
+  readonly proofTokens?: readonly string[];
+  /** Optional id of the spending UCAN proof, resolved target-side at Prepare-B. */
+  readonly ucanProofId?: string;
+  /** Optional per-stream timeout in milliseconds. */
+  readonly timeoutMs?: number;
+  /**
+   * Optional invoker-declared upper bound on billable chunks — the fixed credit
+   * window (§6.2.5: there is no live grant plane for the cross-context stream).
+   */
+  readonly estimatedChunkCount?: number;
+}
+
+/**
+ * The immutable `outletStreamingSagaOpen` argument set, captured at
+ * {@link SCP.outletInvokeCrossContextStreamingSaga} and replayed on the (lazy)
+ * first open. Mirrors the NAPI open param order exactly.
+ *
+ * @internal
+ */
+interface StreamingSagaOpenParams {
+  readonly sourceHandle: unknown;
+  readonly targetHandle: unknown;
+  readonly callerDid: string;
+  readonly outletRegistrationId: string;
+  readonly input: Readonly<Record<string, unknown>>;
+  readonly assertedNonceHex: string;
+  readonly timestampMs: bigint;
+  readonly chainDepth: number;
+  readonly ucanToken: string;
+  readonly proofTokens: readonly string[] | undefined;
+  readonly ucanProofId: string | undefined;
+  readonly timeoutMs: number | undefined;
+  readonly estimatedChunkCount: number | undefined;
+}
+
+/**
+ * The async-iterable + awaitable handle for a §6.2.4 cross-context STREAMING
+ * saga (SCP-OUT-047), returned by
+ * {@link SCP.outletInvokeCrossContextStreamingSaga}.
+ *
+ * Modelled on the same-context {@link InvocationHandle}, minus the live control
+ * plane (there is no cross-context grantCredit / cancel — §6.2.5 / SCP-OUT-046).
+ * It is simultaneously:
+ *
+ * - **`AsyncIterable<OutletStreamChunk>`** — `for await (const chunk of handle)`
+ *   opens the saga on the first pull (`outletStreamingSagaOpen` returns the
+ *   durable `sagaId` PROMPTLY at the Commit-transition, NOT block-until-terminal),
+ *   then yields each {@link OutletStreamChunk} polled from
+ *   `outletStreamingSagaPollNext(sagaId)` up to and including the terminal.
+ *   Iteration stops on a terminal-flagged chunk (`End` / terminal `Error`) OR on
+ *   `null` (an abnormal sender-drop terminal).
+ * - **`PromiseLike<Aggregate>`** — `await handle` (equivalently
+ *   {@link StreamingSagaHandle.aggregate}) drains to the terminal and resolves the
+ *   {@link Aggregate} from the `End` chunk; a terminal `Error` chunk rejects with
+ *   the typed {@link OutletError} it carried.
+ *
+ * The saga is opened LAZILY — `outletInvokeCrossContextStreamingSaga` returns
+ * immediately without starting the saga; the open (which drives the saga to the
+ * Commit-transition and reserves escrow) happens on first iteration / `await`.
+ * An open rejection — the §6.2.4 caller-principal binding, a Prepare/Commit saga
+ * terminal, or an input/UCAN rejection — surfaces there as the matching typed SDK
+ * error ({@link SagaAbortedError} / {@link SagaBusyError} /
+ * {@link SagaNeedsRepairError} / {@link ValidationError} /
+ * {@link UcanPermissionError}), and the receiver is never handed out.
+ *
+ * A stream has a single consumer: draining it from two async contexts
+ * concurrently (two `for await` loops, or `await` racing iteration) rejects with
+ * {@link ProtocolError} on the second driver rather than silently splitting the
+ * chunk sequence.
+ *
+ * SDK-layer semantics are proven at this wrapper; the runtime-level
+ * billed-count / execute-exactly-once guarantees are proven Rust-side
+ * (SCP-OUT-047 runtime slice), not re-asserted here.
+ */
+export class StreamingSagaHandle
+  implements PromiseLike<Aggregate>, AsyncIterable<OutletStreamChunk>
+{
+  readonly #native: StreamingSagaNative;
+  readonly #params: StreamingSagaOpenParams;
+  /** The durable supervisor-minted saga id (doubles as the poll key); `null` until the lazy first open. */
+  #sagaId: string | null = null;
+  /** Memoized open, so concurrent first-touches open only one saga. */
+  #openPromise: Promise<string> | null = null;
+  /** Set once a terminal chunk is observed, or the sender drops without one. */
+  #closed = false;
+  /** In-flight re-entrancy guard: `true` while a `next()` poll is outstanding. */
+  #draining = false;
+  /** Captured terminal state, read back by `aggregate()`. */
+  #aggregate: Aggregate | null = null;
+  #error: OutletError | null = null;
+  /**
+   * §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk must
+   * carry. The bridge forwards A's operator-signed chunks VERBATIM over a
+   * lossless ordered channel (no re-sequencing), so a non-contiguous sequence is
+   * a {@link StreamGap} (defense-in-depth). There is NO live cancel plane, so the
+   * gap is a purely local terminal — the SDK does NOT sign a receiver cancel
+   * (unlike the same-context handle).
+   */
+  #expectedSequence = 0;
+
+  /** @internal Construct via {@link SCP.outletInvokeCrossContextStreamingSaga}, never directly. */
+  constructor(native: StreamingSagaNative, params: StreamingSagaOpenParams) {
+    this.#native = native;
+    this.#params = params;
+  }
+
+  /** The durable saga id, available once the saga has been opened (after the first iteration / `await`); `null` before. */
+  get sagaId(): string | null {
+    return this.#sagaId;
+  }
+
+  /** Open the saga exactly once (idempotent), returning the durable saga id. */
+  async #ensureOpen(): Promise<string> {
+    if (this.#sagaId !== null) {
+      return this.#sagaId;
+    }
+    if (this.#openPromise === null) {
+      this.#openPromise = this.#open();
+    }
+    return await this.#openPromise;
+  }
+
+  async #open(): Promise<string> {
+    const p = this.#params;
+    try {
+      const sagaId = await this.#native.outletStreamingSagaOpen(
+        p.sourceHandle,
+        p.targetHandle,
+        p.callerDid,
+        p.outletRegistrationId,
+        JSON.stringify(p.input),
+        p.assertedNonceHex,
+        p.timestampMs,
+        p.chainDepth,
+        p.ucanToken,
+        p.proofTokens,
+        p.ucanProofId,
+        p.timeoutMs,
+        p.estimatedChunkCount,
+      );
+      this.#sagaId = sagaId;
+      return sagaId;
+    } catch (cause) {
+      // Reset so a later await / iteration can retry the open rather than
+      // re-awaiting a memoized rejection. Open rejections — the §6.2.4
+      // caller-principal binding, a Prepare/Commit saga terminal, or an
+      // input/UCAN rejection — surface as the matching typed SDK error (saga
+      // terminals via mapSagaError, everything else via mapBridgeError). The
+      // receiver is NEVER handed out (#sagaId stays null).
+      this.#openPromise = null;
+      throw mapSagaError(cause);
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<OutletStreamChunk, undefined> {
+    return this;
+  }
+
+  async next(): Promise<IteratorResult<OutletStreamChunk, undefined>> {
+    if (this.#closed) {
+      return { done: true, value: undefined };
+    }
+    if (this.#draining) {
+      throw new ProtocolError(
+        "StreamingSagaHandle is already being drained by another consumer; a " +
+          "cross-context streaming saga has a single shared drain — do not iterate " +
+          "or await it from two async contexts concurrently",
+      );
+    }
+    this.#draining = true;
+    try {
+      const sagaId = await this.#ensureOpen();
+      let raw: Uint8Array | number[] | null;
+      try {
+        raw = await this.#native.outletStreamingSagaPollNext(sagaId);
+      } catch (cause) {
+        // A mid-drain bridge rejection (unknown / evicted saga_id, serialization
+        // fault) surfaces as the matching SDK type.
+        throw mapBridgeError(cause);
+      }
+      if (raw === null) {
+        // Abnormal terminal: the sender dropped without a terminal chunk.
+        this.#closed = true;
+        return { done: true, value: undefined };
+      }
+      const chunk = OutletStreamChunk._fromBridgeBytes(toBytes(raw));
+      if (chunk.sequence !== this.#expectedSequence) {
+        // §5.4.5 "Ordering and gaps": a non-contiguous sequence is a
+        // receiver-detected StreamGap. There is NO live cross-context cancel
+        // plane (§6.2.5 / SCP-OUT-046), so the gap is a purely local terminal —
+        // mark closed and throw WITHOUT yielding the offending chunk and WITHOUT
+        // a bridge cancel round-trip.
+        this.#closed = true;
+        const gap = new StreamGap(
+          `cross-context streaming-saga sequence gap: expected ${this.#expectedSequence}, ` +
+            `got ${chunk.sequence} (§5.4.5)`,
+        );
+        this.#error = gap;
+        throw gap;
+      }
+      this.#expectedSequence += 1;
+      if (chunk.isTerminal) {
+        // Terminal chunk closes the stream. Capture the terminal state for
+        // aggregate(), mark closed, then still YIELD the terminal chunk so an
+        // iterating consumer observes it.
+        this.#closed = true;
+        if (chunk.kind === "end") {
+          this.#aggregate = {
+            value: chunk.payload.aggregate,
+            provenance: asRecord(chunk.payload.provenance),
+            executionTimeMs: Number(chunk.payload.execution_time_ms ?? 0),
+          };
+        } else if (chunk.kind === "error") {
+          this.#error = new OutletError(
+            String(chunk.payload.message ?? "outlet stream error"),
+            String(chunk.payload.code ?? "SCP-OUTLET-6000"),
+          );
+        }
+      }
+      return { done: false, value: chunk };
+    } finally {
+      this.#draining = false;
+    }
+  }
+
+  // biome-ignore lint/suspicious/noThenProperty: StreamingSagaHandle is deliberately PromiseLike<Aggregate> — mirroring InvocationHandle, `await handle` is sugar over the primary `handle.aggregate()` verb.
+  then<TResult1 = Aggregate, TResult2 = never>(
+    onfulfilled?: ((value: Aggregate) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): Promise<TResult1 | TResult2> {
+    return this.aggregate().then(onfulfilled, onrejected);
+  }
+
+  /**
+   * Drain the saga stream to its terminal and resolve the {@link Aggregate}.
+   *
+   * Idempotent: if the stream has already been drained (by `await` or by full
+   * iteration), the captured `Aggregate` is returned without re-draining. A
+   * terminal `Error` chunk rejects with the typed {@link OutletError} it carried;
+   * a stream that ends without an `End` chunk rejects with {@link ProtocolError}.
+   */
+  async aggregate(): Promise<Aggregate> {
+    while (!this.#closed) {
+      const result = await this.next();
+      if (result.done === true) {
+        break;
+      }
+    }
+    if (this.#error !== null) {
+      throw this.#error;
+    }
+    if (this.#aggregate === null) {
+      throw new ProtocolError("cross-context streaming saga closed without an End chunk");
+    }
+    return this.#aggregate;
   }
 }

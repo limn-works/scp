@@ -71,13 +71,19 @@ export { Context } from "./context";
 // Outlets
 // ---------------------------------------------------------------------------
 
-export type { Aggregate, InvokeOptions } from "./outlets";
+export type {
+  Aggregate,
+  InvokeOptions,
+  StreamingSagaNative,
+  StreamingSagaOptions,
+} from "./outlets";
 export {
   Credit,
   defineOutletDefinition,
   InvocationHandle,
   OutletStreamChunk,
   Outlets,
+  StreamingSagaHandle,
 } from "./outlets";
 
 // ---------------------------------------------------------------------------

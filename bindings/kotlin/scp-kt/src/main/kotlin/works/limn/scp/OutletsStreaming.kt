@@ -42,8 +42,10 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
+import uniffi.scp.ContextHandle
 import uniffi.scp.ScpException
 import java.util.concurrent.atomic.AtomicBoolean
+import uniffi.scp.Scp as NativeScp
 
 // ---------------------------------------------------------------------------
 // Protocol-class exception hierarchy (mirrors the Python OutletError ->
@@ -595,4 +597,316 @@ public class InvocationHandle internal constructor(
     private suspend fun sendCancel(id: String) {
         native.outletStreamCancel(id, params.callerDid)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-context STREAMING saga (§5.4.5 / §6.2.4, SCP-OUT-047).
+// ---------------------------------------------------------------------------
+//
+// The STREAMING sibling of the unary block-until-terminal
+// [SCP.outletInvokeCrossContextSaga]. Per the ADR-049 §3a streaming wait-model
+// amendment, the streaming saga returns its chunk receiver PROMPTLY at the
+// Commit-transition (the caller consumes chunks as produced) and reaches
+// `Committed` ASYNCHRONOUSLY at seal-close — it MUST NOT block until the stream
+// terminates (an LLM stream can exceed the unary saga's ~95s bound; the credit
+// ceiling bounds chunk COUNT, not wall-clock). The UniFFI open
+// (`outletStreamingSagaOpen`) returns a durable `sagaId` promptly, and the SDK
+// drives the stream by polling `outletStreamingSagaPollNext(sagaId)` behind
+// [StreamingSagaHandle] — modelled on the same-context [InvocationHandle], MINUS
+// the live control plane (there is no cross-context grantCredit / cancel —
+// §6.2.5 / SCP-OUT-046, cancel_ack_ceiling = u64::MAX).
+//
+// This mirrors the CANONICAL Python reference `StreamingSagaHandle`
+// (bindings/python/scp_sdk/outlets.py). Runtime-level guarantees (billed-count /
+// execute-exactly-once) are proven Rust-side and are NOT re-asserted here.
+
+/**
+ * The minimal §6.2.4 cross-context streaming-saga FFI surface a
+ * [StreamingSagaHandle] drives.
+ *
+ * The production implementation ([ScpStreamingSagaNative]) forwards to the
+ * UniFFI-generated `Scp.outletStreamingSaga*` suspend methods on the owned
+ * opaque native object, capturing the source + target context handles at
+ * construction. Abstracting the seam here mirrors Python's duck-typed `_native`
+ * bridge: it lets the handle's iteration / aggregation / lifecycle logic be
+ * exercised against a scripted playback of §5.4.5 wire chunks without a built
+ * Rust cdylib (the LIVE wire path is covered by the Rust bridge's own test).
+ */
+public interface StreamingSagaNative {
+    /** Opens the saga, returning the durable `sagaId`. Rejections throw a typed [ScpException]. */
+    @Suppress("LongParameterList") // Flat §6.2.4 open envelope — agent-first named params.
+    public suspend fun outletStreamingSagaOpen(
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: ULong,
+        chainDepth: UByte,
+        ucanToken: String,
+        proofTokens: List<String>?,
+        ucanProofId: String?,
+        timeoutMs: UInt?,
+        estimatedChunkCount: UInt?,
+    ): String
+
+    /** Drains one chunk (JSON `OutletStreamChunk` bytes), or `null` at the terminal sentinel. */
+    public suspend fun outletStreamingSagaPollNext(sagaId: String): ByteArray?
+}
+
+/**
+ * The production [StreamingSagaNative] — forwards to the UniFFI-generated
+ * `Scp.outletStreamingSaga*` suspend methods on the owned opaque native object,
+ * capturing the co-resident source + target [ContextHandle] at construction.
+ */
+internal class ScpStreamingSagaNative(
+    private val inner: NativeScp,
+    private val sourceHandle: ContextHandle,
+    private val targetHandle: ContextHandle,
+) : StreamingSagaNative {
+    @Suppress("LongParameterList")
+    override suspend fun outletStreamingSagaOpen(
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: ULong,
+        chainDepth: UByte,
+        ucanToken: String,
+        proofTokens: List<String>?,
+        ucanProofId: String?,
+        timeoutMs: UInt?,
+        estimatedChunkCount: UInt?,
+    ): String =
+        inner.outletStreamingSagaOpen(
+            sourceHandle = sourceHandle,
+            targetHandle = targetHandle,
+            callerDid = callerDid,
+            outletRegistrationId = outletRegistrationId,
+            inputJson = inputJson,
+            assertedNonceHex = assertedNonceHex,
+            timestampMs = timestampMs,
+            chainDepth = chainDepth,
+            ucanToken = ucanToken,
+            proofTokens = proofTokens,
+            ucanProofId = ucanProofId,
+            timeoutMs = timeoutMs,
+            estimatedChunkCount = estimatedChunkCount,
+        )
+
+    override suspend fun outletStreamingSagaPollNext(sagaId: String): ByteArray? =
+        inner.outletStreamingSagaPollNext(sagaId = sagaId)
+}
+
+/**
+ * The immutable `outletStreamingSagaOpen` argument set, captured at
+ * [SCP.outletInvokeCrossContextStreamingSaga] and replayed on the (lazy) first
+ * open. Mirrors the FFI open param order.
+ */
+internal data class StreamingSagaOpenParams(
+    val callerDid: String,
+    val outletRegistrationId: String,
+    val inputJson: String,
+    val assertedNonceHex: String,
+    val timestampMs: ULong,
+    val chainDepth: UByte,
+    val ucanToken: String,
+    val proofTokens: List<String>?,
+    val ucanProofId: String?,
+    val timeoutMs: UInt?,
+    val estimatedChunkCount: UInt?,
+)
+
+/**
+ * The handle for a §6.2.4 cross-context STREAMING saga (SCP-OUT-047), returned by
+ * [SCP.outletInvokeCrossContextStreamingSaga].
+ *
+ * Modelled on the same-context [InvocationHandle], minus the live control plane
+ * (there is no cross-context grantCredit / cancel — §6.2.5 / SCP-OUT-046). Two
+ * drain surfaces, ONE shared single-consumer drain:
+ *
+ * - **[aggregate]** — the explicit PRIMARY drain verb. Opens the saga on first
+ *   touch (`outletStreamingSagaOpen` returns the durable `sagaId` PROMPTLY at the
+ *   Commit-transition, NOT block-until-terminal), drains to the terminal, and
+ *   returns the [Aggregate] from the `End` chunk. A terminal `Error` chunk raises
+ *   the typed [ScpException.Outlet] it carried; a stream that ends without an
+ *   `End` chunk raises [OutletProtocolException].
+ * - **[asFlow]** — a [Flow] backed by the SAME shared drain. Collecting emits
+ *   each [OutletStreamChunk] up to and including the terminal. It does NOT re-open
+ *   or re-drive the saga on each `collect`.
+ *
+ * The saga is opened LAZILY — [SCP.outletInvokeCrossContextStreamingSaga] returns
+ * immediately without starting the saga; the open happens on the first
+ * [aggregate] / [asFlow] collection. An open rejection — the §6.2.4
+ * caller-principal binding, a Prepare/Commit saga terminal (a typed
+ * [ScpException] `Saga*` case), or an input/UCAN rejection — surfaces there, and
+ * the receiver is never handed out (the `sagaId` stays `null`).
+ *
+ * Draining from two coroutines concurrently raises [OutletProtocolException] on
+ * the second driver rather than silently splitting the chunk sequence.
+ */
+public class StreamingSagaHandle internal constructor(
+    private val native: StreamingSagaNative,
+    private val params: StreamingSagaOpenParams,
+) {
+    private val openMutex = Mutex()
+
+    /** The durable supervisor-minted saga id (doubles as the poll key); `null` until the lazy first open. */
+    @Volatile
+    public var currentSagaId: String? = null
+        private set
+
+    /**
+     * `true` while a chunk drain is outstanding, so a second concurrent driver
+     * fails loud instead of stealing chunks from the shared single-consumer drain.
+     */
+    private val draining = AtomicBoolean(false)
+
+    /** Set once a terminal chunk is observed (or the sender drops without one). */
+    @Volatile
+    private var closed = false
+
+    /** Captured `End` terminal, read back by [aggregate]. */
+    @Volatile
+    private var aggregateResult: Aggregate? = null
+
+    /** Captured terminal `Error`, re-thrown by [aggregate]. */
+    @Volatile
+    private var terminalError: ScpException? = null
+
+    /** Captured [StreamGap] terminal, re-thrown by a re-[aggregate] after a gap. */
+    @Volatile
+    private var streamGapError: StreamGap? = null
+
+    /**
+     * §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk must
+     * carry. The bridge forwards A's operator-signed chunks VERBATIM over a
+     * lossless ordered channel (no re-sequencing), so a non-contiguous sequence is
+     * a [StreamGap] (defense-in-depth). There is NO live cancel plane, so the gap
+     * is a purely local terminal — the SDK does NOT sign a receiver cancel.
+     */
+    @Volatile
+    private var expectedSequence: Long = 0
+
+    /** Opens the saga exactly once (idempotent), returning the durable saga id. */
+    private suspend fun ensureOpen(): String {
+        currentSagaId?.let { return it }
+        openMutex.withLock {
+            currentSagaId?.let { return it }
+            val id =
+                native.outletStreamingSagaOpen(
+                    callerDid = params.callerDid,
+                    outletRegistrationId = params.outletRegistrationId,
+                    inputJson = params.inputJson,
+                    assertedNonceHex = params.assertedNonceHex,
+                    timestampMs = params.timestampMs,
+                    chainDepth = params.chainDepth,
+                    ucanToken = params.ucanToken,
+                    proofTokens = params.proofTokens,
+                    ucanProofId = params.ucanProofId,
+                    timeoutMs = params.timeoutMs,
+                    estimatedChunkCount = params.estimatedChunkCount,
+                )
+            currentSagaId = id
+            return id
+        }
+    }
+
+    /**
+     * The single shared drain step: returns the next chunk, or `null` at the
+     * terminal (channel-closed sentinel). Both [aggregate] and [asFlow] pull from
+     * HERE, so the executor's chunk sequence is drained exactly once.
+     */
+    private suspend fun nextChunk(): OutletStreamChunk? {
+        if (closed) {
+            return null
+        }
+        if (!draining.compareAndSet(false, true)) {
+            throw OutletProtocolException(
+                "StreamingSagaHandle is already being drained by another consumer; a cross-context " +
+                    "streaming saga has a single shared drain — do not collect or aggregate it from two " +
+                    "coroutines concurrently",
+            )
+        }
+        try {
+            val id = ensureOpen()
+            val raw = native.outletStreamingSagaPollNext(id)
+            if (raw == null) {
+                // Abnormal terminal: the sender dropped without a terminal chunk.
+                closed = true
+                return null
+            }
+            val chunk = OutletStreamChunk.fromBridgeBytes(raw)
+            if (chunk.sequence != expectedSequence) {
+                // §5.4.5 "Ordering and gaps": a non-contiguous sequence is a
+                // receiver-detected StreamGap. There is NO live cross-context
+                // cancel plane (§6.2.5 / SCP-OUT-046), so the gap is a purely
+                // local terminal — mark closed and throw WITHOUT returning the
+                // offending chunk and WITHOUT a bridge cancel round-trip.
+                closed = true
+                val gap =
+                    StreamGap(
+                        "cross-context streaming-saga sequence gap: expected $expectedSequence, " +
+                            "got ${chunk.sequence} (§5.4.5)",
+                    )
+                streamGapError = gap
+                throw gap
+            }
+            expectedSequence += 1
+            if (chunk.isTerminal) {
+                // Capture the terminal state for aggregate(), mark closed, then
+                // still return the terminal chunk so a collector observes it.
+                closed = true
+                when (chunk.kind) {
+                    "end" -> aggregateResult = Aggregate.fromEndPayload(chunk.payload)
+                    "error" ->
+                        terminalError =
+                            ScpException.Outlet(
+                                msg = chunk.payload["message"]?.jsonPrimitive?.contentOrNull ?: "outlet stream error",
+                                code = chunk.payload["code"]?.jsonPrimitive?.contentOrNull ?: "SCP-OUTLET-6000",
+                            )
+                }
+            }
+            return chunk
+        } finally {
+            draining.set(false)
+        }
+    }
+
+    /**
+     * Drains the saga stream to its terminal and returns the [Aggregate] (§5.4.5
+     * `End`). This is the PRIMARY drain verb (Kotlin is not awaitable).
+     *
+     * Idempotent: if the stream has already been drained (by [asFlow] or a prior
+     * [aggregate]), the captured [Aggregate] is returned without re-draining. A
+     * terminal `Error` chunk raises the typed [ScpException.Outlet] it carried; a
+     * stream that ends without an `End` chunk raises [OutletProtocolException].
+     */
+    public suspend fun aggregate(): Aggregate {
+        while (!closed) {
+            if (nextChunk() == null) {
+                break
+            }
+        }
+        // A gap terminal takes priority over a bridge Error terminal; either is
+        // re-thrown here on a re-aggregate (a single throw keeps ThrowsCount≤2).
+        (streamGapError ?: terminalError)?.let { throw it }
+        return aggregateResult
+            ?: throw OutletProtocolException("cross-context streaming saga closed without an End chunk")
+    }
+
+    /**
+     * A [Flow] over the saga stream's chunks, backed by the SINGLE SHARED DRAIN.
+     *
+     * Collecting pulls from the one shared drain cursor via [nextChunk]: it does
+     * NOT re-open or re-drive the saga. Once the shared drain reaches its terminal,
+     * a subsequent `collect` emits nothing, and a second CONCURRENT collector
+     * raises [OutletProtocolException] on its first pull.
+     */
+    public fun asFlow(): Flow<OutletStreamChunk> =
+        flow {
+            while (true) {
+                val chunk = nextChunk() ?: break
+                emit(chunk)
+            }
+        }
 }
