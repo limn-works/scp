@@ -1856,15 +1856,15 @@ class SCP:
 
         Args:
             i_trust_all_commands: Must be ``True`` to confirm the security
-                bypass. Raises ``ValidationError`` if ``False``.
+                bypass. Raises ``McpError`` if ``False``.
 
         Raises:
-            ValidationError: If *i_trust_all_commands* is not ``True``.
+            McpError: If *i_trust_all_commands* is not ``True``.
         """
-        from scp_sdk.errors import ValidationError
+        from scp_sdk.errors import McpError
 
         if not i_trust_all_commands:
-            raise ValidationError(
+            raise McpError(
                 "You must pass i_trust_all_commands=True to disable the "
                 "stdio allowlist. This allows arbitrary command execution.",
                 code="SCP-MCP-10007",

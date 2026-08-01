@@ -14,7 +14,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, TypedDict
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import EconomyError, ScpError
 
 if TYPE_CHECKING:
     from scp_sdk.scp import SCP
@@ -120,12 +120,12 @@ _KNOWN_CURRENCY_DECIMALS: dict[str, int] = {
 
 def _format_with_decimals(amount: int, decimals: int) -> str:
     if amount < 0:
-        raise ScpError(
+        raise EconomyError(
             f"amount must be non-negative, got {amount}",
             code="SCP-ECON-12070",
         )
     if decimals < 0 or decimals > 100:
-        raise ScpError(
+        raise EconomyError(
             f"decimals must be in 0..=100, got {decimals}",
             code="SCP-ECON-12070",
         )
@@ -172,7 +172,7 @@ def format_amount(
             if ``amount``/``decimals`` are out of range.
     """
     if (currency is None) == (decimals is None):
-        raise ScpError(
+        raise EconomyError(
             "exactly one of 'currency' or 'decimals' must be supplied",
             code="SCP-ECON-12070",
         )
@@ -181,7 +181,7 @@ def format_amount(
     assert currency is not None  # narrowed by the exclusivity check above
     known = _KNOWN_CURRENCY_DECIMALS.get(currency.upper())
     if known is None:
-        raise ScpError(
+        raise EconomyError(
             f"unknown currency {currency!r} has no known decimals; "
             "pass an explicit decimals= override",
             code="SCP-ECON-12070",
