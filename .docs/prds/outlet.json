@@ -3102,7 +3102,7 @@
       "gate": "gate-streaming-saga",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/outlet_stream.rs",
         "crates/scp-ffi/napi/src/outlet_stream.rs",

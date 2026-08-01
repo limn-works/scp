@@ -619,6 +619,23 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["outletInvokeCrossContextSaga"],
         "swift": ["outletInvokeCrossContextSaga"],
     },
+    # Streaming cross-context saga (SCP-OUT-047): the open verb wraps the
+    # bridge outlet_streaming_saga_open behind a StreamingSagaHandle. Swift
+    # exposes it as a Context extension method (invokeOutletCrossContextStreamingSaga).
+    ("Outlets", "invoke_cross_context_streaming_saga"): {
+        "python": ["outlet_invoke_cross_context_streaming_saga"],
+        "typescript": ["outletInvokeCrossContextStreamingSaga"],
+        "kotlin": ["outletInvokeCrossContextStreamingSaga"],
+        "swift": ["invokeOutletCrossContextStreamingSaga"],
+    },
+    # Streaming cross-context saga FFI-reconnect key-bearing recovery driver
+    # (SCP-OUT-047): all four SDKs expose the bare recover verb name.
+    ("Outlets", "recover_streaming_saga_truncated_close"): {
+        "python": ["recover_streaming_saga_truncated_close"],
+        "typescript": ["recoverStreamingSagaTruncatedClose"],
+        "kotlin": ["recoverStreamingSagaTruncatedClose"],
+        "swift": ["recoverStreamingSagaTruncatedClose"],
+    },
     ("Outlets", "session_create"): {
         "python": ["outlet_session_create"],
         "typescript": ["outletSessionCreate"],

@@ -603,6 +603,22 @@
           "notes": "The §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a). Exported by all three native bridges — PyO3 outlet_invoke_cross_context_saga, UniFFI outlet_invoke_cross_context_saga, NAPI outletInvokeCrossContextSaga (js_name); see scripts/bridge-aliases.json (category outlets). Each export binds the caller principal to the authenticated FFI identity (enforce_caller_principal_binding) before dispatching to Supervisor::start_cross_context_outlet_invocation_saga, pinned by the pyo3/napi/uniffi saga-export assertions in pipeline_wiring.rs. All four SDK wrappers are live: Python (SCP.outlet_invoke_cross_context_saga), TypeScript (SCP.outletInvokeCrossContextSaga), Swift (Context.invokeOutletCrossContextSaga), and Kotlin (SCP.outletInvokeCrossContextSaga / OutletBridge.invokeCrossContextSaga)."
         },
         {
+          "name": "invoke_cross_context_streaming_saga",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "The §6.2.5 STREAMING cross-context outlet-invocation saga (ADR-049 §3a streaming wait-model amendment + ADR-061 seal phase, SCP-OUT-047) — DISTINCT from the unary invoke_cross_context_saga above: the streaming surface does NOT block-until-Committed. The open mints a durable saga_id PROMPTLY at the Commit-transition and the SDK drives chunks behind a StreamingSagaHandle by polling the bridge outlet_streaming_saga_poll_next; the saga reaches Committed ASYNCHRONOUSLY at seal-close (terminal on the channel + durable journal, not a saga_state poll). Exported by all three native bridges — PyO3 outlet_streaming_saga_open (+ outlet_streaming_saga_poll_next), UniFFI outlet_streaming_saga_open (+ outlet_streaming_saga_poll_next), NAPI outletStreamingSagaOpen (+ outletStreamingSagaPollNext) js_name; see scripts/bridge-aliases.json (canonical outlet_streaming_saga_open / outlet_streaming_saga_poll_next). Each open binds caller_did to the authenticated FFI principal/channel (the §3a forward obligation) BEFORE handing out the receiver, dispatching to Supervisor::start_cross_context_streaming_outlet_invocation_saga, pinned by out047_pyo3_streaming_saga_open_binds_caller_and_reaches_start_saga in pipeline_wiring.rs. All four SDK wrappers are live: Python (SCP.outlet_invoke_cross_context_streaming_saga → StreamingSagaHandle), TypeScript (SCP.outletInvokeCrossContextStreamingSaga), Swift (Context.invokeOutletCrossContextStreamingSaga), and Kotlin (SCP.outletInvokeCrossContextStreamingSaga). WASM (scp-client-wasm) is NODE-DELEGATED per the ADR-057 scope fence — it does NOT host the saga pump/open/poll (that is SCP-OUT-048); WASM's streaming-saga surface is invoker-side pure predicates only (outlet_stream_compute_caveats_binding / outlet_stream_verify_chunk_signature, BrowserParticipant domain)."
+        },
+        {
+          "name": "recover_streaming_saga_truncated_close",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "The FFI-reconnect KEY-BEARING crash-recovery driver for a witness-ABSENT truncated streaming-saga prefix (SCP-OUT-046 #136 / SCP-OUT-047, ADR-049 §3a). On reconnect the export authenticates the caller (invoker gate — caller_did must equal the saga's pinned invoker_did, else SCP-PERM-3001), surfaces the target's Active Signing Key per-call from custody (never envelope-asserted, per the §3a forward obligation), and dispatches to Supervisor::recover_streaming_saga_truncated_close via the shared drive_recover_truncated_close helper — pinned by out047_pyo3_streaming_saga_recover_reaches_truncated_close in pipeline_wiring.rs. Exported by all three native bridges — PyO3 outlet_streaming_saga_recover_truncated_close, UniFFI outlet_streaming_saga_recover_truncated_close, NAPI outletStreamingSagaRecoverTruncatedClose (js_name); see scripts/bridge-aliases.json. All four SDK wrappers are live: Python (SCP.recover_streaming_saga_truncated_close), TypeScript (SCP.recoverStreamingSagaTruncatedClose), Swift (Context.recoverStreamingSagaTruncatedClose), and Kotlin (SCP.recoverStreamingSagaTruncatedClose). WASM (scp-client-wasm) is NODE-DELEGATED per the ADR-057 scope fence — it does NOT host the key-bearing recovery driver (SCP-OUT-048)."
+        },
+        {
           "name": "session_create",
           "python": true,
           "typescript": true,
