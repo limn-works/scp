@@ -364,22 +364,6 @@ impl NapiContextHandle {
             instance_id,
         }
     }
-
-    /// Test-only: forces the handle's lifecycle state, so tests can exercise the
-    /// non-active-context rejection guards (e.g. the cross-context streaming-saga
-    /// open's `OUTLET_6010` / `OUTLET_6011` gate) without driving a real
-    /// close/expiry. Does NOT touch the core handle. Gated on
-    /// `allow_in_memory_custody` — its sole caller, the
-    /// `xctx_streaming_saga_tests` module, carries the same gate.
-    #[cfg(feature = "allow_in_memory_custody")]
-    pub(crate) fn set_state_for_test(&self, state: ContextState) {
-        // A poisoned lock in a test means a prior test panic already failed the
-        // run; best-effort set (no `expect`/`unwrap`, matching the crate's
-        // fail-soft lock idiom) keeps `clippy::expect_used` green.
-        if let Ok(mut guard) = self.state.lock() {
-            *guard = state;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

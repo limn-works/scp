@@ -978,15 +978,67 @@ mod xctx_streaming_saga_tests {
         );
     }
 
+    /// A close-capable streaming ceiling: identical to [`STREAMING_CEILING`] but
+    /// also grants `context:close`, so the creator can drive the context to a REAL
+    /// non-active lifecycle state through the supervisor close path.
+    const CLOSEABLE_STREAMING_CEILING: &[&str] = &[
+        "context:close",
+        "outlet:call:*",
+        "messages:read",
+        "messages:write",
+        "governance:propose",
+    ];
+
+    /// Drives `context_id` to a real non-active (`Closed`) lifecycle state through
+    /// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
+    /// dispatch the bridge's close uses — so a subsequent
+    /// `supervisor.read_context_state(context_id)` returns a non-`Active` state.
+    /// That authoritative state (NOT the bridge-cached `ContextHandle::state`) is
+    /// what the streaming-saga open's active-state guard now reads. `initiator_did`
+    /// must be the creator of a context created with a `ContextClose`-bearing
+    /// ceiling (see [`CLOSEABLE_STREAMING_CEILING`]).
+    async fn drive_context_closed(
+        bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+        context_id: &str,
+        initiator_did: &str,
+    ) {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+
+        let supervisor = Arc::clone(
+            bi.context_manager_or_error()
+                .expect("supervisor should be attached"),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: context_id.to_owned(),
+                params: scp_core::context::ContextParams::default(),
+                initiator_did: scp_did::DID(initiator_did.to_owned()),
+            }),
+            reply: tx,
+        };
+        supervisor
+            .dispatch_lifecycle_command(cmd)
+            .await
+            .expect("close dispatch should succeed");
+        rx.await
+            .expect("close reply channel should not drop")
+            .expect("close should succeed");
+    }
+
     /// (LIFECYCLE) A money-moving streaming-saga OPEN against a NON-active source
     /// or target context is rejected with `OUTLET_6010` (caller) / `OUTLET_6011`
     /// (target) — parity with the UNARY cross-context saga export's two-handle
     /// guard and the NAPI streaming open — BEFORE any input validation, UCAN
     /// check, or saga drive, so no saga is started and no receiver is handed out.
+    ///
+    /// The context is driven to a REAL `Closed` state through the actual
+    /// supervisor close path; the guard reads the AUTHORITATIVE actor state via
+    /// `read_context_state` (NOT the lagging FFI `ContextHandle::state` cache), so
+    /// this genuinely exercises the authoritative read that closes the
+    /// Closing-cache money gap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_saga_open_rejects_non_active_context() {
-        use crate::bridge::ContextState;
-
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = Arc::clone(&scp.inner);
         let _resolver = install_seedable_resolver(&bi);
@@ -996,20 +1048,6 @@ mod xctx_streaming_saga_tests {
             .await
             .expect("identity_create (creator) should succeed");
         let hosted_caller = creator_identity.did.clone();
-        let handle_a = scp
-            .context_create(
-                Arc::clone(&creator_identity),
-                streaming_context_params(STREAMING_CEILING),
-            )
-            .await
-            .expect("context_create (caller) should succeed");
-        let handle_b = scp
-            .context_create(
-                Arc::clone(&creator_identity),
-                streaming_context_params(STREAMING_CEILING),
-            )
-            .await
-            .expect("context_create (target) should succeed");
         let outlet_id =
             scp_ffi_common::outlet_id::generate_outlet_id("xctx_streaming_non_active_probe");
 
@@ -1024,7 +1062,36 @@ mod xctx_streaming_saga_tests {
         };
 
         // --- source (caller) context non-active → OUTLET_6010 ---------------
-        *handle_a.state.lock().await = ContextState::Closing;
+        // Drive the CALLER context to a REAL Closed state through the supervisor;
+        // the authoritative guard must reject it.
+        let handle_a = scp
+            .context_create(
+                Arc::clone(&creator_identity),
+                streaming_context_params(CLOSEABLE_STREAMING_CEILING),
+            )
+            .await
+            .expect("context_create (caller) should succeed");
+        let handle_b = scp
+            .context_create(
+                Arc::clone(&creator_identity),
+                streaming_context_params(CLOSEABLE_STREAMING_CEILING),
+            )
+            .await
+            .expect("context_create (target) should succeed");
+        drive_context_closed(&bi, &handle_a.context_id(), &hosted_caller).await;
+
+        // Precondition: the authoritative supervisor state is non-active — this is
+        // what the guard reads, proving the test drives a REAL Closing/Closed
+        // context, not the FFI cache.
+        assert_ne!(
+            bi.context_manager_or_error()
+                .expect("supervisor")
+                .read_context_state(&handle_a.context_id())
+                .await,
+            Some(scp_core::context::ContextState::Active),
+            "the caller context must be authoritatively non-active before the open"
+        );
+
         let (caller, outlet, input, nonce, ucan) =
             open_args(hosted_caller.clone(), outlet_id.clone());
         let err = outlet_streaming_saga_open_impl(
@@ -1056,13 +1123,28 @@ mod xctx_streaming_saga_tests {
         );
 
         // --- source active, target context non-active → OUTLET_6011 ---------
-        *handle_a.state.lock().await = ContextState::Active;
-        *handle_b.state.lock().await = ContextState::Expired;
+        // Fresh caller (still authoritatively active); close only the TARGET.
+        let handle_c = scp
+            .context_create(
+                Arc::clone(&creator_identity),
+                streaming_context_params(CLOSEABLE_STREAMING_CEILING),
+            )
+            .await
+            .expect("context_create (caller 2) should succeed");
+        let handle_d = scp
+            .context_create(
+                Arc::clone(&creator_identity),
+                streaming_context_params(CLOSEABLE_STREAMING_CEILING),
+            )
+            .await
+            .expect("context_create (target 2) should succeed");
+        drive_context_closed(&bi, &handle_d.context_id(), &hosted_caller).await;
+
         let (caller, outlet, input, nonce, ucan) = open_args(hosted_caller, outlet_id);
         let err = outlet_streaming_saga_open_impl(
             &bi,
-            &handle_a,
-            &handle_b,
+            &handle_c,
+            &handle_d,
             caller,
             outlet,
             input,

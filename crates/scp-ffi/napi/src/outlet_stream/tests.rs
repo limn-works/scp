@@ -1317,15 +1317,82 @@ mod xctx_streaming_saga_tests {
         );
     }
 
+    /// Creates a saga context whose CREATOR holds the `ContextClose` capability
+    /// (ceiling includes `context:close`), so the test can drive it to a REAL
+    /// non-active lifecycle state through the actual supervisor close path — NOT
+    /// the stale FFI state cache. Otherwise identical to `create_saga_context`.
+    async fn create_closeable_saga_context(
+        bi: &std::sync::Arc<NapiBridgeInstance>,
+        owner_identity: &crate::identity::NapiIdentity,
+    ) -> NapiContextHandle {
+        let params = serde_json::json!({
+            "ceiling": [
+                "context:close",
+                "governance:propose",
+                "outlet:interface",
+                "outlet:register",
+                "outlet:call:*",
+                "messages:read",
+                "messages:write"
+            ],
+            "governance": "single_admin",
+            "memoryScope": "ephemeral",
+        })
+        .to_string();
+        crate::context::context_create_on(bi, owner_identity, params)
+            .await
+            .expect("context_create should succeed")
+    }
+
+    /// Drives `context_id` to a real non-active (`Closed`) lifecycle state through
+    /// the REAL supervisor close path — the exact `LifecycleCommand::CloseContext`
+    /// dispatch the bridge's close uses — so a subsequent
+    /// `supervisor.read_context_state(context_id)` returns a non-`Active` state.
+    /// That authoritative state (NOT the bridge-cached handle state) is what the
+    /// streaming-saga open's active-state guard now reads. `initiator_did` must be
+    /// the creator of a context created with a `ContextClose`-bearing ceiling (see
+    /// `create_closeable_saga_context`).
+    async fn drive_context_closed(
+        bi: &std::sync::Arc<NapiBridgeInstance>,
+        context_id: &str,
+        initiator_did: &str,
+    ) {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+
+        let supervisor = crate::runtime::supervisor(bi)
+            .expect("supervisor should be attached")
+            .clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: context_id.to_owned(),
+                params: scp_core::context::ContextParams::default(),
+                initiator_did: scp_did::DID(initiator_did.to_owned()),
+            }),
+            reply: tx,
+        };
+        supervisor
+            .dispatch_lifecycle_command(cmd)
+            .await
+            .expect("close dispatch should succeed");
+        rx.await
+            .expect("close reply channel should not drop")
+            .expect("close should succeed");
+    }
+
     /// (LIFECYCLE) A money-moving streaming-saga OPEN against a NON-active source
     /// or target context is rejected with `OUTLET_6010` (caller) / `OUTLET_6011`
     /// (target) — parity with the UNARY cross-context saga export's two-handle
     /// guard — BEFORE any input validation, UCAN check, or saga drive, so no saga
     /// is started and no receiver is handed out.
+    ///
+    /// The context is driven to a REAL `Closed` state through the actual
+    /// supervisor close path; the guard reads the AUTHORITATIVE actor state via
+    /// `read_context_state` (NOT the lagging FFI `NapiContextHandle::state()`
+    /// cache), so this genuinely exercises the authoritative read that closes the
+    /// Closing-cache money gap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn xctx_streaming_saga_open_rejects_non_active_context() {
-        use scp_core::context::ContextState;
-
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let bi = std::sync::Arc::clone(&scp.inner);
 
@@ -1334,14 +1401,28 @@ mod xctx_streaming_saga_tests {
             .await
             .expect("identity_create should succeed");
         let hosted_caller = owner_identity.inner.did.clone();
-
-        let handle_a = create_saga_context(&bi, &owner_identity).await;
-        let handle_b = create_saga_context(&bi, &owner_identity).await;
         let outlet_id =
             scp_ffi_common::outlet_id::generate_outlet_id("xctx_streaming_non_active_probe");
 
         // --- source (caller) context non-active → OUTLET_6010 ---------------
-        handle_a.set_state_for_test(ContextState::Closing);
+        // Drive the CALLER context to a REAL Closed state through the supervisor;
+        // the authoritative guard must reject it.
+        let handle_a = create_closeable_saga_context(&bi, &owner_identity).await;
+        let handle_b = create_closeable_saga_context(&bi, &owner_identity).await;
+        drive_context_closed(&bi, &handle_a.context_id(), &hosted_caller).await;
+
+        // Precondition: the authoritative supervisor state is non-active. This is
+        // what the guard reads — proving the test drives a REAL Closing/Closed
+        // context, not the FFI cache.
+        assert_ne!(
+            crate::runtime::supervisor(&bi)
+                .expect("supervisor")
+                .read_context_state(&handle_a.context_id())
+                .await,
+            Some(scp_core::context::ContextState::Active),
+            "the caller context must be authoritatively non-active before the open"
+        );
+
         let err = Box::pin(outlet_streaming_saga_open_on(
             &bi,
             &handle_a,
@@ -1371,12 +1452,16 @@ mod xctx_streaming_saga_tests {
         );
 
         // --- source active, target context non-active → OUTLET_6011 ---------
-        handle_a.set_state_for_test(ContextState::Active);
-        handle_b.set_state_for_test(ContextState::Expired);
+        // Fresh caller (still authoritatively active); close only the TARGET so
+        // only the target axis is non-active.
+        let handle_c = create_closeable_saga_context(&bi, &owner_identity).await;
+        let handle_d = create_closeable_saga_context(&bi, &owner_identity).await;
+        drive_context_closed(&bi, &handle_d.context_id(), &hosted_caller).await;
+
         let err = Box::pin(outlet_streaming_saga_open_on(
             &bi,
-            &handle_a,
-            &handle_b,
+            &handle_c,
+            &handle_d,
             hosted_caller,
             outlet_id,
             r#"{"a":"x","b":"y"}"#.to_owned(),
