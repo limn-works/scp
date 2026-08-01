@@ -741,8 +741,11 @@ internal data class StreamingSagaOpenParams(
  * [ScpException] `Saga*` case), or an input/UCAN rejection — surfaces there, and
  * the receiver is never handed out (the `sagaId` stays `null`).
  *
- * Draining from two coroutines concurrently raises [OutletProtocolException] on
- * the second driver rather than silently splitting the chunk sequence.
+ * The handle is single-consumer: a concurrent second drive is DETECTED and
+ * rejected on the common path (the `draining` guard is held across the poll)
+ * with [OutletProtocolException]. Callers MUST NOT share a handle across
+ * coroutines — the guard is released between chunks, so this reliably catches the
+ * common concurrent-drive footgun but is not a hard concurrency barrier.
  */
 public class StreamingSagaHandle internal constructor(
     private val native: StreamingSagaNative,
@@ -752,7 +755,7 @@ public class StreamingSagaHandle internal constructor(
 
     /** The durable supervisor-minted saga id (doubles as the poll key); `null` until the lazy first open. */
     @Volatile
-    public var currentSagaId: String? = null
+    public var sagaId: String? = null
         private set
 
     /**
@@ -789,9 +792,9 @@ public class StreamingSagaHandle internal constructor(
 
     /** Opens the saga exactly once (idempotent), returning the durable saga id. */
     private suspend fun ensureOpen(): String {
-        currentSagaId?.let { return it }
+        sagaId?.let { return it }
         openMutex.withLock {
-            currentSagaId?.let { return it }
+            sagaId?.let { return it }
             val id =
                 native.outletStreamingSagaOpen(
                     callerDid = params.callerDid,
@@ -806,7 +809,7 @@ public class StreamingSagaHandle internal constructor(
                     timeoutMs = params.timeoutMs,
                     estimatedChunkCount = params.estimatedChunkCount,
                 )
-            currentSagaId = id
+            sagaId = id
             return id
         }
     }

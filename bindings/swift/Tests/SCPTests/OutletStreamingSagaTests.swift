@@ -85,7 +85,7 @@ final class OutletStreamingSagaTests: XCTestCase {
         // Constructing the handle must not open the saga.
         let openCalls = await native.openCalls
         XCTAssertEqual(openCalls, 0)
-        let sagaId = await handle.currentSagaId
+        let sagaId = await handle.sagaId
         XCTAssertNil(sagaId)
     }
 
@@ -104,7 +104,7 @@ final class OutletStreamingSagaTests: XCTestCase {
         XCTAssertEqual(kinds, ["data", "data", "end"])
         let openCalls = await native.openCalls
         XCTAssertEqual(openCalls, 1) // Opened exactly once for the whole drain.
-        let sagaId = await handle.currentSagaId
+        let sagaId = await handle.sagaId
         XCTAssertEqual(sagaId, "saga-1")
     }
 
@@ -172,7 +172,7 @@ final class OutletStreamingSagaTests: XCTestCase {
             XCTAssertEqual(code, "SCP-SAGA-13050")
         }
         // The receiver is never handed out — the saga id stays nil.
-        let sagaId = await handle.currentSagaId
+        let sagaId = await handle.sagaId
         XCTAssertNil(sagaId)
     }
 

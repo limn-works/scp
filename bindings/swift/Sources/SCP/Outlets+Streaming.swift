@@ -933,17 +933,22 @@ struct StreamingSagaOpenParams {
 /// terminal (surfaced as the generated ``ScpError`` saga case), or an input/UCAN
 /// rejection — surfaces there, and the receiver is never handed out.
 ///
-/// A stream has a single consumer: draining it from two tasks concurrently throws
-/// ``OutletError/protocolViolation(msg:code:)`` on the second driver. The handle
-/// is an `actor`, so the shared drain is serialized and the terminal cache is
-/// race-free.
+/// The handle is single-consumer: a concurrent second drive is DETECTED and
+/// rejected on the common path (the `draining` guard is held across the poll
+/// await) with ``OutletError/protocolViolation(msg:code:)``. Callers MUST NOT
+/// share a handle across tasks — the guard is released between chunks, so this
+/// reliably catches the common concurrent-drive footgun but is not a hard
+/// concurrency barrier. The handle is an `actor`, so each drain step and the
+/// terminal cache are race-free.
 public actor StreamingSagaHandle {
     private let bridge: any StreamingSagaNative
     private let params: StreamingSagaOpenParams
 
     /// Memoized durable saga id, set once the saga is opened. Doubles as the
-    /// poll key. `nil` until the (lazy) first open.
-    private var sagaId: String?
+    /// poll key. `nil` until the (lazy) first open. Private storage behind the
+    /// public ``sagaId`` accessor (the distinct name avoids the actor
+    /// stored-vs-computed property name collision).
+    private var sagaIdStorage: String?
     /// Memoizes the in-flight open so concurrent first-touches open only one saga.
     private var openTask: Task<String, Error>?
     /// Set once a terminal chunk (End / terminal Error) is observed, or the
@@ -972,14 +977,14 @@ public actor StreamingSagaHandle {
 
     /// The durable supervisor-minted saga id, available once the saga has been
     /// opened (after the first iteration / ``aggregate()``); `nil` before.
-    public var currentSagaId: String? {
-        sagaId
+    public var sagaId: String? {
+        sagaIdStorage
     }
 
     /// Opens the saga exactly once (idempotent), returning the durable saga id.
     private func ensureOpen() async throws -> String {
-        if let sagaId {
-            return sagaId
+        if let sagaIdStorage {
+            return sagaIdStorage
         }
         if let openTask {
             return try await openTask.value
@@ -1005,13 +1010,13 @@ public actor StreamingSagaHandle {
         openTask = task
         do {
             let id = try await task.value
-            sagaId = id
+            sagaIdStorage = id
             return id
         } catch {
             // Clear the memoized task so a later call can retry the open; the
             // rejection (caller-principal binding, saga terminal, UCAN denial)
             // surfaces to this caller unchanged, and the receiver is never handed
-            // out (`sagaId` stays nil).
+            // out (`sagaIdStorage` stays nil).
             openTask = nil
             throw error
         }

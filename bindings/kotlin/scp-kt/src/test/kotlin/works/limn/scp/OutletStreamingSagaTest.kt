@@ -206,7 +206,7 @@ class StreamingSagaHandleTest {
             val native = FakeSagaNative(listOf(sagaEndChunk(0, sagaObj("n", 1))))
             val handle = sagaHandle(native)
             assertEquals(0, native.openCalls)
-            assertNull(handle.currentSagaId)
+            assertNull(handle.sagaId)
         }
 
     @Test
@@ -224,7 +224,7 @@ class StreamingSagaHandleTest {
             val kinds = handle.asFlow().toList().map { it.kind }
             assertEquals(listOf("data", "data", "end"), kinds)
             assertEquals(1, native.openCalls) // opened once for the whole drain
-            assertEquals("saga-1", handle.currentSagaId)
+            assertEquals("saga-1", handle.sagaId)
         }
 
     @Test
@@ -287,7 +287,7 @@ class StreamingSagaHandleTest {
             val handle = sagaHandle(native)
             val ex = assertFailsWith<ScpException.SagaAborted> { handle.aggregate() }
             assertEquals("SCP-SAGA-13050", ex.code)
-            assertNull(handle.currentSagaId)
+            assertNull(handle.sagaId)
         }
 
     @Test

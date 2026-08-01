@@ -901,10 +901,11 @@ interface StreamingSagaOpenParams {
  * {@link SagaNeedsRepairError} / {@link ValidationError} /
  * {@link UcanPermissionError}), and the receiver is never handed out.
  *
- * A stream has a single consumer: draining it from two async contexts
- * concurrently (two `for await` loops, or `await` racing iteration) rejects with
- * {@link ProtocolError} on the second driver rather than silently splitting the
- * chunk sequence.
+ * The handle is single-consumer: a concurrent second drive is DETECTED and
+ * rejected on the common path (the `#draining` guard is held across the poll)
+ * with {@link ProtocolError}. Callers MUST NOT share a handle across async
+ * contexts — the guard is released between chunks, so this reliably catches the
+ * common concurrent-drive footgun but is not a hard concurrency barrier.
  *
  * SDK-layer semantics are proven at this wrapper; the runtime-level
  * billed-count / execute-exactly-once guarantees are proven Rust-side
