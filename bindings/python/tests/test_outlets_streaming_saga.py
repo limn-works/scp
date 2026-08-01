@@ -383,8 +383,8 @@ class TestAc5CallerDidMismatch:
 
 
 class TestAc8ReconnectTruncatedClose:
-    """AC8: the SDK recover wrapper drives the key-bearing crash-recovery
-    truncated close. Success resolves ``Committed`` (returns ``None``); the
+    """AC8: the SDK recover wrapper drives the key-bearing in-session
+    reconnect/repair truncated close. Success resolves ``Committed`` (returns ``None``); the
     money-moving invoker gate and a ``NeedsRepair`` terminal translate to typed
     SDK errors.
 

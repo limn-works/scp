@@ -975,8 +975,9 @@ impl UniffiKeyCustody {
     /// active backend — the enum analogue of the per-backend
     /// `export_ed25519_signing_key` used by [`resolve_uniffi_signing_key`].
     ///
-    /// Needed by the streaming-saga crash-recovery path (SCP-OUT-047), which
-    /// resolves the TARGET context creator's Active Signing Key from the
+    /// Needed by the streaming-saga in-session reconnect/repair recover path
+    /// (SCP-OUT-047), which resolves the TARGET context creator's Active Signing
+    /// Key from the
     /// per-instance identity custody registry (a `UniffiKeyCustody`) by DID —
     /// there is no `ContextHandle` on the reconnect leg. Private key material
     /// never crosses the FFI boundary; it is used in-process to seal the durable

@@ -1871,8 +1871,15 @@ class SCP internal constructor(
         )
 
     /**
-     * Drives the key-bearing crash-recovery truncated-close for a cross-context
-     * streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+     * Drives the key-bearing in-session reconnect/repair truncated-close for a
+     * cross-context streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+     *
+     * This is IN-SESSION reconnect/repair of a seal that stalled or went
+     * `NeedsRepair` while THIS bridge process is still alive (e.g. a client
+     * reconnects to the same live node). The saga registry is per-instance and
+     * in-memory, so this does NOT survive a process/node restart — cross-restart
+     * recovery replays the durable saga journal via a separate operator path, not
+     * this surface.
      *
      * Forwards 1:1 to [NativeScp.outletStreamingSagaRecoverTruncatedClose] on
      * [inner]. On FFI reconnect this authenticates the caller, surfaces the target

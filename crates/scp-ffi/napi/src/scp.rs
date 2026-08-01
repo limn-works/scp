@@ -3167,14 +3167,18 @@ impl Scp {
             .map(|opt| opt.map(Buffer::from))
     }
 
-    /// Key-bearing crash-recovery truncated-close for a cross-context streaming
-    /// saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the TARGET
-    /// context's Active Signing Key (resolved per-call from custody) and resolves
-    /// the saga `Committed` WITHOUT re-opening the stream or re-invoking the
-    /// executor. `caller_did` must be an identity hosted by this bridge instance
-    /// (§6.2.4 channel-auth) AND the invoker pinned at open (CRITICAL #1 —
-    /// recovery is money-moving; rejects `SCP-PERM-3001` otherwise). On success
-    /// the saga registry entry is evicted.
+    /// Key-bearing in-session reconnect/repair truncated-close for a cross-context
+    /// streaming saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the
+    /// TARGET context's Active Signing Key (resolved per-call from custody) and
+    /// resolves the saga `Committed` WITHOUT re-opening the stream or re-invoking
+    /// the executor. Recovers a seal that stalled / went `NeedsRepair` while THIS
+    /// bridge process is still alive; the saga registry is per-instance and
+    /// in-memory, so it does NOT survive a process/node restart (cross-restart
+    /// recovery is a separate durable-journal operator path, §17.16).
+    /// `caller_did` must be an identity hosted by this bridge instance (§6.2.4
+    /// channel-auth) AND the invoker pinned at open (CRITICAL #1 — recovery is
+    /// money-moving; rejects `SCP-PERM-3001` otherwise). On success the saga
+    /// registry entry is evicted.
     #[napi(js_name = "outletStreamingSagaRecoverTruncatedClose")]
     pub async fn outlet_streaming_saga_recover_truncated_close(
         &self,

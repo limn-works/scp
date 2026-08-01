@@ -1523,13 +1523,20 @@ pub(crate) async fn outlet_streaming_saga_poll_next_on(
     }
 }
 
-/// Key-bearing crash-recovery truncated-close for a cross-context streaming saga
-/// (SCP-OUT-046 #136 AC7). AUTHENTICATES the reconnect caller and supplies the
-/// TARGET's Active Signing Key to
+/// Key-bearing in-session reconnect/repair truncated-close for a cross-context
+/// streaming saga (SCP-OUT-046 #136 AC7). AUTHENTICATES the reconnect caller and
+/// supplies the TARGET's Active Signing Key to
 /// [`Supervisor::recover_streaming_saga_truncated_close`](scp_core::context::supervisor::Supervisor::recover_streaming_saga_truncated_close)
 /// via the shared [`drive_recover_truncated_close`] driver. Seals B's durable
 /// prefix and resolves the saga `Committed` WITHOUT re-opening the stream or
 /// re-invoking the executor.
+///
+/// This is IN-SESSION reconnect/repair of a seal that stalled or went
+/// `NeedsRepair` while THIS bridge process is still ALIVE (e.g. a client
+/// reconnects to the same live node). The saga registry is per-instance and
+/// IN-MEMORY, so this does NOT survive a process/node restart — cross-restart
+/// recovery replays the durable saga journal via a separate operator path
+/// (§17.16), NOT this FFI surface.
 ///
 /// Auth (TWO gates, both required, in order):
 ///   1. `caller_did` MUST be an identity THIS bridge instance hosts (the

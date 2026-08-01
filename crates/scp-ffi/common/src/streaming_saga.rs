@@ -17,8 +17,9 @@
 //! - [`serialize_saga_chunk`] — the one chunk-serialization + terminal-detection
 //!   step every bridge's `poll_next` performs, so the JSON encoding and the
 //!   "terminal ⇒ evict" boundary are byte-identical across bridges.
-//! - [`drive_recover_truncated_close`] — the key-bearing crash-recovery driver
-//!   body (SCP-OUT-046 #136 AC7 / ADR-049 §3a). It performs the ADR-056
+//! - [`drive_recover_truncated_close`] — the key-bearing in-session
+//!   reconnect/repair driver body (SCP-OUT-046 #136 AC7 / ADR-049 §3a). It
+//!   performs the ADR-056
 //!   chokepoint id conversion (decode-64-hex-else-SHA256) THE SAME WAY on every
 //!   bridge before reaching
 //!   [`Supervisor::recover_streaming_saga_truncated_close`] — so no bridge can
@@ -53,8 +54,9 @@ pub struct StreamingSagaEntry {
     /// `poll_next` parked in `recv()` clones the `Arc` out of the registry shard
     /// guard before awaiting (never holding a `DashMap` ref across `.await`).
     pub receiver: Arc<Mutex<mpsc::Receiver<OutletStreamChunk>>>,
-    /// The durable saga id — the operator-repair handle a crash-recovery
-    /// truncated-close keys on, and the registry key (as its string form).
+    /// The durable saga id — the operator-repair handle the in-session
+    /// reconnect/repair truncated-close keys on, and the registry key (as its
+    /// string form).
     pub saga_id: SagaId,
     /// The OPERATING context B (hex) that hosts the streaming outlet
     /// registration — the context whose Active Signing Key seals the receipt at
@@ -90,8 +92,15 @@ pub fn serialize_saga_chunk(
     Ok((bytes, terminal))
 }
 
-/// The key-bearing streaming-saga crash-recovery truncated-close driver
-/// (SCP-OUT-046 #136 AC7).
+/// The key-bearing streaming-saga in-session reconnect/repair truncated-close
+/// driver (SCP-OUT-046 #136 AC7).
+///
+/// This is IN-SESSION reconnect/repair: each bridge's recover surface calls it to
+/// re-drive a seal that stalled or went `NeedsRepair` while THIS bridge process
+/// is still ALIVE (e.g. a client reconnects to the same live node). The
+/// per-instance saga registry that routes to it is in-memory, so this driver does
+/// NOT survive a process/node restart — cross-restart recovery replays the
+/// durable saga journal via a separate operator path (§17.16), not this surface.
 ///
 /// Given the OPERATING context B's Active Signing Key (resolved per-call from
 /// custody by the caller — the runtime holds none autonomously, ADR-006), it

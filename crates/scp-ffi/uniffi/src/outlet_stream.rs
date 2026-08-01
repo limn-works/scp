@@ -1109,7 +1109,7 @@ async fn resolve_context_active_signing_key_by_id(
         .ok_or_else(|| ScpError::Context {
             msg: format!(
                 "context '{context_id}' not found in the UCAN registry — cannot resolve its \
-                 Active Signing Key for streaming-saga crash-recovery"
+                 Active Signing Key for streaming-saga reconnect recovery"
             ),
             // Same "not hosted by this bridge instance" (channel-auth /
             // co-resident single-tenant) class as the identity-custody miss
@@ -1122,7 +1122,7 @@ async fn resolve_context_active_signing_key_by_id(
         let entry = registry.get(&creator_did).ok_or_else(|| ScpError::Context {
             msg: format!(
                 "no local identity custody for context creator '{creator_did}' — streaming-saga \
-                 crash-recovery requires the target context's creator identity to be hosted by \
+                 reconnect recovery requires the target context's creator identity to be hosted by \
                  this bridge instance (co-resident single-tenant constraint)"
             ),
             // Hosted-identity (channel-auth) rejection — SAME code the NAPI and
@@ -1513,13 +1513,20 @@ pub(crate) async fn outlet_streaming_saga_poll_next_impl(
     }
 }
 
-/// Key-bearing crash-recovery truncated-close for a cross-context streaming saga
-/// (SCP-OUT-046 #136 AC7). AUTHENTICATES the reconnect caller and supplies the
-/// TARGET's Active Signing Key to
+/// Key-bearing in-session reconnect/repair truncated-close for a cross-context
+/// streaming saga (SCP-OUT-046 #136 AC7). AUTHENTICATES the reconnect caller and
+/// supplies the TARGET's Active Signing Key to
 /// [`Supervisor::recover_streaming_saga_truncated_close`](scp_core::context::supervisor::Supervisor::recover_streaming_saga_truncated_close)
 /// via the shared [`drive_recover_truncated_close`] driver. Seals B's durable
 /// prefix and resolves the saga `Committed` WITHOUT re-opening the stream or
 /// re-invoking the executor.
+///
+/// This is IN-SESSION reconnect/repair of a seal that stalled or went
+/// `NeedsRepair` while THIS bridge process is still ALIVE (e.g. a client
+/// reconnects to the same live node). The saga registry is per-instance and
+/// IN-MEMORY, so this does NOT survive a process/node restart — cross-restart
+/// recovery replays the durable saga journal via a separate operator path
+/// (§17.16), NOT this FFI surface.
 ///
 /// Auth (TWO gates, both required, in order):
 ///   1. `caller_did` MUST be an identity THIS bridge instance hosts (the
@@ -1902,13 +1909,17 @@ impl Scp {
             .map_err(join_err)?
     }
 
-    /// Key-bearing crash-recovery truncated-close for a cross-context streaming
-    /// saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the TARGET
-    /// context's Active Signing Key (resolved per-call from custody) and resolves
-    /// the saga `Committed` WITHOUT re-opening the stream or re-invoking the
-    /// executor. `caller_did` must be an identity hosted by this bridge instance
-    /// (§6.2.4 channel-auth) AND the invoker pinned at open (CRITICAL #1 —
-    /// recovery is money-moving). On success the saga registry entry is evicted.
+    /// Key-bearing in-session reconnect/repair truncated-close for a cross-context
+    /// streaming saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the
+    /// TARGET context's Active Signing Key (resolved per-call from custody) and
+    /// resolves the saga `Committed` WITHOUT re-opening the stream or re-invoking
+    /// the executor. Recovers a seal that stalled / went `NeedsRepair` while THIS
+    /// bridge process is still alive; the saga registry is per-instance and
+    /// in-memory, so it does NOT survive a process/node restart (cross-restart
+    /// recovery is a separate durable-journal operator path, §17.16).
+    /// `caller_did` must be an identity hosted by this bridge instance (§6.2.4
+    /// channel-auth) AND the invoker pinned at open (CRITICAL #1 — recovery is
+    /// money-moving). On success the saga registry entry is evicted.
     ///
     /// # Errors
     ///
