@@ -763,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_session_with_log_appends_media_session_started_event() {
+    fn activate_session_appends_media_session_started_event() {
         // ADR-024 AC 8: MediaSessionStarted must be recorded in the context
         // event log when activate_session transitions the session to Active.
         pyo3::prepare_freethreaded_python();
@@ -783,7 +783,7 @@ mod tests {
             let result = scp.py_media_activate_session(py, initiating_session_json(ctx));
             assert!(
                 result.is_ok(),
-                "media_activate_session_with_log should succeed: {result:?}"
+                "media_activate_session should succeed: {result:?}"
             );
         });
 
@@ -804,7 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn end_session_with_log_appends_media_session_ended_event() {
+    fn end_session_appends_media_session_ended_event() {
         // ADR-024 AC 8: MediaSessionEnded must be recorded in the context
         // event log when end_media_session is called.
         pyo3::prepare_freethreaded_python();
@@ -832,7 +832,7 @@ mod tests {
             let result = scp.py_media_end_session(py, active_session_json(ctx), TS_END);
             assert!(
                 result.is_ok(),
-                "media_end_session_with_log should succeed: {result:?}"
+                "media_end_session should succeed: {result:?}"
             );
         });
 
@@ -855,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_session_with_log_without_registered_context_succeeds() {
+    fn activate_session_without_registered_context_succeeds() {
         // Best-effort: missing context -> warning only, session op still succeeds.
         pyo3::prepare_freethreaded_python();
 
@@ -871,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn end_session_with_log_without_registered_context_succeeds() {
+    fn end_session_without_registered_context_succeeds() {
         // Best-effort: missing context -> warning only, session op still succeeds.
         pyo3::prepare_freethreaded_python();
 
