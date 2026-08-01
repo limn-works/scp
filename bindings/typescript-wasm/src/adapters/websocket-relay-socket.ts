@@ -9,7 +9,7 @@
  * in the Rust crate (the no-dev/test-stand-in-in-production tenet).
  */
 
-import { mapWasmError, type ScpError } from "../errors";
+import { mapBridgeError, type ScpError } from "../errors";
 import type { JsSocket } from "./types";
 
 /** WebSocket `readyState` for an OPEN connection (per the WHATWG WebSocket standard). */
@@ -185,7 +185,7 @@ export class WebSocketRelaySocket implements JsSocket {
         handlers.onFrame(bytes);
       } catch (error) {
         // A genuine driver error routes to onError and MUST NOT kill the pump.
-        const mapped = mapWasmError(error);
+        const mapped = mapBridgeError(error);
         (handlers.onError ?? this.#onError)?.(mapped);
       }
     };
@@ -198,7 +198,7 @@ export class WebSocketRelaySocket implements JsSocket {
     ws.onerror = () => {
       // Surface transport errors to the consumer; the close handler drives
       // reconnect. Not fatal to the pump.
-      this.#onError?.(mapWasmError(new Error("[SCP-TRANS-5010] relay WebSocket error")));
+      this.#onError?.(mapBridgeError(new Error("[SCP-TRANS-5010] relay WebSocket error")));
     };
   }
 

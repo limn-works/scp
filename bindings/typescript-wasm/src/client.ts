@@ -15,7 +15,7 @@ import {
   WebSocketRelaySocket,
   type WebSocketRelaySocketOptions,
 } from "./adapters/websocket-relay-socket";
-import { mapWasmError, type ScpError, ValidationError } from "./errors";
+import { mapBridgeError, type ScpError, ValidationError } from "./errors";
 import type {
   AddMemberOutput,
   ContextStatus,
@@ -134,7 +134,7 @@ function call<T>(fn: () => T): T {
   try {
     return fn();
   } catch (e) {
-    throw mapWasmError(e);
+    throw mapBridgeError(e);
   }
 }
 

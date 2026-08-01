@@ -63,7 +63,6 @@ export {
   IdentityError,
   McpError,
   mapBridgeError,
-  mapWasmError,
   OutletError,
   ScpError,
   StorageError,

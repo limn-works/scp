@@ -9,11 +9,12 @@
  *
  * The wasm surface throws JS exceptions whose message carries a stable
  * `[SCP-{CATEGORY}-{NUMBER}]` prefix (`crates/scp-client-wasm/src/error.rs`).
- * {@link mapWasmError} routes that prefix through the SAME string-prefix
- * dispatch the NAPI tier uses, so a wasm `SCP-CTX-2005` classifies to
- * `ContextError` exactly as a native one does — classification is by code
- * prefix, never by cross-package object identity (the bounded dual-package
- * `instanceof` residual D1 accepts).
+ * The client maps those through {@link mapBridgeError} — the SAME string-prefix
+ * dispatch the NAPI tier uses — so a wasm `SCP-CTX-2005` classifies to
+ * `ContextError` exactly as a native one does. Classification is by code prefix,
+ * never by cross-package object identity (the bounded dual-package `instanceof`
+ * residual D1 accepts). `mapBridgeError` is re-exported for cross-tier API
+ * symmetry (the error surface is identical across the `-ts` / `-ts-wasm` tiers).
  */
 
 export {
@@ -32,22 +33,3 @@ export {
   UcanPermissionError,
   ValidationError,
 } from "@scp-core/errors";
-
-import { mapBridgeError, type ScpError } from "@scp-core/errors";
-
-/**
- * Maps an exception thrown across the wasm boundary to a typed {@link ScpError}
- * subclass.
- *
- * wasm-bindgen throws the driver's code-prefixed string
- * (`"[SCP-CRYPTO-4010] …"`) as a JS exception. This delegates to the shared
- * {@link mapBridgeError}, which extracts the bracketed code and dispatches on
- * its category prefix (`code.startsWith(...)`). An already-typed `ScpError`
- * (e.g. one this SDK's own guards threw) passes through untouched.
- *
- * @param error - The raw value caught from a wasm call (string, Error, or unknown).
- * @returns A typed `ScpError` subclass instance.
- */
-export function mapWasmError(error: unknown): ScpError {
-  return mapBridgeError(error);
-}
