@@ -1273,6 +1273,7 @@ jobs:
       - python-lint
       - python-test
       - typescript-check
+      - typescript-wasm-check
       - kotlin-lint
       - kotlin-test
       - swift-lint
@@ -1319,6 +1320,7 @@ jobs:
             "${{ needs.python-lint.result }}" \
             "${{ needs.python-test.result }}" \
             "${{ needs.typescript-check.result }}" \
+            "${{ needs.typescript-wasm-check.result }}" \
             "${{ needs.kotlin-lint.result }}" \
             "${{ needs.kotlin-test.result }}" \
             "${{ needs.swift-lint.result }}" \
