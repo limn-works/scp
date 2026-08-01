@@ -145,6 +145,23 @@ pub const KP_MAILBOX_CAPACITY: usize = 32;
 /// [`crate::context::actor::handle::SEND_TIMEOUT`] for consistency.
 pub const KP_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-caller reply-await timeout bounding how long
+/// [`KeyPackageStoreHandle::send`] waits on the actor's oneshot reply AFTER the
+/// command was enqueued. Distinct budget from [`KP_SEND_TIMEOUT`], which bounds
+/// only mailbox ADMISSION (waiting for a free slot on a full mailbox): once the
+/// command is enqueued, this bounds actor-side PROCESSING — the actor runs a
+/// single serial mailbox loop, so a `Reserve` / `ConfirmConsume` / `Replenish`
+/// reply can legitimately trail every command already queued ahead of it
+/// (up to [`KP_MAILBOX_CAPACITY`] of them), each doing MLS crypto plus durable
+/// storage I/O. Conflating the two budgets would risk turning a merely
+/// deep-queued (but healthy) actor into an error on the very bootstrap path
+/// this bound protects, so the reply budget is deliberately larger. Bounding it
+/// at all is the point: a WEDGED actor (stuck inside a hung storage/transport
+/// call) must never pin a bootstrap caller forever — on elapse the handle
+/// fail-closes with a typed [`ContextError::ActorBusy`] (retryable) rather than
+/// awaiting the reply unbounded (internal follow-up #129).
+pub const KP_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
+
 /// Target pool size: 10 usable KeyPackages per identity (ADR-001 criterion 8,
 /// mirrored by ADR-049 §9.16.1). Replenish refills `pool` (+ outstanding
 /// `reserved`) back up to this high-water mark.
@@ -596,8 +613,9 @@ impl KeyPackageStoreHandle {
     /// # Errors
     ///
     /// - [`ContextError::ActorBusy`] — mailbox full for
-    ///   [`KP_SEND_TIMEOUT`], or inbox closed, or the actor dropped the
-    ///   reply channel.
+    ///   [`KP_SEND_TIMEOUT`], or the actor did not reply within
+    ///   [`KP_REPLY_TIMEOUT`] after enqueue (wedged/backed-up actor), or inbox
+    ///   closed, or the actor dropped the reply channel.
     /// - The handler's typed error.
     pub async fn send<T, F>(&self, cmd_factory: F) -> Result<T, ContextError>
     where
@@ -607,11 +625,21 @@ impl KeyPackageStoreHandle {
         let cmd = cmd_factory(tx);
 
         match tokio::time::timeout(KP_SEND_TIMEOUT, self.inbox.send(cmd)).await {
-            Ok(Ok(())) => rx.await.unwrap_or_else(|_| {
-                Err(ContextError::ActorBusy(
+            // Enqueued: bound the reply-await too. A stuck/slow actor (e.g. hung
+            // inside a storage/transport call) must never pin the caller — a
+            // bootstrap path — forever (#129). On elapse, fail-closed with a
+            // retryable `ActorBusy`, matching the enqueue-timeout taxonomy;
+            // never a silent default.
+            Ok(Ok(())) => match tokio::time::timeout(KP_REPLY_TIMEOUT, rx).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_dropped)) => Err(ContextError::ActorBusy(
                     "key-package actor dropped reply channel".to_owned(),
-                ))
-            }),
+                )),
+                Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                    "key-package actor did not reply within {} seconds",
+                    KP_REPLY_TIMEOUT.as_secs()
+                ))),
+            },
             Ok(Err(_closed)) => Err(ContextError::ActorBusy(
                 "key-package actor inbox is closed".to_owned(),
             )),
