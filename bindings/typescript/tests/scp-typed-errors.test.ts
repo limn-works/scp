@@ -25,6 +25,8 @@ import {
   ScpError,
   UcanPermissionError,
 } from "../src/errors";
+import type { Bridge } from "../src/internal/bridge";
+import { __setBridgeForTests, wrapBridgeErrors } from "../src/internal/bridge";
 import { mountMockScp } from "./mock-bridge";
 
 /** Build a plain NAPI-style error: a bare `Error` carrying a code prefix. */
@@ -32,13 +34,49 @@ function rawBridgeError(message: string): Error {
   return new Error(message);
 }
 
+/**
+ * Properties that the JS runtime probes on objects (Promise interop,
+ * inspection, coercion). Spy bridges must return `undefined` for these
+ * so `await` and `util.inspect` don't chase thenable / iterator paths.
+ */
+const PROBE_PROPS = new Set<string | symbol>([
+  "then",
+  "catch",
+  "finally",
+  Symbol.toPrimitive,
+  Symbol.toStringTag,
+  Symbol.iterator,
+  Symbol.asyncIterator,
+]);
+
+/**
+ * Build a minimal spy Bridge Proxy that rejects the named method with the
+ * given raw error, and throws for any other unexpected call. Wrap with
+ * `wrapBridgeErrors` before injecting so error mapping runs as it does in
+ * production (`createNativeBridge` also wraps the bridge).
+ */
+function makeSpyBridge(method: string, error: Error): Bridge {
+  const spy = new Proxy({} as Bridge, {
+    get(_t, prop) {
+      if (PROBE_PROPS.has(prop)) return undefined;
+      if (prop === method) {
+        return (..._args: unknown[]) => Promise.reject(error);
+      }
+      throw new Error(`Spy bridge: unexpected call to Bridge.${String(prop)}`);
+    },
+  });
+  return wrapBridgeErrors(spy);
+}
+
 describe("SCP typed-error mapping", () => {
   it("contextSend surfaces a typed ContextError with the documented SCP-CTX-2095 code", async () => {
     // The contextSend JSDoc promises a typed `ContextError` with code
     // `SCP-CTX-2095` when a multi-member encrypted send fails closed.
-    const { scp, native } = mountMockScp();
-    native.__stub("contextSend", () =>
-      Promise.reject(
+    const { scp } = mountMockScp();
+    __setBridgeForTests(
+      scp,
+      makeSpyBridge(
+        "contextSend",
         rawBridgeError(
           "[SCP-CTX-2095] context error: no peer routing id announced yet — retry after pseudonym announcement",
         ),
@@ -56,9 +94,13 @@ describe("SCP typed-error mapping", () => {
   });
 
   it("maps an async governance error to GovernanceError", async () => {
-    const { scp, native } = mountMockScp();
-    native.__stub("contextGovernancePropose", () =>
-      Promise.reject(rawBridgeError("[SCP-GOV-11001] governance error: proposer is not a member")),
+    const { scp } = mountMockScp();
+    __setBridgeForTests(
+      scp,
+      makeSpyBridge(
+        "contextGovernancePropose",
+        rawBridgeError("[SCP-GOV-11001] governance error: proposer is not a member"),
+      ),
     );
 
     let thrown: unknown;
@@ -72,9 +114,13 @@ describe("SCP typed-error mapping", () => {
   });
 
   it("maps an async outlet error to OutletError", async () => {
-    const { scp, native } = mountMockScp();
-    native.__stub("outletInvoke", () =>
-      Promise.reject(rawBridgeError("[SCP-OUTLET-6002] outlet error: outlet not registered")),
+    const { scp } = mountMockScp();
+    __setBridgeForTests(
+      scp,
+      makeSpyBridge(
+        "outletInvoke",
+        rawBridgeError("[SCP-OUTLET-6002] outlet error: outlet not registered"),
+      ),
     );
 
     let thrown: unknown;
@@ -123,9 +169,13 @@ describe("SCP typed-error mapping", () => {
   });
 
   it("falls back to the base ScpError for a code with no registered class", async () => {
-    const { scp, native } = mountMockScp();
-    native.__stub("contextMemberCount", () =>
-      Promise.reject(rawBridgeError("[SCP-UNKNOWN-9999] something unmapped happened")),
+    const { scp } = mountMockScp();
+    __setBridgeForTests(
+      scp,
+      makeSpyBridge(
+        "contextMemberCount",
+        rawBridgeError("[SCP-UNKNOWN-9999] something unmapped happened"),
+      ),
     );
 
     let thrown: unknown;
@@ -134,15 +184,18 @@ describe("SCP typed-error mapping", () => {
     } catch (err) {
       thrown = err;
     }
-    expect(thrown).toBeInstanceOf(ScpError);
+    // Must be exactly ScpError, not a subclass — TransportError extends ScpError
+    // so toBeInstanceOf(ScpError) alone would pass vacuously on a transport failure.
+    expect((thrown as ScpError).constructor).toBe(ScpError);
+    expect((thrown as ScpError).code).toBe("SCP-UNKNOWN-9999");
   });
 });
 
 describe("SCP typed-error mapping (trust.ts consumers)", () => {
   it("maps a ucanValidate PERM-3030 error to UcanPermissionError with the prefix preserved", async () => {
-    const { scp, native } = mountMockScp();
+    const { scp } = mountMockScp();
     const message = "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance";
-    native.__stub("ucanValidate", () => Promise.reject(rawBridgeError(message)));
+    __setBridgeForTests(scp, makeSpyBridge("ucanValidate", rawBridgeError(message)));
 
     let thrown: unknown;
     try {
