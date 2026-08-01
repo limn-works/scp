@@ -300,6 +300,7 @@ pub enum NatSlot {
 ///     Reach::Local,
 ///     IdentitySource::Generate { custody, did_method },
 ///     storage,
+///     BlobStorageBackend::in_memory(), // durability-only arm, selected explicitly
 /// )).await?;
 /// ```
 ///
@@ -320,6 +321,7 @@ pub enum NatSlot {
 ///         Reach::Domain { domain: "example.com".into() },
 ///         IdentitySource::Generate { custody, did_method },
 ///         storage,
+///         BlobStorageBackend::sqlite(&blob_db)?, // durable backend for a public node
 ///     )
 /// }).await?;
 /// ```
@@ -397,9 +399,19 @@ pub struct NodeConfig<
     pub nat: NatSlot,
     /// Network change detector for tier re-evaluation (§10.12.1, SCP-243).
     pub network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    /// Blob storage backend for the relay. `None` preserves the builder's
-    /// in-memory default; `Some` overrides it.
-    pub blob_storage: Option<BlobStorageBackend>,
+    /// Blob storage backend for the relay.
+    ///
+    /// **Required, irreducible selection** (SCP-CAPINJECT-010 / ADR-062
+    /// §Decision 5; spec §17.17.1). This is a non-`Option` field for the same
+    /// reason `reach`/`identity`/`storage` are (M4): the relay's blob backend is
+    /// a provider-capability choice the runtime MUST NOT manufacture
+    /// (SCP-CAPSEL-8002), default (SCP-CAPSEL-8000), or fall back to
+    /// (SCP-CAPSEL-8001). The caller selects it explicitly at this construction
+    /// boundary. [`BlobStorageBackend::in_memory`] is a durability-only
+    /// development arm (SCP-CAPSEL-8010/8011) — legitimately selectable here, but
+    /// only ever by explicit choice, never by omission. Production nodes select a
+    /// durable backend (Sqlite/redb/Postgres/S3; see spec §17.7).
+    pub blob_storage: BlobStorageBackend,
 }
 
 impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
@@ -410,15 +422,29 @@ impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
     /// (no publish), every `Option` = `None`, `dht_gateways = []`,
     /// `nat = NatSlot::Auto`.
     ///
-    /// This enables the spread idiom. Because `reach`/`identity`/`storage` are
-    /// moved into the returned struct, the caller passes *separate* values to
-    /// `defaults(...)` than the fields it overrides:
+    /// This enables the spread idiom. Because `reach`/`identity`/`storage`/
+    /// `blob_storage` are moved into the returned struct, the caller passes
+    /// *separate* values to `defaults(...)` than the fields it overrides:
     ///
     /// ```ignore
-    /// NodeConfig { tls: TlsMode::Acme { email }, ..NodeConfig::defaults(reach2, identity2, storage2) }
+    /// NodeConfig {
+    ///     tls: TlsMode::Acme { email },
+    ///     ..NodeConfig::defaults(reach2, identity2, storage2, blob_storage2)
+    /// }
     /// ```
+    ///
+    /// `blob_storage` is a required argument (not defaulted) because the relay's
+    /// blob backend is an irreducible provider-capability selection the runtime
+    /// must never manufacture (SCP-CAPINJECT-010 / spec §17.17.1). A local demo
+    /// selects the durability-only arm explicitly:
+    /// `NodeConfig::defaults(reach, identity, storage, BlobStorageBackend::in_memory())`.
     #[must_use]
-    pub fn defaults(reach: Reach, identity: IdentitySource<K, D>, storage: S) -> Self {
+    pub fn defaults(
+        reach: Reach,
+        identity: IdentitySource<K, D>,
+        storage: S,
+        blob_storage: BlobStorageBackend,
+    ) -> Self {
         Self {
             reach,
             identity,
@@ -436,7 +462,7 @@ impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
             http3: None,
             nat: NatSlot::Auto,
             network_detector: None,
-            blob_storage: None,
+            blob_storage,
         }
     }
 }
@@ -499,7 +525,9 @@ struct ConfigTail {
     http3: Option<scp_transport::http3::Http3Config>,
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    blob_storage: Option<BlobStorageBackend>,
+    /// The caller's explicit blob backend selection, threaded verbatim to the
+    /// relay build (never defaulted/fallen-back — SCP-CAPINJECT-010).
+    blob_storage: BlobStorageBackend,
 }
 
 /// Validates the config, returning a loud error for contradictory combinations
@@ -868,7 +896,7 @@ async fn build_node_domain<D, S>(
     #[cfg(feature = "http3")] http3: Option<scp_transport::http3::Http3Config>,
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    blob_storage_opt: Option<BlobStorageBackend>,
+    blob_storage: BlobStorageBackend,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
     D: DidMethod + 'static,
@@ -918,7 +946,9 @@ where
         ..RelayConfig::default()
     };
 
-    let blob_storage = Arc::new(blob_storage_opt.unwrap_or_default());
+    // The caller's explicit blob-backend selection, threaded verbatim — never
+    // defaulted or fallen-back (SCP-CAPINJECT-010 / SCP-CAPSEL-8002).
+    let blob_storage = Arc::new(blob_storage);
     let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
     let connection_tracker = relay_server.connection_tracker();
     let subscription_registry = relay_server.subscriptions();
@@ -1036,7 +1066,7 @@ async fn build_node_no_domain<D, S>(
     #[cfg(feature = "http3")] _http3: Option<scp_transport::http3::Http3Config>,
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    blob_storage_opt: Option<BlobStorageBackend>,
+    blob_storage: BlobStorageBackend,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
@@ -1052,7 +1082,9 @@ where
         ..RelayConfig::default()
     };
 
-    let blob_storage = Arc::new(blob_storage_opt.unwrap_or_default());
+    // The caller's explicit blob-backend selection, threaded verbatim — never
+    // defaulted or fallen-back (SCP-CAPINJECT-010 / SCP-CAPSEL-8002).
+    let blob_storage = Arc::new(blob_storage);
     let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
     let connection_tracker = relay_server.connection_tracker();
     let subscription_registry = relay_server.subscriptions();
@@ -1304,6 +1336,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1352,6 +1385,7 @@ mod tests {
                     },
                 )),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1389,6 +1423,7 @@ mod tests {
                 Reach::NatTraversal,
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1420,6 +1455,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1445,7 +1481,12 @@ mod tests {
     async fn local_skips_nat_and_builds() {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .unwrap();
@@ -1486,6 +1527,7 @@ mod tests {
                     did_method: Arc::clone(&did_method),
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1507,6 +1549,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1529,7 +1572,12 @@ mod tests {
             tls: TlsMode::Acme {
                 email: Some("spread@example.com".to_owned()),
             },
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         };
         // The override took effect.
         assert!(matches!(config.tls, TlsMode::Acme { .. }));
@@ -1539,7 +1587,12 @@ mod tests {
 
     #[test]
     fn defaults_are_fail_safe() {
-        let c = NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new());
+        let c = NodeConfig::defaults(
+            Reach::Local,
+            generate_identity(),
+            InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
+        );
         assert!(matches!(c.tls, TlsMode::SelfSigned), "tls fail-safe");
         assert!(
             matches!(c.dht, DhtMode::Disabled),
@@ -1553,7 +1606,12 @@ mod tests {
         assert!(c.projection_rate_limit.is_none());
         assert!(c.dns_provider.is_none());
         assert!(c.network_detector.is_none());
-        assert!(c.blob_storage.is_none());
+        // `blob_storage` is now a required, explicit selection (no default) — it
+        // holds exactly the arm the caller passed (SCP-CAPINJECT-010).
+        assert!(
+            matches!(c.blob_storage, BlobStorageBackend::InMemory(_)),
+            "blob_storage holds the explicitly-selected in-memory arm"
+        );
         assert!(c.dht_gateways.is_empty());
         #[cfg(feature = "http3")]
         assert!(c.http3.is_none());
@@ -1571,6 +1629,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -1601,6 +1660,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1637,6 +1697,7 @@ mod tests {
                 Reach::NatTraversal,
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1669,6 +1730,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1678,7 +1740,12 @@ mod tests {
 
         let local = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .expect("Local + DhtMode::Disabled is a non-publishing reach and must be valid");
@@ -1706,7 +1773,12 @@ mod tests {
                 port_mapper: None,
                 reachability_probe: None,
             },
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .expect("NatSlot::Tuned overrides should lower and build offline on a Local reach");
@@ -1718,35 +1790,36 @@ mod tests {
         node.shutdown();
     }
 
-    // --- Test 15: blob_storage Some overrides, None preserves the default -----
+    // --- Test 15: blob_storage is an explicit, required durability-only choice --
 
+    /// SCP-CAPINJECT-010 AC3: `InMemoryBlobStorage` remains a legitimate,
+    /// **explicitly-selected** durability-only backend (SCP-CAPSEL-8010/8011). A
+    /// node built with an explicit `BlobStorageBackend::in_memory()` selection
+    /// still builds and serves — proving the durability-only arm stays reachable
+    /// by explicit choice. There is deliberately no "None preserves default" case
+    /// anymore: `blob_storage` is a required, non-`Option` field, so there is no
+    /// omit-the-field / silent-default shape to test (that shape was the removed
+    /// SCP-CAPSEL-8011 violation).
     #[tokio::test]
-    async fn blob_storage_some_overrides_and_none_preserves_default() {
-        // Some(...) overrides the builder's in-memory default; None preserves it
-        // (the builder's `new()` sets `Some(BlobStorageBackend::default())`, so
-        // the None path must NOT clear the relay's blob storage). Both paths
-        // build on a Local (non-publishing) reach, which is the observable proof:
-        // the None path did not break the build by clearing blob storage. We do
-        // not assert the private backend value — only what is observable.
-        let with_some = Node::start_for_testing(NodeConfig {
+    async fn blob_storage_in_memory_is_explicitly_selectable() {
+        // Build on a Local (non-publishing) reach with an EXPLICIT in-memory blob
+        // backend. A successful build + serve is the observable proof that the
+        // durability-only arm is still selectable; we do not assert the private
+        // backend value — only what is observable.
+        let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            blob_storage: Some(BlobStorageBackend::default()),
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                // The required, explicit durability-only selection.
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
-        .expect("blob_storage: Some(default) should override and build");
-        assert!(with_some.domain().is_none());
-        with_some.shutdown();
-
-        let with_none = Node::start_for_testing(NodeConfig {
-            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            blob_storage: None,
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
-        })
-        .await
-        .expect("blob_storage: None should preserve the builder default and build");
-        assert!(with_none.domain().is_none());
-        with_none.shutdown();
+        .expect("an explicit in-memory blob backend should build and serve");
+        assert!(node.domain().is_none());
+        node.shutdown();
     }
 
     // --- Test 16: Persisted rejects mismatched custody through Node::start -----
@@ -1774,6 +1847,7 @@ mod tests {
                     did_method: did_method_a,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1796,6 +1870,7 @@ mod tests {
                     did_method: did_method_b,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -1840,6 +1915,7 @@ mod tests {
                 },
                 generate_identity(),
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1884,6 +1960,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1926,6 +2003,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1959,7 +2037,12 @@ mod tests {
             tls: TlsMode::Acme {
                 email: Some("admin@example.com".to_owned()),
             },
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await;
 
@@ -1998,7 +2081,12 @@ mod tests {
                 tls: TlsMode::Acme {
                     email: Some("admin@example.com".to_owned()),
                 },
-                ..NodeConfig::defaults(reach, generate_identity(), InMemoryStorage::new())
+                ..NodeConfig::defaults(
+                    reach,
+                    generate_identity(),
+                    InMemoryStorage::new(),
+                    BlobStorageBackend::in_memory(),
+                )
             })
             .await;
 
@@ -2053,7 +2141,12 @@ mod tests {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             tls: TlsMode::Plaintext,
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .expect("Local + Plaintext is a non-Domain no-op TLS build and must succeed");
@@ -2075,7 +2168,12 @@ mod tests {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             tls: TlsMode::Terminated,
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .expect("Local + Terminated is a non-Domain no-op TLS build and must succeed");

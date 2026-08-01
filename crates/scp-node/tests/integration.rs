@@ -12,6 +12,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use scp_transport::native::storage::BlobStorageBackend;
+
 use axum::body::Body;
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -95,6 +97,7 @@ async fn build_test_node_with(
                 did_method: Arc::new(did_dht),
             },
             InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
         )
     })
     .await

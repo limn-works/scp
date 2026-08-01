@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use quinn::{ClientConfig, Endpoint};
 use scp_relay_client::{ClientMessage, RelayMessage};
+use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::quic::listener::SCP_ALPN;
 
 use scp_clock::SystemClock;
@@ -146,6 +147,7 @@ async fn build_tls_node(http_port: u16) -> ApplicationNode<InMemoryStorage> {
                 did_method,
             },
             InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
         )
     })
     .await

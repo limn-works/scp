@@ -558,11 +558,15 @@ impl BlobStorageBackend {
     }
 }
 
-impl Default for BlobStorageBackend {
-    fn default() -> Self {
-        Self::in_memory()
-    }
-}
+// NOTE (SCP-CAPINJECT-010 / ADR-062 §Decision 5, spec §17.17.1): this enum has
+// deliberately NO `Default` implementation. `InMemory` is a durability-only
+// development arm (SCP-CAPSEL-8010/8011): it may be selected EXPLICITLY
+// (`in_memory()` / `in_memory_with_capacity()`), but it must never be
+// manufactured as a default or reached as a fallback. A `Default` that returned
+// `in_memory()` was a live SCP-CAPSEL-8011 violation (the runtime silently
+// selecting the dev arm the operator never chose); the backend is now a required,
+// non-`Option` selection made by the caller at the relay/node construction
+// boundary (see `scp-node`'s `NodeConfig::blob_storage` / `self_host`).
 
 impl From<InMemoryBlobStorage> for BlobStorageBackend {
     fn from(storage: InMemoryBlobStorage) -> Self {

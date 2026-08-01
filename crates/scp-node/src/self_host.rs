@@ -2265,7 +2265,11 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
         nat,
         http_bind_addr: Some(http_addr),
         projection_rate_limit: Some(projection_rate_limit),
-        blob_storage: Some(blob_storage),
+        // The self-host binary's operator-chosen backend: a durable, persistent
+        // SQLite blob store (opened above, fail-closed on error). Passed as the
+        // required `blob_storage` selection at this construction boundary — the
+        // legitimate config default (an explicit caller choice), NOT a runtime
+        // manufactured default (SCP-CAPINJECT-010 / spec §17.17.1).
         ..NodeConfig::defaults(
             reach,
             IdentitySource::Persisted {
@@ -2273,6 +2277,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
                 did_method,
             },
             node_storage,
+            blob_storage,
         )
     };
 

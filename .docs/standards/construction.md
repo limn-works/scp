@@ -13,6 +13,7 @@ let node = Node::start(NodeConfig {
     reach: Reach::Domain { domain: "example.com".into() },
     identity: IdentitySource::Generate { custody, did_method },
     storage: StorageSlot::Sqlite { path, passphrase }, // core slot; the FFI bridges mirror it as their `StorageConfig` enum
+    blob_storage: BlobStorageBackend::sqlite(&blob_db)?, // required relay blob backend (M4); durable for a public node
     ..NodeConfig::defaults(/* required… */)
 }).await?;
 ```
@@ -86,7 +87,7 @@ Instead:
 - Provide a `Thing::defaults(required…) -> Config` **factory** that takes the irreducible required fields and fills the rest with fail-safe defaults, enabling the spread idiom:
 
   ```rust
-  NodeConfig { reach, identity, storage, ..NodeConfig::defaults(reach2, identity2, storage2) }
+  NodeConfig { reach, identity, storage, blob_storage, ..NodeConfig::defaults(reach2, identity2, storage2, blob_storage2) }
   ```
 
 A config whose every field is genuinely fail-safe **may** keep `Default` — `RelayConfig` qualifies, since every field has a safe default. This explicitly depends on `BridgeRole::default() == Disabled`: `bridge` is `RelayConfig`'s only security-consequential field, and because its `Default` is the fail-safe `Disabled` (a relay that brokers nothing until explicitly enabled), the whole struct's `Default` manufactures no unsafe value. If `BridgeRole::default()` were `Enabled`, `RelayConfig` would forfeit this exception and M4 would fire. The rule fires only when a field is security-relevant or irreducible *and lacks a fail-safe default*.

@@ -31,6 +31,7 @@ use scp_node::{
 };
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
+use scp_transport::native::storage::BlobStorageBackend;
 
 /// The concrete `DidDht` type used in tests (in-memory DHT, system clock).
 pub type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
@@ -143,6 +144,8 @@ pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemory
                 did_method,
             },
             InMemoryStorage::new(),
+            // Durability-only blob arm, selected explicitly (SCP-CAPINJECT-010).
+            BlobStorageBackend::in_memory(),
         )
     }
 }
@@ -170,6 +173,8 @@ pub fn test_no_domain_node_config(
                 did_method,
             },
             InMemoryStorage::new(),
+            // Durability-only blob arm, selected explicitly (SCP-CAPINJECT-010).
+            BlobStorageBackend::in_memory(),
         )
     }
 }

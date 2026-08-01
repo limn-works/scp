@@ -26,6 +26,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use quinn::{ClientConfig, Endpoint};
 use scp_relay_client::{ClientMessage, RelayMessage};
+use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::quic::listener::SCP_ALPN;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -419,6 +420,7 @@ async fn build_tls_node(http_port: u16) -> ApplicationNode<InMemoryStorage> {
                 did_method,
             },
             InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
         )
     })
     .await

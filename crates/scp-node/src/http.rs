@@ -1165,7 +1165,7 @@ mod tests {
             dev_token: None,
             dev_bind_addr: None,
             projected_contexts: RwLock::new(HashMap::new()),
-            blob_storage: Arc::new(BlobStorageBackend::default()),
+            blob_storage: Arc::new(BlobStorageBackend::in_memory()),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
