@@ -21,8 +21,17 @@
  * would (a) produce a key no code path consumes (the MLS key is in `scp-mls`),
  * (b) not be bound to the DID or persisted, and (c) throw on platforms without
  * WebCrypto Ed25519 (Safari <17-class) — breaking the `create({ did })` quickstart
- * for a key nobody uses. Key generation and binding are #1980's job; this slice
- * verifies WebCrypto is present (so #1980 can wire it) and binds the DID.
+ * for a key nobody uses. Key generation and binding are #1980's job.
+ *
+ * ## The `crypto.subtle` precondition is this type's OWN identity, not #1980
+ *
+ * `create()` requires a WebCrypto environment (`crypto.subtle`) to exist and
+ * rejects (fail-closed) when it does not — the same way it rejects an empty DID.
+ * This is a precondition of *what this type IS*, independent of #1980: a
+ * `WebCryptoCustody` is, by definition, the WebCrypto-backed custody, so
+ * constructing one where WebCrypto is absent is a contradiction. The check stands
+ * on its own identity contract; it is NOT scaffolding that verifies WebCrypto "so
+ * a later slice can wire it."
  */
 
 import type { JsKeyCustody } from "./types";
@@ -35,7 +44,11 @@ export interface WebCryptoCustodyOptions {
    * default (fail-closed).
    */
   readonly did: string;
-  /** The `Crypto` implementation. Defaults to `globalThis.crypto`. */
+  /**
+   * The `Crypto` implementation. Defaults to `globalThis.crypto`. Used for the
+   * `crypto.subtle` presence check and as the injection point for tests /
+   * non-standard hosts that supply their own `Crypto`.
+   */
   readonly crypto?: Crypto;
 }
 
@@ -61,17 +74,20 @@ export class WebCryptoCustody implements JsKeyCustody {
   /**
    * Binds the participant DID.
    *
-   * Fails closed if WebCrypto (`crypto.subtle`) is unavailable or no DID is
-   * bound — the two preconditions on-device custody requires. This slice does
-   * NOT generate a key (see the module note): key custody + signing land with
-   * #1980; verifying WebCrypto is present is what lets that later slice wire it.
+   * Fails closed on either of this custody's two construction preconditions: a
+   * WebCrypto environment (`crypto.subtle`) must exist — a `WebCryptoCustody` is
+   * WebCrypto-backed by definition, so its absence is a type-identity
+   * contradiction, NOT a #1980 concern — and a non-empty DID must be provided.
+   * This slice generates NO key (key generation is #1980's custody-model redesign;
+   * see the module note); `did()` is the one live custody call.
    */
   static create(options: WebCryptoCustodyOptions): WebCryptoCustody {
     const crypto = options.crypto ?? globalThis.crypto;
     if (!crypto?.subtle) {
       throw new Error(
-        "WebCrypto (crypto.subtle) is unavailable in this environment — cannot back " +
-          "on-device key custody. Supply options.crypto or use a host that provides WebCrypto (fails closed).",
+        "WebCrypto (crypto.subtle) is unavailable in this environment — a " +
+          "WebCryptoCustody is WebCrypto-backed by definition and cannot be constructed " +
+          "without it. Supply options.crypto or use a host that provides WebCrypto (fails closed).",
       );
     }
     if (options.did.trim() === "") {

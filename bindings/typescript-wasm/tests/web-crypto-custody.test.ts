@@ -21,9 +21,12 @@ test("create fails closed when no DID is bound", () => {
 });
 
 test("create fails closed when WebCrypto (crypto.subtle) is unavailable", () => {
+  // A WebCryptoCustody is WebCrypto-backed by definition — absent crypto.subtle is
+  // a type-identity precondition failure (like an empty DID), NOT a #1980 concern.
+  // The injected `crypto` option is the seam that makes this precondition testable.
   const noSubtle = {} as unknown as Crypto;
   expect(() => WebCryptoCustody.create({ did: DID, crypto: noSubtle })).toThrow(
-    /WebCrypto.*unavailable/i,
+    /WebCrypto.*by definition|WebCrypto.*unavailable/i,
   );
 });
 
