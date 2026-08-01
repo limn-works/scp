@@ -51,17 +51,26 @@ test("write-behind persists in FIFO order and reload restores it", async () => {
 });
 
 /**
- * Wraps a real `IDBFactory` so the opened database's `transaction()` throws once
- * `arm.fail` is set — a durable-write fault injected AFTER open/preload succeed.
+ * Wraps a real `IDBFactory` so each database `transaction(...)` consults a
+ * fault-policy predicate: `shouldFault(txArgs)` returns a message to THROW for
+ * that transaction, or `undefined` to pass it through to the real store. The
+ * caller keeps its arming state local — one helper serves both the uniform and
+ * the non-uniform (fail-then-succeed) fault shapes. Faults are injected AFTER
+ * open/preload succeed (open uses the same `transaction` path only for the
+ * readonly preload, which policies below leave untouched).
  */
-function faultingFactory(real: IDBFactory, arm: { fail: boolean }): IDBFactory {
+function faultingFactory(
+  real: IDBFactory,
+  shouldFault: (txArgs: unknown[]) => string | undefined,
+): IDBFactory {
   const wrapDb = (db: IDBDatabase): IDBDatabase =>
     new Proxy(db, {
       get(target, prop, receiver) {
         if (prop === "transaction") {
           return (...args: unknown[]) => {
-            if (arm.fail) {
-              throw new Error("simulated IndexedDB write fault");
+            const msg = shouldFault(args);
+            if (msg !== undefined) {
+              throw new Error(msg);
             }
             return (target.transaction as (...a: unknown[]) => unknown)(...args);
           };
@@ -91,9 +100,12 @@ function faultingFactory(real: IDBFactory, arm: { fail: boolean }): IDBFactory {
 }
 
 test("a durable-write fault surfaces fail-closed on a later call", async () => {
+  // Uniform policy: fault every transaction once armed.
   const arm = { fail: false };
   const storage = await IndexedDbStorage.open({
-    indexedDB: faultingFactory(new IDBFactory(), arm),
+    indexedDB: faultingFactory(new IDBFactory(), () =>
+      arm.fail ? "simulated IndexedDB write fault" : undefined,
+    ),
     databaseName: "fault-db",
   });
 
@@ -109,49 +121,6 @@ test("a durable-write fault surfaces fail-closed on a later call", async () => {
   await expect(storage.flushed()).rejects.toThrow(/simulated IndexedDB write fault/);
 });
 
-/**
- * Wraps a real `IDBFactory` so ONLY the FIRST `readwrite` transaction faults
- * (non-uniform: any later op's transaction would otherwise succeed). This models
- * the deterministic crash-consistency trigger — a quota-exceeded `put` that
- * aborts, followed by a `delete` that frees space and would succeed.
- */
-function firstWriteFaultingFactory(real: IDBFactory, arm: { failFirstWrite: boolean }): IDBFactory {
-  const wrapDb = (db: IDBDatabase): IDBDatabase =>
-    new Proxy(db, {
-      get(target, prop, receiver) {
-        if (prop === "transaction") {
-          return (...args: unknown[]) => {
-            if (arm.failFirstWrite && args[1] === "readwrite") {
-              arm.failFirstWrite = false; // fault ONLY the first readwrite tx
-              throw new Error("simulated non-uniform IndexedDB write fault (first write only)");
-            }
-            return (target.transaction as (...a: unknown[]) => unknown)(...args);
-          };
-        }
-        const value = Reflect.get(target, prop, receiver);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-
-  const wrapOpenRequest = (request: IDBOpenDBRequest): IDBOpenDBRequest =>
-    new Proxy(request, {
-      get(target, prop, receiver) {
-        if (prop === "result") {
-          return wrapDb(target.result);
-        }
-        const value = Reflect.get(target, prop, receiver);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-      set(target, prop, value) {
-        return Reflect.set(target, prop, value);
-      },
-    });
-
-  return {
-    open: (name: string, version?: number) => wrapOpenRequest(real.open(name, version)),
-  } as unknown as IDBFactory;
-}
-
 test("a NON-UNIFORM fault keeps the durable store a strict PREFIX (sticky, no gap)", async () => {
   const factory = new IDBFactory();
   const dbName = "prefix-db";
@@ -161,10 +130,18 @@ test("a NON-UNIFORM fault keeps the durable store a strict PREFIX (sticky, no ga
   seed.set("scp-client/ctx/keep", bytes(7, 7, 7));
   await seed.flushed();
 
-  // Open an instance whose FIRST readwrite tx faults; later ops would succeed.
+  // Open an instance whose FIRST readwrite tx faults; later ops would succeed —
+  // the non-uniform crash-consistency trigger (a quota-exceeded `put` that aborts,
+  // then a `delete` that frees space and would otherwise land).
   const arm = { failFirstWrite: false };
   const storage = await IndexedDbStorage.open({
-    indexedDB: firstWriteFaultingFactory(factory, arm),
+    indexedDB: faultingFactory(factory, (args) => {
+      if (arm.failFirstWrite && args[1] === "readwrite") {
+        arm.failFirstWrite = false; // fault ONLY the first readwrite tx
+        return "simulated non-uniform IndexedDB write fault (first write only)";
+      }
+      return undefined;
+    }),
     databaseName: dbName,
   });
   expect(storage.get("scp-client/ctx/keep")).toEqual(bytes(7, 7, 7)); // preloaded prefix

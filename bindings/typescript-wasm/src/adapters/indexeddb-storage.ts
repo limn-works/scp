@@ -215,13 +215,11 @@ export class IndexedDbStorage implements JsStorage {
 
   #enqueue(op: WriteOp): void {
     // Chain each op after the previous so durable writes land in issue order
-    // (FIFO), AND gate the run on the poison flag so that once any op faults, NO
-    // op issued after it is ever flushed. Together these keep the durable store a
-    // strict PREFIX of the issued sequence up to the first failed op — never a
-    // gap (a later op landing durably while an earlier one was lost would break
-    // the driver's write-ordering crash-consistency, e.g. deleting a pending blob
-    // whose snapshot put was lost). The fault is captured (fire-and-forget) and
-    // surfaced stickily on the next synchronous call via #throwIfFaulted.
+    // (FIFO), AND gate the run on the poison flag so once any op faults, no op
+    // issued after it is ever flushed. Together these keep the durable store a
+    // strict PREFIX (ordering + sticky poison — see the class doc for the worked
+    // gap scenario). The fault is captured (fire-and-forget) and surfaced stickily
+    // on the next synchronous call via #throwIfFaulted.
     this.#flushChain = this.#flushChain
       .then(() => {
         if (this.#chainPoisoned) {
