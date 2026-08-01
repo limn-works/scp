@@ -79,6 +79,7 @@ scaffolds/                       Clonable barebones project setups
 ├── rust-client/                 Minimal Rust binary using scp-core
 ├── python-agent/                Python agent skeleton with async runtime
 ├── typescript-node/             Node.js agent with NAPI binding
+├── typescript-web/              In-tab browser participant over scp-ts-wasm, keys on-device (ADR-057)
 ├── swift-ios/                   iOS app with Keychain custody
 ├── swift-macos/                 macOS app with Secure Enclave custody
 ├── kotlin-android/              Android app with Keystore custody
@@ -431,6 +432,7 @@ Each scaffold is a minimal, working project structure with:
 | `scaffolds/rust-client/` | Rust | Minimal Rust binary using scp-core directly |
 | `scaffolds/python-agent/` | Python | Python agent with scp-python, async runtime, identity setup |
 | `scaffolds/typescript-node/` | TypeScript | Node.js agent using NAPI binding |
+| `scaffolds/typescript-web/` | TypeScript | In-tab browser participant over `@limn-works/scp-ts-wasm`, keys on-device (ADR-057) |
 | `scaffolds/swift-ios/` | Swift | iOS app with Keychain custody, push notifications |
 | `scaffolds/swift-macos/` | Swift | macOS app with Secure Enclave custody |
 | `scaffolds/kotlin-android/` | Kotlin | Android app with Keystore custody |
@@ -459,6 +461,12 @@ Each template is a complete, running application that demonstrates a real use ca
 | `templates/personal-relay/` | Rust | Self-hosted relay with automatic TLS and DID publishing |
 | `templates/broadcast-feed/` | Python | Broadcast context (§5.14) with subscriber management |
 | `templates/cross-context-bridge/` | Rust | Outlet interface bridging two contexts (§6.2) |
+
+> A functional two-party **browser** chat template (`templates/chat/typescript/`) is
+> forthcoming under **#2187**, once relay-mediated invitation-join is available in the
+> wasm tier (its §9.7.1 DID-VM KeyPackage binding). Until then, `scaffolds/typescript-web/`
+> demonstrates the single-tab in-browser client (ADR-057). No TypeScript chat template
+> exists yet — the row is intentionally absent rather than phantom.
 
 Templates are **functional** — they solve a real problem out of the box. An agent studying a template understands not just how SCP works mechanically but how it's used to build real things.
 

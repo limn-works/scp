@@ -2,7 +2,7 @@
 
 Two-party encrypted chat over the Shared Context Protocol. Provides a Python CLI client that uses real SCP SDK APIs: DID identity creation, encrypted context lifecycle, and async message send/receive.
 
-A browser client is not included: in-browser SCP runs as a remote thin client to a server-side `scp-node` (ADR-055), which is being added separately.
+A browser chat client is not included yet. In-browser SCP is a real in-tab participant — the full MLS protocol runs in the tab with keys on-device (ADR-057, which amends ADR-055's earlier remote-thin-client model), not a remote thin client to a server-side `scp-node`. A functional two-party browser chat template (`templates/chat/typescript/`) is forthcoming under #2187, once relay-mediated invitation-join is available in the wasm tier. In the meantime, `scaffolds/typescript-web/` demonstrates the single-tab in-browser client over `@limn-works/scp-ts-wasm` today.
 
 ## Architecture
 

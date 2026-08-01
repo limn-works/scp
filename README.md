@@ -63,7 +63,7 @@ The protocol engine is Rust, with bindings for the ecosystems where agents and a
 |---|---|---|
 | Python | PyO3 | Agent ecosystem (LangChain, CrewAI, AutoGen) |
 | Swift | UniFFI | iOS / macOS |
-| TypeScript | napi-rs | Node / Bun (server, in-process; browser = remote thin client) |
+| TypeScript | napi-rs | Node / Bun (server, in-process); browser = in-tab wasm client, keys on-device (`@limn-works/scp-ts-wasm`, ADR-057) |
 | Kotlin | UniFFI | Android |
 | Rust | Native | Direct |
 

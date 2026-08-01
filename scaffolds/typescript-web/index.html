@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      Production-hardening default CSP for a copyable web skeleton. It permits
+      exactly what this scaffold needs and nothing more:
+        - script-src 'self' 'wasm-unsafe-eval' — bundled module scripts + the
+          WebAssembly instantiation the wasm SDK performs.
+        - connect-src 'self' wss: — the same-origin wasm asset fetch plus the
+          untrusted relay WebSocket (wss:// only; see the wss:// guard in main.ts).
+        - default-src 'self'; object-src/base-uri locked down.
+      Dev note: `vite dev` HMR uses a same-origin WebSocket, which 'self' permits
+      on CSP-Level-3 browsers; if yours blocks it, only hot-reload is degraded —
+      the app still runs and `vite build` is unaffected. This tight policy is what
+      ships in the production bundle.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' wss:; object-src 'none'; base-uri 'none'"
+    />
+    <title>SCP in-browser participant scaffold</title>
+  </head>
+  <body>
+    <main>
+      <h1>SCP in-browser participant (scaffold)</h1>
+      <p>
+        A single-tab in-browser SCP participant over
+        <code>@limn-works/scp-ts-wasm</code>. The full MLS protocol runs in-tab,
+        keys on-device (ADR-057). This is a <strong>structural scaffold</strong>:
+        it wires identity, storage, transport, and a message render loop.
+        Cross-party invitation-join is deferred to #2187.
+      </p>
+
+      <form id="connect-form">
+        <fieldset>
+          <legend>Connect</legend>
+          <p>
+            <label for="did">Participant DID (pre-provisioned — the browser tier
+              does not mint DIDs in-tab)</label><br />
+            <input
+              id="did"
+              name="did"
+              type="text"
+              autocomplete="off"
+              placeholder="did:dht:z6Mk…"
+            />
+          </p>
+          <p>
+            <label for="relay">Relay URL</label><br />
+            <input
+              id="relay"
+              name="relay"
+              type="url"
+              autocomplete="off"
+              placeholder="wss://relay.example"
+            />
+          </p>
+          <p>
+            <label for="context">Context id</label><br />
+            <input
+              id="context"
+              name="context"
+              type="text"
+              autocomplete="off"
+              placeholder="my-context"
+            />
+          </p>
+          <button id="connect" type="submit">Connect and create context</button>
+        </fieldset>
+      </form>
+
+      <form id="send-form">
+        <fieldset>
+          <legend>Send a message</legend>
+          <p>
+            <label for="message">Message</label><br />
+            <input
+              id="message"
+              name="message"
+              type="text"
+              autocomplete="off"
+              placeholder="hello"
+            />
+          </p>
+          <button id="send" type="submit" disabled>Send</button>
+        </fieldset>
+      </form>
+
+      <section aria-labelledby="log-heading">
+        <h2 id="log-heading">Activity</h2>
+        <div id="log" role="log" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
