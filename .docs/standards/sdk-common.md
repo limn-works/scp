@@ -14,7 +14,12 @@ ScpError (root)
 ├── CryptoError          — Encryption, decryption, signature failures
 ├── TransportError       — Network, relay, connection failures
 ├── OutletError          — Outlet registration, invocation, verification failures
-└── ValidationError      — Input validation, schema, parameter failures
+├── ValidationError      — Input validation, schema, parameter failures
+├── StorageError         — Persistent-storage operation failures (SCP-STORAGE range)
+├── AttestationError     — Device and identity attestation failures (SCP-ATTEST range)
+├── McpError             — MCP protocol and tool-invocation failures (SCP-MCP range)
+├── GovernanceError      — Context governance proposal and voting failures (SCP-GOV range)
+└── EconomyError         — Payment, budget, and economic-policy failures (SCP-ECON range)
 ```
 
 ### Error requirements
