@@ -940,7 +940,7 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
  * `__setBridgeForTests(scp, mockBridge)` before invoking module-level helpers
  * (`evaluateTrust`, `bridgeCreateShadow`, …) under test.
  *
- * @internal Phase 4 PR 4 — used by `bridge-trust.test.ts` default-options tests.
+ * @internal Phase 4 PR 4 — used by `identity-lifecycle.test.ts` routing tests.
  */
 export function __setBridgeForTests(scp: SCP, bridge: Bridge): void {
   assertTestEnvironment("__setBridgeForTests");

@@ -42,6 +42,11 @@ const _NODE_ENV_AT_LOAD: string | undefined =
  *
  * The decision is frozen at module load time — runtime mutations to
  * `process.env` cannot flip this after import.
+ *
+ * Exported for `tests/test-guard.test.ts`, which asserts on the frozen
+ * constant value in the current process. No `src/` module consumes this
+ * function directly — callers that need the boolean use the module-level
+ * `_IS_TEST_ENVIRONMENT` constant or call `assertTestEnvironment`.
  */
 export function isTestEnvironment(): boolean {
   return _IS_TEST_ENVIRONMENT;
