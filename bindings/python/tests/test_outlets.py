@@ -68,14 +68,15 @@ class TestCodedBridgeError:
         assert isinstance(result, expected_sdk_cls)
         assert result.message == "something went wrong"
 
-    def test_unknown_bridge_error_falls_back_to_context_error(self) -> None:
-        """An unmapped bridge exception class name falls back to ContextError."""
+    def test_unknown_bridge_error_falls_back_to_scperror(self) -> None:
+        """An unmapped bridge exception class name with no code falls back to ScpError."""
         bridge_cls = type("SomeUnknownBridgeError", (Exception,), {})
         bridge_exc = bridge_cls("unexpected failure")
 
         result = _coded_bridge_error(bridge_exc)
 
-        assert isinstance(result, ContextError)
+        assert isinstance(result, ScpError)
+        assert not isinstance(result, ContextError)
         assert "unexpected failure" in result.message
 
     def test_extracts_scp_code_from_leading_bracket(self) -> None:
