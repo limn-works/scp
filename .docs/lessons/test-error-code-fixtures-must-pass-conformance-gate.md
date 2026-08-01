@@ -13,15 +13,16 @@ it lives in production code or a test fixture. Two ways a fixture breaks the gat
 - **Out-of-range code for a real prefix** — e.g. `SCP-GOV-6001`, when the GOV range
   is `11000-11999` (see the script's range table and the `SCP-GOV)` case).
 - **Non-canonical prefix** — e.g. `SCP-WEIRD-9999`, when `SCP-WEIRD` is not one of
-  the recognized categories (`IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA`).
+  the recognized categories (`IDENT|CTX|PERM|CRYPTO|TRANS|OUTLET|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA`).
 
 ## The Pattern
 
 In test fixtures, either:
 
 1. Use a **real, in-range** code for the category under test, or
-2. Use the **`SCP-UNKNOWN-*` sentinel** — explicitly allowlisted in the script
-   (`SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge errors — allowed`) for the
+2. Use the **`SCP-UNKNOWN-*` or `SCP-TEST-*` sentinel** — both are explicitly
+   allowlisted in the script (`SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge
+   errors — allowed` and `SCP-TEST)  ;; # Test-only sentinel — allowed`) for the
    "unmapped / placeholder error" case.
 
 Never invent a placeholder prefix or an arbitrary number for a test.

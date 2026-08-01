@@ -31,7 +31,7 @@ the leading `[SCP-CAT-NNNN] ` prefix so `.message` holds only the human-readable
 description:
 
 ```python
-match = _CODE_RE.match(raw_msg)          # extract code first
+match = _SCP_CODE_RE.search(raw_msg)     # extract code first
 code = match.group(1) if match else None
 message = raw_msg[match.end():].lstrip() if match is not None else raw_msg
 ```
