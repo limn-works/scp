@@ -214,7 +214,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install tree-sitter tree-sitter-rust ruff
+      # ruff pinned for reproducible CI — an unpinned `pip install ruff`
+      # silently tracks upstream and a new release (e.g. 0.16.x restyling
+      # Markdown code blocks) can red the lint gate repo-wide with no local
+      # change. Bump deliberately in its own PR. Keep in sync with python-lint.
+      - run: pip install tree-sitter tree-sitter-rust ruff==0.15.4
       # Self-test MUST run first: it plants a deliberately-transposed stub
       # parameter and proves the gate REJECTS it, before we trust it on the
       # real tree.
@@ -700,7 +704,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # ruff pinned for reproducible CI (see the pyi-generated job above for
+      # rationale). Bump deliberately in its own PR.
+      - run: pip install ruff==0.15.4
       - run: ruff format --check .
       - run: ruff check .
       # H14 / M16: enforce `is not None` over falsy checks on Optional
