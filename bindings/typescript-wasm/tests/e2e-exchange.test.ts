@@ -22,6 +22,8 @@ import {
   type ReceivedEvent,
   ScpBrowserClient,
   type SenderKeyDistribution,
+  ValidationError,
+  WebSocketRelaySocket,
 } from "../src/index";
 import { loadRealWasm } from "./support/load-wasm";
 import { stubCustody } from "./support/stubs";
@@ -162,4 +164,26 @@ test("an op on an unknown context throws a typed ContextError (SCP-CTX-2001) thr
   }
   expect(caught).toBeInstanceOf(ContextError);
   expect((caught as ContextError).code).toBe("SCP-CTX-2001");
+});
+
+test("create() rejects the managed WebSocketRelaySocket with a loud pointer to connect()", () => {
+  // The managed socket must be attached (two-phase) by connect(); handed to
+  // create() it would silently never connect. The guard makes that loud.
+  const socket = new WebSocketRelaySocket({
+    url: "ws://relay.test",
+    reconnect: { enabled: false },
+  });
+  let caught: unknown;
+  try {
+    ScpBrowserClient.create({
+      custody: stubCustody(ALICE),
+      storage: new InMemoryStorage(),
+      socket,
+    });
+  } catch (e) {
+    caught = e;
+  }
+  expect(caught).toBeInstanceOf(ValidationError);
+  expect((caught as ValidationError).code).toBe("SCP-VALID-7026");
+  expect((caught as ValidationError).message).toMatch(/connect\(\)/);
 });

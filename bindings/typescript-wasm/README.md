@@ -62,8 +62,33 @@ the first-class `JsSocket` / `JsKeyCustody` / `JsStorage` interfaces:
 | Custody | `WebCryptoCustody` | binds the DID (`did()`); signing lands with #1980 |
 | Storage | `IndexedDbStorage` (durable) / `InMemoryStorage` (ephemeral) | `InMemoryStorage` is a legitimate ephemeral choice, not a stand-in |
 
+### Bring your own socket (`create`)
+
 `ScpBrowserClient.create({ custody, storage, socket })` is the bring-your-own-`JsSocket`
-path (you pump `handleRelayFrame` and call `resubscribeAll` on each open yourself).
+path — for a Deno / Workers / `ws` embedder. You own the inbound pump. Do NOT pass the
+managed `WebSocketRelaySocket` here (it would never get attached — `create()` throws
+`SCP-VALID-7026` telling you to use `connect()`); instead wire your own socket's
+`onmessage` → `handleRelayFrame` and `onopen` → `resubscribeAll`:
+
+```typescript
+const ws = new WebSocket("wss://relay.example");
+ws.binaryType = "arraybuffer";
+
+// A JsSocket is just `{ send(frame: Uint8Array): void }` — throw when not open so
+// the client surfaces SCP-TRANS-5010 rather than silently dropping a frame.
+const socket = {
+  send(frame: Uint8Array) {
+    if (ws.readyState !== WebSocket.OPEN) throw new Error("relay socket not open");
+    ws.send(frame);
+  },
+};
+
+const client = ScpBrowserClient.create({ custody, storage, socket });
+
+// You own the pump:
+ws.onopen = () => client.resubscribeAll();                  // on EVERY (re)open
+ws.onmessage = (evt) => client.handleRelayFrame(new Uint8Array(evt.data as ArrayBuffer));
+```
 
 ## Caveats (as-built)
 

@@ -205,6 +205,22 @@ export class ScpBrowserClient {
    */
   static create(options: ScpBrowserClientCreateOptions): ScpBrowserClient {
     assertInitialized();
+    // Loud guard against a silent footgun: WebSocketRelaySocket is the MANAGED
+    // transport for connect(), which performs the two-phase attach (wires the
+    // inbound pump + reconnect). Passing it to create() leaves it unattached —
+    // send() would throw "not open" forever and no inbound frame ever arrives.
+    // Fail closed with a clear pointer rather than a silently-dead client.
+    if (options.socket instanceof WebSocketRelaySocket) {
+      throw new ValidationError(
+        "[SCP-VALID-7026] WebSocketRelaySocket is the managed transport for " +
+          "ScpBrowserClient.connect() (it wires the inbound pump + reconnect). Passing it " +
+          "to create() leaves it unattached — send() would throw forever with no inbound " +
+          "flow. Use ScpBrowserClient.connect({ custody, storage, url }) for the managed " +
+          "transport, or pass your OWN JsSocket to create() and pump handleRelayFrame / " +
+          "resubscribeAll from its onmessage / onopen yourself.",
+        "SCP-VALID-7026",
+      );
+    }
     const inner = new WasmScpClient(options.custody, options.storage, options.socket);
     return new ScpBrowserClient(inner);
   }
