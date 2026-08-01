@@ -2,10 +2,11 @@
  * A faithful in-test relay + mock WebSocket — the "dumb pipe" a real relay is.
  *
  * This is a legitimately EXTERNAL component (the relay is a separate untrusted
- * pipe in the real system), NOT a mock of the client under test. It mirrors the
- * shipped relay's client-facing semantics the Rust `scp-relay-mock` models
- * (`crates/scp-relay-mock/src/lib.rs`), so `ScpBrowserClient` drives the REAL
- * wasm over the REAL relay wire protocol:
+ * pipe in the real system), NOT a mock of the client under test. The Rust
+ * `scp-relay-mock` (`crates/scp-relay-mock/src/lib.rs`) is the SEMANTIC AUTHORITY
+ * for the shipped relay's client-facing behavior; this JS relay MIRRORS it (kept
+ * in sync by hand — if the two diverge, the Rust mock is correct), so
+ * `ScpBrowserClient` drives the REAL wasm over the REAL relay wire protocol:
  *
  *   - a subscription table `routing_id → subscribers`, populated by `SUBSCRIBE`
  *     frames, so a `PUBLISH` reaches only those subscribed at publish time;

@@ -19,6 +19,11 @@
  * symmetry (the error surface is identical across the `-ts` / `-ts-wasm` tiers).
  */
 
+// `@scp-core/errors` is a tsconfig path alias to the SIBLING package's internal
+// `../typescript/src/errors` (see tsconfig.json `paths`). Reaching into a
+// sibling's `src/` is a deliberate, bounded coupling seam — CI-guarded: the
+// `typescript-wasm-check` path filter includes `bindings/typescript/src/errors.ts`,
+// so a change to the shared error core re-runs this tier's gate.
 export {
   AttestationError,
   ContextError,
