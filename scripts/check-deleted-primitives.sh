@@ -114,6 +114,12 @@ BAN_ENTRIES=(
     "QueryStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
     "RwLock<ContextInner>|crates/scp-runtime|*.rs|ADR-049 §Decision 12: ContextHandle's read-path RwLock<ContextInner> was replaced by lock-free Arc<ArcSwap<ContextState>>; the RwLock<ContextInner> shape must not reappear"
     "pending_joins|crates/scp-runtime/src/crypto|*.rs|ADR-049 2F-residual deleted the legacy single-slot Welcome-join primitive (prepare_key_package_for_join + MlsCryptoProvider::join_from_welcome); joins flow through the KeyPackageStoreActor reserve/confirm protocol"
+    "take_crypto_state\\(|crates/scp-runtime|*.rs|#2148 (birth-into-actor) deleted MlsCryptoProvider::take_crypto_state; birth constructors return OwnedMlsCryptoState the CREATE/WELCOME caller seeds onto the actor directly (no insert-then-take round-trip)"
+    "\\.with_context\\(|crates/scp-runtime|*.rs|#2148 (birth-into-actor) deleted the MlsCryptoProvider::with_context per-context accessor; the provider holds no per-context state (the contexts map is gone)"
+    "create_group_into_slot|crates/scp-runtime|*.rs|#2148 (birth-into-actor) deleted the MlsCryptoProvider::create_group_into_slot slot-reservation core; the owned birth constructor reserves no shared-map slot"
+    "contexts: DashMap|crates/scp-runtime|*.rs|#2148 (birth-into-actor) dissolved the MlsCryptoProvider per-context state; the contexts DashMap is deleted (the actor's PerContextState is the sole per-context crypto home; removing it closes the #2167 cross-map TOCTOU)"
+    "taken_context_ids: DashSet|crates/scp-runtime|*.rs|#2148 (birth-into-actor) deleted the MlsCryptoProvider::taken_context_ids guard set; the supervisor registry's atomic first-writer-wins insert is the sole double-birth guard"
+    "broadcast_keys: DashMap|crates/scp-runtime|*.rs|#2148 (birth-into-actor) deleted the MlsCryptoProvider::broadcast_keys map; the broadcast key lives on the actor's BroadcastState"
 )
 
 # ---------------------------------------------------------------------------

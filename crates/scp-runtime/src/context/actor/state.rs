@@ -2166,8 +2166,9 @@ impl PerContextState {
     }
 
     /// Seed this actor state's encrypted-mode crypto from the owned material
-    /// that [`MlsCryptoProvider::take_crypto_state`](crate::crypto::mls::provider::MlsCryptoProvider::take_crypto_state) / `build_restored_owned`
-    /// hands out (ADR-049 PR-7 §15). Installs the moved [`OwnedMlsCryptoState`]
+    /// that the provider's birth/restore seams (`create_mls_group_with_context`
+    /// / `install_joined_group` / `build_restored_owned`) hand out (#2148
+    /// birth-into-actor). Installs the moved [`OwnedMlsCryptoState`]
     /// into [`Self::mode`] — wrapping the payload's non-optional `mls_group` /
     /// `sender_key` in `Some(..)` (the actor holds them optionally because a
     /// fresh Create actor spawns before its group exists) and starting the
@@ -2324,20 +2325,14 @@ impl PerContextState {
     }
 
     /// Adds a member to the MLS group by their optional TLS-serialized
-    /// `KeyPackage` bytes, verbatim from [`MlsCryptoProvider::add_member`] — but
-    /// operating on THIS actor's OWNED `ScpMlsGroup` instead of a provider
-    /// `contexts` entry.
+    /// `KeyPackage` bytes, operating on THIS actor's OWNED `ScpMlsGroup`.
     ///
-    /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) STEP-C C2 JOIN seam (option A). Member
-    /// ADD on a LIVE, actor-owned context is a steady-state crypto orchestration
-    /// op, so it belongs on the actor — the completeness twin of
-    /// [`Self::remove_member`] (Prep-A moved `remove_member` but missed
-    /// `add_member`, the same gap as the `remove_member_sender_key` twin). The
-    /// provider `add_member` is RETAINED for the create-time BIRTH only (before
-    /// `take_crypto_state` hands the crypto to the actor); once the actor owns the
-    /// crypto the provider's `with_context` returns "owned by actor", so the JOIN
-    /// handler routes here. One-way take is preserved — no crypto is ever handed
-    /// back to the provider.
+    /// #2148 (ADR-049 birth-into-actor): member ADD on a LIVE, actor-owned
+    /// context is a steady-state crypto orchestration op, so it belongs on the
+    /// actor — the completeness twin of [`Self::remove_member`]. The provider's
+    /// per-context `add_member` is DELETED (the provider holds no per-context
+    /// state); the governance `AddMember` handler routes here, mutating the
+    /// actor-owned group directly.
     ///
     /// With `Some(bytes)` performs the real MLS add via
     /// [`Self::add_member_from_bytes`]. With `None` (no `KeyPackage`) the
@@ -2352,8 +2347,6 @@ impl PerContextState {
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
     /// `KeyPackage`, no `KeyPackage` in production, or any MLS / serialization
     /// failure.
-    ///
-    /// [`MlsCryptoProvider::add_member`]: crate::crypto::mls::provider::MlsCryptoProvider::add_member
     pub(crate) fn add_member(
         &mut self,
         member_did: &str,
@@ -2830,15 +2823,16 @@ impl PerContextState {
         }
     }
 
-    /// Reads the replicated `0xFF02` group-context extension, verbatim from
-    /// [`MlsCryptoProvider::group_context_extension`]. Read-only.
+    /// Reads the replicated `0xFF02` group-context extension off this actor's
+    /// OWNED MLS group. Read-only. #2148 (birth-into-actor): the provider's
+    /// per-context `group_context_extension` reader is DELETED; live-actor reads
+    /// route here (rehydrated / joined groups read the extension off the owned
+    /// material at the lifecycle layer before seeding).
     ///
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or a malformed
     /// extension payload.
-    ///
-    /// [`MlsCryptoProvider::group_context_extension`]: crate::crypto::mls::provider::MlsCryptoProvider::group_context_extension
     pub(crate) fn group_context_extension(
         &self,
     ) -> Result<Option<ScpContextExtension>, ContextError> {
@@ -2975,14 +2969,11 @@ impl PerContextState {
         result
     }
 
-    /// Destroys the MLS group for this context (creation rollback), verbatim
-    /// from [`MlsCryptoProvider::destroy_mls_group`].
+    /// Destroys the MLS group for this context (creation rollback).
     ///
-    /// The provider removed the whole `contexts` map entry, which DROPS (and
-    /// hence zeroizes, via `SenderKey`'s `ZeroizeOnDrop`) the entire
-    /// `ContextCryptoState` — group, `sender_key`, `sender_key_store`,
-    /// `member_wrapping_keys`, and counters. This method only zeroizes + nulls
-    /// the GROUP handle (`crypto.mls_group = None`); the sibling crypto material
+    /// #2148 (birth-into-actor): the provider's `destroy_mls_group` is DELETED;
+    /// this actor-owned method is the sole group-teardown path. It zeroizes +
+    /// nulls the GROUP handle (`crypto.mls_group = None`); the sibling crypto material
     /// (`sender_key`, `sender_key_store`, `member_wrapping_keys`, epoch/sequence)
     /// stays RESIDENT and its old `sender_key` is NOT zeroized.
     ///
@@ -2991,26 +2982,20 @@ impl PerContextState {
     /// This is why a subsequent [`Self::export_crypto_state`] returns an EMPTY
     /// blob (export short-circuits on `mls_group == None`) while other reads —
     /// `local_sender_key_epoch`, the residual `sender_key_store` — would still
-    /// surface the old material and thus DIVERGE from the provider's full drop.
-    /// The atomic core (SCP-CRYPTOMOVE-001) that wires this method MUST, at the
-    /// destroy seam, discard / replace the whole `PerContextState` (or otherwise
-    /// clear + zeroize the residual sender-key material) to match the provider's
-    /// disposal hygiene. This method deliberately does the minimal group-null so
-    /// the verbatim move stays a pure orchestration op; whole-state disposal is a
-    /// caller (ownership) concern, not this method's.
+    /// surface the old material. For whole-crypto disposal (Ephemeral/Summary
+    /// close, TTL expiry, shutdown) the actor calls `dispose_secrets` instead,
+    /// which tears down the group AND zeroizes the sibling sender-key material.
+    /// This method deliberately does the minimal group-null so it stays a pure
+    /// orchestration op; whole-state disposal is a caller (ownership) concern.
     ///
     /// # Errors
     ///
-    /// Never returns `Err` today (mirrors the provider); the `Result` shape is
-    /// retained for signature parity.
-    ///
-    /// [`MlsCryptoProvider::destroy_mls_group`]: crate::crypto::mls::provider::MlsCryptoProvider::destroy_mls_group
+    /// Never returns `Err` today; the `Result` shape is retained for signature
+    /// stability.
     #[allow(
         clippy::unnecessary_wraps,
-        reason = "byte-identical signature parity with the retained \
-                  `MlsCryptoProvider::destroy_mls_group` twin (a `pub fn`, which \
-                  the lint exempts) so the atomic core (SCP-CRYPTOMOVE-001) can \
-                  swap callers with no shape change"
+        reason = "signature stability so callers can swap between the minimal \
+                  group-null and whole-crypto `dispose_secrets` with no shape change"
     )]
     pub(crate) fn destroy_mls_group(&mut self) -> Result<(), ContextCreationError> {
         if let ContextModeState::Encrypted(crypto) = &mut self.mode {
@@ -3023,26 +3008,20 @@ impl PerContextState {
     }
 
     /// Destroys (rotates out) the local sender key and clears the per-context
-    /// sender-key store, verbatim from
-    /// [`MlsCryptoProvider::destroy_sender_key`].
+    /// sender-key store.
     ///
-    /// The provider additionally removed any `broadcast_keys` entry for the
-    /// context id; a single actor's [`PerContextState`] is exactly one mode
-    /// (Encrypted OR Broadcast, never both), so there is no encrypted-mode
-    /// broadcast-key entry to remove here.
+    /// #2148 (birth-into-actor): the provider's `destroy_sender_key` (which also
+    /// removed any `broadcast_keys` entry) is DELETED. A single actor's
+    /// [`PerContextState`] is exactly one mode (Encrypted OR Broadcast, never
+    /// both), so there is no encrypted-mode broadcast-key entry to remove here.
     ///
     /// # Errors
     ///
-    /// Never returns `Err` today (mirrors the provider); the `Result` shape is
-    /// retained for signature parity.
-    ///
-    /// [`MlsCryptoProvider::destroy_sender_key`]: crate::crypto::mls::provider::MlsCryptoProvider::destroy_sender_key
+    /// Never returns `Err` today; the `Result` shape is retained for signature
+    /// stability.
     #[allow(
         clippy::unnecessary_wraps,
-        reason = "byte-identical signature parity with the retained \
-                  `MlsCryptoProvider::destroy_sender_key` twin (a `pub fn`, which \
-                  the lint exempts) so the atomic core (SCP-CRYPTOMOVE-001) can \
-                  swap callers with no shape change"
+        reason = "signature stability with the sibling `destroy_mls_group` teardown op"
     )]
     pub(crate) fn destroy_sender_key(&mut self) -> Result<(), ContextCreationError> {
         let ctx_id_hex = hex::encode(self.context_id);

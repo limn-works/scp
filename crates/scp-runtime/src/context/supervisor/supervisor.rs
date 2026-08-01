@@ -5234,46 +5234,45 @@ impl Supervisor {
     /// Unlike [`Self::despawn_actor`] — which removes ONLY the in-memory actor
     /// handle — this fully reverses everything
     /// [`Self::spawn_actor_from_welcome`] materialized after the irreversible
-    /// KeyPackage consume, mirroring that entrypoint's OWN post-consume
-    /// rollback arms: it destroys the installed MLS crypto group
-    /// (`destroy_mls_group`) AND deletes the persisted Class-S snapshot
-    /// (`delete_context`) in addition to dropping the actor handle.
+    /// KeyPackage consume: it drops the actor handle (whose owned
+    /// `PerContextState` holds the MLS crypto — #2148 birth-into-actor — so the
+    /// group + sender key ZEROIZE when the actor task ends) AND deletes the
+    /// persisted Class-S snapshot (`delete_context`).
     ///
     /// The FFI bridges call this as the compensating teardown when a
     /// post-irreversible-commit join step fails (e.g. a concurrent close/leave
     /// removed the bridge state before the authenticated ceiling could be
-    /// synced). A bare `despawn_actor` there would leave the resident MLS
-    /// crypto group AND the durable snapshot behind, so on restart the
-    /// "torn-down" context would RESURRECT (FFI/runtime divergence) and the
-    /// residual snapshot would block a fresh re-join via Precheck-D
-    /// (first-writer-wins durable collision). Tearing down all three leaves the
-    /// join strictly MORE recoverable: a re-join with a fresh KeyPackage
-    /// reservation now succeeds.
+    /// synced). A bare `despawn_actor` there would leave the durable snapshot
+    /// behind, so on restart the "torn-down" context would RESURRECT
+    /// (FFI/runtime divergence) and the residual snapshot would block a fresh
+    /// re-join via Precheck-D (first-writer-wins durable collision). Tearing
+    /// down the handle, snapshot, and floor registry entry leaves the join
+    /// strictly MORE recoverable: a re-join with a fresh KeyPackage reservation
+    /// now succeeds.
     ///
     /// The single-use KeyPackage the join burned is NOT restored — that
     /// consume is irreversible by construction (a KeyPackage is one-shot), and
     /// re-joining draws a fresh reservation anyway.
     ///
-    /// Like the internal rollback arms, the crypto-destroy and snapshot-delete
-    /// are best-effort (`let _ =`): each is an idempotent no-op when the
-    /// corresponding step never ran, and a compensating teardown must never
-    /// itself fail. Both are synchronous, so they run under `write_lock`
-    /// (no `.await` while held) — making the teardown atomic with respect to
-    /// concurrent register/despawn.
+    /// Like the internal rollback arms, the snapshot-delete is best-effort
+    /// (`let _ =`): an idempotent no-op when the join never persisted, and a
+    /// compensating teardown must never itself fail. The handle drop + floor
+    /// reap are synchronous, so the teardown runs under `write_lock` — atomic
+    /// with respect to concurrent register/despawn.
     ///
     /// Returns `true` if a live actor handle was registered and removed,
     /// `false` if no entry existed for `context_id`.
     pub async fn discard_joined_context(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
-        // 1. Drop the in-memory actor handle (identical to `despawn_actor`).
+        // 1. Drop the in-memory actor handle. #2148 (ADR-049 birth-into-actor):
+        //    the joiner's MLS crypto is OWNED by the actor's `PerContextState`
+        //    (born owned at the WELCOME seam, never provider-resident), so
+        //    dropping the actor handle closes its mailbox — the actor task ends
+        //    and its state drops, ZEROIZING the group + sender key. There is no
+        //    provider map to also destroy (the deleted `destroy_mls_group` arm).
         let removed = self.actors.remove(context_id).is_some();
-        // 2. Destroy the resident MLS crypto group so no keyed state lingers
-        //    (mirrors `spawn_actor_from_welcome`'s `destroy_mls_group` arm).
         let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
-        if let Some(crypto) = self.crypto_ref() {
-            let _ = crypto.destroy_mls_group(&context_id_bytes);
-        }
-        // 3. Delete the durable Class-S snapshot the join persisted so a
+        // 2. Delete the durable Class-S snapshot the join persisted so a
         //    restart cannot resurrect the context and Precheck-D does not block
         //    a fresh re-join (mirrors the `delete_context` rollback arm; the
         //    helper-persistence slot is the same backend the join persisted to,
@@ -5281,15 +5280,14 @@ impl Supervisor {
         if let Some(persistence) = self.persistence_ref() {
             let _ = persistence.delete_context(context_id).await;
         }
-        // 4. Drop the authoritative Class-M floor registry entry (ADR-049) —
-        //    the registry twin of the provider's per-context crypto teardown
-        //    inside `destroy_mls_group` (step 2). A discarded welcome-join
-        //    is permanently gone (its crypto group + durable snapshot were just
-        //    destroyed), so the floors are moot and pruning is sound; see
+        // 3. Drop the authoritative Class-M floor registry entry (ADR-049). A
+        //    discarded welcome-join is permanently gone (its actor-owned crypto
+        //    zeroized on the handle drop above, its durable snapshot deleted), so
+        //    the floors are moot and pruning is sound; see
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
         //    transient safety argument.
         self.remove_context_floors(&context_id_bytes);
-        // 5. Drop the per-context stream admission-tracker registry entry on
+        // 4. Drop the per-context stream admission-tracker registry entry on
         //    the same permanent-teardown sweep (spec §5.4.5) — the streaming
         //    twin of the floor-registry reap above. An in-flight pump holding
         //    its own Arc keeps the tracker alive; this only drops the
@@ -13760,19 +13758,26 @@ impl Supervisor {
                     )
                     .map_err(ContextError::CryptoFailed)?;
 
-                    // 2. Install the joined group into the live crypto provider (Vacant-
-                    //    guarded; refuses to overwrite a live group) + a locally-minted
-                    //    sender key. From here the crypto is resident but the context is
-                    //    NOT yet reachable for send/receive — no actor handle is registered
-                    //    until step 5, so a crash in this window cannot expose a half-keyed
-                    //    live context.
-                    deps.crypto
-                        .install_joined_group(&context_id_bytes, joined_group)?;
+                    // 2. #2148 (ADR-049 birth-into-actor) WELCOME seam: BIRTH the
+                    //    joiner's crypto as OWNED material — the joined group (moved in
+                    //    here, consuming `joined_group`) plus a locally-minted sender key
+                    //    (spec §9.16.1; the Welcome carries no sender key). This touches
+                    //    NO provider map: there is no insert-then-`take_crypto_state`
+                    //    round-trip and no cross-map check-then-insert to race (#2167
+                    //    TOCTOU is impossible by construction). The crypto is held in the
+                    //    local `owned` binding until it is seeded onto `state` at 2b; a
+                    //    failure on any early-return between here and the spawn DROPS it
+                    //    (zeroizing the `ScpMlsGroup` / `SenderKey`). The supervisor
+                    //    registry's atomic first-writer-wins check-then-insert (under
+                    //    `write_lock`, at step 5's `spawn_actor_with_state`) is the SOLE
+                    //    and sufficient double-birth guard.
+                    let owned = deps.crypto.install_joined_group(joined_group);
 
-                    // 3. Build the Welcome-derived PerContextState. On any failure, roll the
-                    //    just-installed group back so nothing keyed is left resident. (No
-                    //    durable snapshot exists yet, so no `delete_context` is needed here.)
-                    let mut state = match Self::build_welcome_joiner_state(
+                    // 3. Build the Welcome-derived PerContextState (EMPTY encrypted mode).
+                    //    On any failure, `owned` drops here (zeroizing the joined group);
+                    //    nothing is provider-resident and no durable snapshot exists yet,
+                    //    so there is nothing to tear down.
+                    let mut state = Self::build_welcome_joiner_state(
                         &deps,
                         &context_id,
                         &params,
@@ -13780,45 +13785,18 @@ impl Supervisor {
                         &owning_did,
                         local_pseudonym,
                         joined_epoch,
-                    ) {
-                        Ok(state) => state,
-                        Err(e) => {
-                            let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
-                            return Err(e);
-                        }
-                    };
+                    )?;
 
-                    // 2b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 WELCOME seam: TAKE the
-                    //     just-installed joined group's crypto out of the provider and
-                    //     SEED it onto the actor state. This is a BIRTH seam, exactly
-                    //     like CREATE: `install_joined_group` (step 2, a RETAINED
-                    //     provider birth-seam) births the group + local sender key into
-                    //     the provider; `take_crypto_state` then hands it to the actor
-                    //     ONE-WAY (removes the `contexts` entry AND records
-                    //     `taken_context_ids`, so a subsequent provider birth/take for
-                    //     this id fails closed — CM-001 double-owner guard). No crypto is
-                    //     ever handed back to the provider. `build_welcome_joiner_state`
-                    //     deliberately built an EMPTY encrypted mode; `seed` installs the
-                    //     owned group + sender key and resumes `send_sequence` via
-                    //     `from_persisted` (a freshly-installed joiner group starts at 0).
-                    //     From here the actor `state` is the SOLE crypto authority — the
-                    //     durability check (3b) and the fail-closed persist (4) read the
-                    //     export off `state`, not the provider.
-                    //
-                    //     Rollback semantics past this point: the crypto now lives in
-                    //     `state`, so every early-return below DROPS it (zeroizing the
-                    //     `ScpMlsGroup` / `SenderKey`); the `destroy_mls_group` calls
-                    //     become defensive no-ops (the group is no longer provider-
-                    //     resident) and the `taken_context_ids` marker is LEFT in place
-                    //     (fail-closed — the id must not resurrect a divergent second
-                    //     group; a retry re-drives a fresh Welcome).
-                    let owned = match deps.crypto.take_crypto_state(&context_id_bytes) {
-                        Ok(owned) => owned,
-                        Err(e) => {
-                            let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
-                            return Err(e);
-                        }
-                    };
+                    // 2b. SEED the owned crypto onto the actor `state`.
+                    //     `build_welcome_joiner_state` deliberately built an EMPTY
+                    //     encrypted mode; `seed` installs the owned group + sender key and
+                    //     resumes `send_sequence` via `from_persisted` (a freshly-born
+                    //     joiner group starts at 0). From here the actor `state` is the
+                    //     SOLE crypto authority — the durability check (3b) and the
+                    //     fail-closed persist (4) read the export off `state`. Every
+                    //     early-return below now DROPS the seeded crypto with `state`
+                    //     (zeroizing), so no provider teardown is needed and a retry
+                    //     re-drives a fresh Welcome.
                     state.seed_encrypted_crypto_from_owned(owned);
 
                     let handle = state.handle.clone();
@@ -13835,14 +13813,10 @@ impl Supervisor {
                     //     documented to stand up (§9(b)) could receive but never send.
                     //     `state.handle` and this `handle` clone share one
                     //     `Arc<ArcSwap<ContextState>>`, so the actor's own handle observes
-                    //     `Active` too. On a transition failure roll the installed group back
-                    //     (nothing is persisted or registered yet) and fail closed.
-                    if let Err(e) =
-                        handle.transition_to(&scp_protocol::context::ContextState::Active)
-                    {
-                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
-                        return Err(e);
-                    }
+                    //     `Active` too. On a transition failure the seeded `state`
+                    //     (owning the crypto) drops on the early return — zeroizing the
+                    //     group + sender key; nothing is persisted or registered yet.
+                    handle.transition_to(&scp_protocol::context::ContextState::Active)?;
 
                     // 3b. Entrypoint-level crypto durability check — BEFORE the persist
                     //     (BLACK-2J-03 / crypto L2 / simplifier). `build_snapshot_for_persist`
@@ -13853,21 +13827,21 @@ impl Supervisor {
                     //     reconnect-derive — it would need a fresh Welcome — so a keyless
                     //     snapshot means a live send-capable actor with NO durable keys. The
                     //     snapshot's crypto blob is a 1:1 copy of `export_crypto_state`, and the
-                    //     export is DETERMINISTIC between the install above and here (no mutation
+                    //     export is DETERMINISTIC between the seed above and here (no mutation
                     //     in between), so re-reading the live export tells us exactly what a
                     //     snapshot WOULD carry. Check it here, BEFORE persisting: on a
-                    //     non-durable export roll the just-installed group back and return
-                    //     `Err` — nothing has been persisted yet, so there is no durable
-                    //     snapshot to delete (strictly cleaner than persist-then-delete, same
-                    //     fail-closed guarantee).
+                    //     non-durable export the seeded `state` drops on the early return
+                    //     (zeroizing the crypto) — nothing has been persisted yet, so there
+                    //     is no durable snapshot to delete (strictly cleaner than
+                    //     persist-then-delete, same fail-closed guarantee).
                     // ADR-049 PR-6 (read-authority switch): floors sourced from
                     // the AUTHORITATIVE Supervisor-owned Class-M registry
                     // (`deps.supervisor.export_*`) and threaded into
                     // `export_crypto_state` as the durable-blob params; the
                     // provider floor mirrors are deleted.
-                    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 WELCOME seam: the crypto is
-                    // now OWNED by the seeded actor `state` (taken from the provider in
-                    // step 2b), so read the export off `state` — identical to what
+                    // #2148 (ADR-049 birth-into-actor) WELCOME seam: the crypto is
+                    // OWNED by the seeded actor `state` (born owned at step 2), so read
+                    // the export off `state` — identical to what
                     // `build_snapshot_for_persist` (step 4) will persist. The X25519
                     // wrapping keypair is node-level and enters as params from the
                     // RETAINED `deps.crypto.wrapping_keypair()` accessor.
@@ -13898,7 +13872,6 @@ impl Supervisor {
                             ),
                         )
                     {
-                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
                         return Err(ContextError::PersistenceFailed(format!(
                             "spawn-from-Welcome: the joined group for '{context_id}' produces no \
                          durable MLS crypto export (export failed / needs_reconnect) — a \
@@ -13908,12 +13881,13 @@ impl Supervisor {
                     }
 
                     // 4. Persist the initial Class-S snapshot FAIL-CLOSED, BEFORE the spawn
-                    //    is acked. The snapshot captures the installed MLS crypto state
-                    //    (`build_snapshot_for_persist` reads `deps.crypto.export_crypto_state`),
+                    //    is acked. The snapshot captures the seeded actor MLS crypto state
+                    //    (`build_snapshot_for_persist` reads `state.export_crypto_state`),
                     //    so a crash after this point rehydrates a fully-keyed context. A
-                    //    persist failure tears the installed group back out AND deletes any
-                    //    partial durable snapshot, then returns `Err` — never a live
-                    //    half-keyed actor and never an orphaned/clobbered durable snapshot.
+                    //    persist failure deletes any partial durable snapshot and returns
+                    //    `Err`; the seeded `state` (owning the crypto) drops on the early
+                    //    return (zeroizing) — never a live half-keyed actor and never an
+                    //    orphaned/clobbered durable snapshot.
                     if let Err(e) = crate::context::messaging_helpers::persist_state_fail_closed(
                         &state,
                         &deps,
@@ -13921,23 +13895,25 @@ impl Supervisor {
                     )
                     .await
                     {
-                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
                         let _ = deps.persistence.delete_context(&context_id).await;
                         return Err(e);
                     }
 
                     // 5. Spawn the owned-state actor + register its send handle. On failure
-                    //    (e.g. a racing duplicate registration) roll the group back AND delete
-                    //    the durable snapshot so no orphaned durable state survives the `Err`.
-                    //    Drop any stale crash-window state for this id FIRST (under
-                    //    `bootstrap_spawn_lock`, mirroring the create / import / standing
-                    //    bootstraps): a previously-poisoned+despawned same-id context must not
-                    //    leave the freshly-spawned joiner actor inheriting a sticky poison
-                    //    window.
+                    //    (e.g. a racing duplicate registration) delete the durable snapshot
+                    //    so no orphaned durable state survives the `Err`; `spawn_actor_with_state`
+                    //    consumes `state`, so on its `Err` return the seeded crypto is dropped
+                    //    (zeroizing) — it never returns to any provider. This atomic first-writer-wins
+                    //    registration (under `write_lock`) is the SOLE double-birth guard —
+                    //    the deleted provider `taken_context_ids` / `Entry::Vacant` guard was a
+                    //    redundant re-check of this same property (#2167 subsumed). Drop any
+                    //    stale crash-window state for this id FIRST (under `bootstrap_spawn_lock`,
+                    //    mirroring the create / import / standing bootstraps): a
+                    //    previously-poisoned+despawned same-id context must not leave the
+                    //    freshly-spawned joiner actor inheriting a sticky poison window.
                     self.reset_crash_window(&context_id);
                     let owned_deps = deps.clone_for_spawn();
                     if let Err(e) = self.spawn_actor_with_state(state, owned_deps, None).await {
-                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
                         let _ = deps.persistence.delete_context(&context_id).await;
                         return Err(e);
                     }
@@ -13950,18 +13926,18 @@ impl Supervisor {
                 Ok(inner) => inner,
                 Err(_elapsed) => {
                     // Timeout elapsed while the global `bootstrap_spawn_lock` was held.
-                    // Roll back exactly as the post-consume error arms do: destroy any
-                    // installed group and delete any persisted snapshot. Both are
-                    // idempotent `let _ =` no-ops when the elapse landed before that
-                    // step ran, so this is safe regardless of how far the timed region
-                    // progressed — no half-keyed crypto or orphaned durable snapshot
-                    // survives. Mirrors the `TransportTimeout` the import / restore /
-                    // respawn bootstraps return on their own `LIFECYCLE_TIMEOUT` elapse.
-                    // The actor is registered only by step 5's
-                    // `spawn_actor_with_state`, which resolves the timed future to
-                    // `Ok(..)` (never `Elapsed`) once it returns, so this arm is reached
-                    // only with NO registered actor for `context_id`.
-                    let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                    // The timed future is CANCELLED at the elapse, dropping any in-flight
+                    // seeded `state` (and with it the owned crypto — zeroizing); there is
+                    // no provider-resident crypto to tear down (#2148 birth-into-actor).
+                    // Delete any persisted snapshot: an idempotent `let _ =` no-op when the
+                    // elapse landed before step 4 ran, so it is safe regardless of how far
+                    // the timed region progressed — no orphaned durable snapshot survives.
+                    // Mirrors the `TransportTimeout` the import / restore / respawn
+                    // bootstraps return on their own `LIFECYCLE_TIMEOUT` elapse. The actor
+                    // is registered only by step 5's `spawn_actor_with_state`, which
+                    // resolves the timed future to `Ok(..)` (never `Elapsed`) once it
+                    // returns, so this arm is reached only with NO registered actor for
+                    // `context_id`.
                     let _ = deps.persistence.delete_context(&context_id).await;
                     Err(ContextError::TransportTimeout(format!(
                         "spawn-from-Welcome exceeded {:?} budget for context {context_id}",
@@ -16433,13 +16409,35 @@ mod tests {
     /// steady-state crypto twins (`seal` / `rotate_sender_key` / `drain_pending_
     /// sender_key_messages` / …) live on the actor, so tests that drive them move
     /// the party onto the actor first. One-way: the provider loses the context.
+    /// A minimal valid `0xFF02` extension bound to `ctx` for test births. The
+    /// export/restore tests below only exercise the crypto MATERIAL + floors, not
+    /// the §5.13.3 binding, so any well-formed extension suffices.
+    fn test_ctx_ext(ctx: &[u8; 32]) -> scp_protocol::context::ScpContextExtension {
+        let params = scp_protocol::context::ContextParams::default();
+        scp_protocol::context::ScpContextExtension::for_root(
+            hex::encode(ctx),
+            DID(String::new()),
+            params.mode,
+            &params.governance,
+            params.ceiling_policy,
+            &scp_protocol::context::roles::CapabilityCeiling::new(params.ceiling.clone()),
+        )
+        .expect("build test 0xFF02 extension")
+    }
+
+    /// #2148 (ADR-049 birth-into-actor): BIRTH an owned context group on `crypto`
+    /// via the owned-return `create_mls_group_with_context` and seed it onto a
+    /// throwaway actor `PerContextState` — the actor-native replacement for the
+    /// deleted `create_mls_group[_with_context]` + `generate_sender_key` +
+    /// `take_crypto_state` triad. The provider holds no per-context state.
     fn take_into_actor(
         crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
         ctx: &[u8; 32],
+        ext: &scp_protocol::context::ScpContextExtension,
     ) -> crate::context::actor::state::PerContextState {
         let owned = crypto
-            .take_crypto_state(ctx)
-            .expect("take owned crypto material off the provider");
+            .create_mls_group_with_context(ext)
+            .expect("birth owned crypto material");
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             *ctx,
             0,
@@ -16452,11 +16450,12 @@ mod tests {
     fn actor_export(
         crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
         ctx: &[u8; 32],
+        ext: &scp_protocol::context::ScpContextExtension,
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, scp_protocol::context::builder::ReceiveFloor)>,
     ) -> Result<Vec<u8>, ContextError> {
         let (wpub, wsec) = crypto.wrapping_keypair_snapshot();
-        let state = take_into_actor(crypto, ctx);
+        let state = take_into_actor(crypto, ctx, ext);
         state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
     }
 
@@ -20995,10 +20994,6 @@ mod tests {
             &scp_protocol::context::roles::CapabilityCeiling::new(ctx_params.ceiling.clone()),
         )
         .expect("build scp_context_params (0xFF02) extension for respawn fixture");
-        crypto
-            .create_mls_group_with_context(&ctx_id_bytes, &ctx_extension)
-            .unwrap();
-        crypto.generate_sender_key(&ctx_id_bytes).unwrap();
 
         // ADR-049 PR-6: the AUTHORITATIVE per-sender floor lives in the
         // Supervisor-owned Class-M registry. Advance it to epoch 5 — the
@@ -21027,6 +21022,7 @@ mod tests {
         snap.mls_crypto_state = actor_export(
             &crypto,
             &ctx_id_bytes,
+            &ctx_extension,
             sup.export_sender_key_epochs(&ctx_id_bytes),
             sup.export_recv_sequence_floors(&ctx_id_bytes),
         )
@@ -21116,8 +21112,6 @@ mod tests {
         // Origin node: keyed context + non-trivially advanced registry floors.
         let origin = supervisor_with_providers();
         let origin_crypto = origin.crypto_ref().expect("origin crypto").clone();
-        origin_crypto.create_mls_group(&ctx).unwrap();
-        origin_crypto.generate_sender_key(&ctx).unwrap();
         origin
             .check_and_advance_sender_epoch(&ctx, sender, 4, MAX_EPOCH_ADVANCE)
             .unwrap();
@@ -21137,6 +21131,7 @@ mod tests {
         let blob = actor_export(
             &origin_crypto,
             &ctx,
+            &test_ctx_ext(&ctx),
             origin.export_sender_key_epochs(&ctx),
             origin.export_recv_sequence_floors(&ctx),
         )
@@ -21246,14 +21241,13 @@ mod tests {
         // Exporter snapshot carries a LOW sender-epoch floor (=2).
         let exporter = supervisor_with_providers();
         let exporter_crypto = exporter.crypto_ref().expect("exporter crypto").clone();
-        exporter_crypto.create_mls_group(&ctx).unwrap();
-        exporter_crypto.generate_sender_key(&ctx).unwrap();
         exporter
             .check_and_advance_sender_epoch(&ctx, sender, 2, MAX_EPOCH_ADVANCE)
             .unwrap();
         let blob = actor_export(
             &exporter_crypto,
             &ctx,
+            &test_ctx_ext(&ctx),
             exporter.export_sender_key_epochs(&ctx),
             exporter.export_recv_sequence_floors(&ctx),
         )
@@ -21296,14 +21290,13 @@ mod tests {
             "the live floor (9) must survive the rejected import"
         );
 
-        // Provider rolled back: the just-restored group was destroyed on the Err
-        // path, so the importer's provider holds NO crypto state for `ctx`. Probe
-        // via the retained `context_crypto_present` (the serializing
-        // `export_crypto_state` twin is deleted post-ADR-049 PR-7).
-        assert!(
-            !importer_crypto.context_crypto_present(&ctx),
-            "the restored crypto must be rolled back (group destroyed) on rejection"
-        );
+        // #2148 (ADR-049 birth-into-actor): rollback = the owned material is
+        // dropped (zeroized) on the Err path and never seeded onto an actor. The
+        // provider holds NO per-context state (the `contexts` map and the
+        // `context_crypto_present` residency probe are deleted), so there is no
+        // provider residency to assert — the floor-registry state above is the
+        // observable evidence the rejected import left nothing behind.
+        let _ = &importer_crypto;
     }
 
     /// ADR-049 A2 — a cold restart of a context whose per-sender epoch high-water
@@ -21325,8 +21318,6 @@ mod tests {
 
         let origin = supervisor_with_providers();
         let origin_crypto = origin.crypto_ref().expect("origin crypto").clone();
-        origin_crypto.create_mls_group(&ctx).unwrap();
-        origin_crypto.generate_sender_key(&ctx).unwrap();
         origin
             .check_and_advance_sender_epoch(&ctx, sender, high, high)
             .unwrap();
@@ -21344,6 +21335,7 @@ mod tests {
         let blob = actor_export(
             &origin_crypto,
             &ctx,
+            &test_ctx_ext(&ctx),
             origin.export_sender_key_epochs(&ctx),
             origin.export_recv_sequence_floors(&ctx),
         )
@@ -21399,8 +21391,6 @@ mod tests {
         // regress below importer live recv).
         let exporter = supervisor_with_providers();
         let exporter_crypto = exporter.crypto_ref().expect("exporter crypto").clone();
-        exporter_crypto.create_mls_group(&ctx).unwrap();
-        exporter_crypto.generate_sender_key(&ctx).unwrap();
         exporter
             .check_and_advance_sender_epoch(&ctx, sender, 9, MAX_EPOCH_ADVANCE)
             .unwrap();
@@ -21418,6 +21408,7 @@ mod tests {
         let blob = actor_export(
             &exporter_crypto,
             &ctx,
+            &test_ctx_ext(&ctx),
             exporter.export_sender_key_epochs(&ctx),
             exporter.export_recv_sequence_floors(&ctx),
         )

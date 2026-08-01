@@ -10918,18 +10918,14 @@ impl Scp {
                 let memory_scope = core_handle.params().memory_scope;
                 let now = scp_clock::SystemClock.now_secs();
 
-                // Build a fresh `MlsCryptoProvider` for key-destruction scoped to
-                // the initiator's DID. The bridge no longer caches a global stub
-                // crypto provider (commit 4 removed `FfiBridgeCrypto`). The
-                // `CloseOrchestrator` only uses this provider to destroy MLS group
-                // and sender-key material for the context being closed; a fresh
-                // per-call instance is correct.
-                let crypto_provider = scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-                    identity_did,
-                    std::sync::Arc::new(scp_clock::SystemClock),
-                );
-                let orchestrator =
-                    scp_core::context::key_destruction::CloseOrchestrator::new(&crypto_provider);
+                // #2148 (ADR-049 birth-into-actor): the `CloseOrchestrator` no
+                // longer holds a crypto provider. The actual MLS-group +
+                // sender-key destruction is performed by the context's ACTOR — the
+                // `LifecycleCommand::CloseContext` dispatched above routes through
+                // the actor's close handler, which disposes the actor-owned crypto
+                // for Ephemeral/Summary scope. This orchestrator only computes the
+                // relay-deletion + attestation `CloseAction` for observability.
+                let orchestrator = scp_core::context::key_destruction::CloseOrchestrator::new();
 
                 let close_action = orchestrator
                     .initiate_close(

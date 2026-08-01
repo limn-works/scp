@@ -11,8 +11,8 @@
 //!
 //! ADR-049 #2148 (birth-into-actor) slice 2: the pair is born DIRECTLY onto
 //! actor-owned [`PerContextState`] via the owned-return MLS constructors
-//! ([`MlsCryptoProvider::create_mls_group_with_context_owned`] /
-//! [`MlsCryptoProvider::install_joined_group_owned`]) plus the production
+//! ([`MlsCryptoProvider::create_mls_group_with_context`] /
+//! [`MlsCryptoProvider::install_joined_group`]) plus the production
 //! [`PerContextState::seed_encrypted_crypto_from_owned`] seed primitive — never
 //! through a provider-resident insert + `take_crypto_state` round-trip. The
 //! returned providers are kept ONLY as the node-resident source of each party's
@@ -273,7 +273,7 @@ pub fn stand_up_two_party(
 
             // Alice (bare creator provider) BIRTHS the honest SCP context group
             // (committing her DID + params into `0xFF02`) DIRECTLY onto owned
-            // actor state via `create_mls_group_with_context_owned` + the
+            // actor state via `create_mls_group_with_context` + the
             // production seed primitive — no provider-resident insert. The owned
             // constructor mints her sender key (epoch 1).
             let params = joiner_params();
@@ -282,7 +282,7 @@ pub fn stand_up_two_party(
                 Arc::new(scp_clock::SystemClock),
             ));
             let alice_owned = alice_crypto
-                .create_mls_group_with_context_owned(&honest_ext(ctx_str, alice_did, &params))
+                .create_mls_group_with_context(&honest_ext(ctx_str, alice_did, &params))
                 .expect("alice births the owned SCP context group (0xFF02)");
             let mut alice_state = PerContextState::new_for_test_encrypted(
                 ctx_bytes,
@@ -310,7 +310,7 @@ pub fn stand_up_two_party(
             // Bob confirms the join at the PROVIDER level (the real fused
             // `ConfirmConsume` join → the joined `ScpMlsGroup`), then BIRTHS the
             // joined crypto DIRECTLY onto owned actor state via
-            // `install_joined_group_owned` + the production seed primitive — no
+            // `install_joined_group` + the production seed primitive — no
             // provider-resident insert, no `take_crypto_state` round-trip. The
             // owned constructor mints Bob's own sender key (epoch 1) locally
             // (§9.16.1 — the Welcome carries no sender key).
@@ -327,7 +327,7 @@ pub fn stand_up_two_party(
                 })
                 .await
                 .expect("bob confirms the join and receives the joined MLS group");
-            let bob_owned = bob_crypto.install_joined_group_owned(joined_group);
+            let bob_owned = bob_crypto.install_joined_group(joined_group);
             let mut bob_state = PerContextState::new_for_test_encrypted(
                 ctx_bytes,
                 0,

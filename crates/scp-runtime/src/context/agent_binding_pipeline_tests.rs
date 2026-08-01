@@ -663,7 +663,7 @@ mod live_supervisor_send {
         // Bob confirms the join at the PROVIDER level (the real fused
         // `ConfirmConsume` join → the joined `ScpMlsGroup`), then BIRTHS the
         // joined crypto DIRECTLY onto owned actor state via the #2148
-        // `install_joined_group_owned` constructor + the production seed
+        // `install_joined_group` constructor + the production seed
         // primitive (no provider-resident insert, no `take_crypto_state`
         // round-trip). The owned constructor mints Bob's own sender key locally.
         let bob_pseudonym = [0x42u8; 32];
@@ -680,7 +680,7 @@ mod live_supervisor_send {
             })
             .await
             .expect("bob confirms the join and receives the joined MLS group");
-        let bob_owned = bob.install_joined_group_owned(joined_group);
+        let bob_owned = bob.install_joined_group(joined_group);
         drop(bob_sup);
 
         // Bob's node-resident wrapping secret (the actor HPKE-open key), captured

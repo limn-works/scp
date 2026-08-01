@@ -47,7 +47,9 @@ use std::time::Duration;
 
 use super::ContextHandle;
 use super::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::crypto::mls::provider::MlsCryptoProvider;
+// #2148 (ADR-049 birth-into-actor): production TTL/close paths no longer take a
+// crypto provider (key destruction runs on the actor-owned crypto). The single
+// test that constructs a provider imports it locally.
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::membership::ContextEvent;
@@ -520,7 +522,6 @@ pub struct CloseResult {
 #[allow(clippy::unused_async)]
 pub async fn finalize_close(
     handle: &ContextHandle,
-    crypto: &MlsCryptoProvider,
     transport: &dyn ContextTransportProvider,
     event_log: &dyn ContextEventLogProvider,
     // Timestamp recorded on the `ContextClosed` leaf. This lower-level producer
@@ -535,31 +536,28 @@ pub async fn finalize_close(
     // `handle_ttl_expiry` and never reaches this function (§7.3.1, §9.9.3).
     timestamp_secs: u64,
 ) -> Result<(), ContextError> {
-    // Validate state transition BEFORE destroying any key material.
-    // Key destruction is irreversible — once zeroized, encrypted content
-    // becomes permanently unreadable. If the transition fails (e.g. context
-    // is not in Closing state), no keys must be destroyed.
+    // Validate state transition BEFORE any key destruction (which the caller,
+    // `ttl_close_helpers::finalize_close`, performs on the ACTOR-owned crypto
+    // AFTER this returns Ok). Key destruction is irreversible — once zeroized,
+    // encrypted content becomes permanently unreadable. If the transition fails
+    // (e.g. context is not in Closing state), no keys must be destroyed.
     handle.transition_to(&ContextState::Closed)?;
 
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = context_id_to_bytes(&context_id);
     let memory_scope = handle.params().memory_scope;
 
-    // Full memory scope retains keys — content remains readable after close.
-    // Only destroy crypto material for Ephemeral and Summary scopes. Key
-    // destruction is synchronous; the best-effort relay ciphertext deletion is
-    // deferred until AFTER the completeness-critical `ContextClosed` append
-    // below (M2), so a stalled relay cannot delay/starve the terminal leaf.
+    // #2148 (ADR-049 birth-into-actor): the MLS group + sender key are
+    // ACTOR-owned (the provider holds none — its `destroy_mls_group` /
+    // `destroy_sender_key` methods are DELETED). The actual key destruction for
+    // Ephemeral/Summary scope is performed by the caller
+    // (`ttl_close_helpers::finalize_close`) on the actor-owned crypto via the
+    // `ClassSCell`, AFTER this transition succeeds. This function only stamps
+    // the terminal leaf and issues the best-effort relay ciphertext delete —
+    // the latter still gated on `needs_key_destruction`: Full scope retains
+    // keys and content, so its ciphertext is NOT deleted.
     let needs_key_destruction =
         memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
-    if needs_key_destruction {
-        crypto
-            .destroy_mls_group(&context_id_bytes)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        crypto
-            .destroy_sender_key(&context_id_bytes)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-    }
 
     // (d) idempotent terminal leaf (ADR-049 §9 amendment): if a `ContextClosed`
     // leaf already exists for this context (a prior finalize appended it, then
@@ -637,7 +635,9 @@ pub async fn finalize_close(
 #[allow(clippy::unused_async)]
 pub async fn try_ttl_expiry_cleanup(
     handle: &ContextHandle,
-    crypto: &MlsCryptoProvider,
+    // #2148 (ADR-049 birth-into-actor): the actor-owned crypto to dispose on
+    // Ephemeral/Summary expiry (`None` for Broadcast / already-disposed).
+    crypto_state: Option<&mut crate::context::actor::ContextCryptoState>,
     transport: Option<&dyn ContextTransportProvider>,
     event_log: &dyn ContextEventLogProvider,
     prior_completed: u8,
@@ -656,7 +656,7 @@ pub async fn try_ttl_expiry_cleanup(
     // ([`apply_ttl_terminal_transition`] + [`finish_ttl_expiry_io`]) SEPARATELY
     // so the fail-closed persist runs OUTSIDE the relay/event-log transport
     // timeout.
-    let result = apply_ttl_terminal_transition(handle, crypto, prior_completed);
+    let result = apply_ttl_terminal_transition(handle, crypto_state, prior_completed);
     if result.completed_steps & STEP_STATE_TRANSITIONED == 0 {
         // Transition failed / context not in an expiry-eligible state — bail
         // before any I/O (mirrors the prior early return).
@@ -686,11 +686,14 @@ pub async fn try_ttl_expiry_cleanup(
 #[must_use]
 pub(crate) fn apply_ttl_terminal_transition(
     handle: &ContextHandle,
-    crypto: &MlsCryptoProvider,
+    // #2148 (ADR-049 birth-into-actor): key destruction runs on the ACTOR-owned
+    // crypto (the provider holds none). `Some` for an Encrypted context, `None`
+    // for a Broadcast context (which is always Full scope, so no destruction is
+    // ever needed) or an already-disposed one.
+    crypto_state: Option<&mut crate::context::actor::ContextCryptoState>,
     prior_completed: u8,
 ) -> TtlExpiryResult {
     let context_id = handle.context_id().to_owned();
-    let context_id_bytes = context_id_to_bytes(&context_id);
     let memory_scope = handle.params().memory_scope;
 
     let mut result = TtlExpiryResult {
@@ -737,33 +740,25 @@ pub(crate) fn apply_ttl_terminal_transition(
         }
     }
 
-    // 2. Key destruction (Ephemeral/Summary only). Each operation is
-    //    independent — a failure in one does not block the other. Skip
-    //    operations that already succeeded on a prior attempt. SYNC crypto
-    //    ops (no `.await`), so this whole phase runs outside any timeout.
-    if needs_key_destruction {
-        if result.completed_steps & STEP_MLS_DESTROYED == 0 {
-            match crypto.destroy_mls_group(&context_id_bytes) {
-                Ok(()) => result.set_step(STEP_MLS_DESTROYED),
-                Err(e) => {
-                    let msg = format!("failed to destroy MLS group: {e}");
-                    tracing::warn!(context_id = %context_id, error = %e,
-                        "failed to destroy MLS group after TTL expiry — keys may persist");
-                    result.errors.push(msg);
-                }
-            }
+    // 2. Key destruction (Ephemeral/Summary only). #2148 (ADR-049
+    //    birth-into-actor): the MLS group + sender key are ACTOR-owned, so
+    //    destruction runs `dispose_secrets` on the actor-owned
+    //    `ContextCryptoState` (which runs OpenMLS `destroy_group` — deleting the
+    //    epoch secrets a bare drop would leave resident — then zeroizes the
+    //    sender key material). This is infallible and atomic (both the MLS group
+    //    and the sender keys are torn down in one call), so both destroy steps
+    //    are marked together. SYNC (no `.await`), so this whole phase runs
+    //    outside any timeout. A `None` crypto state (broadcast / already-disposed)
+    //    has nothing to tear down — the steps are marked done so the fail-closed
+    //    persist records completion and a retry does not spin.
+    if needs_key_destruction
+        && result.completed_steps & (STEP_MLS_DESTROYED | STEP_SENDER_KEY_DESTROYED)
+            != (STEP_MLS_DESTROYED | STEP_SENDER_KEY_DESTROYED)
+    {
+        if let Some(crypto_state) = crypto_state {
+            crypto_state.dispose_secrets();
         }
-        if result.completed_steps & STEP_SENDER_KEY_DESTROYED == 0 {
-            match crypto.destroy_sender_key(&context_id_bytes) {
-                Ok(()) => result.set_step(STEP_SENDER_KEY_DESTROYED),
-                Err(e) => {
-                    let msg = format!("failed to destroy sender key: {e}");
-                    tracing::warn!(context_id = %context_id, error = %e,
-                        "failed to destroy sender key after TTL expiry — keys may persist");
-                    result.errors.push(msg);
-                }
-            }
-        }
+        result.set_step(STEP_MLS_DESTROYED | STEP_SENDER_KEY_DESTROYED);
     }
 
     result
@@ -1139,12 +1134,11 @@ mod tests {
     /// `MlsBackend`-level fail-injection in ADR-049 §15.
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
-    fn mk_crypto() -> std::sync::Arc<MlsCryptoProvider> {
-        std::sync::Arc::new(MlsCryptoProvider::new(
-            TEST_DID.to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ))
-    }
+    // #2148 (ADR-049 birth-into-actor): `mk_crypto` was DELETED — the production
+    // TTL/close paths no longer take a crypto provider (key destruction runs on
+    // the actor-owned crypto), and these tests exercise the FSM + leaf/relay
+    // behaviour with `None` crypto state (an unregistered context has nothing to
+    // dispose).
 
     // ---------------------------------------------------------------------------
     // Transport / event-log mocks — these do NOT touch crypto.
@@ -1240,7 +1234,6 @@ mod tests {
     /// second leaf. Post-fix it consults the log tail and skips.
     #[tokio::test]
     async fn expiry_leaf_append_is_idempotent_across_respawn() {
-        let crypto = mk_crypto();
         let transport = NullTransport;
         let event_log = StatefulEventLog::default();
         let handle = active_handle("ctx-ttl-idem", MemoryScope::Full);
@@ -1248,7 +1241,7 @@ mod tests {
         // First expiry — appends the ContextExpired leaf.
         let r1 = super::try_ttl_expiry_cleanup(
             &handle,
-            crypto.as_ref(),
+            None,
             Some(&transport),
             &event_log,
             0,
@@ -1261,7 +1254,7 @@ mod tests {
         // the terminal leaf already exists, so the append is skipped.
         let r2 = super::try_ttl_expiry_cleanup(
             &handle,
-            crypto.as_ref(),
+            None,
             Some(&transport),
             &event_log,
             0,
@@ -1335,7 +1328,6 @@ mod tests {
     /// own `RELAY_DELETE_BUDGET`, so a stalled relay cannot starve the append.
     #[tokio::test(start_paused = true)]
     async fn relay_stall_does_not_starve_leaf_append() {
-        let crypto = mk_crypto();
         let transport = StallingTransport::default();
         let event_log = StatefulEventLog::default();
         // Ephemeral scope ⇒ the terminal path DOES issue the best-effort relay
@@ -1352,7 +1344,7 @@ mod tests {
             crate::context::actor::handlers::ttl_close::HANDLER_TIMEOUT,
             super::try_ttl_expiry_cleanup(
                 &handle,
-                crypto.as_ref(),
+                None,
                 Some(&transport),
                 &event_log,
                 0,
@@ -1464,20 +1456,13 @@ mod tests {
     /// leaf so it is byte-identical across all honest members' `finalize_close` leaves.
     #[tokio::test]
     async fn finalize_close_stamps_system_close_actor_did() {
-        let crypto = mk_crypto();
         let transport = NullTransport;
         let event_log = CapturingEventLog::default();
         let handle = active_handle("ctx-close-actor", MemoryScope::Full);
         handle.transition_to(&ContextState::Closing).unwrap();
-        finalize_close(
-            &handle,
-            crypto.as_ref(),
-            &transport,
-            &event_log,
-            1_700_000_000,
-        )
-        .await
-        .unwrap();
+        finalize_close(&handle, &transport, &event_log, 1_700_000_000)
+            .await
+            .unwrap();
 
         let appends = event_log.appends.lock().unwrap();
         let closed = appends
@@ -1496,12 +1481,11 @@ mod tests {
     /// across all honest members' leaves.
     #[tokio::test]
     async fn ttl_expiry_stamps_system_timer_actor_did() {
-        let crypto = mk_crypto();
         let event_log = CapturingEventLog::default();
         let handle = active_handle("ctx-ttl-actor", MemoryScope::Full);
         let res = super::try_ttl_expiry_cleanup(
             &handle,
-            crypto.as_ref(),
+            None,
             Some(&NullTransport),
             &event_log,
             0,
@@ -1539,181 +1523,49 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_close_full_scope_skips_destruction() {
-        let crypto = mk_crypto();
         let transport = NullTransport;
         let event_log = NullEventLog;
         let handle = active_handle("ctx-1", MemoryScope::Full);
         handle.transition_to(&ContextState::Closing).unwrap();
-        let res = finalize_close(
-            &handle,
-            crypto.as_ref(),
-            &transport,
-            &event_log,
-            1_700_000_000,
-        )
-        .await;
+        let res = finalize_close(&handle, &transport, &event_log, 1_700_000_000).await;
         assert!(res.is_ok());
     }
 
     #[tokio::test]
     async fn finalize_close_ephemeral_scope_runs_destruction() {
-        let crypto = mk_crypto();
         let transport = NullTransport;
         let event_log = NullEventLog;
         let handle = active_handle("ctx-eph", MemoryScope::Ephemeral);
         handle.transition_to(&ContextState::Closing).unwrap();
-        let res = finalize_close(
-            &handle,
-            crypto.as_ref(),
-            &transport,
-            &event_log,
-            1_700_000_000,
-        )
-        .await;
+        let res = finalize_close(&handle, &transport, &event_log, 1_700_000_000).await;
         // Real MlsCryptoProvider is idempotent on destroy for unregistered ctxs.
         assert!(res.is_ok());
     }
-
-    /// ADR-056 forward-secrecy regression guard for the TTL-expiry destruction
-    /// path. `try_ttl_expiry_cleanup` MUST resolve its MLS-keying bytes through
-    /// the canonical
-    /// [`context_id_to_bytes`](crate::context::state::context_id_to_bytes)
-    /// chokepoint, NOT the raw
-    /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive.
-    ///
-    /// For a REAL 64-hex member-context id the chokepoint DECODES the string to
-    /// its 32-byte digest, while the raw primitive RE-HASHES it
-    /// (`SHA-256(hex(digest))`). The live MLS group and sender key are keyed
-    /// under the DIGEST, so a regression to the raw primitive would call
-    /// `destroy_mls_group(SHA-256(id))` — a no-op against an unkeyed slot —
-    /// while the real group SURVIVES past TTL expiry (the ADR-056 fail-open).
-    ///
-    /// The other ttl.rs tests use `"ctx-*"` labels, for which the chokepoint
-    /// and the raw primitive coincide. This test seeds the group + sender key
-    /// under the DIGEST of a real 64-hex id, drives the production
-    /// `try_ttl_expiry_cleanup` path with an Ephemeral handle carrying the
-    /// STRING id, and asserts the group was PRESENT before and GONE after —
-    /// under the digest. `export_crypto_state` returns a non-empty snapshot only
-    /// for a keyed context (empty vec otherwise), so a destruction that keyed
-    /// off `SHA-256(id)` would leave the digest slot populated and FAIL the
-    /// post-destruction emptiness assertion (mutation-resistant).
-    #[tokio::test]
-    async fn ttl_expiry_destroys_real_context_via_chokepoint_not_raw_primitive() {
-        // A REAL (64-hex) member-context id: `hex(digest)` of a 32-byte digest.
-        let digest = [0xABu8; 32];
-        let id = hex::encode(digest);
-        assert_eq!(id.len(), 64, "fixture id must be a real 64-hex context id");
-
-        // Precondition: the canonical resolver DECODES the 64-hex id to its
-        // digest, while the raw primitive RE-HASHES it. The two must differ,
-        // otherwise this test could not distinguish the keying paths.
-        let chokepoint_bytes = crate::context::state::context_id_to_bytes(&id);
-        let raw_bytes = scp_protocol::context::context_id_bytes(&id);
-        assert_eq!(
-            chokepoint_bytes, digest,
-            "the chokepoint must decode a 64-hex id to its digest"
-        );
-        assert_ne!(
-            chokepoint_bytes, raw_bytes,
-            "test precondition: digest must differ from SHA-256(hex(digest))"
-        );
-
-        // Seed an MLS group AND a sender key under the DIGEST — the slot the
-        // live context (and the chokepoint) key on.
-        let crypto = mk_crypto();
-        crypto
-            .create_mls_group(&digest)
-            .expect("create_mls_group under the digest");
-        crypto
-            .generate_sender_key(&digest)
-            .expect("generate_sender_key under the digest");
-
-        // The group MUST be present under the digest before expiry — proves this
-        // is a real destroy, not a phantom no-op against an empty slot. Probe via
-        // the retained `context_crypto_present` (the serializing `export_crypto_
-        // state` twin is deleted post-ADR-049 PR-7).
-        assert!(
-            crypto.context_crypto_present(&digest),
-            "precondition: crypto state must be keyed under the digest before TTL expiry"
-        );
-
-        // Drive the REAL TTL-expiry destruction path with an Ephemeral handle
-        // carrying the STRING id, so production resolves id -> bytes via the
-        // chokepoint at :792.
-        let event_log = NullEventLog;
-        let handle = active_handle(&id, MemoryScope::Ephemeral);
-        let result = try_ttl_expiry_cleanup(
-            &handle,
-            crypto.as_ref(),
-            Some(&NullTransport),
-            &event_log,
-            0,
-            1_700_000_000,
-        )
-        .await;
-
-        // The cleanup must complete with no failures, and must report both the
-        // MLS group and the sender key destroyed.
-        assert!(
-            !result.has_failures(),
-            "TTL expiry cleanup must complete cleanly, errors: {:?}",
-            result.errors()
-        );
-        assert!(
-            result.mls_destroyed(),
-            "TTL expiry must destroy the MLS group"
-        );
-        assert!(
-            result.sender_key_destroyed(),
-            "TTL expiry must destroy the sender key"
-        );
-
-        // The group MUST be GONE under the digest after expiry. If production had
-        // resolved via the raw `SHA-256(id)` primitive, `destroy_mls_group`
-        // would have addressed an unkeyed slot (a silent no-op) and the digest
-        // slot would still be populated — this assertion FAILS in that case.
-        assert!(
-            !crypto.context_crypto_present(&digest),
-            "ADR-056 FAIL-OPEN: the MLS group SURVIVED under the digest after TTL \
-             expiry — destruction keyed off the wrong slot (raw SHA-256(id) \
-             instead of the chokepoint digest)"
-        );
-    }
+    // #2148 (ADR-049 birth-into-actor): the ADR-056 TTL-expiry chokepoint
+    // regression test was DELETED — `try_ttl_expiry_cleanup` now disposes the
+    // actor-owned crypto passed to it directly and no longer resolves a
+    // context-id string to provider-map bytes, so there is no id-resolution to
+    // guard here. The decode-not-rehash keying invariant is proved at the birth
+    // seam / actor level (see `builder::create_context` tests).
 
     #[tokio::test]
     async fn ttl_expiry_transitions_active_to_expired() {
-        let crypto = mk_crypto();
         let event_log = NullEventLog;
         let handle = active_handle("ctx-ttl", MemoryScope::Full);
-        let res = super::try_ttl_expiry_cleanup(
-            &handle,
-            crypto.as_ref(),
-            None,
-            &event_log,
-            0,
-            1_700_000_000,
-        )
-        .await;
+        let res =
+            super::try_ttl_expiry_cleanup(&handle, None, None, &event_log, 0, 1_700_000_000).await;
         assert!(!res.has_failures(), "expiry cleanup completes: {res}");
         assert_eq!(handle.state(), ContextState::Expired);
     }
 
     #[tokio::test]
     async fn ttl_expiry_rejects_non_active_contexts() {
-        let crypto = mk_crypto();
         let event_log = NullEventLog;
         let handle = ContextHandle::new("ctx-new".to_owned(), ContextParams::default());
         // Handle is in Creating state — not Active / Expired, so the terminal
         // transition is refused: the cleanup reports failure and no transition.
-        let res = super::try_ttl_expiry_cleanup(
-            &handle,
-            crypto.as_ref(),
-            None,
-            &event_log,
-            0,
-            1_700_000_000,
-        )
-        .await;
+        let res =
+            super::try_ttl_expiry_cleanup(&handle, None, None, &event_log, 0, 1_700_000_000).await;
         assert!(res.has_failures(), "non-active expiry must report failure");
         assert!(
             !res.state_transitioned(),
