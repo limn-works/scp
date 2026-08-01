@@ -995,6 +995,72 @@ impl MlsCryptoProvider {
         Ok(())
     }
 
+    /// #2148 (ADR-049 birth-into-actor) owned-return birth path — the
+    /// additive, map-free twin of [`Self::create_mls_group_with_context`].
+    ///
+    /// Builds the context group through the SAME `scp-mls` primitive
+    /// ([`group::create_group_with_context`]) and mints the local sender key
+    /// through the SAME [`generate_sender_key`], then assembles the
+    /// [`OwnedMlsCryptoState`] payload DIRECTLY and hands it back. It does NOT
+    /// touch any shared provider map: no [`Self::contexts`] insert, no
+    /// [`Self::taken_context_ids`] mark, no private
+    /// [`ContextCryptoState`]. The ONLY difference from the insert-based
+    /// sibling is "return owned" vs "install into the shared map" — the two
+    /// paths are proven byte-identical field-by-field (deterministic fields
+    /// exact, freshly-minted fields shape-equal) by
+    /// `create_mls_group_with_context_owned_matches_insert_path`.
+    ///
+    /// This is the constructor the LATER birth-into-actor slice will call to
+    /// hand a freshly-born group + sender key straight onto the spawning
+    /// actor's `PerContextState`, eliminating the transient
+    /// insert-then-`take_crypto_state` round-trip through the provider. This
+    /// slice adds it additively; the insert-based path stays untouched and in
+    /// use.
+    ///
+    /// Unlike the insert-based sibling this takes NO `context_id`: the map-free
+    /// owned birth reserves no shared-map slot, so it needs no context key. The
+    /// birth-into-actor caller already holds the `context_id` it uses to key the
+    /// spawning actor. There is likewise no overwrite-refusal or "owned by
+    /// actor" guard here — those guards on the insert paths exist only to keep
+    /// the provider and actor from becoming double owners while BOTH homes
+    /// coexist; the owned path never installs a second home.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::CryptoFailed`] if credential creation or
+    /// MLS group creation fails. Cannot fail on slot contention — it reserves
+    /// no slot.
+    pub fn create_mls_group_with_context_owned(
+        &self,
+        context_extension: &scp_protocol::context::ScpContextExtension,
+    ) -> Result<OwnedMlsCryptoState, ContextCreationError> {
+        let credential = self.make_credential()?;
+        // Load through ArcSwap; the guard is dropped as `.public` is `Copy`ed
+        // into the stack array — same discipline as `create_group_into_slot`.
+        let wrapping_pk = self.wrapping_keypair.load().public;
+        let mls_group = group::create_group_with_context(
+            &credential,
+            &wrapping_pk,
+            context_extension,
+            self.clock.as_ref(),
+        )
+        .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
+
+        // Assemble the owned payload directly — identical field values to the
+        // `ContextCryptoState` that `create_group_into_slot` would have
+        // installed, minus the map insert.
+        Ok(OwnedMlsCryptoState {
+            mls_group,
+            sender_key: generate_sender_key(),
+            sender_key_store: SenderKeyStore::new(),
+            sender_key_epoch: 1,
+            send_sequence: 0,
+            pending_distributions: Vec::new(),
+            nonce_dedup: NonceDedup::new(),
+            member_wrapping_keys: HashMap::new(),
+        })
+    }
+
     /// Installs an already-joined `OpenMLS` group into the provider's live
     /// context store, keyed by `context_id` (ADR-049 Phase 2J,
     /// spawn-from-Welcome).
@@ -1087,6 +1153,52 @@ impl MlsCryptoProvider {
 
         slot.insert(state);
         Ok(())
+    }
+
+    /// #2148 (ADR-049 birth-into-actor) owned-return join path — the additive,
+    /// map-free twin of [`Self::install_joined_group`].
+    ///
+    /// A joiner has already produced its self-contained [`ScpMlsGroup`] by
+    /// processing a received Welcome (it owns its own `OpenMLS` provider +
+    /// signer). This constructor mints the joiner's OWN AES-256 sender key
+    /// LOCALLY through the SAME [`generate_sender_key`] (spec §9.16.1 — the
+    /// Welcome carries no sender key) and assembles the [`OwnedMlsCryptoState`]
+    /// payload DIRECTLY, moving the joined `group` in verbatim. It touches no
+    /// shared provider map: no [`Self::contexts`] insert, no `Vacant` guard, no
+    /// [`Self::taken_context_ids`] mark. The ONLY difference from the
+    /// insert-based sibling is "return owned" vs "install into the shared map";
+    /// the two paths' assembly is proven equivalent field-by-field
+    /// (deterministic fields exact, freshly-minted sender key shape-equal, the
+    /// passed-in group preserved verbatim) by
+    /// `install_joined_group_owned_matches_insert_path`.
+    ///
+    /// Like [`Self::create_mls_group_with_context_owned`], this is the
+    /// constructor the LATER birth-into-actor slice will call to seed the
+    /// spawning-from-Welcome actor directly, eliminating the transient
+    /// `install_joined_group` + `take_crypto_state` round-trip. Cannot fail: it
+    /// reserves no slot and does no fallible I/O, so it returns the payload by
+    /// value (no `Result`). `sender_key_store`, `nonce_dedup`,
+    /// `pending_distributions`, and `member_wrapping_keys` start empty — the
+    /// same initial shape a fresh join produces (see
+    /// [`Self::install_joined_group`] for why `member_wrapping_keys` stays empty
+    /// for a joiner).
+    #[must_use]
+    pub fn install_joined_group_owned(&self, group: ScpMlsGroup) -> OwnedMlsCryptoState {
+        // Direct assembly — identical field values to the `ContextCryptoState`
+        // that `install_joined_group` would have installed, minus the map
+        // insert.
+        OwnedMlsCryptoState {
+            mls_group: group,
+            // The joiner's own AES-256 sender key (spec §9.16.1), minted
+            // locally — epoch starts at 1, matching a fresh create / join.
+            sender_key: generate_sender_key(),
+            sender_key_store: SenderKeyStore::new(),
+            sender_key_epoch: 1,
+            send_sequence: 0,
+            pending_distributions: Vec::new(),
+            nonce_dedup: NonceDedup::new(),
+            member_wrapping_keys: HashMap::new(),
+        }
     }
 
     /// Generates a sender key for the given context.
@@ -4760,6 +4872,250 @@ mod tests {
         assert!(
             matches!(second, Err(ContextCreationError::CreationFailed(_))),
             "a second create for a live id must be refused, got {second:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2148 (ADR-049 birth-into-actor) — byte-parity between the additive
+    // owned-return birth constructors and the current insert-based paths.
+    //
+    // The point of this slice is to prove, BEFORE the later slice deletes the
+    // insert-then-take round-trip, that the map-free owned constructors are
+    // byte-identical to the insert-based path wherever the field is
+    // deterministic. Two SEPARATE births can never share the fresh randomness
+    // each one mints (a fresh MLS group carries fresh epoch/init secrets; a
+    // fresh sender key is 32 fresh random bytes), so those fields are asserted
+    // shape-equal (same length / structural readability / same committed
+    // params), and the deterministic fields are asserted byte-exact. This is
+    // NOT a construction divergence — both paths route through the SAME
+    // `scp-mls` primitives and the SAME `generate_sender_key`; the only
+    // difference under test is "install into the shared map" vs "return owned".
+    // -----------------------------------------------------------------------
+
+    /// Build a self-contained joined [`ScpMlsGroup`] over the real
+    /// creator-add → sign → join-from-Welcome path (mirrors
+    /// `encrypt_decrypt_roundtrip_two_members`). Each call mints an INDEPENDENT
+    /// group with fresh secrets — used to exercise the join-side owned
+    /// constructor.
+    fn make_joined_group() -> ScpMlsGroup {
+        let alice_provider = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let ctx_id = make_context_id();
+        alice_provider.create_mls_group(&ctx_id).unwrap();
+
+        let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider_mls) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let add_result = {
+            let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
+            let kp_in: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
+            group::add_member(&mut state.mls_group, kp_in, &SystemClock).unwrap()
+        };
+        group::join_group(&add_result.welcome, bob_provider_mls, bob_signer).unwrap()
+    }
+
+    /// #2148: `create_mls_group_with_context_owned` yields owned material
+    /// byte-identical to the insert-based `create_mls_group_with_context` +
+    /// `take_crypto_state` round-trip.
+    ///
+    /// Deterministic fields (`sender_key_epoch`, `send_sequence`,
+    /// `pending_distributions`, `member_wrapping_keys`, `sender_key_store`
+    /// contents, `nonce_dedup` TTL) are asserted byte/shape-exact. The MLS
+    /// group's committed `scp_context_params` (`0xFF02`) extension is
+    /// deterministic (it is the caller-supplied input folded in identically) so
+    /// it too is asserted byte-equal. The freshly-minted `sender_key` and the
+    /// group's own epoch/init secrets are per-birth random — asserted
+    /// shape-equal (32-byte non-zero key; readable epoch/group-id) rather than
+    /// byte-equal, because two independent births legitimately mint different
+    /// randomness (documented above).
+    #[test]
+    fn create_mls_group_with_context_owned_matches_insert_path() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        let ctx_ext = provider_context_extension("ctx:2148-owned-create");
+
+        // OLD path: existing insert-based create, then destructive take → owned.
+        provider
+            .create_mls_group_with_context(&ctx_id, &ctx_ext)
+            .unwrap();
+        let owned_old = provider.take_crypto_state(&ctx_id).unwrap();
+
+        // NEW path: additive owned-return constructor, SAME crypto input
+        // (`ctx_ext`). Runs on the same provider even though `ctx_id` is now in
+        // `taken_context_ids` — the owned constructor is deliberately map-free
+        // and never consults any shared map (that independence is part of what
+        // this slice proves).
+        let owned_new = provider
+            .create_mls_group_with_context_owned(&ctx_ext)
+            .unwrap();
+
+        // --- Deterministic fields: byte/shape-exact ---
+        assert_eq!(owned_old.sender_key_epoch, 1);
+        assert_eq!(owned_new.sender_key_epoch, owned_old.sender_key_epoch);
+        assert_eq!(owned_old.send_sequence, 0);
+        assert_eq!(owned_new.send_sequence, owned_old.send_sequence);
+        assert!(owned_old.pending_distributions.is_empty());
+        assert!(owned_new.pending_distributions.is_empty());
+        assert!(owned_old.member_wrapping_keys.is_empty());
+        assert!(owned_new.member_wrapping_keys.is_empty());
+        assert_eq!(
+            owned_old.nonce_dedup.ttl_secs(),
+            owned_new.nonce_dedup.ttl_secs(),
+            "both births construct a default-TTL NonceDedup"
+        );
+        // Both sender-key stores start with no remote keys — probe a DID and
+        // expect a miss on both (SenderKeyStore exposes no len()/is_empty()).
+        let probe = "did:dht:z6MkProbeProbeProbeProbeProbeProbeProbeProb";
+        let ctx_hex = hex::encode(ctx_id);
+        assert!(owned_old.sender_key_store.get(&ctx_hex, probe).is_none());
+        assert!(owned_new.sender_key_store.get(&ctx_hex, probe).is_none());
+
+        // The committed `0xFF02` context params are deterministic (the folded
+        // input): both births bind the identical `ScpContextExtension`.
+        let ext_old = owned_old.mls_group.group_context_extension().unwrap();
+        let ext_new = owned_new.mls_group.group_context_extension().unwrap();
+        assert_eq!(ext_old, Some(ctx_ext));
+        assert_eq!(
+            ext_new, ext_old,
+            "both births must commit the same ScpContextExtension byte-for-byte"
+        );
+
+        // --- Per-birth random fields: shape-equal, NOT byte-equal ---
+        // Fresh sender key: 32 non-zero bytes on each path, and the two
+        // independent births differ (negligible collision probability).
+        assert_ne!(owned_old.sender_key.as_bytes(), &[0u8; 32]);
+        assert_ne!(owned_new.sender_key.as_bytes(), &[0u8; 32]);
+        assert_ne!(
+            owned_old.sender_key.as_bytes(),
+            owned_new.sender_key.as_bytes(),
+            "two independent births mint independent sender keys (fresh randomness)"
+        );
+        // Group: both readable; group ids are the same length. Epoch is
+        // readable on both (fresh group starts at a valid epoch). The group's
+        // internal secrets legitimately differ per birth, so no byte compare.
+        let gid_old = owned_old.mls_group.group_id().unwrap();
+        let gid_new = owned_new.mls_group.group_id().unwrap();
+        assert_eq!(
+            gid_old.len(),
+            gid_new.len(),
+            "both births produce a group id of the same length"
+        );
+        assert!(owned_old.mls_group.epoch().is_ok());
+        assert!(owned_new.mls_group.epoch().is_ok());
+
+        // Neither path installed anything into the shared `contexts` map: the
+        // old entry was destructively taken, and the owned path never inserts.
+        assert!(!provider.contexts.contains_key(&ctx_id));
+    }
+
+    /// #2148: `install_joined_group_owned` yields owned material equivalent to
+    /// the insert-based `install_joined_group` + `take_crypto_state`
+    /// round-trip.
+    ///
+    /// The joined group is PASSED IN (not minted), so each path preserves its
+    /// input group verbatim — asserted by capturing the input group id before
+    /// the move and matching it on the returned owned material. The locally
+    /// minted `sender_key` is per-join random (shape-equal, not byte-equal);
+    /// all other fields are the deterministic empty/zero initial shape and are
+    /// asserted exactly.
+    #[test]
+    fn install_joined_group_owned_matches_insert_path() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+
+        // NEW path: install a joined group via the owned constructor. Capture
+        // the group id first so we can prove the group is preserved verbatim.
+        let group_new = make_joined_group();
+        let gid_new = group_new.group_id().unwrap().to_vec();
+        let owned_new = provider.install_joined_group_owned(group_new);
+        assert_eq!(
+            owned_new.mls_group.group_id().unwrap(),
+            gid_new.as_slice(),
+            "owned path must preserve the passed-in joined group verbatim"
+        );
+        // The owned constructor touched no shared map.
+        assert!(!provider.contexts.contains_key(&ctx_id));
+
+        // OLD path: install an INDEPENDENT joined group into `contexts`, then
+        // destructively take → owned.
+        let group_old = make_joined_group();
+        let gid_old = group_old.group_id().unwrap().to_vec();
+        provider.install_joined_group(&ctx_id, group_old).unwrap();
+        let owned_old = provider.take_crypto_state(&ctx_id).unwrap();
+        assert_eq!(
+            owned_old.mls_group.group_id().unwrap(),
+            gid_old.as_slice(),
+            "insert path must preserve the passed-in joined group verbatim"
+        );
+
+        // --- Deterministic fields: exact ---
+        assert_eq!(owned_old.sender_key_epoch, 1);
+        assert_eq!(owned_new.sender_key_epoch, owned_old.sender_key_epoch);
+        assert_eq!(owned_old.send_sequence, 0);
+        assert_eq!(owned_new.send_sequence, owned_old.send_sequence);
+        assert!(owned_old.pending_distributions.is_empty());
+        assert!(owned_new.pending_distributions.is_empty());
+        assert!(owned_old.member_wrapping_keys.is_empty());
+        assert!(owned_new.member_wrapping_keys.is_empty());
+        assert_eq!(
+            owned_old.nonce_dedup.ttl_secs(),
+            owned_new.nonce_dedup.ttl_secs()
+        );
+        let probe = "did:dht:z6MkProbeProbeProbeProbeProbeProbeProbeProb";
+        let ctx_hex = hex::encode(ctx_id);
+        assert!(owned_old.sender_key_store.get(&ctx_hex, probe).is_none());
+        assert!(owned_new.sender_key_store.get(&ctx_hex, probe).is_none());
+
+        // --- Per-join random field: shape-equal, NOT byte-equal ---
+        assert_ne!(owned_old.sender_key.as_bytes(), &[0u8; 32]);
+        assert_ne!(owned_new.sender_key.as_bytes(), &[0u8; 32]);
+        assert_ne!(
+            owned_old.sender_key.as_bytes(),
+            owned_new.sender_key.as_bytes(),
+            "each join mints its own local sender key (fresh randomness)"
+        );
+        assert!(owned_old.mls_group.epoch().is_ok());
+        assert!(owned_new.mls_group.epoch().is_ok());
+    }
+
+    /// #2148: the owned-return birth family is side-effect-free on the shared
+    /// crypto map. `build_restored_owned` (the restore-side owned constructor)
+    /// is callable on a fresh provider that never held the context and yields
+    /// owned material WITHOUT ever inserting into `contexts` — the same map-free
+    /// birth property the new create/install owned constructors uphold.
+    ///
+    /// (The rich per-floor-axis reconstruction is pinned separately by
+    /// `build_restored_owned_returns_owned_material_without_insert`; this test
+    /// only asserts the #2148 owned-return contract: callable + `contexts`
+    /// untouched.)
+    #[test]
+    fn build_restored_owned_is_side_effect_free_on_contexts_map() {
+        // Produce a snapshot from a throwaway provider via the actor export seam.
+        let source = make_provider();
+        let ctx_id = make_context_id();
+        source.create_mls_group(&ctx_id).unwrap();
+        source.generate_sender_key(&ctx_id).unwrap();
+        let exported = actor_export(&source, &ctx_id, Vec::new(), Vec::new()).unwrap();
+        assert!(!exported.is_empty());
+
+        // Fresh provider that never held this context and never took it.
+        let provider = make_provider();
+        assert!(!provider.contexts.contains_key(&ctx_id));
+        assert!(!provider.taken_context_ids.contains(&ctx_id));
+
+        let (owned, _floors) = provider.build_restored_owned(&ctx_id, &exported).unwrap();
+
+        // Owned material is present (readable group + a non-zero local key)...
+        assert!(owned.mls_group.group_id().is_ok());
+        assert!(owned.mls_group.epoch().is_ok());
+        assert_ne!(owned.sender_key.as_bytes(), &[0u8; 32]);
+
+        // ...and the shared `contexts` map was never inserted into (the
+        // owned-return birth is map-free, like the create/install owned twins).
+        assert!(
+            !provider.contexts.contains_key(&ctx_id),
+            "owned-return restore must not install into the shared contexts map"
         );
     }
 }
