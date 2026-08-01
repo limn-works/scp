@@ -19,6 +19,11 @@ Exception hierarchy::
     +-- TransportError        -- Network, relay, connection
     +-- OutletError           -- Outlet registration, invocation, verification
     +-- ValidationError       -- Input validation, schema, parameters
+    +-- StorageError          -- Persistent-storage operation failures
+    +-- AttestationError      -- Device and identity attestation failures
+    +-- McpError              -- MCP protocol and tool-invocation failures
+    +-- GovernanceError       -- Context governance proposal and voting failures
+    +-- EconomyError          -- Payment, budget, and economic-policy failures
 
 Note: The permission error is named ``UcanPermissionError`` to avoid
 shadowing Python's built-in ``PermissionError``.
@@ -169,6 +174,36 @@ class ValidationError(ScpError):
     _default_code: str = "SCP-VALID-7000"
 
 
+class StorageError(ScpError):
+    """Persistent-storage operation failure (SCP-STORAGE range, 8000-8999)."""
+
+    _default_code: str = "SCP-STORAGE-8000"
+
+
+class AttestationError(ScpError):
+    """Device or identity attestation failure (SCP-ATTEST range, 9000-9999)."""
+
+    _default_code: str = "SCP-ATTEST-9000"
+
+
+class McpError(ScpError):
+    """MCP protocol or tool-invocation failure (SCP-MCP range, 10000-10999)."""
+
+    _default_code: str = "SCP-MCP-10000"
+
+
+class GovernanceError(ScpError):
+    """Context governance proposal or voting failure (SCP-GOV range, 11000-11999)."""
+
+    _default_code: str = "SCP-GOV-11000"
+
+
+class EconomyError(ScpError):
+    """Payment, budget, or economic-policy failure (SCP-ECON range, 12000-12999)."""
+
+    _default_code: str = "SCP-ECON-12000"
+
+
 # ---------------------------------------------------------------------------
 # Cross-context outlet-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors.
 # ---------------------------------------------------------------------------
@@ -267,8 +302,12 @@ def _saga_terminal_from_bridge(exc: BaseException) -> ScpError | None:
     of the three saga terminals (so the caller re-raises it unchanged).
     """
     args = exc.args
-    message = str(args[0]) if len(args) > 0 else str(exc)
+    raw_message = str(args[0]) if len(args) > 0 else str(exc)
     code = args[1] if len(args) > 1 and isinstance(args[1], str) else None
+    # Strip any leading "[SCP-CAT-NNNN] " prefix from the raw message so
+    # ScpError.__str__ (which prepends f"[{code}] ") does not double-bracket.
+    _msg_match = _SCP_CODE_RE.search(raw_message)
+    message = raw_message[_msg_match.end() :].lstrip() if _msg_match is not None else raw_message
     datum = args[2] if len(args) > 2 else None
 
     name = type(exc).__name__
@@ -292,8 +331,8 @@ def _saga_terminal_from_bridge(exc: BaseException) -> ScpError | None:
 # ---------------------------------------------------------------------------
 
 #: Maps ``ScpPyError`` variant names (from ``_scp_core``) to SDK exception
-#: classes.  Used by bridge integration code to translate Rust-side errors
-#: into the correct Python exception.
+#: classes.  Used by :func:`_coded_bridge_error` as a fallback when no
+#: ``SCP-CAT-NNNN`` code is present in the bridge error message.
 BRIDGE_ERROR_MAP: dict[str, type[ScpError]] = {
     "IdentityError": IdentityError,
     "ContextError": ContextError,
@@ -302,6 +341,26 @@ BRIDGE_ERROR_MAP: dict[str, type[ScpError]] = {
     "TransportError": TransportError,
     "OutletError": OutletError,
     "ValidationError": ValidationError,
+}
+
+#: Maps the ``SCP-CATEGORY`` prefix (the code without its trailing ``-NNNNN``
+#: suffix) to the matching SDK exception class.  Primary classification path
+#: in :func:`_coded_bridge_error`: when a code is present, the prefix is
+#: extracted via ``rsplit("-", 1)[0]`` and looked up here.  Mirrors the
+#: TypeScript ``ERROR_PREFIX_MAP`` in ``src/errors.ts``.
+CODE_PREFIX_MAP: dict[str, type[ScpError]] = {
+    "SCP-IDENT": IdentityError,
+    "SCP-CTX": ContextError,
+    "SCP-PERM": UcanPermissionError,
+    "SCP-CRYPTO": CryptoError,
+    "SCP-TRANS": TransportError,
+    "SCP-OUTLET": OutletError,
+    "SCP-VALID": ValidationError,
+    "SCP-STORAGE": StorageError,
+    "SCP-ATTEST": AttestationError,
+    "SCP-MCP": McpError,
+    "SCP-GOV": GovernanceError,
+    "SCP-ECON": EconomyError,
 }
 
 
@@ -315,15 +374,16 @@ _SCP_CODE_RE = re.compile(r"^\s*\[(SCP-[A-Z]+-\d+)\]")
 def _coded_bridge_error(exc: Exception) -> ScpError:
     """Translate a native ``_scp_core`` exception into a coded SDK exception.
 
-    Looks up the SDK class by the bridge exception's class name (via
-    :data:`BRIDGE_ERROR_MAP`, defaulting to :class:`ContextError`) and
-    recovers the structured ``SCP-CAT-NNNN`` code from the message so
-    callers can branch on ``exc.code`` rather than parsing prose. An
-    already-typed :class:`ScpError` is returned unchanged.
+    When the bridge error message carries a ``[SCP-CAT-NNNN]`` code, the
+    prefix (e.g. ``SCP-ECON`` from ``SCP-ECON-12010``) is looked up in
+    :data:`CODE_PREFIX_MAP` to select the SDK class.  When no code is
+    present, the bridge exception's class name is looked up in
+    :data:`BRIDGE_ERROR_MAP` as a fallback.  Unknown codes and class names
+    both fall back to the base :class:`ScpError`.  An already-typed
+    :class:`ScpError` is returned unchanged.
     """
     if isinstance(exc, ScpError):
         return exc
-    sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
     raw_msg = str(exc)
     match = _SCP_CODE_RE.search(raw_msg)
     code = match.group(1) if match is not None else None
@@ -331,21 +391,34 @@ def _coded_bridge_error(exc: Exception) -> ScpError:
     # prepends f"[{code}] ") does not double the bracket when the bridge has
     # already embedded the code at the start of the message.
     message = raw_msg[match.end() :].lstrip() if match is not None else raw_msg
+    if code is not None:
+        # Classify by code prefix — e.g. "SCP-ECON-12010" → "SCP-ECON".
+        prefix = code.rsplit("-", 1)[0]
+        sdk_cls = CODE_PREFIX_MAP.get(prefix, ScpError)
+    else:
+        # No code in message: fall back to bridge exception class name.
+        sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ScpError)
     return sdk_cls(message, code=code)
 
 
 __all__ = [
     "BRIDGE_ERROR_MAP",
+    "CODE_PREFIX_MAP",
+    "AttestationError",
     "ContextError",
     "CryptoError",
+    "EconomyError",
+    "GovernanceError",
     "IdentityError",
     "InvalidGrant",
+    "McpError",
     "OutletError",
     "ProtocolError",
     "SagaAbortedError",
     "SagaBusyError",
     "SagaNeedsRepairError",
     "ScpError",
+    "StorageError",
     "StreamAlreadyClosed",
     "StreamGap",
     "TransportError",
