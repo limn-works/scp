@@ -1,13 +1,13 @@
 # Custody Substrate Isolation Holds At Rest, Not In Transit
 
-**Source:** ADR-053 (pre-rotation custody substrate isolation), corrected Consequences §
+**Source:** ADR-054 (pre-rotation custody substrate isolation), corrected Consequences §
 **Applies to:** any cross-substrate secret handoff — pre-rotation seed migration, MLS
 sender-key handoff, media key derivation, and similar construct.
 
 ## The Claim That Was Wrong
 
 "The type system enforces §9.7.4.1 §3 storage isolation at compile time." This was an
-overclaim that appeared in ADR-053's original Consequences section and in
+overclaim that appeared in ADR-054's original Consequences section and in
 `.docs/lessons/hash-commitment-preimage-lifetime.md`.
 
 A separate Rust trait (`PreRotationCustodyProvider` distinct from `KeyCustodyProvider`)
@@ -78,6 +78,6 @@ When a new cross-substrate secret handoff is introduced:
 
 - `.docs/lessons/hash-commitment-preimage-lifetime.md` — pre-rotation commitment scheme;
   contains the corrected type-isolation claim
-- `.docs/adrs/ADR-053-pre-rotation-custody-substrate-isolation.md` — source of this lesson
+- `.docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md` — source of this lesson
 - `crates/scp-ffi/uniffi/src/bridge.rs:686-692` — honest code comment: "Type-level
   isolation is satisfied... Substrate isolation is NOT yet satisfied"
