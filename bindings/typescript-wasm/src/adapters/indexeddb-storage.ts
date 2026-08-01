@@ -10,27 +10,42 @@
  * 2. `get` / `set` / `delete` / `listKeys` serve SYNCHRONOUSLY from that mirror.
  * 3. Each mutation is WRITE-BEHIND-flushed to IndexedDB, in FIFO order.
  *
- * ## FIFO is a crash-safety obligation, not an optimization
+ * ## The durable store is always a strict PREFIX (ordering + sticky poison)
  *
  * The driver's crash-consistency invariants depend on write ORDER between two
- * keys (join persists the snapshot then deletes the pending blob; close deletes
- * the snapshot before dropping in-memory state). So the write-behind queue is a
- * single serialized chain — on a crash the durable store is always a PREFIX of
- * the issued mutation sequence, never a reordered subset. Losing the un-flushed
- * tail is the accepted "lose the last unpersisted mutation" property; a reorder
- * would corrupt the invariants, so it is structurally prevented here.
+ * keys (join persists the snapshot THEN deletes the pending blob; close deletes
+ * the snapshot before dropping in-memory state). The durable store must therefore
+ * always be a strict PREFIX of the issued mutation sequence — never a gap (a
+ * later op landing durably while an earlier one was lost). Two mechanisms
+ * together give the prefix:
  *
- * ## A durable-write fault fails closed on a later call
+ * 1. **Serialization → ordering.** The write-behind queue is a single serialized
+ *    chain, so ops flush in issue order (no reorder).
+ * 2. **Sticky poison → prefix.** A durable-write fault poisons the chain: once any
+ *    op faults, NO op issued after it is ever flushed, and the instance fails
+ *    every subsequent synchronous call closed. Losing the un-flushed tail from the
+ *    first failed op onward is the accepted "lose the last unpersisted mutations"
+ *    property. WITHOUT the sticky poison a non-uniform fault (e.g. a quota-exceeded
+ *    `put` that aborts, followed by a `delete` that frees space and succeeds) would
+ *    land the later op while the earlier was lost — a GAP that corrupts the
+ *    driver's write-ordering (deleting a pending blob whose snapshot put was lost →
+ *    a consumed KeyPackage with no recoverable context). Skipping every op after a
+ *    fault keeps the store a strict prefix by construction.
+ *
+ * ## A durable-write fault fails closed STICKILY
  *
  * A write-behind flush that faults is captured and re-thrown on the NEXT
  * synchronous call — surfaced as `[SCP-STORAGE-8010]` at the client boundary (the
- * wasm adapter re-codes the thrown exception). The interface only promises "on a
- * LATER call": the fault surfaces on whichever `get`/`set`/`delete`/`listKeys`
- * comes next, which need NOT belong to the same context whose write failed (the
- * write-behind queue is a single cross-context chain). The fault is never
- * swallowed — the driver treats the throw as a durable-write failure and fails
- * closed (poisoning the context it is operating on) rather than believing a lost
- * write landed.
+ * wasm adapter re-codes the thrown exception) — and STAYS surfaced on every call
+ * thereafter (sticky, never cleared). The interface only promises "on a LATER
+ * call": the fault surfaces on whichever `get`/`set`/`delete`/`listKeys` comes
+ * next, which need NOT belong to the same context whose write failed (the
+ * write-behind queue is a single cross-context chain; a durable fault like quota
+ * is store-wide, so failing the whole instance closed is honest — it is NOT made
+ * per-context). The driver treats the throw as a durable-write failure and fails
+ * closed (poisoning the context it is operating on). **Recovery is re-opening the
+ * store**: a fresh {@link open} re-preloads the durable prefix (all mutations up
+ * to, but not including, the first failed op) into a clean, un-poisoned instance.
  *
  * Restore fail-closed (corrupt / foreign / unreadable snapshot) is the DRIVER's
  * job (`SCP-STORAGE-8011/8012`) over the faithful bytes this adapter serves; a
@@ -74,8 +89,17 @@ export class IndexedDbStorage implements JsStorage {
 
   /** The serialized write-behind chain — guarantees FIFO durable ordering. */
   #flushChain: Promise<void> = Promise.resolve();
-  /** A captured durable-write fault, surfaced on the next synchronous call. */
+  /**
+   * A captured durable-write fault. Once set it stays set (sticky) — every
+   * subsequent synchronous call fails closed until a fresh {@link open}.
+   */
   #pendingFault: unknown;
+  /**
+   * Whether the write-behind chain is poisoned by a durable-write fault. Once
+   * true, NO further queued op is flushed — so the durable store stays a strict
+   * PREFIX of the issued mutation sequence (never a gap). Sticky until re-open.
+   */
+  #chainPoisoned = false;
 
   private constructor(db: IDBDatabase, storeName: string, mirror: Map<string, Uint8Array>) {
     this.#db = db;
@@ -178,21 +202,35 @@ export class IndexedDbStorage implements JsStorage {
 
   #throwIfFaulted(): void {
     if (this.#pendingFault !== undefined) {
+      // STICKY: do NOT clear the fault. A durable-write fault (e.g. quota) is
+      // store-wide, and every op issued after it was NEVER flushed (the chain is
+      // poisoned), so the durable store is a strict prefix up to the failed op.
+      // Failing every subsequent call closed — until a fresh open() re-preloads
+      // that consistent prefix — is the honest crash-safe semantics; clearing the
+      // fault would let the caller believe the store recovered when it did not.
       const fault = this.#pendingFault;
-      // Surface once, then clear: a still-broken backend re-captures on the next
-      // failed flush, so the fault is not permanently sticky.
-      this.#pendingFault = undefined;
       throw fault instanceof Error ? fault : new Error(String(fault));
     }
   }
 
   #enqueue(op: WriteOp): void {
     // Chain each op after the previous so durable writes land in issue order
-    // (FIFO). A fault is captured — not thrown here (this is fire-and-forget) —
-    // and surfaced on the next synchronous call via #throwIfFaulted.
+    // (FIFO), AND gate the run on the poison flag so that once any op faults, NO
+    // op issued after it is ever flushed. Together these keep the durable store a
+    // strict PREFIX of the issued sequence up to the first failed op — never a
+    // gap (a later op landing durably while an earlier one was lost would break
+    // the driver's write-ordering crash-consistency, e.g. deleting a pending blob
+    // whose snapshot put was lost). The fault is captured (fire-and-forget) and
+    // surfaced stickily on the next synchronous call via #throwIfFaulted.
     this.#flushChain = this.#flushChain
-      .then(() => this.#runOp(op))
+      .then(() => {
+        if (this.#chainPoisoned) {
+          return; // skip — keep the durable store a strict prefix
+        }
+        return this.#runOp(op);
+      })
       .catch((err: unknown) => {
+        this.#chainPoisoned = true;
         if (this.#pendingFault === undefined) {
           this.#pendingFault = err;
         }

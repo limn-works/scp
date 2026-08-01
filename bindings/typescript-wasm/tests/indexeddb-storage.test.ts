@@ -108,3 +108,86 @@ test("a durable-write fault surfaces fail-closed on a later call", async () => {
   storage.set("scp-client/ctx/b", bytes(2));
   await expect(storage.flushed()).rejects.toThrow(/simulated IndexedDB write fault/);
 });
+
+/**
+ * Wraps a real `IDBFactory` so ONLY the FIRST `readwrite` transaction faults
+ * (non-uniform: any later op's transaction would otherwise succeed). This models
+ * the deterministic crash-consistency trigger — a quota-exceeded `put` that
+ * aborts, followed by a `delete` that frees space and would succeed.
+ */
+function firstWriteFaultingFactory(real: IDBFactory, arm: { failFirstWrite: boolean }): IDBFactory {
+  const wrapDb = (db: IDBDatabase): IDBDatabase =>
+    new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "transaction") {
+          return (...args: unknown[]) => {
+            if (arm.failFirstWrite && args[1] === "readwrite") {
+              arm.failFirstWrite = false; // fault ONLY the first readwrite tx
+              throw new Error("simulated non-uniform IndexedDB write fault (first write only)");
+            }
+            return (target.transaction as (...a: unknown[]) => unknown)(...args);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+  const wrapOpenRequest = (request: IDBOpenDBRequest): IDBOpenDBRequest =>
+    new Proxy(request, {
+      get(target, prop, receiver) {
+        if (prop === "result") {
+          return wrapDb(target.result);
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+      set(target, prop, value) {
+        return Reflect.set(target, prop, value);
+      },
+    });
+
+  return {
+    open: (name: string, version?: number) => wrapOpenRequest(real.open(name, version)),
+  } as unknown as IDBFactory;
+}
+
+test("a NON-UNIFORM fault keeps the durable store a strict PREFIX (sticky, no gap)", async () => {
+  const factory = new IDBFactory();
+  const dbName = "prefix-db";
+
+  // Seed a pre-existing durable key K on a clean instance.
+  const seed = await IndexedDbStorage.open({ indexedDB: factory, databaseName: dbName });
+  seed.set("scp-client/ctx/keep", bytes(7, 7, 7));
+  await seed.flushed();
+
+  // Open an instance whose FIRST readwrite tx faults; later ops would succeed.
+  const arm = { failFirstWrite: false };
+  const storage = await IndexedDbStorage.open({
+    indexedDB: firstWriteFaultingFactory(factory, arm),
+    databaseName: dbName,
+  });
+  expect(storage.get("scp-client/ctx/keep")).toEqual(bytes(7, 7, 7)); // preloaded prefix
+
+  // Mirror the driver's join write-ordering: persist the new snapshot (put),
+  // THEN delete a DIFFERENT pre-existing key. The put faults; if the delete were
+  // NOT skipped it would succeed (freeing "space") and remove K — a GAP.
+  arm.failFirstWrite = true;
+  storage.set("scp-client/ctx/new", bytes(1, 2, 3));
+  storage.delete("scp-client/ctx/keep");
+
+  // Drain the write-behind chain (the put faults → chain poisoned → delete skipped).
+  await storage.flushed().catch(() => {});
+
+  // (a) The next synchronous call throws (the fault is surfaced) …
+  expect(() => storage.get("scp-client/ctx/keep")).toThrow(/non-uniform/);
+  // (c) … and a FURTHER call still throws — the fault is STICKY, not cleared.
+  expect(() => storage.set("scp-client/ctx/z", bytes(9))).toThrow(/non-uniform/);
+
+  // (b) Re-open a fresh, un-poisoned instance over the same durable store: the
+  // delete was SKIPPED (poison gate), so K survives — the store is still a strict
+  // prefix — and the faulted put's key is absent. Recovery = re-open re-preloads.
+  const reopened = await IndexedDbStorage.open({ indexedDB: factory, databaseName: dbName });
+  expect(reopened.get("scp-client/ctx/keep")).toEqual(bytes(7, 7, 7)); // NOT deleted (no gap)
+  expect(reopened.get("scp-client/ctx/new")).toBeUndefined(); // put faulted → never landed
+});
