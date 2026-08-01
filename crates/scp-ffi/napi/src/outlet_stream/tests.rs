@@ -1151,9 +1151,9 @@ mod streaming_vectors_live {
 // MUTATION-RESISTANCE: the OPEN test asserts the BRIDGE-UNIQUE substring the
 // producer never emits, so it fails closed if the binding is removed.
 //
-// Gated on `allow_in_memory_custody` (identity_create + the test-only registry
+// Gated on `testing` (identity_create + the test-only registry
 // seam), mirroring the `outlets.rs` `xctx_saga_tests` gating.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 mod xctx_streaming_saga_tests {
     use super::*;
 

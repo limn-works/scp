@@ -986,7 +986,7 @@ impl UniffiKeyCustody {
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(imc) => imc.0.export_ed25519_signing_key(handle).await,
             Self::Callback(cb) => cb.export_ed25519_signing_key(handle).await,
         }

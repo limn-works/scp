@@ -1619,7 +1619,7 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_on(
 /// TEST-ONLY helpers on [`Scp`](crate::scp::Scp). NOT a `#[napi]` block, so
 /// nothing here is exported to Node/Bun or counted by the bridge-symmetry gate.
 /// Gated on the same test/testing features as `Scp::new_in_memory_for_test`.
-#[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+#[cfg(any(test, feature = "testing"))]
 impl crate::scp::Scp {
     /// Injects a live cross-context streaming-saga registry entry pinned to
     /// `invoker_did`, so the recover invoker-gate (CRITICAL #1) can be exercised
