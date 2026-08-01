@@ -3403,3 +3403,46 @@ fn newtype_reservation_id_serializes_transparently_as_string() {
 // `clear_kp_poison` surface; see `kp_actor_watchdog_records_panic_and_respawns`,
 // `kp_actor_poisons_after_budget`, and `clear_kp_poison_recovers_poisoned_actor`
 // there.
+
+// ---------------------------------------------------------------------------
+// 8. handle reply-await is bounded (internal follow-up #129)
+// ---------------------------------------------------------------------------
+
+/// A command that enqueues successfully but is NEVER replied to (no actor
+/// drains the mailbox / no oneshot ack) must NOT hang the caller forever: the
+/// handle's post-enqueue reply-await is bounded by
+/// [`super::KP_REPLY_TIMEOUT`], returning a retryable
+/// [`ContextError::ActorBusy`] on elapse. Uses `start_paused` so tokio
+/// auto-advances virtual time to fire the timer — the test is deterministic
+/// and completes instantly instead of waiting the real 60 s.
+#[tokio::test(start_paused = true)]
+async fn send_reply_await_is_bounded_when_actor_never_replies() {
+    use super::{KP_MAILBOX_CAPACITY, KP_REPLY_TIMEOUT, KeyPackageStoreHandle};
+
+    // Buffered mailbox (capacity > 0) with the receiver held alive but NEVER
+    // drained: `inbox.send` succeeds and buffers the command, so we exercise
+    // the post-enqueue reply-await — the exact #129 wedge — rather than the
+    // enqueue-timeout or closed-inbox branches. `_rx` stays bound to keep the
+    // inbox open (dropping it would close the channel and take the other arm).
+    let (tx, _rx) = tokio::sync::mpsc::channel::<KeyPackageCommand>(KP_MAILBOX_CAPACITY);
+    let handle = KeyPackageStoreHandle::from_sender(tx);
+
+    let start = tokio::time::Instant::now();
+    let result = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await;
+    let elapsed = start.elapsed();
+
+    // `panic!` is banned in this dispatch-layer file by check-handler-no-panic
+    // (the test module carries no inner `#[cfg(test)]` marker), so assert over
+    // a `matches!` rather than a catch-all panic arm.
+    assert!(
+        matches!(&result, Err(ContextError::ActorBusy(msg)) if msg.contains("did not reply")),
+        "expected the reply-timeout ActorBusy variant, got: {result:?}"
+    );
+    assert!(
+        elapsed >= KP_REPLY_TIMEOUT,
+        "reply-await must span the full KP_REPLY_TIMEOUT budget before failing \
+         closed (elapsed {elapsed:?} < {KP_REPLY_TIMEOUT:?})"
+    );
+}
