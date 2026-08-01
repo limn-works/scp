@@ -3891,35 +3891,21 @@ mod crypto_ops_golden {
     const ALICE: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
     const BOB: &str = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
 
-    /// Stand up the real joined Alice/Bob pair and return both providers plus
-    /// the 32-byte context id.
-    fn setup() -> (Arc<MlsCryptoProvider>, Arc<MlsCryptoProvider>, [u8; 32]) {
+    /// Stand up the real joined Alice/Bob pair, born DIRECTLY onto actor-owned
+    /// [`PerContextState`] via the #2148 owned-return constructors + the
+    /// production `seed_encrypted_crypto_from_owned` primitive (no provider
+    /// `take_crypto_state` round-trip). Returns
+    /// `(alice_provider, alice_state, bob_provider, bob_state, ctx)`: each
+    /// [`PerContextState`] already OWNS its per-context crypto, and each provider
+    /// is retained solely for its node-resident wrapping keypair.
+    fn setup() -> (
+        Arc<MlsCryptoProvider>,
+        PerContextState,
+        Arc<MlsCryptoProvider>,
+        PerContextState,
+        [u8; 32],
+    ) {
         stand_up_two_party(CTX_STR, ALICE, BOB)
-    }
-
-    /// Move a provider-birthed context into an actor-owned [`PerContextState`]
-    /// (Encrypted mode) via the real ADR-049 PR-7 one-way seam: destructively
-    /// [`take_crypto_state`](MlsCryptoProvider::take_crypto_state) the owned MLS +
-    /// sender-key material off the provider, then seed the actor with it through
-    /// the production [`seed_encrypted_crypto_from_owned`](PerContextState::seed_encrypted_crypto_from_owned)
-    /// primitive.
-    ///
-    /// Post-PR-7 the provider steady-state twins (seal / open / rotate /
-    /// export / …) are DELETED, so there is no longer a provider "twin" to drive
-    /// for a byte-identity comparison — the actor is the sole crypto authority.
-    /// The take is therefore direct (not the old non-destructive
-    /// export→restore→take round-trip): every caller takes each party's crypto
-    /// exactly once and drives all subsequent ops on the actor.
-    fn take_into_actor(src: &MlsCryptoProvider, ctx: [u8; 32], local_did: &str) -> PerContextState {
-        let owned = src
-            .take_crypto_state(&ctx)
-            .expect("take owned crypto material off the provider");
-        let mut state =
-            PerContextState::new_for_test_encrypted(ctx, 0, DID::from(local_did.to_owned()));
-        // Exercise the production seed primitive (ADR-049 PR-7) so its shape is
-        // pinned by these golden tests.
-        state.seed_encrypted_crypto_from_owned(owned);
-        state
     }
 
     /// Build a minimal signed `InnerEnvelope` (signature is not verified by
@@ -3992,9 +3978,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_seal_open_cross_roundtrip() {
-        let (alice_p, bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
-        let mut bob_a = take_into_actor(&bob_p, ctx, BOB);
+        let (_alice_p, mut alice_a, _bob_p, mut bob_a, ctx) = setup();
         let rid = routing(&ctx);
         let inner = build_inner(ALICE, 0);
 
@@ -4029,9 +4013,7 @@ mod crypto_ops_golden {
     /// post-increment at every step, not just at 0.
     #[test]
     fn golden_seal_open_multi_sequence_progression() {
-        let (alice_p, bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
-        let mut bob_a = take_into_actor(&bob_p, ctx, BOB);
+        let (_alice_p, mut alice_a, _bob_p, mut bob_a, ctx) = setup();
         let rid = routing(&ctx);
 
         let mut actor_seqs = Vec::new();
@@ -4060,14 +4042,12 @@ mod crypto_ops_golden {
     /// zero-epoch tests cannot see an epoch-binding divergence).
     #[test]
     fn golden_seal_open_after_rotate_nonzero_epoch() {
-        let (alice_p, bob_p, ctx) = setup();
+        let (_alice_p, mut alice_a, bob_p, mut bob_recv_a, ctx) = setup();
         let rid = routing(&ctx);
         let bob_secret = bob_wrapping_secret(&bob_p);
         let inner = build_inner(ALICE, 0);
 
         // --- Actor path: actor rotate + actor seal + actor open. ---
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
-        let mut bob_recv_a = take_into_actor(&bob_p, ctx, BOB);
         alice_a.rotate_sender_key(ALICE).unwrap();
         let epoch_a = alice_a.local_sender_key_epoch();
         assert!(
@@ -4118,16 +4098,13 @@ mod crypto_ops_golden {
     /// receiver that was seeded with the delivered key inline.
     #[test]
     fn golden_seal_open_cross_roundtrip_nonzero_epoch() {
-        let (alice_p, bob_p, ctx) = setup();
+        let (_alice_p, mut alice_a, bob_p, mut bob_a, ctx) = setup();
         let rid = routing(&ctx);
-        // Bob's node-resident wrapping secret — captured before the take, since
-        // `take_crypto_state` destructively moves Bob's crypto onto the actor.
+        // Bob's node-resident wrapping secret (the actor path's HPKE-open key).
         let bob_secret = bob_wrapping_secret(&bob_p);
 
-        // Move both parties onto the actor seam, then rotate ONCE on the actor so
-        // Alice holds a single rotated key at a non-zero epoch.
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
-        let mut bob_a = take_into_actor(&bob_p, ctx, BOB);
+        // Rotate ONCE on the actor so Alice holds a single rotated key at a
+        // non-zero epoch.
         alice_a.rotate_sender_key(ALICE).unwrap();
         let epoch = alice_a.local_sender_key_epoch();
         assert!(epoch >= 1, "rotate advances the sender-key epoch past 0");
@@ -4173,8 +4150,7 @@ mod crypto_ops_golden {
     /// the `SendSequenceTracker::reserve_next` saturating-add fail-OPEN.
     #[test]
     fn seal_fails_closed_on_send_sequence_overflow() {
-        let (alice_p, _bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (_alice_p, mut alice_a, _bob_p, _bob_a, ctx) = setup();
         // Saturate the send tracker to the u64 ceiling.
         alice_a.send_tracker = SendSequenceTracker::from_persisted(u64::MAX);
         let inner = build_inner(ALICE, 0);
@@ -4194,9 +4170,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_mls_encrypt_management_cross_roundtrip() {
-        let (alice_p, bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
-        let mut bob_a = take_into_actor(&bob_p, ctx, BOB);
+        let (_alice_p, mut alice_a, _bob_p, mut bob_a, ctx) = setup();
         let rid = routing(&ctx);
         let payload = b"management golden payload";
 
@@ -4211,8 +4185,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_group_context_extension_byte_identical() {
-        let (alice_p, _bob_p, ctx) = setup();
-        let alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (_alice_p, alice_a, _bob_p, _bob_a, _ctx) = setup();
         let from_actor = alice_a.group_context_extension().unwrap();
         let ext = from_actor.expect("an SCP context group carries the 0xFF02 extension");
         assert_eq!(
@@ -4228,8 +4201,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_local_sender_key_epoch_matches() {
-        let (alice_p, _bob_p, ctx) = setup();
-        let alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (_alice_p, alice_a, _bob_p, _bob_a, _ctx) = setup();
         assert_eq!(
             alice_a.local_sender_key_epoch(),
             1,
@@ -4239,8 +4211,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_distribute_and_process_recover_identical_key() {
-        let (alice_p, bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (_alice_p, mut alice_a, bob_p, mut bob_a, ctx) = setup();
         // Bob's wrapping secret (node-resident) — the actor path's HPKE-open key.
         let (_bob_pub, bob_secret) = bob_p.wrapping_keypair_snapshot();
         let bob_secret: [u8; 32] = *bob_secret;
@@ -4260,7 +4231,6 @@ mod crypto_ops_golden {
         // Recover the key via the actor receive half. The recovered key material
         // is deterministic (Alice's existing key), so it equals Alice's actual
         // local sender key byte-for-byte.
-        let mut bob_a = take_into_actor(&bob_p, ctx, BOB);
         let (recovered_key, epoch) = bob_a
             .process_incoming_sender_key(&bob_secret, ALICE, &actor_msgs[0].1)
             .unwrap();
@@ -4287,8 +4257,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_rotate_sender_key_parity() {
-        let (alice_p, bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (_alice_p, mut alice_a, bob_p, bob_a, _ctx) = setup();
         let (_bob_pub, bob_secret) = bob_p.wrapping_keypair_snapshot();
         let bob_secret: [u8; 32] = *bob_secret;
 
@@ -4313,7 +4282,6 @@ mod crypto_ops_golden {
         // carries the new epoch.
         let msgs = alice_a.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1, "one member (Bob) receives the rotated key");
-        let bob_a = take_into_actor(&bob_p, ctx, BOB);
         let (_key, epoch) = bob_a
             .process_incoming_sender_key(&bob_secret, ALICE, &msgs[0].1)
             .unwrap();
@@ -4322,8 +4290,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_advance_epoch_parity() {
-        let (alice_p, bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (alice_p, mut alice_a, _bob_p, mut bob_from_actor, _ctx) = setup();
         let (wpub, _wsec) = alice_p.wrapping_keypair_snapshot();
 
         // `advance_epoch` self-merges the committer's Update+Commit, advancing
@@ -4344,7 +4311,6 @@ mod crypto_ops_golden {
         // The counterparty PROCESSES the commit and reaches the committer's new
         // epoch (the actor is the sole crypto authority; the provider twin is
         // deleted).
-        let mut bob_from_actor = take_into_actor(&bob_p, ctx, BOB);
         process_commit_on_actor(&mut bob_from_actor, &out_a.commit_bytes)
             .expect("Bob processes the actor-produced advance Commit");
         assert_eq!(
@@ -4356,8 +4322,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_remove_member_parity() {
-        let (alice_p, bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (_alice_p, mut alice_a, _bob_p, mut bob_from_actor, _ctx) = setup();
 
         // Self-removal is a no-op (empty output).
         assert!(
@@ -4385,7 +4350,6 @@ mod crypto_ops_golden {
 
         // The counterparty (Bob — the removed member) PROCESSES the remove-Commit
         // and learns of his removal, reaching the committer's new epoch.
-        let mut bob_from_actor = take_into_actor(&bob_p, ctx, BOB);
         process_commit_on_actor(&mut bob_from_actor, &out_a.commit_bytes)
             .expect("Bob processes the actor-produced remove Commit");
         assert_eq!(actor_mls_epoch(&bob_from_actor), epoch_before + 1);
@@ -4393,8 +4357,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_export_restore_equivalent() {
-        let (alice_p, _bob_p, ctx) = setup();
-        let alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (alice_p, alice_a, _bob_p, _bob_a, ctx) = setup();
         // Use Alice's provider wrapping keypair so the actor export embeds the
         // SAME node-resident wrapping material a restore needs.
         let (wpub, wsec) = alice_p.wrapping_keypair_snapshot();
@@ -4433,8 +4396,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_destroy_mls_group_empties_export() {
-        let (alice_p, _bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
         let (wpub, wsec) = alice_p.wrapping_keypair_snapshot();
 
         assert!(
@@ -4456,8 +4418,7 @@ mod crypto_ops_golden {
 
     #[test]
     fn golden_destroy_sender_key_rotates_and_clears() {
-        let (alice_p, _bob_p, ctx) = setup();
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        let (_alice_p, mut alice_a, _bob_p, _bob_a, ctx) = setup();
 
         let key_before = actor_sender_key(&alice_a);
         alice_a.destroy_sender_key().unwrap();
@@ -4497,7 +4458,7 @@ mod crypto_ops_golden {
         use ed25519_dalek::Signer as _;
         use scp_clock::Clock as _;
 
-        let (alice_p, _bob_p, ctx) = setup();
+        let (_alice_p, mut alice_a, _bob_p, _bob_a, ctx) = setup();
         let ctx_hex = hex::encode(ctx);
         let blocked: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -4534,8 +4495,7 @@ mod crypto_ops_golden {
         };
         let req_bytes = rmp_serde::to_vec_named(&request).unwrap();
 
-        // Move Alice's crypto onto the actor and answer.
-        let mut alice_a = take_into_actor(&alice_p, ctx, ALICE);
+        // Answer Bob's request on Alice's owned actor state.
         let resp_bytes = {
             let crypto = match &mut alice_a.mode {
                 ContextModeState::Encrypted(c) => c.as_mut(),

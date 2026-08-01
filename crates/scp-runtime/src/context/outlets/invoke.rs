@@ -8763,7 +8763,6 @@ mod tests {
         #[test]
         fn ac10_seal_for_a_preserves_operator_sig() {
             use crate::context::actor::state::PerContextState;
-            use crate::crypto::mls::provider::MlsCryptoProvider;
             use crate::crypto::mls::two_party_test_support::stand_up_two_party;
             use crate::envelope::inner::sign::create_inner_envelope_raw;
             use crate::envelope::inner::{
@@ -8776,29 +8775,13 @@ mod tests {
             let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAl";
             let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
             // Alice (sealer, A member) + Bob (opener, A member) share a real MLS
-            // group for the receiving context A.
-            let (alice, bob, a_ctx_bytes) = stand_up_two_party(a_ctx_str, alice_did, bob_did);
+            // group for the receiving context A, born DIRECTLY onto actor-owned
+            // state via the #2148 owned-return constructors (no provider
+            // `take_crypto_state` round-trip) — the actor seal/open seam every
+            // other two-party crypto test now drives.
+            let (_alice_p, mut alice_a, _bob_p, mut bob_a, a_ctx_bytes) =
+                stand_up_two_party(a_ctx_str, alice_did, bob_did);
             let routing_id = a_ctx_bytes.to_vec();
-
-            // ADR-049 PR-7 moved seal/open off the `MlsCryptoProvider` onto the
-            // per-context actor. Destructively take each party's provider-resident
-            // crypto onto an actor `PerContextState` (the production seed
-            // primitive) so this bridge test drives the actor seal/open seam
-            // exactly as every other two-party crypto test now does.
-            let take_into_actor = |provider: &MlsCryptoProvider, did: &str| -> PerContextState {
-                let owned = provider
-                    .take_crypto_state(&a_ctx_bytes)
-                    .expect("take owned crypto material off the provider");
-                let mut state = PerContextState::new_for_test_encrypted(
-                    a_ctx_bytes,
-                    0,
-                    DID::from(did.to_owned()),
-                );
-                state.seed_encrypted_crypto_from_owned(owned);
-                state
-            };
-            let mut alice_a = take_into_actor(alice.as_ref(), alice_did);
-            let mut bob_a = take_into_actor(bob.as_ref(), bob_did);
 
             let chunk = operator_signed_chunk();
             let operator_pk = SigningKey::from_bytes(&[0x5c; 32]).verifying_key();

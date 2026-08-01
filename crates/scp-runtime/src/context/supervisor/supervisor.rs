@@ -21481,12 +21481,16 @@ mod tests {
         const BOB: &str = "did:dht:z6MkBobE2eReceiverBobE2eReceiverBob123";
         let ctx_str = "e2e-decrypt-and-dispatch-fail-closed";
 
-        // Real two-party join: Bob holds the group + Alice's sender key at epoch 1.
-        let (alice_crypto, bob_crypto, ctx_bytes) =
+        // Real two-party join, born DIRECTLY onto actor-owned state: Bob's actor
+        // holds the group + Alice's pulled sender key at epoch 1, Alice's actor
+        // owns her group + sender key.
+        let (_alice_crypto, mut alice_actor, bob_crypto, mut bob_actor, ctx_bytes) =
             crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
-        // Wrap Bob's post-join provider in a fresh Supervisor (empty registry) and
-        // build his production ActorDeps.
+        // Wrap Bob's provider in a fresh Supervisor (empty registry) and build his
+        // production ActorDeps. App-data delivery never touches the provider's
+        // per-context crypto (Bob's crypto lives on his actor state), so the
+        // groupless `bob_deps.crypto` is only read for `local_did`.
         let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
         let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Bob's ActorDeps from a sync #[test]; not a production async bridge
             .enable_all()
@@ -21495,10 +21499,6 @@ mod tests {
         let bob_deps = rt
             .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
             .expect("build bob's actor deps");
-
-        // Move Alice onto the actor seam (the provider `seal` twin is deleted
-        // post-ADR-049 PR-7); she seals from her actor-owned crypto.
-        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
 
         // Alice seals an Application envelope; the sender-layer header carries her
         // current (epoch, send_sequence). First seal → sequence 0, second → 1.
@@ -21530,12 +21530,8 @@ mod tests {
         let msg_a = seal_app(b"first-application-message"); // header sequence 0
         let msg_b = seal_app(b"second-application-message"); // header sequence 1
 
-        // Move Bob onto the actor seam and hand `decrypt_and_dispatch` his
-        // actor-owned crypto state: post-ADR-049 PR-7 the receive seam opens
-        // through the actor's `&mut ContextCryptoState` (a `None` means "no
-        // group"). App-data delivery never touches the provider's per-context
-        // crypto, so the emptied `bob_deps.crypto` is only read for `local_did`.
-        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        // Hand `decrypt_and_dispatch` Bob's actor-owned crypto state: the receive
+        // seam opens through the actor's `&mut ContextCryptoState`.
         let bob_cs = match &mut bob_actor.mode {
             crate::context::actor::ContextModeState::Encrypted(c) => c,
             crate::context::actor::ContextModeState::Broadcast(_) => {
@@ -21622,21 +21618,20 @@ mod tests {
         const BOB: &str = "did:dht:z6MkBobCatchUpBobCatchUpBobCatchUpBob12";
         let ctx_str = "e2e-decrypt-and-dispatch-catch-up";
 
-        let (alice_crypto, bob_crypto, ctx_bytes) =
+        let (_alice_crypto, mut alice_actor, bob_crypto, mut bob_actor, ctx_bytes) =
             crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
-        // Move Alice onto the actor seam (the provider rotate/drain twins are
-        // deleted post-ADR-049 PR-7). Alice rotates her sender key (epoch 1 → 2)
-        // and redistributes it to Bob, who installs it via the retained
-        // receive-side provider methods — exactly what the live flow does.
-        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+        // Alice rotates her sender key (epoch 1 → 2) on her owned actor state and
+        // redistributes it to Bob, who installs it on HIS owned actor state via
+        // the actor-native receive-side seams — exactly what the live flow does.
+        let bob_secret: [u8; 32] = *bob_crypto.wrapping_keypair_snapshot().1;
         alice_actor.rotate_sender_key(ALICE).unwrap();
         alice_actor.distribute_sender_key(ALICE, ALICE).ok();
         for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
             if let Ok((key, _epoch)) =
-                bob_crypto.process_incoming_sender_key(&ctx_bytes, ALICE, &msg)
+                bob_actor.process_incoming_sender_key(&bob_secret, ALICE, &msg)
             {
-                bob_crypto.set_sender_key_unchecked(&ctx_bytes, ALICE, key);
+                bob_actor.set_sender_key_unchecked(ALICE, key);
             }
         }
 
@@ -21680,10 +21675,9 @@ mod tests {
             .seal(ALICE, &inner, &routing_id, 3600)
             .expect("alice seals at the rotated epoch");
 
-        // Hand Bob's actor-owned crypto state to the receive seam (it now opens
-        // through the actor's `&mut ContextCryptoState`); the rotated key Bob
-        // installed above is carried onto the actor by `take_into_actor`.
-        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        // Hand Bob's actor-owned crypto state (carrying the rotated key installed
+        // above) to the receive seam; it opens through the actor's
+        // `&mut ContextCryptoState`.
         let bob_cs = match &mut bob_actor.mode {
             crate::context::actor::ContextModeState::Encrypted(c) => c,
             crate::context::actor::ContextModeState::Broadcast(_) => {
@@ -21731,8 +21725,9 @@ mod tests {
         const BOB: &str = "did:dht:z6MkBobHeartbeatBobHeartbeatBobHeartbe1";
         let ctx_str = "heartbeat-mutated-regression";
 
-        // Real two-party join: Alice owns the joined MLS group + her sender key.
-        let (alice_crypto, _bob_crypto, ctx_bytes) =
+        // Real two-party join, born directly onto actor-owned state: Alice's
+        // actor owns the joined MLS group + her sender key.
+        let (alice_crypto, mut alice_state, _bob_crypto, _bob_actor, _ctx_bytes) =
             crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
         let alice_sup = supervisor_with_crypto(Arc::clone(&alice_crypto));
@@ -21744,11 +21739,10 @@ mod tests {
             .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
             .expect("build alice's actor deps");
 
-        // Move Alice's joined crypto onto the actor. Activate the context and seed
-        // Alice as a member with `messages:write` directly (mirroring the
+        // Activate the context on Alice's owned actor state and seed Alice as a
+        // member with `messages:write` directly (mirroring the
         // `writable_encrypted_state` fixture) so the heartbeat's require-active and
         // send-authorization gates pass without a governance round-trip.
-        let mut alice_state = take_into_actor(&alice_crypto, &ctx_bytes);
         alice_state
             .handle
             .transition_to(&ContextState::Active)
@@ -21822,7 +21816,7 @@ mod tests {
         const CHARLIE: &str = "did:dht:z6MkCharliePullCharliePullCharliePul12";
         let ctx_str = "sender-key-pull-receive-path";
 
-        let (alice_crypto, bob_crypto, ctx_bytes) =
+        let (alice_crypto, mut alice_actor, _bob_crypto, mut bob_actor, ctx_bytes) =
             crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
         let ctx_hex = hex::encode(ctx_bytes);
         let routing_id = scp_protocol::context::context_routing_id(ctx_str).to_vec();
@@ -21876,7 +21870,6 @@ mod tests {
 
         // Bob seals both requests through his actor-owned MLS group as management
         // envelopes (in MLS-generation order: mismatch first, then well-formed).
-        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
         let bob_cs = match &mut bob_actor.mode {
             crate::context::actor::ContextModeState::Encrypted(c) => c.as_mut(),
             crate::context::actor::ContextModeState::Broadcast(_) => panic!("expected encrypted"),
@@ -21892,8 +21885,7 @@ mod tests {
             .mls_encrypt_management(&ok_dist, &routing_id, 3600)
             .expect("bob seals the well-formed request");
 
-        // Alice opens on the production receive seam.
-        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+        // Alice opens on the production receive seam using her owned actor state.
         let alice_cs = match &mut alice_actor.mode {
             crate::context::actor::ContextModeState::Encrypted(c) => c.as_mut(),
             crate::context::actor::ContextModeState::Broadcast(_) => panic!("expected encrypted"),

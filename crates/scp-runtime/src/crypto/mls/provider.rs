@@ -4173,27 +4173,24 @@ mod tests {
     /// derive its id from a real string rather than an arbitrary 32-byte value.
     const TEST_CTX_STR: &str = "h9-ceiling-ctx";
 
-    fn setup_alice_bob_two_party() -> (
-        Arc<MlsCryptoProvider>,
-        Arc<MlsCryptoProvider>,
-        [u8; 32],
-        String,
-    ) {
+    fn setup_alice_bob_two_party() -> (PerContextState, PerContextState, [u8; 32], String) {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         // Stand up the joined pair over the REAL reserve → creator-add → sign →
-        // HPKE-seal → spawn-from-Welcome path (the legacy provider-level
-        // prepare/join shortcut is retired). The helper also distributes Alice's
-        // sender key to Bob, so `bob.sender_key_store.epoch(ctx, alice_did) = 1` —
-        // the H9 high-water mark these tests anchor on.
-        let (alice, bob, context_id) =
+        // HPKE-seal → join path, born DIRECTLY onto actor-owned state via the
+        // #2148 owned-return constructors (no provider `take_crypto_state`
+        // round-trip). The helper also pulls Alice's sender key to Bob, so Bob's
+        // installed sender-key epoch for Alice is 1 — the H9 high-water mark these
+        // tests anchor on. The returned providers are unused here, so they are
+        // discarded.
+        let (_alice_p, alice_state, _bob_p, bob_state, context_id) =
             crate::crypto::mls::two_party_test_support::stand_up_two_party(
                 TEST_CTX_STR,
                 alice_did,
                 bob_did,
             );
 
-        (alice, bob, context_id, alice_did.to_string())
+        (alice_state, bob_state, context_id, alice_did.to_string())
     }
 
     /// Build a minimal `InnerEnvelope` with a deterministic signing key.
@@ -4237,14 +4234,8 @@ mod tests {
         // contract. Proof: a `seal`ed message opens with the raw string but
         // FAILS to open when the hex-of-bytes string is supplied as the AAD
         // source — the exact value native used to (incorrectly) bind.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let (mut alice_actor, mut bob_actor, ctx_id, alice_did) = setup_alice_bob_two_party();
         let routing_id = ctx_routing_id(&ctx_id);
-
-        // Seal/open moved onto the actor seam: move each party's provider-resident
-        // crypto onto an actor and drive the relocated
-        // `PerContextState::seal` / `PerContextState::open`.
-        let mut alice_actor = take_into_actor(&alice, &ctx_id);
-        let mut bob_actor = take_into_actor(&bob, &ctx_id);
 
         // Two independently-sealed messages. MLS forward secrecy deletes the
         // per-message decryption secret on the FIRST `open` of a given
@@ -4307,9 +4298,7 @@ mod tests {
         // decrypt, or sender-layer AEAD work — so the rejection is the fast-path
         // resolve-consistency error, distinct from an AEAD authentication
         // failure.
-        let (_alice, bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
-        // Seal/open moved onto the actor seam; drive the relocated open.
-        let mut bob_actor = take_into_actor(&bob, &ctx_id);
+        let (_alice_actor, mut bob_actor, ctx_id, _alice_did) = setup_alice_bob_two_party();
 
         // A `context_id_str` whose canonical resolution is NOT `ctx_id`. It is a
         // non-64-hex string, so it resolves via the SHA-256 fallback; `ctx_id`
@@ -4355,12 +4344,8 @@ mod tests {
         // BEFORE any inner-envelope serialization, sender-layer AEAD, or MLS
         // encrypt work — so the rejection is the fast-path resolve-consistency
         // error, not a downstream crypto failure.
-        let (alice, _bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let (mut alice_actor, _bob_actor, ctx_id, alice_did) = setup_alice_bob_two_party();
         let routing_id = ctx_routing_id(&ctx_id);
-        // Seal moved onto the actor seam; drive the relocated seal on the
-        // actor whose `context_id` is the real `ctx_id` (so the live MLS group +
-        // sender key from setup are present).
-        let mut alice_actor = take_into_actor(&alice, &ctx_id);
 
         // The keying context is the REAL `ctx_id`, but the inner envelope binds
         // a DIFFERENT context-id string. The string is non-64-hex, so it
@@ -4397,12 +4382,17 @@ mod tests {
 
     #[test]
     fn take_crypto_state_removes_entry_from_provider() {
-        // Create a two-member context via the legacy path, then take
-        // the state. Post-take: the provider's `contexts` map has no
-        // entry for this context_id, the `taken_context_ids` set
-        // does, and the returned `OwnedMlsCryptoState` carries the
-        // expected mls group + sender key + counter values.
-        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+        // #2148 slice 2: this test verifies the PROVIDER's own take/taken
+        // bookkeeping — a provider-resident-birth mechanic that has no actor-native
+        // equivalent (the actor never reserves a `contexts` slot). It therefore
+        // births a provider-resident group directly through the RETAINED provider
+        // birth seam (deleted, with this test, in slice 3), rather than the
+        // actor-native `stand_up_two_party` fixture.
+        let alice = make_provider();
+        let ctx_id = make_context_id();
+        alice
+            .create_mls_group(&ctx_id)
+            .expect("provider-resident birth for the take mechanic");
 
         // Capture the sender_key_epoch before take so we can compare
         // to the returned owned value.
@@ -4417,8 +4407,7 @@ mod tests {
             .take_crypto_state(&ctx_id)
             .expect("take_crypto_state succeeds for live context");
         assert_eq!(owned.sender_key_epoch, epoch_before);
-        // send_sequence starts at 0 — setup_alice_bob_two_party does
-        // not call seal().
+        // send_sequence starts at 0 — the birth does not call seal().
         assert_eq!(owned.send_sequence, 0);
 
         // `contexts` map now has no entry for this id.
@@ -4450,7 +4439,15 @@ mod tests {
         // First take succeeds. Second take sees the id in
         // `taken_context_ids` and returns the "owned by actor"
         // error instead of the generic `no MLS group` error.
-        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+        //
+        // #2148 slice 2: a PROVIDER take/taken mechanic — no actor-native
+        // equivalent — so it births provider-resident through the RETAINED birth
+        // seam (deleted, with this test, in slice 3).
+        let alice = make_provider();
+        let ctx_id = make_context_id();
+        alice
+            .create_mls_group(&ctx_id)
+            .expect("provider-resident birth for the double-take mechanic");
 
         let _owned = alice.take_crypto_state(&ctx_id).unwrap();
 
@@ -4485,7 +4482,15 @@ mod tests {
         // never created, and the "context state owned by actor"
         // error when it was taken. The distinction matters for
         // actionable diagnostics.
-        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+        //
+        // #2148 slice 2: a PROVIDER with_context/take mechanic — no actor-native
+        // equivalent — so it births provider-resident through the RETAINED birth
+        // seam (deleted, with this test, in slice 3).
+        let alice = make_provider();
+        let ctx_id = make_context_id();
+        alice
+            .create_mls_group(&ctx_id)
+            .expect("provider-resident birth for the with_context mechanic");
 
         // Never-created id.
         let other_id = [0xAAu8; 32];
@@ -4524,7 +4529,19 @@ mod tests {
     /// the double-owner vector where provider and actor both seal.
     #[test]
     fn taken_context_write_paths_fail_closed() {
-        let (alice, bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+        // #2148 slice 2: the H2 "owned by actor" guards on the RETAINED provider
+        // write seams (`create_mls_group` / `install_joined_group` /
+        // `generate_sender_key`) are provider-only mechanics with no actor-native
+        // equivalent, so this test births provider-resident through those very
+        // seams (deleted, with this test, in slice 3).
+        let alice = make_provider();
+        let bob = make_provider();
+        let ctx_id = make_context_id();
+        alice
+            .create_mls_group(&ctx_id)
+            .expect("provider-resident birth for alice");
+        bob.create_mls_group(&ctx_id)
+            .expect("provider-resident birth for bob");
 
         // Borrow a well-formed MLS group from bob BEFORE taking alice's state
         // (used only to exercise `install_joined_group`; the H2 guard fires
@@ -4604,23 +4621,20 @@ mod tests {
     /// which the string-driven helper cannot address.)
     fn setup_two_party_for_ctx_string(
         ctx_str: &str,
-    ) -> (
-        Arc<MlsCryptoProvider>,
-        Arc<MlsCryptoProvider>,
-        [u8; 32],
-        String,
-    ) {
+    ) -> (PerContextState, PerContextState, [u8; 32], String) {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-        // Stand up the joined pair over the REAL join path, keyed by
-        // `context_id_bytes(ctx_str)`. The helper distributes Alice's sender key
-        // to Bob so Bob can decrypt Alice's app-data sends.
-        let (alice, bob, context_id) =
+        // Stand up the joined pair over the REAL join path, born DIRECTLY onto
+        // actor-owned state via the #2148 owned-return constructors, keyed by
+        // `context_id_bytes(ctx_str)`. The helper pulls Alice's sender key to Bob
+        // so Bob can decrypt Alice's app-data sends. The returned providers are
+        // unused here, so they are discarded.
+        let (_alice_p, alice_state, _bob_p, bob_state, context_id) =
             crate::crypto::mls::two_party_test_support::stand_up_two_party(
                 ctx_str, alice_did, bob_did,
             );
 
-        (alice, bob, context_id, alice_did.to_string())
+        (alice_state, bob_state, context_id, alice_did.to_string())
     }
 
     /// The cleartext outer-envelope `routing_id` produced by
@@ -4631,16 +4645,17 @@ mod tests {
     #[test]
     fn app_data_envelope_routing_id_is_zeroed_not_context_rid() {
         let ctx_str = "ctx-app-data-zeroed-rid";
-        let (alice, _bob, ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
+        let (mut alice_actor, _bob_actor, _ctx_id, alice_did) =
+            setup_two_party_for_ctx_string(ctx_str);
         let clock: std::sync::Arc<dyn scp_clock::Clock> =
             std::sync::Arc::new(scp_clock::SystemClock);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
-        // Send-path seal moved onto the actor: `build_encrypted_envelope_actor` is
-        // the production app-data seal that zeroes the outer routing_id (§9.10.4).
-        let mut alice_actor = take_into_actor(&alice, &ctx_id);
+        // `build_encrypted_envelope_actor` is the production app-data seal that
+        // zeroes the outer routing_id (§9.10.4), driven on Alice's owned actor
+        // state.
         let wire = crate::context::messaging_helpers::build_encrypted_envelope_actor(
             &clock,
             actor_crypto_mut(&mut alice_actor),
@@ -4677,16 +4692,15 @@ mod tests {
     #[test]
     fn app_data_roundtrip_decrypts_with_zeroed_routing_id() {
         let ctx_str = "ctx-app-data-roundtrip";
-        let (alice, bob, ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
+        let (mut alice_actor, mut bob_actor, _ctx_id, alice_did) =
+            setup_two_party_for_ctx_string(ctx_str);
         let clock: std::sync::Arc<dyn scp_clock::Clock> =
             std::sync::Arc::new(scp_clock::SystemClock);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
-        // Both seal (Alice) and open (Bob) move onto the actor seam.
-        let mut alice_actor = take_into_actor(&alice, &ctx_id);
-        let mut bob_actor = take_into_actor(&bob, &ctx_id);
+        // Both seal (Alice) and open (Bob) drive their owned actor states.
         let wire = crate::context::messaging_helpers::build_encrypted_envelope_actor(
             &clock,
             actor_crypto_mut(&mut alice_actor),
@@ -4736,7 +4750,8 @@ mod tests {
         // supplied 32-byte id is its SHA-256, so a hex-of-bytes inner id (which
         // is not the preimage of `ctx_id`) would be rejected.
         let ctx_str = "ctx-control-routing-id";
-        let (alice, _bob, ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
+        let (mut alice_actor, _bob_actor, _ctx_id, alice_did) =
+            setup_two_party_for_ctx_string(ctx_str);
         let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
 
         // Mirror the control-path inner envelope (Recovery message type).
@@ -4756,10 +4771,9 @@ mod tests {
         let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap();
 
         // Control path passes `context_routing_id` to `seal` (as in
-        // trust_recovery_helpers / supervisor / lifecycle_helpers). Seal moved
-        // onto the actor seam, which preserves whatever `routing_id` it is given.
+        // trust_recovery_helpers / supervisor / lifecycle_helpers). The actor
+        // seal preserves whatever `routing_id` it is given.
         let control_rid = scp_protocol::context::context_routing_id(ctx_str);
-        let mut alice_actor = take_into_actor(&alice, &ctx_id);
         let wire = alice_actor
             .seal(&alice_did, &inner, &control_rid, 300)
             .unwrap();
