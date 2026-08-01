@@ -219,7 +219,10 @@ def _build_mock_bridge(
     _tool_revoked_for: set[str] = set()
 
     def _tool_invoke(
-        ctx_id: str, tool: str, input_data: dict[str, Any], invoker_did: str,
+        ctx_id: str,
+        tool: str,
+        input_data: dict[str, Any],
+        invoker_did: str,
     ) -> dict[str, Any]:
         if invoker_did in _tool_revoked_for:
             raise UcanPermissionError(
@@ -243,7 +246,9 @@ def _build_mock_bridge(
     bridge.ucan_validate.return_value = None  # Validation passes silently.
 
     def _ucan_mint(
-        context: str, audience: str, capabilities: list[str],
+        context: str,
+        audience: str,
+        capabilities: list[str],
     ) -> MagicMock:
         return _mock_bridge_ucan_token(
             token_id=f"ucan-{audience[:20]}-{context[:16]}",
@@ -264,8 +269,12 @@ def _build_mock_bridge(
     bridge.event_log_query.return_value = [
         _mock_bridge_event("ContextCreated", alice_did, 0),
         _mock_bridge_event("MemberJoined", bob_did, 1),
-        _mock_bridge_event("MessageSent", alice_did, 2, {"content": "Hello from Python"}),
-        _mock_bridge_event("ToolInvoked", bob_did, 3, {"tool": "calculator", "result": 3}),
+        _mock_bridge_event(
+            "MessageSent", alice_did, 2, {"content": "Hello from Python"}
+        ),
+        _mock_bridge_event(
+            "ToolInvoked", bob_did, 3, {"tool": "calculator", "result": 3}
+        ),
     ]
     bridge.event_log_verify.return_value = _mock_bridge_proof(verified=True)
 
@@ -382,7 +391,8 @@ class TestPhase3EndToEnd:
 
     @pytest.mark.asyncio
     async def test_step03_alice_creates_context_with_tools(
-        self, mock_bridge: MagicMock,
+        self,
+        mock_bridge: MagicMock,
     ) -> None:
         """Step 3: Context creation with capability ceiling and tools.
 
@@ -525,7 +535,8 @@ class TestPhase3EndToEnd:
 
     @pytest.mark.asyncio
     async def test_step08_bob_admin_action_rejected(
-        self, mock_bridge: MagicMock,
+        self,
+        mock_bridge: MagicMock,
     ) -> None:
         """Step 8: Bob attempts ``ctx.close()`` -- UCAN rejects.
 
@@ -544,7 +555,9 @@ class TestPhase3EndToEnd:
             with pytest.raises(UcanPermissionError) as exc_info:
                 await ctx.close(identity=bob)
 
-            assert "ContextClose" in str(exc_info.value) or "lacks" in str(exc_info.value), (
+            assert "ContextClose" in str(exc_info.value) or "lacks" in str(
+                exc_info.value
+            ), (
                 f"Error should mention ContextClose or lack of capability, "
                 f"got: {exc_info.value}"
             )
@@ -553,7 +566,8 @@ class TestPhase3EndToEnd:
 
     @pytest.mark.asyncio
     async def test_step09_mcp_server_exposes_contexts(
-        self, mock_bridge: MagicMock,
+        self,
+        mock_bridge: MagicMock,
     ) -> None:
         """Step 9: ``server = await scp.mcp.serve_mcp(identity=alice, ...)``.
 
@@ -588,7 +602,8 @@ class TestPhase3EndToEnd:
 
     @pytest.mark.asyncio
     async def test_step10_mcp_client_invokes_tool(
-        self, mock_bridge: MagicMock,
+        self,
+        mock_bridge: MagicMock,
     ) -> None:
         """Step 10: MCP client invokes ``ctx/calculator``.
 
@@ -614,8 +629,7 @@ class TestPhase3EndToEnd:
             tool_names = [t.name for t in tools]
 
             assert f"{CONTEXT_ID}/calculator" in tool_names, (
-                f"Expected '{CONTEXT_ID}/calculator' in tool list, "
-                f"got: {tool_names}"
+                f"Expected '{CONTEXT_ID}/calculator' in tool list, got: {tool_names}"
             )
             assert f"{CONTEXT_ID}/send_message" in tool_names
             assert f"{CONTEXT_ID}/read_messages" in tool_names
@@ -685,8 +699,10 @@ class TestPhase3EndToEnd:
         After revocation, Bob's next tool invocation attempt fails
         with UcanPermissionError.
         """
-        with patch.dict(sys.modules, {"_scp_core": mock_bridge}), \
-             patch("scp_sdk.ucan._scp_core", mock_bridge):
+        with (
+            patch.dict(sys.modules, {"_scp_core": mock_bridge}),
+            patch("scp_sdk.ucan._scp_core", mock_bridge),
+        ):
             alice = await Identity.create(custody="in_memory")
             ctx = await Context.create(
                 creator=alice,
@@ -800,8 +816,10 @@ class TestPhase3FullScenario:
     @pytest.mark.asyncio
     async def test_full_scenario(self, mock_bridge: MagicMock) -> None:
         """Execute the complete 13-step Phase 3 integration scenario."""
-        with patch.dict(sys.modules, {"_scp_core": mock_bridge}), \
-             patch("scp_sdk.ucan._scp_core", mock_bridge):
+        with (
+            patch.dict(sys.modules, {"_scp_core": mock_bridge}),
+            patch("scp_sdk.ucan._scp_core", mock_bridge),
+        ):
             # Step 2: Alice creates an identity.
             alice = await Identity.create(custody="in_memory")
             assert alice.did.startswith("did:")

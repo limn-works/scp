@@ -83,7 +83,9 @@ def story_to_markdown(story: dict) -> str:
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python3 story-to-markdown.py <prd.json> <story-id>", file=sys.stderr)
+        print(
+            "Usage: python3 story-to-markdown.py <prd.json> <story-id>", file=sys.stderr
+        )
         sys.exit(1)
 
     prd_path = Path(sys.argv[1])

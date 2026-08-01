@@ -165,9 +165,7 @@ FIXTURE_FILE = REPO_ROOT / "scripts" / "tests" / "block-in-place-fixture.rs"
 EXCLUDED_FILES = {
     "crates/scp-runtime/src/crypto/mls/storage.rs",
 }
-EXCLUDED_PREFIXES = (
-    "crates/scp-ffi/",
-)
+EXCLUDED_PREFIXES = ("crates/scp-ffi/",)
 
 # Directive: single-line inline allow-list.
 #
@@ -454,9 +452,7 @@ def _collect_runtime_aliases(root, source: bytes) -> set[str]:
     return aliases
 
 
-def _is_bare_block_in_place_reference(
-    node, source: bytes, aliases: set[str]
-) -> bool:
+def _is_bare_block_in_place_reference(node, source: bytes, aliases: set[str]) -> bool:
     """True if `node` is a `scoped_identifier` or bare `identifier`
     that names `block_in_place` (or a known alias) AND is used as a
     VALUE EXPRESSION rather than as a call callee, a let binding's
@@ -600,9 +596,7 @@ def _call_is_block_on(call_node, source: bytes) -> bool:
     return node_text(field, source) == "block_on"
 
 
-def _call_is_runtime_new(
-    call_node, source: bytes, runtime_aliases: set[str]
-) -> bool:
+def _call_is_runtime_new(call_node, source: bytes, runtime_aliases: set[str]) -> bool:
     """True if `call_node` is `Runtime::new(...)`,
     `tokio::runtime::Runtime::new(...)`, or `ALIAS::new(...)` where
     `ALIAS` was bound via `type ALIAS = Runtime;` or
@@ -630,9 +624,7 @@ def _call_is_runtime_new(
     return path_txt in runtime_aliases or tail in runtime_aliases
 
 
-def _use_decl_is_pub_reexport_of_block_in_place(
-    use_node, source: bytes
-) -> bool:
+def _use_decl_is_pub_reexport_of_block_in_place(use_node, source: bytes) -> bool:
     """True if `use_node` is a `use_declaration` that
 
       (a) carries a `visibility_modifier` DIRECT child (`pub`, `pub(crate)`,
@@ -934,9 +926,7 @@ def load_baseline() -> tuple[dict[str, int], dict[str, int]]:
         sys.stderr.write(
             f"{C_RED}error:{C_RESET} ratchet file missing: {RATCHET_FILE}\n"
         )
-        sys.stderr.write(
-            "Create it with the current per-file counts. See ADR-049.\n"
-        )
+        sys.stderr.write("Create it with the current per-file counts. See ADR-049.\n")
         sys.exit(2)
     try:
         data = json.loads(RATCHET_FILE.read_text())
@@ -955,9 +945,7 @@ def load_baseline() -> tuple[dict[str, int], dict[str, int]]:
     per_file = {str(k): int(v) for k, v in files.items()}
     crates = data.get("crates", {})
     per_crate = (
-        {str(k): int(v) for k, v in crates.items()}
-        if isinstance(crates, dict)
-        else {}
+        {str(k): int(v) for k, v in crates.items()} if isinstance(crates, dict) else {}
     )
     return (per_file, per_crate)
 
@@ -973,9 +961,7 @@ def do_real_scan(verbose: bool) -> int:
         total_errors.extend(errors)
 
     if total_errors:
-        sys.stderr.write(
-            f"{C_RED}error:{C_RESET} malformed allow-list directives:\n"
-        )
+        sys.stderr.write(f"{C_RED}error:{C_RESET} malformed allow-list directives:\n")
         for e in total_errors:
             sys.stderr.write(f"  {e}\n")
         return 1
@@ -1002,9 +988,7 @@ def do_real_scan(verbose: bool) -> int:
     # the baseline with 0 current hits are silently fine (they've been
     # fully cleaned up).
     fail = False
-    all_files: set[str] = set(per_file_baseline.keys()) | set(
-        per_file_count.keys()
-    )
+    all_files: set[str] = set(per_file_baseline.keys()) | set(per_file_count.keys())
     drops: list[tuple[str, int, int]] = []
     for rel in sorted(all_files):
         counted = per_file_count.get(rel, 0)
@@ -1160,12 +1144,18 @@ REQUIRED_FIXTURE_PATTERNS: list[tuple[str, str]] = [
     #     modifier and the imported symbol name is `block_in_place`.
     #     Anchored on a dedicated fixture mod so the substring match
     #     is tight to the `pub use` line.
-    ("pub_reexport_block_in_place", "pub_reexport_cases:pub use tokio::task::block_in_place"),
+    (
+        "pub_reexport_block_in_place",
+        "pub_reexport_cases:pub use tokio::task::block_in_place",
+    ),
     # 18. `pub(crate) use tokio::task::block_in_place;` — same
     #     bypass family, distinct visibility modifier. The scanner
     #     treats every `visibility_modifier` form uniformly (pub,
     #     pub(crate), pub(super), pub(in ...)).
-    ("pub_reexport_block_in_place", "pub_reexport_cases:pub(crate) use tokio::task::block_in_place"),
+    (
+        "pub_reexport_block_in_place",
+        "pub_reexport_cases:pub(crate) use tokio::task::block_in_place",
+    ),
 ]
 
 
@@ -1214,9 +1204,7 @@ def _mod_line_ranges(fixture_path: Path) -> dict[str, tuple[int, int]]:
 
 def do_self_test() -> int:
     if not FIXTURE_FILE.is_file():
-        sys.stderr.write(
-            f"{C_RED}error:{C_RESET} fixture missing: {FIXTURE_FILE}\n"
-        )
+        sys.stderr.write(f"{C_RED}error:{C_RESET} fixture missing: {FIXTURE_FILE}\n")
         return 2
 
     # Scan the fixture as though it were in-scope. Bypass the scope filter

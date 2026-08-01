@@ -27,9 +27,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 REQUIRED_STORY_FIELDS = [
-    "id", "title", "gate", "priority", "severity", "status",
-    "files", "description", "acceptanceCriteria", "actionItems",
-    "blockedBy", "sources", "details",
+    "id",
+    "title",
+    "gate",
+    "priority",
+    "severity",
+    "status",
+    "files",
+    "description",
+    "acceptanceCriteria",
+    "actionItems",
+    "blockedBy",
+    "sources",
+    "details",
 ]
 
 VALID_PRIORITIES = {"P0", "P1", "P2"}
@@ -148,22 +158,19 @@ def validate_story(story: dict, prd_name: str) -> list[str]:
     priority = story.get("priority", "")
     if priority and priority not in VALID_PRIORITIES:
         errors.append(
-            f"Invalid priority `{priority}` — "
-            f"must be one of {sorted(VALID_PRIORITIES)}"
+            f"Invalid priority `{priority}` — must be one of {sorted(VALID_PRIORITIES)}"
         )
 
     severity = story.get("severity", "")
     if severity and severity not in VALID_SEVERITIES:
         errors.append(
-            f"Invalid severity `{severity}` — "
-            f"must be one of {sorted(VALID_SEVERITIES)}"
+            f"Invalid severity `{severity}` — must be one of {sorted(VALID_SEVERITIES)}"
         )
 
     status = story.get("status", "")
     if status and status not in VALID_STATUSES:
         errors.append(
-            f"Invalid status `{status}` — "
-            f"must be one of {sorted(VALID_STATUSES)}"
+            f"Invalid status `{status}` — must be one of {sorted(VALID_STATUSES)}"
         )
 
     # --- Array field types ---
@@ -195,9 +202,7 @@ def validate_story(story: dict, prd_name: str) -> list[str]:
 
     # --- ID uniqueness ---
     if sid in all_ids:
-        errors.append(
-            f"Story ID `{sid}` already exists in an existing PRD file"
-        )
+        errors.append(f"Story ID `{sid}` already exists in an existing PRD file")
 
     # --- blockedByIssues validation ---
     for issue_num in story.get("blockedByIssues", []):
@@ -231,8 +236,7 @@ def validate_story(story: dict, prd_name: str) -> list[str]:
             headings = extract_headings(resolved)
             if source_section not in headings:
                 errors.append(
-                    f"Source section not found in `{source_file}`: "
-                    f"`{source_section}`"
+                    f"Source section not found in `{source_file}`: `{source_section}`"
                 )
 
     # --- Acceptance criteria quality (basic checks) ---
@@ -264,7 +268,11 @@ def validate_story(story: dict, prd_name: str) -> list[str]:
     # --- Empty sources without explanation ---
     sources = story.get("sources", [])
     if isinstance(sources, list) and len(sources) == 0:
-        if isinstance(desc, str) and "infer" not in desc.lower() and "context" not in desc.lower():
+        if (
+            isinstance(desc, str)
+            and "infer" not in desc.lower()
+            and "context" not in desc.lower()
+        ):
             errors.append(
                 "Empty `sources` array — per standard, explain the origin in "
                 "`description` when no external source exists"

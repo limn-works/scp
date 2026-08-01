@@ -25,9 +25,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 REQUIRED_STORY_FIELDS = [
-    "id", "title", "gate", "priority", "severity", "status",
-    "files", "description", "acceptanceCriteria", "actionItems",
-    "blockedBy", "sources", "details",
+    "id",
+    "title",
+    "gate",
+    "priority",
+    "severity",
+    "status",
+    "files",
+    "description",
+    "acceptanceCriteria",
+    "actionItems",
+    "blockedBy",
+    "sources",
+    "details",
 ]
 
 VALID_PRIORITIES = {"P0", "P1", "P2"}
@@ -97,22 +107,19 @@ def validate_prd(prd_path: Path, all_story_ids: set[str] | None = None) -> list[
         priority = story.get("priority", "")
         if priority and priority not in VALID_PRIORITIES:
             errors.append(
-                f"{prefix} invalid priority '{priority}' "
-                f"(expected {VALID_PRIORITIES})"
+                f"{prefix} invalid priority '{priority}' (expected {VALID_PRIORITIES})"
             )
 
         severity = story.get("severity", "")
         if severity and severity not in VALID_SEVERITIES:
             errors.append(
-                f"{prefix} invalid severity '{severity}' "
-                f"(expected {VALID_SEVERITIES})"
+                f"{prefix} invalid severity '{severity}' (expected {VALID_SEVERITIES})"
             )
 
         status = story.get("status", "")
         if status and status not in VALID_STATUSES:
             errors.append(
-                f"{prefix} invalid status '{status}' "
-                f"(expected {VALID_STATUSES})"
+                f"{prefix} invalid status '{status}' (expected {VALID_STATUSES})"
             )
 
         # --- Check 6: Gate exists ---
@@ -133,8 +140,7 @@ def validate_prd(prd_path: Path, all_story_ids: set[str] | None = None) -> list[
         for dep in story.get("blockedBy", []):
             if dep not in valid_ids:
                 errors.append(
-                    f"{prefix} blockedBy references non-existent "
-                    f"story '{dep}'"
+                    f"{prefix} blockedBy references non-existent story '{dep}'"
                 )
 
         # --- Check 5b: blockedByIssues must be positive integers ---
@@ -154,9 +160,7 @@ def validate_prd(prd_path: Path, all_story_ids: set[str] | None = None) -> list[
                 source_file = source.get("file", "")
                 source_section = source.get("section")
             else:
-                errors.append(
-                    f"{prefix} invalid source format: {source}"
-                )
+                errors.append(f"{prefix} invalid source format: {source}")
                 continue
 
             if not source_file:
@@ -164,10 +168,7 @@ def validate_prd(prd_path: Path, all_story_ids: set[str] | None = None) -> list[
 
             resolved = REPO_ROOT / source_file
             if not resolved.is_file():
-                errors.append(
-                    f"{prefix} source file does not exist: "
-                    f"{source_file}"
-                )
+                errors.append(f"{prefix} source file does not exist: {source_file}")
                 continue
 
             # Check section heading exists in the file
@@ -189,8 +190,7 @@ def validate_prd(prd_path: Path, all_story_ids: set[str] | None = None) -> list[
         for ref_sid in gate.get("stories", []):
             if ref_sid not in story_ids:
                 errors.append(
-                    f"gate '{gid}': references non-existent story "
-                    f"'{ref_sid}'"
+                    f"gate '{gid}': references non-existent story '{ref_sid}'"
                 )
 
     return errors
@@ -243,10 +243,7 @@ def main() -> int:
             data = json.load(f)
         story_count += len(data.get("stories", []))
 
-    print(
-        f"PRD validation passed: {len(prd_files)} file(s), "
-        f"{story_count} stories"
-    )
+    print(f"PRD validation passed: {len(prd_files)} file(s), {story_count} stories")
     return 0
 
 

@@ -4,6 +4,7 @@
 Uses tree-sitter to parse Rust files and detect async functions outside
 #[cfg(test)] modules. Fails CI if any are found.
 """
+
 import sys
 import os
 import tree_sitter_rust as ts_rust
@@ -26,7 +27,7 @@ def has_test_cfg_attribute(node, source):
     sibling = node.prev_sibling
     while sibling is not None:
         if sibling.type == "attribute_item":
-            text = source[sibling.start_byte:sibling.end_byte].decode(
+            text = source[sibling.start_byte : sibling.end_byte].decode(
                 "utf-8", errors="replace"
             )
             if "cfg(" in text and "test" in text:
@@ -53,7 +54,7 @@ def walk(node, source, in_test=False, filepath=""):
     if node.type == "function_item" and not test_ctx:
         for child in node.children:
             if child.type == "function_modifiers":
-                mod_text = source[child.start_byte:child.end_byte].decode(
+                mod_text = source[child.start_byte : child.end_byte].decode(
                     "utf-8", errors="replace"
                 )
                 if "async" in mod_text:
@@ -62,7 +63,9 @@ def walk(node, source, in_test=False, filepath=""):
                         (c for c in node.children if c.type == "identifier"), None
                     )
                     name = (
-                        source[name_node.start_byte:name_node.end_byte].decode("utf-8")
+                        source[name_node.start_byte : name_node.end_byte].decode(
+                            "utf-8"
+                        )
                         if name_node
                         else "unknown"
                     )
