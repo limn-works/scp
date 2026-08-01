@@ -1,0 +1,21 @@
+{
+  "name": "scp-typescript-web",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "start": "vite",
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "lint": "biome check src/"
+  },
+  "dependencies": {
+    "@limn-works/scp-ts-wasm": "file:../../bindings/typescript-wasm"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.5",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}
