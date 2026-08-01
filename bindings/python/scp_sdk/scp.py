@@ -55,7 +55,7 @@ from typing import (
     runtime_checkable,
 )
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import ScpError, _coded_bridge_error
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
@@ -690,7 +690,6 @@ class SCP:
 
     async def identity_add_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_add_agent_key`` (returns :class:`Identity`)."""
-        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
         try:
@@ -821,8 +820,6 @@ class SCP:
         """
         import json
 
-        from scp_sdk.errors import _coded_bridge_error
-
         try:
             result_json = await asyncio.to_thread(
                 self._native.identity_execute_recovery, did, tier, context_ids
@@ -869,7 +866,6 @@ class SCP:
         distribute the event to active context members (spec §9.12,
         ADR-003 §4b).
         """
-        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
         try:
@@ -882,7 +878,6 @@ class SCP:
 
     async def identity_remove_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_remove_agent_key`` (returns :class:`Identity`)."""
-        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
         try:
@@ -898,7 +893,6 @@ class SCP:
         without error when the DID is not present. Delegates to
         ``_scp_core.SCP.identity_remove``.
         """
-        from scp_sdk.errors import _coded_bridge_error
 
         try:
             await asyncio.to_thread(self._native.identity_remove, did)
@@ -912,7 +906,6 @@ class SCP:
         the DID was not in the registry. Delegates to
         ``_scp_core.SCP.identity_remove_if_present``.
         """
-        from scp_sdk.errors import _coded_bridge_error
 
         try:
             return await asyncio.to_thread(self._native.identity_remove_if_present, did)
@@ -952,7 +945,6 @@ class SCP:
 
     async def identity_rotate_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_rotate_agent_key`` (returns :class:`Identity`)."""
-        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
         try:
@@ -963,7 +955,6 @@ class SCP:
 
     async def identity_rotate_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_rotate_key`` (returns :class:`Identity`)."""
-        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.identity import Identity
 
         try:
@@ -1300,7 +1291,6 @@ class SCP:
 
     async def context_member_count(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_count``."""
-        from scp_sdk.errors import _coded_bridge_error
 
         try:
             return await asyncio.to_thread(self._native.context_member_count, handle)
@@ -1392,7 +1382,6 @@ class SCP:
         event); retry once peers' pseudonym-announcement messages have arrived.
         A lone-member send is a no-op; broadcast contexts are unaffected.
         """
-        from scp_sdk.errors import _coded_bridge_error
 
         try:
             return await asyncio.to_thread(
@@ -1477,7 +1466,6 @@ class SCP:
         step-5 audience check the tautology ``aud == aud`` and inflate trust).
         Pass the DID the token must be addressed to.
         """
-        from scp_sdk.errors import _coded_bridge_error
 
         try:
             return await asyncio.to_thread(
@@ -1774,7 +1762,6 @@ class SCP:
 
     async def governance_propose(self, handle: Any, identity_did: str, action_json: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_propose``."""
-        from scp_sdk.errors import _coded_bridge_error
 
         try:
             return await asyncio.to_thread(
@@ -2156,7 +2143,6 @@ class SCP:
 
         Returns a list of :class:`~scp_sdk.event_log.Event` dataclasses.
         """
-        from scp_sdk.errors import _coded_bridge_error
         from scp_sdk.event_log import Event
 
         try:
@@ -2269,7 +2255,12 @@ class SCP:
         import json
 
         receipts_json = json.dumps(receipts)
-        raw = await asyncio.to_thread(self._native.economy_verify_payment_receipts, receipts_json)
+        try:
+            raw = await asyncio.to_thread(
+                self._native.economy_verify_payment_receipts, receipts_json
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return json.loads(raw)
 
     # endregion Economy
@@ -2553,7 +2544,6 @@ class SCP:
         spending_ucan: str | None = None,
     ) -> Any:
         """Delegate to ``_scp_core.SCP.outlet_invoke``."""
-        from scp_sdk.errors import _coded_bridge_error
 
         try:
             return await asyncio.to_thread(

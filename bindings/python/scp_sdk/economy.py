@@ -337,16 +337,21 @@ async def verify_payment_receipts(
         on failure.
 
     Raises:
-        ValueError: If the receipts cannot be serialized, the batch
-            exceeds the maximum, or the JSON is invalid.
-        RuntimeError: If the supervisor is not initialized.
+        ScpError: (or an appropriate subclass) if the bridge raises any
+            protocol error, including invalid receipts or an uninitialized
+            supervisor.
     """
+    from scp_sdk.errors import _coded_bridge_error
+
     instance = scp._native
     receipts_json = json.dumps(receipts)
-    result = await asyncio.to_thread(
-        instance.economy_verify_payment_receipts,
-        receipts_json,
-    )
+    try:
+        result = await asyncio.to_thread(
+            instance.economy_verify_payment_receipts,
+            receipts_json,
+        )
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
     if isinstance(result, str):
         return json.loads(result)
     return result

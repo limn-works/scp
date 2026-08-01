@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import ScpError, _coded_bridge_error
 
 if TYPE_CHECKING:
     pass
@@ -121,11 +121,14 @@ def discover(query: str) -> list[dict[str, Any]]:
         plus optional ``creator_did`` / ``member_count`` / ``outlet_count``.
 
     Raises:
-        ValidationError: If the query is neither a DID nor an ``scp://`` URI.
-        ContextError: If DID resolution or URI parsing fails.
+        ScpError: (or an appropriate subclass) if the query is invalid, DID
+            resolution fails, or the bridge raises any protocol error.
     """
     bridge = _bridge()
-    results = bridge.context_discover(query)
+    try:
+        results = bridge.context_discover(query)
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
     return [dict(r) for r in results]
 
 
