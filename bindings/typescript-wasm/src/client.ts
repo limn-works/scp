@@ -381,8 +381,23 @@ export class ScpBrowserClient {
     return this.#inner.eventLogLeafHashes(contextId);
   }
 
-  /** The MLS group epoch for `contextId` as a `bigint` (a u64 — #1229). */
-  mlsEpoch(contextId: string): bigint {
+  /**
+   * The MLS group epoch for `contextId` as a `bigint` (a u64 — #1229), or
+   * `undefined` if the context is not held (or poisoned).
+   *
+   * Returns `undefined` for an absent/poisoned context — symmetric with the
+   * sibling observers ({@link memberDids}, {@link eventLogRoot},
+   * {@link eventLogLeafCount}, {@link eventLogLeafHashes}), which collapse
+   * not-held/poisoned into `undefined` rather than throwing.
+   */
+  mlsEpoch(contextId: string): bigint | undefined {
+    // Gate on the non-throwing status predicate so a not-held/poisoned context
+    // yields `undefined` like the siblings, instead of the wasm surface's
+    // `[SCP-CTX-2001]` / `[SCP-STORAGE-8013]` throw. Single-threaded driver, so
+    // there is no status→epoch race.
+    if (this.#inner.contextStatus(contextId) !== "live") {
+      return undefined;
+    }
     return call(() => this.#inner.mlsEpoch(contextId));
   }
 

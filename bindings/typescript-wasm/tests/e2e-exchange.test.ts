@@ -136,8 +136,12 @@ test("two-party create/add/join/send/receive/converge through the real wasm + re
   expect(aliceLeaves?.length).toBe(2 * 32);
   expect(alice.eventLogRoot(CTX)).toEqual(bob.eventLogRoot(CTX));
 
-  // The add Commit advanced the MLS epoch.
-  expect(alice.mlsEpoch(CTX) >= 1n).toBe(true);
+  // The add Commit advanced the MLS epoch (a live context returns a bigint).
+  const epoch = alice.mlsEpoch(CTX);
+  expect(epoch).toBeDefined();
+  expect((epoch ?? 0n) >= 1n).toBe(true);
+  // Symmetric with the sibling observers: an absent context is undefined, not a throw.
+  expect(alice.mlsEpoch("no-such-ctx")).toBeUndefined();
 
   alice.closeContext(CTX);
   bob.closeContext(CTX);
