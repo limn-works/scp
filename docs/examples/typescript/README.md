@@ -51,7 +51,7 @@ bun run tools.ts
 
 ## Key Patterns
 
-- **Server in-process**: On Bun/Node the SDK runs the protocol engine in-process via the napi-rs native addon. In the browser it operates as a remote thin client (no in-browser protocol backend).
+- **Server in-process**: On Bun/Node the SDK runs the protocol engine in-process via the napi-rs native addon. In the browser the full protocol runs in-tab via the sibling wasm tier `@limn-works/scp-ts-wasm`, keys on-device (ADR-057); a remote custodial thin client is an optional mode.
 - **AsyncDisposable**: `Context` implements `Symbol.asyncDispose` for `await using` cleanup.
 - **Typed params**: Use `ContextParams`, `ToolDefinition`, `Message` types for safety.
 - **UCAN authorization**: Tool invocation requires a valid UCAN token (spec section 7.2).

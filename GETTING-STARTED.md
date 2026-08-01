@@ -102,7 +102,7 @@ crates/              # Rust workspace -- the protocol core
 
 bindings/            # Language SDK wrappers
   python/            #   scp_sdk (wraps PyO3 bridge)
-  typescript/        #   @limn-works/scp-ts (wraps NAPI bridge; browser = remote thin client)
+  typescript/        #   @limn-works/scp-ts (wraps NAPI bridge; browser = in-tab wasm client via @limn-works/scp-ts-wasm, ADR-057)
   swift/             #   SCP Swift package (wraps UniFFI bridge)
   kotlin/            #   scp-kt (wraps UniFFI bridge)
 

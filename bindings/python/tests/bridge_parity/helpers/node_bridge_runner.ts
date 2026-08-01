@@ -18,8 +18,9 @@
  *
  * Bridge selection is explicit — NO auto-fallback. If a non-NAPI bridge
  * mode is requested, the response is an error. The harness surfaces this
- * as a test failure, not a skip. (The WASM bridge was removed per ADR-055;
- * the browser target is a remote thin client, not an in-process engine.)
+ * as a test failure, not a skip. (The WASM bridge was removed per ADR-055, so
+ * this NAPI harness is server-only; the browser runs the full protocol in-tab
+ * over `scp-client-wasm` per ADR-057, not through this bridge.)
  *
  * ADR-048 / #1549 Phase 4 PR 4: NAPI ops construct a fresh `addon.SCP()`
  * per call and invoke per-instance methods on the resulting handle. The
