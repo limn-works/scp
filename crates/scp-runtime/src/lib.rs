@@ -21,6 +21,17 @@
 
 #![forbid(unsafe_code)]
 
+// scp-runtime test targets require the `testing` feature: numerous `#[cfg(test)]`
+// modules call `#[cfg(feature = "testing")]`-gated helpers. `testing` is normally
+// enabled transitively via the `scp-testing` dev-dependency; this tripwire turns a
+// severed back-edge into a clear message instead of a cryptic E0599 (or silent vanish).
+#[cfg(all(test, not(feature = "testing")))]
+compile_error!(
+    "scp-runtime test targets require the `testing` feature \
+     (enabled transitively via the scp-testing dev-dependency, or pass \
+     `--features scp-runtime/testing` explicitly)."
+);
+
 pub mod bridge;
 pub mod context;
 pub mod crypto;
