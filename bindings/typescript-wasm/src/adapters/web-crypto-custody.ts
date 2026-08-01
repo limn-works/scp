@@ -2,26 +2,27 @@
  * {@link WebCryptoCustody} — the browser-default {@link JsKeyCustody}: on-device
  * key custody backed by WebCrypto (`SubtleCrypto`), ADR-057 component 3.
  *
- * ## What this slice wires, and what is a #1980 seam
+ * ## What this slice wires, and what lands with #1980
  *
- * The driver's identity abstraction (`Signer`) only reads `did()` in this slice
- * — that is the ONE method with a driver call site. `did()` returns the bound
- * participant DID (created elsewhere and bound here) and is fully wired.
+ * The driver's identity abstraction (`Signer`) reads ONLY `did()` in this slice —
+ * that is the single method with a driver call site. `did()` returns the bound
+ * participant DID (created by the identity flow and bound here). That is all the
+ * driver needs today, so this custody binds the DID and nothing else.
  *
- * `sign` / `getPublicKey` / `generateKeypair` / `dhAgree` are the typed custody
- * SEAM the MLS-signing-key→WebCrypto move (#1980) consumes next. They have NO
- * driver call site in this slice (the MLS signing key still lives in `scp-mls`,
- * per the Rust module docs), and WebCrypto's `SubtleCrypto` operations are
- * ASYNCHRONOUS — they cannot satisfy the driver's SYNCHRONOUS seam signature
- * today. So they FAIL CLOSED with a clear #1980 message rather than fabricate a
- * signature/secret: an honest "not yet wired" absence, never a stand-in that
- * masks a missing backend on a reachable path. When #1980 lands the custody port
- * (an async signing boundary), these route the real on-device key through
- * WebCrypto without a shape change on the caller.
+ * On-device **key custody and signing land with #1980** (the MLS-signing-key →
+ * WebCrypto move). Until then the MLS signing key lives in `scp-mls`, so
+ * `sign` / `getPublicKey` / `generateKeypair` / `dhAgree` are typed custody SEAMS
+ * with NO driver call site — and WebCrypto's `SubtleCrypto` is asynchronous, so it
+ * cannot satisfy the driver's synchronous seam signature anyway. They FAIL CLOSED
+ * with a clear #1980 message rather than fabricate a signature/secret: an honest
+ * "not yet wired" absence, never a stand-in that masks a missing backend.
  *
- * The identity key is generated **non-extractable** where the platform supports
- * it, so the private key never leaves WebCrypto — the design intent (ADR-022,
- * carried into ADR-057) the seam preserves.
+ * This slice deliberately generates NO key: an eager `crypto.subtle.generateKey`
+ * would (a) produce a key no code path consumes (the MLS key is in `scp-mls`),
+ * (b) not be bound to the DID or persisted, and (c) throw on platforms without
+ * WebCrypto Ed25519 (Safari <17-class) — breaking the `create({ did })` quickstart
+ * for a key nobody uses. Key generation and binding are #1980's job; this slice
+ * verifies WebCrypto is present (so #1980 can wire it) and binds the DID.
  */
 
 import type { JsKeyCustody } from "./types";
@@ -36,11 +37,6 @@ export interface WebCryptoCustodyOptions {
   readonly did: string;
   /** The `Crypto` implementation. Defaults to `globalThis.crypto`. */
   readonly crypto?: Crypto;
-  /**
-   * An existing non-extractable identity keypair to bind, instead of generating
-   * a fresh one. Supply this to reattach to a key already held on-device.
-   */
-  readonly identityKeyPair?: CryptoKeyPair;
 }
 
 /** The message thrown by every #1980 custody seam that has no driver call site yet. */
@@ -50,27 +46,27 @@ function unwiredSeam(method: string): Error {
       "the MLS signing key lives in scp-mls and has no browser custody call site " +
       "(ADR-057 custody friction). WebCrypto's SubtleCrypto is asynchronous and " +
       "cannot satisfy the driver's synchronous seam today; it fails closed rather " +
-      "than fabricate a value. The MLS-signing-key→WebCrypto move (#1980) wires it.",
+      "than fabricate a value. On-device key custody + signing land with the " +
+      "MLS-signing-key→WebCrypto move (#1980).",
   );
 }
 
 export class WebCryptoCustody implements JsKeyCustody {
   readonly #did: string;
-  #identityKeyPair: CryptoKeyPair | undefined;
 
-  private constructor(did: string, identityKeyPair: CryptoKeyPair | undefined) {
+  private constructor(did: string) {
     this.#did = did;
-    this.#identityKeyPair = identityKeyPair;
   }
 
   /**
-   * Binds the participant DID and holds a non-extractable on-device identity key
-   * in WebCrypto.
+   * Binds the participant DID.
    *
    * Fails closed if WebCrypto (`crypto.subtle`) is unavailable or no DID is
-   * bound — the two preconditions a real on-device custody requires.
+   * bound — the two preconditions on-device custody requires. This slice does
+   * NOT generate a key (see the module note): key custody + signing land with
+   * #1980; verifying WebCrypto is present is what lets that later slice wire it.
    */
-  static async create(options: WebCryptoCustodyOptions): Promise<WebCryptoCustody> {
+  static create(options: WebCryptoCustodyOptions): WebCryptoCustody {
     const crypto = options.crypto ?? globalThis.crypto;
     if (!crypto?.subtle) {
       throw new Error(
@@ -83,31 +79,7 @@ export class WebCryptoCustody implements JsKeyCustody {
         "WebCryptoCustody requires a bound participant DID — none was provided (fails closed).",
       );
     }
-
-    let keyPair = options.identityKeyPair;
-    if (keyPair) {
-      // Defense-in-depth: an embedder-supplied key MUST be non-extractable, so
-      // the private key cannot leave WebCrypto — the whole point of on-device
-      // custody. The default generated path below is already non-extractable;
-      // this hardens the inject path against an extractable key slipping in.
-      if (keyPair.privateKey.extractable) {
-        throw new Error(
-          "WebCryptoCustody rejects an extractable identity private key — an " +
-            "on-device custody key MUST be non-extractable (generate it with " +
-            "`crypto.subtle.generateKey(..., /* extractable */ false, ...)`). Fails closed.",
-        );
-      }
-    } else {
-      // Non-extractable Ed25519 identity key: the private key never leaves
-      // WebCrypto. If the platform lacks Ed25519 in WebCrypto, custody cannot be
-      // backed as specified — fail closed rather than hold a weaker key silently.
-      keyPair = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, [
-        "sign",
-        "verify",
-      ])) as CryptoKeyPair;
-    }
-
-    return new WebCryptoCustody(options.did, keyPair);
+    return new WebCryptoCustody(options.did);
   }
 
   /** The bound participant DID. Throws if unbound (fail-closed — no anonymous default). */
@@ -139,12 +111,11 @@ export class WebCryptoCustody implements JsKeyCustody {
   }
 
   /**
-   * Drops the held identity key handle. Idempotent. The non-extractable private
-   * key is released to WebCrypto's GC; there is no exportable material to zero.
-   * (Synchronous and safe — unlike the async signing seams, this needs no
-   * SubtleCrypto call, so it is genuinely wired even in this slice.)
+   * No-op in this slice: there is no held key material to destroy (key custody
+   * lands with #1980). Kept to satisfy the {@link JsKeyCustody} contract;
+   * idempotent and synchronous.
    */
   destroyKey(_keyId: string): void {
-    this.#identityKeyPair = undefined;
+    // Intentionally empty — no key is held this slice.
   }
 }

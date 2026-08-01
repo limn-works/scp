@@ -30,7 +30,7 @@ import { ScpBrowserClient, WebCryptoCustody, IndexedDbStorage } from "@limn-work
 // On-device key custody (WebCrypto) + durable storage (IndexedDB) are explicit,
 // injected ports — the SDK never reaches for a hidden default. `did` comes from
 // your identity flow.
-const custody = await WebCryptoCustody.create({ did: myDid });
+const custody = WebCryptoCustody.create({ did: myDid });
 const storage = await IndexedDbStorage.open();
 
 // The managed transport wires the inbound pump + reconnect: on every (re)open it
@@ -59,7 +59,7 @@ the first-class `JsSocket` / `JsKeyCustody` / `JsStorage` interfaces:
 | Port | Browser default | Notes |
 |------|-----------------|-------|
 | Socket | `WebSocketRelaySocket` | outbound relay sink + inbound pump + reconnect |
-| Custody | `WebCryptoCustody` | non-extractable on-device identity key |
+| Custody | `WebCryptoCustody` | binds the DID (`did()`); signing lands with #1980 |
 | Storage | `IndexedDbStorage` (durable) / `InMemoryStorage` (ephemeral) | `InMemoryStorage` is a legitimate ephemeral choice, not a stand-in |
 
 `ScpBrowserClient.create({ custody, storage, socket })` is the bring-your-own-`JsSocket`

@@ -1,7 +1,8 @@
 /**
  * Unit tests for {@link WebCryptoCustody} — the DID binding is wired; the
  * signing seams fail closed (#1980); construction fails closed on missing
- * preconditions.
+ * preconditions. This slice generates NO key (key custody + signing land with
+ * #1980), so `create` is synchronous and there is no key path to test.
  */
 
 import { expect, test } from "bun:test";
@@ -9,25 +10,25 @@ import { WebCryptoCustody } from "../src/index";
 
 const DID = "did:dht:z6MkExampleParticipantIdentityAAAAAAAAAAAA";
 
-test("did() returns the bound DID (the one wired driver call site)", async () => {
-  const custody = await WebCryptoCustody.create({ did: DID });
+test("did() returns the bound DID (the one wired driver call site)", () => {
+  const custody = WebCryptoCustody.create({ did: DID });
   expect(custody.did()).toBe(DID);
 });
 
-test("create fails closed when no DID is bound", async () => {
-  await expect(WebCryptoCustody.create({ did: "" })).rejects.toThrow(/bound.*DID/i);
-  await expect(WebCryptoCustody.create({ did: "   " })).rejects.toThrow(/bound.*DID/i);
+test("create fails closed when no DID is bound", () => {
+  expect(() => WebCryptoCustody.create({ did: "" })).toThrow(/bound.*DID/i);
+  expect(() => WebCryptoCustody.create({ did: "   " })).toThrow(/bound.*DID/i);
 });
 
-test("create fails closed when WebCrypto (crypto.subtle) is unavailable", async () => {
+test("create fails closed when WebCrypto (crypto.subtle) is unavailable", () => {
   const noSubtle = {} as unknown as Crypto;
-  await expect(WebCryptoCustody.create({ did: DID, crypto: noSubtle })).rejects.toThrow(
+  expect(() => WebCryptoCustody.create({ did: DID, crypto: noSubtle })).toThrow(
     /WebCrypto.*unavailable/i,
   );
 });
 
-test("the #1980 signing seams fail closed (no driver call site this slice)", async () => {
-  const custody = await WebCryptoCustody.create({ did: DID });
+test("the #1980 signing seams fail closed (no driver call site this slice)", () => {
+  const custody = WebCryptoCustody.create({ did: DID });
   const data = new Uint8Array([1, 2, 3]);
   expect(() => custody.sign("k", data)).toThrow(/#1980/);
   expect(() => custody.getPublicKey("k")).toThrow(/#1980/);
@@ -35,35 +36,9 @@ test("the #1980 signing seams fail closed (no driver call site this slice)", asy
   expect(() => custody.dhAgree("k", data)).toThrow(/#1980/);
 });
 
-test("destroyKey is genuinely wired (synchronous) and idempotent", async () => {
-  const custody = await WebCryptoCustody.create({ did: DID });
+test("destroyKey is a no-op this slice (no key held) and idempotent", () => {
+  const custody = WebCryptoCustody.create({ did: DID });
   expect(() => custody.destroyKey("k")).not.toThrow();
   expect(() => custody.destroyKey("k")).not.toThrow();
-  // did() still resolves after the key handle is dropped (identity is the DID).
-  expect(custody.did()).toBe(DID);
-});
-
-test("holds a non-extractable on-device identity key by default", async () => {
-  // Generation succeeding proves a non-extractable Ed25519 key was bound; a
-  // caller can also supply their own keypair to reattach.
-  const kp = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, [
-    "sign",
-    "verify",
-  ])) as CryptoKeyPair;
-  expect(kp.privateKey.extractable).toBe(false);
-  const custody = await WebCryptoCustody.create({ did: DID, identityKeyPair: kp });
-  expect(custody.did()).toBe(DID);
-});
-
-test("rejects an embedder-supplied EXTRACTABLE identity key (fail-closed, defense-in-depth)", async () => {
-  // An extractable private key would let the key leave WebCrypto — the opposite
-  // of on-device custody. create() must reject it rather than bind it.
-  const extractable = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
-    "sign",
-    "verify",
-  ])) as CryptoKeyPair;
-  expect(extractable.privateKey.extractable).toBe(true);
-  await expect(WebCryptoCustody.create({ did: DID, identityKeyPair: extractable })).rejects.toThrow(
-    /non-extractable/i,
-  );
+  expect(custody.did()).toBe(DID); // identity is the DID; unaffected
 });

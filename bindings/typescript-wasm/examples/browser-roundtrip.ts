@@ -24,7 +24,7 @@ import {
 async function connect(did: string, relayUrl: string): Promise<ScpBrowserClientType> {
   // On-device key custody (WebCrypto) + durable storage (IndexedDB). Both are
   // explicit, injected ports — the SDK never reaches for a hidden default.
-  const custody = await WebCryptoCustody.create({ did });
+  const custody = WebCryptoCustody.create({ did });
   const storage = await IndexedDbStorage.open();
 
   // The managed transport wires the inbound pump + reconnect for you: on every
