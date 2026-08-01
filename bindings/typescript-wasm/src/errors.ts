@@ -2,10 +2,12 @@
  * Error surface for `@limn-works/scp-ts-wasm`.
  *
  * Single-sources the cross-SDK `ScpError` hierarchy and the prefix-dispatch
- * `mapBridgeError` from the shared core (`@limn-works/scp-ts`, imported via the
- * `@scp-core/errors` workspace-source path and BUNDLED into this package at
- * build — ADR-057 Amendment 2026-07-15 D1). There is no drift: one definition,
- * bundled into both tiers.
+ * `mapBridgeError` from the sibling package's shared core
+ * (`../typescript/src/errors`), reached via the `@scp-core/errors` **tsconfig
+ * path alias** (a relative-path alias resolved by tsc + esbuild — NOT a
+ * node_modules package dependency), and BUNDLED into this package at build so the
+ * published package is self-contained (ADR-057 Amendment 2026-07-15 D1). One
+ * definition, bundled into both tiers — no drift.
  *
  * The wasm surface throws JS exceptions whose message carries a stable
  * `[SCP-{CATEGORY}-{NUMBER}]` prefix (`crates/scp-client-wasm/src/error.rs`).
