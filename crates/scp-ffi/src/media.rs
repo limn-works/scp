@@ -2,8 +2,8 @@
 //!
 //! Exposes SCP media session lifecycle and signaling to Python:
 //!
-//! - Session lifecycle: [`py_media_initiate_session`], [`py_media_activate_session`],
-//!   [`py_media_join_session`], [`py_media_end_session`]
+//! - Session lifecycle: [`py_media_initiate_session`], [`py_media_join_session`],
+//!   [`PyScp::py_media_activate_session`], [`PyScp::py_media_end_session`]
 //! - Signaling: [`py_media_create_offer`], [`py_media_create_answer`],
 //!   [`py_media_create_ice_candidate`], [`py_media_create_session_end`],
 //!   [`py_media_send_signaling`], [`py_media_verify_sender_attribution`]
@@ -280,35 +280,6 @@ pub fn py_media_initiate_session(
     session_to_dict(py, &session)
 }
 
-/// Activates a media session (transitions from Initiating to Active).
-///
-/// # Arguments
-///
-/// * `session_json` - JSON string representing the session (as returned by `media_initiate_session`).
-///
-/// # Returns
-///
-/// A dict with the updated session fields.
-///
-/// # Errors
-///
-/// Raises `ContextError` if the session is not in the `Initiating` state.
-#[pyfunction]
-#[pyo3(name = "media_activate_session")]
-pub fn py_media_activate_session(
-    py: Python<'_>,
-    session_json: String,
-) -> PyResult<Bound<'_, PyDict>> {
-    let mut session: MediaSession =
-        serde_json::from_str(&session_json).map_err(|e| ScpPyError::ValidationError {
-            message: format!("invalid session JSON: {e}"),
-            code: codes::VALID_7301.to_string(),
-        })?;
-
-    activate_session(&mut session).map_err(media_error_to_py)?;
-    session_to_dict(py, &session)
-}
-
 /// Adds a participant to a media session.
 ///
 /// # Arguments
@@ -338,43 +309,6 @@ pub fn py_media_join_session(
 
     join_media_session(&mut session, participant_did.into()).map_err(media_error_to_py)?;
     session_to_dict(py, &session)
-}
-
-/// Ends a media session and returns session metadata for event log recording.
-///
-/// # Arguments
-///
-/// * `session_json` - JSON string representing the session.
-/// * `timestamp` - Unix timestamp (seconds) when the session ended.
-///
-/// # Returns
-///
-/// A dict with two keys: `session` (updated session) and `metadata`
-/// (session metadata for event log recording).
-///
-/// # Errors
-///
-/// Raises `ContextError` if the session has already ended or the timestamp
-/// is before the session start time.
-#[pyfunction]
-#[pyo3(name = "media_end_session")]
-pub fn py_media_end_session(
-    py: Python<'_>,
-    session_json: String,
-    timestamp: u64,
-) -> PyResult<Bound<'_, PyDict>> {
-    let mut session: MediaSession =
-        serde_json::from_str(&session_json).map_err(|e| ScpPyError::ValidationError {
-            message: format!("invalid session JSON: {e}"),
-            code: codes::VALID_7301.to_string(),
-        })?;
-
-    let metadata = end_media_session(&mut session, timestamp).map_err(media_error_to_py)?;
-
-    let result = PyDict::new(py);
-    result.set_item("session", session_to_dict(py, &session)?)?;
-    result.set_item("metadata", metadata_to_dict(py, &metadata)?)?;
-    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,9 +533,7 @@ pub fn register_media(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Session lifecycle
     m.add_function(wrap_pyfunction!(py_media_check_capability, m)?)?;
     m.add_function(wrap_pyfunction!(py_media_initiate_session, m)?)?;
-    m.add_function(wrap_pyfunction!(py_media_activate_session, m)?)?;
     m.add_function(wrap_pyfunction!(py_media_join_session, m)?)?;
-    m.add_function(wrap_pyfunction!(py_media_end_session, m)?)?;
     // Signaling
     m.add_function(wrap_pyfunction!(py_media_create_offer, m)?)?;
     m.add_function(wrap_pyfunction!(py_media_create_answer, m)?)?;
@@ -616,14 +548,11 @@ pub fn register_media(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // Bridge-instance-aware methods — ADR-024 AC 8
 // ---------------------------------------------------------------------------
 //
-// The module-level `py_media_activate_session` / `py_media_end_session`
-// functions above are pure state-machine helpers (no bridge instance access).
-// These `#[pymethods]` on `PyScp` replicate the same logic but additionally
-// append `MediaSessionStarted` / `MediaSessionEnded` events to the context
-// event log, matching the NAPI and UniFFI bridge behaviour.
-//
-// Python names use the `_with_log` suffix to avoid collision with the
-// existing module-level free functions.
+// These `#[pymethods]` on `PyScp` are the canonical implementations of
+// `media_activate_session` and `media_end_session`. They perform the session
+// state-machine transition and additionally append `MediaSessionStarted` /
+// `MediaSessionEnded` events to the context event log, matching the NAPI and
+// UniFFI bridge behaviour.
 
 #[pymethods]
 impl crate::scp::PyScp {
@@ -646,8 +575,8 @@ impl crate::scp::PyScp {
     ///
     /// Raises `ValidationError` if the JSON is invalid.
     /// Raises `ContextError` if the session is not in the `Initiating` state.
-    #[pyo3(name = "media_activate_session_with_log")]
-    pub fn media_activate_session_py<'py>(
+    #[pyo3(name = "media_activate_session")]
+    pub fn py_media_activate_session<'py>(
         &self,
         py: Python<'py>,
         session_json: String,
@@ -724,8 +653,8 @@ impl crate::scp::PyScp {
     /// Raises `ValidationError` if the JSON is invalid.
     /// Raises `ContextError` if the session has already ended or the timestamp
     /// is before the session start time.
-    #[pyo3(name = "media_end_session_with_log")]
-    pub fn media_end_session_py<'py>(
+    #[pyo3(name = "media_end_session")]
+    pub fn py_media_end_session<'py>(
         &self,
         py: Python<'py>,
         session_json: String,
@@ -851,7 +780,7 @@ mod tests {
 
         let scp = crate::scp::PyScp { inner: bi.clone() };
         pyo3::Python::with_gil(|py| {
-            let result = scp.media_activate_session_py(py, initiating_session_json(ctx));
+            let result = scp.py_media_activate_session(py, initiating_session_json(ctx));
             assert!(
                 result.is_ok(),
                 "media_activate_session_with_log should succeed: {result:?}"
@@ -888,7 +817,7 @@ mod tests {
 
         // First: append the Started event so the tree is non-empty.
         pyo3::Python::with_gil(|py| {
-            scp.media_activate_session_py(py, initiating_session_json(ctx))
+            scp.py_media_activate_session(py, initiating_session_json(ctx))
                 .unwrap();
         });
 
@@ -900,7 +829,7 @@ mod tests {
 
         // End the session using a fresh Active-state JSON.
         pyo3::Python::with_gil(|py| {
-            let result = scp.media_end_session_py(py, active_session_json(ctx), TS_END);
+            let result = scp.py_media_end_session(py, active_session_json(ctx), TS_END);
             assert!(
                 result.is_ok(),
                 "media_end_session_with_log should succeed: {result:?}"
@@ -933,7 +862,7 @@ mod tests {
         let scp = crate::scp::PyScp { inner: test_bi() };
         pyo3::Python::with_gil(|py| {
             let result = scp
-                .media_activate_session_py(py, initiating_session_json("ctx-py-unregistered-act"));
+                .py_media_activate_session(py, initiating_session_json("ctx-py-unregistered-act"));
             assert!(
                 result.is_ok(),
                 "activate must succeed without a registered context"
@@ -957,7 +886,7 @@ mod tests {
         })
         .to_string();
         pyo3::Python::with_gil(|py| {
-            let result = scp.media_end_session_py(py, session_json.clone(), TS_END);
+            let result = scp.py_media_end_session(py, session_json.clone(), TS_END);
             assert!(
                 result.is_ok(),
                 "end must succeed without a registered context"

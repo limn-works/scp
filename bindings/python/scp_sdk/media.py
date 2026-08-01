@@ -114,7 +114,7 @@ def activate_session(scp: SCP, session_json: str) -> dict[str, Any]:
         ContextError: If the session is not in the ``Initiating`` state.
         ValidationError: If *session_json* is not valid session JSON.
     """
-    return dict(scp._native.media_activate_session_with_log(session_json))
+    return dict(scp._native.media_activate_session(session_json))
 
 
 def join_session(session_json: str, participant_did: str) -> dict[str, Any]:
@@ -162,7 +162,7 @@ def end_session(
             is before the session start time.
         ValidationError: If *session_json* is not valid session JSON.
     """
-    result = scp._native.media_end_session_with_log(session_json, timestamp)
+    result = scp._native.media_end_session(session_json, timestamp)
     return {
         "session": dict(result["session"]),
         "metadata": dict(result["metadata"]),
