@@ -806,6 +806,33 @@ fn reserve_outlet_economy_enforces_value_caveats() {
     );
 }
 
+// #2196 — the fail-closed ContextState::Active gate must be wired as the FIRST
+// predicate on every forward-debit outlet reserve path (same-context unary,
+// stream open, and mid-stream grant top-up), and the gate itself must read the
+// authoritative sync handle state. Asserts the REAL `ensure_context_active`
+// call in each reserve (not a dead `let _ =`) plus the `.state()` read inside
+// the gate, so a Closing / Expired / MigratingOut context can never take on new
+// spend. (`MANAGER_SRC` embeds `outlets_helpers.rs`.)
+#[test]
+fn outlet_reserves_gate_on_context_active_state() {
+    for reserve in [
+        "reserve_outlet_economy",
+        "reserve_outlet_stream_economy",
+        "reserve_stream_grant_escrow",
+    ] {
+        assert!(
+            fn_body_contains(MANAGER_SRC, reserve, "ensure_context_active"),
+            "{reserve} must call ensure_context_active as its fail-closed #2196 \
+             context-lifecycle gate before any escrow / budget debit"
+        );
+    }
+    assert!(
+        fn_body_contains(MANAGER_SRC, "ensure_context_active", ".state()"),
+        "ensure_context_active must read the authoritative sync handle .state() \
+         (the ArcSwap load), not a lagging cache"
+    );
+}
+
 // Manager level: send_message delegates to encrypt_and_send which calls transport.send_message
 #[test]
 fn send_message_calls_transport_send() {

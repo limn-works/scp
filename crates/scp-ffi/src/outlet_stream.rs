@@ -1200,17 +1200,23 @@ fn outlet_streaming_saga_open_impl(
 
     // ----- (a2) lifecycle gate: both contexts MUST be Active ------------------
     //
-    // LOAD-BEARING (not defense-in-depth): the runtime streaming-saga open path
+    // TARGET axis: DEFENSE-IN-DEPTH (#2196). CALLER/source axis: still primary.
+    //
+    // The runtime streaming-saga open path
     // (`start_cross_context_streaming_outlet_invocation_saga` →
-    // `open_outlet_stream_phase1` → `reserve_outlet_stream_economy`) DEBITS the
-    // invoker's escrow with NO context-lifecycle Active gate — its only pre-debit
-    // gates are membership (SCP-SAGA-13050 / SCP-OUTLET-6089), the established
-    // outlet interface (SCP-SAGA-13062), and the saga context-set reservation.
-    // Unlike the SESSION path (`create_session` / `invoke_session`) and the
-    // send / governance / TTL paths, it does NOT surface `SCP-OUTLET-6080`
-    // "context not active". So THIS bridge check is the only barrier stopping a
-    // Closing / Expired / MigratingOut source or target from opening a
+    // `open_outlet_stream_phase1(&target_hex, ...)` → `reserve_outlet_stream_economy`)
+    // NOW carries its own fail-closed `ContextState::Active` gate
+    // (`ensure_context_active`, the FIRST predicate before any escrow debit)
+    // surfacing the canonical `SCP-OUTLET-6080` "context not active". That
+    // reserve runs on the TARGET context (the money moves there), so the runtime
+    // gate is now the PRIMARY money-protecting barrier for the TARGET axis and
+    // this bridge's target-axis check (`OUTLET_6011`) is demoted to
+    // defense-in-depth. The reserve does NOT run on the CALLER/source context,
+    // so this bridge's caller-axis check (`OUTLET_6010`) remains the authoritative
+    // gate stopping a Closing / Expired / MigratingOut source from initiating a
     // money-moving cross-context streaming saga (§5.3 lifecycle / §6.2.4).
+    // Retained regardless: both checks reject at the edge with bridge-native
+    // codes before the drive even starts.
     //
     // PyO3 is string-keyed (no `ContextHandle`), so the authoritative lifecycle
     // state is read from the per-context supervisor actor via

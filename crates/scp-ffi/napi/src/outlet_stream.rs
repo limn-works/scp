@@ -1161,15 +1161,19 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     // reference's authoritative `read_context_state`. A missing actor (`None`) is
     // treated as non-active (fail-closed).
     //
-    // LOAD-BEARING (not defense-in-depth): the runtime streaming-saga reserve
-    // path (`reserve_outlet_stream_economy`) debits the invoker's escrow with NO
-    // context-lifecycle Active gate — its only pre-debit gates are membership
-    // (13050 / 6089), the established interface (13062), and the saga context-set
-    // reservation; it never surfaces SCP-OUTLET-6080 "context not active" the way
-    // the SESSION and send/governance/TTL paths do. This bridge check is the sole
-    // barrier stopping a non-active source/target from debiting escrow. Checked
-    // BEFORE input validation, the caller-principal binding, and the saga drive,
-    // so a non-active context is rejected before any receiver is handed out.
+    // TARGET axis: DEFENSE-IN-DEPTH (#2196). CALLER/source axis: still primary.
+    // The runtime streaming-saga reserve path (`reserve_outlet_stream_economy`)
+    // NOW carries its own fail-closed `ContextState::Active` gate
+    // (`ensure_context_active`, the FIRST predicate before any escrow debit) that
+    // surfaces the canonical SCP-OUTLET-6080 "context not active". That reserve
+    // runs on the TARGET context (where the escrow moves), so the runtime gate is
+    // now the PRIMARY money-protecting barrier for the target axis and this
+    // bridge's target-axis check (OUTLET_6011) is demoted to defense-in-depth.
+    // The reserve does NOT run on the CALLER/source context, so this bridge's
+    // caller-axis check (OUTLET_6010) remains the authoritative gate stopping a
+    // non-active source from initiating the saga. Both checked BEFORE input
+    // validation, the caller-principal binding, and the saga drive, so a
+    // non-active context is rejected before any receiver is handed out.
     // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis).
     let supervisor = crate::runtime::supervisor(bi)?;
     let source_state = supervisor.read_context_state(&caller_context_id).await;

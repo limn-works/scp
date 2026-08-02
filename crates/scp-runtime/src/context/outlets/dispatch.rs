@@ -105,7 +105,7 @@ use super::stream::{
     AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, GrantError, OpenError,
     OriginAdmissionTracker, StreamAdmissionTracker, StreamEscrow, StreamIdentity,
     admission_outcome_to_slug, coerce_estimated_chunk_count, cumulative_reserve_amount,
-    effective_max_billable_chunks, enforce_estimated_chunk_count_bound, open_error_to_slug,
+    effective_max_billable_chunks, enforce_estimated_chunk_count_bound,
 };
 
 use scp_protocol::context::outlets::registry::OutletRegistry;
@@ -307,6 +307,28 @@ pub enum OpenStreamRejection {
         /// branch's slug representation rather than interning to a static.
         slug: String,
     },
+    /// The context is not in the `Active` state at open time (#2196). The
+    /// runtime reserve path (`reserve_outlet_stream_economy` via
+    /// `ensure_context_active`) and the synchronous `invoke_outlet` open
+    /// validation both surface `SCP-OUTLET-6080` "context not active"; this
+    /// open-surface rejection carries that state forward so the FFI / SDK
+    /// layer shapes it identically to the in-stream
+    /// `protocol.context-closed-mid-stream` terminal chunk the pump emits when
+    /// a context is torn down MID-stream. Reuses that existing slug
+    /// (`protocol.context-closed-mid-stream`) + code
+    /// ([`CODE_PROTOCOL_SESSION`](error_codes::CODE_PROTOCOL_SESSION),
+    /// `SCP-OUTLET-6101`, the NON-retryable Protocol class) rather than minting
+    /// a new code: a pre-open teardown and a mid-stream teardown are the same
+    /// permanent, non-retryable protocol condition to a receiver. (The
+    /// canonical runtime reserve error stays `SCP-OUTLET-6080`; only the
+    /// open-stream wire surface maps to `6101`.)
+    ContextNotActive {
+        /// The context's current lifecycle state, rendered from
+        /// [`ContextState`](crate::context::ContextState) (e.g. `"Closing"`),
+        /// carried verbatim from the reserve / invoke error so the surfaced
+        /// message names the actual state.
+        current_state: String,
+    },
 }
 
 impl OpenStreamRejection {
@@ -328,6 +350,8 @@ impl OpenStreamRejection {
             Self::InsufficientFunds => error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
             Self::CaveatsBindingMismatch => error_codes::SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
             Self::StreamCapExhausted => error_codes::SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
+            // #2196 — reuse the mid-stream teardown slug for a pre-open teardown.
+            Self::ContextNotActive { .. } => error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
         }
     }
 
@@ -340,6 +364,12 @@ impl OpenStreamRejection {
             Self::EscrowOverflow | Self::InsufficientFunds => error_codes::CODE_ECONOMIC_FAULT,
             Self::CaveatsBindingMismatch => error_codes::CODE_AUTHORIZATION_DENIED,
             Self::StreamCapExhausted => error_codes::CODE_EXECUTION_CREDIT,
+            // #2196 — Protocol class, `SCP-OUTLET-6101`, NON-retryable
+            // (`error_code_to_retry_policy` → `RetryPolicy::Never`). This is the
+            // whole point of the error-masking fix: a permanent context-not-active
+            // failure must NOT be reported through the retryable transport-fault
+            // band the pre-fix catch-all used.
+            Self::ContextNotActive { .. } => error_codes::CODE_PROTOCOL_SESSION,
             // Mirror `caveat_violation_chunk`'s slug→code routing: the
             // input-schema slug is Input-class (`SCP-OUTLET-6120`), every
             // other caveat slug is Authorization-class (`SCP-OUTLET-6110`).
@@ -358,9 +388,18 @@ impl OpenStreamRejection {
     /// identically to other open-time validation failures.
     #[must_use]
     pub fn to_invocation_error(&self) -> InvocationError {
-        InvocationError::CaveatViolation {
-            slug: self.slug().to_owned(),
-            message: format!("stream open rejected: {}", self.slug()),
+        match self {
+            // #2196 — round-trip as the canonical `InvocationError::ContextNotActive`
+            // (→ `invocation_error_to_context` → `SCP-OUTLET-6080`) rather than a
+            // misleading `CaveatViolation`, preserving the state string so the
+            // surfaced message names the actual lifecycle state.
+            Self::ContextNotActive { current_state } => InvocationError::ContextNotActive {
+                current_state: current_state.clone(),
+            },
+            _ => InvocationError::CaveatViolation {
+                slug: self.slug().to_owned(),
+                message: format!("stream open rejected: {}", self.slug()),
+            },
         }
     }
 }
@@ -1168,13 +1207,14 @@ impl StreamSessionHandle {
     /// - [`super::stream::CancelError::CursorAdvanced`] — `cancel.next_seq`
     ///   does not match the runtime's live next-to-emit cursor.
     // `allow` (not `expect`): the verbatim-apply path is the single
-    // verify+record primitive for cross-context forwarding waves, which —
-    // with their tests — land in a later chunk, so it currently has no
-    // caller in either cfg on this branch. `allow` tolerates the later
-    // caller without churn; `expect` would then fire "unfulfilled".
+    // verify+record primitive for cross-context forwarding waves. Its caller —
+    // browser-initiated cross-context cancel forwarding — is tracked by #2203
+    // and not yet wired, so it currently has no caller in either cfg on this
+    // branch. `allow` tolerates the #2203 caller landing without churn; `expect`
+    // would then fire "unfulfilled".
     #[allow(
         dead_code,
-        reason = "retained as the single verify+record primitive; cross-context forwarding callers + tests land in a later chunk"
+        reason = "retained as the single verify+record primitive; cross-context browser-initiated cancel forwarding callers + tests land with #2203"
     )]
     pub(crate) fn apply_outlet_cancel_verbatim(
         &self,
@@ -2051,6 +2091,49 @@ fn spawn_pump_task(
     });
 }
 
+/// Maps a synchronous [`invoke_outlet`] open failure to its correct
+/// [`OpenStreamRejection`] class (#2196 error-masking fix).
+///
+/// `invoke_outlet`'s synchronous validation (before the receiver is allocated)
+/// can only reject with one of four [`InvocationError`] variants —
+/// `ContextNotActive`, `OutletNotFound`, `InvokerNotAuthorized`,
+/// `InputValidationFailed` — and ALL FOUR are PERMANENT. This maps each to a
+/// NON-retryable §5.4.4 class so the FFI / SDK surface never invites a retry of
+/// an open that can never succeed:
+///
+/// - `ContextNotActive` → [`OpenStreamRejection::ContextNotActive`] (Protocol,
+///   `SCP-OUTLET-6101`, `RetryPolicy::Never`);
+/// - `InputValidationFailed` → schema-violation
+///   ([`OpenStreamRejection::CaveatPostInputViolation`] carrying
+///   `input.schema-violation` → Input class, `SCP-OUTLET-6120`, never);
+/// - every other variant (`InvokerNotAuthorized`, `OutletNotFound`, and any
+///   future synchronous open error) → the fail-closed authorization-denied slug
+///   (Authorization class, `SCP-OUTLET-6110`, never).
+///
+/// The pre-fix code discarded the error and collapsed everything into the
+/// RETRYABLE `transport.rate-limited` slug.
+fn invocation_error_to_open_rejection(err: &InvocationError) -> OpenStreamRejection {
+    match err {
+        InvocationError::ContextNotActive { current_state } => {
+            OpenStreamRejection::ContextNotActive {
+                current_state: current_state.clone(),
+            }
+        }
+        InvocationError::InputValidationFailed { .. } => {
+            OpenStreamRejection::CaveatPostInputViolation {
+                slug: error_codes::SLUG_INPUT_SCHEMA_VIOLATION.to_owned(),
+            }
+        }
+        // Fail closed: an authorization / outlet-not-found (or any future
+        // synchronous open) failure is permanent and non-retryable. Routes to
+        // the Authorization-denied class via the non-schema slug branch of
+        // `CaveatPostInputViolation::error_code`.
+        _ => OpenStreamRejection::CaveatPostInputViolation {
+            slug: error_codes::SLUG_AUTHORIZATION_DENIED.to_owned(),
+        },
+    }
+}
+
 /// Opens a §5.4.5 stream session with full OUT-034 wiring.
 ///
 /// Runs the §5.4.5 round-5 5-step admission sequence, reserves escrow
@@ -2158,10 +2241,7 @@ where
     ) {
         release_admission(&admission, &origin_admission, &params);
         return Err(match open_err {
-            OpenError::EstimateExceedsBound => {
-                let _ = open_error_to_slug(open_err);
-                OpenStreamRejection::EstimateExceedsBound
-            }
+            OpenError::EstimateExceedsBound => OpenStreamRejection::EstimateExceedsBound,
         });
     }
 
@@ -2293,15 +2373,17 @@ where
     )
     .await
     .map_err(|err| {
-        // Roll back admission on synchronous invoke_outlet failure.
-        // Synchronous validation failures (context not active, schema,
-        // etc.) do not match the OUT-034 rejection taxonomy; route
-        // through the rate-limited slug as a defensive fallback.
+        // Roll back admission on synchronous invoke_outlet failure, then map
+        // the REAL error to its correct §5.4.4 class (#2196 error-masking fix).
+        // Every synchronous `invoke_outlet` open failure (context-not-active,
+        // outlet-not-found, invoker-not-authorized, input-schema) is PERMANENT
+        // — the receiver was never allocated. The pre-fix code discarded `err`
+        // (`let _ = err`) and collapsed ALL of them into the RETRYABLE transport
+        // rate-limit slug, inviting a client to spin retrying an open that can
+        // never succeed. `invocation_error_to_open_rejection` routes each to its
+        // real non-retryable class instead.
         release_admission(&admission, &origin_admission, &params);
-        let _ = err;
-        OpenStreamRejection::AdmissionRateLimited {
-            slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
-        }
+        invocation_error_to_open_rejection(&err)
     })?;
 
     // Step 5.5 (R4 HIGH-1 / HIGH-2): commit the durable counter CAS HERE —
@@ -3468,6 +3550,72 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use scp_protocol::context::outlets::stream::ChunkPayload;
     use std::time::Duration;
+
+    /// #2196 — the open-stream `ContextNotActive` rejection maps to the
+    /// NON-retryable Protocol class (reusing the mid-stream teardown slug +
+    /// `SCP-OUTLET-6101`), and round-trips as the canonical
+    /// `InvocationError::ContextNotActive` (→ `SCP-OUTLET-6080`) preserving the
+    /// state string. A permanent context-not-active failure is thereby never
+    /// reported as a transient, retryable condition.
+    #[test]
+    fn context_not_active_rejection_is_non_retryable_protocol() {
+        use scp_protocol::context::outlets::errors::RetryPolicy;
+        let rej = OpenStreamRejection::ContextNotActive {
+            current_state: "Closing".to_owned(),
+        };
+        assert_eq!(
+            rej.slug(),
+            error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM
+        );
+        assert_eq!(rej.error_code(), error_codes::CODE_PROTOCOL_SESSION);
+        assert_eq!(
+            error_codes::error_code_to_retry_policy(rej.error_code()),
+            Some(RetryPolicy::Never),
+            "a context-not-active open failure must be non-retryable"
+        );
+        match rej.to_invocation_error() {
+            InvocationError::ContextNotActive { current_state } => {
+                assert_eq!(current_state, "Closing", "state string round-trips");
+            }
+            other => panic!("expected ContextNotActive round-trip, got {other:?}"),
+        }
+    }
+
+    /// #2196 error-masking — EVERY permanent synchronous `invoke_outlet` open
+    /// failure maps to a NON-retryable class, NEVER the retryable transport
+    /// rate-limit the pre-fix `let _ = err` code collapsed all of them into.
+    #[test]
+    fn permanent_open_failures_map_to_non_retryable() {
+        use scp_protocol::context::outlets::errors::RetryPolicy;
+        let cases = [
+            InvocationError::ContextNotActive {
+                current_state: "Expired".to_owned(),
+            },
+            InvocationError::InputValidationFailed {
+                message: "bad schema".to_owned(),
+            },
+            InvocationError::InvokerNotAuthorized {
+                did: "did:dht:x".to_owned(),
+                outlet_id: "o".to_owned(),
+            },
+            InvocationError::OutletNotFound {
+                outlet_id: "o".to_owned(),
+            },
+        ];
+        for err in cases {
+            let rej = invocation_error_to_open_rejection(&err);
+            assert_eq!(
+                error_codes::error_code_to_retry_policy(rej.error_code()),
+                Some(RetryPolicy::Never),
+                "permanent open failure {err:?} must be non-retryable (got {rej:?})"
+            );
+            assert_ne!(
+                rej.error_code(),
+                error_codes::CODE_TRANSPORT_FAULT,
+                "a permanent failure must NOT surface the retryable transport-fault code: {err:?}"
+            );
+        }
+    }
 
     fn fixed_signing_key() -> SigningKey {
         SigningKey::from_bytes(&[0x42; 32])

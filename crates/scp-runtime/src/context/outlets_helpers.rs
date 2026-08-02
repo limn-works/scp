@@ -57,6 +57,7 @@ use std::sync::Arc;
 
 use scp_did::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::ContextState;
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
 use scp_protocol::context::outlets::registry::OutletRegistry;
@@ -556,6 +557,70 @@ pub struct InvocationCaveatBinding {
 }
 
 // ---------------------------------------------------------------------------
+// Context-lifecycle Active gate (shared by every forward-debit reserve path)
+// ---------------------------------------------------------------------------
+
+/// The `SCP-OUTLET-6080` "context not active" marker string.
+///
+/// Stamped into the `PermissionDenied` message by [`invocation_error_to_context`]
+/// and matched back out by [`reserve_error_to_open_rejection`]. Kept as one
+/// const so the producer and the reverse-map consumer move together if the code
+/// is ever renamed (mirrors the `SLUG_*`-constant discipline the escrow /
+/// insufficient-funds reverse-map arms already use).
+const SCP_OUTLET_6080_MARKER: &str = "SCP-OUTLET-6080";
+
+/// The `SCP-OUTLET-6089` "invoker is not a member" marker string.
+///
+/// Stamped into the `PermissionDenied` message by the
+/// [`reserve_outlet_stream_economy`] membership gate and matched back out by
+/// [`reserve_error_to_open_rejection`]. Kept as one const so the producer and
+/// the reverse-map consumer move together — a permanent membership/authorization
+/// denial must map to a NON-retryable class, never the retryable transport
+/// rate-limit the catch-all uses (mirrors the 6080 marker discipline).
+const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
+
+/// Fail-closed `ContextState::Active` gate for the outlet forward-debit reserve
+/// paths (#2196).
+///
+/// The outlet-stream reserve path (`open_outlet_stream_phase1` →
+/// `reserve_outlet_stream_economy`), the same-context unary reserve
+/// (`reserve_outlet_economy`), and the mid-stream grant top-up
+/// (`reserve_stream_grant_escrow`) all DEBIT escrow / budget, but historically
+/// gated only hard-rate / velocity / membership (6089) / overflow / funds — NOT
+/// context lifecycle. So a non-active (`Closing` / `Expired` / `MigratingOut` /
+/// …) context could take on NEW spend as long as no caller-side bridge guard
+/// rejected it first (SCP-OUT-047 added such guards on the 3 FFI bridges, but
+/// the same-context unary + stream-open paths shared the gap).
+///
+/// This is the single authoritative runtime gate that closes the root cause: it
+/// reads the sync lock-free authoritative [`ContextHandle::state`] (an `ArcSwap`
+/// load — never the lagging FFI handle cache) and, when the context is not
+/// `Active`, returns the canonical `SCP-OUTLET-6080` error via the SAME path the
+/// SESSION path (`create_session` / `invoke_session`) uses —
+/// [`InvocationError::ContextNotActive`] → [`invocation_error_to_context`]. The
+/// per-bridge guards are thereby demoted to true defense-in-depth.
+///
+/// Called as the FIRST predicate on each reserve path (before any escrow debit
+/// or bookkeeping mutation), so a rejected open touches no state and needs no
+/// rollback.
+///
+/// # Errors
+///
+/// [`ContextError::PermissionDenied`] carrying `SCP-OUTLET-6080: context not
+/// active: {current_state}` when `handle.state() != ContextState::Active`.
+fn ensure_context_active(handle: &ContextHandle) -> Result<(), ContextError> {
+    let state = handle.state();
+    if state != ContextState::Active {
+        return Err(invocation_error_to_context(
+            InvocationError::ContextNotActive {
+                current_state: state.to_string(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1: reserve_outlet_economy (actor handler entry point)
 // ---------------------------------------------------------------------------
 
@@ -644,6 +709,14 @@ pub async fn reserve_outlet_economy(
         let mut view = cell.class_c_view();
 
         handle = view.handle_mut().clone();
+
+        // #2196 — fail-closed context-lifecycle gate. FIRST predicate, before the
+        // hard-rate consume / velocity tick / economy pre-check / any budget
+        // debit, so a non-active context is rejected touching no state (no
+        // rollback path). `view` is dropped on the early return without
+        // persisting.
+        ensure_context_active(&handle)?;
+
         role_state = view.role_state().clone();
         let member_count = u64::try_from(view.membership_class_c_mut().count()).unwrap_or(u64::MAX);
 
@@ -1126,6 +1199,14 @@ pub async fn reserve_outlet_stream_economy(
     {
         let mut view = cell.class_c_view();
         handle = view.handle_mut().clone();
+
+        // #2196 — fail-closed context-lifecycle gate. FIRST predicate, before the
+        // hard-rate consume / velocity tick / membership gate / overflow / escrow
+        // debit, so a non-active (Closing / Expired / MigratingOut) context can
+        // never open a stream that debits escrow. `view` is dropped on the early
+        // return without persisting.
+        ensure_context_active(&handle)?;
+
         role_state = view.role_state().clone();
 
         let gov = view.governance_class_c_mut();
@@ -1164,7 +1245,7 @@ pub async fn reserve_outlet_stream_economy(
             .rollback(invoker_did, velocity_token);
         gov.hard_rate_limit_mut().refund(invoker_did);
         return Err(ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6089: invoker {invoker_did} is not a member of context \
+            "{SCP_OUTLET_6089_MARKER}: invoker {invoker_did} is not a member of context \
              '{context_id}' — cannot open a stream"
         )));
     }
@@ -1354,6 +1435,15 @@ pub async fn reserve_stream_grant_escrow(
     grant: u32,
 ) -> Result<Amount, ContextError> {
     use crate::context::outlets::dispatch::OpenStreamRejection;
+
+    // #2196 — fail-closed context-lifecycle gate. FIRST predicate, before the
+    // zero-cost early return and before any budget debit / durable record bump:
+    // a Closing (or otherwise non-active) context must not take on NEW spend via
+    // a mid-stream credit top-up. Reads the sync authoritative handle state off
+    // a transient Class-C view (the handle is a cheap Arc-backed clone whose
+    // `state()` shares the live ArcSwap).
+    let handle = cell.class_c_view().handle_mut().clone();
+    ensure_context_active(&handle)?;
 
     // Zero-cost / Query outlets, or a zero grant: no debit, no balance
     // consultation, no persist (spec: "no top-up is performed").
@@ -2815,7 +2905,7 @@ fn check_invocation_error_to_context(
 fn invocation_error_to_context(err: InvocationError) -> ContextError {
     match err {
         InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
-            format!("SCP-OUTLET-6080: context not active: {current_state}"),
+            format!("{SCP_OUTLET_6080_MARKER}: context not active: {current_state}"),
         ),
         InvocationError::InvokerNotAuthorized { did, outlet_id } => ContextError::PermissionDenied(
             format!("SCP-OUTLET-6081: invoker {did} lacks OutletCall({outlet_id})"),
@@ -2941,6 +3031,43 @@ pub fn reserve_error_to_open_rejection(
         {
             OpenStreamRejection::InsufficientFunds
         }
+        // #2196 error-masking fix — the new `ensure_context_active` gate stamps
+        // the canonical `SCP-OUTLET-6080` marker into a `PermissionDenied`. Map
+        // it to the stream-open surface's `ContextNotActive` rejection
+        // (`protocol.context-closed-mid-stream` / `SCP-OUTLET-6101`, the
+        // NON-retryable Protocol class) rather than letting it fall through to
+        // the catch-all below, which collapses everything into the RETRYABLE
+        // transport rate-limit slug. A permanent "context not active" failure
+        // must never be reported as a transient, retryable condition. The
+        // `current_state` is recovered from the message tail (the marker format
+        // is `{marker}: context not active: {current_state}`; `ContextState`
+        // renders with no embedded `": "`, so the last segment is the state).
+        ContextError::PermissionDenied(msg) if msg.contains(SCP_OUTLET_6080_MARKER) => {
+            let current_state = msg
+                .rsplit(": ")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            OpenStreamRejection::ContextNotActive { current_state }
+        }
+        // #2196 error-masking fix — the membership gate emits SCP-OUTLET-6089
+        // (invoker is not a member of the context) as a plain `PermissionDenied`.
+        // `open_outlet_stream_phase1` runs no membership check before the reserve,
+        // so a non-member same-context open flows here. It is a PERMANENT
+        // authorization denial — map it to the non-retryable authorization-denied
+        // class (`authorization.denied` → CODE_AUTHORIZATION_DENIED,
+        // SCP-OUTLET-6110, RetryPolicy::Never), NOT the retryable transport
+        // rate-limit the catch-all uses. Routed through `CaveatPostInputViolation`
+        // (its non-schema slug branch yields CODE_AUTHORIZATION_DENIED), matching
+        // how `invocation_error_to_open_rejection` maps `InvokerNotAuthorized`.
+        ContextError::PermissionDenied(msg) if msg.contains(SCP_OUTLET_6089_MARKER) => {
+            OpenStreamRejection::CaveatPostInputViolation {
+                slug: error_codes::SLUG_AUTHORIZATION_DENIED.to_owned(),
+            }
+        }
+        // A persist failure / mailbox fault / any other reserve error is GENUINELY
+        // transient — keep it on the retryable transport-fault path.
         _ => OpenStreamRejection::AdmissionRateLimited {
             slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
         },
@@ -4499,6 +4626,67 @@ mod tests {
                 "a rejected paid reserve leaves the cumulative counter at its last admitted total"
             );
         }
+
+        /// #2196 — fail-closed `ContextState::Active` gate on the unary reserve.
+        /// A non-active (Closing / Expired / `MigratingOut`) context rejects with
+        /// SCP-OUTLET-6080 BEFORE any budget debit, spending-nonce consume, or
+        /// caveat-counter mutation — the gate is the FIRST predicate. A paid
+        /// reserve that WOULD charge leaves the funded budget untouched and
+        /// touches no counter. That the error is the 6080 `PermissionDenied` (not a
+        /// `RateLimited` / `maxCalls` / insufficient-funds reject) proves the gate
+        /// short-circuited BEFORE the hard-rate / velocity / pre-check gates ran
+        /// (no rollback path was taken). Also covers the caller side of the unary
+        /// cross-context saga (`prepare_a` → `reserve_outlet_economy`).
+        #[tokio::test]
+        async fn unary_reserve_gated_on_non_active_context() {
+            let deps = build_deps_paid(Box::new(OkPersistence)).await;
+            let invoker = DID(INVOKER.to_owned());
+            let caveats = max_calls_caveats(1);
+            let input = serde_json::json!({});
+            let now = scp_clock::SystemClock.now_secs();
+            for target in [
+                ContextState::Closing,
+                ContextState::Expired,
+                ContextState::MigratingOut,
+            ] {
+                let state = paid_active_state();
+                state
+                    .handle
+                    .transition_to(&target)
+                    .expect("Active → non-active transition");
+                let mut cell = ClassSCell::new(state);
+                let spending = signed_spending_ucan_for(&invoker);
+
+                let err = paid_reserve_step(
+                    &mut cell,
+                    &deps,
+                    &spending,
+                    &caveats,
+                    "cid-2196-unary",
+                    &input,
+                    now,
+                )
+                .await
+                .expect_err("a non-active context must reject the unary reserve before any debit");
+                let ContextError::PermissionDenied(msg) = &err else {
+                    panic!("expected PermissionDenied(SCP-OUTLET-6080), got {err:?}");
+                };
+                assert!(
+                    msg.contains("SCP-OUTLET-6080") && msg.contains(&target.to_string()),
+                    "reject must be the 6080 context-not-active error naming {target}: {msg}"
+                );
+                assert_eq!(
+                    cell.governance.budget_tracker.remaining(&invoker).0,
+                    1_000,
+                    "the active gate fires BEFORE the paid debit — the funded budget is \
+                     untouched ({target})"
+                );
+                assert!(
+                    !cell.class_s.caveat_counters.contains_key("cid-2196-unary"),
+                    "the gate short-circuits before any caveat-counter mutation ({target})"
+                );
+            }
+        }
     }
 
     /// Sub-chunk 3a — streaming open-time economy reserve
@@ -5259,6 +5447,152 @@ mod tests {
                 cell.governance.budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "the grant debit is REVERSED when the persist does not land"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // #2196 — fail-closed ContextState::Active gate on the forward-debit
+        // reserve paths. A non-active context must reject with SCP-OUTLET-6080
+        // BEFORE any escrow debit / durable record bump (the gate is the FIRST
+        // predicate — no rollback path is taken).
+        // -------------------------------------------------------------------
+
+        /// The three non-Active lifecycle states a forward-debit reserve rejects.
+        const NON_ACTIVE_STATES: [ContextState; 3] = [
+            ContextState::Closing,
+            ContextState::Expired,
+            ContextState::MigratingOut,
+        ];
+
+        /// An `INVOKER`-member context transitioned Active → `target`, funded so a
+        /// reserve WOULD debit if the gate did not fire first.
+        fn non_active_member_state(budget: u64, target: &ContextState) -> PerContextState {
+            let state = member_state(budget);
+            state
+                .handle
+                .transition_to(target)
+                .expect("Active → non-active transition");
+            state
+        }
+
+        /// Streaming open reserve (SCP-OUT-037 same-context open; SCP-OUT-047
+        /// target-side saga reserve): a non-active context rejects with
+        /// SCP-OUTLET-6080 naming the state, debiting NO escrow. The 6080
+        /// `PermissionDenied` (not a `RateLimited` / membership / overflow reject)
+        /// proves the gate ran before the hard-rate / velocity / membership /
+        /// overflow / funds gates.
+        #[tokio::test]
+        async fn stream_reserve_gated_on_non_active_context() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            for target in NON_ACTIVE_STATES {
+                let mut cell = ClassSCell::new(non_active_member_state(1000, &target));
+
+                let err = reserve(&mut cell, &deps, 10, 4, None).await.expect_err(
+                    "a non-active context must reject the stream open before any debit",
+                );
+                let ContextError::PermissionDenied(msg) = &err else {
+                    panic!("expected PermissionDenied(SCP-OUTLET-6080), got {err:?}");
+                };
+                assert!(
+                    msg.contains("SCP-OUTLET-6080") && msg.contains(&target.to_string()),
+                    "reject must be the 6080 context-not-active error naming {target}: {msg}"
+                );
+                assert_eq!(
+                    cell.governance.budget_tracker.total_spent(&invoker()),
+                    Amount::new(0),
+                    "the active gate fires BEFORE any escrow debit — nothing is spent ({target})"
+                );
+            }
+        }
+
+        /// Mid-stream grant top-up: a non-active context rejects with
+        /// SCP-OUTLET-6080 BEFORE the zero-cost early return and BEFORE any budget
+        /// debit / durable record bump — a Closing context must not take on NEW
+        /// spend. The seeded open-time record is left un-bumped.
+        #[tokio::test]
+        async fn grant_reserve_gated_on_non_active_context() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            for target in NON_ACTIVE_STATES {
+                let mut state = non_active_member_state(1000, &target);
+                seed_open_record(&mut state, 50);
+                let mut cell = ClassSCell::new(state);
+
+                let err = grant_reserve(&mut cell, &deps, 10, 4)
+                    .await
+                    .expect_err("a non-active context must reject a mid-stream grant top-up");
+                let ContextError::PermissionDenied(msg) = &err else {
+                    panic!("expected PermissionDenied(SCP-OUTLET-6080), got {err:?}");
+                };
+                assert!(
+                    msg.contains("SCP-OUTLET-6080") && msg.contains(&target.to_string()),
+                    "reject must be the 6080 context-not-active error naming {target}: {msg}"
+                );
+                assert_eq!(
+                    cell.governance.budget_tracker.total_spent(&invoker()),
+                    Amount::new(0),
+                    "the active gate fires BEFORE any grant debit — nothing is spent ({target})"
+                );
+                assert_eq!(
+                    cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                    Amount::new(50),
+                    "the seeded open-time record is left un-bumped ({target})"
+                );
+            }
+        }
+
+        /// #2196 error-masking — a non-member same-context open produces the
+        /// canonical SCP-OUTLET-6089 membership denial, and the supervisor-side
+        /// reverse-map (`reserve_error_to_open_rejection`) must route that
+        /// PERMANENT authorization failure to a NON-retryable class, NOT the
+        /// retryable transport rate-limit the catch-all uses. Feeds the REAL
+        /// reserve error through the reverse-map so the producer marker + consumer
+        /// match move together.
+        #[tokio::test]
+        async fn non_member_open_maps_to_non_retryable_authorization() {
+            use scp_protocol::context::outlets::error_codes;
+            use scp_protocol::context::outlets::errors::RetryPolicy;
+
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+            state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("transition to Active");
+            state
+                .governance
+                .budget_tracker
+                .grant(&invoker(), Amount::new(1000));
+            // NOTE: no `add_member` — the invoker is not on the roster, so the
+            // membership gate (not the active gate) fires with 6089.
+            let mut cell = ClassSCell::new(state);
+
+            let err = reserve(&mut cell, &deps, 10, 4, None)
+                .await
+                .expect_err("a non-member cannot open a stream");
+            let ContextError::PermissionDenied(msg) = &err else {
+                panic!("expected PermissionDenied(SCP-OUTLET-6089), got {err:?}");
+            };
+            assert!(
+                msg.contains("SCP-OUTLET-6089"),
+                "the reserve emits the canonical 6089 membership marker: {msg}"
+            );
+
+            let rejection = super::super::reserve_error_to_open_rejection(&err);
+            assert_ne!(
+                rejection.error_code(),
+                error_codes::CODE_TRANSPORT_FAULT,
+                "a permanent membership denial must NOT surface the retryable \
+                 transport-fault code (the pre-fix catch-all bug)"
+            );
+            assert_eq!(
+                rejection.error_code(),
+                error_codes::CODE_AUTHORIZATION_DENIED,
+                "6089 maps to the authorization-denied class (SCP-OUTLET-6110)"
+            );
+            assert_eq!(
+                error_codes::error_code_to_retry_policy(rejection.error_code()),
+                Some(RetryPolicy::Never),
+                "a 6089 membership denial must be NON-retryable"
             );
         }
     }
