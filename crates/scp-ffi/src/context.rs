@@ -6179,6 +6179,157 @@ impl crate::scp::PyScp {
                 })
         })
     }
+
+    // -----------------------------------------------------------------------
+    // App sandboxing — durable bind / unbind (spec §8.4)
+    // -----------------------------------------------------------------------
+
+    /// Binds an app to a context and appends an `AppBound` event to the
+    /// durable event log (spec §8.4).
+    ///
+    /// Validates the capability declaration against the context ceiling and the
+    /// actor's effective role capabilities (suspension-aware), then appends a
+    /// typed `AppBound` event. Returns a JSON summary on success:
+    /// `{"app_did": "...", "granted_capabilities": [...]}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ValueError` for an invalid declaration or capability; returns
+    /// `RuntimeError` if validation fails (ceiling exceeded, signature invalid)
+    /// or if the durable event log append fails.
+    #[pyo3(signature = (context_id, declaration_json, actor_did, timestamp_secs))]
+    pub fn sandbox_app_bind(
+        &self,
+        context_id: &str,
+        declaration_json: &str,
+        actor_did: &str,
+        timestamp_secs: u64,
+    ) -> PyResult<String> {
+        use scp_core::context::app_sandbox::{CapabilityDeclaration, SandboxError, bind_app};
+        use scp_core::context::roles::Capability;
+        use scp_core::context::{ContextHandle, ContextParams};
+
+        let bi = &*self.inner;
+
+        let decl: CapabilityDeclaration = serde_json::from_str(declaration_json)
+            .map_err(|e| PyValueError::new_err(format!("invalid declaration JSON: {e}")))?;
+
+        // Extract the ceiling and effective role capabilities from FFI state.
+        // Suspensions are applied via member_has_capability (suspension-aware).
+        let (ceiling_caps, role_caps): (Vec<Capability>, Vec<Capability>) =
+            crate::runtime::with_ffi_state(bi, context_id, |st| {
+                let ceiling: Vec<Capability> = st
+                    .ceiling_strings
+                    .iter()
+                    .filter_map(Capability::new)
+                    .collect();
+                // Effective caps = capabilities the actor holds in the ceiling universe,
+                // filtered suspension-aware via member_has_capability.
+                let role: Vec<Capability> = ceiling
+                    .iter()
+                    .filter(|cap| st.role_state.member_has_capability(actor_did, cap))
+                    .cloned()
+                    .collect();
+                Ok((ceiling, role))
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let handle = ContextHandle::new(context_id.to_owned(), ContextParams::default());
+        let event_log = crate::runtime::build_event_log_provider(bi);
+        let actor_did_owned = actor_did.to_owned();
+
+        let rt = crate::runtime()?;
+        let scoped = rt
+            .block_on(async move {
+                bind_app(
+                    &decl,
+                    &ceiling_caps,
+                    &role_caps,
+                    handle,
+                    event_log.as_ref(),
+                    &actor_did_owned,
+                    timestamp_secs,
+                )
+                .await
+            })
+            .map_err(|e| match &e {
+                SandboxError::CeilingExceeded { .. }
+                | SandboxError::InvalidDeclaration(_)
+                | SandboxError::SignatureVerificationFailed => {
+                    PyRuntimeError::new_err(format!("[SCP-CTX-2055] bind_app rejected: {e}"))
+                }
+                SandboxError::EventLogFailed(_) => {
+                    PyRuntimeError::new_err(format!("[SCP-CTX-2056] event log append failed: {e}"))
+                }
+                _ => PyRuntimeError::new_err(format!("[SCP-CTX-2057] bind_app failed: {e}")),
+            })?;
+
+        let app_did = scoped.app_did().to_string();
+        let granted: Vec<String> = scoped
+            .allowed_capabilities()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+
+        // Store the scoped handle keyed by app_did for capability enforcement.
+        crate::runtime::with_ffi_state(bi, context_id, |st| {
+            st.bound_apps.insert(app_did.clone(), scoped);
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        serde_json::to_string(&serde_json::json!({
+            "app_did": app_did,
+            "granted_capabilities": granted,
+        }))
+        .map_err(|e| PyRuntimeError::new_err(format!("serialization failed: {e}")))
+    }
+
+    /// Unbinds an app from a context and appends an `AppUnbound` event to
+    /// the durable event log (spec §8.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeError` if the context is not found or if the durable
+    /// event log append fails.
+    #[pyo3(signature = (context_id, app_did, actor_did, timestamp_secs))]
+    pub fn sandbox_app_unbind(
+        &self,
+        context_id: &str,
+        app_did: &str,
+        actor_did: &str,
+        timestamp_secs: u64,
+    ) -> PyResult<()> {
+        use scp_core::context::app_sandbox::unbind_app;
+
+        let bi = &*self.inner;
+        let event_log = crate::runtime::build_event_log_provider(bi);
+        let context_id_owned = context_id.to_owned();
+        let app_did_owned = app_did.to_owned();
+        let actor_did_owned = actor_did.to_owned();
+
+        let rt = crate::runtime()?;
+        rt.block_on(async move {
+            unbind_app(
+                &context_id_owned,
+                &app_did_owned,
+                event_log.as_ref(),
+                &actor_did_owned,
+                timestamp_secs,
+            )
+            .await
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("[SCP-CTX-2058] unbind_app failed: {e}")))?;
+
+        // Remove the stored scoped handle.
+        crate::runtime::with_ffi_state(bi, context_id, |st| {
+            st.bound_apps.remove(app_did);
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 /// Registers all context bridge types and functions with the Python module.

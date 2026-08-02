@@ -44,8 +44,10 @@ use scp_ffi_common::credentials::FfiCredentialStore;
 // path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::error_codes as codes;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+use scp_core::context::app_sandbox::ScopedHandle;
 
 use dashmap::DashMap;
 use scp_clock::SystemClock;
@@ -374,6 +376,13 @@ pub struct UniffiBridgeInstance {
     /// stream via [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) outlet_streaming_saga_registry:
         Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+
+    /// Per-instance app binding registry (spec §8.4).
+    ///
+    /// Outer key: `context_id`. Inner key: `app_did`. Value: `ScopedHandle`
+    /// retaining the granted capability set for enforcement. Populated by
+    /// `Scp::sandbox_app_bind` and cleared by `Scp::sandbox_app_unbind`.
+    pub(crate) bound_apps_registry: Arc<DashMap<String, HashMap<String, ScopedHandle>>>,
 }
 
 impl std::fmt::Debug for UniffiBridgeInstance {
@@ -423,6 +432,7 @@ impl UniffiBridgeInstance {
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            bound_apps_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -458,6 +468,7 @@ impl UniffiBridgeInstance {
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            bound_apps_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -606,6 +617,7 @@ impl UniffiBridgeInstance {
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            bound_apps_registry: Arc::new(DashMap::new()),
         }
     }
 

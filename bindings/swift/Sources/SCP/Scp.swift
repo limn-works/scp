@@ -556,6 +556,25 @@ public extension SCP {
         try await inner.contextSend(handle: handle, identity: identity, payload: payload, spendingUcanJwt: spendingUcanJwt)
     }
 
+    /// Forwards to ``Scp/sandboxAppBind`` on ``inner``.
+    ///
+    /// Validates the capability declaration against the context ceiling and
+    /// the actor's role capabilities, then appends a durable `AppBound` event
+    /// (tag 74) to the event log (spec §8.4.1).
+    ///
+    /// - Returns: A JSON summary string with `app_did` and `granted_capabilities`.
+    func contextSandboxAppBind(handle: ContextHandle, declarationJson: String, actorDid: String, timestampSecs: UInt64) async throws -> String {
+        try await inner.sandboxAppBind(handle: handle, declarationJson: declarationJson, actorDid: actorDid, timestampSecs: timestampSecs)
+    }
+
+    /// Forwards to ``Scp/sandboxAppUnbind`` on ``inner``.
+    ///
+    /// Removes the app binding and appends a durable `AppUnbound` event
+    /// (tag 75) to the event log (spec §8.4.2).
+    func contextSandboxAppUnbind(handle: ContextHandle, appDid: String, actorDid: String, timestampSecs: UInt64) async throws {
+        try await inner.sandboxAppUnbind(handle: handle, appDid: appDid, actorDid: actorDid, timestampSecs: timestampSecs)
+    }
+
     /// Reconnects `identity`'s contexts after an offline period, running the
     /// ADR-029 six-phase reconnection protocol for each of `contextIds`
     /// flagged `needsReconnect` (§23.11).

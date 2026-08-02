@@ -1431,7 +1431,9 @@ fn discovery_and_provenance_coverage() {
 // native bridge (PyO3 / UniFFI / NAPI) and removing the pass-1 bridge-alias
 // exemptions. Pure coverage expansion, not a swap for the removed
 // `economy_adjust_relay_price`.
-const MIN_PARITY_OPERATIONS: usize = 109;
+// +2: `sandbox_app_bind` and `sandbox_app_unbind` (spec §8.4) — durable
+// AppBound/AppUnbound event log appends across all three native bridges.
+const MIN_PARITY_OPERATIONS: usize = 111;
 
 // ---------------------------------------------------------------------------
 // Ratchet meta-tests — detect weakening of enforcement

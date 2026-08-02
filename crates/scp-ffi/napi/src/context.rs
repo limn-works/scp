@@ -5116,6 +5116,143 @@ pub(crate) fn validate_capability_declaration_on(
         .map_err(|e| NapiError::from_reason(format!("serialization failed: {e}")))
 }
 
+/// Binds an app to a context and appends an `AppBound` event to the durable
+/// event log (spec §8.4).
+///
+/// Validates the declaration against the context ceiling (looked up from
+/// `UcanContextState`) and the actor's effective (suspension-aware) role
+/// capabilities, then appends a typed `AppBound` leaf. Returns a camelCase
+/// JSON summary: `{"appDid": "...", "grantedCapabilities": [...]}`.
+///
+/// # Errors
+///
+/// Returns a `NapiError` if the declaration is invalid, capabilities are
+/// ceiling-exceeded, or the durable event log append fails.
+pub(crate) fn app_bind_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    declaration_json: String,
+    actor_did: String,
+    timestamp_secs: u64,
+) -> napi::Result<String> {
+    use scp_core::context::app_sandbox::{CapabilityDeclaration, SandboxError, bind_app};
+    use scp_core::context::roles::Capability;
+    use scp_core::context::{ContextHandle, ContextParams};
+
+    let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid declaration JSON: {e}")))?;
+
+    // Extract ceiling and effective (suspension-aware) role capabilities from
+    // per-context UCAN state without holding the DashMap lock across an await.
+    let (ceiling_caps, role_caps): (Vec<Capability>, Vec<Capability>) =
+        crate::runtime::with_context(bi, &context_id, |st| {
+            let ceiling: Vec<Capability> = st
+                .core
+                .ceiling_strings
+                .iter()
+                .filter_map(Capability::new)
+                .collect();
+            let role: Vec<Capability> = ceiling
+                .iter()
+                .filter(|cap| st.role_state.member_has_capability(&actor_did, cap))
+                .cloned()
+                .collect();
+            Ok((ceiling, role))
+        })
+        .map_err(NapiError::from)?;
+
+    let handle = ContextHandle::new(context_id.clone(), ContextParams::default());
+    let event_log = crate::runtime::event_log_provider_from_existing_repo(bi);
+
+    let scoped = crate::runtime()
+        .block_on(async move {
+            bind_app(
+                &decl,
+                &ceiling_caps,
+                &role_caps,
+                handle,
+                event_log.as_ref(),
+                &actor_did,
+                timestamp_secs,
+            )
+            .await
+        })
+        .map_err(|e| match &e {
+            SandboxError::CeilingExceeded { .. }
+            | SandboxError::InvalidDeclaration(_)
+            | SandboxError::SignatureVerificationFailed => {
+                NapiError::from_reason(format!("[SCP-CTX-2055] bind_app rejected: {e}"))
+            }
+            SandboxError::EventLogFailed(_) => {
+                NapiError::from_reason(format!("[SCP-CTX-2056] event log append failed: {e}"))
+            }
+            _ => NapiError::from_reason(format!("[SCP-CTX-2057] bind_app failed: {e}")),
+        })?;
+
+    let app_did = scoped.app_did().to_string();
+    let granted: Vec<String> = scoped
+        .allowed_capabilities()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+
+    // Store the scoped handle in UCAN state for capability enforcement.
+    crate::runtime::with_context(bi, &context_id, |st| {
+        st.bound_apps.insert(app_did.clone(), scoped);
+        Ok(())
+    })
+    .map_err(NapiError::from)?;
+
+    serde_json::to_string(&serde_json::json!({
+        "appDid": app_did,
+        "grantedCapabilities": granted,
+    }))
+    .map_err(|e| NapiError::from_reason(format!("serialization failed: {e}")))
+}
+
+/// Unbinds an app from a context and appends an `AppUnbound` event to the
+/// durable event log (spec §8.4).
+///
+/// # Errors
+///
+/// Returns a `NapiError` if the context is not found or if the durable event
+/// log append fails.
+pub(crate) fn app_unbind_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    app_did: String,
+    actor_did: String,
+    timestamp_secs: u64,
+) -> napi::Result<()> {
+    use scp_core::context::app_sandbox::unbind_app;
+
+    let event_log = crate::runtime::event_log_provider_from_existing_repo(bi);
+    let context_id_c = context_id.clone();
+    let app_did_c = app_did.clone();
+
+    crate::runtime()
+        .block_on(async move {
+            unbind_app(
+                &context_id_c,
+                &app_did_c,
+                event_log.as_ref(),
+                &actor_did,
+                timestamp_secs,
+            )
+            .await
+        })
+        .map_err(|e| NapiError::from_reason(format!("[SCP-CTX-2058] unbind_app failed: {e}")))?;
+
+    // Remove the stored scoped handle.
+    crate::runtime::with_context(bi, &context_id, |st| {
+        st.bound_apps.remove(&app_did);
+        Ok(())
+    })
+    .map_err(NapiError::from)?;
+
+    Ok(())
+}
+
 /// Checks whether a given capability is allowed for an app binding.
 #[napi]
 #[must_use]

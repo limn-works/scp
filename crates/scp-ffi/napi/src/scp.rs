@@ -2767,6 +2767,42 @@ impl Scp {
     // `SCP.checkScopedCapability` routes through `nativeFreeFn(...)` to
     // reach the module-level export.
 
+    /// Binds an app to a context and appends an `AppBound` event to the
+    /// durable event log (spec §8.4).
+    ///
+    /// Returns a camelCase JSON summary on success.
+    #[napi(js_name = "sandboxAppBind")]
+    pub fn sandbox_app_bind(
+        &self,
+        context_id: String,
+        declaration_json: String,
+        actor_did: String,
+        timestamp_secs: f64,
+    ) -> napi::Result<String> {
+        // `timestamp_secs` arrives as a JS `number` (f64). Unix timestamps fit
+        // exactly in f64 (≤ 2^31 seconds until 2038; < 2^53 until year 4000+).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ts = timestamp_secs as u64;
+        crate::context::app_bind_on(&self.inner, context_id, declaration_json, actor_did, ts)
+    }
+
+    /// Unbinds an app from a context and appends an `AppUnbound` event to
+    /// the durable event log (spec §8.4).
+    #[napi(js_name = "sandboxAppUnbind")]
+    pub fn sandbox_app_unbind(
+        &self,
+        context_id: String,
+        app_did: String,
+        actor_did: String,
+        timestamp_secs: f64,
+    ) -> napi::Result<()> {
+        // `timestamp_secs` arrives as a JS `number` (f64). Unix timestamps fit
+        // exactly in f64 (≤ 2^31 seconds until 2038; < 2^53 until year 4000+).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ts = timestamp_secs as u64;
+        crate::context::app_unbind_on(&self.inner, context_id, app_did, actor_did, ts)
+    }
+
     /// Per-instance equivalent of the free-function `evaluate_invitation`.
     #[napi(js_name = "evaluateInvitation")]
     pub fn evaluate_invitation(

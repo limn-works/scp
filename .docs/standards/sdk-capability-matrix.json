@@ -320,6 +320,28 @@
           }
         },
         {
+          "name": "sandbox_app_bind",
+          "python": true,
+          "typescript": true,
+          "kotlin": false,
+          "swift": true,
+          "notes": "Binds an app to a context (spec §8.4.1), appending a durable AppBound event (tag 74). Returns JSON with app_did and granted_capabilities.",
+          "exemptions": {
+            "kotlin": "SDK does not expose sandboxAppBind wrapper; UniFFI-generated binding available but no idiomatic Kotlin SDK wrapper"
+          }
+        },
+        {
+          "name": "sandbox_app_unbind",
+          "python": true,
+          "typescript": true,
+          "kotlin": false,
+          "swift": true,
+          "notes": "Unbinds an app from a context (spec §8.4.2), appending a durable AppUnbound event (tag 75).",
+          "exemptions": {
+            "kotlin": "SDK does not expose sandboxAppUnbind wrapper; UniFFI-generated binding available but no idiomatic Kotlin SDK wrapper"
+          }
+        },
+        {
           "name": "metadata_record_serialize",
           "python": true,
           "typescript": true,

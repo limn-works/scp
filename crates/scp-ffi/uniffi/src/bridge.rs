@@ -15778,6 +15778,205 @@ impl Scp {
         .await
     }
 
+    // ===== App Sandboxing (spec §8.4) =====
+
+    /// Binds an app to a context (spec §8.4.1), appending a durable
+    /// `AppBound` event (tag 74) to the context event log.
+    ///
+    /// Validates the capability declaration JSON, derives role capabilities
+    /// from the context ceiling and the actor's current membership role via
+    /// `ContextRoleState::member_has_capability` (suspension-aware), and
+    /// stores the `ScopedHandle` in the bridge instance's `bound_apps_registry`.
+    ///
+    /// Returns a JSON string with fields: `app_did`, `granted_capabilities`.
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn sandbox_app_bind(
+        &self,
+        handle: Arc<ContextHandle>,
+        declaration_json: String,
+        actor_did: String,
+        timestamp_secs: u64,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                use scp_core::context::actor::commands::QueriesCommand;
+                use scp_core::context::app_sandbox::{CapabilityDeclaration, bind_app};
+                use scp_core::context::roles::Capability;
+                use scp_core::context::{ContextHandle as CoreContextHandle, ContextParams};
+
+                let trimmed_did = actor_did.trim();
+                validate_did(trimmed_did)?;
+
+                let decl: CapabilityDeclaration =
+                    serde_json::from_str(&declaration_json).map_err(|e| ScpError::Validation {
+                        msg: format!("invalid declaration JSON: {e}"),
+                        code: codes::VALID_7070.to_owned(),
+                    })?;
+
+                // Derive ceiling from the ContextHandle's ceiling_strings.
+                let ceiling: Vec<Capability> = handle
+                    .ceiling_strings
+                    .iter()
+                    .filter_map(Capability::new)
+                    .collect();
+
+                // Derive role caps: query the supervisor for this context's
+                // role state, then filter the ceiling by which capabilities
+                // the actor actually holds (suspension-aware).
+                let role_caps: Vec<Capability> = {
+                    let sup = bi
+                        .context_manager_expect()
+                        .map_err(|e| ScpError::Context {
+                            msg: format!("Supervisor not initialized: {e}"),
+                            code: codes::CTX_2000.to_owned(),
+                        })?
+                        .clone();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = QueriesCommand::GetRoleState {
+                        context_id: handle.context_id.clone(),
+                        reply: tx,
+                    };
+                    sup.dispatch_query(cmd)
+                        .await
+                        .map_err(|e| ScpError::Context {
+                            msg: format!("dispatch_query failed: {e}"),
+                            code: codes::CTX_2000.to_owned(),
+                        })?;
+                    let role_state = rx
+                        .await
+                        .map_err(|_| ScpError::Context {
+                            msg: "query reply dropped".to_owned(),
+                            code: codes::CTX_2000.to_owned(),
+                        })?
+                        .map_err(|e| ScpError::Context {
+                            msg: e.to_string(),
+                            code: codes::CTX_2000.to_owned(),
+                        })?
+                        .ok_or_else(|| ScpError::Context {
+                            msg: format!("context '{}' not registered", handle.context_id),
+                            code: codes::CTX_2000.to_owned(),
+                        })?;
+                    ceiling
+                        .iter()
+                        .filter(|cap| role_state.member_has_capability(trimmed_did, cap))
+                        .cloned()
+                        .collect()
+                };
+
+                let event_log = bi.protocol_repository.event_log_provider();
+                let ctx_handle =
+                    CoreContextHandle::new(handle.context_id.clone(), ContextParams::default());
+
+                let scoped = bind_app(
+                    &decl,
+                    &ceiling,
+                    &role_caps,
+                    ctx_handle,
+                    &*event_log,
+                    trimmed_did,
+                    timestamp_secs,
+                )
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: e.to_string(),
+                    code: codes::CTX_2030.to_owned(),
+                })?;
+
+                let app_did = scoped.app_did().to_string();
+                let granted: Vec<String> = scoped
+                    .allowed_capabilities()
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect();
+
+                // Store the ScopedHandle in the per-context binding registry.
+                bi.bound_apps_registry
+                    .entry(handle.context_id.clone())
+                    .or_default()
+                    .insert(app_did.clone(), scoped);
+
+                serde_json::to_string(&serde_json::json!({
+                    "app_did": app_did,
+                    "granted_capabilities": granted,
+                }))
+                .map_err(|e| ScpError::Context {
+                    msg: format!("serialization failed: {e}"),
+                    code: codes::CTX_2030.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })?
+    }
+
+    /// Unbinds a previously bound app from a context (spec §8.4.2), appending
+    /// a durable `AppUnbound` event (tag 75) to the context event log.
+    ///
+    /// Removes the binding from the bridge instance's `bound_apps_registry`.
+    /// Returns `ScpError::Context` (SCP-CTX-2030) when the event log append
+    /// fails — silent app detachment is not possible (spec §8.4).
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn sandbox_app_unbind(
+        &self,
+        handle: Arc<ContextHandle>,
+        app_did: String,
+        actor_did: String,
+        timestamp_secs: u64,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                use scp_core::context::app_sandbox::unbind_app;
+
+                let trimmed_actor = actor_did.trim();
+                let trimmed_app = app_did.trim();
+                validate_did(trimmed_actor)?;
+                validate_did(trimmed_app)?;
+
+                let event_log = bi.protocol_repository.event_log_provider();
+
+                unbind_app(
+                    &handle.context_id,
+                    trimmed_app,
+                    &*event_log,
+                    trimmed_actor,
+                    timestamp_secs,
+                )
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: e.to_string(),
+                    code: codes::CTX_2030.to_owned(),
+                })?;
+
+                // Remove the binding from the per-context registry.
+                if let Some(mut ctx_bindings) = bi.bound_apps_registry.get_mut(&handle.context_id) {
+                    ctx_bindings.remove(trimmed_app);
+                }
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })?
+    }
+
     // ===== UniFFI sub-slice G — transport + MCP + trust + misc =====
     //
     // Migrates the transport / MCP / local-DID / trust / sync-policy free

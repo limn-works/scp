@@ -58,6 +58,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
+use scp_core::context::app_sandbox::ScopedHandle;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::outlets::OutletRegistry;
 use scp_core::context::persistence::ContextPersistence;
@@ -1513,6 +1514,11 @@ pub struct FfiBridgeState {
     /// Stores active outlet sessions keyed by session ID. Sessions are created
     /// via `py_outlet_session_create` and cleaned up on context close.
     pub session_store: scp_core::context::outlets::SessionStore,
+    /// App binding registry for this context (spec §8.4).
+    ///
+    /// Maps `app_did` → `ScopedHandle` for every app bound to this context.
+    /// Populated by `py_app_bind` and cleared by `py_app_unbind`.
+    pub bound_apps: HashMap<String, ScopedHandle>,
 }
 
 /// Buffer capacity for the receive channel (SCP-216, sketch.md §receive).
@@ -1618,6 +1624,7 @@ pub fn register_ffi_state(
                 message_tx: None,
                 message_rx: None,
                 session_store: scp_core::context::outlets::SessionStore::new(),
+                bound_apps: HashMap::new(),
             };
 
             vacant.insert(state);

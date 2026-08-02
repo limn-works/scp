@@ -4619,6 +4619,59 @@ export class SCP {
     }
   }
 
+  /**
+   * Binds an app to a context and appends a durable `AppBound` event (tag 74)
+   * to the event log (spec §8.4.1).
+   *
+   * Validates the capability declaration against the context ceiling and the
+   * actor's role capabilities before appending.
+   *
+   * @returns A JSON summary string with `app_did` and `granted_capabilities`.
+   */
+  async contextSandboxAppBind(
+    contextId: string,
+    declarationJson: string,
+    actorDid: string,
+    timestampSecs: number,
+  ): Promise<string> {
+    try {
+      return await (
+        this.#native.sandboxAppBind as (
+          id: string,
+          decl: string,
+          did: string,
+          ts: number,
+        ) => Promise<string>
+      )(contextId, declarationJson, actorDid, timestampSecs);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Unbinds an app from a context and appends a durable `AppUnbound` event
+   * (tag 75) to the event log (spec §8.4.2).
+   */
+  async contextSandboxAppUnbind(
+    contextId: string,
+    appDid: string,
+    actorDid: string,
+    timestampSecs: number,
+  ): Promise<void> {
+    try {
+      await (
+        this.#native.sandboxAppUnbind as (
+          id: string,
+          app: string,
+          did: string,
+          ts: number,
+        ) => Promise<void>
+      )(contextId, appDid, actorDid, timestampSecs);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
   // ───────────────────────────────────────────────────────────────────────
   // Internal — `__nativeForInternalUseOnly` is **NOT** a method or getter;
   // access routes through module-private functions below so the handle

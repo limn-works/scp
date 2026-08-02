@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::ContextHandle;
+use crate::context::builder::ContextEventLogProvider;
 use scp_did::DID;
+use scp_event_log::payload::{AppBoundPayload, AppUnboundPayload, encode_payload};
 use scp_protocol::context::roles::Capability;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,14 @@ pub enum SandboxError {
     /// Serialization or deserialization failed.
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
+
+    /// Appending the bind or unbind event to the durable event log failed.
+    ///
+    /// Returned when `ContextEventLogProvider::append_context_event_with_payload`
+    /// fails during `bind_app` or `unbind_app`. The bind/unbind operation is
+    /// rejected — silent app attachment is not possible (spec §8.4).
+    #[error("event log failed: {0}")]
+    EventLogFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -824,59 +834,101 @@ pub fn validate_declaration(
 }
 
 // ---------------------------------------------------------------------------
-// AppBindEvent / AppUnbindEvent (event log entries)
+// Durable event log operations (spec §8.4)
 // ---------------------------------------------------------------------------
 
-/// Event log entry for when an app is bound to a context.
+/// Validates a capability declaration and binds the app, appending an
+/// `AppBound` (tag 74) event to the durable event log (spec §8.4).
 ///
-/// Recorded in the context's event log at bind time for auditability
-/// (spec 8.4.2). Context members can inspect which apps are bound and
-/// what capabilities they hold.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppBindEvent {
-    /// The DID of the app that was bound.
-    pub app_did: DID,
-    /// The capabilities granted to the app.
-    pub capabilities: Vec<Capability>,
-    /// The app name from the declaration.
-    pub app_name: String,
-    /// The app version from the declaration.
-    pub app_version: String,
+/// This is the authoritative bind path. It first calls `validate_declaration`
+/// for all-or-nothing capability checking, then serialises an
+/// [`AppBoundPayload`] and appends it via
+/// [`ContextEventLogProvider::append_context_event_with_payload`]. If the
+/// event log append fails the bind is rejected — silent app attachment is not
+/// possible.
+///
+/// # Errors
+///
+/// Returns `SandboxError::CeilingExceeded` / `SandboxError::InvalidDeclaration`
+/// / `SandboxError::SignatureVerificationFailed` (via `validate_declaration`)
+/// or `SandboxError::EventLogFailed` when the durable append fails.
+pub async fn bind_app(
+    declaration: &CapabilityDeclaration,
+    context_ceiling: &[Capability],
+    role_capabilities: &[Capability],
+    context_handle: ContextHandle,
+    event_log: &dyn ContextEventLogProvider,
+    actor_did: &str,
+    timestamp_secs: u64,
+) -> Result<ScopedHandle, SandboxError> {
+    let scoped = validate_declaration(
+        declaration,
+        context_ceiling,
+        role_capabilities,
+        context_handle,
+    )?;
+
+    let payload = encode_payload(&AppBoundPayload {
+        app_did: scoped.app_did().to_string(),
+        app_name: scoped.declaration().app_name.clone(),
+        app_version: scoped.declaration().app_version.clone(),
+        capabilities: scoped
+            .allowed_capabilities()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+    })
+    .map_err(|e| SandboxError::EventLogFailed(e.to_string()))?;
+
+    let context_id_bytes = super::state::context_id_to_bytes(scoped.context_id());
+    event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::AppBound,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+        .await
+        .map_err(|e| SandboxError::EventLogFailed(e.to_string()))?;
+
+    Ok(scoped)
 }
 
-/// Event log entry for when an app is unbound from a context.
+/// Unbinds an app from a context, appending an `AppUnbound` (tag 75) event
+/// to the durable event log (spec §8.4).
 ///
-/// Recorded in the context's event log when an app is removed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppUnbindEvent {
-    /// The DID of the app that was unbound.
-    pub app_did: DID,
-}
-
-/// Formats an `AppBindEvent` as an event log string.
+/// Serialises an [`AppUnboundPayload`] and appends it via
+/// [`ContextEventLogProvider::append_context_event_with_payload`]. If the
+/// event log append fails the unbind is rejected — silent app detachment is
+/// not possible.
 ///
-/// Returns a string suitable for appending to the context's Merkle event log
-/// via `ContextEventLogProvider::append_event`.
-#[must_use]
-pub fn format_bind_event(event: &AppBindEvent) -> String {
-    let cap_names: Vec<String> = event
-        .capabilities
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect();
-    format!(
-        "AppBound:{}:{}:{}:[{}]",
-        event.app_did,
-        event.app_name,
-        event.app_version,
-        cap_names.join(",")
-    )
-}
+/// # Errors
+///
+/// Returns `SandboxError::EventLogFailed` when the durable append fails.
+pub async fn unbind_app(
+    context_id: &str,
+    app_did: &str,
+    event_log: &dyn ContextEventLogProvider,
+    actor_did: &str,
+    timestamp_secs: u64,
+) -> Result<(), SandboxError> {
+    let payload = encode_payload(&AppUnboundPayload {
+        app_did: app_did.to_owned(),
+    })
+    .map_err(|e| SandboxError::EventLogFailed(e.to_string()))?;
 
-/// Formats an `AppUnbindEvent` as an event log string.
-#[must_use]
-pub fn format_unbind_event(event: &AppUnbindEvent) -> String {
-    format!("AppUnbound:{}", event.app_did)
+    let context_id_bytes = super::state::context_id_to_bytes(context_id);
+    event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::AppUnbound,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+        .await
+        .map_err(|e| SandboxError::EventLogFailed(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,7 +1057,10 @@ pub fn declaration_content_hash(
     clippy::expect_used,
     clippy::panic,
     clippy::redundant_clone,
-    clippy::large_stack_frames
+    clippy::large_stack_frames,
+    // `std::sync::Mutex` is used by the `RecordingEventLog` test mock; it is
+    // never held across an `.await` point so it cannot deadlock the runtime.
+    clippy::disallowed_types
 )]
 mod tests {
     use super::*;
@@ -1705,36 +1760,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Event Log Recording
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn format_bind_event_produces_parseable_string() {
-        let event = AppBindEvent {
-            app_did: DID::from("did:key:z1234"),
-            capabilities: vec![Capability::MessagesRead, Capability::MessagesWrite],
-            app_name: "Test App".to_owned(),
-            app_version: "1.0.0".to_owned(),
-        };
-
-        let formatted = format_bind_event(&event);
-        assert!(formatted.starts_with("AppBound:"));
-        assert!(formatted.contains("did:key:z1234"));
-        assert!(formatted.contains("messages:read"));
-        assert!(formatted.contains("messages:write"));
-    }
-
-    #[test]
-    fn format_unbind_event_produces_parseable_string() {
-        let event = AppUnbindEvent {
-            app_did: DID::from("did:key:z1234"),
-        };
-
-        let formatted = format_unbind_event(&event);
-        assert_eq!(formatted, "AppUnbound:did:key:z1234");
-    }
-
-    // -----------------------------------------------------------------------
     // Capability Entry Parsing
     // -----------------------------------------------------------------------
 
@@ -2050,35 +2075,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // App Bind/Unbind Event Serialization
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn app_bind_event_serialization() {
-        let event = AppBindEvent {
-            app_did: DID::from("did:key:z1234"),
-            capabilities: vec![Capability::MessagesRead],
-            app_name: "My App".to_owned(),
-            app_version: "1.0.0".to_owned(),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        let roundtripped: AppBindEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtripped, event);
-    }
-
-    #[test]
-    fn app_unbind_event_serialization() {
-        let event = AppUnbindEvent {
-            app_did: DID::from("did:key:z1234"),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        let roundtripped: AppUnbindEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtripped, event);
-    }
-
-    // -----------------------------------------------------------------------
     // sign_declaration
     // -----------------------------------------------------------------------
 
@@ -2327,18 +2323,6 @@ mod tests {
     }
 
     #[test]
-    fn format_bind_event_empty_capabilities() {
-        let event = AppBindEvent {
-            app_did: DID::from("did:key:z1234"),
-            capabilities: vec![],
-            app_name: "Empty App".to_owned(),
-            app_version: "0.0.1".to_owned(),
-        };
-        let formatted = format_bind_event(&event);
-        assert!(formatted.contains("[]"));
-    }
-
-    #[test]
     fn scoped_handle_check_capability_error_includes_app_did() {
         let (_, did) = test_keypair();
         let handle = ContextHandle::new("ctx-test".to_owned(), ContextParams::default());
@@ -2427,5 +2411,191 @@ mod tests {
         // Not granted:
         assert!(handle.check_context_close().is_err());
         assert!(handle.check_member_remove().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // bind_app / unbind_app — durable event log append (spec §8.4)
+    // -----------------------------------------------------------------------
+
+    use crate::context::builder::ContextEventLogProvider;
+    use scp_event_log::{EventPayload, EventType};
+    use scp_protocol::context::builder::ContextCreationError;
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal mock that records every `append_event` call.
+    struct RecordingEventLog {
+        calls: Arc<Mutex<Vec<(EventType, String)>>>,
+        fail: bool,
+    }
+
+    impl RecordingEventLog {
+        fn new_ok() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            }
+        }
+
+        fn new_fail() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail: true,
+            }
+        }
+
+        fn recorded(&self) -> Vec<(EventType, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for RecordingEventLog {
+        async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event_type: EventType,
+            actor_did: &str,
+            _payload: EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            if self.fail {
+                return Err(ContextCreationError::EventLogFailed(
+                    "simulated failure".to_owned(),
+                ));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push((event_type, actor_did.to_owned()));
+            Ok(())
+        }
+
+        async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_app_appends_app_bound_event() {
+        let (signing_key, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        sign_declaration(&mut decl, &signing_key).unwrap();
+
+        let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+        let role_caps = ceiling.clone();
+        let handle = ContextHandle::new("ctx-bind".to_owned(), ContextParams::default());
+        let log = RecordingEventLog::new_ok();
+
+        let result = bind_app(
+            &decl,
+            &ceiling,
+            &role_caps,
+            handle,
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let calls = log.recorded();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, EventType::AppBound);
+        assert_eq!(calls[0].1, "did:key:actor");
+    }
+
+    #[tokio::test]
+    async fn bind_app_ceiling_exceeded_does_not_append() {
+        let (signing_key, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        sign_declaration(&mut decl, &signing_key).unwrap();
+
+        // Ceiling does NOT include MessagesWrite even though the declaration
+        // requests it — so validate_declaration should fail BEFORE the log
+        // append.
+        let ceiling = vec![Capability::MessagesRead];
+        let role_caps = ceiling.clone();
+        let handle = ContextHandle::new("ctx-bind".to_owned(), ContextParams::default());
+        let log = RecordingEventLog::new_ok();
+
+        let result = bind_app(
+            &decl,
+            &ceiling,
+            &role_caps,
+            handle,
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(matches!(result, Err(SandboxError::CeilingExceeded { .. })));
+        // No event must be appended when validation fails.
+        assert!(log.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bind_app_event_log_failure_propagates() {
+        let (signing_key, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        sign_declaration(&mut decl, &signing_key).unwrap();
+
+        let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+        let role_caps = ceiling.clone();
+        let handle = ContextHandle::new("ctx-bind".to_owned(), ContextParams::default());
+        let log = RecordingEventLog::new_fail();
+
+        let result = bind_app(
+            &decl,
+            &ceiling,
+            &role_caps,
+            handle,
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(matches!(result, Err(SandboxError::EventLogFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn unbind_app_appends_app_unbound_event() {
+        let log = RecordingEventLog::new_ok();
+
+        let result = unbind_app(
+            "ctx-unbind",
+            "did:key:app",
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let calls = log.recorded();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, EventType::AppUnbound);
+        assert_eq!(calls[0].1, "did:key:actor");
+    }
+
+    #[tokio::test]
+    async fn unbind_app_event_log_failure_propagates() {
+        let log = RecordingEventLog::new_fail();
+
+        let result = unbind_app(
+            "ctx-unbind",
+            "did:key:app",
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(matches!(result, Err(SandboxError::EventLogFailed(_))));
     }
 }

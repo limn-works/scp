@@ -2768,6 +2768,32 @@
       ]
     },
     {
+      "canonical": "sandbox_app_bind",
+      "category": "context",
+      "pyo3": [
+        "sandbox_app_bind"
+      ],
+      "uniffi": [
+        "sandbox_app_bind"
+      ],
+      "napi": [
+        "sandbox_app_bind"
+      ]
+    },
+    {
+      "canonical": "sandbox_app_unbind",
+      "category": "context",
+      "pyo3": [
+        "sandbox_app_unbind"
+      ],
+      "uniffi": [
+        "sandbox_app_unbind"
+      ],
+      "napi": [
+        "sandbox_app_unbind"
+      ]
+    },
+    {
       "canonical": "configure_relay_transport",
       "category": "transport",
       "pyo3": [

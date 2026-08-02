@@ -32,6 +32,7 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_clock::SystemClock;
+use scp_core::context::app_sandbox::ScopedHandle;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::outlets::{OutletRegistry, SessionStore};
 use scp_core::context::persistence::ContextPersistence;
@@ -1298,7 +1299,7 @@ pub(crate) fn build_event_log_provider() -> (
 /// entries unreadable. When the bridge is SQLite-backed, this returns an
 /// event log provider that writes into the same `SQLCipher` database as
 /// context snapshots.
-fn event_log_provider_from_existing_repo(
+pub(crate) fn event_log_provider_from_existing_repo(
     bi: &NapiBridgeInstance,
 ) -> Box<dyn ContextEventLogProvider> {
     bi.protocol_repository.event_log_provider()
@@ -1614,6 +1615,11 @@ pub struct UcanContextState {
     pub outlet_handlers: HashMap<String, OutletHandler>,
     /// Session store for stateful outlet sessions (spec section 6.2.1).
     pub session_store: SessionStore,
+    /// App binding registry for this context (spec §8.4).
+    ///
+    /// Maps `app_did` → `ScopedHandle` for every app bound to this context.
+    /// Populated by `app_bind_on` and cleared by `app_unbind_on`.
+    pub bound_apps: HashMap<String, ScopedHandle>,
 }
 
 /// Returns a reference to the given bridge instance's UCAN state registry.
@@ -1715,6 +1721,7 @@ fn build_ucan_context_state(
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
+        bound_apps: HashMap::new(),
     })
 }
 
@@ -2012,6 +2019,7 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
+        bound_apps: HashMap::new(),
     };
 
     map.entry(context_id.to_owned()).or_insert(state);
