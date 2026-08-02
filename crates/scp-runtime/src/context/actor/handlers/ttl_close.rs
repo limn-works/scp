@@ -315,7 +315,26 @@ async fn handle_finalize_close(
     let finalize_fut = crate::context::ttl_close_helpers::finalize_close(cell, deps, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
-        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Ok(attestation)) => {
+            // #2199 (F2): finalize_close returns the TRUTHFUL, post-disposal
+            // `KeyDestructionAttestation` (built from the OBSERVED disposal
+            // outcome) for Ephemeral/Summary closes. Log it HERE at the local
+            // caller. The FFI oneshot reply stays `Result<(), ContextError>`
+            // UNCHANGED — surfacing the attestation across the SDK boundary is a
+            // separate DOA wire-format decision owned by #2215.
+            if let Some(att) = attestation.as_ref() {
+                tracing::info!(
+                    context_id = %context_id,
+                    level = ?att.level,
+                    mls_group_destroyed = att.mls_group_destroyed,
+                    sender_keys_destroyed = att.sender_keys_destroyed,
+                    attested_at = att.attested_at,
+                    "key-destruction attestation (truthful, post-disposal): observed \
+                     disposal of actor-owned MLS crypto for Ephemeral/Summary close (#2199)"
+                );
+            }
+            (Outcome::ok_mutated(()), Ok(()))
+        }
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
             (Outcome::err_mutated(sketch), Err(e))
@@ -466,6 +485,86 @@ mod tests {
             "FinalizeClose MUST transition the actor's REAL handle to Closed \
              (pre-fix it mutated a detached throwaway and left the live handle \
              in Closing)"
+        );
+    }
+
+    /// #2199 (F2): `finalize_close` builds the TRUTHFUL key-destruction
+    /// attestation at the disposal seam and RETURNS it to the local caller. For a
+    /// seeded Encrypted (default `ContextParams` ⇒ Ephemeral) context in `Closing`
+    /// with a PRESENT sender key (and no MLS group), the returned attestation must
+    /// reflect the OBSERVED disposal exactly: `sender_keys_destroyed = true`,
+    /// `mls_group_destroyed = false`, `level = SoftwareOnly`, `attested_at =` the
+    /// close instant, `context_id =` the real handle id. This tests the honesty
+    /// AT THE BUILD SITE — the flags are read through the `DisposalOutcome`
+    /// accessors, never fabricated.
+    #[tokio::test]
+    async fn finalize_close_returns_truthful_attestation_from_observed_disposal() {
+        use scp_protocol::context::memory_scope::KeyDestructionLevel;
+
+        let deps = build_deps().await;
+        let context_id_bytes = [0xfd; 32];
+
+        let mut state = PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        );
+        // Seed a PRESENT sender key (no MLS group) so the observed disposal is
+        // {mls: false, sender: true} — the flags must track this exactly.
+        if let Some(crypto) = state.mode.crypto_mut() {
+            crypto.sender_key = Some(scp_protocol::crypto::sender_keys::generate_sender_key());
+        }
+
+        let context_id = state.handle.context_id().to_owned();
+        // Default `ContextParams` ⇒ Ephemeral scope (attestation is built).
+        assert_eq!(
+            state.handle.params().memory_scope,
+            scp_protocol::context::MemoryScope::Ephemeral,
+            "fixture must be Ephemeral so finalize_close builds an attestation"
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .unwrap();
+
+        deps.event_log
+            .init_event_log(&context_id_bytes)
+            .await
+            .expect("init event log");
+
+        let mut cell = ClassSCell::new(state);
+        let handle = cell.handle.clone();
+
+        let attestation =
+            crate::context::ttl_close_helpers::finalize_close(&mut cell, &deps, &handle)
+                .await
+                .expect("finalize_close on a Closing Ephemeral context succeeds")
+                .expect("Ephemeral close with present crypto returns Some(attestation)");
+
+        assert_eq!(
+            attestation.context_id, context_id,
+            "attestation is for this context"
+        );
+        assert_eq!(
+            attestation.level,
+            KeyDestructionLevel::SoftwareOnly,
+            "software disposal (no hardware attestation wired) ⇒ SoftwareOnly"
+        );
+        assert_eq!(
+            attestation.attested_at, 1_700_000_000,
+            "attested_at is the actual close instant (TestClock)"
+        );
+        assert!(
+            attestation.sender_keys_destroyed,
+            "a PRESENT sender key was observed disposed ⇒ sender_keys_destroyed true"
+        );
+        assert!(
+            !attestation.mls_group_destroyed,
+            "no MLS group was present ⇒ mls_group_destroyed honestly false (not fabricated)"
         );
     }
 }

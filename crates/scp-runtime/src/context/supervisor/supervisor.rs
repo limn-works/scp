@@ -4544,7 +4544,10 @@ impl Supervisor {
                 // so this is defense-in-depth / forward-compat with #82, matching
                 // the close-seam teardown. A no-op for a broadcast /
                 // never-seeded state.
-                state.dispose_secrets();
+                // #2199: rollback path — no attestation is built here, so discard
+                // the observed `DisposalOutcome` (the `#[must_use]` guards that the
+                // honest signal is consumed on the seams that DO build one).
+                let _ = state.dispose_secrets();
                 return Err(ContextError::CreationFailed(format!(
                     "context '{ctx_id_str}' is already registered"
                 )));
@@ -13883,7 +13886,10 @@ impl Supervisor {
                     if let Err(e) =
                         handle.transition_to(&scp_protocol::context::ContextState::Active)
                     {
-                        state.dispose_secrets();
+                        // #2199: rollback path — no attestation is built here, so discard
+                        // the observed `DisposalOutcome` (the `#[must_use]` guards that the
+                        // honest signal is consumed on the seams that DO build one).
+                        let _ = state.dispose_secrets();
                         return Err(e);
                     }
 
@@ -13945,7 +13951,10 @@ impl Supervisor {
                             ),
                         )
                     {
-                        state.dispose_secrets();
+                        // #2199: rollback path — no attestation is built here, so discard
+                        // the observed `DisposalOutcome` (the `#[must_use]` guards that the
+                        // honest signal is consumed on the seams that DO build one).
+                        let _ = state.dispose_secrets();
                         return Err(ContextError::PersistenceFailed(format!(
                             "spawn-from-Welcome: the joined group for '{context_id}' produces no \
                          durable MLS crypto export (export failed / needs_reconnect) — a \
@@ -13971,7 +13980,10 @@ impl Supervisor {
                     )
                     .await
                     {
-                        state.dispose_secrets();
+                        // #2199: rollback path — no attestation is built here, so discard
+                        // the observed `DisposalOutcome` (the `#[must_use]` guards that the
+                        // honest signal is consumed on the seams that DO build one).
+                        let _ = state.dispose_secrets();
                         let _ = deps.persistence.delete_context(&context_id).await;
                         return Err(e);
                     }

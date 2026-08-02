@@ -714,9 +714,10 @@ async fn phase2_end_to_end_integration() {
     let _prev_hash_final = append_and_hash(&mut alice_log, &expired_event);
     append_and_hash(&mut bob_log, &expired_event);
 
-    // Simulate key destruction: in production, this would call
-    // KeyDestructionOrchestrator. Here we verify the memory scope is ephemeral,
-    // meaning keys would be destroyed immediately.
+    // Simulate key destruction: in production this is the actor-owned crypto
+    // disposal at the `ttl_close_helpers::finalize_close` seam (#2148/#2199).
+    // Here we verify the memory scope is ephemeral, meaning keys would be
+    // destroyed immediately.
     assert_eq!(
         context.params().memory_scope,
         MemoryScope::Ephemeral,

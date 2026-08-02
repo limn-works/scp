@@ -11,11 +11,11 @@
 //! - [`validate_memory_scope_for_broadcast`] -- Rejects `Ephemeral` or
 //!   `Summary` memory scopes for broadcast contexts.
 //!
-//! The `KeyDestructionOrchestrator` (which actually invokes the crypto
-//! provider to destroy keys) lives in
-//! `scp_runtime::context::key_destruction` after ADR-049 commit 12c.9e —
-//! it operates on the concrete `NodeMlsFactory` and so cannot live in
-//! `scp-protocol` (forward dep).
+//! Key-destruction ATTESTATION ([`KeyDestructionAttestation`]) is a pure-data
+//! record defined here; it is BUILT at the actor finalize seam
+//! (`scp_runtime::context::ttl_close_helpers::finalize_close`) from the observed
+//! disposal outcome. The former runtime-side `KeyDestructionOrchestrator` was
+//! deleted in #2199 (dead after #2148 moved crypto disposal onto the actor).
 //!
 //! # Key Destruction
 //!
@@ -315,22 +315,17 @@ pub struct EphemeralContextMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// KeyDestructionResult
+// KeyDestructionResult — DELETED (#2199)
 // ---------------------------------------------------------------------------
-
-/// Result of a key destruction orchestration.
-///
-/// Produced by the runtime-side `KeyDestructionOrchestrator`
-/// (`scp_runtime::context::key_destruction`). Lives in `scp-protocol` as a
-/// pure-data payload because it crosses the protocol → runtime boundary
-/// and has no crypto-provider dependency of its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyDestructionResult {
-    /// Attestation of the key destruction.
-    pub attestation: KeyDestructionAttestation,
-    /// Relay deletion requests issued for encrypted event data.
-    pub deletion_requests: Vec<RelayDeletionRequest>,
-}
+//
+// `KeyDestructionResult` (the `KeyDestructionOrchestrator` return wrapper:
+// attestation + relay-deletion requests) was DELETED in #2199 along with the
+// dead orchestrators that were its only producers/consumers. The TRUTHFUL
+// `KeyDestructionAttestation` is now built inline from the OBSERVED
+// `DisposalOutcome` at the actor finalize seam
+// (`scp_runtime::context::ttl_close_helpers::finalize_close`);
+// `RelayDeletionRequest` (retained below) remains the standalone relay-deletion
+// protocol type.
 
 // ---------------------------------------------------------------------------
 // RelayDeletionTracker
@@ -500,10 +495,10 @@ mod tests {
     use super::*;
     use crate::context::{ContextError, ContextMode, MemoryScope};
 
-    // Note: `KeyDestructionOrchestrator` tests moved to
-    // `scp_runtime::context::key_destruction` in ADR-049 commit 12c.9e —
-    // the orchestrator now operates on the concrete `NodeMlsFactory`
-    // which lives in scp-runtime (forward dep of scp-protocol).
+    // Note: the runtime-side `KeyDestructionOrchestrator` and its tests were
+    // DELETED in #2199 (dead after #2148 moved crypto disposal onto the context
+    // actor). The truthful attestation is now built + tested at the actor
+    // finalize seam (`scp_runtime::context::ttl_close_helpers::finalize_close`).
 
     // -----------------------------------------------------------------------
     // KeyDestructionLevel tests

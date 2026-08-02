@@ -325,6 +325,19 @@ impl SenderKeyStore {
         Self::default()
     }
 
+    /// Returns `true` when the store holds no sender keys for any context.
+    ///
+    /// [`Self::remove`] prunes an inner per-context map the moment it empties
+    /// (see its body), so an empty outer `keys` map is an exact "no stored keys"
+    /// signal — no phantom empty inner maps linger. Used by the actor's
+    /// `dispose_secrets` (#2199) to record an HONEST `sender_keys_destroyed`
+    /// attestation flag: sender-key material must be observed PRESENT at disposal
+    /// entry before the destroyed-flag may be `true`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Retrieves the sender key for a given context and sender DID.
     ///
     /// Returns `None` if no key is stored for the given pair.

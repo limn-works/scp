@@ -750,20 +750,65 @@ pub(crate) fn apply_ttl_terminal_transition(
     //    `dispose_secrets` runs OpenMLS `destroy_group` (eagerly FREEING the
     //    Ed25519 signer — freed, NOT zeroized, since `SignatureKeyPair` implements
     //    no `Zeroize`; scp-mls issue #82 — and freeing the group's in-memory
-    //    storage) and zeroizes the sender key material. This is infallible and atomic (both
-    //    the MLS group and the sender keys are torn down in one call), so both
-    //    destroy steps
-    //    are marked together. SYNC (no `.await`), so this whole phase runs
-    //    outside any timeout. A `None` crypto state (broadcast / already-disposed)
-    //    has nothing to tear down — the steps are marked done so the fail-closed
-    //    persist records completion and a retry does not spin.
+    //    storage) and zeroizes the sender key material. SYNC (no `.await`), so
+    //    this whole phase runs outside any timeout.
+    //
+    //    #2199 / F-BH — COMPLETION vs PROVENANCE are SEPARATED here. The STEP
+    //    bits serve exactly ONE master on this path: COMPLETION. They drive
+    //    `is_complete()`, which the actor's despawn gate (`actor/mod.rs`) requires
+    //    to be `true` before it stops re-arming the terminal-cleanup retry. So a
+    //    bit MUST be set once the destruction STEP has EXECUTED — i.e. after
+    //    `dispose_secrets` runs (which frees whatever was present and is a no-op
+    //    for what was absent) — WHETHER material was present-and-destroyed OR
+    //    trivially absent. Gating these bits on the OBSERVED destruction flags
+    //    (as an earlier revision did) conflated completion with provenance: a
+    //    terminal Ephemeral/Summary context reaching TTL with a partially-absent
+    //    or already-disposed crypto sub-component would set only a SUBSET, so
+    //    `is_complete()` never held and the actor re-armed a retry FOREVER (a
+    //    resource-exhaustion liveness bug). The honest DESTRUCTION PROVENANCE is
+    //    NOT lost: it lives in the observed `DisposalOutcome`, which the CLOSE
+    //    finalize seam (`ttl_close_helpers::finalize_close`) consumes to build the
+    //    truthful `KeyDestructionAttestation`. The TTL-expiry path builds NO
+    //    success attestation; on FAILURE the per-step bits surface via
+    //    `ExpiryFailed` as an honest "step executed" diagnostic (not an
+    //    attestation). A destruction-required scope with `None` crypto is an
+    //    anomaly (unreachable in practice — Ephemeral/Summary are ALWAYS Encrypted
+    //    and `seed_encrypted_crypto_from_owned` installs `mls_group` + `sender_key`
+    //    as `Some` together; Broadcast is always Full) that is warned but STILL
+    //    completes the step (nothing to destroy ⇒ trivially done) so the actor
+    //    despawns.
     if needs_key_destruction
         && result.completed_steps & (STEP_MLS_DESTROYED | STEP_SENDER_KEY_DESTROYED)
             != (STEP_MLS_DESTROYED | STEP_SENDER_KEY_DESTROYED)
     {
-        if let Some(crypto_state) = crypto_state {
-            crypto_state.dispose_secrets();
+        match crypto_state {
+            Some(crypto_state) => {
+                // Execute the disposal (the real teardown). The observed
+                // `DisposalOutcome` is the PROVENANCE signal — consumed ONLY by
+                // the close-seam attestation, never on this expiry path — so it is
+                // discarded here explicitly (`#[must_use]`).
+                let _ = crypto_state.dispose_secrets();
+            }
+            None => {
+                // No `ContextCryptoState` on a destruction-required scope: nothing
+                // to destroy (the step is trivially complete), but the shape is an
+                // anomaly — surface it loudly. The completion bits are still set
+                // below so the actor despawns instead of spinning (#2199 F-BH).
+                tracing::warn!(
+                    context_id = %context_id,
+                    ?memory_scope,
+                    "TTL expiry: destruction-required scope has no crypto state to \
+                     dispose — nothing to tear down; marking the destruction STEP \
+                     complete (trivially done) so the terminal actor despawns \
+                     (#2199 F-BH completion, not a destruction claim)"
+                );
+            }
         }
+        // COMPLETION (not provenance): the destruction STEP has EXECUTED, so mark
+        // it done UNCONDITIONALLY. This restores the spin-prevention `is_complete()`
+        // needs to hold so the terminal actor despawns; it does NOT assert any
+        // destruction fact (that lives in the observed `DisposalOutcome` / the
+        // close-seam attestation).
         result.set_step(STEP_MLS_DESTROYED | STEP_SENDER_KEY_DESTROYED);
     }
 
@@ -1337,8 +1382,11 @@ mod tests {
         let transport = StallingTransport::default();
         let event_log = StatefulEventLog::default();
         // Ephemeral scope ⇒ the terminal path DOES issue the best-effort relay
-        // delete (the op that stalls), and key destruction is idempotent on the
-        // real crypto provider for an unregistered context.
+        // delete (the op that stalls). Crypto is `None` here (a fixture
+        // convenience — a real Ephemeral context carries Some); #2199 F-BH makes
+        // the destruction STEP complete UNCONDITIONALLY once it executes (nothing
+        // to destroy ⇒ trivially done), so `is_complete()` still holds and the
+        // actor despawns. The M2 property under test is the leaf append.
         let handle = active_handle("ctx-ttl-relay-stall", MemoryScope::Ephemeral);
 
         // Wrap exactly as the actor does: a single outer `timeout(HANDLER_TIMEOUT)`
@@ -1364,9 +1412,17 @@ mod tests {
              within HANDLER_TIMEOUT despite the relay stall (M2); pre-fix the \
              relay-first ordering consumed the whole budget and this elapsed",
         );
+        // M2's property is that the completeness-critical `ContextExpired` leaf is
+        // RECORDED despite the relay stall. #2199 F-BH restored completion-only
+        // STEP-bit semantics on the TTL path: the destruction step is marked done
+        // once it executes (here the None-crypto case is trivially done), so all
+        // four steps complete and the whole result `is_complete()` — the actor
+        // despawns rather than spinning. Assert full completion (which subsumes
+        // the leaf append `event_logged()`).
         assert!(
             result.is_complete(),
-            "the ContextExpired leaf is recorded despite the relay stall (M2): {result}"
+            "the ContextExpired leaf is recorded AND the terminal cleanup completes \
+             despite the relay stall (M2), so the actor despawns: {result}"
         );
 
         let entries = event_log.entries.lock().unwrap();
@@ -1581,6 +1637,71 @@ mod tests {
             handle.state(),
             ContextState::Creating,
             "the FSM stays in its original (Creating) state"
+        );
+    }
+
+    /// #2199 F-BH — COMPLETION semantics on the TTL path. The STEP destroyed bits
+    /// track COMPLETION (the teardown step EXECUTED), not destruction provenance:
+    /// even a PARTIAL-ABSENT crypto (a present sender key, NO MLS group) sets BOTH
+    /// bits once `dispose_secrets` runs, so `is_complete()` can hold and the actor
+    /// despawns. The honest destruction PROVENANCE (that this disposal observed
+    /// {mls: false, sender: true}) lives in the observed `DisposalOutcome` — tested
+    /// at the `dispose_secrets` level (`state.rs`) and surfaced only by the CLOSE
+    /// finalize attestation, never on this expiry path.
+    #[test]
+    fn apply_ttl_terminal_transition_partial_absent_completes_both_steps() {
+        use crate::context::actor::ContextCryptoState;
+        use scp_protocol::crypto::sender_keys::generate_sender_key;
+
+        let handle = active_handle("ctx-2199-observed", MemoryScope::Ephemeral);
+        // Present sender key, absent MLS group (partial-absent).
+        let mut crypto = ContextCryptoState {
+            sender_key: Some(generate_sender_key()),
+            ..Default::default()
+        };
+
+        let result = super::apply_ttl_terminal_transition(&handle, Some(&mut crypto), 0);
+
+        assert!(result.state_transitioned(), "Active ⇒ Expired");
+        assert!(
+            result.mls_destroyed() && result.sender_key_destroyed(),
+            "the destruction step EXECUTED ⇒ BOTH completion bits set even for a \
+             partial-absent crypto (completion, not a destruction claim): {result}"
+        );
+    }
+
+    /// #2199 F-BH — LIVENESS regression guard. A `None`-crypto (or partial-absent)
+    /// Ephemeral/Summary context reaching TTL MUST still reach `is_complete()` so
+    /// the terminal actor DESPAWNS (`actor/mod.rs` despawn gate) instead of
+    /// re-arming a retry FOREVER. An earlier revision gated the destroyed bits on
+    /// the observed flags, so a `None`-crypto context set only a SUBSET, never
+    /// completed, and the actor spun forever (resource exhaustion). Here the
+    /// destruction step is trivially complete (nothing to destroy), both bits set;
+    /// combined
+    /// with the FSM transition + the leaf append the whole result is complete.
+    #[test]
+    fn apply_ttl_terminal_transition_none_crypto_ephemeral_completes_for_despawn() {
+        let handle = active_handle("ctx-2199-absent", MemoryScope::Ephemeral);
+
+        let mut result = super::apply_ttl_terminal_transition(&handle, None, 0);
+
+        assert!(
+            result.state_transitioned(),
+            "the FSM still transitions to Expired"
+        );
+        assert!(
+            result.mls_destroyed() && result.sender_key_destroyed(),
+            "None crypto ⇒ nothing to destroy ⇒ destruction step trivially complete: \
+             BOTH completion bits set so the actor can despawn (not spin): {result}"
+        );
+        // The async leaf-append phase is the only remaining step; once it lands the
+        // result is fully complete and the despawn gate (`is_complete()`) is met.
+        // Simulate it here to prove the terminal cleanup CONVERGES (does NOT loop).
+        result.set_step(STEP_EVENT_LOGGED);
+        assert!(
+            result.is_complete(),
+            "with the leaf appended the None-crypto expiry is COMPLETE ⇒ the actor \
+             despawns rather than re-arming a retry forever (F-BH): {result}"
         );
     }
 

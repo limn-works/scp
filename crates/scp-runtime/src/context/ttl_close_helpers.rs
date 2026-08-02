@@ -37,6 +37,7 @@ use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::MemoryScope;
 use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::memory_scope::{KeyDestructionAttestation, KeyDestructionLevel};
 
 use crate::context::ContextHandle;
 use crate::context::actor::class_s::ClassSCell;
@@ -850,6 +851,23 @@ pub fn convergent_ttl_deadline(
 /// `ContextClosed` leaf is stamped with the ACTUAL close instant
 /// (`deps.clock.now_secs()`) — see the body for why the TTL deadline is NOT the
 /// right quantity for this (explicit-only) path.
+///
+/// # Returns — the truthful key-destruction attestation (#2199 / F2)
+///
+/// On a successful Ephemeral/Summary close where actor-owned crypto was present
+/// and disposed, returns `Ok(Some(attestation))` — the TRUTHFUL
+/// [`KeyDestructionAttestation`] built HERE from the OBSERVED
+/// [`DisposalOutcome`](crate::context::actor::state::DisposalOutcome) (the sole
+/// canonical build site since the dead orchestrators were deleted in #2199).
+/// Returns `Ok(None)` for Full scope (crypto retained), a Broadcast context (no
+/// crypto), or the destruction-required-but-crypto-absent anomaly. The
+/// attestation is returned to the LOCAL caller ([`handle_finalize_close`]) for
+/// logging; this is a pure in-process Rust value — it is NOT surfaced across the
+/// FFI reply (the oneshot stays `Result<(), ContextError>`), and recording it
+/// into the event log / `ContextClosed` leaf is a separate DOA wire-format
+/// decision tracked by #2215.
+///
+/// [`handle_finalize_close`]: crate::context::actor::handlers
 pub async fn finalize_close(
     // #2148 (ADR-049 birth-into-actor): the actor-owned crypto lives here — for
     // an Ephemeral/Summary explicit close it is disposed through the cell after
@@ -857,7 +875,7 @@ pub async fn finalize_close(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
-) -> Result<(), ContextError> {
+) -> Result<Option<KeyDestructionAttestation>, ContextError> {
     let context_id = handle.context_id().to_owned();
 
     // `ContextClosed` leaf timestamp = the ACTUAL close instant (F4). This helper
@@ -901,11 +919,51 @@ pub async fn finalize_close(
     // (readable after close), so it is
     // skipped. A broadcast context carries no `ContextCryptoState`
     // (`crypto_mut() == None`), a clean no-op there.
+    // #2199 (F2): the TRUTHFUL `KeyDestructionAttestation`, built below from the
+    // OBSERVED disposal outcome and RETURNED to the local caller (which logs it).
+    // `None` for Full scope / Broadcast / the crypto-absent anomaly.
+    let mut attestation: Option<KeyDestructionAttestation> = None;
     let memory_scope = handle.params().memory_scope;
     if memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary {
         let mut view = cell.class_c_view();
         if let Some(crypto) = view.mode_mut().crypto_mut() {
-            crypto.dispose_secrets();
+            // #2199: capture the OBSERVED disposal outcome and build the TRUTHFUL
+            // `KeyDestructionAttestation` HERE — at the seam where the actor-owned
+            // crypto is actually torn down (post-disposal), from the REAL context
+            // params (`memory_scope` above, read from `handle.params()`) + the
+            // observed outcome + the actual close instant. The destroyed-flags are
+            // the disposal's OBSERVED result read through the `DisposalOutcome`
+            // accessors, never a fabricated `true` (a lying provenance record is
+            // worse than honest absence — ADR-018). This is the SOLE canonical
+            // attestation build site since #2199 deleted the dead orchestrators
+            // (which minted a hardcoded `true` off a fake default `ContextParams`
+            // BEFORE any disposal and discarded it). The built attestation is
+            // RETURNED to `handle_finalize_close` for logging; recording it into
+            // the event log / `ContextClosed` leaf is a separate DOA wire-format
+            // decision tracked by #2215 — deliberately NOT done here.
+            let disposal = crypto.dispose_secrets();
+            attestation = Some(KeyDestructionAttestation {
+                context_id: context_id.clone(),
+                // `dispose_secrets` zeroizes the sender key (`ZeroizeOnDrop`) and
+                // frees the MLS group in software; no hardware attestation is wired
+                // on this path, so `SoftwareOnly` is the honest level.
+                level: KeyDestructionLevel::SoftwareOnly,
+                attested_at: close_ts,
+                mls_group_destroyed: disposal.mls_group_destroyed(),
+                sender_keys_destroyed: disposal.sender_keys_destroyed(),
+            });
+        } else {
+            // Destruction-required scope with no `ContextCryptoState` — Broadcast is
+            // Full-scope, so this is unreachable in practice. No disposal was
+            // observed, so there is no truthful attestation to build; surface the
+            // anomaly rather than fabricating one (#2199 honest-absent).
+            tracing::warn!(
+                context_id = %context_id,
+                ?memory_scope,
+                "finalize_close: destruction-required scope has no crypto state to \
+                 dispose — no disposal observed, no attestation built (#2199 \
+                 honest-absent)"
+            );
         }
     }
 
@@ -939,7 +997,9 @@ pub async fn finalize_close(
     // entry. An in-flight pump holding its own Arc keeps the tracker alive.
     deps.supervisor.reap_stream_admission(&context_id);
 
-    Ok(())
+    // #2199 (F2): hand the truthful attestation back to the local caller (which
+    // logs it). Pure in-process value — not surfaced across the FFI reply.
+    Ok(attestation)
 }
 
 // ---------------------------------------------------------------------------

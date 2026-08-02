@@ -384,6 +384,82 @@ pub struct PendingBroadcastKeyRotation {
 // Encrypted-mode state (skeleton)
 // ---------------------------------------------------------------------------
 
+/// The OBSERVED outcome of a per-context crypto disposal
+/// ([`ContextCryptoState::dispose_secrets`] / [`PerContextState::dispose_secrets`]).
+///
+/// #2199: a [`KeyDestructionAttestation`](scp_protocol::context::memory_scope::KeyDestructionAttestation)'s
+/// `mls_group_destroyed` / `sender_keys_destroyed` flags are a provenance record
+/// a verifier relies on (ADR-018): `true` MUST mean "key material was verifiably
+/// gone as the result of an ACTUALLY-EXECUTED, OBSERVED disposal". A fabricated
+/// `true` is a nullifier-class false guarantee (worse than honest absence). This
+/// struct is that honest signal: each flag is `true` ONLY when disposal ran on
+/// material that was PRESENT at entry, `false` when the material was absent
+/// (nothing to destroy).
+///
+/// # A fabricated `true` is structurally unrepresentable (#2199 / F3)
+///
+/// The two flags are PRIVATE and there is no public/`pub(crate)` constructor:
+/// the only code that can mint a `DisposalOutcome` is this module
+/// (`crate::context::actor::state`), via the private [`Self::observed`]
+/// constructor called EXCLUSIVELY from [`ContextCryptoState::dispose_secrets`]
+/// (which derives the flags from the PRE-disposal presence of the material) and
+/// the [`PerContextState::dispose_secrets`] Broadcast N/A arm (which mints
+/// `observed(false, false)`). No code OUTSIDE this module — the finalize / TTL
+/// seams, the FFI bridge, any future caller — can construct one at all, let
+/// alone hand-forge `observed(true, true)`; they may only READ the flags through
+/// the [`Self::mls_group_destroyed`] / [`Self::sender_keys_destroyed`]
+/// accessors. So a `true` an attestation reads is compile-guaranteed to have
+/// originated in an actual observed disposal.
+///
+/// `pub(crate)`: this type is crate-internal — it never appears in a public
+/// signature (the `dispose_secrets` methods are `pub(crate)`; the finalize seam
+/// returns a `KeyDestructionAttestation`, not this outcome), so it is not part of
+/// the SDK surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DisposalOutcome {
+    /// `true` iff an MLS group was PRESENT at disposal entry and
+    /// [`scp_mls::group::destroy_group`] ran (it is total — `Ok` or the
+    /// idempotent `Err(GroupDestroyed)` both mean gone). `false` when no group
+    /// was present (honest absence).
+    mls_group_destroyed: bool,
+    /// `true` iff sender-key material (the local `sender_key`, a non-empty
+    /// `sender_key_store`, OR a non-empty `pending_distributions` queue) was
+    /// PRESENT at entry and was cleared/zeroized here. `false` when no sender-key
+    /// material was present (honest absence).
+    sender_keys_destroyed: bool,
+}
+
+impl DisposalOutcome {
+    /// Mints an observed outcome. PRIVATE by construction (#2199 / F3): callable
+    /// only within `crate::context::actor::state`, so the sole minters are
+    /// [`ContextCryptoState::dispose_secrets`] (real observed disposal) and the
+    /// [`PerContextState::dispose_secrets`] Broadcast N/A arm. No code outside
+    /// this module can fabricate an outcome — least of all a `(true, true)`.
+    const fn observed(mls_group_destroyed: bool, sender_keys_destroyed: bool) -> Self {
+        Self {
+            mls_group_destroyed,
+            sender_keys_destroyed,
+        }
+    }
+
+    /// `true` iff an MLS group was observed present-and-destroyed by the
+    /// disposal that produced this outcome. Sole read path for the attestation's
+    /// `mls_group_destroyed` flag. Takes `self` by value — `DisposalOutcome` is a
+    /// 2-byte `Copy` type, so a by-ref accessor is `trivially_copy_pass_by_ref`.
+    #[must_use]
+    pub(crate) const fn mls_group_destroyed(self) -> bool {
+        self.mls_group_destroyed
+    }
+
+    /// `true` iff sender-key material was observed present-and-destroyed by the
+    /// disposal that produced this outcome. Sole read path for the attestation's
+    /// `sender_keys_destroyed` flag. Takes `self` by value (2-byte `Copy` type).
+    #[must_use]
+    pub(crate) const fn sender_keys_destroyed(self) -> bool {
+        self.sender_keys_destroyed
+    }
+}
+
 /// State owned by an encrypted-mode (MLS) `ContextActor`. Mirrors the
 /// legacy `NodeMlsFactory::contexts[ctx_id]`
 /// (`crate::crypto::mls::provider::ContextCryptoState`) field-for-field.
@@ -2129,8 +2205,43 @@ impl ContextCryptoState {
     ///   epoch counter) so no stale material lingers on a still-live actor.
     ///
     /// Idempotent: safe to call on an already-disposed or never-populated state.
-    pub(crate) fn dispose_secrets(&mut self) {
+    ///
+    /// # Returns — the OBSERVED disposal outcome (#2199)
+    ///
+    /// Returns a [`DisposalOutcome`] whose flags are computed from the
+    /// PRE-disposal state, BEFORE any field is nulled: a destroyed-flag is
+    /// `true` ONLY when the corresponding material was actually PRESENT at entry
+    /// and this call tore it down. When material is absent the flag is `false`
+    /// (honest absence) — never a fabricated `true`. The returned outcome is the
+    /// sole honest source for a
+    /// [`KeyDestructionAttestation`](scp_protocol::context::memory_scope::KeyDestructionAttestation)'s
+    /// destroyed-flags (ADR-018); see the close/TTL finalize seams. The
+    /// `#[must_use]` guards the honesty invariant at the call site: the observed
+    /// outcome must be consumed (or explicitly discarded on a rollback path where
+    /// no attestation is built).
+    #[must_use]
+    pub(crate) fn dispose_secrets(&mut self) -> DisposalOutcome {
+        // Observe the PRE-disposal presence of each material class BEFORE nulling
+        // — this is what makes the destroyed-flags truthful (#2199).
+        let mls_group_present = self.mls_group.is_some();
+        // #2199 F-BH1: `pending_distributions` holds serialized sender-key
+        // DISTRIBUTION ciphertext (key-bearing material) that `dispose_secrets`
+        // tears down below. Include it in the sender-key presence observation so
+        // the destroyed-flag honestly reflects "queued key material was present
+        // and torn down" — otherwise a state with only queued distributions would
+        // report `sender_keys_destroyed = false` while real key material WAS
+        // destroyed (an inverse-precision honesty gap).
+        let sender_keys_present = self.sender_key.is_some()
+            || !self.sender_key_store.is_empty()
+            || !self.pending_distributions.is_empty();
+
         if let Some(group) = self.mls_group.as_mut() {
+            // `scp_mls::group::destroy_group` is total: `Ok(())` on the first
+            // teardown or the idempotent `Err(MlsError::GroupDestroyed)` on a
+            // retry — BOTH mean the group is gone. There is no partial-failure
+            // branch, so an MLS group present at entry is verifiably destroyed
+            // here (subject to the #82 signer-not-zeroized-only-freed caveat
+            // documented above).
             let _ = scp_mls::group::destroy_group(group);
         }
         self.mls_group = None;
@@ -2143,6 +2254,8 @@ impl ContextCryptoState {
         self.nonce_dedup = NonceDedup::new();
         self.recv_sequence_tracker.clear();
         self.sender_key_epoch = 0;
+
+        DisposalOutcome::observed(mls_group_present, sender_keys_present)
     }
 }
 
@@ -2212,6 +2325,18 @@ impl PerContextState {
             matches!(self.mode, ContextModeState::Encrypted(_)),
             "seed_encrypted_crypto_from_owned onto non-Encrypted mode"
         );
+        // #2199 F-BH — BOTH-PRESENT-AT-TTL invariant. This seam is the SOLE way an
+        // Encrypted actor gains live crypto (CREATE / WELCOME / restore all route
+        // here). It installs `mls_group` AND `sender_key` as `Some` TOGETHER,
+        // atomically, from an `OwnedMlsCryptoState` that itself carries both as
+        // owned (non-optional) values. There is no code path that installs one
+        // without the other. Therefore an `Active` Encrypted context — the only
+        // shape a TTL expiry ever fires against for Ephemeral/Summary scope (which
+        // are ALWAYS Encrypted) — holds both `mls_group` and `sender_key` at TTL.
+        // This closes the `apply_ttl_terminal_transition` partial-absence case BY
+        // CONSTRUCTION for a real production context: the observed disposal there
+        // is `{true, true}`, and the `None`/partial branches are anomaly-only
+        // (fixtures) — handled for liveness, never reached in production.
         self.mode = ContextModeState::Encrypted(Box::new(ContextCryptoState {
             mls_group: Some(owned.mls_group),
             sender_key: Some(owned.sender_key),
@@ -2251,9 +2376,24 @@ impl PerContextState {
     /// next line regardless, so this is defense-in-depth / forward-compat with
     /// #82 (destroy_group frees but does NOT zeroize the Ed25519 signer today;
     /// if upstream ever adds `Zeroize` this path would then zeroize it).
-    pub(crate) fn dispose_secrets(&mut self) {
-        if let ContextModeState::Encrypted(crypto) = &mut self.mode {
-            crypto.dispose_secrets();
+    ///
+    /// # Returns — the OBSERVED disposal outcome (#2199)
+    ///
+    /// - **Encrypted:** delegates to [`ContextCryptoState::dispose_secrets`] and
+    ///   returns its observed [`DisposalOutcome`].
+    /// - **Broadcast:** returns `observed(false, false)` — N/A. A
+    ///   Broadcast context is always Full memory-scope (per-author AES-256-GCM,
+    ///   no MLS group), so no ephemeral key-destruction attestation is ever built
+    ///   from it; honest absence, never a fabricated `true`.
+    ///
+    /// `#[must_use]`: the observed outcome guards the attestation-honesty
+    /// invariant; a caller that discards it (a creation-rollback / shutdown path
+    /// that builds no attestation) does so explicitly via `let _ = …`.
+    #[must_use]
+    pub(crate) fn dispose_secrets(&mut self) -> DisposalOutcome {
+        match &mut self.mode {
+            ContextModeState::Encrypted(crypto) => crypto.dispose_secrets(),
+            ContextModeState::Broadcast(_) => DisposalOutcome::observed(false, false),
         }
     }
 
@@ -3306,6 +3446,114 @@ mod tests {
         }
     }
 
+    /// #2199: `dispose_secrets` on an EMPTY encrypted crypto state (no group, no
+    /// sender key material) reports HONEST ABSENCE — both destroyed-flags are
+    /// `false`. A fabricated `true` here would be a lying provenance record.
+    #[test]
+    fn dispose_secrets_empty_encrypted_reports_honest_absence() {
+        let mut s = PerContextState::new_for_test_encrypted([7u8; 32], 1, test_admin());
+        let outcome = s.dispose_secrets();
+        assert!(
+            !outcome.mls_group_destroyed,
+            "no MLS group was present ⇒ mls_group_destroyed MUST be false (honest absence)"
+        );
+        assert!(
+            !outcome.sender_keys_destroyed,
+            "no sender-key material was present ⇒ sender_keys_destroyed MUST be false"
+        );
+    }
+
+    /// #2199: `dispose_secrets` on a Broadcast context is N/A — Broadcast is
+    /// always Full memory-scope, so no ephemeral key-destruction attestation is
+    /// ever built from it. Both flags are `false` (honest absence), never a
+    /// fabricated `true`.
+    #[test]
+    fn dispose_secrets_broadcast_is_not_applicable() {
+        let mut s = PerContextState::new_for_test_broadcast([8u8; 32], 1, test_admin());
+        let outcome = s.dispose_secrets();
+        assert_eq!(
+            outcome,
+            DisposalOutcome {
+                mls_group_destroyed: false,
+                sender_keys_destroyed: false,
+            },
+            "Broadcast disposal is N/A — both destroyed-flags MUST be false"
+        );
+    }
+
+    /// #2199: a present-but-partial crypto state (a local sender key, no MLS
+    /// group) reports each flag INDEPENDENTLY from its OBSERVED pre-state — the
+    /// present sender key yields `sender_keys_destroyed = true`, the absent group
+    /// yields `mls_group_destroyed = false`. Proves the flags are not coupled and
+    /// never fabricated.
+    #[test]
+    fn dispose_secrets_reports_each_flag_from_observed_presence() {
+        let mut s = PerContextState::new_for_test_encrypted([9u8; 32], 1, test_admin());
+        match &mut s.mode {
+            ContextModeState::Encrypted(cs) => {
+                cs.sender_key = Some(generate_sender_key());
+            }
+            ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+        }
+        let outcome = s.dispose_secrets();
+        assert!(
+            !outcome.mls_group_destroyed,
+            "no group present ⇒ mls_group_destroyed false"
+        );
+        assert!(
+            outcome.sender_keys_destroyed,
+            "a local sender key WAS present ⇒ sender_keys_destroyed true (observed)"
+        );
+        // Idempotent second call now observes an emptied state ⇒ honest false.
+        let again = s.dispose_secrets();
+        assert_eq!(
+            again,
+            DisposalOutcome {
+                mls_group_destroyed: false,
+                sender_keys_destroyed: false,
+            },
+            "a repeat disposal of an already-emptied state reports honest false"
+        );
+    }
+
+    /// #2199 F-BH1: sender-key presence includes the `pending_distributions`
+    /// queue (serialized sender-key DISTRIBUTION ciphertext — key-bearing
+    /// material that `dispose_secrets` clears). A state with an EMPTY local
+    /// `sender_key`/`sender_key_store` but a NON-EMPTY `pending_distributions`
+    /// still reports `sender_keys_destroyed = true` — the flag honestly reflects
+    /// that queued key material was present and torn down, closing the
+    /// inverse-precision gap where real key material was destroyed but the flag
+    /// read `false`.
+    #[test]
+    fn dispose_secrets_pending_distributions_alone_reports_sender_destroyed() {
+        let mut s = PerContextState::new_for_test_encrypted([11u8; 32], 1, test_admin());
+        match &mut s.mode {
+            ContextModeState::Encrypted(cs) => {
+                assert!(cs.sender_key.is_none(), "no local sender key");
+                assert!(cs.sender_key_store.is_empty(), "no stored sender keys");
+                // Only queued distribution ciphertext is present.
+                cs.pending_distributions
+                    .push(("did:dht:recipient".to_owned(), vec![0xDE, 0xAD, 0xBE, 0xEF]));
+            }
+            ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+        }
+        let outcome = s.dispose_secrets();
+        assert!(
+            outcome.sender_keys_destroyed(),
+            "queued key material (pending_distributions) WAS present and torn down \
+             ⇒ sender_keys_destroyed true (#2199 F-BH1)"
+        );
+        assert!(
+            !outcome.mls_group_destroyed(),
+            "no MLS group present ⇒ mls_group_destroyed false"
+        );
+        // The queue was cleared by disposal ⇒ a repeat reports honest false.
+        assert!(
+            !s.dispose_secrets().sender_keys_destroyed(),
+            "pending_distributions was cleared ⇒ a repeat disposal reports honest false"
+        );
+    }
+
     /// Exhaustive-destructure witness that every field on
     /// [`PerContextState`] is populated by the test fixture. The
     /// destructuring pattern intentionally does NOT use `..` — adding a
@@ -4018,6 +4266,42 @@ mod crypto_ops_golden {
 
     fn routing(ctx: &[u8; 32]) -> Vec<u8> {
         ctx.to_vec()
+    }
+
+    /// #2199: `dispose_secrets` on a REAL seeded encrypted state (a live MLS
+    /// group + a present sender key, born over the end-to-end join path) reports
+    /// BOTH destroyed-flags `true` — an OBSERVED disposal of present material.
+    /// This is the only path on which a `KeyDestructionAttestation`'s
+    /// destroyed-flags may honestly be `true`.
+    #[test]
+    fn dispose_secrets_seeded_encrypted_reports_observed_true() {
+        let (_alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
+        // Precondition: the fixture really did seed a live group + sender key.
+        match &alice_a.mode {
+            ContextModeState::Encrypted(c) => {
+                assert!(c.mls_group.is_some(), "fixture seeds a live MLS group");
+                assert!(c.sender_key.is_some(), "fixture seeds a local sender key");
+            }
+            ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+        }
+        let outcome = alice_a.dispose_secrets();
+        assert_eq!(
+            outcome,
+            DisposalOutcome {
+                mls_group_destroyed: true,
+                sender_keys_destroyed: true,
+            },
+            "present group + present sender key ⇒ both destroyed-flags observed true"
+        );
+        // The material is now gone: a repeat disposal reports honest false.
+        assert_eq!(
+            alice_a.dispose_secrets(),
+            DisposalOutcome {
+                mls_group_destroyed: false,
+                sender_keys_destroyed: false,
+            },
+            "after disposal the state is emptied ⇒ a repeat reports honest false"
+        );
     }
 
     /// Read the (cloned) local sender key out of an encrypted actor state.

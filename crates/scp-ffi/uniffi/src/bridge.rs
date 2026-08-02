@@ -10935,68 +10935,20 @@ impl Scp {
                         .map_err(ScpError::from)?;
                 }
 
-                // Wire CloseOrchestrator for contexts with summary verification.
-                // After the ContextManager has processed the close, check the
-                // context's memory scope and initiate the appropriate destruction
-                // path via CloseOrchestrator (#365).
-                let memory_scope = core_handle.params().memory_scope;
-                let now = scp_clock::SystemClock.now_secs();
-
-                // #2148 (ADR-049 birth-into-actor): the `CloseOrchestrator` no
-                // longer holds a crypto provider. The actual MLS-group +
-                // sender-key destruction is performed by the context's ACTOR — the
-                // `LifecycleCommand::CloseContext` dispatched above routes through
-                // the actor's close handler, which disposes the actor-owned crypto
-                // for Ephemeral/Summary scope. This orchestrator only computes the
-                // relay-deletion + attestation `CloseAction` for observability.
-                let orchestrator = scp_core::context::key_destruction::CloseOrchestrator::new();
-
-                let close_action = orchestrator
-                    .initiate_close(
-                        &handle.context_id,
-                        scp_core::context::close::ContextCloseReason::GovernanceClosed,
-                        memory_scope,
-                        &[], // relay_urls — not available at bridge layer
-                        &[], // blob_ids — not available at bridge layer
-                        scp_core::context::memory_scope::KeyDestructionLevel::SoftwareOnly,
-                        0,    // member_count — not tracked at bridge layer
-                        None, // verification_window_secs — use default
-                        now,
-                    )
-                    .map_err(|e| ScpError::Context {
-                        msg: format!("close orchestration failed: {e}"),
-                        code: codes::CTX_2017.to_owned(),
-                    })?;
-
-                // Log the close action for observability. For Summary scope,
-                // the verification window is opened but not actively polled —
-                // that requires a SummaryOutlet which needs design decisions.
-                // For Ephemeral, keys are destroyed immediately.
-                // For Full, data is preserved.
-                match close_action {
-                    scp_core::context::close::CloseAction::KeysDestroyed { .. } => {
-                        tracing::info!(
-                            context_id = %handle.context_id,
-                            "close orchestrator: keys destroyed (ephemeral scope)"
-                        );
-                    }
-                    scp_core::context::close::CloseAction::VerificationWindowOpened {
-                        ref window,
-                        ..
-                    } => {
-                        tracing::info!(
-                            context_id = %handle.context_id,
-                            deadline = window.deadline(),
-                            "close orchestrator: summary verification window opened"
-                        );
-                    }
-                    scp_core::context::close::CloseAction::Preserved { .. } => {
-                        tracing::info!(
-                            context_id = %handle.context_id,
-                            "close orchestrator: full data preservation (no key destruction)"
-                        );
-                    }
-                }
+                // #2199: the fabricated pre-disposal `CloseOrchestrator::initiate_close`
+                // attestation build was DELETED here. It minted a
+                // `KeyDestructionAttestation` with hardcoded `mls_group_destroyed =
+                // sender_keys_destroyed = true` off a fresh `ContextParams::default()`
+                // (a FAKE memory_scope) BEFORE any disposal ran, then discarded it in
+                // a log line — a lying provenance record decoupled from real key
+                // destruction. `context_close` only dispatches
+                // `LifecycleCommand::CloseContext` (which transitions the FSM; it does
+                // NOT dispose crypto). The actual disposal — and the TRUTHFUL
+                // attestation, built from the observed `DisposalOutcome` — happens at
+                // the runtime finalize seam (`ttl_close_helpers::finalize_close`, on
+                // the `context_finalize_close` path). No real relay deletion was ever
+                // issued from here either (relay_urls / blob_ids were always empty),
+                // so nothing observable is lost by removing this block.
 
                 // Clean up per-context UCAN state on this instance.
                 bi.remove_ucan_state(&handle.context_id);
