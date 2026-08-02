@@ -33,6 +33,9 @@
 //! - [`lifetime`] — `KeyPackage` `Lifetime` minting/validation via the injected
 //!   [`scp_clock::Clock`] (ADR-057 Prereq-1).
 //! - [`wrapping_extension`] — `scp_wrapping_key` `LeafNode` extension helpers.
+//! - [`keypackage_attestation`] — `scp_keypackage_attestation` (`0xFF03`)
+//!   `LeafNode` extension: the DID-to-leaf `KeyPackage` attestation type + wire
+//!   format (§9.5.2, §9.7.1).
 //! - [`context_extension`] — `scp_context_params` `group_context` extension
 //!   helpers (§5.13.3, finding FFI-02).
 //! - [`epoch_grace`] — Epoch grace-window store (forward-secrecy bound).
@@ -49,6 +52,7 @@ pub mod epoch_grace;
 pub mod error;
 pub mod group;
 pub mod key_package;
+pub mod keypackage_attestation;
 pub mod lifetime;
 pub mod ratchet;
 pub mod snapshot;
@@ -62,6 +66,11 @@ pub use convergent_timestamp::{
 pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};
 pub use error::MlsError;
+pub use keypackage_attestation::{
+    AttestationTrigger, KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
+    MAX_KEYPACKAGE_ATTESTATION_LIFETIME, SCP_KEYPACKAGE_ATTESTATION_DOMAIN,
+    SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE, scp_capabilities_with_keypackage_attestation,
+};
 
 // The MLS signing key pair appears in this crate's public op signatures
 // (`generate_key_package` returns it; `join_group` consumes it). Re-export it so
