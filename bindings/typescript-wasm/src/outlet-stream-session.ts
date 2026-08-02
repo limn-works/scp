@@ -137,6 +137,13 @@ export interface BrowserInvokerStreamSessionOptions {
   /**
    * The invoker's 32-byte outlet-signing seed, held on-device. Used to sign
    * credit grants in-tab. Never leaves the browser; never sent to the node.
+   *
+   * CALLER-OWNED LIFECYCLE: this is the invoker's long-lived identity signing
+   * key, naturally reused across many streams — the session never mutates or
+   * zeroizes it (doing so would silently break a caller that reuses the same
+   * buffer for a later session). Its lifecycle is the caller's responsibility.
+   * Comprehensive in-tab key protection (non-extractable WebCrypto keys) is
+   * deferred to #1980 per the ADR-057 Slice-3 as-built caveat.
    */
   readonly invokerSigningSeed: Uint8Array;
   /**
@@ -262,11 +269,16 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
   }
 
   /**
-   * Marks the session closed exactly once, releases its `(client, contextId)`
-   * live-consumer claim so a fresh session can be constructed on it, and
-   * best-effort zeroizes the in-tab signing-seed copy. Idempotent — safe to call
-   * from every terminal path, from {@link close}, from the async-iterator
-   * {@link return}, and from the `using` / `await using` disposal hooks.
+   * Marks the session closed exactly once and releases its `(client, contextId)`
+   * live-consumer claim so a fresh session can be constructed on it. Idempotent —
+   * safe to call from every terminal path, from {@link close}, from the
+   * async-iterator {@link return}, and from the `using` / `await using` disposal
+   * hooks.
+   *
+   * Does NOT touch `invokerSigningSeed`: that buffer is the invoker's long-lived
+   * identity signing key, caller-owned and naturally reused across streams —
+   * zeroizing it here would corrupt a caller that reuses it for a later session
+   * (see the {@link BrowserInvokerStreamSessionOptions.invokerSigningSeed} note).
    */
   #markClosed(): void {
     if (this.#closed) {
@@ -274,19 +286,15 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
     }
     this.#closed = true;
     liveStreamConsumers.get(this.#opts.client)?.delete(this.#opts.contextId);
-    // Best-effort seed hygiene: overwrite the JS-heap copy of the on-device
-    // signing seed once the session can no longer sign a credit grant. Not
-    // load-bearing (the tab threat model already assumes heap-read capability —
-    // ADR-057 Slice-3 caveat), but it shortens the window a stale copy lingers.
-    this.#opts.invokerSigningSeed?.fill(0);
   }
 
   /**
-   * Closes the session: releases its `(client, contextId)` live-consumer claim
-   * (so a fresh session can be constructed on the same pair) and zeroizes the
-   * in-tab seed copy. Idempotent. Call this when abandoning a session without
-   * draining it to a terminal chunk — otherwise the claim leaks until the client
-   * is garbage-collected and the next session on the pair throws `SCP-VALID-7028`.
+   * Closes the session: releases its `(client, contextId)` live-consumer claim so
+   * a fresh session can be constructed on the same pair. Idempotent. Call this
+   * when abandoning a session without draining it to a terminal chunk — otherwise
+   * the claim leaks until the client is garbage-collected and the next session on
+   * the pair throws `SCP-VALID-7028`. Does NOT zeroize `invokerSigningSeed`; that
+   * caller-owned identity key's lifecycle is the caller's responsibility.
    */
   close(): void {
     this.#markClosed();
