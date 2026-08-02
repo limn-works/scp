@@ -59,7 +59,7 @@ pub enum ClientError {
     /// (the primary duplicate-delivery guarantee is openmls's per-generation replay
     /// protection — this is defense-in-depth). Benign-dropped by
     /// [`handle_relay_frame`](crate::ScpClient::handle_relay_frame). Surfaced as
-    /// `SCP-VALID-7011`.
+    /// `SCP-VALID-7029`.
     #[error("frame content does not match its relay channel (mis-routed; dropped)")]
     ChannelContentMismatch,
 
@@ -68,7 +68,7 @@ pub enum ClientError {
     /// transport loss — the relay is an untrusted dumb pipe and the message may be
     /// re-driven — NOT a state-corrupting error: by the time a frame is published
     /// the driver's crypto/log state has already advanced and been persisted.
-    /// Surfaced as `SCP-TRANS-5010`.
+    /// Surfaced as `SCP-TRANS-5005`.
     #[error("transport error: {0}")]
     Transport(String),
 
@@ -82,7 +82,7 @@ pub enum ClientError {
     /// [`handle_relay_frame`](crate::ScpClient::handle_relay_frame)) and retries.
     /// It is raised *before* the MLS ratchet advances, so no crypto state is
     /// consumed by the failed send. Mirrors the native runtime's
-    /// `ContextError::PseudonymRegistryEmpty`. Surfaced as `SCP-CTX-2040`.
+    /// `ContextError::PseudonymRegistryEmpty`. Surfaced as `SCP-CTX-2095`.
     #[error(
         "context '{context_id}' has {member_count} members but no peer has announced a \
          pseudonym yet; retry after peers' announcements are pumped in"

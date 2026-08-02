@@ -87,7 +87,7 @@ test("send throws before the socket is OPEN, then succeeds once open", () => {
     throw new Error("factory not invoked");
   }
 
-  // CONNECTING → send rejects (surfaced as SCP-TRANS-5010 at the client boundary).
+  // CONNECTING → send rejects (surfaced as SCP-TRANS-5005 at the client boundary).
   expect(() => socket.send(new Uint8Array([1]))).toThrow();
 
   ws.open();
@@ -135,7 +135,7 @@ test("a throwing onFrame routes to onError and does not kill the pump", () => {
     onFrame: () => {
       calls += 1;
       if (calls === 1) {
-        throw new Error("[SCP-CRYPTO-4010] boom");
+        throw new Error("[SCP-CRYPTO-4041] boom");
       }
     },
   });
@@ -147,7 +147,7 @@ test("a throwing onFrame routes to onError and does not kill the pump", () => {
   ws.deliver(new Uint8Array([1])); // throws → routed to onError
   ws.deliver(new Uint8Array([2])); // pump survived → delivered
   expect(calls).toBe(2);
-  expect(errors).toEqual(["SCP-CRYPTO-4010"]);
+  expect(errors).toEqual(["SCP-CRYPTO-4041"]);
   // Contrast with the fatal wasm-trap path below: a PLAIN error leaves the socket
   // OPEN (the pump is not killed).
   expect(ws.readyState).toBe(WS_OPEN);

@@ -127,7 +127,7 @@ export class WebSocketRelaySocket implements JsSocket {
   /**
    * Writes one serialized relay frame to the socket.
    *
-   * Throws if the socket is not OPEN — surfaced as `[SCP-TRANS-5010]` at the
+   * Throws if the socket is not OPEN — surfaced as `[SCP-TRANS-5005]` at the
    * client boundary (the wasm `RelaySink` adapter re-codes the thrown exception).
    * A frame is never silently dropped.
    */
@@ -210,7 +210,7 @@ export class WebSocketRelaySocket implements JsSocket {
     ws.onerror = () => {
       // Surface transport errors to the consumer; the close handler drives
       // reconnect. Not fatal to the pump.
-      this.#onError?.(mapBridgeError(new Error("[SCP-TRANS-5010] relay WebSocket error")));
+      this.#onError?.(mapBridgeError(new Error("[SCP-TRANS-5005] relay WebSocket error")));
     };
   }
 

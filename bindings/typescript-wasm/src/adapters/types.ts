@@ -28,7 +28,7 @@ export interface JsSocket {
    * Writes one serialized relay `ClientMessage` frame to the socket.
    *
    * MUST throw if the frame cannot be enqueued (the socket is not OPEN, a
-   * buffering fault). A thrown exception surfaces as `[SCP-TRANS-5010]` at the
+   * buffering fault). A thrown exception surfaces as `[SCP-TRANS-5005]` at the
    * client boundary; it MUST NOT silently drop the frame.
    */
   send(frame: Uint8Array): void;
