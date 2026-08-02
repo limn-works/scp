@@ -59,7 +59,7 @@ use scp_client::{ContextStatus, RelaySink, ScpClient, Signer, Storage};
 use scp_clock::Clock;
 use wasm_bindgen::prelude::*;
 
-use crate::error::map_err;
+use crate::error::{WASM_INPUT_VALIDATION_CODE, map_err};
 
 /// Initializes the browser surface.
 ///
@@ -353,7 +353,7 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2002]` if the context id is already held, or a
+    /// Throws `[SCP-CTX-2083]` if the context id is already held, or a
     /// `[SCP-CRYPTO-…]` error on group-creation / leaf failure. A
     /// `[SCP-STORAGE-8010]` on the post-create snapshot write **poisons** the
     /// freshly-created context (its in-memory state exists but was never durably
@@ -385,7 +385,7 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-VALID-7010]`
+    /// Throws `[SCP-CTX-2082]` if the context is not held, `[SCP-VALID-7028]`
     /// if the key package cannot be deserialized, or a `[SCP-CRYPTO-…]` error on
     /// MLS / leaf failure. A `[SCP-STORAGE-8010]` on the post-add snapshot write
     /// **poisons** the context (its state advanced in memory but was not durably
@@ -420,10 +420,10 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2005]` if there is no pending join material (route this
-    /// case to the reconstruct-from-durable retry path), `[SCP-CTX-2004]` on a
+    /// Throws `[SCP-CTX-2086]` if there is no pending join material (route this
+    /// case to the reconstruct-from-durable retry path), `[SCP-CTX-2085]` on a
     /// generic driver-invariant violation (bad argument),
-    /// `[SCP-CTX-2002]` if already joined, `[SCP-VALID-7010]` if the event-log
+    /// `[SCP-CTX-2083]` if already joined, `[SCP-VALID-7028]` if the event-log
     /// stream cannot be deserialized, or a `[SCP-CRYPTO-…]` error on Welcome /
     /// replay failure. A `[SCP-STORAGE-8010]` on the post-join snapshot write
     /// **poisons** the freshly-joined context (its state advanced in memory but was
@@ -467,10 +467,10 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CTX-2040]` if no
+    /// Throws `[SCP-CTX-2082]` if the context is not held, `[SCP-CTX-2095]` if no
     /// peer has announced a pseudonym yet (retryable — pump peers' announcements in
     /// first), a `[SCP-CRYPTO-…]` error on a crypto / leaf failure, or
-    /// `[SCP-TRANS-5010]` if the socket rejects a frame. A `[SCP-STORAGE-8010]`
+    /// `[SCP-TRANS-5005]` if the socket rejects a frame. A `[SCP-STORAGE-8010]`
     /// on the pre-publish snapshot write **poisons** the context, and
     /// `[SCP-STORAGE-8013]` is thrown if the context is already poisoned — either
     /// way, discard this client and reconstruct it via the [`WasmScpClient`]
@@ -490,8 +490,8 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-VALID-7010]` if the frame or its wrapped envelope cannot be
-    /// deserialized, `[SCP-TRANS-5010]` if the relay reported an error, or a
+    /// Throws `[SCP-VALID-7028]` if the frame or its wrapped envelope cannot be
+    /// deserialized, `[SCP-TRANS-5005]` if the relay reported an error, or a
     /// `[SCP-CRYPTO-…]` / `[SCP-CTX-…]` / `[SCP-STORAGE-…]` error if decrypting or
     /// applying a resolved blob fails (the same failures
     /// [`WasmScpClient::receive_message`] raises).
@@ -531,7 +531,7 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CTX-2003]` if
+    /// Throws `[SCP-CTX-2082]` if the context is not held, `[SCP-CTX-2084]` if
     /// the Commit removes a member (out of Slice 2 scope; rejected pre-merge so
     /// the context stays consistent), or a `[SCP-CRYPTO-…]` error on failure
     /// (including a missing or malformed convergent-timestamp AAD —
@@ -562,7 +562,7 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held. A `[SCP-STORAGE-8010]`
+    /// Throws `[SCP-CTX-2082]` if the context is not held. A `[SCP-STORAGE-8010]`
     /// on the snapshot write that records the emptied buffer **poisons** the
     /// context (the buffer was drained in memory but the emptied state was not
     /// durably recorded), and `[SCP-STORAGE-8013]` is thrown if the context is
@@ -623,7 +623,7 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, or `[SCP-STORAGE-8010]`
+    /// Throws `[SCP-CTX-2082]` if the context is not held, or `[SCP-STORAGE-8010]`
     /// if a durable delete (the pending-join blob or the snapshot) fails. Close is
     /// retryable: on such a failure the in-memory context is left intact and the
     /// recoverable snapshot is preserved (the delete order deletes the snapshot
@@ -643,7 +643,7 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-STORAGE-8013]` if
+    /// Throws `[SCP-CTX-2082]` if the context is not held, `[SCP-STORAGE-8013]` if
     /// it is poisoned, or a `[SCP-CRYPTO-…]` error on epoch overflow or a
     /// seal/frame failure. A `[SCP-STORAGE-8010]` on the post-rotation snapshot
     /// write **poisons** the context.
@@ -746,7 +746,7 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CRYPTO-…]`
+    /// Throws `[SCP-CTX-2082]` if the context is not held, `[SCP-CRYPTO-…]`
     /// if the MLS group has been destroyed, or `[SCP-STORAGE-8013]` if the context
     /// is poisoned (discard this client and reconstruct it via the [`WasmScpClient`] constructor for your target
     /// — see [`ContextStatus`](scp_client::ContextStatus)). This read-only observer
@@ -810,7 +810,7 @@ impl WasmScpClient {
 ///
 /// # Errors
 ///
-/// Throws `[SCP-VALID-7010]` if `requestId` is not exactly 16 bytes.
+/// Throws `[SCP-VALID-7028]` if `requestId` is not exactly 16 bytes.
 #[wasm_bindgen(js_name = "outletStreamComputeCaveatsBinding")]
 pub fn outlet_stream_compute_caveats_binding(
     ucan_cid: Vec<u8>,
@@ -820,8 +820,11 @@ pub fn outlet_stream_compute_caveats_binding(
     effective_caveats_jcs: Vec<u8>,
 ) -> Result<Vec<u8>, JsValue> {
     use scp_protocol::context::outlets::stream::compute_caveats_binding;
-    let request_id = <[u8; 16]>::try_from(request_id.as_slice())
-        .map_err(|_| JsValue::from_str("[SCP-VALID-7010] request_id must be 16 bytes"))?;
+    let request_id = <[u8; 16]>::try_from(request_id.as_slice()).map_err(|_| {
+        JsValue::from_str(&format!(
+            "[{WASM_INPUT_VALIDATION_CODE}] request_id must be 16 bytes"
+        ))
+    })?;
     let binding = compute_caveats_binding(
         &ucan_cid,
         &request_id,
@@ -852,7 +855,7 @@ pub fn outlet_stream_compute_caveats_binding(
 ///
 /// # Errors
 ///
-/// Throws `[SCP-VALID-7010]` on malformed INPUT — a chunk that will not
+/// Throws `[SCP-VALID-7028]` on malformed INPUT — a chunk that will not
 /// deserialize, an `operatorPk` that is not 32 bytes or not a valid Ed25519
 /// point, or a `caveatsBinding` that is not 32 bytes. These are distinct from a
 /// `false` return so a caller can tell "I was handed garbage" from "this chunk
@@ -868,19 +871,25 @@ pub fn outlet_stream_verify_chunk_signature(
     use scp_protocol::context::outlets::stream::{OutletStreamChunk, verify_chunk_signature};
     let chunk: OutletStreamChunk = serde_json::from_slice(&chunk).map_err(|e| {
         JsValue::from_str(&format!(
-            "[SCP-VALID-7010] invalid OutletStreamChunk bytes: {e}"
+            "[{WASM_INPUT_VALIDATION_CODE}] invalid OutletStreamChunk bytes: {e}"
         ))
     })?;
-    let pk_bytes = <[u8; 32]>::try_from(operator_pk.as_slice())
-        .map_err(|_| JsValue::from_str("[SCP-VALID-7010] operator_pk must be 32 bytes"))?;
+    let pk_bytes = <[u8; 32]>::try_from(operator_pk.as_slice()).map_err(|_| {
+        JsValue::from_str(&format!(
+            "[{WASM_INPUT_VALIDATION_CODE}] operator_pk must be 32 bytes"
+        ))
+    })?;
     let operator_verifying_key =
         ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).map_err(|e| {
             JsValue::from_str(&format!(
-                "[SCP-VALID-7010] operator_pk is not a valid key: {e}"
+                "[{WASM_INPUT_VALIDATION_CODE}] operator_pk is not a valid key: {e}"
             ))
         })?;
-    let binding = <[u8; 32]>::try_from(caveats_binding.as_slice())
-        .map_err(|_| JsValue::from_str("[SCP-VALID-7010] caveats_binding must be 32 bytes"))?;
+    let binding = <[u8; 32]>::try_from(caveats_binding.as_slice()).map_err(|_| {
+        JsValue::from_str(&format!(
+            "[{WASM_INPUT_VALIDATION_CODE}] caveats_binding must be 32 bytes"
+        ))
+    })?;
     Ok(verify_chunk_signature(
         &chunk,
         &operator_verifying_key,
@@ -901,29 +910,38 @@ pub fn outlet_stream_verify_chunk_signature(
 /// `Event` field values by `append_unsigned_event` on replay, independent of
 /// this transport encoding.
 fn serialize_event_log(events: &[scp_event_log::Event]) -> Result<Vec<u8>, JsValue> {
-    rmp_serde::to_vec(events)
-        .map_err(|e| JsValue::from_str(&format!("[SCP-VALID-7010] serializing event log: {e}")))
+    rmp_serde::to_vec(events).map_err(|e| {
+        JsValue::from_str(&format!(
+            "[{WASM_INPUT_VALIDATION_CODE}] serializing event log: {e}"
+        ))
+    })
 }
 
 /// Deserializes the adder's event-log stream the joiner replays.
 fn deserialize_event_log(bytes: &[u8]) -> Result<Vec<scp_event_log::Event>, JsValue> {
-    rmp_serde::from_slice(bytes)
-        .map_err(|e| JsValue::from_str(&format!("[SCP-VALID-7010] deserializing event log: {e}")))
+    rmp_serde::from_slice(bytes).map_err(|e| {
+        JsValue::from_str(&format!(
+            "[{WASM_INPUT_VALIDATION_CODE}] deserializing event log: {e}"
+        ))
+    })
 }
 
 /// Serializes the adder's member-wrapping-key directory for transport to the
 /// joiner (`MessagePack`, width-/endianness-independent — same transport idiom as
 /// the event-log stream).
 fn serialize_wrapping_keys(wrapping_keys: &[(String, [u8; 32])]) -> Result<Vec<u8>, JsValue> {
-    rmp_serde::to_vec(wrapping_keys)
-        .map_err(|e| JsValue::from_str(&format!("[SCP-VALID-7010] serializing wrapping keys: {e}")))
+    rmp_serde::to_vec(wrapping_keys).map_err(|e| {
+        JsValue::from_str(&format!(
+            "[{WASM_INPUT_VALIDATION_CODE}] serializing wrapping keys: {e}"
+        ))
+    })
 }
 
 /// Deserializes the member-wrapping-key directory the joiner adopts.
 fn deserialize_wrapping_keys(bytes: &[u8]) -> Result<Vec<(String, [u8; 32])>, JsValue> {
     rmp_serde::from_slice(bytes).map_err(|e| {
         JsValue::from_str(&format!(
-            "[SCP-VALID-7010] deserializing wrapping keys: {e}"
+            "[{WASM_INPUT_VALIDATION_CODE}] deserializing wrapping keys: {e}"
         ))
     })
 }
@@ -1331,7 +1349,7 @@ mod pure_wrapper_wasm_tests {
         err.as_string().unwrap_or_default()
     }
 
-    /// A `request_id` that is not 16 bytes fails closed as `[SCP-VALID-7010]`.
+    /// A `request_id` that is not 16 bytes fails closed as `[SCP-VALID-7028]`.
     #[wasm_bindgen_test]
     fn compute_caveats_binding_rejects_wrong_request_id_len() {
         let err = outlet_stream_compute_caveats_binding(
@@ -1344,13 +1362,13 @@ mod pure_wrapper_wasm_tests {
         .expect_err("an 8-byte request_id must be rejected");
         let msg = err_message(err);
         assert!(
-            msg.contains("[SCP-VALID-7010]") && msg.contains("request_id must be 16 bytes"),
+            msg.contains("[SCP-VALID-7028]") && msg.contains("request_id must be 16 bytes"),
             "wrong-length request_id fails closed: {msg}"
         );
     }
 
     /// Malformed chunk bytes, a wrong-length operator key, and a wrong-length
-    /// caveats binding each fail closed as `[SCP-VALID-7010]` — distinct from the
+    /// caveats binding each fail closed as `[SCP-VALID-7028]` — distinct from the
     /// `false` a well-formed-but-unauthentic chunk returns.
     #[wasm_bindgen_test]
     fn verify_chunk_signature_rejects_malformed_inputs() {
@@ -1369,7 +1387,7 @@ mod pure_wrapper_wasm_tests {
         )
         .expect_err("garbage chunk bytes are rejected");
         assert!(
-            err_message(err).contains("[SCP-VALID-7010]"),
+            err_message(err).contains("[SCP-VALID-7028]"),
             "unparseable chunk fails closed"
         );
 

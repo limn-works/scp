@@ -24,12 +24,41 @@ use scp_client::ClientError;
 use scp_mls::MlsError;
 use wasm_bindgen::JsValue;
 
+/// The code emitted for a browser-participant wire/input (de)serialization or
+/// byte-shape validation failure.
+///
+/// Shared by [`ClientError::Codec`] (via [`error_code`]) AND the `lib.rs` wasm
+/// free-function input validators (`request_id`/`operator_pk`/`caveats_binding`
+/// length, `OutletStreamChunk` decode, event-log & wrapping-key `MessagePack`
+/// serde), which construct their `JsValue` message DIRECTLY rather than through
+/// [`error_code`]. Routing every emitter through this ONE constant makes a typo
+/// impossible and lets the exhaustive allowlist test pin all of them at once
+/// (`error_code(Codec)` returns this constant, and the test asserts its value).
+///
+/// Registered as `scp-client-wasm` in `.docs/standards/sdk-common.md`; verified
+/// free across all five surfaces (native/swift/kotlin/ts-native/ts-wasm).
+pub(crate) const WASM_INPUT_VALIDATION_CODE: &str = "SCP-VALID-7028";
+
 /// Stable error-code prefix for each [`ClientError`] category.
 ///
-/// The numbers slot into the cross-SDK ranges documented in
-/// `.docs/standards/sdk-common.md` (CTX 2000-2999, CRYPTO 4000-4999,
-/// VALID 7000-7999, STORAGE 8000-8999). They are part of the public JS error
-/// contract — append new variants, never renumber existing ones.
+/// The numbers are the reconciled per-code meanings registered in
+/// `.docs/standards/sdk-common.md` ("Registered SCP-CTX- / SCP-CRYPTO- /
+/// SCP-TRANS- / SCP-VALID- codes"). That ledger is the single source of truth
+/// for the browser-owned allocations. The numbers were chosen by an exhaustive
+/// manual cross-surface review (the process `scripts/check-error-codes.sh`
+/// Phase-2 mandates for the SDK-wrapper surfaces it cannot machine-check): every
+/// browser-owned code here is FREE across all five surfaces (native
+/// FFI-common registry, Swift, Kotlin, ts-native, ts-wasm). The ONE exception is
+/// the deliberate reuse of `SCP-CTX-2095` (pseudonym-registry-empty), whose
+/// meaning is identical on native + Swift + Kotlin + ts-native + this surface.
+/// (Native CTX-2003 is NOT reused: native means "already exists" but Swift means
+/// "message stream already active" and Kotlin "not a member" — a pre-existing
+/// cross-surface overload — so `ContextAlreadyExists` took a fresh browser-owned
+/// number instead.) This crate cannot import the native registry (the ADR-057
+/// wasm/tokio fence), so these literals are hand-written and kept in agreement
+/// with the ledger by the exhaustive allowlist test below. The numbers are part
+/// of the public JS error contract — never silently renumber; a change must move
+/// the ledger row first (after re-running the cross-surface union check).
 ///
 /// This is a pure `&ClientError -> &str` mapping with no `JsValue` dependency,
 /// so it is testable on the native host (where `JsValue` construction aborts —
@@ -47,38 +76,56 @@ pub const fn error_code(err: &ClientError) -> &'static str {
         ClientError::Mls(
             MlsError::ConvergentTimestampMissing | MlsError::ConvergentTimestampMalformed(_),
         ) => "SCP-CRYPTO-4040",
-        // MLS / sender-key / event-log are the cryptographic protocol layers.
-        ClientError::Mls(_) => "SCP-CRYPTO-4010",
+        // Generic MLS group operation catch-all (create/add/join/encrypt/decrypt/
+        // commit). A browser-owned crypto code, distinct from the native registry's
+        // CRYPTO-4010 ("MLS group create error"), whose narrower meaning this
+        // catch-all does not share (see the registered-codes table in sdk-common.md).
+        ClientError::Mls(_) => "SCP-CRYPTO-4041",
+        // Sender-key (§9.16) and event-log are the other browser crypto layers.
         ClientError::SenderKey(_) => "SCP-CRYPTO-4020",
         ClientError::EventLog(_) => "SCP-CRYPTO-4030",
         // Wire (de)serialization of MLS objects is a validation failure on
-        // attacker-suppliable bytes.
-        ClientError::Codec(_) => "SCP-VALID-7010",
+        // attacker-suppliable bytes. Browser-owned VALID code (7028), free across
+        // all five surfaces. The wasm free-function input validators
+        // (request_id/operator_pk/caveats length, OutletStreamChunk decode,
+        // event-log & wrapping-key serde) emit this SAME code — one meaning:
+        // "browser wire/input validation failure" — via the shared constant.
+        ClientError::Codec(_) => WASM_INPUT_VALIDATION_CODE,
         // A decrypted frame's content type did not match the relay channel it
         // arrived on (§9.10.4 defense-in-depth: a mis-routed announcement/app
         // frame). Benign-dropped in `handle_relay_frame`, so it is not normally
-        // surfaced across the JS boundary; the distinct VALID code exists so it
-        // is legible if it ever is (e.g. a direct `receive_*` call).
-        ClientError::ChannelContentMismatch => "SCP-VALID-7011",
-        // Context lifecycle / membership.
-        ClientError::UnknownContext(_) => "SCP-CTX-2001",
-        ClientError::ContextAlreadyExists(_) => "SCP-CTX-2002",
-        ClientError::UnsupportedMembershipChange(_) => "SCP-CTX-2003",
+        // surfaced across the JS boundary; the distinct browser-owned VALID code
+        // (7029) exists so it is legible if it ever is (e.g. a direct `receive_*`
+        // call). Free across all five surfaces.
+        ClientError::ChannelContentMismatch => "SCP-VALID-7029",
+        // Context lifecycle / membership. `UnknownContext`, `ContextAlreadyExists`,
+        // `UnsupportedMembershipChange`, and `Driver` are browser-owned CTX codes
+        // (2082-2085), each verified FREE across all five surfaces. In particular
+        // `ContextAlreadyExists` does NOT reuse native CTX-2003 ("already exists"):
+        // that number is already overloaded off-native (Swift = "message stream
+        // already active", Kotlin = "not a member"), so a fresh code is minted.
+        ClientError::UnknownContext(_) => "SCP-CTX-2082",
+        ClientError::ContextAlreadyExists(_) => "SCP-CTX-2083",
+        ClientError::UnsupportedMembershipChange(_) => "SCP-CTX-2084",
         // A driver invariant violation (bad argument / missing pending state).
-        ClientError::Driver(_) => "SCP-CTX-2004",
+        ClientError::Driver(_) => "SCP-CTX-2085",
         // An app-data send hit an empty peer-pseudonym registry in a multi-member
         // context — retryable once peers' announcements are pumped in (§9.10.4,
-        // ADR-057 transport slice). CTX band; distinct from the generic driver code.
-        ClientError::PseudonymRegistryEmpty { .. } => "SCP-CTX-2040",
+        // ADR-057 transport slice). Semantically IDENTICAL to native
+        // `ContextError::PseudonymRegistryEmpty` (`SCP-CTX-2095`) — and the same
+        // meaning on Swift, Kotlin, and ts-native — so it is the ONE deliberate
+        // cross-surface shared-meaning reuse (sdk-common.md).
+        ClientError::PseudonymRegistryEmpty { .. } => "SCP-CTX-2095",
         // The injected outbound Socket failed to enqueue a relay frame (the
-        // WebSocket is closed / a JS exception was thrown). Transport band.
-        ClientError::Transport(_) => "SCP-TRANS-5010",
+        // WebSocket is closed / a JS exception was thrown). Browser-owned Transport
+        // code (5005), free across all five surfaces.
+        ClientError::Transport(_) => "SCP-TRANS-5005",
         // A join was attempted with no retained pending key package (never
         // generated, or already consumed by a prior join attempt — single-use per
-        // attempt). Distinct from the generic Driver code so a caller can tell an
-        // absent-pending-material join apart from other invariant violations and
-        // route it to the reconstruct-from-durable retry path.
-        ClientError::NoPendingJoinMaterial { .. } => "SCP-CTX-2005",
+        // attempt). Browser-owned CTX code (2086), distinct from the generic Driver
+        // code so a caller can route it to the reconstruct-from-durable retry path.
+        // (2080/2081 are taken by Kotlin, so this sits at 2086 — free across five.)
+        ClientError::NoPendingJoinMaterial { .. } => "SCP-CTX-2086",
         // The injected Storage backend failed at the I/O level (a
         // get/put/delete/list_keys fault) — distinct from a corrupt-but-readable
         // blob. NOTE: 8001-8003 are already allocated by scp-kt-android's
@@ -104,7 +151,7 @@ pub const fn error_code(err: &ClientError) -> &'static str {
 /// code prefix.
 ///
 /// The resulting [`JsValue`] is a string of the form
-/// `"[SCP-CRYPTO-4010] MLS error: …"`. wasm-bindgen turns a returned
+/// `"[SCP-CRYPTO-4041] MLS error: …"`. wasm-bindgen turns a returned
 /// `Err(JsValue)` into a thrown JS exception, so the TypeScript wrapper receives
 /// it as `error.message` and parses the bracketed prefix.
 #[must_use]
@@ -130,135 +177,100 @@ pub fn map_err<T>(result: Result<T, ClientError>) -> Result<T, JsValue> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn unknown_context_maps_to_stable_ctx_code() {
-        let err = ClientError::UnknownContext("ctx-x".to_owned());
-        assert_eq!(error_code(&err), "SCP-CTX-2001");
+    /// The reconciled `error_code()` value expected for every [`ClientError`]
+    /// variant, as an EXHAUSTIVE positive allowlist.
+    ///
+    /// This is deliberately an independent, no-wildcard `match` over the whole
+    /// `ClientError` enum: it is the single-source-of-truth mirror of the
+    /// `.docs/standards/sdk-common.md` ledger expressed as code. Its purpose is
+    /// twofold and both halves are load-bearing:
+    ///
+    /// 1. **Exhaustiveness (a closed whitelist).** Because there is NO `_`
+    ///    wildcard, adding a new `ClientError` variant fails to compile HERE
+    ///    until an arm — and thus a deliberate ledger decision — is added. A new
+    ///    variant cannot silently fall through to an unaudited code.
+    /// 2. **Value pinning.** Every arm is a literal reconciled code. If
+    ///    `error_code()` is edited to emit a different (e.g. native-colliding)
+    ///    code without also updating this allowlist AND the ledger, the
+    ///    `codes_match_the_reconciled_allowlist` assertion below fails.
+    ///
+    /// It is NOT a re-check of a property the type system already guarantees:
+    /// the type system cannot know that `SCP-CTX-2095` means "pseudonym registry
+    /// empty" or that the browser surface must not collide with a Swift/Kotlin
+    /// SDK code — that is a human cross-surface-review decision, and this is where
+    /// it is mechanically pinned.
+    fn reconciled_code(err: &ClientError) -> &'static str {
+        match err {
+            ClientError::Mls(
+                MlsError::ConvergentTimestampMissing | MlsError::ConvergentTimestampMalformed(_),
+            ) => "SCP-CRYPTO-4040",
+            ClientError::Mls(_) => "SCP-CRYPTO-4041",
+            ClientError::SenderKey(_) => "SCP-CRYPTO-4020",
+            ClientError::EventLog(_) => "SCP-CRYPTO-4030",
+            ClientError::Codec(_) => "SCP-VALID-7028",
+            ClientError::UnknownContext(_) => "SCP-CTX-2082",
+            ClientError::ContextAlreadyExists(_) => "SCP-CTX-2083",
+            ClientError::UnsupportedMembershipChange(_) => "SCP-CTX-2084",
+            ClientError::Driver(_) => "SCP-CTX-2085",
+            ClientError::ChannelContentMismatch => "SCP-VALID-7029",
+            ClientError::Transport(_) => "SCP-TRANS-5005",
+            ClientError::PseudonymRegistryEmpty { .. } => "SCP-CTX-2095",
+            ClientError::NoPendingJoinMaterial { .. } => "SCP-CTX-2086",
+            ClientError::StorageBackend(_) => "SCP-STORAGE-8010",
+            ClientError::StorageCorrupt(_) => "SCP-STORAGE-8011",
+            ClientError::StorageIdentityMismatch(_) => "SCP-STORAGE-8012",
+            ClientError::ContextPoisoned { .. } => "SCP-STORAGE-8013",
+        }
     }
 
-    #[test]
-    fn distinct_categories_get_distinct_codes() {
-        let already = ClientError::ContextAlreadyExists("c".to_owned());
-        let unsupported = ClientError::UnsupportedMembershipChange("c".to_owned());
-        assert_ne!(error_code(&already), error_code(&unsupported));
-    }
-
-    #[test]
-    fn convergent_timestamp_family_maps_to_distinct_crypto_code() {
-        // ADR-057: both convergent-timestamp AAD failures (which arrive wrapped in
-        // ClientError::Mls) get the distinct SCP-CRYPTO-4040 code, so a caller can
-        // tell a convergence-authentication rejection apart from a generic MLS
-        // failure. The distinct arm must be matched BEFORE the catch-all
-        // ClientError::Mls(_) → 4010.
-        for err in [
+    /// One representative value of EVERY `ClientError` variant (plus the two
+    /// `Mls` convergent-timestamp sub-cases, which take a different code from the
+    /// generic `Mls(_)` catch-all). Built without a wildcard so the compiler
+    /// forces this list to grow with the enum.
+    fn every_variant_representative() -> Vec<ClientError> {
+        // Enumerate via an exhaustive destructuring match on a placeholder so a
+        // new variant breaks compilation here too, not just in `reconciled_code`.
+        // (The value below is discarded; the match exists only for its
+        // exhaustiveness check.)
+        let probe = ClientError::ChannelContentMismatch;
+        match &probe {
+            ClientError::Mls(_)
+            | ClientError::SenderKey(_)
+            | ClientError::EventLog(_)
+            | ClientError::Codec(_)
+            | ClientError::UnknownContext(_)
+            | ClientError::ContextAlreadyExists(_)
+            | ClientError::UnsupportedMembershipChange(_)
+            | ClientError::Driver(_)
+            | ClientError::ChannelContentMismatch
+            | ClientError::Transport(_)
+            | ClientError::PseudonymRegistryEmpty { .. }
+            | ClientError::NoPendingJoinMaterial { .. }
+            | ClientError::StorageBackend(_)
+            | ClientError::StorageCorrupt(_)
+            | ClientError::StorageIdentityMismatch(_)
+            | ClientError::ContextPoisoned { .. } => {}
+        }
+        vec![
+            // Both `Mls` sub-cases (distinct 4040) plus a generic `Mls` (4041).
             ClientError::Mls(MlsError::ConvergentTimestampMissing),
             ClientError::Mls(MlsError::ConvergentTimestampMalformed("bad len".to_owned())),
-        ] {
-            assert_eq!(error_code(&err), "SCP-CRYPTO-4040");
-        }
-        // A different MLS failure still falls through to the generic MLS code.
-        assert_eq!(
-            error_code(&ClientError::Mls(MlsError::GroupDestroyed)),
-            "SCP-CRYPTO-4010"
-        );
-    }
-
-    #[test]
-    fn no_pending_join_material_gets_its_own_distinct_ctx_code() {
-        // The single-use-per-attempt join failure has a DISTINCT code from the
-        // generic Driver invariant violation, so a caller can route it to the
-        // reconstruct-from-durable retry path rather than treating it as a generic
-        // bad-argument fault.
-        let no_pending = ClientError::NoPendingJoinMaterial {
-            context_id: "ctx".to_owned(),
-        };
-        assert_eq!(error_code(&no_pending), "SCP-CTX-2005");
-        assert_ne!(
-            error_code(&no_pending),
-            error_code(&ClientError::Driver("d".to_owned())),
-            "absent-pending-material is distinct from a generic Driver violation"
-        );
-    }
-
-    #[test]
-    fn channel_content_mismatch_gets_its_own_distinct_valid_code() {
-        // The §9.10.4 mis-routed-frame validation failure has a DISTINCT code
-        // from the generic MLS-wire codec failure, both in the VALID band, so a
-        // caller can tell a channel/content binding rejection apart from a raw
-        // deserialization fault even though the driver benign-drops it internally.
-        assert_eq!(
-            error_code(&ClientError::ChannelContentMismatch),
-            "SCP-VALID-7011"
-        );
-        assert_ne!(
-            error_code(&ClientError::ChannelContentMismatch),
-            error_code(&ClientError::Codec("wire".to_owned())),
-        );
-    }
-
-    #[test]
-    fn storage_variants_map_to_distinct_stable_storage_codes() {
-        // The four browser storage failure classes each get a distinct, stable
-        // code in the SCP-STORAGE-8010+ sub-range (part of the public JS error
-        // contract). 8001-8003 are reserved for scp-kt-android; the browser codes
-        // start at 8010 to avoid that collision.
-        assert_eq!(
-            error_code(&ClientError::StorageBackend("io".to_owned())),
-            "SCP-STORAGE-8010"
-        );
-        assert_eq!(
-            error_code(&ClientError::StorageCorrupt("checkpoint".to_owned())),
-            "SCP-STORAGE-8011"
-        );
-        assert_eq!(
-            error_code(&ClientError::StorageIdentityMismatch("owner".to_owned())),
-            "SCP-STORAGE-8012"
-        );
-        assert_eq!(
-            error_code(&ClientError::ContextPoisoned {
-                context_id: "ctx".to_owned()
-            }),
-            "SCP-STORAGE-8013"
-        );
-    }
-
-    #[test]
-    fn browser_storage_codes_avoid_the_android_reserved_low_block() {
-        // Regression guard for the collision this renumber fixed: scp-kt-android's
-        // AndroidStorage owns the low `800x` block, so every browser storage code
-        // must sit at 8010 or above. Checked numerically (no reserved-code string
-        // literal, so the grep guarding this crate against the old codes stays 0).
-        for err in [
-            ClientError::StorageBackend("s".to_owned()),
-            ClientError::StorageCorrupt("s".to_owned()),
-            ClientError::StorageIdentityMismatch("s".to_owned()),
-            ClientError::ContextPoisoned {
-                context_id: "c".to_owned(),
-            },
-        ] {
-            let code = error_code(&err);
-            // A non-storage / malformed code parses to 0 and trips the same assert.
-            let number: u32 = code
-                .strip_prefix("SCP-STORAGE-")
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0);
-            assert!(
-                number >= 8010,
-                "browser storage code {code} is in the Android-reserved low block (or malformed)"
-            );
-        }
-    }
-
-    #[test]
-    fn every_code_is_in_the_documented_prefix_space() {
-        // A representative of each category resolves to a `SCP-` code.
-        for err in [
+            ClientError::Mls(MlsError::GroupDestroyed),
+            ClientError::SenderKey(
+                scp_protocol::crypto::sender_keys::SenderKeyError::EpochOverflow,
+            ),
+            ClientError::EventLog(scp_event_log::EventLogError::EmptyLog),
+            ClientError::Codec("wire".to_owned()),
             ClientError::UnknownContext("c".to_owned()),
             ClientError::ContextAlreadyExists("c".to_owned()),
             ClientError::UnsupportedMembershipChange("c".to_owned()),
-            ClientError::Codec("c".to_owned()),
-            ClientError::ChannelContentMismatch,
             ClientError::Driver("d".to_owned()),
+            ClientError::ChannelContentMismatch,
+            ClientError::Transport("t".to_owned()),
+            ClientError::PseudonymRegistryEmpty {
+                context_id: "c".to_owned(),
+                member_count: 2,
+            },
             ClientError::NoPendingJoinMaterial {
                 context_id: "c".to_owned(),
             },
@@ -268,7 +280,90 @@ mod tests {
             ClientError::ContextPoisoned {
                 context_id: "c".to_owned(),
             },
+        ]
+    }
+
+    #[test]
+    fn codes_match_the_reconciled_allowlist() {
+        // Positive whitelist: for every representative, the emitted code equals
+        // the reconciled ledger value. Any divergence between `error_code()` and
+        // the sdk-common.md ledger (a renumber, a native-code re-use regression)
+        // fails here.
+        for err in every_variant_representative() {
+            assert_eq!(
+                error_code(&err),
+                reconciled_code(&err),
+                "error_code() diverged from the reconciled sdk-common.md allowlist for {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pseudonym_registry_empty_is_the_only_cross_surface_reuse() {
+        // `SCP-CTX-2095` (pseudonym-registry-empty) is the ONE code the browser
+        // surface deliberately shares with the other surfaces — same meaning on
+        // native + Swift + Kotlin + ts-native. Every OTHER browser code is
+        // browser-owned and cross-surface-free (verified by manual union review;
+        // see the module doc). This pins the ruling.
+        const INTENTIONAL_CROSS_SURFACE_REUSES: [&str; 1] = ["SCP-CTX-2095"];
+
+        assert_eq!(
+            error_code(&ClientError::PseudonymRegistryEmpty {
+                context_id: "c".to_owned(),
+                member_count: 2,
+            }),
+            INTENTIONAL_CROSS_SURFACE_REUSES[0],
+        );
+        // `ContextAlreadyExists` must NOT revert to native CTX-2003: that number
+        // is overloaded off-native (Swift/Kotlin use it for other conditions), so
+        // a fresh browser-owned code was minted.
+        assert_eq!(
+            error_code(&ClientError::ContextAlreadyExists("c".to_owned())),
+            "SCP-CTX-2083",
+        );
+        assert_ne!(
+            error_code(&ClientError::ContextAlreadyExists("c".to_owned())),
+            "SCP-CTX-2003",
+            "ContextAlreadyExists must not reuse the cross-surface-overloaded 2003"
+        );
+    }
+
+    #[test]
+    fn lib_rs_input_validation_code_is_pinned() {
+        // The ~9 `lib.rs` wasm free-function input validators construct their
+        // `JsValue` message DIRECTLY (not via `error_code`), so the allowlist test
+        // above cannot see them. They all route through `WASM_INPUT_VALIDATION_CODE`
+        // — pinning that one constant here pins every one of those emitters, and a
+        // typo in the constant fails this test (and the allowlist test, since
+        // `error_code(Codec)` returns the constant).
+        assert_eq!(WASM_INPUT_VALIDATION_CODE, "SCP-VALID-7028");
+        assert_eq!(
+            error_code(&ClientError::Codec("wire".to_owned())),
+            WASM_INPUT_VALIDATION_CODE,
+            "ClientError::Codec must route through the shared lib.rs input-validation code"
+        );
+    }
+
+    #[test]
+    fn convergent_timestamp_family_precedes_the_generic_mls_catch_all() {
+        // ADR-057 arm-ordering guard: both convergent-timestamp AAD failures
+        // (wrapped in `ClientError::Mls`) must resolve to the distinct
+        // SCP-CRYPTO-4040, NOT fall through to the generic SCP-CRYPTO-4041.
+        for err in [
+            ClientError::Mls(MlsError::ConvergentTimestampMissing),
+            ClientError::Mls(MlsError::ConvergentTimestampMalformed("bad len".to_owned())),
         ] {
+            assert_eq!(error_code(&err), "SCP-CRYPTO-4040");
+        }
+        assert_eq!(
+            error_code(&ClientError::Mls(MlsError::GroupDestroyed)),
+            "SCP-CRYPTO-4041"
+        );
+    }
+
+    #[test]
+    fn every_code_is_in_the_documented_prefix_space() {
+        for err in every_variant_representative() {
             assert!(
                 error_code(&err).starts_with("SCP-"),
                 "code for {err:?} is in the SCP- prefix space"
@@ -288,7 +383,7 @@ mod wasm_tests {
         let err = ClientError::UnknownContext("ctx-x".to_owned());
         let js = to_js(&err);
         let msg = js.as_string().unwrap_or_default();
-        assert!(msg.starts_with("[SCP-CTX-2001] "), "prefix present: {msg}");
+        assert!(msg.starts_with("[SCP-CTX-2082] "), "prefix present: {msg}");
         assert!(msg.contains("ctx-x"), "message preserved: {msg}");
     }
 
