@@ -31,6 +31,7 @@ export {
   EconomyError,
   GovernanceError,
   IdentityError,
+  InvalidGrant,
   McpError,
   mapBridgeError,
   OutletError,
