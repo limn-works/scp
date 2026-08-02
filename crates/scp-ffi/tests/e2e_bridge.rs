@@ -2913,9 +2913,11 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
             .expect_err("a non-member invoker is rejected at the runtime membership gate");
         let msg = open_err.to_string();
         assert!(
-            msg.contains("SCP-OUTLET-6160"),
-            "the open reached the runtime and mapped its rejection to a canonical \
-             SCP-OUTLET code (UCAN validation passed): {msg}"
+            msg.contains("SCP-OUTLET-6110"),
+            "the open reached the runtime and mapped its rejection to the canonical \
+             NON-RETRYABLE authorization-denied code (#2196: a non-member membership \
+             denial is SCP-OUTLET-6110 authorization.denied, NOT the old wrongly-retryable \
+             transport-fault SCP-OUTLET-6160): {msg}"
         );
 
         // Control-plane graceful not-found: the six control methods on an
