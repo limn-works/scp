@@ -39,8 +39,8 @@
 
 import type { ScpBrowserClient } from "./client";
 import { outletStreamSignCredit, outletStreamVerifyChunkSignature } from "./client";
-import type { Credit } from "./credit";
-import { OutletError, ValidationError } from "./errors";
+import { Credit } from "./credit";
+import { InvalidGrant, OutletError, ValidationError } from "./errors";
 
 /**
  * Tracks the single live stream consumer per `(client, contextId)`.
@@ -262,8 +262,11 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
   }
 
   /**
-   * Marks the session closed exactly once and releases its `(client, contextId)`
-   * live-consumer claim so a fresh session can be constructed on it. Idempotent.
+   * Marks the session closed exactly once, releases its `(client, contextId)`
+   * live-consumer claim so a fresh session can be constructed on it, and
+   * best-effort zeroizes the in-tab signing-seed copy. Idempotent — safe to call
+   * from every terminal path, from {@link close}, from the async-iterator
+   * {@link return}, and from `Symbol.asyncDispose`.
    */
   #markClosed(): void {
     if (this.#closed) {
@@ -271,6 +274,37 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
     }
     this.#closed = true;
     liveStreamConsumers.get(this.#opts.client)?.delete(this.#opts.contextId);
+    // Best-effort seed hygiene: overwrite the JS-heap copy of the on-device
+    // signing seed once the session can no longer sign a credit grant. Not
+    // load-bearing (the tab threat model already assumes heap-read capability —
+    // ADR-057 Slice-3 caveat), but it shortens the window a stale copy lingers.
+    this.#opts.invokerSigningSeed?.fill(0);
+  }
+
+  /**
+   * Closes the session: releases its `(client, contextId)` live-consumer claim
+   * (so a fresh session can be constructed on the same pair) and zeroizes the
+   * in-tab seed copy. Idempotent. Call this when abandoning a session without
+   * draining it to a terminal chunk — otherwise the claim leaks until the client
+   * is garbage-collected and the next session on the pair throws `SCP-VALID-7028`.
+   */
+  close(): void {
+    this.#markClosed();
+  }
+
+  /**
+   * Async-iterator close hook: the ECMAScript `for await … of` protocol invokes
+   * this on `break`, `return`, or a thrown error in the loop body, so abandoning
+   * a drain early releases the live-consumer claim instead of leaking it.
+   */
+  async return(): Promise<IteratorResult<OutletStreamChunkView, undefined>> {
+    this.#markClosed();
+    return { done: true, value: undefined };
+  }
+
+  /** `using`/`await using` disposal hook — releases the claim + zeroizes the seed. */
+  [Symbol.asyncDispose](): void {
+    this.#markClosed();
   }
 
   /**
@@ -338,6 +372,12 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
    *   terminal chunk arriving on a concurrent drain).
    */
   async grantCredit(grant: Credit): Promise<Uint8Array> {
+    if (!(grant instanceof Credit)) {
+      // Defense in depth: tsc already rejects a raw number, but a dynamically
+      // typed (JS / `any`) caller must still fail loud and uniform rather than
+      // reach signing with an unvalidated `.value` (mirrors the native surface).
+      throw new InvalidGrant(`grantCredit requires a Credit, got ${typeof grant}`);
+    }
     this.#throwIfClosed("grant credit");
     await this.open();
     // Re-check after the await: a concurrent drain may have reached a terminal
@@ -384,9 +424,9 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
       // distinct from the `SCP-OUTLET-6100` lifecycle-closed cases (an operator
       // can filter caller misuse apart from protocol/lifecycle errors).
       throw new ValidationError(
-        "[SCP-VALID-7027] the outlet stream has a single shared drain — do not iterate it " +
+        "[SCP-VALID-7029] the outlet stream has a single shared drain — do not iterate it " +
           "from two async contexts concurrently",
-        "SCP-VALID-7027",
+        "SCP-VALID-7029",
       );
     }
     this.#draining = true;
@@ -412,7 +452,7 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
         // cancel `next_seq` is the runtime's live emission cursor, which a
         // remote invoker cannot read — so on a gap it surfaces `StreamGap` to
         // the caller and node-side reclamation (credit-stall / timeout,
-        // §5.4.5 `stream_credit_stall_secs`, 05-contexts.md:530) reclaims the
+        // §5.4.5 `stream_credit_stall_secs`, 05-contexts.md:485) reclaims the
         // stream. Browser-initiated active cancel is deferred to a future
         // cross-context-cancel slice. Close and throw WITHOUT yielding the
         // offending chunk.
