@@ -8,11 +8,16 @@
 //! §25 test vectors, ADR-049). Each entry is sign-verifiable against the
 //! reference Ed25519 keypair (RFC 8032 §7.1 Test Vector 1).
 //!
-//! All four FFI bridges (PyO3, NAPI, UniFFI Swift, UniFFI Kotlin) plus the
-//! WASM bridge call into the same `scp_protocol::context::outlets::
-//! compute_outlet_registration_canonical_bytes` reference, so this Rust-core
-//! validation transitively certifies every bridge that funnels through
-//! `register_outlet`.
+//! This suite validates the vectors via the Rust core only, using
+//! `compute_outlet_registration_canonical_bytes`,
+//! `verify_outlet_registration_signature`, and direct Ed25519 verification.
+//! It does NOT exercise the FFI bridges: the live per-bridge
+//! registration-signature scheme is unwired — `register_outlet`
+//! (registry.rs) does not compute or verify a signature, and the PyO3 /
+//! NAPI / UniFFI bridges build `OutletRegistration { signature: vec![] }`.
+//! Wiring the §5.4.1 registration signature through production
+//! `register_outlet` and each bridge is tracked in #2229. (The WASM bridge
+//! is genuinely N/A per ADR-057.)
 //!
 //! # Preimage layout (§5.4.1, current)
 //!

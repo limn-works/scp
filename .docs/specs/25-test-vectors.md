@@ -1089,7 +1089,7 @@ Conformance test `CONF-045` enforces that for every entry `v1_canonical_hash != 
 
 ### 25.24.3 Conformance procedure
 
-The four FFI bridges (PyO3, NAPI, UniFFI Swift / Kotlin) and the WASM bridge all funnel through `scp_protocol::context::outlets::registry::compute_outlet_registration_canonical_bytes` whenever they sign or verify an outlet registration; validating the vectors against the Rust core therefore transitively validates every bridge. The conformance suite enforces this:
+The conformance suite validates the vectors against the **Rust core only** — `scp_protocol::context::outlets::registry::compute_outlet_registration_canonical_bytes` + `verify_outlet_registration_signature` + direct Ed25519 verification. It does **not** exercise the FFI bridges: the live per-bridge registration-signature scheme is currently unwired — `register_outlet` (registry.rs) neither computes nor verifies a registration signature, and the PyO3 / NAPI / UniFFI bridges construct `OutletRegistration { signature: vec![] }`. Wiring the §5.4.1 registration signature through production `register_outlet` and each bridge (so a vector is sign-verifiable via each FFI bridge) is tracked in **#2229**; the WASM bridge is genuinely N/A per ADR-057. The suite:
 
 ```bash
 cargo test -p scp-testing --test conformance \

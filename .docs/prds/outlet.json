@@ -715,7 +715,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-testing/src/conformance/mod.rs",
         "crates/scp-testing/tests/integration/conformance.rs",
@@ -755,7 +755,7 @@
         }
       ],
       "details": {
-        "auditNote": "Recovered (#2219): re-ported the two net-new deliverables (outlet_registration_v2.json + crates/scp-testing/src/conformance/outlet_registration.rs) from orphaned commit b5a25f142, then regenerated all goldens (expected_preimage/expected_canonical_hash/expected_signature + v1_rejection_corpus) against main's CURRENT §5.4.1 canonical preimage (real kind_byte, description_hash, schema_hash over 3-field OutletSchema, cost_hash, catalog_hash). The orphaned bytes were stale (placeholder kind_byte 0x01, no description_hash/catalog_hash); regen changed every hash (e.g. minimal-query canonical_hash 6aeebe1b… → 40152a10…). CONF-043..046 + conf_outlet_registration_v2_regen wired into the conformance harness; 46 passed / 1 ignored."
+        "auditNote": "Partially recovered (#2219), NOT done. LANDED + PASSING: the 12 SCP-OUTLET-REGISTRATION-V2 vectors + v1_rejection_corpus (tests/conformance/vectors/outlet_registration_v2.json) and the Rust-core sign-verify conformance suite (CONF-043..046 + conf_outlet_registration_v2_regen), re-ported from orphaned commit b5a25f142 and regenerated against main's CURRENT §5.4.1 canonical preimage (real kind_byte, description_hash, schema_hash over 3-field OutletSchema, cost_hash, catalog_hash). The orphaned goldens were stale (placeholder kind_byte 0x01, no description_hash/catalog_hash); regen changed every hash (e.g. minimal-query canonical_hash 6aeebe1b… → 40152a10…). §25.24 documents the vectors. UNMET: AC3 'a vector is sign-verifiable via each FFI bridge' — the §5.4.1 registration-signature scheme is unwired in production: register_outlet (registry.rs) neither computes nor verifies a registration signature, and the PyO3/NAPI/UniFFI bridges build OutletRegistration { signature: vec![] }. The suite therefore certifies the Rust core only, NOT the bridges. Wiring registration signing/verification through register_outlet + each bridge is tracked in #2229. WASM is genuinely N/A per ADR-057. Story stays in-progress until #2229 lands."
       }
     },
     {
