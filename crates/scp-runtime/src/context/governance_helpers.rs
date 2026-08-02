@@ -1045,7 +1045,7 @@ pub async fn execute_revoke(
             timestamp_secs,
         )
         .await?;
-    // Spec §2008 / §2015: emit one best-effort KeyEpochAdvance leaf per author
+    // Spec §5.14.8 / §5.14.10: emit one best-effort KeyEpochAdvance leaf per author
     // whose broadcast key was rotated by the governance ban.  Each rotation
     // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
     // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
