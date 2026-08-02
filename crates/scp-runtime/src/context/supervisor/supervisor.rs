@@ -25763,6 +25763,83 @@ mod tests {
         assert_eq!(xctx_invoked.4, expected_leaf_secs);
     }
 
+    /// #2196 — a non-active (Closing) CALLER context rejects the UNARY
+    /// cross-context outlet-invocation saga at Prepare-A's caller-side reserve
+    /// (`reserve_outlet_economy`, now gated by `ensure_context_active`),
+    /// surfacing SCP-OUTLET-6080 "context not active". Prepare-A fails before
+    /// Prepare-B / Commit, so the outlet NEVER executes and no A-side reservation
+    /// is applied. Covers the caller/A-leg of the unary saga, which the runtime
+    /// previously left ungated (bridge-guard only, on a stale handle cache).
+    #[tokio::test]
+    async fn xctx_saga_closing_caller_rejected_at_prepare_a_no_execution() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let creator_did = "did:dht:z6MkXctxClosingCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxClosingCaller";
+
+        // Caller transitioned Active → Closing before spawn (its actor stays
+        // alive); target stays Active. Gates 1/2 (outbound-caller authorize +
+        // established interface) and the rate-limit consume all pass, so the
+        // Prepare-A reserve's active gate is the barrier under test.
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        caller_state
+            .handle
+            .transition_to(&scp_protocol::context::ContextState::Closing)
+            .expect("Active → Closing");
+        let target_state = xctx_target_state(caller_did, &creator_did);
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_exec = Arc::clone(&calls);
+        let executor = move |input: serde_json::Value| {
+            let calls = Arc::clone(&calls_for_exec);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let a = input["a"].as_i64().unwrap_or(0);
+                let b = input["b"].as_i64().unwrap_or(0);
+                Ok(serde_json::json!({ "result": a + b }))
+            }
+        };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let err = supervisor
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    outlet_registration_id: XCTX_OUTLET.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 2,
+                    asserted_nonce: [0x43u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                executor,
+            )
+            .await
+            .expect_err("a Closing caller must reject the unary saga at Prepare-A");
+
+        assert!(
+            format!("{err}").contains("not active") || format!("{err}").contains("6080"),
+            "the abort surfaces the caller context-not-active reserve rejection: {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the outlet MUST NOT execute — Prepare-A rejected before Prepare-B / Commit"
+        );
+    }
+
     /// Prepare-B reject (confused deputy): the caller references a UCAN proof in
     /// B's store that is delegated to a DIFFERENT principal. Prepare-B rejects
     /// (SCP-SAGA-13013), the saga ABORTS, the outlet NEVER executes, and the
@@ -31667,7 +31744,7 @@ mod streaming_saga_tests {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::caveats::InvocationCaveats;
 
-    use super::{DurableProviders, SagaSigningKeys, Supervisor};
+    use super::{DurableProviders, SagaAbortReason, SagaError, SagaSigningKeys, Supervisor};
     use crate::context::actor::ContextCommand;
     use crate::context::actor::commands::{QueriesCommand, SagaPhaseMessage, SigningKeyBytes};
     use crate::context::actor::state::PerContextState;
@@ -32459,6 +32536,217 @@ mod streaming_saga_tests {
             "AC3: exactly one billed PaymentReceipt is captured (real close-time settlement)"
         );
 
+        drop(invoked);
+    }
+
+    /// #2196 — a non-active (Closing) TARGET context rejects the cross-context
+    /// streaming saga at the B-side escrow reserve, BEFORE any escrow debit and
+    /// BEFORE the seal task spawns. The runtime `ensure_context_active` gate
+    /// (added to `reserve_outlet_stream_economy`, which the saga runs on the
+    /// TARGET) is authoritative — no FFI bridge guard is in the loop at the
+    /// runtime layer, and no earlier saga gate checks lifecycle state (the
+    /// interface + context-set gates pass for an established, live target).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xctx_streaming_saga_closing_target_rejected_before_debit_and_seal() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let recording = SsRecordingEventLog::default();
+        let supervisor =
+            build_ss_supervisor(&captured, Arc::clone(&journal), Box::new(recording.clone()));
+
+        // Caller Active; TARGET transitioned Active → Closing before spawn. Its
+        // actor stays alive, so the interface + membership gates still pass and the
+        // active-state reserve gate is the barrier under test.
+        spawn_ss_actor(
+            &supervisor,
+            "did:example:ss-caller-owner",
+            ss_caller_state_for(SS_CALLER, SS_TARGET),
+        )
+        .await;
+        let target_state = ss_paid_target_state(SS_TARGET);
+        target_state
+            .handle
+            .transition_to(&ContextState::Closing)
+            .expect("Active → Closing");
+        spawn_ss_actor(&supervisor, "did:example:ss-target-owner", target_state).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x46; 16]);
+        let executor = Arc::new(FiniteChunkExecutor {
+            data_chunks: 10,
+            invoked: Arc::clone(&invoked),
+        });
+        let target_signing = SigningKey::from_bytes(&[7u8; 32]);
+        let caller_signing = SigningKey::from_bytes(&[8u8; 32]);
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+
+        let Err(err) = supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                SS_CALLER,
+                SS_TARGET,
+                ss_invoker(),
+                SS_OUTLET.to_owned(),
+                None,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                1,
+                [0x99u8; 16],
+                SS_NOW.saturating_mul(1000),
+                Some(5_000),
+                executor,
+                Some(binding),
+                SagaSigningKeys {
+                    target: &target_signing,
+                    caller: &caller_signing,
+                },
+                params,
+            )
+            .await
+        else {
+            panic!("a Closing target must reject the streaming saga at the B-side reserve");
+        };
+
+        match &err {
+            SagaError::Aborted {
+                reason,
+                code,
+                message,
+            } => {
+                assert_eq!(*code, 13067, "a B-side reserve rejection aborts with 13067");
+                assert!(
+                    matches!(reason, SagaAbortReason::Rejected),
+                    "a context-not-active reject is a PERMANENT rejection, not retryable: {reason:?}"
+                );
+                assert!(
+                    message.contains("not in Active state") && message.contains("Closing"),
+                    "the abort surfaces the context-not-active reserve rejection naming the \
+                     state (the 6080 gate flowed through reserve_error_to_open_rejection → \
+                     ContextNotActive): {message}"
+                );
+            }
+            other => panic!("expected SagaError::Aborted, got {other:?}"),
+        }
+
+        // No escrow was debited on the target — the gate fired before the debit.
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &hex::encode(SS_TARGET), &ss_invoker()).await,
+            Amount::new(SS_GRANTED),
+            "the invoker's target budget is untouched — the reserve gate fired before any debit"
+        );
+        // The outlet executor was never invoked and the saga was resolved Aborted
+        // (never Committing), so no off-mailbox seal task was spawned.
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "no executor invocation on a rejected open"
+        );
+        assert!(
+            journal
+                .load_unresolved()
+                .await
+                .expect("load_unresolved")
+                .is_empty(),
+            "the rejected saga is resolved Aborted — no Committing entry survives, so no seal \
+             task was spawned"
+        );
+
+        drop(invoked);
+    }
+
+    /// #2196 — a SAME-context stream OPEN (SCP-OUT-037 path,
+    /// `Supervisor::open_outlet_stream`) against a Closing context is rejected
+    /// with `OpenStreamRejection::ContextNotActive` — Protocol class,
+    /// `SCP-OUTLET-6101`, NON-retryable — at the runtime reserve gate, debiting
+    /// no escrow and never invoking the executor. No FFI bridge guard exists for
+    /// this path at either layer historically, so the runtime gate is the sole
+    /// barrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_context_stream_open_gated_on_closing_context() {
+        use crate::context::outlets::dispatch::OpenStreamRejection;
+        use scp_protocol::context::outlets::error_codes;
+        use scp_protocol::context::outlets::errors::RetryPolicy;
+
+        let captured = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(InMemoryStorage::new());
+        let journal: Arc<dyn SagaJournal> =
+            Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
+        let supervisor = build_ss_supervisor(
+            &captured,
+            Arc::clone(&journal),
+            Box::new(SsRecordingEventLog::default()),
+        );
+
+        // One context, transitioned Active → Closing before spawn.
+        let ctx_state = ss_paid_target_state(SS_TARGET);
+        ctx_state
+            .handle
+            .transition_to(&ContextState::Closing)
+            .expect("Active → Closing");
+        spawn_ss_actor(&supervisor, "did:example:ss-target-owner", ctx_state).await;
+
+        let registry = ss_registry();
+        let (params, binding) = ss_stream_params([0x37; 16]);
+        let executor = Arc::new(FiniteChunkExecutor {
+            data_chunks: 5,
+            invoked: Arc::clone(&invoked),
+        });
+        let outlet_id: OutletId = SS_OUTLET.to_owned();
+        let target_hex = hex::encode(SS_TARGET);
+
+        let Err(err) = supervisor
+            .open_outlet_stream(
+                &target_hex,
+                &registry,
+                &outlet_id,
+                serde_json::json!({ "a": 1, "b": 2 }),
+                &ss_invoker(),
+                Some(5_000),
+                executor,
+                None,
+                None,
+                None,
+                Some(binding),
+                params,
+            )
+            .await
+        else {
+            panic!("a Closing context must reject a same-context stream open");
+        };
+
+        match &err {
+            OpenStreamRejection::ContextNotActive { current_state } => {
+                assert!(
+                    current_state.contains("Closing"),
+                    "the rejection names the lifecycle state: {current_state}"
+                );
+            }
+            other => panic!("expected OpenStreamRejection::ContextNotActive, got {other:?}"),
+        }
+        assert_eq!(
+            err.error_code(),
+            error_codes::CODE_PROTOCOL_SESSION,
+            "#2196 maps the same-context open reject to the Protocol class (SCP-OUTLET-6101)"
+        );
+        assert_eq!(
+            error_codes::error_code_to_retry_policy(err.error_code()),
+            Some(RetryPolicy::Never),
+            "a same-context open reject on a Closing context is NON-retryable"
+        );
+        assert_eq!(
+            ss_remaining_budget(&supervisor, &target_hex, &ss_invoker()).await,
+            Amount::new(SS_GRANTED),
+            "no escrow debited on a rejected same-context open"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "the executor is never invoked on a rejected open"
+        );
         drop(invoked);
     }
 

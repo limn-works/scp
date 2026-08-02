@@ -5204,6 +5204,22 @@ pub(crate) async fn run_streaming_saga_seal_task(
             // journal at `Committing` — the autonomous crash-recovery sweep
             // (SCP-OUT-046 #136) resolves it (witness present → Committed; absent
             // → the key-bearing truncated close, or an honest NeedsRepair).
+            //
+            // EXACTLY-ONCE ESCROW INVARIANT (#2196 audit note): dropping the
+            // ticket here is the SOLE refund and is safe ONLY because a resident
+            // actor's ed25519 receipt-signing is INFALLIBLE — the one signing
+            // failure path (`SCP-SAGA-13044`, streaming Commit-B receipt-signing,
+            // the preimage-construction/sign step) is unreachable under the
+            // §9.10.3 256 KB preimage bound, so no seal ever
+            // fails transiently *after* having signed. If a future receipt field
+            // or a new signer introduced a GENUINE transient resident-actor
+            // signing error, this drop would reverse the hold and a later
+            // key-bearing reseal (crash recovery) would refund it AGAIN —
+            // DOUBLE-REFUND. Such a real transient signing error MUST NOT reach
+            // this drop: handle it with a "sealed-but-unsigned / do-not-drop"
+            // marker that keeps the hold pending the reseal, never a silent ticket
+            // drop. (Behavioural change is out of scope here — this documents the
+            // load-bearing precondition the current drop relies on.)
             drop(escrow_ticket);
             tracing::error!(
                 saga_id = %saga_id.0,
