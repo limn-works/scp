@@ -55,7 +55,7 @@ from typing import (
     runtime_checkable,
 )
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import ScpError, _coded_bridge_error
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
@@ -614,6 +614,7 @@ class SCP:
         runs ``block_on`` internally, so the sync path is correct here.
         Async callers should use :meth:`__aexit__` / ``async with``.
         """
+        del exc_type, exc, tb
         self._native.shutdown(self._shutdown_millis(5.0))
 
     async def __aenter__(self) -> SCP:
@@ -631,6 +632,7 @@ class SCP:
         Awaits :meth:`shutdown` so the event loop keeps running while
         the tokio runtime drains in-flight tasks.
         """
+        del exc_type, exc, tb
         await self.shutdown()
 
     # ------------------------------------------------------------------
@@ -661,16 +663,16 @@ class SCP:
         """Create an identity link attestation (§3.5).
 
         Returns an :class:`~scp_sdk.identity.IdentityAttestation` on success.
-        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge does
+        Raises :class:`~scp_sdk.errors.AttestationError` when the bridge does
         not expose attestation creation (missing FFI feature).
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "create_identity_link_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation creation is not yet available in the bridge",
                 "SCP-ATTEST-9010",
             )
@@ -690,7 +692,10 @@ class SCP:
         """Delegate to ``_scp_core.SCP.identity_add_agent_key`` (returns :class:`Identity`)."""
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_attest_device(self, identity_did: str) -> Any:
@@ -815,25 +820,28 @@ class SCP:
         """
         import json
 
-        result_json = await asyncio.to_thread(
-            self._native.identity_execute_recovery, did, tier, context_ids
-        )
+        try:
+            result_json = await asyncio.to_thread(
+                self._native.identity_execute_recovery, did, tier, context_ids
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return json.loads(result_json) if isinstance(result_json, str) else result_json
 
     async def identity_link_attestations(self, did: str) -> list[Any]:
         """List identity link attestations for *did* (§3.5).
 
         Returns a list of :class:`~scp_sdk.identity.IdentityAttestation`
-        instances. Raises :class:`~scp_sdk.errors.IdentityError` when the
+        instances. Raises :class:`~scp_sdk.errors.AttestationError` when the
         bridge does not expose the endpoint.
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "identity_link_attestations"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation listing is not yet available in the bridge",
                 "SCP-ATTEST-9011",
             )
@@ -853,23 +861,29 @@ class SCP:
 
         The bridge returns a tuple ``(PyIdentity, rotation_event_json)``
         — the JSON-serialized ``DidRotationEvent`` (spec §9.12,
-        ADR-003 §4b/4c) is attached to the returned :class:`Identity`
+        ADR-003 §4b) is attached to the returned :class:`Identity`
         wrapper as ``identity.rotation_event_json`` so SDK callers can
-        distribute the event to active context members per spec
-        §3.2.1 step 4b.
+        distribute the event to active context members (spec §9.12,
+        ADR-003 §4b).
         """
         from scp_sdk.identity import Identity
 
-        raw_handle, rotation_event_json = await asyncio.to_thread(
-            self._native.identity_migrate, identity
-        )
+        try:
+            raw_handle, rotation_event_json = await asyncio.to_thread(
+                self._native.identity_migrate, identity
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw_handle, rotation_event_json=rotation_event_json)
 
     async def identity_remove_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_remove_agent_key`` (returns :class:`Identity`)."""
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_remove(self, did: str) -> None:
@@ -879,7 +893,11 @@ class SCP:
         without error when the DID is not present. Delegates to
         ``_scp_core.SCP.identity_remove``.
         """
-        await asyncio.to_thread(self._native.identity_remove, did)
+
+        try:
+            await asyncio.to_thread(self._native.identity_remove, did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def identity_remove_if_present(self, did: str) -> bool:
         """Remove a DID from the identity registry if present.
@@ -888,23 +906,27 @@ class SCP:
         the DID was not in the registry. Delegates to
         ``_scp_core.SCP.identity_remove_if_present``.
         """
-        return await asyncio.to_thread(self._native.identity_remove_if_present, did)
+
+        try:
+            return await asyncio.to_thread(self._native.identity_remove_if_present, did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def identity_renew_attestation(self, did: str, attestation_id: str) -> Any:
         """Renew an identity link attestation (§3.5.2).
 
         Returns an :class:`~scp_sdk.identity.IdentityAttestation` with a
         refreshed ``verified_at`` timestamp. Raises
-        :class:`~scp_sdk.errors.IdentityError` when the bridge does not
+        :class:`~scp_sdk.errors.AttestationError` when the bridge does not
         expose renewal.
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "identity_renew_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation renewal is not yet available in the bridge",
                 "SCP-ATTEST-9013",
             )
@@ -925,14 +947,20 @@ class SCP:
         """Delegate to ``_scp_core.SCP.identity_rotate_agent_key`` (returns :class:`Identity`)."""
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_rotate_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_rotate_key`` (returns :class:`Identity`)."""
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_rotate_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_rotate_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_verify_device_attestation(self, did: str, token_base64: str) -> Any:
@@ -967,10 +995,10 @@ class SCP:
         Returns ``True`` if the attestation existed and was removed,
         ``False`` if no attestation with that ID was present.
         """
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
 
         if not hasattr(self._native, "remove_identity_link_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation removal is not yet available in the bridge",
                 "SCP-ATTEST-9012",
             )
@@ -1263,7 +1291,11 @@ class SCP:
 
     async def context_member_count(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_count``."""
-        return await asyncio.to_thread(self._native.context_member_count, handle)
+
+        try:
+            return await asyncio.to_thread(self._native.context_member_count, handle)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def context_member_dids(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_dids``."""
@@ -1350,9 +1382,13 @@ class SCP:
         event); retry once peers' pseudonym-announcement messages have arrived.
         A lone-member send is a no-op; broadcast contexts are unaffected.
         """
-        return await asyncio.to_thread(
-            self._native.context_send, handle, identity_did, payload, spending_ucan_jwt
-        )
+
+        try:
+            return await asyncio.to_thread(
+                self._native.context_send, handle, identity_did, payload, spending_ucan_jwt
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def get_economic_policy(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.get_economic_policy``."""
@@ -1430,14 +1466,18 @@ class SCP:
         step-5 audience check the tautology ``aud == aud`` and inflate trust).
         Pass the DID the token must be addressed to.
         """
-        return await asyncio.to_thread(
-            self._native.ucan_validate,
-            context_id,
-            token,
-            capability,
-            presenting_agent_did,
-            proof_tokens,
-        )
+
+        try:
+            return await asyncio.to_thread(
+                self._native.ucan_validate,
+                context_id,
+                token,
+                capability,
+                presenting_agent_did,
+                proof_tokens,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def ucan_evaluate(
         self,
@@ -1722,9 +1762,13 @@ class SCP:
 
     async def governance_propose(self, handle: Any, identity_did: str, action_json: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_propose``."""
-        return await asyncio.to_thread(
-            self._native.governance_propose, handle, identity_did, action_json
-        )
+
+        try:
+            return await asyncio.to_thread(
+                self._native.governance_propose, handle, identity_did, action_json
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def governance_reject(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_reject``."""
@@ -1812,15 +1856,15 @@ class SCP:
 
         Args:
             i_trust_all_commands: Must be ``True`` to confirm the security
-                bypass. Raises ``ValidationError`` if ``False``.
+                bypass. Raises ``McpError`` if ``False``.
 
         Raises:
-            ValidationError: If *i_trust_all_commands* is not ``True``.
+            McpError: If *i_trust_all_commands* is not ``True``.
         """
-        from scp_sdk.errors import ValidationError
+        from scp_sdk.errors import McpError
 
         if not i_trust_all_commands:
-            raise ValidationError(
+            raise McpError(
                 "You must pass i_trust_all_commands=True to disable the "
                 "stdio allowlist. This allows arbitrary command execution.",
                 code="SCP-MCP-10007",
@@ -2101,7 +2145,10 @@ class SCP:
         """
         from scp_sdk.event_log import Event
 
-        raw_events = await asyncio.to_thread(self._native.event_log_query, context_id, filter)
+        try:
+            raw_events = await asyncio.to_thread(self._native.event_log_query, context_id, filter)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return [
             Event(
                 event_type=e.event_type,
@@ -2180,6 +2227,41 @@ class SCP:
     async def economy_budget_remaining(self, context_id: str, did: str) -> Any:
         """Delegate to ``_scp_core.SCP.economy_budget_remaining``."""
         return await asyncio.to_thread(self._native.economy_budget_remaining, context_id, did)
+
+    async def economy_verify_payment_receipts(
+        self, receipts: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Delegate to ``_scp_core.SCP.economy_verify_payment_receipts``.
+
+        Verifies a batch of payment receipts against this instance's economy
+        state. The result reports cryptographic validity via the top-level
+        ``all_valid`` flag and a per-receipt ``valid`` flag. Note that an
+        invalid-but-reachable receipt still carries ``ok == True`` — callers
+        scanning for failures MUST inspect ``valid``/``all_valid``, not ``ok``.
+
+        Args:
+            receipts: List of payment receipt dicts to verify. Maximum
+                10,000 receipts per call.
+
+        Returns:
+            A dict with keys ``all_valid`` (bool) and ``results`` (list of
+            per-receipt dicts with ``receipt_id``, ``ok``, ``valid``, and
+            ``result`` keys).
+
+        Raises:
+            ScpError: If the receipts are invalid or the supervisor is
+                not initialized.
+        """
+        import json
+
+        receipts_json = json.dumps(receipts)
+        try:
+            raw = await asyncio.to_thread(
+                self._native.economy_verify_payment_receipts, receipts_json
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+        return json.loads(raw)
 
     # endregion Economy
 
@@ -2462,16 +2544,20 @@ class SCP:
         spending_ucan: str | None = None,
     ) -> Any:
         """Delegate to ``_scp_core.SCP.outlet_invoke``."""
-        return await asyncio.to_thread(
-            self._native.outlet_invoke,
-            context_id,
-            outlet_id,
-            input,
-            identity_did,
-            ucan_token,
-            proof_tokens,
-            spending_ucan,
-        )
+
+        try:
+            return await asyncio.to_thread(
+                self._native.outlet_invoke,
+                context_id,
+                outlet_id,
+                input,
+                identity_did,
+                ucan_token,
+                proof_tokens,
+                spending_ucan,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def outlet_invoke_cross_context(
         self,

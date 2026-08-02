@@ -187,6 +187,12 @@
   ParticipationProfile (L218) + spec19 PaymentReceipt got PROSE COMMENT only — no field. Interim is shipping
   state, so anchored=false surfacing is load-bearing NOW. Add per-fact bool/bitmask when interim lands.
 
+### SDK Coverage Fail-Closed + Parity (fix/sdk-coverage-fail-closed-and-parity, b27ef7bff) -- 2026-06-21 -- APPROVED, ZERO FINDINGS
+- check-sdk-coverage.py fail-closed VERIFIED: missing SDK key=error; non-bool/None cell=error; true-but-no-symbol-no-exemption=error; all-exempted-no-verified-SDK=error; empty/blank exemption reason=error. Alias+candidate matching is exact `in sdk_symbols` set membership ONLY (substring/suffix fuzzy match REMOVED -- closed the ~23-fabricated-name bypass class). ALIASES map to REAL op-name symbols, can't fabricate. broadcast_open_key ALIASES entry present+correct (all 4 SDKs -> real symbols confirmed in code). Gate runs PASS 0 errors / 223 ops. 11 self-tests pass; CI now runs self-tests BEFORE gate (strengthened).
+- PERM-3030 re-raise (trust.py:770 startswith, trust.ts:461 /^\[SCP-PERM-3030\]/) anchored at START. Load-bearing: PyO3 maps HandleAffinityError->UcanError(PERM-3030) so `except UcanError` WOULD catch it; without re-raise it'd classify "unknown"->all-False false trust verdict masking caller instance-mismatch bug. _classify_ucan_error returns "unknown" for "handle belongs to..." (no prefix matches). HandleAffinityError Display SANITIZED (ids in Debug only, not user string) -- no info leak. thiserror fmt `[{code}] permission error: {msg}` => bracket at pos 0, anchor matches. Tested both SDKs (trust.test.ts:401, test_sdk_parity_additions.py:103).
+- test-guard.ts: _IS_TEST_ENVIRONMENT frozen at module load (IIFE reads process.env once); Object.hasOwn resists prototype pollution; guards __setBridgeForTests + __constructScpWithNativeForTests (native-bridge swap = priv-esc vector). Defense layered: frozen const + hasOwn + tsup DCE + package.json exports gating. Prototype-pollution + frozen-mutation tested (test-guard.test.ts:64).
+- FFI identity + MLS provider diffs = DOC-COMMENT ONLY (§3.2.1->§9.12,ADR-003§4b citation fix; ContextManager->actor wording). No logic change. discovery.py adds TypedDict/Literal + discover_contexts passthrough to bridge.context_discover (validation in Rust validate.rs; no injection/format-string/leak).
+
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
 - zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no
@@ -270,3 +276,13 @@
 - MEDIUM: send_sequence wrapping_add allows theoretical nonce reuse at u64::MAX
 - FIXED from prior: sender key AAD zeros; MLS management messages; epoch poisoning defense; error message sanitization
 - GOOD: Escrow budget pattern with reverse_spend; ConsequenceRule::validate whitelist; NoOpPaymentAdapter cfg-gated; decrypt collapses CiphertextTooShort into AuthenticationFailed (oracle prevention); TOCTOU guard in enforce_triggered_consequences
+
+### fix/sdk-coverage-fail-closed-and-parity @ f6caeb5dd (2026-06-20) -- CLEAN
+- See `trust-error-classifier-f6caeb5dd.md`. No CRITICAL/HIGH. trust.ts UCAN error classifier SAFE (START-anchored fixed prefixes + startsWith, attacker data always after fixed colon-literal, output ADVISORY not authz). LESSON: error-string classifiers MUST use startsWith on start-anchored prefixes, never includes(). __setBridgeForTests triple-isolated (not in index.ts + exports map blocks deep import + NODE_ENV guard). check-sdk-coverage all_exempted_ops gate sound for honest-drift not malicious committer. ADR-051 (Proposed) = pre-existing MEDIUM (pre-rotation key shares process-memory substrate, §9.7.4.1 §3). MLS provider.rs = doc-comment-only.
+
+### fix/sdk-coverage-fail-closed-and-parity (2026-06-20, HEAD f1edb7498) -- CLEAN
+- test-guard.ts: module-load IIFE freezes _IS_TEST_ENVIRONMENT; Object.hasOwn (proto-pollution resistant); fail-closed on missing process/env/unrecognized NODE_ENV. assertTestEnvironment gates __constructScpWithNativeForTests + __setBridgeForTests (blocks RED-PR5-007/BLACK-PR5-003 native-injection seams in prod).
+- trust.ts evaluateTrust: faithful Python port. Optimistic-true -> classify-first-failure -> break. __PASSED_BEFORE.unknown = empty set => fail-closed (all caps false on unrecognized error). [SCP-PERM-\d+] guard rethrows non-UCAN; SCP-PERM-3030 (handle-affinity) explicitly rethrown so cross-instance misuse isn't classified as trust signal. Layer-2 [SCP-CTX-\d+] guard same pattern. break-after-first-failure matches Python; conservative (only clears fields); advisory not a gate.
+- economy receipt verify (TS+Py): thin JSON pass-through, no SDK-side error string interpolation, no leakage. ok vs valid/all_valid documented (prevents "adapter responded"=="valid" misuse).
+- identity lifecycle (5 wrappers TS+Py): pass opaque handle through, no ambient/string identity resolution; scoping enforced in Rust core. identityMigrate surfaces rotation_event_json.
+- ADR-051 (proposal): separate PreRotationCustodyProvider interface structurally enforces §9.7.4.1 §3 substrate isolation. consume()->Zeroizing destroy-export. WATCH at impl time: consume() raw bytes crossing FFI to JS Array<number> are NOT zeroizable on JS heap (cf exportSigningKeyBytes adapter scp.ts:708) -- minimize surfacing pre-rotation bytes into JS.

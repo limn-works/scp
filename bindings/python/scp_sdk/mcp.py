@@ -27,7 +27,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ValidationError
+from scp_sdk.errors import McpError
 
 if TYPE_CHECKING:
     from scp_sdk.scp import McpAllowlistState
@@ -179,7 +179,7 @@ def validate_client_connect(
 ) -> None:
     """Validate MCP client connect parameters before FFI dispatch.
 
-    Raises :class:`~scp_sdk.errors.ValidationError` with a canonical
+    Raises :class:`~scp_sdk.errors.McpError` with a canonical
     error code when a parameter is missing or the stdio command shape is
     invalid (path, missing).
 
@@ -191,19 +191,19 @@ def validate_client_connect(
     unlisted commands, but only after the FFI round-trip.
     """
     if transport not in _VALID_TRANSPORTS:
-        raise ValidationError(
+        raise McpError(
             f"transport must be 'stdio' or 'sse', got {transport!r}",
             code="SCP-MCP-10002",
         )
 
     if transport == "stdio" and not command:
-        raise ValidationError(
+        raise McpError(
             "command is required for stdio transport",
             code="SCP-MCP-10004",
         )
 
     if transport == "sse" and not url:
-        raise ValidationError(
+        raise McpError(
             "url is required for sse transport",
             code="SCP-MCP-10005",
         )
@@ -220,7 +220,7 @@ def validate_client_connect(
         # covers ``..\\bin\\sh`` (the same gap `validate_command` documents
         # in `crates/scp-mcp/src/allowlist.rs`).
         if binary != basename or "\\" in binary:
-            raise ValidationError(
+            raise McpError(
                 f"command must be a bare binary name, not a path: "
                 f"'{binary}'. The OS will resolve it via PATH.",
                 code="SCP-MCP-10006",
@@ -234,7 +234,7 @@ def validate_client_connect(
             allowed_set = allowlist_state["allowed"]
             if not unrestricted and basename not in allowed_set:
                 allowed = sorted(allowed_set)
-                raise ValidationError(
+                raise McpError(
                     f"command '{basename}' is not in the MCP stdio allowlist. "
                     f"Allowed: {allowed}. "
                     f"Call scp.mcp_configure_stdio_allowlist("

@@ -74,6 +74,13 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-905 (LOW)**: MissingPassphrase → VALID-7004 (UniFFI only). Combined with pre-existing CustodyError("decryption failed (wrong passphrase?)") vs Io differential, gives 3-way oracle for identity file state.
 - **RED-906 (LOW)**: NaN guard in TS uses Number.isFinite but not Number.isSafeInteger. Unsafe-integer verified_at (>=2^53) silently truncates on re-serialize, causing cross-peer signature consistency failure.
 
+## PR `fix/sdk-coverage-fail-closed-and-parity` (2026-06-20, commit 6f356f8dc)
+See [pr_sdk_coverage_fail_closed_parity.md](pr_sdk_coverage_fail_closed_parity.md) for full chains.
+- **RED-1101 (LOW)**: test-guard freeze-order — env set BEFORE first eval flips guard, but `__setBridgeForTests` not exported + `exports` map only `"."` blocks deep import. Not exploitable except prod NODE_ENV=test bleed.
+- **RED-1102 (LOW, premise disproven)**: `[SCP-PERM-0000]` -> "unknown" -> empty PASSED set -> all fields FALSE. Fail-closed. Real residual only via compromised bridge (resolve-on-forged / late-stage-error elevation).
+- **RED-1103 (MEDIUM, PROVEN)**: coverage gate checks symbol EXISTENCE not REACHABILITY. Routed `true` op to dead stub via stale ALIASES — gate passed clean. Same class as OwnedIdentityDid name-vs-definition lesson.
+- **RED-1104 (NON-ISSUE)**: receipt JSON.stringify/parse — no injection, no proto pollution (native parse `__proto__` = own key).
+
 ## Key Attack Patterns for This Codebase
 - **Bridge parity gap**: WASM bridge cannot depend on scp-core (tokio incompatibility), so it re-implements validation partially. ALWAYS check WASM bridge when core validation changes.
 - **Two UcanToken types**: `roles::UcanToken` (stub, no sig/expiry) vs `crypto::ucan::UcanToken` (full, has sig/encoded). Broadcast uses the stub. Any code accepting the stub has no sig verification.
@@ -88,6 +95,8 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **Replay without nonce**: BRIDGE_REGISTER uses timestamp-only replay protection (60s window). No nonce, no connection binding. Captured frames are replayable within window.
 - **Unbounded event-driven loops**: tier re-evaluation loop has no debounce. Any channel sender can trigger unlimited STUN probes + DID publishes.
 - **Structural fallback bypass (FIXED)**: check_projection_auth now hard-rejects empty member_keys with 401. Dead `None` arm remains but is unreachable. Latent risk only.
+- **TS test-seam tree-shaking (r12 2026-06-20)**: tsup `splitting:false` + entry=src/index.ts dead-code-eliminates anything not in the index export graph. `__setBridgeForTests`/`__constructScpWithNativeForTests` are grep-count-0 in dist/index.js — the env guard (`assertTestEnvironment`) is defense-in-depth #2, the bundle elimination is the real barrier. BUN_TEST="0" DOES flip the guard open (`"0".length>0`) but it gates nothing reachable. To re-check after any change: build, then `node -e 'import("./dist/index.js").then(m=>console.log("__setBridgeForTests" in m))'` must print false. Residual risk only if a future change adds `splitting:true` or an `./internal` subpath to `exports`.
+- **JS regex `^` without `m` = string-start only**: `/^\[SCP-PERM-\d+\]/.test(msg)` on a multi-line msg with the code on line 2 returns FALSE → error re-thrown (fail-closed). Used in trust.ts for SCP-PERM/SCP-CTX error classification. Not a downgrade/forgery vector — worst case is over-propagation (real UCAN error escapes as a throw instead of populating weaker Layer-1 fields). Safe by construction; an attacker controlling the Rust error text cannot use newlines to SUPPRESS a hard throw.
 
 ## Critical Files
 - `crates/scp-ffi/wasm/src/ucan.rs` -- Missing 5 validation steps (RED-101), wildcard bypass (RED-105)

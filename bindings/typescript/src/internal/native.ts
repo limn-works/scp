@@ -8,7 +8,7 @@
  * optional dependency. If the package is not installed, loading fails with
  * a `TransportError` and an actionable message.
  *
- * Since ADR-048 (#1549 Phase 4 PR 4), all calls route through the caller-
+ * Since ADR-048 (Phase 4 PR 4), all calls route through the caller-
  * supplied {@link SCP} instance's class methods rather than module-level
  * free functions. The process-wide default-instance fallback was deleted
  * alongside `SCP.default()` in PR 4 — every bridge is constructed with an
@@ -166,7 +166,7 @@ export function loadNativeAddon(): NativeAddon {
  *
  * @param scp The {@link SCP} wrapper whose native handle should receive
  *   all routable method calls. Required — the legacy process-wide
- *   default-instance fallback was removed in Phase 4 PR 4 (#1549)
+ *   default-instance fallback was removed in Phase 4 PR 4
  *   demolition.
  *
  * @internal
@@ -313,7 +313,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       identityDid: string,
       callback: MessageCallback,
     ): Promise<void> {
-      // NAPI `context_subscribe` is `async` after coder H's #1549 Phase 4
+      // NAPI `context_subscribe` is `async` after Phase 4
       // PR 1 changes — the subscription task is now registered against
       // the bridge's `JoinSet` / cancel token so shutdown drains it
       // deterministically. The returned Promise resolves once the
@@ -1732,7 +1732,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
-    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+    // Recovery and custody migration (#632, spec §9.12)
     async identityExecuteRecovery(
       did: string,
       tier: string,

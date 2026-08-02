@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 #       +-- TransportError
 #       +-- UcanError
 #       +-- ValidationError
+#       +-- StorageError
+#       +-- AttestationError
+#       +-- McpError
+#       +-- GovernanceError
+#       +-- EconomyError
 
 class ScpError(Exception):
     """Base exception for all SCP protocol errors."""
@@ -80,6 +85,31 @@ class UcanError(ScpError):
 
 class ValidationError(ScpError):
     """Input validation failed (malformed data, schema mismatch, constraint violation)."""
+
+    ...
+
+class StorageError(ScpError):
+    """A persistent-storage operation failed (SCP-STORAGE range, 8000-8999)."""
+
+    ...
+
+class AttestationError(ScpError):
+    """A device or identity attestation operation failed (SCP-ATTEST range, 9000-9999)."""
+
+    ...
+
+class McpError(ScpError):
+    """An MCP protocol or tool-invocation operation failed (SCP-MCP range, 10000-10999)."""
+
+    ...
+
+class GovernanceError(ScpError):
+    """A context governance proposal or voting operation failed (SCP-GOV range, 11000-11999)."""
+
+    ...
+
+class EconomyError(ScpError):
+    """A payment, budget, or economic-policy operation failed (SCP-ECON range, 12000-12999)."""
 
     ...
 

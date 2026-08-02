@@ -12,12 +12,67 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import EconomyError, ScpError
 
 if TYPE_CHECKING:
     from scp_sdk.scp import SCP
+
+# ---------------------------------------------------------------------------
+# Payment receipt verification types
+# ---------------------------------------------------------------------------
+
+
+class _PaymentReceiptVerificationEntryRequired(TypedDict):
+    """Required fields present on every PaymentReceiptVerificationEntry."""
+
+    ok: bool
+    """Whether the adapter successfully processed this receipt.
+
+    ``True`` means the adapter responded — NOT that the payment is valid.
+    Inspect ``valid`` / :attr:`PaymentReceiptVerificationResult.all_valid`
+    for actual validity.
+    """
+
+
+class PaymentReceiptVerificationEntry(_PaymentReceiptVerificationEntryRequired, total=False):
+    """One entry in a :class:`PaymentReceiptVerificationResult` results list.
+
+    ``ok`` is always present. All other keys are optional and only populated
+    when the adapter responded (``ok == True``), except ``error`` which is
+    set when the adapter failed (``ok == False``).
+
+    Mirrors the TypeScript ``PaymentReceiptVerificationEntry`` interface and
+    the wire shape produced by ``verification_results_to_json`` in
+    ``scp-runtime/economy/receipt.rs``.
+    """
+
+    receipt_id: str
+    """Receipt identifier — present only when ``ok`` is ``True``."""
+    valid: bool
+    """Whether the receipt was cryptographically valid — present only when ``ok`` is ``True``."""
+    result: dict[str, object]
+    """Structured verification detail — present only when ``ok`` is ``True``."""
+    error: str
+    """Error message — present only when ``ok`` is ``False``."""
+
+
+class PaymentReceiptVerificationResult(TypedDict):
+    """Result of verifying a batch of payment receipts.
+
+    Returned by :meth:`~scp_sdk.SCP.economy_verify_payment_receipts`.
+
+    ``all_valid`` is ``True`` iff every receipt both reached the adapter
+    and the adapter reported it valid. Vacuously ``True`` for an empty batch.
+    Mirrors the TypeScript ``PaymentReceiptVerificationResult`` interface.
+    """
+
+    all_valid: bool
+    """``True`` iff every receipt reached the adapter and was reported valid."""
+    results: list[PaymentReceiptVerificationEntry]
+    """Per-receipt verification outcomes."""
+
 
 logger = logging.getLogger("scp_sdk")
 
@@ -65,12 +120,12 @@ _KNOWN_CURRENCY_DECIMALS: dict[str, int] = {
 
 def _format_with_decimals(amount: int, decimals: int) -> str:
     if amount < 0:
-        raise ScpError(
+        raise EconomyError(
             f"amount must be non-negative, got {amount}",
             code="SCP-ECON-12070",
         )
     if decimals < 0 or decimals > 100:
-        raise ScpError(
+        raise EconomyError(
             f"decimals must be in 0..=100, got {decimals}",
             code="SCP-ECON-12070",
         )
@@ -117,7 +172,7 @@ def format_amount(
             if ``amount``/``decimals`` are out of range.
     """
     if (currency is None) == (decimals is None):
-        raise ScpError(
+        raise EconomyError(
             "exactly one of 'currency' or 'decimals' must be supplied",
             code="SCP-ECON-12070",
         )
@@ -126,7 +181,7 @@ def format_amount(
     assert currency is not None  # narrowed by the exclusivity check above
     known = _KNOWN_CURRENCY_DECIMALS.get(currency.upper())
     if known is None:
-        raise ScpError(
+        raise EconomyError(
             f"unknown currency {currency!r} has no known decimals; "
             "pass an explicit decimals= override",
             code="SCP-ECON-12070",
@@ -281,32 +336,29 @@ async def verify_payment_receipts(
         on failure.
 
     Raises:
-        ValueError: If the receipts cannot be serialized, the batch
-            exceeds the maximum, or the JSON is invalid.
-        RuntimeError: If the supervisor is not initialized.
+        ScpError: (or an appropriate subclass) if the bridge raises any
+            protocol error, including invalid receipts or an uninitialized
+            supervisor.
     """
+    from scp_sdk.errors import _coded_bridge_error
+
     instance = scp._native
     receipts_json = json.dumps(receipts)
-    result = await asyncio.to_thread(
-        instance.economy_verify_payment_receipts,
-        receipts_json,
-    )
+    try:
+        result = await asyncio.to_thread(
+            instance.economy_verify_payment_receipts,
+            receipts_json,
+        )
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
     if isinstance(result, str):
         return json.loads(result)
     return result
 
 
-# ---------------------------------------------------------------------------
-# Budget tracking
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Antispam velocity tracking
-# ---------------------------------------------------------------------------
-
-
 __all__ = [
+    "PaymentReceiptVerificationEntry",
+    "PaymentReceiptVerificationResult",
     "auto_accept_blocked",
     "check_policy_lock",
     "estimate_cost",

@@ -19,6 +19,8 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
+import type { Context } from "../src/context";
+import type { SCP } from "../src/scp";
 import type {
   AttestorInfo,
   CachedAttestation,
@@ -115,6 +117,30 @@ function statefulUcanEvaluate(
   };
 }
 
+/**
+ * Creates a mock SCP instance paired with a minimal Context handle for tests
+ * that exercise methods requiring a context (e.g. `evaluateTrust` Layer 1+2).
+ */
+function mountWithContext() {
+  const { scp, native } = mountMockScp();
+  const context = { _rawHandle: {} as object, contextId: "ctx-test" } as unknown as Context;
+  return { scp, native, context };
+}
+
+/**
+ * Thin wrapper so tests can call `evaluateTrust(scp, did, ctx, tokens?)` rather
+ * than `scp.evaluateTrust(ctx._rawHandle, did, tokens?)` — mirrors Python's
+ * standalone `evaluate_trust(scp, did, ctx, tokens)` helper convention.
+ */
+function evaluateTrust(
+  scp: SCP,
+  subjectDid: string,
+  context: Context,
+  tokens?: readonly string[],
+): ReturnType<SCP["evaluateTrust"]> {
+  return scp.evaluateTrust(context._rawHandle, subjectDid, tokens);
+}
+
 describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
   let cleanup: (() => Promise<void>) | undefined;
   afterEach(async () => {
@@ -170,6 +196,29 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
     expect(call?.args[2]).toBeNull();
     expect(call?.args[3]).toBe("did:dht:agent");
     expect(call?.args[4]).toBeNull();
+  });
+
+  it("PERM-3030 handle-affinity error re-throws instead of being classified", async () => {
+    // PERM-3030 errors indicate caller misuse (handle belongs to a different SCP
+    // instance) and must propagate to the caller rather than being silently
+    // mapped to a failed CapabilityValidation. Mirrors Python's
+    // test_evaluate_trust_reraises_perm_3030_handle_affinity_error.
+    const { scp, native, context } = mountWithContext();
+    const perm3030 = new Error(
+      "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance",
+    );
+    // scp.evaluateTrust calls this.ucanEvaluate (read-only probe), not ucanValidate.
+    native.__stub("ucanEvaluate", () => Promise.reject(perm3030));
+
+    let threw = false;
+    try {
+      await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
+    } catch (err) {
+      threw = true;
+      // mapBridgeError re-wraps the raw error; check the preserved message.
+      expect((err as Error).message).toContain("[SCP-PERM-3030]");
+    }
+    expect(threw).toBe(true);
   });
 });
 
@@ -609,6 +658,20 @@ describe("encodeCapabilityRequirements", () => {
         verification_level: "ChallengeVerified",
       },
     ]);
+  });
+
+  it("Layer 2 — non-context error propagates instead of swallowing to null", async () => {
+    const { scp, native, context } = mountWithContext();
+    // No tokens → Layer 1 skipped. scp.evaluateTrust calls participationRecord for Layer 2.
+    const networkError = new Error("Network timeout");
+    native.__stub("participationRecord", () => {
+      throw networkError;
+    });
+
+    // The catch block in Layer 2 must re-throw non-context errors — it must NOT
+    // swallow them into behavioralRecord: null (which would hide genuine faults).
+    // mapBridgeError re-wraps the raw error; check the preserved message.
+    await expect(evaluateTrust(scp, "did:dht:z6MkBob", context)).rejects.toThrow("Network timeout");
   });
 });
 

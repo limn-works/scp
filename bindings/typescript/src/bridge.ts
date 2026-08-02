@@ -1,12 +1,17 @@
 /**
- * Bridge connector types and entry points for the SCP TypeScript SDK.
+ * Bridge connector types and module functions for the SCP TypeScript SDK.
  *
- * Defines bridge-connector wire types (spec §12, ADR-023). The
- * `bridgeCreateShadow` entry point lives on the {@link SCP} class
- * (Phase 4 PR 4, ADR-048); {@link bridgeRegister} is the public
- * wrapper over the NAPI `bridge_register` free function
- * (`bridge_connector.rs`), exposed here as a free function that takes an
- * explicit {@link SCP} instance per the ADR-048 multi-instance pattern.
+ * Defines bridge-connector wire types (spec §12, ADR-023). The stateful
+ * functional entry point (`bridgeCreateShadow`) moved onto the
+ * {@link SCP} class in Phase 4 PR 4 (#1549, ADR-048).
+ *
+ * {@link evaluateTrust} is the pure bridge-provenance trust-tier classifier
+ * (spec §12). It is a module function — mirroring the Python SDK's
+ * `scp_sdk.bridge.evaluate_trust` — that routes to the bridge's
+ * `bridgeEvaluateTrust` operation. It takes an {@link SCP} instance because
+ * the per-instance bridge is resolved through `getBridge(scp)` (the same
+ * mechanism the discovery-module free functions use); the operation itself
+ * is pure (no per-instance state).
  *
  * See spec section 12 (Bridge System) and ADR-023.
  */
@@ -20,6 +25,17 @@ import type { SCP } from "./scp";
 
 /** Bridge operating mode (spec §12). */
 export type BridgeMode = "relay" | "puppet" | "api" | "cooperative";
+
+/**
+ * Bridge trust tier returned by {@link evaluateTrust} (spec §12).
+ *
+ * Integer discriminants mirror the Rust `BridgeTrustLevel` enum:
+ * - `0` — `ShadowBridged` (weakest): bridged, unclaimed shadow identity.
+ * - `1` — `ClaimedBridged`: bridged, shadow identity was claimed.
+ * - `2` — `NativeBridged`: bridged action over native SCP transport.
+ * - `3` — `NativeNative` (strongest): native action over native transport.
+ */
+export type BridgeTrustLevel = 0 | 1 | 2 | 3;
 
 /** Shadow identity provenance status. */
 export type ShadowStatus = "shadow" | "claimed";
@@ -98,25 +114,53 @@ export async function bridgeRegister(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Trust evaluation (bridge provenance)
+// ---------------------------------------------------------------------------
+
 /**
- * Evaluate the trust level for a bridge action (spec §12, ADR-023).
- *
- * Wraps the NAPI `bridge_evaluate_trust` free function. Returns a numeric
- * trust level derived from whether the action is bridged, whether it crossed a
- * native SCP transport, and the shadow-identity provenance status.
- *
- * @param scp The SCP instance to resolve the bridge under.
- * @param isBridged Whether the action originated through a bridge connector.
- * @param isNativeTransport Whether the action used SCP-native transport.
- * @param shadowStatus The shadow identity's provenance status.
- * @returns The evaluated bridge trust level.
+ * Options for {@link evaluateTrust}. Mirrors the keyword-only arguments and
+ * defaults of the Python SDK's `scp_sdk.bridge.evaluate_trust`.
  */
-export async function bridgeEvaluateTrust(
+export interface BridgeTrustOptions {
+  /** Whether the action carries bridge provenance. Defaults to `false`. */
+  readonly isBridged?: boolean;
+  /** Whether the transport is native SCP. Defaults to `true`. */
+  readonly isNativeTransport?: boolean;
+  /**
+   * Shadow provenance status. Only meaningful when `isBridged` is `true`.
+   * Defaults to `"shadow"`.
+   */
+  readonly shadowStatus?: ShadowStatus;
+}
+
+/**
+ * Evaluates the trust tier for an action based on bridge provenance (spec §12).
+ *
+ * Returns an integer (0–3) representing the trust tier, strongest last:
+ *
+ * - `0` — `ShadowBridged` (weakest): bridged action, unclaimed shadow identity.
+ * - `1` — `ClaimedBridged`: bridged action whose shadow identity was claimed.
+ * - `2` — `NativeBridged`: bridged action over native SCP transport.
+ * - `3` — `NativeNative` (strongest): native action over native transport.
+ *
+ * Mirrors the Python SDK's `scp_sdk.bridge.evaluate_trust`. The operation is
+ * pure (no per-instance state); the {@link SCP} argument exists only so the
+ * per-instance bridge can be resolved — consistent with the discovery-module
+ * free functions (`parseAddress`, `createQuery`, …).
+ *
+ * @param scp The {@link SCP} instance whose bridge dispatches the call.
+ * @param options Provenance inputs; each field defaults per the Python SDK
+ *   (`isBridged=false`, `isNativeTransport=true`, `shadowStatus="shadow"`).
+ * @returns The trust tier as a {@link BridgeTrustLevel} integer (0–3).
+ */
+export async function evaluateTrust(
   scp: SCP,
-  isBridged: boolean,
-  isNativeTransport: boolean,
-  shadowStatus: ShadowStatus,
-): Promise<number> {
+  options: BridgeTrustOptions = {},
+): Promise<BridgeTrustLevel> {
   const bridge = await getBridge(scp);
-  return bridge.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus);
+  const isBridged = options.isBridged ?? false;
+  const isNativeTransport = options.isNativeTransport ?? true;
+  const shadowStatus = options.shadowStatus ?? "shadow";
+  return bridge.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus) as BridgeTrustLevel;
 }

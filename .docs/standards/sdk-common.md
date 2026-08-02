@@ -10,11 +10,16 @@ All SDKs implement the same error hierarchy. Language-specific idioms (exception
 ScpError (root)
 ├── IdentityError        — DID creation, resolution, key rotation failures
 ├── ContextError         — Context lifecycle (create, join, leave, close) failures
-├── PermissionError      — UCAN capability validation failures (Python: `UcanPermissionError` to avoid shadowing `builtins.PermissionError`)
+├── UcanPermissionError  — UCAN capability validation failures (avoids shadowing `builtins.PermissionError` in Python and the global `PermissionError` in TypeScript)
 ├── CryptoError          — Encryption, decryption, signature failures
 ├── TransportError       — Network, relay, connection failures
 ├── OutletError          — Outlet registration, invocation, verification failures
-└── ValidationError      — Input validation, schema, parameter failures
+├── ValidationError      — Input validation, schema, parameter failures
+├── StorageError         — Persistent-storage operation failures (SCP-STORAGE range)
+├── AttestationError     — Device and identity attestation failures (SCP-ATTEST range)
+├── McpError             — MCP protocol and tool-invocation failures (SCP-MCP range)
+├── GovernanceError      — Context governance proposal and voting failures (SCP-GOV range)
+└── EconomyError         — Payment, budget, and economic-policy failures (SCP-ECON range)
 ```
 
 ### Error requirements

@@ -922,8 +922,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["resume"],
     },
     # Bridge -- Python uses bare 'register' and 'evaluate_trust'.
-    # TypeScript does not expose bridge_register as a named public SDK function
-    # (matrix: typescript=false); the entry below covers only the SDKs that do.
+    # TypeScript's bridgeRegister is matched by the domain_camel auto-candidate.
     ("Bridge", "register"): {
         "python": ["register"],
     },
@@ -1230,11 +1229,16 @@ def _extract_python_methods_from_block(
 
     Handles both plain function_definition and decorated_definition
     (e.g., @classmethod, @staticmethod, @property) inside the block.
+
+    Only public (non-underscore-prefixed) names are added.  Private and
+    dunder methods (``_foo``, ``__bar``, ``__init__``, etc.) are excluded
+    so they cannot be referenced by ALIASES entries — parity with the
+    TypeScript extractor which requires an explicit ``export`` keyword.
     """
     for member in block_node.children:
         if member.type == "function_definition":
             name = _get_func_name_from_definition(member)
-            if name:
+            if name and not name.startswith("_"):
                 symbols.add(f"{class_name}.{name}")
                 symbols.add(name)
 
@@ -1243,19 +1247,23 @@ def _extract_python_methods_from_block(
             for inner in member.children:
                 if inner.type == "function_definition":
                     name = _get_func_name_from_definition(inner)
-                    if name:
+                    if name and not name.startswith("_"):
                         symbols.add(f"{class_name}.{name}")
                         symbols.add(name)
 
 
 def _extract_python_class(class_node: Node, symbols: set[str]) -> None:
-    """Extract class name and all its methods from a class_definition node."""
+    """Extract class name and all its methods from a class_definition node.
+
+    Private classes (names starting with ``_``) are skipped entirely — their
+    name and all their methods are excluded from the symbol set.
+    """
     class_name = None
     for child in class_node.children:
         if child.type == "identifier":
             class_name = _node_text(child) or None
             break
-    if not class_name:
+    if not class_name or class_name.startswith("_"):
         return
 
     symbols.add(class_name)
@@ -1265,20 +1273,27 @@ def _extract_python_class(class_node: Node, symbols: set[str]) -> None:
 
 
 def _extract_python_symbols(root_node: Node) -> set[str]:
-    """Extract function and class.method names from a Python AST.
+    """Extract public function and class.method names from a Python AST.
+
+    Only **public** symbols are collected — names starting with ``_``
+    (private/dunder) are excluded.  This brings parity with the TypeScript
+    extractor which requires an explicit ``export`` keyword: ALIASES entries
+    that reference a private helper would otherwise pass the gate while the
+    underlying symbol is implementation-internal and not callable as public API.
 
     Collects:
-      - Top-level function names (including decorated, e.g., @decorated)
-      - Class names
-      - Method names as both "ClassName.method_name" and bare "method_name"
-      - Decorated methods (@classmethod, @staticmethod, @property)
+      - Top-level public function names (``def foo``, not ``def _foo``)
+      - Public class names (not ``_PrivateClass``)
+      - Public method names as both "ClassName.method_name" and bare
+        "method_name" (``def method``, not ``def _method``)
+      - Decorated public methods (@classmethod, @staticmethod, @property)
     """
     symbols: set[str] = set()
 
     for child in root_node.children:
         if child.type == "function_definition":
             name = _get_func_name_from_definition(child)
-            if name:
+            if name and not name.startswith("_"):
                 symbols.add(name)
 
         elif child.type == "class_definition":
@@ -1289,7 +1304,7 @@ def _extract_python_symbols(root_node: Node) -> set[str]:
             for inner in child.children:
                 if inner.type == "function_definition":
                     name = _get_func_name_from_definition(inner)
-                    if name:
+                    if name and not name.startswith("_"):
                         symbols.add(name)
                 elif inner.type == "class_definition":
                     _extract_python_class(inner, symbols)
@@ -1685,6 +1700,15 @@ def _check_operation_in_sdk(
     domain_snake = f"{domain_lower}_{op_name}"
     domain_camel = _to_camel(domain_snake)
 
+    # NOTE: The candidate list includes bare op_name/camelCase/PascalCase.
+    # These are necessary because Swift/Kotlin SDKs use bare method names
+    # (e.g. Swift: `addAgentKey`, Kotlin: `isMember`) rather than
+    # domain-prefixed forms. The tradeoff is that a fabricated op whose name
+    # collides with an unrelated SDK symbol will pass the gate — this is the
+    # name-existence vs name-resolution limitation documented in
+    # .docs/lessons/ast-gate-checks-definition-not-name-resolution.md.
+    # Cross-SDK name irregularities and all ops where domain-scoped matching
+    # is insufficient must use explicit ALIASES entries above.
     candidates = [
         # Domain-prefixed
         domain_snake,  # messaging_send_message

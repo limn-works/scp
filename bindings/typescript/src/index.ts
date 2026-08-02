@@ -90,7 +90,16 @@ export {
 // Trust — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { AggregatedTrustInput, AggregationInput } from "./trust";
+export type {
+  AggregatedTrustInput,
+  AggregationInput,
+  Attestation,
+  BehavioralRecord,
+  ChallengeResult,
+  Endorsement,
+  TrustEvaluation,
+} from "./trust";
+export { evaluateTrust } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log — types only (entry points moved to SCP)
@@ -126,17 +135,25 @@ export type { AggregatedTrustInput, AggregationInput } from "./trust";
 export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle } from "./mcp";
 
 // ---------------------------------------------------------------------------
-// Bridge Connector — types + the bridgeRegister entry point
+// Bridge Connector — types + bridge-provenance trust tier
 // ---------------------------------------------------------------------------
+//
+// Stateful entry points (`bridgeCreateShadow`, credentials) live on SCP.
+// `evaluateTrust` (exported here as `bridgeEvaluateTrust` to disambiguate
+// from the four-layer `evaluateTrust` in `./trust`, mirroring the Python
+// SDK's `bridge_evaluate_trust` re-export name) is the pure bridge-provenance
+// trust-tier classifier (spec §12).
 
 export type {
   BridgeCredential,
   BridgeMode,
   BridgeRegistration,
+  BridgeTrustLevel,
+  BridgeTrustOptions,
   ShadowIdentity,
   ShadowStatus,
 } from "./bridge";
-export { bridgeEvaluateTrust, bridgeRegister } from "./bridge";
+export { bridgeRegister, evaluateTrust as bridgeEvaluateTrust } from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)
@@ -185,7 +202,12 @@ export type { DiscoveryMethod, ProvenanceRecord } from "./provenance";
 // Economy — types + display helper (stateful entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { ObservableMetrics, PaidActionType } from "./economy";
+export type {
+  ObservableMetrics,
+  PaidActionType,
+  PaymentReceiptVerificationEntry,
+  PaymentReceiptVerificationResult,
+} from "./economy";
 export { formatAmount } from "./economy";
 
 // ---------------------------------------------------------------------------
@@ -236,7 +258,6 @@ export {
   mapBridgeError,
   mapSagaError,
   OutletError,
-  PermissionError,
   ProtocolError,
   SagaAbortedError,
   SagaBusyError,
@@ -261,7 +282,6 @@ export type {
   AttestationType,
   AttestorInfo,
   BatchPublishResult,
-  BehavioralRecord,
   BroadcastAdmissionPolicy,
   CachedAttestation,
   CachedAttestationDuration,
@@ -311,7 +331,6 @@ export type {
   ThresholdRequirement,
   TransportConfig,
   TransportStatus,
-  TrustEvaluation,
   TrustLevel,
   UcanToken,
   VerificationLevel,

@@ -51,6 +51,22 @@ undetected:
 - `scripts/check-sdk-coverage.py` added to the CLAUDE.md "NEVER modify enforcement files"
   list — it is now load-bearing.
 
+## ALIASES verifies name-existence, not semantic correctness
+
+The `ALIASES` table maps a `(domain, operation)` matrix cell to the concrete
+symbol name(s) that implement it in each SDK. It is easy to over-trust: the gate
+proves only that a symbol *of that name* **exists** in the SDK source (tree-sitter
+finds the declaration). It does **not** — and cannot — prove that the symbol
+*implements the named capability*. A method named `broadcastOpenKey` that returns
+`null` unconditionally passes the gate.
+
+Keep the docstring honest about this boundary. Semantic correctness (does the
+symbol actually do the thing) is a **human-review invariant**, enforced by code
+review of the enforcement-labeled files — not by the gate. Do not let a green
+coverage gate stand in for "the capability works"; it stands only for "a symbol
+by this name is present." Adding an ALIASES entry is asserting the name exists,
+not that you verified the behavior.
+
 ## The Lesson
 
 When you add or rewrite a coverage/capability gate, design it closed by construction:

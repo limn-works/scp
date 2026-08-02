@@ -25,7 +25,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from scp_sdk.errors import IdentityError, ValidationError
+from scp_sdk.errors import AttestationError, ValidationError
 from scp_sdk.identity import IdentityAttestation, RevocationStatus, _parse_finite_int
 
 # ---------------------------------------------------------------------------
@@ -170,7 +170,7 @@ class TestScpCreateAttestation:
         from scp_sdk.scp import SCP
 
         scp = _make_scp_without_attestation_methods(missing=("create_identity_link_attestation",))
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9010"):
+        with pytest.raises(AttestationError, match="SCP-ATTEST-9010"):
             asyncio.new_event_loop().run_until_complete(
                 SCP.create_identity_link_attestation(
                     scp,  # type: ignore[arg-type]
@@ -190,7 +190,7 @@ class TestScpListAttestations:
         from scp_sdk.scp import SCP
 
         scp = _make_scp_without_attestation_methods(missing=("identity_link_attestations",))
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9011"):
+        with pytest.raises(AttestationError, match="SCP-ATTEST-9011"):
             asyncio.new_event_loop().run_until_complete(
                 SCP.identity_link_attestations(scp, "did:dht:z6MkTest")  # type: ignore[arg-type]
             )
@@ -203,7 +203,7 @@ class TestScpRemoveAttestation:
         from scp_sdk.scp import SCP
 
         scp = _make_scp_without_attestation_methods(missing=("remove_identity_link_attestation",))
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9012"):
+        with pytest.raises(AttestationError, match="SCP-ATTEST-9012"):
             asyncio.new_event_loop().run_until_complete(
                 SCP.remove_identity_link_attestation(  # type: ignore[arg-type]
                     scp, "did:dht:z6MkTest", "att-id-123"
@@ -218,7 +218,7 @@ class TestScpRenewAttestation:
         from scp_sdk.scp import SCP
 
         scp = _make_scp_without_attestation_methods(missing=("identity_renew_attestation",))
-        with pytest.raises(IdentityError, match="SCP-ATTEST-9013"):
+        with pytest.raises(AttestationError, match="SCP-ATTEST-9013"):
             asyncio.new_event_loop().run_until_complete(
                 SCP.identity_renew_attestation(scp, "did:dht:z6MkTest", "abc123")  # type: ignore[arg-type]
             )
