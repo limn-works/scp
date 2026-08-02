@@ -227,7 +227,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     };
     expect(action0.Enforcement?.SuspendCapability?.capabilities).toEqual([
       "MessagesWrite",
-      { ToolInvoke: "calculator" },
+      { OutletCall: "calculator" },
       { Custom: "my-custom-cap" },
     ]);
 
@@ -1636,16 +1636,31 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({
-          ceiling: ["messages:read", "messages:write", "role:assign", "member:invite"],
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "member:invite",
+            "governance:propose",
+          ],
           governance: "single_admin",
         }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
-      const result = await scp.contextExecuteGovernanceAction(
+      const proposeResult = await scp.contextGovernancePropose(
         ctx._rawHandle,
         JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
+        admin.did,
       );
-      expect(typeof result).toBe("string");
+      // `contextGovernancePropose` returns a JSON object with proposal_id (hex),
+      // status, and execution_result. For single_admin governance the proposal
+      // is auto-approved and auto-executed; the execution_result confirms it.
+      const proposeJson = JSON.parse(proposeResult) as {
+        proposal_id: string;
+        status: string;
+        execution_result: string | null;
+      };
+      expect(typeof proposeJson.proposal_id).toBe("string");
       const newRole = await scp.contextMemberRole(ctx._rawHandle, member.did);
       expect(newRole !== null).toBe(true);
       expect(String(newRole).toLowerCase()).toContain("moderator");
@@ -1657,15 +1672,25 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const ctx = await scp.contextCreate(
         admin,
         JSON.stringify({
-          ceiling: ["messages:read", "member:invite", "member:remove", "role:assign"],
+          ceiling: [
+            "messages:read",
+            "member:invite",
+            "member:remove",
+            "role:assign",
+            "governance:propose",
+          ],
           governance: "single_admin",
         }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
       expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(true);
-      await scp.contextExecuteGovernanceAction(
+      // For single_admin governance, contextGovernancePropose auto-approves
+      // and auto-executes the action in one call. The proposal_id is returned
+      // in the JSON result but execute is not needed separately.
+      await scp.contextGovernancePropose(
         ctx._rawHandle,
         JSON.stringify({ RemoveMember: { did: member.did, reason: null } }),
+        admin.did,
       );
       expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(false);
     });
@@ -1927,7 +1952,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // named adapter against a registry.
       const paid = JSON.stringify({
         locked: false,
-        cost_schedule: { currency: [85, 83, 68, 0], per_message: 100 },
+        cost_schedule: { currency: [85, 83, 68, 0], per_message: "100" },
         payment_adapters: ["x402"],
         pricing_formula: null,
         payee: "did:dht:zpayee",
@@ -2132,16 +2157,20 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
     try {
       const idA = await a.identityCreate("in_memory");
       const idB = await b.identityCreate("in_memory");
-      // Ephemeral instances are strictly isolated — no shared identity store.
+      // Two fresh SCPs mint distinct identities.
       expect(idA.did).not.toBe(idB.did);
-      // And loading A's DID on B must fail (B never saw it).
-      let isolationErr: unknown;
-      try {
-        await b.identityLoad(idA.did);
-      } catch (e) {
-        isolationErr = e;
-      }
-      expect(isolationErr).toBeInstanceOf(Error);
+      // Isolation is over KEY MATERIAL / storage, not public documents. Ephemeral
+      // instances share NO custody or storage, but they DO share the process-wide
+      // DHT (#1144) — the in-memory test double for Mainline — so B can resolve
+      // A's PUBLIC DID document, exactly as any node resolves any published DID in
+      // a real deployment. That resolution yields an "external" handle carrying no
+      // key material: B cannot sign or act as A. (Before ADR-062 Slice 1,
+      // `identityLoad`'s DHT fallback used a throwaway empty client and could
+      // never resolve anything — the fallback is now wired to the shared client,
+      // so cross-instance public resolution actually works.)
+      const aSeenByB = await b.identityLoad(idA.did);
+      expect(aSeenByB.did).toBe(idA.did);
+      expect(aSeenByB.custodyType).toBe("external");
     } finally {
       await a.shutdown(1);
       await b.shutdown(1);

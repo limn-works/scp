@@ -664,7 +664,9 @@ describe("encodeCapabilityRequirements", () => {
     const { scp, native, context } = mountWithContext();
     // No tokens → Layer 1 skipped. scp.evaluateTrust calls participationRecord for Layer 2.
     const networkError = new Error("Network timeout");
-    native.__stub("participationRecord", () => Promise.reject(networkError));
+    native.__stub("participationRecord", () => {
+      throw networkError;
+    });
 
     // The catch block in Layer 2 must re-throw non-context errors — it must NOT
     // swallow them into behavioralRecord: null (which would hide genuine faults).
