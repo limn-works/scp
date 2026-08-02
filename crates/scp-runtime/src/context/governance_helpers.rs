@@ -1048,7 +1048,11 @@ pub async fn execute_revoke(
     // Spec §5.14.8 / §5.14.10: emit one best-effort KeyEpochAdvance leaf per author
     // whose broadcast key was rotated by the governance ban.  Each rotation
     // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
-    // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
+    // Best-effort: the N-author loop cannot be made atomically fail-closed
+    // (a mid-loop failure leaves some leaves appended and some not, with no
+    // transaction to roll back). Each key rotation is already durably committed
+    // in the Class-S snapshot; the leaf is a count-tracked audit record of
+    // that rotation.
     let kea_success_count = {
         let rotations: Vec<(String, u64)> = rotated_authors
             .iter()
@@ -3231,13 +3235,24 @@ pub async fn execute_rotate_content_keys(
 
     // Emit one `KeyEpochAdvance` leaf per broadcast author whose key was
     // rotated (§5.14.10, #1847). Best-effort: warn on failure, no error
-    // propagation — same pattern as governance_ban_subscriber in
-    // `execute_revoke`. `key_advances` is empty on the non-broadcast path.
+    // propagation. The N-author loop cannot be made atomically fail-closed
+    // (a mid-loop failure leaves some leaves appended and some not, with no
+    // transaction to roll back). Each key rotation is already durably committed
+    // in the Class-S snapshot; the leaf is a count-tracked audit record of that
+    // rotation. `key_advances` is empty on the non-broadcast path.
+    //
+    // NOTE §5.14.10: KeyEpochAdvance is spec'd as shared across both Encrypted and
+    // Broadcast modes. The encrypted path emits no KEA leaf here because
+    // encrypted-mode sender-key epoch advances are conveyed via MLS Commit (the
+    // epoch change is implicit in the Welcome/Update), not via a separate leaf.
+    // If a dedicated encrypted-mode KEA leaf is ever added, it should follow the
+    // same best-effort pattern as the broadcast arm below.
     //
     // NOTE: `advance.timestamp` (milliseconds) is not used here — the
-    // event-log append takes `timestamp_secs` directly. The ms field is
-    // carried by `BroadcastKeyEpochAdvance` for the relay-message consumer
-    // on the per-author block path; it is dead data in this governance path.
+    // event-log append takes `timestamp_secs` directly. The `.timestamp`
+    // field exists on the shared `BroadcastKeyEpochAdvance` type for
+    // wire/serde completeness; no production consumer reads it today.
+    // It is dead data in this governance path.
     // `old_epoch` is derived as `new_epoch - 1` because `rotate_all_author_keys`
     // always increments by exactly 1 (pre-validated, sound by construction).
     let kea_success_count = {

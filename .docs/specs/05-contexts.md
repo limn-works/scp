@@ -2051,6 +2051,8 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 - **`WriteAccessRevoked { did, scope }`** — emitted when a governance-approved write access revocation executes (replaces the former AuthorBlocked event). The author's sender key is destroyed. scope indicates Full (retroactive) or FutureOnly. Distinct from `TokenRevoked` (which has different semantics: UCAN revocation).
 - **`KeyEpochAdvance { sender_did, epoch }`** — NEW event type, shared across both Encrypted and Broadcast modes
 
+**`KeyEpochAdvance` emission pattern.** For broadcast contexts, `KeyEpochAdvance` leaves are emitted once per author whose key was rotated, ordered by `author_did` for deterministic Merkle ordering. Emission is best-effort (warn-and-continue on failure) because the N-author rotation loop cannot be made atomically fail-closed — a mid-loop append failure is not recoverable without a transaction, and each rotation is already durably committed before emission. Successfully-appended leaves are counted in `checkpoint_events_since` alongside the primary convergent leaf (e.g. `AccessRevoked`, `ContentKeysRotated`), so the local checkpoint counter remains accurate. Encrypted-mode `KeyEpochAdvance` semantics are reserved for a future slice.
+
 `ConsistencyCheckpoint.epoch` becomes `Option<u64>` (`None` for broadcast contexts, which have no MLS epoch).
 
 ### 5.14.11 Discovery

@@ -613,8 +613,11 @@ async fn rotate_content_keys_broadcast_emits_key_epoch_advance_per_author() {
 /// single author (alice) the ban emits:
 ///   1 × `AccessRevoked`  +  1 × `KeyEpochAdvance`  =  2 leaves
 ///
-/// If either leaf is silently dropped — whether by a code regression in the
-/// append or in the counter — this assertion fails.
+/// If either leaf is silently dropped by a code regression in the append path,
+/// this assertion fails. NOTE: a counter regression (`+= 2` → `+= 1`, or
+/// `+= 1 + kea_success_count` → `+= 1`) would NOT fail this test, since
+/// `checkpoint_events_since` is not directly observable from integration
+/// tests — the counter formula itself must be guarded at unit level.
 #[tokio::test]
 async fn broadcast_governance_ban_checkpoint_counter_increments_by_one_plus_author_count() {
     let manager = new_manager();
@@ -706,8 +709,11 @@ async fn broadcast_governance_ban_checkpoint_counter_increments_by_one_plus_auth
 /// test pins the DURABLE LEAF COUNT that the counter should track:
 ///   1 × `GovernanceReconfigured`  +  1 × `GovernanceDeadlockRecovery`  =  2 leaves
 ///
-/// If either leaf is dropped — whether by a code regression in the append path
-/// or in the counter — this total-count assertion fails.
+/// If either leaf is silently dropped by a code regression in the append path,
+/// this assertion fails. NOTE: a counter regression (`+= 2` → `+= 1`, or
+/// `+= 1 + kea_success_count` → `+= 1`) would NOT fail this test, since
+/// `checkpoint_events_since` is not directly observable from integration
+/// tests — the counter formula itself must be guarded at unit level.
 #[tokio::test]
 async fn governance_reconfigure_checkpoint_counter_increments_by_two() {
     use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};

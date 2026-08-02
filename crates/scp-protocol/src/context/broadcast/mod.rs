@@ -1694,7 +1694,7 @@ impl BroadcastContext {
     ///
     /// - `timestamp_ms`: Unix timestamp in milliseconds to embed in each
     ///   [`BroadcastKeyEpochAdvance`]'s `timestamp` field. This field is part
-    ///   of the relay-message wire format (§5.14.10) and is carried for the
+    ///   of the relay-message wire format (§5.14.8) and is carried for the
     ///   relay-message consumer; governance callers use `timestamp_secs`
     ///   directly for event-log ordering, not `advance.timestamp`.
     ///
@@ -6238,11 +6238,16 @@ mod tests {
         }
 
         // The advance set must cover exactly the three registered authors.
-        let mut advance_dids: Vec<&str> = advances.iter().map(|a| a.author_did.as_str()).collect();
-        advance_dids.sort_unstable();
+        let advance_dids: Vec<&str> = advances.iter().map(|a| a.author_did.as_str()).collect();
+        // Do NOT re-sort here — assert that the production code already sorted.
+        // The test inserts "alice", "bob", "carol" as authors. If the sort in
+        // `rotate_all_author_keys` were removed, HashMap iteration order would
+        // not guarantee this output order, and this assertion would fail (catching
+        // the regression).
         assert_eq!(
             advance_dids,
-            ["did:example:alice", "did:example:bob", "did:example:carol"]
+            ["did:example:alice", "did:example:bob", "did:example:carol"],
+            "advances must be pre-sorted by author_did (see rotate_all_author_keys:1731)"
         );
     }
 
