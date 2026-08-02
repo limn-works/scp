@@ -33,7 +33,8 @@
 //! | [`CODE_AUTHORIZATION_SALT_ROTATION`] (`SCP-OUTLET-6115`) | `Authorization` | `authorization.salt-rotation-unjustified` | `authorization.salt-rotation-unjustified` |
 //! | [`CODE_INPUT_VIOLATION`] (`SCP-OUTLET-6120`) | `Input` | `input.schema-violation` | `input.schema-violation`, `input.too-large`, `input.not-serializable`, `input.estimate-exceeds-bound` |
 //! | [`CODE_EXECUTION_FAULT`] (`SCP-OUTLET-6130`) | `Execution` | `execution.handler-panic` | `execution.handler-panic`, `execution.timeout`, `execution.non-deterministic` |
-//! | [`CODE_EXECUTION_CREDIT`] (`SCP-OUTLET-6131`) | `Execution` | `execution.credit-exhausted` | `execution.credit-exhausted`, `execution.stream-gap`, `execution.stream-cap-exhausted` |
+//! | [`CODE_EXECUTION_CREDIT`] (`SCP-OUTLET-6131`) | `Execution` | `execution.credit-exhausted` | `execution.credit-exhausted`, `execution.stream-gap` |
+//! | [`CODE_EXECUTION_STREAM_CAP`] (`SCP-OUTLET-6132`) | `Execution` | `execution.stream-cap-exhausted` | `execution.stream-cap-exhausted` |
 //! | [`CODE_EXECUTION_CREDIT_STALL`] (`SCP-OUTLET-6133`) | `Execution` | `execution.credit-stall` | `execution.credit-stall` |
 //! | [`CODE_EXECUTION_CANCEL_ACK_TIMEOUT`] (`SCP-OUTLET-6135`) | `Execution` | `execution.cancel-ack-timeout` | `execution.cancel-ack-timeout` |
 //! | [`CODE_OUTPUT_VIOLATION`] (`SCP-OUTLET-6140`) | `Output` | `output.schema-violation` | `output.schema-violation`, `output.too-large`, `output.not-serializable` |
@@ -42,7 +43,7 @@
 //! | [`CODE_GOVERNANCE_FAULT`] (`SCP-OUTLET-6170`) | `Governance` | `governance.outlet-deregistered` | `governance.outlet-deregistered`, `governance.outlet-suspended`, `governance.ceiling-exceeded`, `governance.consequence-active` |
 //!
 //! Codes `SCP-OUTLET-6111`, `SCP-OUTLET-6112`, `SCP-OUTLET-6113`, `SCP-OUTLET-6116..=6119`,
-//! `SCP-OUTLET-6121..=6129`, `SCP-OUTLET-6132`, `SCP-OUTLET-6134`, `SCP-OUTLET-6136..=6139`,
+//! `SCP-OUTLET-6121..=6129`, `SCP-OUTLET-6134`, `SCP-OUTLET-6136..=6139`,
 //! `SCP-OUTLET-6141..=6149`, `SCP-OUTLET-6151..=6159`, `SCP-OUTLET-6161..=6169`,
 //! `SCP-OUTLET-6171..=6179`, and `SCP-OUTLET-6180..=6199` are **reserved** within
 //! the §5.4.4 6100-6199 sub-block. Reserved codes return [`None`] from every
@@ -144,9 +145,34 @@ pub const CODE_EXECUTION_FAULT: &str = "SCP-OUTLET-6130";
 ///
 /// Distinct from the catch-all execution fault. Default slug
 /// `execution.credit-exhausted`. Slugs: `execution.credit-exhausted`,
-/// `execution.stream-gap`, `execution.stream-cap-exhausted` (round-8
-/// node-level concurrent-pump ceiling). See §5.4.4 + §5.4.5 streaming.
+/// `execution.stream-gap`. Both are idempotent "retry now"
+/// ([`RetryPolicy::Immediate`](crate::context::outlets::errors::RetryPolicy::Immediate))
+/// mid-stream conditions — a saturated credit budget the framework refreshes,
+/// or a receiver-detected sequence gap that is mitigated by cancel-and-rerun
+/// (§5.4.5). The node-level concurrent-pump ceiling rejection was split out to
+/// [`CODE_EXECUTION_STREAM_CAP`] (`SCP-OUTLET-6132`) because it needs a
+/// `WithBackoff` policy, not `Immediate` (see #2209). See §5.4.4 + §5.4.5.
 pub const CODE_EXECUTION_CREDIT: &str = "SCP-OUTLET-6131";
+
+/// `SCP-OUTLET-6132` — Execution-class node-level concurrent-pump ceiling.
+///
+/// The node-wide `max_concurrent_outlet_stream_pumps` ceiling (§5.4.5
+/// "Node-level concurrent-pump ceiling") was saturated when an
+/// `OutletStreamOpen` tried to acquire a pump permit, so the open is
+/// hard-rejected with no stream-table entry, escrow reservation, or admission
+/// counter mutated. Default (and only) slug `execution.stream-cap-exhausted`.
+///
+/// Split from [`CODE_EXECUTION_CREDIT`] (`SCP-OUTLET-6131`) per #2209: this is
+/// a transient, node-at-capacity back-pressure condition, so its retry policy
+/// is `WithBackoff` `1s..30s` — the same policy as the credit-stall
+/// ([`CODE_EXECUTION_CREDIT_STALL`]) and per-context transport concurrency-cap
+/// ([`CODE_TRANSPORT_FAULT`]) back-pressure bands. Retrying immediately against
+/// a saturated node just re-fails (busy-spin / thundering herd), which is why
+/// sharing 6131's `Immediate` policy was wrong. A distinct code (not just a
+/// distinct slug) is required because the retry policy is keyed on the *code*
+/// (`error_code_to_retry_policy`), so a receiver could not recover the correct
+/// retryability from the slug alone. See §5.4.4 + §5.4.5.
+pub const CODE_EXECUTION_STREAM_CAP: &str = "SCP-OUTLET-6132";
 
 /// `SCP-OUTLET-6133` — Execution-class credit-stall (round-4 split).
 ///
@@ -199,14 +225,14 @@ pub const CODE_GOVERNANCE_FAULT: &str = "SCP-OUTLET-6170";
 /// All allocated codes in the §5.4.4 6100-6199 sub-block, in canonical order.
 ///
 /// The size of this array is exactly the count of distinct codes the registry
-/// allocates (14). The §5.4.4 design constraint is "compact" — `[12, 18]`
+/// allocates (15). The §5.4.4 design constraint is "compact" — `[12, 18]`
 /// codes total. The reserved range `6180-6199` plus the gaps within each
-/// class range (e.g. `6111`, `6132`, etc.) hold zero allocations.
+/// class range (e.g. `6111`, `6134`, etc.) hold zero allocations.
 ///
 /// Used by [`error_code_to_class`] / [`error_code_to_default_slug`] /
 /// [`error_code_to_retry_policy`] to drive the negative branch of every
 /// lookup.
-pub const ALL_CODES: [&str; 14] = [
+pub const ALL_CODES: [&str; 15] = [
     CODE_PROTOCOL_VIOLATION,
     CODE_PROTOCOL_SESSION,
     CODE_AUTHORIZATION_DENIED,
@@ -215,6 +241,7 @@ pub const ALL_CODES: [&str; 14] = [
     CODE_INPUT_VIOLATION,
     CODE_EXECUTION_FAULT,
     CODE_EXECUTION_CREDIT,
+    CODE_EXECUTION_STREAM_CAP,
     CODE_EXECUTION_CREDIT_STALL,
     CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
     CODE_OUTPUT_VIOLATION,
@@ -363,14 +390,15 @@ pub const SLUG_EXECUTION_CREDIT_EXHAUSTED: &str = "execution.credit-exhausted";
 pub const SLUG_EXECUTION_CREDIT_STALL: &str = "execution.credit-stall";
 /// Slug `execution.stream-gap`.
 pub const SLUG_EXECUTION_STREAM_GAP: &str = "execution.stream-gap";
-/// Slug `execution.stream-cap-exhausted` — round-8 pump ceiling.
+/// Slug `execution.stream-cap-exhausted` — node-level pump ceiling.
 ///
-/// Node-level concurrent-pump ceiling. Shares [`CODE_EXECUTION_CREDIT`]
-/// (`SCP-OUTLET-6131`) with the other Execution-class resource-exhaustion
-/// conditions; emitted at `OutletStreamOpen` acceptance when the
-/// per-instance pump ceiling (`max_concurrent_outlet_stream_pumps`) is
-/// already saturated. See §5.4.5 "Node-level concurrent-pump ceiling
-/// (round 8)".
+/// Node-level concurrent-pump ceiling. Carries the dedicated code
+/// [`CODE_EXECUTION_STREAM_CAP`] (`SCP-OUTLET-6132`); emitted at
+/// `OutletStreamOpen` acceptance when the per-instance pump ceiling
+/// (`max_concurrent_outlet_stream_pumps`) is already saturated. Split from
+/// `SCP-OUTLET-6131` per #2209 so the node-at-capacity condition surfaces a
+/// `WithBackoff` retry policy rather than the credit band's `Immediate`. See
+/// §5.4.5 "Node-level concurrent-pump ceiling".
 pub const SLUG_EXECUTION_STREAM_CAP_EXHAUSTED: &str = "execution.stream-cap-exhausted";
 /// Slug `execution.cancel-ack-timeout` — round-4 cancel-ack timer.
 pub const SLUG_EXECUTION_CANCEL_ACK_TIMEOUT: &str = "execution.cancel-ack-timeout";
@@ -497,6 +525,7 @@ pub fn error_code_to_class(code: &str) -> Option<OutletErrorClass> {
         CODE_INPUT_VIOLATION => Some(OutletErrorClass::Input),
         CODE_EXECUTION_FAULT
         | CODE_EXECUTION_CREDIT
+        | CODE_EXECUTION_STREAM_CAP
         | CODE_EXECUTION_CREDIT_STALL
         | CODE_EXECUTION_CANCEL_ACK_TIMEOUT => Some(OutletErrorClass::Execution),
         CODE_OUTPUT_VIOLATION => Some(OutletErrorClass::Output),
@@ -522,6 +551,7 @@ pub fn error_code_to_default_slug(code: &str) -> Option<&'static str> {
         CODE_INPUT_VIOLATION => Some(SLUG_INPUT_SCHEMA_VIOLATION),
         CODE_EXECUTION_FAULT => Some(SLUG_EXECUTION_HANDLER_PANIC),
         CODE_EXECUTION_CREDIT => Some(SLUG_EXECUTION_CREDIT_EXHAUSTED),
+        CODE_EXECUTION_STREAM_CAP => Some(SLUG_EXECUTION_STREAM_CAP_EXHAUSTED),
         CODE_EXECUTION_CREDIT_STALL => Some(SLUG_EXECUTION_CREDIT_STALL),
         CODE_EXECUTION_CANCEL_ACK_TIMEOUT => Some(SLUG_EXECUTION_CANCEL_ACK_TIMEOUT),
         CODE_OUTPUT_VIOLATION => Some(SLUG_OUTPUT_SCHEMA_VIOLATION),
@@ -544,6 +574,10 @@ pub fn error_code_to_default_slug(code: &str) -> Option<&'static str> {
 ///   broken; retry without operator action will not converge).
 /// - Execution credit / stream-gap — `Immediate` (idempotent on the
 ///   credit-grant side; the framework will refresh credits).
+/// - Execution stream-cap-exhausted (`SCP-OUTLET-6132`, #2209 split) —
+///   `WithBackoff` 1s..30s (the node's concurrent-pump ceiling is
+///   saturated; retrying immediately just re-fails, so back off until a
+///   permit frees).
 /// - Execution credit-stall (round-4 split) — `WithBackoff` 1s..30s
 ///   (peer is alive but back-pressured).
 /// - Execution cancel-ack-timeout — `Never` (cancel was emitted; the
@@ -571,10 +605,12 @@ pub fn error_code_to_retry_policy(code: &str) -> Option<RetryPolicy> {
         | CODE_ECONOMIC_FAULT
         | CODE_GOVERNANCE_FAULT => Some(RetryPolicy::Never),
         CODE_EXECUTION_CREDIT => Some(RetryPolicy::Immediate),
-        CODE_EXECUTION_CREDIT_STALL | CODE_TRANSPORT_FAULT => Some(RetryPolicy::WithBackoff {
-            min: Duration::from_secs(1),
-            max: Duration::from_secs(30),
-        }),
+        CODE_EXECUTION_STREAM_CAP | CODE_EXECUTION_CREDIT_STALL | CODE_TRANSPORT_FAULT => {
+            Some(RetryPolicy::WithBackoff {
+                min: Duration::from_secs(1),
+                max: Duration::from_secs(30),
+            })
+        }
         _ => None,
     }
 }
@@ -776,13 +812,13 @@ mod tests {
     /// to None — pins the registry against accidental drift.
     #[test]
     fn within_block_reserved_codes_return_none() {
-        // 6111-6113, 6116-6119, 6132, 6134, 6136-6139, 6141-6149, 6151-6159,
+        // 6111-6113, 6116-6119, 6134, 6136-6139, 6141-6149, 6151-6159,
         // 6161-6169, 6171-6179 are all reserved gaps within the sub-block.
+        // (6132 is now allocated to `CODE_EXECUTION_STREAM_CAP` per #2209.)
         let reserved_in_block = [
             "SCP-OUTLET-6111",
             "SCP-OUTLET-6112",
             "SCP-OUTLET-6116",
-            "SCP-OUTLET-6132",
             "SCP-OUTLET-6134",
             "SCP-OUTLET-6141",
             "SCP-OUTLET-6151",
@@ -1105,9 +1141,10 @@ mod tests {
         // sound-by-addition refinements that share an existing code band.
         let cases: [(&str, OutletErrorClass, &str); 2] = [
             (
+                // #2209 — split off 6131 into its own code 6132 (WithBackoff).
                 SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
                 OutletErrorClass::Execution,
-                CODE_EXECUTION_CREDIT,
+                CODE_EXECUTION_STREAM_CAP,
             ),
             (
                 SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
@@ -1138,6 +1175,63 @@ mod tests {
             slug_to_class(SLUG_AUTHORIZATION_REVOKED_MID_STREAM),
             "context-closed-mid-stream must NOT share the Authorization class with revoked-mid-stream"
         );
+    }
+
+    /// #2209 — `execution.stream-cap-exhausted` was split off `SCP-OUTLET-6131`
+    /// into its own code `SCP-OUTLET-6132` because it needs a `WithBackoff`
+    /// retry policy (node at capacity), NOT the credit band's `Immediate`. The
+    /// two conditions that legitimately remain on 6131 (`credit-exhausted`,
+    /// `stream-gap`) are both idempotent "retry now" — so they correctly share
+    /// one code + one `Immediate` policy, distinguished by slug.
+    #[test]
+    fn stream_cap_exhausted_is_split_with_backoff_retry() {
+        use std::time::Duration;
+
+        // The two 6131 slugs still resolve to 6131 and to `Immediate`.
+        assert_eq!(
+            slug_to_class(SLUG_EXECUTION_CREDIT_EXHAUSTED),
+            Some(OutletErrorClass::Execution)
+        );
+        assert_eq!(
+            slug_to_class(SLUG_EXECUTION_STREAM_GAP),
+            Some(OutletErrorClass::Execution)
+        );
+        assert_eq!(
+            error_code_to_retry_policy(CODE_EXECUTION_CREDIT),
+            Some(RetryPolicy::Immediate),
+            "credit-exhausted / stream-gap remain Immediate on 6131"
+        );
+
+        // The cap-exhausted slug now carries the distinct 6132 code.
+        assert_eq!(
+            error_code_to_class(CODE_EXECUTION_STREAM_CAP),
+            Some(OutletErrorClass::Execution)
+        );
+        assert_eq!(
+            error_code_to_default_slug(CODE_EXECUTION_STREAM_CAP),
+            Some(SLUG_EXECUTION_STREAM_CAP_EXHAUSTED)
+        );
+        assert_eq!(
+            error_code_to_retry_policy(CODE_EXECUTION_STREAM_CAP),
+            Some(RetryPolicy::WithBackoff {
+                min: Duration::from_secs(1),
+                max: Duration::from_secs(30),
+            }),
+            "a node-at-capacity rejection must back off, not retry immediately"
+        );
+
+        // The split is real: the cap-exhausted code differs from the credit
+        // code, so a receiver keying retry off the CODE gets the right policy.
+        assert_ne!(CODE_EXECUTION_STREAM_CAP, CODE_EXECUTION_CREDIT);
+        assert_ne!(
+            error_code_to_retry_policy(CODE_EXECUTION_STREAM_CAP),
+            error_code_to_retry_policy(CODE_EXECUTION_CREDIT),
+            "the whole point of the #2209 split: the two codes yield different retry policies"
+        );
+
+        // 6132 sits in the canonical 6100-6199 sub-block.
+        validate_slug(SLUG_EXECUTION_STREAM_CAP_EXHAUSTED)
+            .unwrap_or_else(|e| panic!("stream-cap-exhausted fails regex: {e:?}"));
     }
 
     #[test]

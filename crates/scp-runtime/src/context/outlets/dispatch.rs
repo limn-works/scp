@@ -280,9 +280,11 @@ pub enum OpenStreamRejection {
     /// pass, so a rejected open here does NOT consume a per-context
     /// admission slot or an escrow reservation; the caller's prior gates
     /// are rolled back before this rejection is returned. Slug:
-    /// `execution.stream-cap-exhausted`; code: `SCP-OUTLET-6131`
-    /// (`CODE_EXECUTION_CREDIT`, the shared Execution resource-exhaustion
-    /// band per §5.4.5 round-8).
+    /// `execution.stream-cap-exhausted`; code: `SCP-OUTLET-6132`
+    /// (`CODE_EXECUTION_STREAM_CAP`, the dedicated Execution node-capacity
+    /// band split off `SCP-OUTLET-6131` per #2209 so it surfaces a
+    /// `WithBackoff` retry policy — a saturated node needs the caller to back
+    /// off, not retry immediately). See §5.4.5.
     StreamCapExhausted,
     /// The §7.3.8 caveat post-input check
     /// ([`CaveatPostInputCheck`](super::invoke::CaveatPostInputCheck))
@@ -363,7 +365,7 @@ impl OpenStreamRejection {
             Self::EstimateExceedsBound => error_codes::CODE_INPUT_VIOLATION,
             Self::EscrowOverflow | Self::InsufficientFunds => error_codes::CODE_ECONOMIC_FAULT,
             Self::CaveatsBindingMismatch => error_codes::CODE_AUTHORIZATION_DENIED,
-            Self::StreamCapExhausted => error_codes::CODE_EXECUTION_CREDIT,
+            Self::StreamCapExhausted => error_codes::CODE_EXECUTION_STREAM_CAP,
             // #2196 — Protocol class, `SCP-OUTLET-6101`, NON-retryable
             // (`error_code_to_retry_policy` → `RetryPolicy::Never`). This is the
             // whole point of the error-masking fix: a permanent context-not-active
