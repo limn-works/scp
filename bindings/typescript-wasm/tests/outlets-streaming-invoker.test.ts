@@ -523,14 +523,51 @@ test("a second live session on the same (client, context) is refused (SCP-VALID-
     pollNext: async () => null,
   };
   const first = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
-  expect(
-    () => new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding)),
-  ).toThrow(ValidationError);
+  // Pin the specific code (not just the ValidationError class): the second-live-
+  // session refusal is SCP-VALID-7028 exactly, distinct from the SCP-VALID-7029
+  // re-entrant-drain guard below.
+  let secondErr: unknown;
+  try {
+    new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
+  } catch (error) {
+    secondErr = error;
+  }
+  expect(secondErr).toBeInstanceOf(ValidationError);
+  expect((secondErr as ValidationError).code).toBe("SCP-VALID-7028");
   // Draining the first to its terminal releases the claim, so a fresh session
   // on the same (client, context) then constructs cleanly.
   await first.aggregate().catch(() => {});
   const second = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
   expect(second.requestId).toBeInstanceOf(Uint8Array);
+
+  invoker.closeContext(FIX.contextId);
+  operator.closeContext(FIX.contextId);
+});
+
+test("a re-entrant concurrent drain on one session is refused (SCP-VALID-7029)", async () => {
+  const { invoker, operator } = await buildPair();
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => null,
+  };
+  const session = new BrowserInvokerStreamSession(
+    sessionOpts(invoker, coordinator, caveatsBinding),
+  );
+
+  // Enter the single shared drain, then RE-ENTER it before the first pull
+  // settles. next() sets #draining synchronously (before its first await), so a
+  // second concurrent next() sees the guard and rejects with SCP-VALID-7029
+  // (caller misuse) — a code distinct from the SCP-OUTLET-6100 lifecycle-closed
+  // cases, so an operator can filter misuse apart from protocol/lifecycle.
+  const first = session.next();
+  const reentrant = session.next();
+  await expect(reentrant).rejects.toBeInstanceOf(ValidationError);
+  await expect(reentrant).rejects.toMatchObject({ code: "SCP-VALID-7029" });
+  // The first drain settles cleanly (pollNext → null → done): no leak, and the
+  // guard did not corrupt the single drain's own lifecycle.
+  expect(await first).toEqual({ done: true, value: undefined });
 
   invoker.closeContext(FIX.contextId);
   operator.closeContext(FIX.contextId);
