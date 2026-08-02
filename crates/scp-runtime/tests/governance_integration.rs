@@ -3061,6 +3061,107 @@ async fn governance_deadlock_recovery_appends_both_event_leaves() {
 }
 
 // =========================================================================
+// governance_logic.rs:156 / §9.9.3: execute_reconfigure_governance must
+// emit EXACTLY 2 action-specific leaves (GovernanceReconfigured +
+// GovernanceDeadlockRecovery), corresponding to checkpoint_events_since
+// being bumped by exactly 2 for those leaves. The counter is internal to
+// the actor, so this test verifies the invariant indirectly by asserting
+// each leaf type appears exactly once and that no extra action-specific
+// leaves appear (the proposal lifecycle emits one additional leaf bringing
+// the total delta to 3).
+// =========================================================================
+
+#[tokio::test]
+async fn reconfigure_governance_bumps_checkpoint_counter_by_exactly_two() {
+    use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};
+
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-reconfig-counter-1847";
+
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec![alice(), bob()],
+        },
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Baseline: count leaves present before the ReconfigureGovernance execute.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline_count = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    let justification = DeadlockJustification {
+        unavailable_dids: vec![bob()],
+        missed_windows: vec![(bob(), 3)],
+        detected_at: 1_700_000_001,
+    };
+    let action = GovernanceAction::ReconfigureGovernance {
+        changes: vec![GovernanceReconfigAction::RemoveInactiveSigner { did: bob() }],
+        justification: justification.clone(),
+    };
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Proposal auto-executes (threshold=1, alice auto-votes).
+    let (proposal, _events, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "threshold=1: proposer auto-vote must immediately approve and execute"
+    );
+
+    // Assert that EXACTLY ONE GovernanceReconfigured and ONE
+    // GovernanceDeadlockRecovery leaf were emitted by execute_reconfigure_governance.
+    // These are the two leaves that bump checkpoint_events_since by 2 (§9.9.3).
+    // (The proposal lifecycle itself emits an additional leaf — that is expected
+    // and verified by the total delta, NOT by this counter-specific assertion.)
+    let after_entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after reconfigure");
+
+    let reconfigured_count = after_entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceReconfigured)
+        .count();
+    let recovery_count = after_entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceDeadlockRecovery)
+        .count();
+
+    assert_eq!(
+        reconfigured_count, 1,
+        "execute_reconfigure_governance must emit exactly 1 GovernanceReconfigured leaf \
+         (checkpoint_events_since += 1 for this leaf, §9.9.3)"
+    );
+    assert_eq!(
+        recovery_count, 1,
+        "execute_reconfigure_governance must emit exactly 1 GovernanceDeadlockRecovery leaf \
+         (checkpoint_events_since += 1 for this leaf, §9.9.3; total bump = 2)"
+    );
+
+    // Total delta = 3: GovernanceProposed (proposal lifecycle) +
+    // GovernanceReconfigured + GovernanceDeadlockRecovery (action-specific).
+    // This verifies no extra leaves sneak in from the execution path.
+    assert_eq!(
+        after_entries.len() - baseline_count,
+        3,
+        "total delta must be exactly 3 (1 proposal lifecycle leaf + 2 action-specific leaves)"
+    );
+}
+
+// =========================================================================
 // §5.14.8 / §5.14.10: RotateContentKeys on a broadcast context must emit
 // one ContentKeysRotated leaf AND one KeyEpochAdvance leaf per broadcast
 // author.  Verifies the checkpoint counter fix (Bug 2 fast-follow #2218):

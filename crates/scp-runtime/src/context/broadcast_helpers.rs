@@ -257,9 +257,13 @@ pub async fn unsubscribe_broadcast(
     // epoch was advanced as a consequence of the unsubscription. Emit one
     // `KeyEpochAdvance` leaf per rotated author so the event log reflects the
     // new epoch state. Best-effort: a failure here does not roll back the
-    // unsubscription. `rotate_sender_key_for_block` (reused internally by
-    // `unsubscribe`) always increments by exactly 1, so `old_epoch =
+    // unsubscription (§5.14.8: voluntary unsubscribe with forward-secrecy key
+    // rotation is authorization-UPWARD-safe and is intentionally coalesced).
+    // `unsubscribe` always increments by exactly 1, so `old_epoch =
     // new_epoch.saturating_sub(1)` is exact.
+    // Track only successful appends — failed best-effort leaves are never
+    // durable, so they must not inflate the checkpoint counter (§9.9.3).
+    let mut kea_success_count: u64 = 0;
     for rotation in &result.key_rotations {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
         match scp_event_log::payload::encode_payload(
@@ -286,6 +290,8 @@ pub async fn unsubscribe_broadcast(
                         error = %e,
                         "KeyEpochAdvance event-log append failed on unsubscribe (best-effort)"
                     );
+                } else {
+                    kea_success_count += 1;
                 }
             }
             Err(e) => {
@@ -298,6 +304,9 @@ pub async fn unsubscribe_broadcast(
             }
         }
     }
+    // Bump counter by the number of KEA leaves actually appended (may be 0 if
+    // `rotate_keys` was false, or if all appends failed best-effort).
+    *cell.class_c_view().checkpoint_events_since_mut() += kea_success_count;
 
     Ok(result)
 }

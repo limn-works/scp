@@ -133,9 +133,9 @@ pub struct BroadcastKeyEpochAdvance {
     pub new_epoch: u64,
     /// Unix timestamp in milliseconds when the rotation occurred.
     ///
-    /// This field is only consumed on the per-author block relay-message path; on
-    /// the governance/event-log path, `timestamp_secs` is used directly and this
-    /// field is ignored.
+    /// Carried for the relay-message consumer on the per-author block path;
+    /// **currently unused in production** — the governance/event-log path uses
+    /// `timestamp_secs` directly and does not read this field.
     pub timestamp: u64,
 }
 

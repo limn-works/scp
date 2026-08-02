@@ -400,7 +400,9 @@ pub struct AuthorBlockResult {
 pub struct GovernanceBanResult {
     /// The banned subscriber's DID.
     pub banned_did: String,
-    /// Per-author key rotations triggered by the ban.
+    /// Per-author key rotations triggered by the ban, sorted ascending by
+    /// `author_did`. Callers that emit event-log leaves from this output MUST
+    /// preserve this order to maintain §9.9.3 Merkle determinism.
     pub rotated_authors: Vec<AuthorKeyRotation>,
     /// The revocation scope that was applied.
     pub scope: crate::context::governance::AccessScope,
@@ -841,6 +843,11 @@ impl BroadcastContextClassCParts<'_> {
                 }
             }
         }
+
+        // Sort by author_did for deterministic KEA leaf ordering across replicas
+        // and reconstructions (§9.9.3). Mirrors the identical sort in
+        // `rotate_all_author_keys` and `governance_ban_subscriber`.
+        key_rotations.sort_unstable_by(|a, b| a.author_did.cmp(&b.author_did));
 
         Ok(UnsubscribeResult {
             subscriber_did: subscriber_did.to_owned(),
@@ -1689,6 +1696,10 @@ impl BroadcastContext {
     /// emit `KeyEpochAdvance` event-log leaves per §5.14.10. The rotation is
     /// all-or-nothing: the pre-validate pass ensures no mid-loop overflow can
     /// leave some authors rotated and others not.
+    ///
+    /// The returned `Vec` is sorted ascending by `author_did`. Callers that
+    /// emit event-log leaves from this output MUST preserve this order to
+    /// maintain §9.9.3 Merkle determinism.
     ///
     /// # Parameters
     ///
@@ -4152,6 +4163,37 @@ mod tests {
         let result = ctx.unsubscribe("did:example:bob", false).unwrap();
         // Caller uses this to emit a MemberLeft { member_did: result.subscriber_did }
         assert_eq!(result.subscriber_did, "did:example:bob");
+    }
+
+    // §9.9.3: the sort is in the implementation — assert without re-sorting.
+    #[test]
+    fn unsubscribe_key_rotations_sorted_by_author_did() {
+        let mut ctx = make_open_ctx();
+        // Add authors in reverse alphabetical order to prove the sort is not
+        // an accident of insertion order.
+        ctx.add_author("did:example:charlie").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+
+        let result = ctx.unsubscribe("did:example:dave", true).unwrap();
+
+        assert_eq!(result.key_rotations.len(), 3, "one rotation per author");
+        // Verify ascending sort WITHOUT re-sorting (tests the impl, not a post-hoc sort).
+        let dids: Vec<&str> = result
+            .key_rotations
+            .iter()
+            .map(|r| r.author_did.as_str())
+            .collect();
+        assert_eq!(
+            dids,
+            vec![
+                "did:example:alice",
+                "did:example:bob",
+                "did:example:charlie"
+            ],
+            "key_rotations must be sorted ascending by author_did (§9.9.3 Merkle determinism)"
+        );
     }
 
     #[test]

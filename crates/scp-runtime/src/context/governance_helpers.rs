@@ -979,57 +979,37 @@ pub async fn execute_revoke(
             timestamp_secs,
         )
         .await?;
-    // Spec §5.14.8 / §5.14.10: emit one best-effort KeyEpochAdvance leaf per author
-    // whose broadcast key was rotated by the governance ban.  Each rotation
+    // Spec §5.14.8 / §5.14.10: emit one fail-closed KeyEpochAdvance leaf per
+    // author whose broadcast key was rotated by the governance ban. Each rotation
     // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
-    // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
-    // TODO(spec): §2033 vs §5.14.10/ADR-011 tension unresolved — convergent trigger may require fail-closed here
-    let mut kea_success_count: u64 = 0;
+    // ADR-011: governance ban is a convergent trigger → KeyEpochAdvance leaves
+    // are convergent (fail-closed). A failure here is surfaced as an error —
+    // the ban state was already durably persisted (Class-S above) and the
+    // AccessRevoked leaf appended (fail-closed above), so failing the KEA leaf
+    // will cause the caller to retry rather than silently drop the leaf.
     for rotation in &rotated_authors {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
+        let payload = scp_event_log::payload::encode_payload(
             &scp_event_log::payload::KeyEpochAdvancePayload {
                 old_epoch,
                 new_epoch: rotation.new_epoch,
             },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        rotation.author_did.as_str(),
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        author_did = %rotation.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed after governance ban (best-effort)"
-                    );
-                } else {
-                    kea_success_count += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    author_did = %rotation.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed after governance ban (best-effort)"
-                );
-            }
-        }
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        deps.event_log
+            .append_context_event_with_payload(
+                &context_id_bytes,
+                scp_event_log::EventType::KeyEpochAdvance,
+                rotation.author_did.as_str(),
+                payload,
+                timestamp_secs,
+            )
+            .await
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     }
-    // Coalesced Class-C counter bump: 1 for AccessRevoked + each KeyEpochAdvance
-    // leaf that actually appended. The counter must track the true durable-leaf
-    // count (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position
-    // drift. Best-effort leaves that failed are excluded — they were never durable.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_success_count;
+    // Coalesced Class-C counter bump: 1 for AccessRevoked + one per
+    // KeyEpochAdvance leaf. All-or-nothing (fail-closed) so the count is exact.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1 + rotated_authors.len() as u64;
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -3190,10 +3170,10 @@ pub async fn execute_rotate_content_keys(
         )
         .await?;
 
-    // Emit one `KeyEpochAdvance` leaf per broadcast author whose key was
-    // rotated (§5.14.10, #1847). Best-effort: warn on failure, no error
-    // propagation — same pattern as governance_ban_subscriber in
-    // `execute_revoke`. `key_advances` is empty on the non-broadcast path.
+    // Emit one fail-closed `KeyEpochAdvance` leaf per broadcast author whose
+    // key was rotated (§5.14.10, #1847). ADR-011: convergent governance trigger
+    // → convergent leaf; errors are surfaced, not swallowed. `key_advances` is
+    // empty on the non-broadcast path.
     //
     // NOTE: `advance.timestamp` (milliseconds) is not used here — the
     // event-log append takes `timestamp_secs` directly. The ms field is
@@ -3201,54 +3181,31 @@ pub async fn execute_rotate_content_keys(
     // on the per-author block path; it is dead data in this governance path.
     // `old_epoch` is derived as `new_epoch - 1` because `rotate_all_author_keys`
     // always increments by exactly 1 (pre-validated, sound by construction).
-    // TODO(spec): §2033 vs §5.14.10/ADR-011 tension unresolved — convergent trigger may require fail-closed here
-    let mut kea_success_count: u64 = 0;
+    // ADR-011: RotateContentKeys is a convergent governance trigger → KeyEpochAdvance
+    // leaves are convergent (fail-closed). A failure here is surfaced as an error.
     for advance in &key_advances {
         let old_epoch = advance.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
+        let payload = scp_event_log::payload::encode_payload(
             &scp_event_log::payload::KeyEpochAdvancePayload {
                 old_epoch,
                 new_epoch: advance.new_epoch,
             },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        advance.author_did.as_str(),
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        author_did = %advance.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed after RotateContentKeys (best-effort)"
-                    );
-                } else {
-                    kea_success_count += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    author_did = %advance.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed after RotateContentKeys (best-effort)"
-                );
-            }
-        }
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        deps.event_log
+            .append_context_event_with_payload(
+                &context_id_bytes,
+                scp_event_log::EventType::KeyEpochAdvance,
+                advance.author_did.as_str(),
+                payload,
+                timestamp_secs,
+            )
+            .await
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
     }
-    // Coalesced Class-C counter bump: 1 for ContentKeysRotated + each
-    // KeyEpochAdvance leaf that actually appended. The counter must track the
-    // true durable-leaf count (governance_logic.rs:156-158) to prevent §9.9.3
-    // checkpoint-position drift. Best-effort leaves that failed are excluded —
-    // they were never durable.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_success_count;
+    // Coalesced Class-C counter bump: 1 for ContentKeysRotated + one per
+    // KeyEpochAdvance leaf. All-or-nothing (fail-closed) so the count is exact.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1 + key_advances.len() as u64;
     Ok(())
 }
 
