@@ -323,13 +323,15 @@ pub async fn leave_context(
             return Err(ContextError::MemberNotFound(member_did.to_string()));
         }
 
-        // Remove from role state.
-        state.role_state.members.remove(member_did.as_ref());
-        state.role_state.assignments.remove(member_did.as_ref());
-        state
-            .role_state
-            .member_capabilities
-            .remove(member_did.as_ref());
+        // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
+        // assignments, member_capabilities, AND suspended_capabilities. Replaces
+        // the prior strip that left the departing DID's suspension dangling, so a
+        // re-admitted same-DID member no longer inherits a phantom suspension.
+        // `state.membership.remove_member` above already confirmed membership;
+        // `role_state.remove_member` is idempotent (returns `()`). Inside
+        // `commit_class_s_keep`, so the downward-auth suspension drop persists
+        // fail-closed (ADR-049 §9).
+        state.role_state.remove_member(member_did.as_ref());
 
         // Destroy the departing member's access key (§9.17.2, ADR-038).
         state
@@ -337,11 +339,30 @@ pub async fn leave_context(
             .access_key_store
             .remove(&context_id, member_did.as_ref());
 
+        // Drop the departing member's CEK-exclusion entry (spec §5.6.1, §9.17) —
+        // per-DID content-access state outside the role state. Mirrors
+        // `execute_remove_member`, so a re-admitted same-DID member no longer
+        // inherits a phantom read exclusion.
+        state.access.read_exclusion_list.remove(member_did);
+
         // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
         // a broadcast context (which carries no peer registry).
         if let Some(reg) = state.routing.peer_registry_mut() {
             reg.remove(member_did);
         }
+
+        // Drop the departing member's per-sender sequence tracking state
+        // (spec §5.6.1 — "its MLS sequence counter") so a re-admitted same-DID
+        // member's fresh (low-sequence) messages are not rejected as
+        // EnvelopeError::SequenceRegression. Both the anti-replay high-water mark
+        // and any out-of-order buffered envelopes from the departing DID are
+        // cleared. Mirrors `execute_remove_member`.
+        state
+            .sequence_tracker
+            .reset_sender(&context_id, member_did.as_ref());
+        state
+            .reorder_buffer
+            .clear_sender(&context_id, member_did.as_ref());
 
         // Emit MemberLeft event to receive buffer.
         let left_event = ContextEvent::MemberLeft {

@@ -252,6 +252,14 @@ One agent per human per context. Membership is transparent — participants can 
 
 **Broadcast context membership.** Broadcast contexts use a two-tier membership model: authors (MLS-equivalent bounded writers) and subscribers (unbounded readers registered via DID-signed requests). Subscriber registration records membership via `MemberJoined` events with role `subscriber`. The member list includes both tiers. Subscriber count is visible in metadata.
 
+### 5.6.1 Member Removal Is a Clean Teardown
+
+**Member removal is a clean teardown.** When a member is removed from a context — by governance `RemoveMember`, by self-`leave`, or by a failed-join rollback — ALL per-DID role state for that DID is dropped in the same operation: the DID is removed from the member list (`members`), its role assignment (`assignments`), its cached granted capabilities (`member_capabilities`), AND its suspended-capability set (`suspended_capabilities`, §5.3.2). A suspension only ever DENIES authority (§5.3.2 step 5); once the DID holds no role it is meaningless, and a re-admitted same-DID member is a fresh admission that MUST NOT inherit a phantom suspension — a residual suspension would otherwise wrongly deny the re-admitted member a capability their new role grants.
+
+Per-DID content-access and routing state owned outside the role state is likewise dropped at removal: the member's `read_exclusion_list` entry (§9.17), its access-key store entry (§9.17), its MLS sequence counter, and its pseudonym routing entry (§9.10.4). The MLS group leaf for the removed DID is evicted by the MLS commit that precedes the state teardown; eviction is the cryptographic boundary and is non-negotiable — the state teardown described here is the bookkeeping that MUST converge with it, never a substitute for it.
+
+Dropping the suspended-capability set on removal is a pure narrowing-side hygiene that never widens authority, consistent with the suspension-pruning rule at ceiling-change activation (§5.3.2 step 5): a suspension referencing a capability the member no longer holds is already droppable, and a removed member holds none. This teardown is identical across the native and constrained (§5.14, ADR-034) runtimes — both clear the same four per-DID role fields plus the same out-of-role per-DID state, so a context's role state is byte-identical after a remove-then-readmit of the same DID regardless of which runtime executed it.
+
 ## 5.7 Metadata
 
 Context metadata follows a two-tier visibility model that balances legibility (informed consent before joining) with privacy (operational details that may be sensitive).
@@ -436,6 +444,8 @@ Content access actions go through the context's governance model (propose/vote/e
 | `threshold_signers` | 64 per context | Signers participate in quorum; >64 is operationally impractical |
 | `suspended_capabilities[did]` | No artificial cap | Naturally bounded by ceiling cardinality — at most one entry per capability per member |
 | `read_exclusion_list` | No artificial cap | Naturally bounded by membership count — cannot exclude non-members from CEK wrapping |
+
+Both `suspended_capabilities[did]` and the removed DID's `read_exclusion_list` entry are dropped when the member is removed from the context (§5.6.1 — member removal is a clean teardown), so neither retains entries for non-members.
 
 Implementations MUST return an error (e.g., `LimitExceeded`) when an append would exceed the limit. The error message MUST include the limit value for debuggability.
 
