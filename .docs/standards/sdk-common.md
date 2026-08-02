@@ -147,7 +147,10 @@ pre-existing cross-language overlaps predate and are out of scope for #2144 (e.g
 are reused by the Swift/ts-native SDKs for their own validation conditions, and
 `SCP-CTX-2003` is overloaded — see below). #2144 fixes only the browser
 participant's own allocations so they stop colliding; the broader cross-language
-reconciliation is a separate, unaddressed concern.
+reconciliation — auditing the full cross-surface namespace and strengthening the
+compliance mechanism (`check-error-codes.sh` Phase-2 does not machine-check
+SDK-wrapper or match-arm literals; see its documented KNOWN LIMITATION) — is
+tracked in discussion #2208, not addressed here.
 
 This table documents the allocation; it is not a new enforcement mechanism. The
 scp-client-wasm mapping is additionally guarded by an exhaustive positive
