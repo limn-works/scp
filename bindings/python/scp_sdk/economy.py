@@ -302,7 +302,6 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
     return bridge.economy_evaluate_formula(formula_json, m)
 
 
-
 # ---------------------------------------------------------------------------
 # Payment receipt verification
 # ---------------------------------------------------------------------------
@@ -355,7 +354,6 @@ async def verify_payment_receipts(
     if isinstance(result, str):
         return json.loads(result)
     return result
-
 
 
 __all__ = [
