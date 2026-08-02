@@ -55,6 +55,7 @@ interface Fixture {
   streamEpoch: number;
   caveatsJcsHex: string;
   caveatsBindingHex: string;
+  operatorSeedHex: string;
   operatorPkHex: string;
   wrongOperatorPkHex: string;
   invokerSeedHex: string;
@@ -100,6 +101,98 @@ async function ed25519Verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): 
 function sigOf(signedWire: Uint8Array): Uint8Array {
   const obj = JSON.parse(new TextDecoder().decode(signedWire)) as { sig: number[] };
   return Uint8Array.from(obj.sig);
+}
+
+/** PKCS#8 DER prefix for a 32-byte Ed25519 seed (RFC 8410 OneAsymmetricKey). */
+const PKCS8_ED25519_PREFIX = hexToBytes("302e020100300506032b657004220420");
+
+/** WebCrypto Ed25519 sign from a raw 32-byte seed — the operator's role in-test. */
+async function ed25519Sign(seed: Uint8Array, msg: Uint8Array): Promise<Uint8Array> {
+  const pkcs8 = new Uint8Array(PKCS8_ED25519_PREFIX.length + seed.length);
+  pkcs8.set(PKCS8_ED25519_PREFIX);
+  pkcs8.set(seed, PKCS8_ED25519_PREFIX.length);
+  const key = await crypto.subtle.importKey("pkcs8", bufOf(pkcs8), { name: "Ed25519" }, false, [
+    "sign",
+  ]);
+  return new Uint8Array(await crypto.subtle.sign("Ed25519", key, bufOf(msg)));
+}
+
+async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bufOf(bytes)));
+}
+
+function concatBytes(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
+
+function u32be(n: number): Uint8Array {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n, false);
+  return b;
+}
+
+function u64be(n: bigint): Uint8Array {
+  const b = new Uint8Array(8);
+  new DataView(b.buffer).setBigUint64(0, n, false);
+  return b;
+}
+
+/** `len_be32(bytes) || bytes` — the §9.5.1 uniform variable-length field rule. */
+function lenPrefixed(bytes: Uint8Array): Uint8Array {
+  return concatBytes(u32be(bytes.length), bytes);
+}
+
+/**
+ * Signs an operator chunk in-tab and returns its JSON wire bytes, mirroring the
+ * Rust `sign_chunk` (stream.rs) over the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1`
+ * preimage:
+ *
+ *   SHA-256("SCP-OUTLET-CHUNK-SIG-V1:" || len_be32(ctx)||ctx || len_be32(outlet)
+ *     ||outlet || request_id(16) || sequence_be(8) || caveats_binding(32)
+ *     || SHA-256(jcs(payload))(32))
+ *
+ * `payload` MUST already be in RFC-8785 JCS key order (for these ASCII-only
+ * payloads `JSON.stringify` of a sorted-key object IS the JCS). This is
+ * SELF-VALIDATING: the on-device verify only accepts the chunk if this preimage
+ * matches the Rust one byte-for-byte — otherwise `#ingestFrame` throws 6110
+ * instead of reaching the terminal path. A cross-target KAT on the chunk wire.
+ */
+async function signOperatorChunkWire(
+  seed: Uint8Array,
+  contextId: string,
+  outletId: string,
+  requestId: Uint8Array,
+  sequence: bigint,
+  caveatsBinding: Uint8Array,
+  payload: Record<string, unknown>,
+): Promise<Uint8Array> {
+  const enc = new TextEncoder();
+  const payloadHash = await sha256(enc.encode(JSON.stringify(payload)));
+  const preimage = await sha256(
+    concatBytes(
+      enc.encode("SCP-OUTLET-CHUNK-SIG-V1:"),
+      lenPrefixed(enc.encode(contextId)),
+      lenPrefixed(enc.encode(outletId)),
+      requestId,
+      u64be(sequence),
+      caveatsBinding,
+      payloadHash,
+    ),
+  );
+  const sig = await ed25519Sign(seed, preimage);
+  const wire = {
+    request_id: Array.from(requestId),
+    sequence: Number(sequence),
+    payload,
+    sig: Array.from(sig),
+  };
+  return enc.encode(JSON.stringify(wire));
 }
 
 beforeAll(async () => {
@@ -568,6 +661,81 @@ test("a re-entrant concurrent drain on one session is refused (SCP-VALID-7029)",
   // The first drain settles cleanly (pollNext → null → done): no leak, and the
   // guard did not corrupt the single drain's own lifecycle.
   expect(await first).toEqual({ done: true, value: undefined });
+
+  invoker.closeContext(FIX.contextId);
+  operator.closeContext(FIX.contextId);
+});
+
+test("a terminal Error chunk drives aggregate() to re-throw it as an OutletError", async () => {
+  const { invoker, operator, relay, invokerInbound } = await buildPair();
+  const CTX = FIX.contextId;
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+
+  // Construct a terminal Error chunk (seq 0) signed in-tab under the REAL
+  // operator seed (RFC 8032 §7.1 test vector 1 — the fixture operator key). The
+  // on-device verify accepts it only if the TS chunk-sig preimage matches Rust
+  // byte-for-byte, so this doubles as a cross-target KAT on the Error variant.
+  const errorPayload = {
+    "@type": "error",
+    code: "SCP-OUTLET-6130",
+    message: "executor aborted the stream",
+    terminal: true,
+  };
+  const errorWire = await signOperatorChunkWire(
+    hexToBytes(FIX.operatorSeedHex),
+    CTX,
+    FIX.outletId,
+    hexToBytes(FIX.requestIdHex),
+    0n,
+    caveatsBinding,
+    errorPayload,
+  );
+
+  operator.sendMessage(CTX, errorWire);
+  relay.pump();
+  const chunkFrames = invokerInbound.splice(0);
+  expect(chunkFrames).toHaveLength(1);
+
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => chunkFrames.shift() ?? null,
+  };
+  const session = new BrowserInvokerStreamSession(
+    sessionOpts(invoker, coordinator, caveatsBinding),
+  );
+
+  // aggregate() drains to the terminal Error and re-throws the typed OutletError
+  // carrying the chunk's own code + message (not the End aggregate). Idempotent:
+  // a second call re-throws the same cached error.
+  await expect(session.aggregate()).rejects.toBeInstanceOf(OutletError);
+  await expect(session.aggregate()).rejects.toMatchObject({
+    code: "SCP-OUTLET-6130",
+    message: "executor aborted the stream",
+  });
+
+  invoker.closeContext(CTX);
+  operator.closeContext(CTX);
+});
+
+test("a stream that closes without an End chunk makes aggregate() throw SCP-OUTLET-6100", async () => {
+  const { invoker, operator } = await buildPair();
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+
+  // The node signals no more frames (pollNext → null) before any terminal chunk
+  // arrives — an abnormal close. aggregate() must surface SCP-OUTLET-6100
+  // (asserted directly, not .catch-swallowed as the 7028 claim-release does).
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => null,
+  };
+  const session = new BrowserInvokerStreamSession(
+    sessionOpts(invoker, coordinator, caveatsBinding),
+  );
+
+  await expect(session.aggregate()).rejects.toBeInstanceOf(OutletError);
+  await expect(session.aggregate()).rejects.toMatchObject({ code: "SCP-OUTLET-6100" });
 
   invoker.closeContext(FIX.contextId);
   operator.closeContext(FIX.contextId);
