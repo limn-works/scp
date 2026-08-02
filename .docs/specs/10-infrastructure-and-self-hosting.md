@@ -677,6 +677,8 @@ The `source_routing_id` field is zeroed (`[0u8; 32]`) because the bridge operate
 2. The DID derived from `public_key` maps to the claimed `routing_id` via `SHA-256("scp:did:" || did_string)` (§3.10.2).
 3. The `timestamp` is within 60 seconds of the server's current time (replay window).
 
+**Precedent for relay-side validation of public records.** `BRIDGE_REGISTER` establishes the pattern that a relay MAY perform a control-plane cryptographic check — verify an Ed25519 signature and confirm the `SHA-256("scp:did:" || did_string)` DID→routing_id binding — while remaining an untrusted, encrypted-content-blind data plane: `BRIDGE_DATA` payloads are forwarded opaquely, and the client re-verifies everything end-to-end regardless of the relay's acceptance. This same check extends from the control plane to a *stored public record*: an SCP-native relay MAY validate a DID-record blob it stores (verify the BEP44 signature and the DID→routing_id binding, keep a single highest-sequence slot; §3.10.2, §9.10.12) as an availability and anti-suppression measure. It is defense-in-depth, never a trust dependency — a relay that skips or botches this validation degrades availability only, and it never touches MLS-encrypted context content, which relays can neither read nor validate.
+
 #### 10.12.4.1 Routing ID Derivation Disambiguation
 
 The protocol uses two distinct routing ID derivation schemes for different purposes. Implementations MUST NOT conflate them:
