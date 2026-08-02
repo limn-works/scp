@@ -35,11 +35,11 @@ use tracing::{debug, info, warn};
 
 use crate::IdentityError;
 use crate::cache::DidCache;
-use crate::dht::{extract_public_key, verify_self_certification};
+use crate::dht::extract_public_key;
 use crate::republish::RelayPublisher;
-use crate::resolution::did_routing_id;
+use crate::resolution::{did_routing_id, verify_relay_record};
 use scp_clock::{Clock, SystemClock};
-use scp_dht::{DhtClient, DhtRecord, verify_bep44_signature};
+use scp_dht::{DhtClient, DhtRecord};
 use scp_did::{DidDocument, decode_multibase_key};
 
 // ---------------------------------------------------------------------------
@@ -201,39 +201,10 @@ pub trait HealingPublisher: Send + Sync {
     ) -> impl Future<Output = Result<(), IdentityError>> + Send;
 }
 
-// Re-exports `did_routing_id` from `resolution` — no duplication.
-// The BEP44 verification helper `verify_bep44_signature` (and `bep44_signable`)
-// are imported from the transport crate `scp_dht`; `extract_public_key` and
-// `verify_self_certification` remain in `super::dht`.
-
-/// Verifies a raw BEP44 record against a DID string and deserializes the
-/// DID document. Performs:
-/// 1. BEP44 signature verification against the DID's public key.
-/// 2. JSON deserialization of the document.
-/// 3. Self-certification check (identity key in document matches DID).
-///
-/// Returns the verified `DidDocument` on success.
-fn verify_and_deserialize(
-    did_string: &str,
-    public_key: &[u8; 32],
-    value: &[u8],
-    signature: &[u8; 64],
-    seq: u64,
-) -> Result<DidDocument, IdentityError> {
-    // Step 1: Verify BEP44 signature.
-    verify_bep44_signature(public_key, signature, value, seq)?;
-
-    // Step 2: Deserialize the DID document.
-    let doc_json = String::from_utf8(value.to_vec())
-        .map_err(|e| IdentityError::DocumentDeserializationError(format!("invalid UTF-8: {e}")))?;
-    let document = DidDocument::from_json(&doc_json)
-        .map_err(|e| IdentityError::DocumentDeserializationError(e.to_string()))?;
-
-    // Step 3: Self-certification — identity key (#0) must match DID suffix.
-    verify_self_certification(did_string, &document)?;
-
-    Ok(document)
-}
+// `verify_relay_record` (imported from `crate::resolution`) is the single shared
+// BEP44-verify + UTF-8/JSON-deser + self-cert path used by both this resolver
+// and `RealMultiRelayQuerier`, ensuring relay and DHT records are validated
+// identically without duplication.
 
 // ---------------------------------------------------------------------------
 // DualLayerResolver
@@ -724,7 +695,7 @@ fn validate_relay_result(
         }
     };
 
-    match verify_and_deserialize(
+    match verify_relay_record(
         did,
         public_key,
         &record.value,
@@ -774,7 +745,7 @@ fn validate_dht_result(
         }
     };
 
-    match verify_and_deserialize(
+    match verify_relay_record(
         did,
         public_key,
         &record.value,
