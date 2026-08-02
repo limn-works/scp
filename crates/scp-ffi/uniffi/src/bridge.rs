@@ -18926,17 +18926,24 @@ impl Scp {
                     .await;
                 }
 
-                // Post-commit discovery registration (mirrors
-                // `context_join_from_welcome`): an imported context must be
-                // discoverable just like a created one. The import path is
-                // ENCRYPTED-only (broadcast exports are rejected upstream with
-                // SCP-CTX-2092), so the routing id is unconditionally the
-                // importer's derived §9.10.4 pseudonym — no broadcast fallback.
+                // Post-commit discovery registration (mirrors `context_create`
+                // / `context_join`): an imported context must be discoverable
+                // just like a created one. Broadcast contexts use the
+                // deterministic `broadcast_routing_id` — peers route broadcast
+                // on the shared context key, not per-member pseudonyms, so
+                // registering `local_pseudonym` here would make a broadcast
+                // re-home silently unaddressable. Encrypted imports use the
+                // importer's derived §9.10.4 pseudonym as the routing id.
                 // `relay_url` is `None` (the connected relay lives on the
                 // caller-held `TransportManager` handle, not the bridge
                 // instance). Infallible + idempotent, so it needs no rollback.
+                let routing_id = if imported_is_broadcast {
+                    scp_core::context::broadcast_routing_id(&context_id)
+                } else {
+                    local_pseudonym
+                };
                 let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id: local_pseudonym,
+                    routing_id,
                     relay_url: None,
                     member_did: identity.did.clone(),
                     last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
@@ -19660,6 +19667,81 @@ mod tests {
         assert_ne!(
             entry.routing_id, [0u8; 32],
             "encrypted join routing id must be a real derived pseudonym"
+        );
+    }
+
+    /// `context_import` (re-home) registers a discovery `KnownContext`
+    /// post-commit (parity with `context_create` / `context_join`), so an
+    /// imported context is discoverable just like a created one.
+    ///
+    /// Scenario: creator creates, exports, then leaves the context (which
+    /// closes it when the last member departs). On the now-empty runtime,
+    /// re-import succeeds — the export snapshot still lists the creator as a
+    /// member, satisfying `ensure_importer_is_member`. The routing id for an
+    /// encrypted import MUST be the importer's derived §9.10.4 pseudonym (not
+    /// `broadcast_routing_id` or a zero sentinel).
+    #[test]
+    #[cfg(feature = "testing")]
+    fn context_import_registers_known_context() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        let creator_did = identity.did();
+
+        // Export BEFORE leaving so the snapshot still lists the creator as
+        // a member — `ensure_importer_is_member` checks the snapshot.
+        let export_data = rt
+            .block_on(scp.context_export(Arc::clone(&handle)))
+            .expect("context_export should succeed");
+
+        // Leave the context: the creator is the sole member so the context
+        // closes and is removed from the runtime. This makes the subsequent
+        // import work (not "context already exists").
+        rt.block_on(scp.context_leave(Arc::clone(&handle), Arc::clone(&identity)))
+            .expect("context_leave should succeed");
+
+        // Also clear the create-time discovery entry so the assertion below
+        // can only pass if the IMPORT path registers it.
+        scp.inner.core.remove_known_context(&context_id);
+        assert!(
+            !scp.inner.core.has_known_context(&context_id),
+            "discovery entry must be cleared before the import"
+        );
+
+        // Re-import: the export snapshot lists the creator as a member, so
+        // `ensure_importer_is_member` accepts them. Key resolution uses local
+        // in-memory custody (no DID resolver needed).
+        let imported_id = rt
+            .block_on(scp.context_import(export_data, Arc::clone(&identity)))
+            .expect("context_import should succeed");
+        assert_eq!(imported_id, context_id, "imported context id must match");
+
+        assert!(
+            scp.inner.core.has_known_context(&context_id),
+            "context_import must register a discovery KnownContext"
+        );
+        let entry = known_context_entry(&scp, &context_id)
+            .expect("imported context must be in the discovery registry");
+        assert_eq!(
+            entry.member_did, creator_did,
+            "member_did must be the importer"
+        );
+        assert!(entry.relay_url.is_none(), "relay_url must be None");
+        assert_ne!(
+            entry.routing_id, [0u8; 32],
+            "encrypted import routing id must be a real derived pseudonym"
+        );
+        // Specifically NOT broadcast_routing_id — this is an encrypted import.
+        assert_ne!(
+            entry.routing_id,
+            scp_core::context::broadcast_routing_id(&context_id),
+            "encrypted import must NOT use the broadcast routing id"
         );
     }
 
