@@ -43,6 +43,8 @@ import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./e
 import type { Identity } from "./identity";
 import { toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
+import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
+import { StreamingSagaHandle } from "./outlets";
 import { decodeProvenanceRecord, type ProvenanceRecord } from "./provenance";
 import type { Node, Relay } from "./server";
 import type {
@@ -2205,6 +2207,127 @@ export class SCP {
       receipt: raw.receipt ?? null,
       output: raw.output ?? null,
     };
+  }
+
+  /**
+   * Opens the §5.4.5 / §6.2.4 cross-context STREAMING outlet-invocation saga
+   * (SCP-OUT-047) and returns its {@link StreamingSagaHandle}.
+   *
+   * The STREAMING sibling of {@link outletInvokeCrossContextSaga}. Where the
+   * unary saga BLOCKS until `Committed` (≤~95s) and returns the result inline,
+   * the streaming saga returns its chunk receiver PROMPTLY at the
+   * Commit-transition and reaches `Committed` ASYNCHRONOUSLY at seal-close (the
+   * ADR-049 §3a streaming wait-model amendment) — an LLM stream can exceed the
+   * unary bound, so the credit ceiling bounds chunk COUNT, not wall-clock.
+   *
+   * The returned handle is both `AsyncIterable<OutletStreamChunk>`
+   * (`for await (const chunk of handle)`) and `PromiseLike<Aggregate>`
+   * (`await handle`); its FIRST pull opens the saga
+   * (`outletStreamingSagaOpen` mints the durable `sagaId` at the
+   * Commit-transition) and its iteration drains chunks via
+   * `outletStreamingSagaPollNext`. This method performs NO I/O and does not block
+   * — the saga opens lazily on the first `await` / iteration, matching the
+   * same-context `ctx.outlets.invoke(...)`.
+   *
+   * There is NO live control plane (grantCredit / cancel) for the cross-context
+   * saga stream — per §6.2.5 / SCP-OUT-046 the credit window is fixed at open via
+   * `estimatedChunkCount` (cancel_ack_ceiling = u64::MAX). An open rejection — the
+   * §6.2.4 caller-principal binding (a `callerDid` this instance does not host /
+   * not a member of the source context), a Prepare/Commit saga terminal, or an
+   * input/UCAN rejection — surfaces on the first `await` / iteration as the
+   * matching typed SDK error ({@link "./errors".SagaAbortedError} /
+   * {@link "./errors".SagaBusyError} / {@link "./errors".SagaNeedsRepairError} /
+   * {@link ValidationError} / {@link "./errors".UcanPermissionError}), and the
+   * receiver is never handed out.
+   *
+   * `options.timestampMs` is a `bigint` (the bridge's `u64` freshness field) and
+   * must be non-negative. `options.chainDepth` must be an integer in the closed
+   * range `0..255` (the bridge's `u8`). Both are validated synchronously before
+   * the handle is returned (fail-fast).
+   *
+   * See spec §6.2.4, §5.4.5, and ADR-049 §3a.
+   *
+   * @param options Named invocation options (a flat config object — the two
+   *   leading `sourceHandle` / `targetHandle` fields are NAMED to prevent a
+   *   silent caller/target handle-swap).
+   */
+  outletInvokeCrossContextStreamingSaga(options: StreamingSagaOptions): StreamingSagaHandle {
+    if (typeof options.timestampMs !== "bigint" || options.timestampMs < 0n) {
+      throw new ValidationError(
+        `timestampMs must be a non-negative bigint, got ${String(options.timestampMs)}`,
+        "SCP-VALID-7002",
+      );
+    }
+    if (
+      !Number.isInteger(options.chainDepth) ||
+      options.chainDepth < 0 ||
+      options.chainDepth > 255
+    ) {
+      throw new ValidationError(
+        `chainDepth must be an integer in range 0-255, got ${String(options.chainDepth)}`,
+        "SCP-VALID-7002",
+      );
+    }
+    return new StreamingSagaHandle(this.#native as unknown as StreamingSagaNative, {
+      sourceHandle: options.sourceHandle,
+      targetHandle: options.targetHandle,
+      callerDid: options.callerDid,
+      outletRegistrationId: options.outletRegistrationId,
+      input: options.input,
+      assertedNonceHex: options.assertedNonceHex,
+      timestampMs: options.timestampMs,
+      chainDepth: options.chainDepth,
+      ucanToken: options.ucanToken,
+      proofTokens: options.proofTokens,
+      ucanProofId: options.ucanProofId,
+      timeoutMs: options.timeoutMs,
+      estimatedChunkCount: options.estimatedChunkCount,
+    });
+  }
+
+  /**
+   * Drives the key-bearing in-session reconnect/repair truncated-close for a
+   * cross-context streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+   *
+   * This is IN-SESSION reconnect/repair of a seal that stalled or went
+   * `NeedsRepair` while THIS bridge process is still alive (e.g. a client
+   * reconnects to the same live node). The saga registry is per-instance and
+   * in-memory, so this does NOT survive a process/node restart — cross-restart
+   * recovery replays the durable saga journal via a separate operator path, not
+   * this surface.
+   *
+   * On FFI reconnect this authenticates the caller, surfaces the target
+   * context's Active Signing Key (resolved per-call from custody, never
+   * envelope-asserted), and calls the bridge recover op to seal a witness-absent
+   * durable prefix and resolve the saga `Committed` — WITHOUT re-opening the
+   * stream or re-invoking the outlet executor. Resolves with `void` on a
+   * successful `Committed` resolution.
+   *
+   * `callerDid` MUST be an identity hosted by this bridge instance (the §6.2.4
+   * channel-authenticated principal) AND the invoker pinned at open — recovery is
+   * money-moving (it bills the invoker / credits the operator over B's durable
+   * prefix), so a hosted-but-non-invoker caller is rejected with `SCP-PERM-3001`
+   * (the SAME invoker gate the same-context grant/cancel/terminate siblings
+   * enforce) BEFORE the signing key is resolved.
+   *
+   * Rejects with {@link ContextError} if `callerDid` is not hosted by this
+   * instance or `sagaId` is unknown; with {@link "./errors".UcanPermissionError}
+   * whose `.code` is `SCP-PERM-3001` when `callerDid` is hosted but is not the
+   * pinned invoker (branch on `.code` for this money-moving gate, not only a
+   * substring match); or {@link "./errors".SagaNeedsRepairError} if the seal
+   * cannot complete (the saga stays unresolved for a later retry).
+   */
+  async recoverStreamingSagaTruncatedClose(sagaId: string, callerDid: string): Promise<void> {
+    try {
+      await (
+        this.#native.outletStreamingSagaRecoverTruncatedClose as (
+          id: string,
+          did: string,
+        ) => Promise<void>
+      )(sagaId, callerDid);
+    } catch (e) {
+      throw mapSagaError(e);
+    }
   }
 
   async outletSessionCreate(

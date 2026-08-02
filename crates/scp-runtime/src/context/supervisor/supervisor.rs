@@ -9624,6 +9624,30 @@ impl Supervisor {
             .unwrap_or_default()
     }
 
+    /// TEST-ONLY: the latest journaled [`SagaState`] for `saga_id` while it is
+    /// still unresolved, or `None` once it has been resolved
+    /// (Committed / Aborted) or was never journaled — reading the supervisor's
+    /// OWN durable saga journal via the SAME `load_unresolved` the crash-recovery
+    /// sweep uses.
+    ///
+    /// This exists so an FFI-level e2e test (SCP-OUT-047 AC6) can observe the
+    /// PRE-Committed (`Committing`) journal state a streaming-saga open leaves at
+    /// the Commit-transition — before the off-mailbox seal task resolves it to
+    /// `Committed` at stream-close — proving the FFI open returned promptly
+    /// rather than blocking until the stream terminated. It reads the journal
+    /// only (no actor mailbox, no mutation), so it is safe to call from any
+    /// runtime. A `load_unresolved` error is folded to "not found" (`None`).
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn test_saga_journal_state(&self, saga_id: &SagaId) -> Option<SagaState> {
+        self.saga_journal
+            .load_unresolved()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|e| &e.saga_id == saga_id)
+            .map(|e| e.state)
+    }
+
     /// Build the journal `evidence` bytes for a cross-context outlet-invocation
     /// saga — the `MessagePack` of the eight-field
     /// [`CrossContextOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared)

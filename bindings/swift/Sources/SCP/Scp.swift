@@ -1209,6 +1209,56 @@ public extension SCP {
 
     // swiftlint:enable function_parameter_count
 
+    // swiftlint:disable function_parameter_count
+    /// Forwards to ``Scp/outletStreamingSagaOpen`` on ``inner`` (§6.2.4 / §5.4.5
+    /// cross-context streaming saga, SCP-OUT-047). Returns the durable `sagaId`
+    /// promptly at the Commit-transition.
+    func outletStreamingSagaOpen(
+        sourceHandle: ContextHandle,
+        targetHandle: ContextHandle,
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: UInt64,
+        chainDepth: UInt8,
+        ucanToken: String,
+        proofTokens: [String]?,
+        ucanProofId: String?,
+        timeoutMs: UInt32?,
+        estimatedChunkCount: UInt32?
+    ) async throws -> String {
+        try await inner.outletStreamingSagaOpen(
+            sourceHandle: sourceHandle,
+            targetHandle: targetHandle,
+            callerDid: callerDid,
+            outletRegistrationId: outletRegistrationId,
+            inputJson: inputJson,
+            assertedNonceHex: assertedNonceHex,
+            timestampMs: timestampMs,
+            chainDepth: chainDepth,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens,
+            ucanProofId: ucanProofId,
+            timeoutMs: timeoutMs,
+            estimatedChunkCount: estimatedChunkCount
+        )
+    }
+
+    // swiftlint:enable function_parameter_count
+
+    /// Forwards to ``Scp/outletStreamingSagaPollNext`` on ``inner``. Returns the
+    /// JSON-serialized `OutletStreamChunk` bytes, or `nil` at the terminal.
+    func outletStreamingSagaPollNext(sagaId: String) async throws -> Data? {
+        try await inner.outletStreamingSagaPollNext(sagaId: sagaId)
+    }
+
+    /// Forwards to ``Scp/outletStreamingSagaRecoverTruncatedClose`` on ``inner``.
+    /// Seals a witness-absent durable prefix and resolves the saga `Committed`.
+    func outletStreamingSagaRecoverTruncatedClose(sagaId: String, callerDid: String) async throws {
+        try await inner.outletStreamingSagaRecoverTruncatedClose(sagaId: sagaId, callerDid: callerDid)
+    }
+
     /// Forwards to ``Scp/outletRegister`` on ``inner``.
     func outletRegister(handle: ContextHandle, definition: OutletDefinition) async throws -> String {
         try await inner.outletRegister(handle: handle, definition: definition)

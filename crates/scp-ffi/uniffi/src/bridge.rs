@@ -970,6 +970,30 @@ impl fmt::Debug for UniffiKeyCustody {
     }
 }
 
+impl UniffiKeyCustody {
+    /// Exports the raw Ed25519 signing key for `handle` by dispatching to the
+    /// active backend — the enum analogue of the per-backend
+    /// `export_ed25519_signing_key` used by [`resolve_uniffi_signing_key`].
+    ///
+    /// Needed by the streaming-saga in-session reconnect/repair recover path
+    /// (SCP-OUT-047), which resolves the TARGET context creator's Active Signing
+    /// Key from the
+    /// per-instance identity custody registry (a `UniffiKeyCustody`) by DID —
+    /// there is no `ContextHandle` on the reconnect leg. Private key material
+    /// never crosses the FFI boundary; it is used in-process to seal the durable
+    /// prefix and dropped (ADR-006).
+    pub(crate) async fn export_ed25519_signing_key(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(imc) => imc.0.export_ed25519_signing_key(handle).await,
+            Self::Callback(cb) => cb.export_ed25519_signing_key(handle).await,
+        }
+    }
+}
+
 impl KeyCustody for UniffiKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         match self {
@@ -5924,7 +5948,7 @@ async fn resolve_identity_signing_key(
     })
 }
 
-async fn resolve_uniffi_signing_key(
+pub(crate) async fn resolve_uniffi_signing_key(
     handle: &ContextHandle,
 ) -> Result<ed25519_dalek::SigningKey, ScpError> {
     let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
@@ -5982,7 +6006,7 @@ async fn resolve_uniffi_signing_key(
 /// - `NeedsRepair` → [`ScpError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpError::SagaBusy`] (`SCP-SAGA-13066`).
-fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpError {
+pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpError {
     use scp_ffi_common::saga_errors::{SagaErrorKind, decompose_saga_error};
     let parts = decompose_saga_error(err);
     match parts.kind {
@@ -6011,7 +6035,7 @@ fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpError {
 /// wire form (§6.2.4 wire envelope). Any other length is a malformed envelope,
 /// NOT a "pad it" situation. Both failure modes surface as
 /// [`ScpError::Validation`] (`SCP-VALID-7001`).
-fn decode_asserted_nonce(asserted_nonce_hex: &str) -> Result<[u8; 16], ScpError> {
+pub(crate) fn decode_asserted_nonce(asserted_nonce_hex: &str) -> Result<[u8; 16], ScpError> {
     let bytes = hex::decode(asserted_nonce_hex).map_err(|e| ScpError::Validation {
         msg: format!(
             "asserted_nonce_hex is not valid hex: {e} — supply the 16-byte §6.2.4 envelope \
@@ -6048,7 +6072,7 @@ fn decode_asserted_nonce(asserted_nonce_hex: &str) -> Result<[u8; 16], ScpError>
 /// prove the request leg is authenticated AS that member) — so axis (a) is the
 /// load-bearing addition this seam contributes. Enforcing here, before the
 /// entry point, also means the saga never observes an unauthenticated caller.
-async fn enforce_caller_principal_binding(
+pub(crate) async fn enforce_caller_principal_binding(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
     caller_context_id: &str,

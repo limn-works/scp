@@ -149,6 +149,7 @@ from scp_sdk.outlets import (
     Outlets,
     OutletStreamChunk,
     SagaResult,
+    StreamingSagaHandle,
     TestVector,
 )
 from scp_sdk.scp import (
@@ -306,6 +307,7 @@ __all__ = [
     "SqliteStorage",
     "StorageConfig",
     "StreamAlreadyClosed",
+    "StreamingSagaHandle",
     "TestVector",
     "ThresholdRequirement",
     "TransportConfig",

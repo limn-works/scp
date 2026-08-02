@@ -2164,6 +2164,73 @@ fn c7_pyo3_outlet_stream_cancel_uses_runtime_derived_cursor() {
     );
 }
 
+// §5.4.5 / §6.2.4 cross-context streaming saga (SCP-OUT-047 pass 1). The PyO3
+// reference bridge's streaming-saga OPEN MUST (a) run the §6.2.4 caller-principal
+// binding (`enforce_caller_principal_binding`) BEFORE anything irreversible — so
+// the saga never observes an unauthenticated caller and no receiver is handed out
+// on a mismatch — and (b) drive the runtime producer
+// `start_cross_context_streaming_outlet_invocation_saga`. Its RECOVER export MUST
+// reach the key-bearing truncated-close driver.
+//
+// This is the PyO3-reference assertion and is ENFORCED (not ignored — this file
+// forbids stale `#[ignore]`s): the PyO3 impl exists as of SCP-OUT-047 pass 1, so
+// the gate is live from day one. Pass 3 ADDS the sibling NAPI/UniFFI assertions
+// (mirroring the C7/C8 same-context streaming pattern above) when those bridges
+// gain the operation.
+#[test]
+fn out047_pyo3_streaming_saga_open_binds_caller_and_reaches_start_saga() {
+    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "outlet_streaming_saga_open_impl")
+        .expect("outlet_streaming_saga_open_impl body must exist");
+    assert!(
+        body.contains("enforce_caller_principal_binding"),
+        "PyO3 streaming-saga open must run the §6.2.4 caller-principal binding \
+         BEFORE the saga runs — else an unauthenticated caller could open a \
+         cross-context stream (ADR-049 §3a channel-auth)."
+    );
+    assert!(
+        body.contains("start_cross_context_streaming_outlet_invocation_saga"),
+        "PyO3 streaming-saga open must reach \
+         Supervisor::start_cross_context_streaming_outlet_invocation_saga — the \
+         runtime producer that returns the receiver at the Commit-transition. \
+         Without it the §5.4.5 cross-context streaming producer is unwired."
+    );
+}
+
+// SCP-OUT-047 pass 1: the PyO3 recover export MUST reach the key-bearing
+// truncated-close recovery driver (which reaches
+// `Supervisor::recover_streaming_saga_truncated_close`) and MUST authenticate the
+// reconnect caller. ENFORCED (PyO3 impl exists); pass 3 adds the sibling
+// assertions.
+#[test]
+fn out047_pyo3_streaming_saga_recover_reaches_truncated_close() {
+    let body = extract_fn_body(
+        PYO3_OUTLET_STREAM_SRC,
+        "outlet_streaming_saga_recover_truncated_close_impl",
+    )
+    .expect("outlet_streaming_saga_recover_truncated_close_impl body must exist");
+    assert!(
+        body.contains("drive_recover_truncated_close"),
+        "PyO3 streaming-saga recover must reach the shared \
+         drive_recover_truncated_close driver (which reaches \
+         Supervisor::recover_streaming_saga_truncated_close) — the key-bearing \
+         crash-recovery seal (SCP-OUT-046 #136 AC7)."
+    );
+    assert!(
+        body.contains("identity_registry_contains"),
+        "PyO3 streaming-saga recover must AUTHENTICATE the reconnect caller \
+         (identity-registry check) before sealing — the caller MUST be the \
+         channel-authenticated principal (§6.2.4)."
+    );
+    assert!(
+        body.contains("resolve_context_signing_key"),
+        "PyO3 streaming-saga recover must SURFACE the target context's Active \
+         Signing Key per-call from custody (resolve_context_signing_key) before \
+         sealing — the recovery receipt is signed with a custody-resolved key, \
+         NEVER an envelope-asserted one (§6.2.4). Structurally pins the \
+         FFI-layer key-surfacing, not just the runtime seal."
+    );
+}
+
 // §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8a). The NAPI
 // bridge's streaming open MUST (a) validate the invocation UCAN at the bridge
 // (the §5.4.5 "UCAN check locus" — validated exactly ONCE at open) and (b)

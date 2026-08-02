@@ -120,6 +120,14 @@ pub mod credentials;
 #[cfg(feature = "resolvers")]
 pub mod outlet_stream_credit;
 
+// Bridge-agnostic pieces of the §5.4.5 cross-context streaming-saga FFI surface
+// (SCP-OUT-047): the per-instance registry value, the chunk serialize/terminal
+// step, and the ADR-056-chokepoint key-bearing truncated-close recovery driver.
+// Shared so the three bridges' streaming-saga poll/recover wiring cannot drift.
+// Requires scp-core (behind `resolvers`, which always pulls it in).
+#[cfg(feature = "resolvers")]
+pub mod streaming_saga;
+
 // Shared context-parameter builder for all FFI bridges.
 // Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]

@@ -59,7 +59,7 @@ from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
-    from scp_sdk.outlets import OutletDefinition, SagaResult
+    from scp_sdk.outlets import OutletDefinition, SagaResult, StreamingSagaHandle
 
     # Imported under TYPE_CHECKING only to annotate ``ucan_evaluate`` /
     # ``participation_record`` return types without a runtime circular import
@@ -2595,6 +2595,152 @@ class SCP:
             receipt=native_result.receipt,
             output=native_result.output,
         )
+
+    def outlet_invoke_cross_context_streaming_saga(
+        self,
+        caller_context_id: str,
+        target_context_id: str,
+        caller_did: str,
+        outlet_registration_id: str,
+        input: dict[str, Any],
+        asserted_nonce_hex: str,
+        timestamp_ms: int,
+        chain_depth: int,
+        ucan_token: str,
+        proof_tokens: list[str] | None = None,
+        ucan_proof_id: str | None = None,
+        timeout_ms: int | None = None,
+        estimated_chunk_count: int | None = None,
+    ) -> StreamingSagaHandle:
+        """Open the §5.4.5 / §6.2.4 cross-context STREAMING outlet-invocation saga.
+
+        The STREAMING sibling of :meth:`outlet_invoke_cross_context_saga`. Where
+        the unary saga BLOCKS the FFI worker until ``Committed`` (≤~95s) and
+        returns the result inline, the streaming saga returns its chunk receiver
+        PROMPTLY at the Commit-transition and reaches ``Committed``
+        ASYNCHRONOUSLY at seal-close (the ADR-049 §3a streaming wait-model
+        amendment) — an LLM stream can exceed the unary bound, so the credit
+        ceiling bounds chunk COUNT, not wall-clock.
+
+        Returns a :class:`~scp_sdk.outlets.StreamingSagaHandle` — an
+        async-iterable + awaitable handle whose FIRST pull opens the saga
+        (``outlet_streaming_saga_open`` mints the durable ``saga_id`` at the
+        Commit-transition) and whose iteration drains chunks via
+        ``outlet_streaming_saga_poll_next``. This method performs NO I/O and
+        does NOT block — the saga opens lazily on first ``await`` / iteration,
+        matching the same-context :meth:`~scp_sdk.outlets.Outlets.invoke`.
+
+        There is NO live control plane (grant_credit / cancel) for the
+        cross-context saga stream — per §6.2.5 / SCP-OUT-046 the credit window
+        is fixed at open via ``estimated_chunk_count`` (cancel_ack_ceiling =
+        u64::MAX). An open rejection — the §6.2.4 caller-principal binding
+        (a ``caller_did`` this instance does not host / not a member of
+        ``caller_context_id``), a Prepare/Commit saga terminal, or an
+        input/UCAN rejection — surfaces on the first ``await`` / iteration as
+        the matching SDK type (:class:`~scp_sdk.errors.SagaAbortedError` /
+        :class:`~scp_sdk.errors.SagaBusyError` /
+        :class:`~scp_sdk.errors.SagaNeedsRepairError` /
+        :class:`~scp_sdk.errors.ValidationError` /
+        :class:`~scp_sdk.errors.UcanPermissionError`), and the receiver is
+        never handed out.
+
+        The parameters mirror :meth:`outlet_invoke_cross_context_saga`
+        (``caller_context_id`` / ``target_context_id`` / ``caller_did`` /
+        ``outlet_registration_id`` / ``input`` / the ``asserted_nonce_hex`` /
+        ``timestamp_ms`` / ``chain_depth`` freshness triple / ``ucan_proof_id``)
+        plus the streaming-open extras: the required invocation ``ucan_token``,
+        optional ``proof_tokens`` delegation chain, per-stream ``timeout_ms``,
+        and the invoker-declared ``estimated_chunk_count`` credit ceiling.
+
+        Validates ``chain_depth`` is an integer in the closed range ``0..255``
+        (u8 on the bridge side) and ``timestamp_ms`` is a non-negative integer;
+        both reject ``bool`` and floats. See spec §6.2.4, §5.4.5, and
+        ADR-049 §3a.
+        """
+        from scp_sdk.errors import ValidationError
+        from scp_sdk.outlets import StreamingSagaHandle, _StreamingSagaOpenParams
+
+        if (
+            isinstance(chain_depth, bool)
+            or not isinstance(chain_depth, int)
+            or chain_depth < 0
+            or chain_depth > 255
+        ):
+            raise ValidationError(
+                f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
+                code="SCP-VALID-7002",
+            )
+        if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int) or timestamp_ms < 0:
+            raise ValidationError(
+                f"timestamp_ms must be a non-negative integer, got {timestamp_ms!r}",
+                code="SCP-VALID-7002",
+            )
+
+        params = _StreamingSagaOpenParams(
+            caller_context_id=caller_context_id,
+            target_context_id=target_context_id,
+            caller_did=caller_did,
+            outlet_registration_id=outlet_registration_id,
+            input=input,
+            asserted_nonce_hex=asserted_nonce_hex,
+            timestamp_ms=timestamp_ms,
+            chain_depth=chain_depth,
+            ucan_token=ucan_token,
+            proof_tokens=proof_tokens,
+            ucan_proof_id=ucan_proof_id,
+            timeout_ms=timeout_ms,
+            estimated_chunk_count=estimated_chunk_count,
+        )
+        return StreamingSagaHandle(self._native, params)
+
+    async def recover_streaming_saga_truncated_close(self, saga_id: str, caller_did: str) -> None:
+        """Drive the key-bearing in-session reconnect/repair truncated-close for
+        a cross-context streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+
+        This is IN-SESSION reconnect/repair of a seal that stalled or went
+        ``NeedsRepair`` while THIS bridge process is still alive (e.g. a client
+        reconnects to the same live node). The saga registry is per-instance and
+        in-memory, so this does NOT survive a process/node restart — cross-restart
+        recovery replays the durable saga journal via a separate operator path,
+        not this surface.
+
+        On FFI reconnect this authenticates the caller, surfaces the target
+        context's Active Signing Key (resolved per-call from custody, never
+        envelope-asserted), and calls
+        ``Supervisor::recover_streaming_saga_truncated_close`` to seal a
+        witness-absent durable prefix and resolve the saga ``Committed`` —
+        WITHOUT re-opening the stream or re-invoking the outlet executor. It
+        returns ``None`` on a successful ``Committed`` resolution.
+
+        ``caller_did`` MUST be an identity hosted by this bridge instance (the
+        §6.2.4 channel-authenticated principal) AND the invoker pinned at open —
+        recovery is money-moving (it bills the invoker / credits the operator
+        over B's durable prefix), so a hosted-but-non-invoker caller is rejected
+        with ``SCP-PERM-3001`` (the SAME invoker gate the same-context
+        grant/cancel/terminate siblings enforce) BEFORE the signing key is
+        resolved.
+
+        Raises :class:`~scp_sdk.errors.ContextError` if ``caller_did`` is not
+        hosted by this instance or ``saga_id`` is unknown, or — when
+        ``caller_did`` is hosted but is not the pinned invoker — a
+        :class:`~scp_sdk.errors.ContextError` whose structured ``.code`` is
+        ``SCP-PERM-3001`` (a caller can branch on ``.code`` for this
+        money-moving gate, not only substring-match the message);
+        :class:`~scp_sdk.errors.SagaNeedsRepairError` if the seal cannot
+        complete (the saga stays unresolved for a later retry).
+        """
+        from scp_sdk.errors import _saga_terminal_from_bridge
+        from scp_sdk.outlets import _translate_bridge_error
+
+        try:
+            await asyncio.to_thread(
+                self._native.outlet_streaming_saga_recover_truncated_close,
+                saga_id,
+                caller_did,
+            )
+        except Exception as exc:
+            translated = _saga_terminal_from_bridge(exc)
+            raise (translated if translated is not None else _translate_bridge_error(exc)) from exc
 
     async def outlet_register(
         self, context_id: str, registration: OutletDefinition | dict[str, Any]

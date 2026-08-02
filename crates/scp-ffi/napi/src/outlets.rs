@@ -792,7 +792,7 @@ pub struct NapiSagaResult {
 /// - `NeedsRepair` → [`ScpNapiError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpNapiError::SagaBusy`] (`SCP-SAGA-13066`).
-fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpNapiError {
+pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpNapiError {
     use scp_ffi_common::saga_errors::{SagaErrorKind, decompose_saga_error};
     let parts = decompose_saga_error(err);
     match parts.kind {
@@ -826,7 +826,7 @@ fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpNapiError
 /// authoritative owner the handle was minted with — not via the UCAN-state
 /// registry, which a freshly-created context only populates lazily on its first
 /// UCAN/outlet call. `context_id` is carried only for the error message.
-async fn resolve_context_signing_key(
+pub(crate) async fn resolve_context_signing_key(
     bi: &crate::runtime::NapiBridgeInstance,
     creator_did: &str,
     context_id: &str,
@@ -856,7 +856,7 @@ async fn resolve_context_signing_key(
 /// The nonce is a 16-byte value carried as a hex string — the one canonical
 /// wire form (§6.2.4 wire envelope). Any other length is a malformed envelope,
 /// NOT a "pad it" situation. Both failure modes surface as a validation error.
-fn decode_asserted_nonce(asserted_nonce_hex: &str) -> napi::Result<[u8; 16]> {
+pub(crate) fn decode_asserted_nonce(asserted_nonce_hex: &str) -> napi::Result<[u8; 16]> {
     let bytes = hex::decode(asserted_nonce_hex).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!(
@@ -897,7 +897,7 @@ fn decode_asserted_nonce(asserted_nonce_hex: &str) -> napi::Result<[u8; 16]> {
 /// request leg is authenticated AS that member) — so axis (a) is the
 /// load-bearing addition this seam contributes. Enforcing here, before the
 /// entry point, also means the saga never observes an unauthenticated caller.
-async fn enforce_caller_principal_binding(
+pub(crate) async fn enforce_caller_principal_binding(
     bi: &crate::runtime::NapiBridgeInstance,
     supervisor: &std::sync::Arc<scp_core::context::supervisor::Supervisor>,
     caller_context_id: &str,
