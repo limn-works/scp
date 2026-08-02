@@ -1771,7 +1771,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextCryptoProvider::rotate_sender_key (MlsCryptoProvider impl at scp-runtime/src/crypto/mls/provider.rs:739) generates a fresh sender key after a member is removed or leaves (#1541, batch-2 wiring). Invoked transitively from execute_remove_member and leave_context. Pipeline-wiring assertions execute_remove_member_calls_rotate_sender_key and leave_context_calls_rotate_sender_key cover this.",
+          "notes": "Internal: PerContextState::rotate_sender_key (actor-owned, ADR-049 §6; scp-runtime/src/context/actor/state.rs — relocated off the former MlsCryptoProvider by PR-7/#2148) generates a fresh sender key after a member is removed or leaves (#1541, batch-2 wiring). Invoked transitively from execute_remove_member and leave_context. Pipeline-wiring assertions execute_remove_member_calls_rotate_sender_key and leave_context_calls_rotate_sender_key cover this.",
           "exemptions": {
             "python": "internal crypto-provider trait method, not a standalone SDK operation",
             "typescript": "internal crypto-provider trait method, not a standalone SDK operation",
@@ -1785,7 +1785,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextCryptoProvider::remove_member_sender_key (MlsCryptoProvider impl at provider.rs:706) deletes the removed member's sender key from the local store. Invoked transitively from execute_remove_member alongside rotate_sender_key. Pipeline-wiring assertion execute_remove_member_calls_remove_member_sender_key covers this.",
+          "notes": "Internal: PerContextState::remove_member_sender_key (actor-owned, ADR-049 §6; scp-runtime/src/context/actor/state.rs — relocated off the former MlsCryptoProvider by PR-7/#2148) deletes the removed member's sender key from the local store. Invoked transitively from execute_remove_member alongside rotate_sender_key. Pipeline-wiring assertion execute_remove_member_calls_remove_member_sender_key covers this.",
           "exemptions": {
             "python": "internal crypto-provider trait method, not a standalone SDK operation",
             "typescript": "internal crypto-provider trait method, not a standalone SDK operation",
@@ -1799,7 +1799,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextCryptoProvider::advance_epoch (MlsCryptoProvider impl at provider.rs:1240) is the MLS commit/welcome processing entry point used by execute_rotate_content_keys (#1548, batch-2 wiring). Invoked transitively from the governance dispatch path; not a standalone SDK operation.",
+          "notes": "Internal: PerContextState::advance_epoch (actor-owned, ADR-049 §6; scp-runtime/src/context/actor/state.rs — relocated off the former MlsCryptoProvider by PR-7/#2148) is the MLS commit/welcome processing entry point used by execute_rotate_content_keys (#1548, batch-2 wiring). Invoked transitively from the governance dispatch path; not a standalone SDK operation.",
           "exemptions": {
             "python": "internal MLS state advance, not a standalone SDK operation",
             "typescript": "internal MLS state advance, not a standalone SDK operation",
