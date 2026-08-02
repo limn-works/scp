@@ -740,3 +740,117 @@ test("a stream that closes without an End chunk makes aggregate() throw SCP-OUTL
   invoker.closeContext(FIX.contextId);
   operator.closeContext(FIX.contextId);
 });
+
+test("breaking out of a drain releases the (client, context) claim (return() hook)", async () => {
+  const { invoker, operator, relay, invokerInbound } = await buildPair();
+  const CTX = FIX.contextId;
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+
+  const chunkFrames: Uint8Array[] = [];
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => chunkFrames.shift() ?? null,
+  };
+
+  // Forward two chunks so the drain yields at least one before the `break`.
+  for (const seq of [0, 1]) {
+    operator.sendMessage(CTX, hexToBytes(FIX.chunks[seq]?.wireHex ?? ""));
+  }
+  relay.pump();
+  chunkFrames.push(...invokerInbound.splice(0));
+
+  const first = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
+  for await (const chunk of first) {
+    expect(chunk.sequence).toBe(0);
+    // `break` mid-drain: the `for await … of` protocol invokes the iterator's
+    // return() hook, which must release the live-consumer claim (not leak it).
+    break;
+  }
+
+  // Proof the claim was released: a fresh session on the SAME (client, context)
+  // constructs without SCP-VALID-7028.
+  const second = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
+  expect(second.requestId).toBeInstanceOf(Uint8Array);
+
+  invoker.closeContext(CTX);
+  operator.closeContext(CTX);
+});
+
+test("close() releases the (client, context) claim", async () => {
+  const { invoker, operator } = await buildPair();
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => null,
+  };
+
+  const first = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
+  first.close();
+  // The claim released by close() lets a fresh session construct on the same pair.
+  const second = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
+  expect(second.requestId).toBeInstanceOf(Uint8Array);
+
+  invoker.closeContext(FIX.contextId);
+  operator.closeContext(FIX.contextId);
+});
+
+test("`await using` releases the (client, context) claim on block exit (asyncDispose)", async () => {
+  const { invoker, operator } = await buildPair();
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => null,
+  };
+
+  {
+    // `await using` only type-checks if [Symbol.asyncDispose] returns a
+    // PromiseLike (the R4-1 fix); this block also exercises it at runtime.
+    await using session = new BrowserInvokerStreamSession(
+      sessionOpts(invoker, coordinator, caveatsBinding),
+    );
+    expect(session.requestId).toBeInstanceOf(Uint8Array);
+  }
+
+  // Block exit ran [Symbol.asyncDispose] → #markClosed → claim released: a fresh
+  // session on the same pair constructs without SCP-VALID-7028.
+  const next = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
+  expect(next.requestId).toBeInstanceOf(Uint8Array);
+
+  invoker.closeContext(FIX.contextId);
+  operator.closeContext(FIX.contextId);
+});
+
+test("grantCredit rejects a non-Credit at runtime (InvalidGrant) even when tsc is bypassed", async () => {
+  const { invoker, operator } = await buildPair();
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+  let openCalls = 0;
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {
+      openCalls += 1;
+    },
+    grantCredit: async () => {},
+    pollNext: async () => null,
+  };
+  const session = new BrowserInvokerStreamSession(
+    sessionOpts(invoker, coordinator, caveatsBinding),
+  );
+
+  // A bare `{ value }` object satisfies tsc via the cast but is NOT a branded
+  // Credit instance — the runtime guard must reject it (InvalidGrant) BEFORE it
+  // reaches signing with an unvalidated `.value`, mirroring the native surface.
+  await expect(session.grantCredit({ value: 3.5 } as unknown as Credit)).rejects.toBeInstanceOf(
+    InvalidGrant,
+  );
+  await expect(session.grantCredit({ value: 0 } as unknown as Credit)).rejects.toBeInstanceOf(
+    InvalidGrant,
+  );
+  // The guard runs before the lazy open, so no grant ever opened the stream.
+  expect(openCalls).toBe(0);
+
+  session.close();
+  invoker.closeContext(FIX.contextId);
+  operator.closeContext(FIX.contextId);
+});
