@@ -821,9 +821,20 @@ PUBLISH {
 QUERY {
     routing_id: did_routing_id,
     since: null,
-    limit: 1
+    limit: N   (bounded; see below)
 }
 ```
+
+The `limit` is a small bounded constant (implementation: 16) rather than 1. This
+multi-candidate QUERY is required for intra-relay shadow-defeat (§3.10.8): a relay
+stores blobs keyed by content hash, so multiple distinct blobs can co-exist at one
+`routing_id`. An attacker with knowledge of `did_routing_id` (derivable from any
+DID string) and access to unauthenticated PUBLISH can co-locate a
+decodable-but-invalid frame before the genuine record. A `limit: 1` response would
+return only that planted frame; a bounded multi-candidate response lets the resolver
+skip the bad frame and find the genuine one. The resolver selects the highest-seq
+valid candidate (§3.10.7) so neither bad-signature nor stale-but-valid shadows
+suppress the current record.
 
 **Properties:**
 
@@ -936,7 +947,8 @@ The dual-layer architecture preserves all security properties of §9.6.1 (self-c
 
 - **Self-certification preserved.** The BEP44 signature is verified against the public key encoded in the DID string. The storage backend (relay or DHT) is untrusted. §9.6.1 properties are unchanged.
 - **Relay serves stale document.** Detected by sequence number comparison. The resolver falls through to other relays or DHT. Stale documents do not compromise security — they delay propagation of key rotations, which is bounded by the republish cycle (6 days for relays, 2 hours for DHT).
-- **Relay suppresses document.** Parallel query across multiple relays plus DHT. Suppression by one source does not prevent resolution. Multi-relay publishing (§9.9.2) applies to DID documents as it does to context blobs.
+- **Relay suppresses document.** Concurrent query across all relay URLs plus DHT, each relay guarded by an independent per-relay timeout. A single slow or hung relay cannot suppress results obtained from faster relays. Suppression by one source does not prevent resolution. Multi-relay publishing (§9.9.2) applies to DID documents as it does to context blobs.
+- **Intra-relay co-located shadow (honest relay, planted blob).** An attacker who knows a DID's `routing_id` (derivable from the DID string) and can send unauthenticated PUBLISH commands can co-locate a well-framed but bad-signature (or stale-but-valid) blob at the same `routing_id` ahead of the genuine record on an otherwise honest relay. Defeated by the bounded multi-candidate QUERY (§3.10.2): the resolver fetches all candidates within the bounded candidate window (bounded by `MAX_CANDIDATES_PER_RELAY = 16` per relay) and selects the **highest-seq valid** one. A bad-signature candidate fails BEP44 verification and is skipped. A stale-but-valid candidate has a lower seq than the genuine record; since `seq` is inside the BEP44 signed payload, an attacker cannot forge a higher seq without the identity owner's private key (§3.10.7). Both attacks are closed by the same "iterate the bounded candidate window, pick highest-seq-valid" selection rule. (A relay returning >16 candidates can defeat this selection, but a malicious relay can equally suppress resolution by returning an empty set — the cap is a DoS budget bound, not the primary shadow-defeat control; the relay QUERY contract (§3.10.2) specifies the bounded `limit: N` (implementation: 16) response within which the resolver selects the highest-seq valid record. Shadow-defeat therefore holds for honest relays; active suppression by a malicious relay is covered by cross-relay + DHT fan-out, below.)
 - **Relay serves wrong DID's document.** The BEP44 signature does not verify against the target DID's public key. Rejected immediately. The routing ID is derived from the DID string, but verification is against the DID's key — substitution is cryptographically impossible.
 - **Dual-layer resilience.** An attacker must suppress a DID document on ALL of an identity's relays AND ALL reachable DHT nodes to prevent resolution. This is a strictly harder attack than suppressing on either layer alone.
 

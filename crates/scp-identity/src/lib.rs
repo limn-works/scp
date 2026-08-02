@@ -36,6 +36,7 @@
 pub mod cache;
 pub mod config;
 pub mod dht;
+pub mod relay_querier;
 pub mod republish;
 pub mod resolution;
 pub mod resolver;
@@ -47,11 +48,9 @@ pub use dht::{
     PostResolveHook, SequenceStore, did_from_ed25519_public_key, extract_public_key,
     verify_migration, verify_self_certification,
 };
+pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
-pub use resolution::{
-    InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id,
-    relay_resolve,
-};
+pub use resolution::{InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, did_routing_id};
 pub use resolver::{
     DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
     NoOpHealer, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
@@ -237,6 +236,16 @@ pub enum IdentityError {
     /// Querying an SCP relay for a DID document failed.
     #[error("relay query failed: {0}")]
     RelayQueryFailed(String),
+
+    /// A relay querier has no live connection to the specified relay URL.
+    ///
+    /// Returned by `TransportRelayQuerier` (Slice 011b) when the relay
+    /// connection pool does not hold an active connection to the requested
+    /// relay URL and cannot establish one in time. Callers (`RealMultiRelayQuerier`)
+    /// treat this as a soft failure and advance to the next relay in priority
+    /// order — identical to `RelayQueryFailed` in terms of fall-through behavior.
+    #[error("relay not connected: {0}")]
+    RelayNotConnected(String),
 
     /// The resolved document has a stale sequence number (lower than last known).
     #[error("stale sequence number: received {received}, last known {last_known}")]
