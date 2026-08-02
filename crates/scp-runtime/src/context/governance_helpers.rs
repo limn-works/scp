@@ -979,10 +979,11 @@ pub async fn execute_revoke(
             timestamp_secs,
         )
         .await?;
-    // Spec §2008 / §2015: emit one best-effort KeyEpochAdvance leaf per author
+    // Spec §5.14.8 / §5.14.10: emit one best-effort KeyEpochAdvance leaf per author
     // whose broadcast key was rotated by the governance ban.  Each rotation
     // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
     // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
+    // TODO(spec): §2033 vs §5.14.10/ADR-011 tension unresolved — convergent trigger may require fail-closed here
     let mut kea_success_count: u64 = 0;
     for rotation in &rotated_authors {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
@@ -3200,6 +3201,7 @@ pub async fn execute_rotate_content_keys(
     // on the per-author block path; it is dead data in this governance path.
     // `old_epoch` is derived as `new_epoch - 1` because `rotate_all_author_keys`
     // always increments by exactly 1 (pre-validated, sound by construction).
+    // TODO(spec): §2033 vs §5.14.10/ADR-011 tension unresolved — convergent trigger may require fail-closed here
     let mut kea_success_count: u64 = 0;
     for advance in &key_advances {
         let old_epoch = advance.new_epoch.saturating_sub(1);
@@ -3345,6 +3347,11 @@ pub async fn execute_reconfigure_governance(
             timestamp_secs,
         )
         .await?;
+    // Bump the coalesced counter immediately after the first durable leaf so
+    // that a failure on the companion GovernanceDeadlockRecovery append below
+    // does not leave the counter under-counted.  Each leaf that is durably
+    // appended gets exactly one +1 bump (§9.9.3).
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // Append the companion GovernanceDeadlockRecovery leaf carrying the
     // structured recovery justification (issue #1847).  The two leaves share

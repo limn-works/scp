@@ -132,6 +132,10 @@ pub struct BroadcastKeyEpochAdvance {
     /// The new epoch number after rotation.
     pub new_epoch: u64,
     /// Unix timestamp in milliseconds when the rotation occurred.
+    ///
+    /// This field is only consumed on the per-author block relay-message path; on
+    /// the governance/event-log path, `timestamp_secs` is used directly and this
+    /// field is ignored.
     pub timestamp: u64,
 }
 

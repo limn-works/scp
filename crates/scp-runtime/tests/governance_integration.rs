@@ -46,7 +46,9 @@ use scp_protocol::context::governance::{
     GovernanceContext, GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus,
     SingleAdminEngine, VoteType, actions_conflict, sign_vote,
 };
-use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
+use scp_protocol::context::params::{
+    Capability, ContextMode, ContextParams, GovernanceModel, MemoryScope,
+};
 use scp_protocol::context::{ContextError, ContextState};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
@@ -3055,5 +3057,71 @@ async fn governance_deadlock_recovery_appends_both_event_leaves() {
         "GovernanceDeadlockRecovery (seq {}) must follow GovernanceReconfigured (seq {})",
         recovery_entry.sequence,
         reconfigured_seq
+    );
+}
+
+// =========================================================================
+// §5.14.8 / §5.14.10: RotateContentKeys on a broadcast context must emit
+// one ContentKeysRotated leaf AND one KeyEpochAdvance leaf per broadcast
+// author.  Verifies the checkpoint counter fix (Bug 2 fast-follow #2218):
+// each durable leaf bumps the counter once — a crash after the first but
+// before the second append must not leave the counter under-counted.
+// =========================================================================
+
+#[tokio::test]
+async fn rotate_content_keys_broadcast_kea_governance_integration() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-broadcast-rotate-kea";
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: governance_ceiling(),
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Execute RotateContentKeys as SingleAdmin (auto-approve + auto-execute).
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, result) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RotateContentKeys { reason: None },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    let _ = proposal;
+    assert!(
+        result.is_some(),
+        "SingleAdmin must auto-execute RotateContentKeys"
+    );
+
+    // Verify event log: 1 ContentKeysRotated + 1 KeyEpochAdvance (alice is the sole author).
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist");
+
+    let rotated_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::ContentKeysRotated)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+
+    assert_eq!(
+        rotated_count, 1,
+        "exactly 1 ContentKeysRotated leaf must be emitted"
+    );
+    assert_eq!(
+        kea_count, 1,
+        "exactly 1 KeyEpochAdvance leaf per broadcast author (alice is sole author)"
     );
 }

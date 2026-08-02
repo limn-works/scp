@@ -1646,6 +1646,12 @@ impl BroadcastContext {
             });
         }
 
+        // Sort by author_did for deterministic Merkle leaf ordering across
+        // replicas and reconstructions (§9.9.3). HashMap iteration order is
+        // randomized per process, so the same logical ban would otherwise
+        // produce a different Merkle root on different nodes or replays.
+        // Mirrors the identical sort in `rotate_all_author_keys`.
+        rotated_authors.sort_unstable_by(|a, b| a.author_did.cmp(&b.author_did));
         Ok(GovernanceBanResult {
             banned_did: did.to_owned(),
             rotated_authors,
@@ -1673,7 +1679,7 @@ impl BroadcastContext {
         }
     }
 
-    /// Rotates all authors' broadcast keys (governance-triggered, §9.17).
+    /// Rotates all authors' broadcast keys (governance-triggered, §5.14.8 / §5.14.10).
     ///
     /// Advances every author's epoch and generates a new sender key. Used by
     /// `RotateContentKeys` governance action for context-wide key hygiene.
@@ -6201,7 +6207,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // rotate_all_author_keys — §9.17 governance-triggered epoch advance (#1847)
+    // rotate_all_author_keys — §5.14.8 / §5.14.10 governance-triggered epoch advance (#1847)
     // -----------------------------------------------------------------------
 
     /// `rotate_all_author_keys` must return exactly one [`BroadcastKeyEpochAdvance`]
@@ -6294,6 +6300,63 @@ mod tests {
             ctx.authors.get("did:example:alice").unwrap().epoch,
             0,
             "alice's epoch must be unchanged after a failed rotate_all_author_keys"
+        );
+    }
+
+    /// `rotate_all_author_keys` MUST return advances in sorted `author_did` order
+    /// (§9.9.3 Merkle determinism — `HashMap` iteration order is non-deterministic).
+    #[test]
+    fn rotate_all_author_keys_advances_sorted_by_author_did() {
+        let mut ctx = make_open_ctx();
+        // Add authors in reverse alphabetical order to expose any HashMap ordering
+        // dependency — the returned Vec must be sorted regardless of insertion order.
+        ctx.add_author("did:example:carol").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let advances = ctx.rotate_all_author_keys(1_700_000_000_000).unwrap();
+
+        assert_eq!(advances.len(), 3);
+        // Assert sorted order WITHOUT re-sorting — the implementation MUST sort.
+        let dids: Vec<&str> = advances.iter().map(|a| a.author_did.as_str()).collect();
+        assert_eq!(
+            dids,
+            ["did:example:alice", "did:example:bob", "did:example:carol"],
+            "rotate_all_author_keys must return advances in sorted author_did order for \
+             Merkle determinism (§9.9.3) — HashMap iteration is non-deterministic"
+        );
+    }
+
+    /// `governance_ban_subscriber` MUST return `rotated_authors` in sorted
+    /// `author_did` order (§9.9.3 Merkle determinism).
+    #[test]
+    fn governance_ban_subscriber_rotated_authors_sorted_by_author_did() {
+        use crate::context::governance::AccessScope;
+
+        let mut ctx = make_open_ctx();
+        // Register a subscriber so the ban has a registry target.
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1_700_000_000).unwrap();
+        // Add authors in reverse alphabetical order to expose HashMap ordering.
+        ctx.add_author("did:example:carol").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let result = ctx
+            .governance_ban_subscriber("did:example:sub1", AccessScope::Read)
+            .unwrap();
+
+        assert_eq!(result.rotated_authors.len(), 3);
+        // Assert sorted WITHOUT re-sorting in the test.
+        let dids: Vec<&str> = result
+            .rotated_authors
+            .iter()
+            .map(|r| r.author_did.as_str())
+            .collect();
+        assert_eq!(
+            dids,
+            ["did:example:alice", "did:example:bob", "did:example:carol"],
+            "governance_ban_subscriber must return rotated_authors in sorted author_did order \
+             for Merkle determinism (§9.9.3)"
         );
     }
 
