@@ -41,12 +41,17 @@ export {
   WebSocketRelaySocket,
   type WebSocketRelaySocketOptions,
 } from "./adapters/websocket-relay-socket";
-// The client façade, one-time init, and the two pure outlet-stream predicates.
+// The client façade, one-time init, and the pure §5.4.5 outlet-stream invoker
+// predicates (SCP-OUT-037 caveats/chunk + SCP-OUT-048 credit/cancel signing).
 export {
   type InitInput,
   initScp,
   isScpInitialized,
+  outletStreamComputeCancelPreimage,
   outletStreamComputeCaveatsBinding,
+  outletStreamComputeCreditPreimage,
+  outletStreamSignCancel,
+  outletStreamSignCredit,
   outletStreamVerifyChunkSignature,
   ScpBrowserClient,
   type ScpBrowserClientCreateOptions,
@@ -71,10 +76,23 @@ export {
   UcanPermissionError,
   ValidationError,
 } from "./errors";
+// The browser-invoker streaming-saga session (node-delegated coordination;
+// in-tab signing + on-device decrypt/verify — ADR-057 scope fence, SCP-OUT-048).
+export {
+  BrowserInvokerStreamSession,
+  type BrowserInvokerStreamSessionOptions,
+  caveatsBindingFor,
+  type NodeStreamCoordinator,
+  type OutletStreamChunkView,
+  type OutletStreamOpenRequest,
+  type StreamAggregate,
+} from "./outlet-stream-session";
 // Flat result types.
 export type {
   AddMemberOutput,
   ContextStatus,
+  OutletStreamCancel,
+  OutletStreamCredit,
   ReceivedEvent,
   ReceiveOutput,
   SenderKeyDistribution,

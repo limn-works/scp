@@ -2473,6 +2473,66 @@
             "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
             "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
           }
+        },
+        {
+          "name": "outlet_stream_sign_credit",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure invoker signing predicate (browser invoker), SCP-OUT-048 — signs an OutletStreamCredit (SCP-OUTLET-CREDIT-V1) in-tab; the outletStreamSignCredit wrapper over @limn-works/scp-ts-wasm. Saga coordination is node-delegated (SCP-OUT-047) per the ADR-057 scope fence.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_sign_cancel",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure invoker signing predicate (browser invoker), SCP-OUT-048 — signs an OutletStreamCancel (SCP-OUTLET-CANCEL-V1) in-tab; the outletStreamSignCancel wrapper over @limn-works/scp-ts-wasm. Saga coordination is node-delegated (SCP-OUT-047) per the ADR-057 scope fence.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_compute_credit_preimage",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure invoker signing predicate (browser invoker), SCP-OUT-048 — the #1980-forward WebCrypto seam: computes the 32-byte SCP-OUTLET-CREDIT-V1 preimage without touching any private key; the outletStreamComputeCreditPreimage wrapper over @limn-works/scp-ts-wasm. Saga coordination is node-delegated (SCP-OUT-047) per the ADR-057 scope fence.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_compute_cancel_preimage",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure invoker signing predicate (browser invoker), SCP-OUT-048 — the #1980-forward WebCrypto seam: computes the 32-byte SCP-OUTLET-CANCEL-V1 preimage without touching any private key; the outletStreamComputeCancelPreimage wrapper over @limn-works/scp-ts-wasm. Saga coordination is node-delegated (SCP-OUT-047) per the ADR-057 scope fence.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
         }
       ]
     }

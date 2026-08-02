@@ -32,7 +32,11 @@ import wasmInit, {
   type WasmReceiveOutput,
   WasmScpClient,
   type WasmSenderKeyDistribution,
+  outletStreamComputeCancelPreimage as wasmComputeCancelPreimage,
   outletStreamComputeCaveatsBinding as wasmComputeCaveatsBinding,
+  outletStreamComputeCreditPreimage as wasmComputeCreditPreimage,
+  outletStreamSignCancel as wasmSignCancel,
+  outletStreamSignCredit as wasmSignCredit,
   outletStreamVerifyChunkSignature as wasmVerifyChunkSignature,
 } from "./wasm/scp_client_wasm.js";
 
@@ -517,5 +521,134 @@ export function outletStreamVerifyChunkSignature(
   assertInitialized();
   return call(() =>
     wasmVerifyChunkSignature(chunk, operatorPk, contextId, outletId, caveatsBinding),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// §5.4.5 outlet-streaming invoker signing predicates (SCP-OUT-048).
+//
+// A browser INVOKER authors its own §5.4.5 control-plane messages IN-TAB (keys
+// on-device, ADR-057). It does NOT coordinate the streaming saga — the FSM,
+// off-mailbox pump, durable capture, escrow settlement, and receipt signing are
+// NODE-DELEGATED (SCP-OUT-046/047), outside the ADR-057 scope fence. These are
+// pure `scp-protocol` predicates over caller-supplied bytes: they marshal the
+// unit-A wasm exports, mirroring the native bridges so the TS SDK produces ONE
+// credit/cancel wire form across bindings. The `u64` fields marshal as `bigint`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Signs an outlet-stream **credit grant** with the invoker's Ed25519 signing key
+ * IN-TAB (§5.4.5, `SCP-OUTLET-CREDIT-V1`). Returns the JSON-serialized
+ * `OutletStreamCredit` (`request_id` ‖ `grant` ‖ `monotonic_seq` ‖ `sig`) — the
+ * same wire form the native bridges accept, to route to the node coordinator.
+ *
+ * `signingKeySeed` is the invoker's 32-byte outlet-signing seed, held on-device.
+ * `grant` is a `u32`; `monotonicSeq` and `streamEpoch` are `u64` → `bigint`.
+ *
+ * @throws {ValidationError} `SCP-VALID-7010` if `signingKeySeed` is not 32 bytes,
+ *   `requestId` is not 16 bytes, or `caveatsBinding` is not 32 bytes.
+ */
+export function outletStreamSignCredit(
+  signingKeySeed: Uint8Array,
+  contextId: string,
+  outletId: string,
+  requestId: Uint8Array,
+  grant: number,
+  monotonicSeq: bigint,
+  streamEpoch: bigint,
+  caveatsBinding: Uint8Array,
+): Uint8Array {
+  assertInitialized();
+  return call(() =>
+    wasmSignCredit(
+      signingKeySeed,
+      contextId,
+      outletId,
+      requestId,
+      grant,
+      monotonicSeq,
+      streamEpoch,
+      caveatsBinding,
+    ),
+  );
+}
+
+/**
+ * Signs an outlet-stream **cancel** with the invoker's Ed25519 signing key IN-TAB
+ * (§5.4.5, `SCP-OUTLET-CANCEL-V1`). Returns the JSON-serialized
+ * `OutletStreamCancel` (`request_id` ‖ `next_seq` ‖ `sig`) to route to the node
+ * coordinator.
+ *
+ * `signingKeySeed` is the invoker's 32-byte outlet-signing seed, held on-device.
+ * `nextSeq` is a `u64` → `bigint`.
+ *
+ * @throws {ValidationError} `SCP-VALID-7010` if `signingKeySeed` is not 32 bytes,
+ *   `requestId` is not 16 bytes, or `caveatsBinding` is not 32 bytes.
+ */
+export function outletStreamSignCancel(
+  signingKeySeed: Uint8Array,
+  contextId: string,
+  outletId: string,
+  requestId: Uint8Array,
+  nextSeq: bigint,
+  caveatsBinding: Uint8Array,
+): Uint8Array {
+  assertInitialized();
+  return call(() =>
+    wasmSignCancel(signingKeySeed, contextId, outletId, requestId, nextSeq, caveatsBinding),
+  );
+}
+
+/**
+ * Computes the §5.4.5 credit-grant signature preimage (32 bytes) WITHOUT touching
+ * any private key — the #1980-forward WebCrypto seam. An off-wasm signer
+ * (WebCrypto, hardware custody) signs this preimage; a verifier recomputes it to
+ * check a credit's `sig` under the invoker's public key. `grant` is a `u32`;
+ * `monotonicSeq` and `streamEpoch` are `u64` → `bigint`.
+ *
+ * @throws {ValidationError} `SCP-VALID-7010` if `requestId` is not 16 bytes or
+ *   `caveatsBinding` is not 32 bytes.
+ */
+export function outletStreamComputeCreditPreimage(
+  contextId: string,
+  outletId: string,
+  requestId: Uint8Array,
+  grant: number,
+  monotonicSeq: bigint,
+  streamEpoch: bigint,
+  caveatsBinding: Uint8Array,
+): Uint8Array {
+  assertInitialized();
+  return call(() =>
+    wasmComputeCreditPreimage(
+      contextId,
+      outletId,
+      requestId,
+      grant,
+      monotonicSeq,
+      streamEpoch,
+      caveatsBinding,
+    ),
+  );
+}
+
+/**
+ * Computes the §5.4.5 cancel signature preimage (32 bytes) WITHOUT touching any
+ * private key — the #1980-forward WebCrypto seam (the cancel counterpart of
+ * {@link outletStreamComputeCreditPreimage}). `nextSeq` is a `u64` → `bigint`.
+ *
+ * @throws {ValidationError} `SCP-VALID-7010` if `requestId` is not 16 bytes or
+ *   `caveatsBinding` is not 32 bytes.
+ */
+export function outletStreamComputeCancelPreimage(
+  contextId: string,
+  outletId: string,
+  requestId: Uint8Array,
+  nextSeq: bigint,
+  caveatsBinding: Uint8Array,
+): Uint8Array {
+  assertInitialized();
+  return call(() =>
+    wasmComputeCancelPreimage(contextId, outletId, requestId, nextSeq, caveatsBinding),
   );
 }
