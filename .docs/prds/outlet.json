@@ -715,7 +715,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/src/conformance/mod.rs",
         "crates/scp-testing/tests/integration/conformance.rs",
@@ -755,7 +755,7 @@
         }
       ],
       "details": {
-        "auditNote": "Downgraded from done (audit): SCP-OUTLET-REGISTRATION-V2 test vectors (outlet_registration_v2.json) are absent on main (dropped by the squashed re-port #2098). Tracked in #2219."
+        "auditNote": "Recovered (#2219): re-ported the two net-new deliverables (outlet_registration_v2.json + crates/scp-testing/src/conformance/outlet_registration.rs) from orphaned commit b5a25f142, then regenerated all goldens (expected_preimage/expected_canonical_hash/expected_signature + v1_rejection_corpus) against main's CURRENT §5.4.1 canonical preimage (real kind_byte, description_hash, schema_hash over 3-field OutletSchema, cost_hash, catalog_hash). The orphaned bytes were stale (placeholder kind_byte 0x01, no description_hash/catalog_hash); regen changed every hash (e.g. minimal-query canonical_hash 6aeebe1b… → 40152a10…). CONF-043..046 + conf_outlet_registration_v2_regen wired into the conformance harness; 46 passed / 1 ignored."
       }
     },
     {
@@ -764,7 +764,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/prds/main.json"
       ],
@@ -773,7 +773,7 @@
         "SCP-010 in .docs/prds/main.json has `details.superseded_by` equal to [\"SCP-OUT-002\", \"SCP-OUT-003\"] (protocol rename + event log rename stories)",
         "SCP-013 in .docs/prds/main.json has `details.superseded_by` equal to [\"SCP-OUT-002\"] (protocol rename \u2014 sender-key wire types do not themselves reference tool identifiers, but the story's ContextParams `tools` field rename is covered by SCP-OUT-002)",
         "SCP-018 in .docs/prds/main.json has `details.superseded_by` equal to [\"SCP-OUT-002\"] and its AC text that read 'tools (Vec<ToolRegistration>)' is updated to 'outlets (Vec<OutletRegistration>)' to reflect the current ContextParams shape",
-        "SCP-040 in .docs/prds/main.json has `details.superseded_by` equal to [\"SCP-OUT-005\"] (collapsed FFI rename story) and its AC text that read 'py_tool_register', 'py_tool_invoke', 'py_tool_verify' is updated to 'py_outlet_register'/'py_outlet_invoke'/'py_outlet_verify' reflecting the PyO3 bridge's current export names",
+        "SCP-040 in .docs/prds/main.json has `details.superseded_by` equal to [\"SCP-OUT-005\"] (collapsed FFI rename story) and its AC text that read 'py_tool_register', 'py_tool_invoke', 'py_tool_verify' is updated to 'outlet_register'/'outlet_invoke'/'outlet_verify' reflecting the PyO3 bridge's current #[pyo3(name=...)] export names (the py_ prefix was dropped during the #[pymethods] migration in #1549)",
         "SCP-041 in .docs/prds/main.json has `details.superseded_by` equal to [\"SCP-OUT-005\", \"SCP-OUT-006\"] (FFI + SDK rename stories that change what is exported through _scp_core.pyi)",
         "grep -n '\"ToolRegistration\"\\|\"ToolRequest\"\\|\"ToolResponse\"\\|\"ToolInterface\"\\|tool_invoke:\\*' .docs/prds/main.json returns 0 matches in acceptance-criteria strings (the `details` objects of superseded stories may contain tool-era snippets for historical reference, explicitly flagged by the `superseded_by` key)",
         "python3.12 scripts/validate-prd.py passes on the edited main.json",
@@ -799,7 +799,7 @@
         }
       ],
       "details": {
-        "auditNote": "Downgraded from done (audit): superseded_by markers in .docs/prds/main.json are absent (0 present). Tracked in #2219."
+        "auditNote": "Recovered (#2219): the superseded_by markers dropped by the squashed re-port #2098 were re-added to SCP-010/013/018/040/041 in .docs/prds/main.json, and the SCP-040 AC text was reconciled to the real PyO3 export names (outlet_register/outlet_invoke/outlet_verify). Re-completes the story."
       }
     },
     {
@@ -1640,7 +1640,7 @@
       "gate": "gate-errors",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/manager/outlets.rs",
         "crates/scp-runtime/src/context/outlets/invoke.rs"
@@ -1675,7 +1675,7 @@
         }
       ],
       "details": {
-        "auditNote": "Downgraded from done (audit): fix not effective \u2014 the specified manager/outlets.rs no longer exists and no complete From<InvocationError> for OutletError mapping is present. The related stream-open error-masking (permanent failures reported as retryable) is a separate site fixed by #2196. Tracked in #2219."
+        "auditNote": "Obviated / satisfied by the ADR-049 typed-error path (#2219 recovery; original manager/outlets.rs target obsolete). The single-bucket collapse this story feared (all InvocationError variants -> one indistinguishable PermissionDenied) does NOT exist on the current path: the invoke path converts every InvocationError variant, inside the runtime, to a ContextError::PermissionDenied carrying a DISTINCT SCP-OUTLET-XXXX / SCP-ECON-XXXXX code (context::outlets_helpers::invocation_error_to_context, 13 runtime callers), which the PyO3/UniFFI/NAPI bridges recover into the typed error .code field via extract_scp_code; the streaming path maps each variant to a typed \u00a75.4.4 class code (CODE_AUTHORIZATION_DENIED/PROTOCOL_VIOLATION/INPUT_VIOLATION/EXECUTION_FAULT/ECONOMIC_FAULT) in ChunkPayload::Error. The obsolete From<InvocationError> for OutletError catch-all (OUTLET_6002) is dead on the invoke path. The related stream-open masking (permanent failures reported as retryable) was a separate site fixed by #2196. No code change: the story's literal ACs reference a deleted file (manager/outlets.rs), deleted variant names (SchemaViolation/CapabilityDenied/RateLimited/EconomicDenied), and a superseded 6120/6110-6119/6162/6150-6159/6170 code taxonomy; the spirit (no lossy collapse dropping class/variant) is met."
       }
     },
     {

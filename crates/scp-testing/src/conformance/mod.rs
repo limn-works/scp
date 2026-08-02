@@ -8,6 +8,7 @@
 pub mod attestation;
 pub mod blob_store;
 pub mod key_custody;
+pub mod outlet_registration;
 pub mod payment;
 pub mod push;
 pub mod storage;
