@@ -149,8 +149,12 @@ fn setup_two_party(ctx_str: &str) -> (PerContextState, PerContextState, [u8; 32]
     // signature and seals to Bob's #active — the send / receive half below builds
     // its own document-derived `#agent`-aware resolver. The returned providers
     // are unused here, so they are discarded.
-    let (_alice_p, alice_state, _bob_p, bob_state, ctx_bytes) =
-        crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE_DID, BOB_DID);
+    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+        alice_state,
+        bob_state,
+        ctx_bytes,
+        ..
+    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE_DID, BOB_DID);
     (alice_state, bob_state, ctx_bytes)
 }
 

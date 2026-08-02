@@ -702,9 +702,15 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
 // during creation — `create_context` births the group + sender key as OWNED
 // material (`create_mls_group_with_context` → `OwnedMlsCryptoState`) and hands
 // it back to the caller, which seeds the spawning actor directly. There is no
-// provider-side crypto to roll back: a creation failure drops the owned
-// material on the `?` return (Rust drop zeroizes the `ScpMlsGroup` /
-// `SenderKey`). Only the event log retains a provider-resident rollback handle.
+// provider-side crypto to roll back. On a post-birth creation failure the owned
+// material is disposed on the rollback branch (`OwnedMlsCryptoState::dispose_secrets`,
+// F6) — a bare drop FREES the group's in-memory OpenMLS storage but does NOT
+// zeroize the Ed25519 signer (OpenMLS `SignatureKeyPair` has no `Zeroize`;
+// scp-mls `EagerDropSigner` / issue #82). `destroy_group` eagerly frees the same
+// material (signer freed, NOT zeroized — #82); on this rollback branch the owner
+// drops immediately after, so the explicit dispose is defense-in-depth /
+// forward-compat with #82. The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
+// Only the event log retains a provider-resident rollback handle.
 
 /// Opaque handle representing ownership of a created event log.
 ///
@@ -742,9 +748,11 @@ impl EventLogHandle {
 /// two resources that DO leave recoverable state outside the returned owned
 /// crypto material: the event log (`Option<EventLogHandle>`, provider-resident)
 /// and transport publication (`bool` — no recoverable local state, rollback
-/// issues a best-effort DELETE to remote relays). A failed crypto birth drops
-/// the `OwnedMlsCryptoState` on the `?` return (Rust drop zeroizes), so there
-/// is nothing crypto-shaped left for the receipt to roll back.
+/// issues a best-effort DELETE to remote relays). A post-birth creation failure
+/// disposes the `OwnedMlsCryptoState` on the rollback branch (`dispose_secrets`,
+/// which eagerly frees the group via `destroy_group` — signer freed, NOT
+/// zeroized, #82; the `SenderKey` zeroizes on drop), so there is nothing
+/// crypto-shaped left for the receipt to roll back.
 #[derive(Debug, Default)]
 pub struct CreationReceipt {
     /// Handle to the event log initialised during step 4.
@@ -763,9 +771,12 @@ impl CreationReceipt {
     ///
     /// #2148 (ADR-049 birth-into-actor): the crypto (MLS group / sender key)
     /// rollback arms are GONE — crypto is never provider-resident during
-    /// creation, so a failure drops the owned material on the caller's `?`
-    /// return (drop zeroizes). Only the event log + publication are reversed
-    /// here.
+    /// creation. A post-birth failure disposes the owned material on the caller's
+    /// rollback branch (`dispose_secrets` eagerly frees the group via
+    /// `destroy_group` — signer freed, NOT zeroized, #82; the `SenderKey`
+    /// zeroizes on drop). On this branch the owner drops immediately after, so
+    /// the dispose is defense-in-depth / forward-compat with #82. Only the event
+    /// log + publication are reversed here.
     pub async fn rollback(
         &self,
         context_id: &[u8; 32],
@@ -983,6 +994,15 @@ pub async fn create_context(
 
     // Step 4: Initialise event log.
     if let Err(e) = event_log_provider.init_event_log(&id_bytes).await {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto's OpenMLS
+        // group (`destroy_group`) before `owned` drops on this rollback. A bare
+        // drop already frees the in-memory group storage; the signer is freed
+        // either way, NOT zeroized (#82) — so this explicit dispose is
+        // defense-in-depth / forward-compat with #82. `SenderKey` zeroizes on
+        // its own drop.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
         receipt
             .rollback(&id_bytes, transport, event_log_provider)
             .await;
@@ -1013,6 +1033,11 @@ pub async fn create_context(
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active) {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
+        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
         receipt
             .rollback(&id_bytes, transport, event_log_provider)
             .await;
@@ -1032,6 +1057,13 @@ pub async fn create_context(
         )
         .await
     {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
+        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // The handle is Active but `owned_crypto` is still live (returned to the
+        // caller on success at step 9), so it is the live owner here.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
         // Even though the handle is Active, we must roll back everything.
         receipt
             .rollback(&id_bytes, transport, event_log_provider)
@@ -1063,6 +1095,13 @@ pub async fn create_context(
         )
         .await
     {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
+        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // `owned_crypto` is still live (returned to the caller on success at
+        // step 9), so it is the live owner here.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
         receipt
             .rollback(&id_bytes, transport, event_log_provider)
             .await;
@@ -1252,7 +1291,6 @@ mod tests {
             owned_crypto.is_some(),
             "an Encrypted create must return born-owned MLS crypto material"
         );
-        let _ = sha256_of_id;
     }
 
     /// The creation flow must emit a founder `MemberJoined` leaf so the

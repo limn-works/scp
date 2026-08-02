@@ -538,8 +538,9 @@ pub async fn finalize_close(
 ) -> Result<(), ContextError> {
     // Validate state transition BEFORE any key destruction (which the caller,
     // `ttl_close_helpers::finalize_close`, performs on the ACTOR-owned crypto
-    // AFTER this returns Ok). Key destruction is irreversible — once zeroized,
-    // encrypted content becomes permanently unreadable. If the transition fails
+    // AFTER this returns Ok). Key destruction is irreversible — once destroyed
+    // (sender keys zeroized, MLS group + signer freed), encrypted content becomes
+    // permanently unreadable. If the transition fails
     // (e.g. context is not in Closing state), no keys must be destroyed.
     handle.transition_to(&ContextState::Closed)?;
 
@@ -743,10 +744,15 @@ pub(crate) fn apply_ttl_terminal_transition(
     // 2. Key destruction (Ephemeral/Summary only). #2148 (ADR-049
     //    birth-into-actor): the MLS group + sender key are ACTOR-owned, so
     //    destruction runs `dispose_secrets` on the actor-owned
-    //    `ContextCryptoState` (which runs OpenMLS `destroy_group` — deleting the
-    //    epoch secrets a bare drop would leave resident — then zeroizes the
-    //    sender key material). This is infallible and atomic (both the MLS group
-    //    and the sender keys are torn down in one call), so both destroy steps
+    //    `ContextCryptoState`. The load-bearing reason to call it here is that
+    //    this is a LIVE-actor seam — the `PerContextState` is NOT dropped on an
+    //    Ephemeral/Summary close, so the secrets must be released explicitly.
+    //    `dispose_secrets` runs OpenMLS `destroy_group` (eagerly FREEING the
+    //    Ed25519 signer — freed, NOT zeroized, since `SignatureKeyPair` implements
+    //    no `Zeroize`; scp-mls issue #82 — and freeing the group's in-memory
+    //    storage) and zeroizes the sender key material. This is infallible and atomic (both
+    //    the MLS group and the sender keys are torn down in one call), so both
+    //    destroy steps
     //    are marked together. SYNC (no `.await`), so this whole phase runs
     //    outside any timeout. A `None` crypto state (broadcast / already-disposed)
     //    has nothing to tear down — the steps are marked done so the fail-closed

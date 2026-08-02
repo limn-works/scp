@@ -73,6 +73,15 @@ impl KeyDestructionOrchestrator {
     /// The `attestation_level` parameter records the platform's attestation
     /// level for key destruction. This is metadata -- not a gate.
     ///
+    /// OBSERVABILITY NOTE (#2148 F10): the returned attestation's
+    /// `mls_group_destroyed` / `sender_keys_destroyed = true` are observability
+    /// MARKERS, not verified facts. Their truth is guaranteed by the actor's
+    /// SEPARATE crypto disposal (`CloseContext` → `dispose_secrets` /
+    /// `destroy_group`), which the close orchestrator dispatches and awaits
+    /// BEFORE this attestation is recorded; this function does not itself
+    /// destroy any key material or verify that disposal ran. Gating on observed
+    /// disposal is a separate tracked concern, deliberately not done here.
+    ///
     /// # Errors
     ///
     /// Infallible in practice (returns `Result` for signature stability with the
@@ -100,6 +109,9 @@ impl KeyDestructionOrchestrator {
             context_id: context_id.to_owned(),
             level: attestation_level,
             attested_at: now,
+            // Observability markers, not verified facts — the actor's separate
+            // `CloseContext` → `dispose_secrets` disposal (awaited before this
+            // attestation) is what makes them true (#2148 F10; see fn doc).
             mls_group_destroyed: true,
             sender_keys_destroyed: true,
         };

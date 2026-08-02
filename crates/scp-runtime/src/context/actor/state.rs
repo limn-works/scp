@@ -498,6 +498,19 @@ pub struct ContextCryptoState {
     /// the actor-owned [`ContextCryptoState`], performed by
     /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open).
     pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
+
+    /// One-shot fault-injection seam (#2148 F1 / ADR-049 §15(c)), re-homed onto
+    /// the actor from the deleted provider `rotate_sender_key`. When armed via
+    /// [`PerContextState::arm_rotation_failure_once`], the NEXT
+    /// [`PerContextState::rotate_sender_key`] fails closed BEFORE any mutation
+    /// (the old epoch/key/store are retained), then clears itself so a
+    /// subsequent rotation advances normally. The real actor rotation always
+    /// mints a fresh key and increments the epoch, so that Class-S fail-closed
+    /// branch is otherwise structurally unreachable. Gated `#[cfg(any(test,
+    /// feature = "testing"))]` — never present on a production build (neither
+    /// the field nor the branch that reads it).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) force_rotation_failure: bool,
 }
 
 impl std::fmt::Debug for ContextCryptoState {
@@ -506,39 +519,43 @@ impl std::fmt::Debug for ContextCryptoState {
         // epoch secrets, the latter is raw AES-256 key material. All
         // other fields are safe to print: counters, non-secret byte
         // arrays, and store types that already redact on their own.
-        f.debug_struct("ContextCryptoState")
-            .field(
-                "mls_group",
-                &if self.mls_group.is_some() {
-                    "Some(<REDACTED>)"
-                } else {
-                    "None"
-                },
-            )
-            .field(
-                "sender_key",
-                &if self.sender_key.is_some() {
-                    "Some(<REDACTED>)"
-                } else {
-                    "None"
-                },
-            )
-            .field("sender_key_store", &self.sender_key_store)
-            .field("sender_key_epoch", &self.sender_key_epoch)
-            .field(
-                "pending_distributions",
-                &format_args!("[{} entries]", self.pending_distributions.len()),
-            )
-            .field("nonce_dedup", &self.nonce_dedup)
-            .field(
-                "member_wrapping_keys",
-                &format_args!("[{} entries]", self.member_wrapping_keys.len()),
-            )
-            .field(
-                "recv_sequence_tracker",
-                &format_args!("[{} entries]", self.recv_sequence_tracker.len()),
-            )
-            .finish()
+        let mut d = f.debug_struct("ContextCryptoState");
+        d.field(
+            "mls_group",
+            &if self.mls_group.is_some() {
+                "Some(<REDACTED>)"
+            } else {
+                "None"
+            },
+        )
+        .field(
+            "sender_key",
+            &if self.sender_key.is_some() {
+                "Some(<REDACTED>)"
+            } else {
+                "None"
+            },
+        )
+        .field("sender_key_store", &self.sender_key_store)
+        .field("sender_key_epoch", &self.sender_key_epoch)
+        .field(
+            "pending_distributions",
+            &format_args!("[{} entries]", self.pending_distributions.len()),
+        )
+        .field("nonce_dedup", &self.nonce_dedup)
+        .field(
+            "member_wrapping_keys",
+            &format_args!("[{} entries]", self.member_wrapping_keys.len()),
+        )
+        .field(
+            "recv_sequence_tracker",
+            &format_args!("[{} entries]", self.recv_sequence_tracker.len()),
+        );
+        // Test-only fault-injection seam (non-secret bool); included so the
+        // manual `Debug` impl covers every field.
+        #[cfg(any(test, feature = "testing"))]
+        d.field("force_rotation_failure", &self.force_rotation_failure);
+        d.finish()
     }
 }
 
@@ -553,6 +570,8 @@ impl Default for ContextCryptoState {
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
             recv_sequence_tracker: HashMap::new(),
+            #[cfg(any(test, feature = "testing"))]
+            force_rotation_failure: false,
         }
     }
 }
@@ -2083,20 +2102,26 @@ impl ContextCryptoState {
         Ok(Some(message))
     }
 
-    /// Disposes ALL per-context crypto material, matching the disposal hygiene
-    /// the deleted `MlsCryptoProvider` gave by dropping its whole `contexts` map
-    /// entry (ADR-049 PR-7 / SCP-CRYPTOMOVE-001 H4).
+    /// Disposes ALL per-context crypto material (#2148 birth-into-actor: the
+    /// actor is the SOLE owner of the per-context crypto; the provider holds
+    /// none).
     ///
-    /// Now that the actor is the SOLE owner of the per-context crypto (the
-    /// provider `destroy_*` twins are no-ops for a taken context), the actor MUST
-    /// explicitly tear the material down at its destroy seam. A bare drop of
-    /// `ContextCryptoState` is NOT sufficient for the MLS group: OpenMLS keeps
-    /// epoch-secret material in its storage provider that is only deleted by
-    /// [`scp_mls::group::destroy_group`] — dropping the in-memory handle leaves it
-    /// resident. This method:
+    /// The load-bearing reason to call this — rather than relying on a bare drop
+    /// — is the LIVE-actor close/TTL seam: on an Ephemeral/Summary close (or TTL
+    /// expiry) the context's crypto must be released while the `PerContextState`
+    /// stays alive (the actor is NOT dropped), so nothing would otherwise free
+    /// the material. Each [`ScpMlsGroup`] owns its OWN in-memory OpenMLS provider
+    /// (`InMemoryMlsProvider`), so a bare drop DOES free that storage — but it
+    /// does NOT zeroize the Ed25519 signer (OpenMLS `SignatureKeyPair` implements
+    /// no `Zeroize`; `scp-mls` `EagerDropSigner` / issue #82).
+    /// [`scp_mls::group::destroy_group`] eagerly FREES the signer's `Vec<u8>`
+    /// (via `EagerDropSigner::take`) but does NOT overwrite it — signer
+    /// zeroization stays open upstream (#82). This is NOT a shared persistent
+    /// store. This method:
     ///
-    /// - runs `destroy_group` on the MLS group (deletes the OpenMLS epoch secrets),
-    ///   then nulls the handle;
+    /// - runs `destroy_group` on the MLS group (eagerly frees the signer bytes —
+    ///   not zeroized, #82 — and drops the in-memory OpenMLS state), then nulls
+    ///   the handle;
     /// - drops the local `sender_key` and the whole `sender_key_store`, whose
     ///   `SenderKey`s zeroize on drop (`ZeroizeOnDrop`);
     /// - clears the residual non-secret / bookkeeping fields (member wrapping
@@ -2125,33 +2150,20 @@ impl ContextCryptoState {
 // backend calls the provider makes (`scp_mls::encrypt::*`,
 // `scp_mls::group::*`, `scp_mls::ratchet::*`,
 // `scp_protocol::crypto::sender_keys::*`, the HPKE `key_protocol` helpers) —
-// they are NOT re-implemented. Byte-identity with the retained provider twins
-// is guarded by the golden tests in this module (`crypto_ops_golden`).
+// they are NOT re-implemented.
 //
-// The per-context methods below are the actor-side twins on the actor's OWNED
-// `PerContextState`. A subset is production-wired: the CREATE/WELCOME seed via
-// `seed_encrypted_crypto_from_owned`, plus `advance_epoch` / `add_member`. The
-// remaining sender-key-exchange and teardown twins are exercised only by this
-// module's golden byte-identity and two-party seam tests; their corresponding
-// production operations, where they exist, run on the retained provider
-// birth/teardown seam (e.g. `destroy_mls_group`) or through dedicated delivery
-// helpers on the actor-owned state (e.g. `drain_and_deliver_sender_keys` →
-// `mls_encrypt_management`, which replaced the deleted provider drain), pending
-// full provider dissolution (ADR-049 §6). In the `--no-default-features` lib
-// build (no tests) those twins have no caller, so `dead_code` is allow-listed
-// additively across the impl.
-#[allow(
-    dead_code,
-    reason = "ADR-049 PR-7 (SCP-CRYPTOMOVE-001): actor-side per-context crypto \
-              twins on the actor-owned `PerContextState`. A subset is \
-              production-wired (CREATE/WELCOME seed, advance_epoch, add_member); \
-              the remaining sender-key-exchange and teardown twins are exercised \
-              only by this module's golden and two-party seam tests, so they \
-              have no caller in the --no-default-features lib build. Their \
-              production counterparts, where they exist, route through the \
-              retained provider seam or dedicated actor-owned delivery helpers \
-              pending full provider dissolution (ADR-049 §6)."
-)]
+// The per-context methods below are the actor-owned per-context crypto seam on
+// the actor's OWNED `PerContextState`. #2148 (birth-into-actor) COMPLETED the
+// §6 dissolution of the provider's per-context state: the provider holds no
+// `contexts` map and no per-context crypto, so every per-context crypto
+// operation — birth-seed, seal/open, epoch advance, member add/remove,
+// sender-key exchange, and teardown — now lives here, not on the provider.
+// Byte-identity of the seal/open/epoch primitives with their pre-move shape is
+// guarded by the golden tests in this module (`crypto_ops_golden`). A handful of
+// sender-key-exchange / teardown methods are reached only from those in-module
+// tests, so they carry a TARGETED `#[allow(dead_code)]` (they have no caller in
+// the `--no-default-features` lib build); the block-wide allow was narrowed
+// away (#2148 F9) so a genuinely-unwired future method is not masked.
 impl PerContextState {
     /// `&mut` access to the encrypted-mode crypto state, or the provider's
     /// `"no MLS group for this context"` error when this actor is a broadcast
@@ -2178,17 +2190,28 @@ impl PerContextState {
     /// on `send_tracker`, never a crypto-state field; the AAD read/increment
     /// order is preserved byte-for-byte — see `sequence.rs`).
     ///
-    /// This is the single seed primitive for all five take/seed seams: the
-    /// in-dispatch Create/Join take (Mode-A, seeded from
-    /// `take_crypto_state` after the provider births the group) and the
-    /// pre-dispatch welcome / restore / respawn / cold-restart seed (Mode-B,
-    /// seeded from `build_restored_owned` — NO re-take, which on a warm respawn
-    /// would fail closed because the context is already in `taken_context_ids`).
+    /// This is the single seed primitive for every birth/restore seam. #2148
+    /// completed the §6 dissolution of the provider's per-context state: the
+    /// birth constructors (`create_mls_group_with_context` / `install_joined_group`)
+    /// and the restore constructor (`build_restored_owned`) each return an
+    /// [`OwnedMlsCryptoState`] DIRECTLY — there is no provider `contexts` map,
+    /// no `take_crypto_state` round-trip, and no `taken_context_ids` residency
+    /// guard. The CREATE / WELCOME / restore caller seeds the owned material
+    /// straight onto the spawning actor here; a warm respawn re-seeds from the
+    /// restore constructor identically (no re-take to fail closed against).
     ///
     /// Floors (Class-M) are NOT part of the payload and are never seeded here —
     /// they stay the sole authority of the Supervisor-owned `ContextFloors`
     /// registry (ADR-049 §9 / PR-6).
     pub(crate) fn seed_encrypted_crypto_from_owned(&mut self, owned: OwnedMlsCryptoState) {
+        // Defense-in-depth (#2148 F8): seeding replaces an EMPTY Encrypted mode
+        // (the birth/restore seams build one first); a Broadcast context has no
+        // MLS crypto to seed. Asserted at the mutation site — the caller-side
+        // `debug_assert_eq!` (lifecycle_helpers.rs) is release-compiled-out.
+        debug_assert!(
+            matches!(self.mode, ContextModeState::Encrypted(_)),
+            "seed_encrypted_crypto_from_owned onto non-Encrypted mode"
+        );
         self.mode = ContextModeState::Encrypted(Box::new(ContextCryptoState {
             mls_group: Some(owned.mls_group),
             sender_key: Some(owned.sender_key),
@@ -2198,8 +2221,40 @@ impl PerContextState {
             nonce_dedup: owned.nonce_dedup,
             member_wrapping_keys: owned.member_wrapping_keys,
             recv_sequence_tracker: HashMap::new(),
+            #[cfg(any(test, feature = "testing"))]
+            force_rotation_failure: false,
         }));
         self.send_tracker = SendSequenceTracker::from_persisted(owned.send_sequence);
+    }
+
+    /// Arms the one-shot rotation fault seam (#2148 F1 / ADR-049 §15(c)): the
+    /// NEXT [`Self::rotate_sender_key`] fails closed and clears the flag. A
+    /// no-op on a Broadcast context (no encrypted crypto to arm). Re-homed from
+    /// the deleted provider `arm_rotation_failure_once`; gated `#[cfg(any(test,
+    /// feature = "testing"))]` so it is never reachable on a production build.
+    #[cfg(any(test, feature = "testing"))]
+    // #2148 F9: reached only from the in-crate `#[cfg(test)]` fail-closed test;
+    // under `--features testing` (no test) it has no caller.
+    #[allow(dead_code)]
+    pub(crate) fn arm_rotation_failure_once(&mut self) {
+        if let ContextModeState::Encrypted(crypto) = &mut self.mode {
+            crypto.force_rotation_failure = true;
+        }
+    }
+
+    /// Disposes this actor's per-context MLS crypto secrets (Encrypted mode
+    /// only; a no-op for Broadcast), delegating to
+    /// [`ContextCryptoState::dispose_secrets`]. Called on failed-spawn /
+    /// failed-persist creation-rollback branches (#2148 F6) so the crypto is
+    /// eagerly freed via `destroy_group` — consistent with the close/TTL
+    /// teardown seam. On these rollback branches the owner drops on the very
+    /// next line regardless, so this is defense-in-depth / forward-compat with
+    /// #82 (destroy_group frees but does NOT zeroize the Ed25519 signer today;
+    /// if upstream ever adds `Zeroize` this path would then zeroize it).
+    pub(crate) fn dispose_secrets(&mut self) {
+        if let ContextModeState::Encrypted(crypto) = &mut self.mode {
+            crypto.dispose_secrets();
+        }
     }
 
     /// TEST-ONLY whole-state convenience over [`ContextCryptoState::seal`],
@@ -2654,6 +2709,22 @@ impl PerContextState {
         let ctx_id_hex = hex::encode(self.context_id);
         let crypto = self.encrypted_crypto_mut()?;
 
+        // One-shot fault-injection seam (#2148 F1 / ADR-049 §15(c)): induce a
+        // rotation failure that drives the caller's Class-S sync-persist
+        // fail-closed branch. Placed BEFORE any mutation — no fresh key is
+        // generated and `sender_key_epoch` is NOT incremented, so an armed
+        // failure leaves the context byte-identical to its pre-call state
+        // (fail-closed: epoch/key never committed). `std::mem::replace` fires
+        // exactly once, then clears itself so a subsequent rotation succeeds.
+        // The `#[cfg(any(test, feature = "testing"))]` gate compiles both the
+        // field and this branch away on a production build.
+        #[cfg(any(test, feature = "testing"))]
+        if std::mem::replace(&mut crypto.force_rotation_failure, false) {
+            return Err(ContextError::CryptoFailed(
+                "forced rotation persist failure (one-shot test seam)".to_owned(),
+            ));
+        }
+
         // 1. Generate fresh AES-256 sender key.
         let new_key = generate_sender_key();
         // Capture the raw bytes once for the per-member seals below — the
@@ -2752,6 +2823,9 @@ impl PerContextState {
     /// # Errors
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch.
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
+    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    #[allow(dead_code)]
     pub(crate) fn drain_pending_sender_key_messages(
         &mut self,
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
@@ -2772,6 +2846,9 @@ impl PerContextState {
     /// sender-DID authentication check.
     ///
     /// [`MlsCryptoProvider::process_incoming_sender_key`]: crate::crypto::mls::provider::MlsCryptoProvider::process_incoming_sender_key
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
+    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    #[allow(dead_code)]
     pub(crate) fn process_incoming_sender_key(
         &self,
         wrapping_secret_key: &[u8; 32],
@@ -2814,6 +2891,9 @@ impl PerContextState {
     /// Installs an AUTHENTICATED sender key WITHOUT epoch gating, verbatim from
     /// the former provider `set_sender_key_unchecked`. A no-op when this actor
     /// is not encrypted-mode.
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
+    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    #[allow(dead_code)]
     pub(crate) fn set_sender_key_unchecked(&mut self, sender_did: &str, sender_key: SenderKey) {
         let ctx_id_hex = hex::encode(self.context_id);
         if let ContextModeState::Encrypted(crypto) = &mut self.mode {
@@ -2833,6 +2913,9 @@ impl PerContextState {
     ///
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch or a malformed
     /// extension payload.
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
+    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    #[allow(dead_code)]
     pub(crate) fn group_context_extension(
         &self,
     ) -> Result<Option<ScpContextExtension>, ContextError> {
@@ -2972,8 +3055,9 @@ impl PerContextState {
     /// Destroys the MLS group for this context (creation rollback).
     ///
     /// #2148 (birth-into-actor): the provider's `destroy_mls_group` is DELETED;
-    /// this actor-owned method is the sole group-teardown path. It zeroizes +
-    /// nulls the GROUP handle (`crypto.mls_group = None`); the sibling crypto material
+    /// this actor-owned method is the sole group-teardown path. It eagerly frees
+    /// the group (via `destroy_group`; the Ed25519 signer is freed, NOT zeroized —
+    /// #82) + nulls the GROUP handle (`crypto.mls_group = None`); the sibling crypto material
     /// (`sender_key`, `sender_key_store`, `member_wrapping_keys`, epoch/sequence)
     /// stays RESIDENT and its old `sender_key` is NOT zeroized.
     ///
@@ -2984,7 +3068,8 @@ impl PerContextState {
     /// `local_sender_key_epoch`, the residual `sender_key_store` — would still
     /// surface the old material. For whole-crypto disposal (Ephemeral/Summary
     /// close, TTL expiry, shutdown) the actor calls `dispose_secrets` instead,
-    /// which tears down the group AND zeroizes the sibling sender-key material.
+    /// which tears down (eagerly frees) the group AND zeroizes the sibling
+    /// sender-key material (`SenderKey` `ZeroizeOnDrop`).
     /// This method deliberately does the minimal group-null so it stays a pure
     /// orchestration op; whole-state disposal is a caller (ownership) concern.
     ///
@@ -2997,6 +3082,9 @@ impl PerContextState {
         reason = "signature stability so callers can swap between the minimal \
                   group-null and whole-crypto `dispose_secrets` with no shape change"
     )]
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
+    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    #[allow(dead_code)]
     pub(crate) fn destroy_mls_group(&mut self) -> Result<(), ContextCreationError> {
         if let ContextModeState::Encrypted(crypto) = &mut self.mode {
             if let Some(group) = crypto.mls_group.as_mut() {
@@ -3023,6 +3111,9 @@ impl PerContextState {
         clippy::unnecessary_wraps,
         reason = "signature stability with the sibling `destroy_mls_group` teardown op"
     )]
+    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
+    // targeted (not block-wide) so a genuinely-unwired future method still trips.
+    #[allow(dead_code)]
     pub(crate) fn destroy_sender_key(&mut self) -> Result<(), ContextCreationError> {
         let ctx_id_hex = hex::encode(self.context_id);
         if let ContextModeState::Encrypted(crypto) = &mut self.mode {
@@ -3441,6 +3532,7 @@ mod tests {
             nonce_dedup,
             member_wrapping_keys,
             recv_sequence_tracker,
+            force_rotation_failure,
         } = c;
 
         assert!(mls_group.is_none());
@@ -3453,6 +3545,10 @@ mod tests {
         assert!(
             recv_sequence_tracker.is_empty(),
             "recv_sequence_tracker starts empty",
+        );
+        assert!(
+            !force_rotation_failure,
+            "the fault-injection seam defaults disarmed",
         );
     }
 
@@ -3862,7 +3958,7 @@ mod tests {
 mod crypto_ops_golden {
     use super::*;
     use crate::crypto::mls::provider::MlsCryptoProvider;
-    use crate::crypto::mls::two_party_test_support::stand_up_two_party;
+    use crate::crypto::mls::two_party_test_support::{TwoPartyPair, stand_up_two_party};
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
 
@@ -3884,7 +3980,20 @@ mod crypto_ops_golden {
         PerContextState,
         [u8; 32],
     ) {
-        stand_up_two_party(CTX_STR, ALICE, BOB)
+        let TwoPartyPair {
+            alice_provider,
+            alice_state,
+            bob_provider,
+            bob_state,
+            ctx_bytes,
+        } = stand_up_two_party(CTX_STR, ALICE, BOB);
+        (
+            alice_provider,
+            alice_state,
+            bob_provider,
+            bob_state,
+            ctx_bytes,
+        )
     }
 
     /// Build a minimal signed `InnerEnvelope` (signature is not verified by
@@ -4120,6 +4229,46 @@ mod crypto_ops_golden {
             rmp_serde::to_vec_named(&env.inner).unwrap(),
             rmp_serde::to_vec_named(&inner).unwrap(),
             "decrypt at a non-zero epoch must round-trip the original inner"
+        );
+    }
+
+    /// ADR-049 §15(c) fail-closed rotation coverage, RESTORED on the actor
+    /// (#2148 F1). The one-shot fault seam re-homed onto the actor's
+    /// `PerContextState` makes the NEXT `rotate_sender_key` fail closed with NO
+    /// partial mutation — the local sender-key epoch is unchanged (old
+    /// epoch/key/store retained) — proving the actor's rotation is fail-closed;
+    /// the seam then clears itself so the subsequent rotation advances normally.
+    /// This replaces the deleted provider
+    /// `arm_rotation_failure_once_forces_fail_closed_then_normal`.
+    #[test]
+    fn arm_rotation_failure_once_forces_fail_closed_then_normal() {
+        let (_alice_p, mut alice_a, _bob_p, _bob_a, _ctx) = setup();
+        let epoch_before = alice_a.local_sender_key_epoch();
+
+        // Arm the one-shot seam: the next rotation must fail closed.
+        alice_a.arm_rotation_failure_once();
+        assert!(
+            matches!(
+                alice_a.rotate_sender_key(ALICE),
+                Err(ContextError::CryptoFailed(_))
+            ),
+            "armed rotation must return CryptoFailed"
+        );
+        // Fail-closed: the injected failure fired BEFORE any mutation, so the
+        // epoch is unchanged — the rotation was NOT committed.
+        assert_eq!(
+            alice_a.local_sender_key_epoch(),
+            epoch_before,
+            "failed rotation must NOT advance the epoch (no partial mutation)"
+        );
+
+        // One-shot cleared: the next rotation persists normally and advances the
+        // epoch by exactly one.
+        alice_a.rotate_sender_key(ALICE).unwrap();
+        assert_eq!(
+            alice_a.local_sender_key_epoch(),
+            epoch_before + 1,
+            "post-clear rotation must advance the epoch by one"
         );
     }
 

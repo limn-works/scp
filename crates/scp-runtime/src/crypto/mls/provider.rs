@@ -4,23 +4,23 @@
 //! [`MlsBackend`](super::backend::MlsBackend) and
 //! [`HpkeBackend`](crate::crypto::hpke_backend::HpkeBackend) primitives.
 //!
-//! #2148 (ADR-049 birth-into-actor) â provider per-context-state DISSOLUTION.
+//! #2148 (ADR-049 birth-into-actor) — provider per-context-state DISSOLUTION.
 //! The provider holds NO per-context state: the `contexts` / `broadcast_keys`
 //! `DashMap`s and the `taken_context_ids` `DashSet` are DELETED. The provider is
-//! now a node-level MLS-birth / HPKE helper â local DID, injected clock,
+//! now a node-level MLS-birth / HPKE helper — local DID, injected clock,
 //! MLS/HPKE backends, and the node-resident X25519 wrapping keypair
-//! (`ArcSwap<...>` for atomic rotation; Â§9.16.1). The birth constructors
+//! (`ArcSwap<...>` for atomic rotation; §9.16.1). The birth constructors
 //! ([`MlsCryptoProvider::create_mls_group_with_context`],
 //! [`MlsCryptoProvider::install_joined_group`]) and the restore seam
 //! ([`MlsCryptoProvider::build_restored_owned`]) return
 //! [`OwnedMlsCryptoState`] the CREATE / WELCOME / restore caller seeds onto the
-//! spawning actor's `PerContextState` â the actor is the sole per-context crypto
+//! spawning actor's `PerContextState` — the actor is the sole per-context crypto
 //! authority. Removing the shared maps closes the #2167 cross-map TOCTOU by
 //! construction; the supervisor registry's atomic first-writer-wins insert is
 //! the sole double-birth guard.
 //!
 //! No `std::sync::Mutex` survives in this file (CI: `clippy.toml`'s
-//! `disallowed-types` ban for `std::sync::Mutex` is enforced â every internal
+//! `disallowed-types` ban for `std::sync::Mutex` is enforced — every internal
 //! datapath is lock-free).
 //!
 //! Inline `OpenMLS` calls in primitive paths route through the injected
@@ -59,7 +59,7 @@ use scp_protocol::crypto::sender_keys::{
 };
 
 // ---------------------------------------------------------------------------
-// MlsCryptoSnapshot â serializable per-context crypto state for persistence
+// MlsCryptoSnapshot — serializable per-context crypto state for persistence
 // ---------------------------------------------------------------------------
 
 /// Serializable snapshot of per-context MLS cryptographic state.
@@ -75,25 +75,25 @@ use scp_protocol::crypto::sender_keys::{
 /// re-injected into a fresh `MemoryStorage` and the `MlsGroup` is
 /// reconstructed via `MlsGroup::load`.
 ///
-/// # Security â Sensitive Key Material
+/// # Security — Sensitive Key Material
 ///
 /// **This struct contains raw private key material:**
 ///
-/// - `signer_bytes` â Ed25519 private signing key (MLS credential signer)
-/// - `local_sender_key` â AES-256 sender key (per-context message encryption)
-/// - `wrapping_secret_key` â X25519 secret key (HPKE-sealed sender key decryption)
-/// - `mls_storage_entries` â `OpenMLS` `MemoryStorage` dump, which includes MLS
+/// - `signer_bytes` — Ed25519 private signing key (MLS credential signer)
+/// - `local_sender_key` — AES-256 sender key (per-context message encryption)
+/// - `wrapping_secret_key` — X25519 secret key (HPKE-sealed sender key decryption)
+/// - `mls_storage_entries` — `OpenMLS` `MemoryStorage` dump, which includes MLS
 ///   epoch secrets, HPKE private keys, and the key schedule
 ///
 /// **Why self-encryption is not feasible:** Encrypting the snapshot before
-/// returning from `export_crypto_state` creates a circular dependency â the
+/// returning from `export_crypto_state` creates a circular dependency — the
 /// encryption key would need to be stored outside the snapshot or derived
 /// from material inside it (defeating the purpose). This is the same trust
 /// model used by `OpenMLS` itself, which stores MLS `KeyPackage` private
 /// keys in its `StorageProvider` backend in plaintext.
 ///
 /// **Storage layer requirements:** The `Storage` backend that persists this
-/// blob MUST provide encryption at rest (Â§17.5). Platform implementations
+/// blob MUST provide encryption at rest (§17.5). Platform implementations
 /// (Keychain on iOS/macOS, Android Keystore, OS-level encrypted storage)
 /// satisfy this. In-memory storage used in tests is acceptable because no
 /// persistence occurs.
@@ -130,7 +130,7 @@ pub(crate) struct MlsCryptoSnapshot {
     /// because the fresh in-memory map would have no record of the
     /// higher epoch.
     ///
-    /// MIGRATION: `#[serde(default)]` â legacy snapshots (pre-C1)
+    /// MIGRATION: `#[serde(default)]` — legacy snapshots (pre-C1)
     /// deserialize with an empty vec. `SenderKey` material does not
     /// carry the epoch it was bound to, so per-sender floors cannot
     /// be recovered exactly from legacy data. The restore path
@@ -147,7 +147,7 @@ pub(crate) struct MlsCryptoSnapshot {
     /// The sender key epoch counter.
     pub(crate) sender_key_epoch: u64,
     /// The send-side message sequence counter.
-    /// MIGRATION: `#[serde(default)]` â old snapshots deserialize as 0, which is
+    /// MIGRATION: `#[serde(default)]` — old snapshots deserialize as 0, which is
     /// the correct initial state. GCM nonces are random (`OsRng`), not counter-derived,
     /// so a sequence reset does not create nonce reuse.
     #[serde(default)]
@@ -161,20 +161,20 @@ pub(crate) struct MlsCryptoSnapshot {
     /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
     pub(crate) group_id: Vec<u8>,
     /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
-    /// MIGRATION: `#[serde(default)]` â old snapshots deserialize with an empty
+    /// MIGRATION: `#[serde(default)]` — old snapshots deserialize with an empty
     /// tracker, so the first message from each sender is accepted unconditionally.
     /// MLS-level replay protection remains the primary defense; this tracker is
     /// defense-in-depth at the sender-key layer.
     #[serde(default)]
     pub(crate) recv_sequence_tracker: Vec<(String, u64, u64)>,
-    /// The provider-level X25519 wrapping public key (Â§9.16.1).
+    /// The provider-level X25519 wrapping public key (§9.16.1).
     /// Persisted so remote members' HPKE-sealed sender key responses can
     /// still be decrypted after a restart. Without this, the restored
     /// provider would generate a fresh keypair whose public key doesn't
     /// match the one published in the MLS tree's `LeafNode` extension.
     #[serde(default)]
     pub(crate) wrapping_public_key: [u8; 32],
-    /// The provider-level X25519 wrapping secret key (Â§9.16.1).
+    /// The provider-level X25519 wrapping secret key (§9.16.1).
     /// Wrapped in a `Vec<u8>` for serde compatibility; the 32-byte key
     /// is re-wrapped in [`Zeroizing`] on restore.
     #[serde(default)]
@@ -182,7 +182,7 @@ pub(crate) struct MlsCryptoSnapshot {
 }
 
 // SECURITY: Manual Debug impl redacts all sensitive key material.
-// Clone is intentionally NOT derived â snapshots contain raw private keys
+// Clone is intentionally NOT derived — snapshots contain raw private keys
 // (Ed25519 signer, AES-256 sender key, X25519 wrapping secret, MLS epoch
 // secrets) and should not be freely duplicated. The export/restore path
 // constructs snapshots fresh each time without cloning.
@@ -251,8 +251,8 @@ impl MlsCryptoSnapshot {
     }
 }
 
-// SECURITY: zeroize key material on every drop path â including an early `?`
-// return between deserialization and the explicit trailing `zeroize` calls â so
+// SECURITY: zeroize key material on every drop path — including an early `?`
+// return between deserialization and the explicit trailing `zeroize` calls — so
 // private material never lingers in freed memory. No field is ever moved out of a
 // `MlsCryptoSnapshot` (the export/restore paths drain/replace/borrow in place), so
 // this `Drop` does not conflict with a partial move.
@@ -264,32 +264,32 @@ impl Drop for MlsCryptoSnapshot {
 
 // #2148 (ADR-049 birth-into-actor): the provider's private per-context
 // `ContextCryptoState` struct was DELETED. The provider holds NO per-context
-// state â the actor's `ContextCryptoState` (`context/actor/state.rs`) is the
+// state — the actor's `ContextCryptoState` (`context/actor/state.rs`) is the
 // sole per-context crypto home. The provider's birth constructors
 // (`create_mls_group_with_context`, `install_joined_group`) now assemble the
 // `OwnedMlsCryptoState` payload below DIRECTLY and hand it back to the CREATE /
 // WELCOME caller, which seeds it onto the spawning actor.
 
 // ---------------------------------------------------------------------------
-// OwnedMlsCryptoState â owned payload the birth/restore seams hand to the actor
+// OwnedMlsCryptoState — owned payload the birth/restore seams hand to the actor
 // ---------------------------------------------------------------------------
 
 /// Owned per-context MLS crypto state the provider's birth/restore seams hand
 /// to a context's actor (#2148 ADR-049 birth-into-actor).
 ///
 /// This is the boundary payload between the provider and the actor. The
-/// provider births it DIRECTLY â [`MlsCryptoProvider::create_mls_group_with_context`]
+/// provider births it DIRECTLY — [`MlsCryptoProvider::create_mls_group_with_context`]
 /// (CREATE), [`MlsCryptoProvider::install_joined_group`] (WELCOME), and
 /// [`MlsCryptoProvider::build_restored_owned`] (restore / respawn / import) each
-/// assemble one and return it â and the CREATE / WELCOME / restore caller seeds
+/// assemble one and return it — and the CREATE / WELCOME / restore caller seeds
 /// it onto the spawning actor's `PerContextState` via
 /// [`seed_encrypted_crypto_from_owned`](crate::context::actor::state::PerContextState::seed_encrypted_crypto_from_owned).
 /// The provider holds NO per-context state: there is no `contexts` map, no
 /// insert-then-take round-trip, and no cross-map check-then-insert to race
-/// (#2167 TOCTOU is impossible by construction â the supervisor registry's
+/// (#2167 TOCTOU is impossible by construction — the supervisor registry's
 /// atomic first-writer-wins insert is the sole double-birth guard).
 ///
-/// # Ownership â the actor owns crypto by move
+/// # Ownership — the actor owns crypto by move
 ///
 /// This is the shipped steady state. Once seeded, the actor is the sole crypto
 /// authority for the context; crypto is never handed back to the provider, so
@@ -300,6 +300,11 @@ impl Drop for MlsCryptoSnapshot {
 /// This type is a move payload, not a domain struct. The birth/restore seams
 /// assemble it and the actor spawn seams destructure it field-by-field to build
 /// the actor-side [`crate::context::actor::ContextCryptoState`].
+///
+/// `#[must_use]`: a birth path that binds-and-drops this payload without seeding
+/// it (spawning an actor with `mls_group = None`) is a defect the compiler flags
+/// here (#2148 F7).
+#[must_use]
 pub struct OwnedMlsCryptoState {
     /// The `OpenMLS` group handle for this context.
     pub mls_group: ScpMlsGroup,
@@ -309,13 +314,17 @@ pub struct OwnedMlsCryptoState {
     pub sender_key_store: SenderKeyStore,
     /// Sender-key epoch counter.
     pub sender_key_epoch: u64,
-    /// Send-side sequence counter at take-time. Callers seed their
-    /// actor-side [`crate::context::actor::SendSequenceTracker`] with this
-    /// value via
-    /// [`crate::context::actor::SendSequenceTracker::from_persisted`] so
-    /// the actor picks up where the provider left off (preserves AAD
-    /// byte-identity â see `crates/scp-runtime/src/context/actor/sequence.rs`
-    /// Â§"Sequence numbering convention").
+    /// Send-side sequence counter for this birth/restore payload. A fresh
+    /// birth mints it at `0` (via [`OwnedMlsCryptoState::fresh_birth`],
+    /// used by `create_mls_group_with_context` / `install_joined_group`);
+    /// the restore seam (`build_restored_owned`) carries the persisted
+    /// high-water value. There is NO provider `take` — the CREATE / WELCOME /
+    /// restore caller seeds its actor-side
+    /// [`crate::context::actor::SendSequenceTracker`] from this value via
+    /// [`crate::context::actor::SendSequenceTracker::from_persisted`]
+    /// (preserving AAD byte-identity — see
+    /// `crates/scp-runtime/src/context/actor/sequence.rs`
+    /// §"Sequence numbering convention").
     pub send_sequence: u64,
     /// Pending sender-key distribution messages (target DID, serialized
     /// message). Not yet drained to transport at take-time; actor
@@ -329,7 +338,7 @@ pub struct OwnedMlsCryptoState {
 
 // SECURITY: Redacts the MLS group (holds OpenMLS epoch secrets) and
 // sender key (raw AES-256 key material). Other fields are counters or
-// byte-array maps that already redact on their own. Manual impl â
+// byte-array maps that already redact on their own. Manual impl —
 // `ScpMlsGroup` does not derive `Debug` at the library boundary.
 impl std::fmt::Debug for OwnedMlsCryptoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -352,6 +361,40 @@ impl std::fmt::Debug for OwnedMlsCryptoState {
     }
 }
 
+impl OwnedMlsCryptoState {
+    /// Assembles a freshly-born owned crypto payload from a just-created /
+    /// just-joined [`ScpMlsGroup`] (#2148 F11). Mints the local AES-256 sender
+    /// key ([`generate_sender_key`], spec §9.16.1) and defaults the seven
+    /// identical fields every birth seam shares (`sender_key_epoch = 1`,
+    /// `send_sequence = 0`, empty stores/maps). The distinct restore shape is
+    /// built by [`MlsCryptoProvider::build_restored_owned`], which is left
+    /// unchanged.
+    pub(crate) fn fresh_birth(mls_group: ScpMlsGroup) -> Self {
+        Self {
+            mls_group,
+            sender_key: generate_sender_key(),
+            sender_key_store: SenderKeyStore::new(),
+            sender_key_epoch: 1,
+            send_sequence: 0,
+            pending_distributions: Vec::new(),
+            nonce_dedup: NonceDedup::new(),
+            member_wrapping_keys: HashMap::new(),
+        }
+    }
+
+    /// Best-effort teardown of a born-but-never-seeded payload's secrets on a
+    /// creation-rollback path (#2148 F6). A bare drop FREES the group's
+    /// in-memory `OpenMLS` storage but does NOT zeroize its epoch-secret bytes or
+    /// the Ed25519 signer (`OpenMLS` `SignatureKeyPair` implements no `Zeroize` —
+    /// `scp-mls` `EagerDropSigner` / issue #82); [`scp_mls::group::destroy_group`]
+    /// eagerly FREES the signer's `Vec<u8>` via `EagerDropSigner::take` (freed,
+    /// not overwritten — signer zeroization stays open upstream, #82). The
+    /// [`SenderKey`] zeroizes on its own `ZeroizeOnDrop` when the payload drops.
+    pub(crate) fn dispose_secrets(&mut self) {
+        let _ = scp_mls::group::destroy_group(&mut self.mls_group);
+    }
+}
+
 /// Per-context Class-M floors reconstructed from a persisted snapshot.
 ///
 /// Returned by [`MlsCryptoProvider::build_restored_owned`](crate::crypto::mls::provider::MlsCryptoProvider::build_restored_owned) for the caller to
@@ -360,8 +403,8 @@ impl std::fmt::Debug for OwnedMlsCryptoState {
 /// `restore_crypto_state` installs the MLS group + sender-key MATERIAL into the
 /// live provider but NO LONGER seeds any epoch / recv-sequence floor there (the
 /// provider mirrors are deleted). Instead it returns the floors the snapshot
-/// carried â including the legacy back-compat lower bound derived from a
-/// pre-`sender_key_epochs` snapshot's global `sender_key_epoch` counter â so
+/// carried — including the legacy back-compat lower bound derived from a
+/// pre-`sender_key_epochs` snapshot's global `sender_key_epoch` counter — so
 /// `restore_crypto_state_with_floor_guard` can run them through the registry's
 /// fail-closed `validate_and_merge_*` sink.
 #[derive(Debug, Default)]
@@ -378,14 +421,14 @@ pub struct RestoredFloors {
 
 /// Production `ContextCryptoProvider` backed by `OpenMLS`.
 ///
-/// Node-resident X25519 wrapping keypair (Â§9.16.1), held as one unit so the
+/// Node-resident X25519 wrapping keypair (§9.16.1), held as one unit so the
 /// public and secret halves rotate and are read atomically (ADR-049 PR-7
 /// hardening H3). Stored behind a single [`ArcSwap`] on [`MlsCryptoProvider`].
 struct WrappingKeypair {
-    /// X25519 wrapping public key for sender key HPKE (Â§9.16.1). Published in
+    /// X25519 wrapping public key for sender key HPKE (§9.16.1). Published in
     /// the MLS `LeafNode` `scp_wrapping_key` extension.
     public: [u8; 32],
-    /// X25519 wrapping secret key for sender key HPKE (Â§9.16.1). Used to open
+    /// X25519 wrapping secret key for sender key HPKE (§9.16.1). Used to open
     /// HPKE-sealed sender key responses. Wrapped in [`Zeroizing`] so the prior
     /// key material is zeroized when the last `Arc` to this pair drops (i.e. on
     /// rotation, when the `ArcSwap` slot is replaced).
@@ -420,65 +463,47 @@ struct WrappingKeypair {
 pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
-    /// Injected hardened [`Clock`] (ADR-057 Â§Prereq-1). Used for the provider's
+    /// Injected hardened [`Clock`] (ADR-057 §Prereq-1). Used for the provider's
     /// direct `scp-mls` calls that mint or validate `KeyPackage` / group-leaf
     /// `Lifetime`s (create-group, generate-key-package, decrypt). In
     /// production this is the SAME `Arc` the actor-deps clock and the injected
-    /// [`ProductionMlsBackend`] share â one hardened clock per node, never
+    /// [`ProductionMlsBackend`] share — one hardened clock per node, never
     /// openmls's internal one.
     clock: Arc<dyn Clock>,
-    /// Injected MLS primitive backend (ADR-049 Â§15). Production
+    /// Injected MLS primitive backend (ADR-049 §15). Production
     /// callers receive a [`ProductionMlsBackend`] from
     /// [`MlsCryptoProvider::new`]; tests inject failure-driven mocks via
     /// [`MlsCryptoProvider::with_backends`]. The provider's orchestration
-    /// methods route every inline `OpenMLS` primitive through this trait â
+    /// methods route every inline `OpenMLS` primitive through this trait —
     /// state still lives on the provider's lock-free containers below.
     mls_backend: Arc<dyn MlsBackend>,
-    /// Injected HPKE primitive backend (ADR-049 Â§15). Same
-    /// injection contract as `mls_backend` â production wires
+    /// Injected HPKE primitive backend (ADR-049 §15). Same
+    /// injection contract as `mls_backend` — production wires
     /// [`ProductionHpkeBackend`]; tests can substitute mocks for fail
     /// injection on the wrapping-key seal/unseal path.
     hpke_backend: Arc<dyn HpkeBackend>,
     // #2148 (ADR-049 birth-into-actor): the per-context `contexts` /
     // `broadcast_keys` maps and the `taken_context_ids` guard set were DELETED.
-    // The provider holds NO per-context state â the actor's `PerContextState`
+    // The provider holds NO per-context state — the actor's `PerContextState`
     // (`context/actor/state.rs`) is the sole per-context crypto home. Removing
     // the shared `contexts` / `taken_context_ids` maps also closes the #2167
     // cross-map TOCTOU by construction: there is no check-then-insert to race;
     // the supervisor registry's atomic first-writer-wins insert is the sole
     // double-birth guard. The provider is now a node-level MLS-birth / HPKE
     // helper (local DID, clock, MLS/HPKE backends, node wrapping keypair).
-    /// Node-resident X25519 wrapping keypair for sender key HPKE (Â§9.16.1) â
+    /// Node-resident X25519 wrapping keypair for sender key HPKE (§9.16.1) —
     /// public half published in the MLS `LeafNode` `scp_wrapping_key` extension,
     /// secret half used to open HPKE-sealed sender key responses.
     ///
     /// Held as a SINGLE [`WrappingKeypair`] behind ONE [`ArcSwap`] (ADR-049 PR-7
-    /// hardening H3) so the pair rotates and is read atomically â the
+    /// hardening H3) so the pair rotates and is read atomically — the
     /// snapshot-restore path (which takes `&self`) replaces both halves in one
     /// `.store()`, and every reader loads both halves from one `.load()`,
     /// closing the two-slot torn-read window. Rotation is atomic and the prior
     /// key material is zeroized when the last `Arc` to the pair drops. Reader
-    /// discipline (load â use â drop within the same poll) is enforced at every
-    /// callsite â no callsite stores the loaded `Arc` in a struct field.
+    /// discipline (load → use → drop within the same poll) is enforced at every
+    /// callsite — no callsite stores the loaded `Arc` in a struct field.
     wrapping_keypair: ArcSwap<WrappingKeypair>,
-    /// One-shot test seam: when set, the NEXT `rotate_sender_key`
-    /// call returns [`ContextError::CryptoFailed`] and resets the flag.
-    ///
-    /// This exists solely to induce a rotation-call failure that drives the
-    /// caller's ADR-049 Â§9 Class-S sync-persist fail-closed branch end-to-end
-    /// (Â§15(c)): the "injected failure â rotation returns `Err` with the
-    /// epoch/key NOT committed" criterion. Note the Class-S persist itself
-    /// happens in the ACTOR after this call returns, not in this function â
-    /// `rotate_sender_key` only mutates the provider's in-memory state and
-    /// queues distributions; this seam makes that call fail so the actor
-    /// observes its fail-closed signal. The real provider's in-process rotation
-    /// always generates a fresh key and increments successfully, so that
-    /// fail-closed branch is otherwise structurally unreachable. Gated behind
-    /// `#[cfg(any(test, feature = "testing"))]` so the production build carries
-    /// neither the field nor the branch. One-shot (fires once, then clears
-    /// itself) so a subsequent rotation succeeds normally.
-    #[cfg(any(test, feature = "testing"))]
-    force_rotation_failure: std::sync::atomic::AtomicBool,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -492,7 +517,7 @@ impl MlsCryptoProvider {
     /// # Arguments
     ///
     /// * `local_did` - The local member's DID (must be a valid `did:dht:z...`).
-    /// * `clock` - The injected hardened [`Clock`] (ADR-057 Â§Prereq-1). Shared
+    /// * `clock` - The injected hardened [`Clock`] (ADR-057 §Prereq-1). Shared
     ///   with the constructed [`ProductionMlsBackend`] so a node has exactly one
     ///   hardened clock governing every `KeyPackage` / group-leaf `Lifetime`.
     #[must_use]
@@ -507,7 +532,7 @@ impl MlsCryptoProvider {
 
     /// Creates an `MlsCryptoProvider` with caller-supplied backends.
     ///
-    /// Test seam introduced by ADR-049 Â§15. Production code
+    /// Test seam introduced by ADR-049 §15. Production code
     /// uses [`Self::new`]; failure-injection tests instantiate mock
     /// `MlsBackend` / `HpkeBackend` impls and pass them here. The
     /// `local_did` and lock-free state containers behave identically to
@@ -521,7 +546,7 @@ impl MlsCryptoProvider {
     ///   in tests).
     /// * `hpke_backend` - The HPKE primitive backend (typically
     ///   [`ProductionHpkeBackend`] in production).
-    /// * `clock` - The injected hardened [`Clock`] (ADR-057 Â§Prereq-1) used for
+    /// * `clock` - The injected hardened [`Clock`] (ADR-057 §Prereq-1) used for
     ///   the provider's direct `scp-mls` `Lifetime` mint/validate calls. Tests
     ///   pass `Arc::new(SystemClock)`; production passes the node's shared clock.
     #[must_use]
@@ -541,29 +566,11 @@ impl MlsCryptoProvider {
                 public: wrapping_public_key,
                 secret: Zeroizing::new(wrapping_secret_key),
             }),
-            #[cfg(any(test, feature = "testing"))]
-            force_rotation_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Arms the one-shot [`Self::force_rotation_failure`] seam: the NEXT
-    /// `rotate_sender_key` call returns
-    /// [`ContextError::CryptoFailed`] and clears the flag.
-    ///
-    /// Test-only (see the field docs) â used to induce a rotation-call failure
-    /// that drives the caller's ADR-049 Â§9 Class-S sync-persist fail-closed
-    /// branch (Â§15(c)); the persist itself happens in the actor after
-    /// `rotate_sender_key` returns, not in this function. The real provider
-    /// cannot otherwise reach that branch (an in-process rotation always
-    /// generates a fresh key and increments the epoch successfully).
-    #[cfg(any(test, feature = "testing"))]
-    pub fn arm_rotation_failure_once(&self) {
-        self.force_rotation_failure
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// Borrowed reference to the injected MLS primitive backend
-    /// (ADR-049 Â§15). Helper functions outside the provider
+    /// (ADR-049 §15). Helper functions outside the provider
     /// that need the same backend (e.g. handler code in
     /// `handlers/messaging.rs` once the deletion ladder lands) can
     /// borrow through this accessor.
@@ -573,18 +580,18 @@ impl MlsCryptoProvider {
     }
 
     /// Borrowed reference to the injected HPKE primitive backend
-    /// (ADR-049 Â§15). See [`Self::mls_backend`].
+    /// (ADR-049 §15). See [`Self::mls_backend`].
     #[must_use]
     pub fn hpke_backend(&self) -> &Arc<dyn HpkeBackend> {
         &self.hpke_backend
     }
 
-    /// A clone of the injected hardened [`Clock`] (ADR-057 Â§Prereq-1) `Arc`.
+    /// A clone of the injected hardened [`Clock`] (ADR-057 §Prereq-1) `Arc`.
     ///
     /// Lets the node/FFI construction sites wire the SAME clock `Arc` into the
     /// `Supervisor` that this provider holds, so the "one hardened clock per
     /// node" invariant documented on the [`Self::clock`] field holds by
-    /// construction â the supervisor does not fabricate a second `SystemClock`.
+    /// construction — the supervisor does not fabricate a second `SystemClock`.
     /// The returned `Arc` points at the exact same [`Clock`] this provider (and
     /// its [`ProductionMlsBackend`]) already share.
     #[must_use]
@@ -608,7 +615,7 @@ impl MlsCryptoProvider {
 #[allow(clippy::significant_drop_tightening)]
 impl MlsCryptoProvider {
     // #2148 (ADR-049 birth-into-actor): the `context_crypto_present` residency
-    // probe was DELETED â the provider holds no per-context state, so there is no
+    // probe was DELETED — the provider holds no per-context state, so there is no
     // residency to probe. Actor-owned crypto presence is asserted on the actor's
     // `PerContextState` (`context/actor/state.rs`).
 
@@ -626,9 +633,9 @@ impl MlsCryptoProvider {
         // Validate that the local DID is a valid did:dht:z... format.
         //
         // Under the `testing` feature gate, also accept `did:test:*` and
-        // `did:key:*` prefixes so the extensive test suite â which used
+        // `did:key:*` prefixes so the extensive test suite — which used
         // non-dht test DIDs with the deleted `ContextCryptoProvider`
-        // mocks before ADR-049 Â§15 â continues to work with
+        // mocks before ADR-049 §15 — continues to work with
         // the inherent `MlsCryptoProvider` API. Production builds (no
         // `testing` feature) still require `did:dht:z*`.
         let accepted = self.local_did.starts_with("did:dht:z")
@@ -645,27 +652,27 @@ impl MlsCryptoProvider {
 
     /// Births an MLS **context** group whose `group_context` binds the SCP
     /// context parameters via the `scp_context_params` (`0xFF02`) extension
-    /// (spec Â§5.13.3, finding FFI-02), and returns it as OWNED material.
+    /// (spec §5.13.3, finding FFI-02), and returns it as OWNED material.
     ///
     /// #2148 (ADR-049 birth-into-actor): this is the production CREATE birth
     /// seam. It builds the context group through the `scp-mls` primitive
-    /// ([`group::create_group_with_context`]) â the committed
+    /// ([`group::create_group_with_context`]) — the committed
     /// [`ScpContextExtension`](scp_protocol::context::ScpContextExtension) is
     /// folded into the MLS key schedule and read back byte-identically by every
     /// joiner (because the group carries `0xFF02`, `OpenMLS` (`valn0502`) rejects
-    /// any Add whose leaf does not declare `0xFF02` support â pooled key packages
+    /// any Add whose leaf does not declare `0xFF02` support — pooled key packages
     /// MUST be generated via the context-params path, see
-    /// [`MlsBackend::generate_key_package`](super::backend::MlsBackend::generate_key_package)) â
+    /// [`MlsBackend::generate_key_package`](super::backend::MlsBackend::generate_key_package)) —
     /// mints the local sender key via [`generate_sender_key`], and assembles the
     /// [`OwnedMlsCryptoState`] payload DIRECTLY. It touches NO shared provider
     /// map (there is none): `builder::create_context` hands the returned payload
     /// to the caller, which seeds it onto the spawning actor's `PerContextState`.
-    /// There is no overwrite-refusal / "owned by actor" residency guard here â
+    /// There is no overwrite-refusal / "owned by actor" residency guard here —
     /// the supervisor registry's atomic first-writer-wins insert is the sole
     /// double-birth guard (#2167 TOCTOU is impossible by construction).
     ///
     /// Takes NO `context_id`: the owned birth reserves no shared-map slot, so it
-    /// needs no context key â the caller already holds the `context_id` it uses
+    /// needs no context key — the caller already holds the `context_id` it uses
     /// to key the spawning actor.
     ///
     /// # Errors
@@ -690,16 +697,7 @@ impl MlsCryptoProvider {
 
         // Assemble the owned payload directly — the fresh MLS group + a
         // locally-minted sender key (no shared-map install).
-        Ok(OwnedMlsCryptoState {
-            mls_group,
-            sender_key: generate_sender_key(),
-            sender_key_store: SenderKeyStore::new(),
-            sender_key_epoch: 1,
-            send_sequence: 0,
-            pending_distributions: Vec::new(),
-            nonce_dedup: NonceDedup::new(),
-            member_wrapping_keys: HashMap::new(),
-        })
+        Ok(OwnedMlsCryptoState::fresh_birth(mls_group))
     }
 
     /// Births the joiner's crypto from an already-joined `OpenMLS` group and
@@ -710,47 +708,36 @@ impl MlsCryptoProvider {
     /// [`Self::create_mls_group_with_context`]: the creator BUILDS a fresh group,
     /// whereas a joiner has already produced its self-contained [`ScpMlsGroup`]
     /// by processing a received Welcome (through the fused
-    /// `KeyPackageStoreActor::ConfirmConsume` â the `MlsBackend`'s
+    /// `KeyPackageStoreActor::ConfirmConsume` → the `MlsBackend`'s
     /// consumed-init-key-backstopped `join_from_welcome`; it owns its own
     /// `OpenMLS` provider + signer). This constructor mints the joiner's OWN
-    /// AES-256 sender key LOCALLY via [`generate_sender_key`] (spec Â§9.16.1 â the
+    /// AES-256 sender key LOCALLY via [`generate_sender_key`] (spec §9.16.1 — the
     /// Welcome carries no sender key), assembles the [`OwnedMlsCryptoState`]
     /// payload DIRECTLY (moving the joined `group` in verbatim), and returns it
     /// for the WELCOME seam (`Supervisor::spawn_actor_from_welcome`) to seed onto
     /// the spawning actor. It touches NO shared provider map (there is none):
-    /// no residency guard, no double-owner window â the supervisor registry's
+    /// no residency guard, no double-owner window — the supervisor registry's
     /// atomic first-writer-wins insert is the sole double-birth guard.
     ///
     /// Cannot fail: it reserves no slot and does no fallible I/O, so it returns
     /// the payload by value (no `Result`).
     ///
     /// Other members' sender keys arrive later on demand via the PULL protocol
-    /// (Â§9.16.2): the joiner sends a `SenderKeyRequest` carrying a fresh EPHEMERAL
+    /// (§9.16.2): the joiner sends a `SenderKeyRequest` carrying a fresh EPHEMERAL
     /// wrapping key to each incumbent. So `sender_key_store`, `nonce_dedup`,
-    /// `pending_distributions`, and `member_wrapping_keys` start empty â the same
+    /// `pending_distributions`, and `member_wrapping_keys` start empty — the same
     /// initial shape a fresh join produces. `member_wrapping_keys` STAYS empty
     /// for a joiner: it caches other members' STABLE wrapping keys, used ONLY by
     /// the proactive/offline PUSH path and populated on the incumbent/adder side;
     /// openmls 0.8.1 exposes no way to read a remote member's `scp_wrapping_key`
     /// `LeafNode` extension from a joined group (ADR-057), and a joiner does not
-    /// need them â it reaches every incumbent through the pull protocol and
+    /// need them — it reaches every incumbent through the pull protocol and
     /// answers incumbents' pulls via the ephemeral key in their requests.
-    #[must_use]
     pub fn install_joined_group(&self, group: ScpMlsGroup) -> OwnedMlsCryptoState {
-        // Direct assembly of the owned payload â the joiner's own sender key is
-        // minted locally; the joined group is moved in verbatim.
-        OwnedMlsCryptoState {
-            mls_group: group,
-            // The joiner's own AES-256 sender key (spec Â§9.16.1), minted
-            // locally â epoch starts at 1, matching a fresh create / join.
-            sender_key: generate_sender_key(),
-            sender_key_store: SenderKeyStore::new(),
-            sender_key_epoch: 1,
-            send_sequence: 0,
-            pending_distributions: Vec::new(),
-            nonce_dedup: NonceDedup::new(),
-            member_wrapping_keys: HashMap::new(),
-        }
+        // Direct assembly — the joined group moves in verbatim; `fresh_birth`
+        // mints the joiner's own local sender key (epoch 1), matching a fresh
+        // create.
+        OwnedMlsCryptoState::fresh_birth(group)
     }
 
     /// #2148 (ADR-049 birth-into-actor) test seam: births a wrapping-key-only
@@ -758,10 +745,10 @@ impl MlsCryptoProvider {
     ///
     /// The production creator path always commits `0xFF02` (via
     /// [`Self::create_mls_group_with_context`]); this bare owned constructor
-    /// exists ONLY so tests can stand up a NON-SCP group â e.g. to prove the join
+    /// exists ONLY so tests can stand up a NON-SCP group — e.g. to prove the join
     /// path REJECTS a group with no `0xFF02` extension. It touches no per-context
     /// state and mints the local sender key inline, exactly like the context
-    /// birth seam. Gated `#[cfg(any(test, feature = "testing"))]` â never on a
+    /// birth seam. Gated `#[cfg(any(test, feature = "testing"))]` — never on a
     /// production path.
     ///
     /// # Errors
@@ -778,23 +765,16 @@ impl MlsCryptoProvider {
             self.clock.as_ref(),
         )
         .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
-        Ok(OwnedMlsCryptoState {
-            mls_group,
-            sender_key: generate_sender_key(),
-            sender_key_store: SenderKeyStore::new(),
-            sender_key_epoch: 1,
-            send_sequence: 0,
-            pending_distributions: Vec::new(),
-            nonce_dedup: NonceDedup::new(),
-            member_wrapping_keys: HashMap::new(),
-        })
+        // Bare (non-`0xFF02`) group as owned material; `fresh_birth` mints the
+        // local sender key inline, exactly like the context birth seam.
+        Ok(OwnedMlsCryptoState::fresh_birth(mls_group))
     }
 
     // #2148 (ADR-049 birth-into-actor): `generate_sender_key`, `init_broadcast_key`,
     // `destroy_mls_group`, and `destroy_sender_key` were DELETED along with the
     // `contexts` / `broadcast_keys` maps. The local sender key is minted INSIDE
     // the owned birth constructors; the broadcast key lives on the actor's
-    // `BroadcastState`; and per-context teardown is the actor's job â it disposes
+    // `BroadcastState`; and per-context teardown is the actor's job — it disposes
     // its OWNED crypto via `ContextCryptoState::dispose_secrets` (which runs
     // OpenMLS `destroy_group` and zeroizes the sender key material) at its close /
     // TTL-expiry / shutdown seams.
@@ -816,8 +796,8 @@ impl MlsCryptoProvider {
         key_package_bytes: Option<&[u8]>,
     ) -> Result<(), ContextError> {
         // Under `cfg(test)` / `testing` feature accept `None` as a valid
-        // key package â matches the old `MockCrypto::validate_key_package`
-        // behaviour deleted in ADR-049 Â§15.
+        // key package — matches the old `MockCrypto::validate_key_package`
+        // behaviour deleted in ADR-049 §15.
         let Some(bytes) = key_package_bytes else {
             if cfg!(any(test, feature = "testing")) {
                 let _ = owner_did;
@@ -840,10 +820,10 @@ impl MlsCryptoProvider {
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
 
-        // SECURITY (ADR-057 Â§Prereq-1): openmls's `validate` above runs its own
+        // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
         // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
         // clock. This eager join gate is the accept-family sibling of
-        // `ProductionMlsBackend::validate_key_package` â re-validate the accepted
+        // `ProductionMlsBackend::validate_key_package` — re-validate the accepted
         // `Lifetime` against the injected hardened clock and enforce the RFC 9420
         // max-range bound openmls's `validate` never applies. Additive hardening;
         // never replaces openmls.
@@ -882,7 +862,7 @@ impl MlsCryptoProvider {
 
     // #2148 (ADR-049 birth-into-actor): the provider `add_member` /
     // `add_member_from_bytes` were DELETED. Member addition mutates the
-    // ACTOR-owned MLS group â the governance `AddMember` handler calls the
+    // ACTOR-owned MLS group — the governance `AddMember` handler calls the
     // actor-side `ContextCryptoState::add_member` on its owned
     // `PerContextState` (`context/actor/state.rs`), which routes the invitee's
     // `KeyPackage` through the same `scp_mls::group::add_member` primitive. The
@@ -899,7 +879,7 @@ impl MlsCryptoProvider {
     ///
     /// Deserializes the message and HPKE-opens + DID-verifies the recovered
     /// sender key. ADR-049 PR-6: it does NOT install the key or enforce any
-    /// epoch floor â the caller (the `decrypt_and_dispatch` messaging seam)
+    /// epoch floor — the caller (the `decrypt_and_dispatch` messaging seam)
     /// gates the returned `epoch` against the authoritative Class-M floor
     /// registry and then installs the key via
     /// `set_sender_key_unchecked` (gate-before-install = fail-safe).
@@ -922,7 +902,7 @@ impl MlsCryptoProvider {
 
         match msg {
             SenderKeyDistributionMessage::KeyResponse(response) => {
-                // ADR-049 Â§15: load wrapping secret through
+                // ADR-049 §15: load wrapping secret through
                 // `ArcSwap`. The returned `Arc` is held only for the
                 // duration of the HPKE-open call (no `.await` between
                 // load and drop).
@@ -972,11 +952,11 @@ impl MlsCryptoProvider {
     // tests drive them there.
 
     /// Test-only snapshot of the provider's identity-level X25519 wrapping
-    /// keypair (Â§9.16.1): `(public, secret)`. Lets the full-stack harness
+    /// keypair (§9.16.1): `(public, secret)`. Lets the full-stack harness
     /// publish the provider's OWN self-consistent keypair into the joiner's
     /// `Supervisor::set_wrapping_keys` slot so the pooled `KeyPackage`'s `0xFF01`
     /// wrapping-leaf pubkey and the secret this provider opens sender keys with
-    /// stay the SAME keypair across the reserve â `spawn_actor_from_welcome` join
+    /// stay the SAME keypair across the reserve → `spawn_actor_from_welcome` join
     /// migration. The wrapping SECRET never leaves the provider in a prod build.
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
@@ -1013,15 +993,15 @@ impl MlsCryptoProvider {
     /// #2148 (ADR-049 birth-into-actor): this is the owned-return restore seam.
     /// The restore / respawn / cold-restart / import caller
     /// (`lifecycle_helpers`) seeds the per-context actor directly from the
-    /// returned material â the provider holds no per-context state to install
+    /// returned material — the provider holds no per-context state to install
     /// into. This method restores the node-level X25519 wrapping keypair as a
     /// `&self` side effect but touches no per-context map (there is none) and
     /// imports nothing from `context::actor` (the owned payload is the boundary
     /// shape between the provider and the actor).
     ///
-    /// # Side effect â node-level wrapping keypair
+    /// # Side effect — node-level wrapping keypair
     ///
-    /// The X25519 wrapping keypair (Â§9.16.1) is node-level, NOT per-context and
+    /// The X25519 wrapping keypair (§9.16.1) is node-level, NOT per-context and
     /// NOT part of [`OwnedMlsCryptoState`]; the atomic-core actor reads it via
     /// the Prep B `pub(crate)` accessors
     /// ([`wrapping_keypair`](Self::wrapping_keypair)). This method restores it into
@@ -1032,7 +1012,7 @@ impl MlsCryptoProvider {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if `data` is empty (the owned path
-    /// must always yield material â unlike the legacy no-op-on-empty
+    /// must always yield material — unlike the legacy no-op-on-empty
     /// `restore_crypto_state`), if deserialization
     /// fails, or if the data is corrupt.
     pub(crate) fn build_restored_owned(
@@ -1068,7 +1048,7 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(format!("signer deserialization: {e}")))?;
 
         // SECURITY: Zeroize the raw signer bytes now that they've been
-        // deserialized â the Ed25519 private key should not linger in this
+        // deserialized — the Ed25519 private key should not linger in this
         // intermediate buffer.
         snapshot.signer_bytes.zeroize();
 
@@ -1083,7 +1063,7 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(format!("MlsGroup::load storage error: {e}")))?
             .ok_or_else(|| {
                 ContextError::CryptoFailed(
-                    "MlsGroup::load returned None â group not found in restored storage"
+                    "MlsGroup::load returned None — group not found in restored storage"
                         .to_string(),
                 )
             })?;
@@ -1100,7 +1080,7 @@ impl MlsCryptoProvider {
         //
         // `sender_key_epochs` can cover DIDs that no longer have a key entry
         // (e.g., removed members whose floor was preserved by
-        // `SenderKeyStore::remove`) â those entries still matter for rollback
+        // `SenderKeyStore::remove`) — those entries still matter for rollback
         // protection and are returned so the registry retains them.
         let had_epoch_map = !snapshot.sender_key_epochs.is_empty();
         let mut restored_sender_epochs: Vec<(String, u64)> =
@@ -1111,7 +1091,7 @@ impl MlsCryptoProvider {
         // we installed key material below with `set_unchecked` and
         // left every floor at 0, the first post-upgrade receive
         // would be `set_checked(..., epoch=k>0)` and would be
-        // accepted against a zero floor â re-opening the rollback
+        // accepted against a zero floor — re-opening the rollback
         // window for exactly one boot cycle.
         //
         // `SenderKey` material does not carry the epoch it was
@@ -1140,7 +1120,7 @@ impl MlsCryptoProvider {
             Some(snapshot.sender_key_epoch.max(1))
         };
         for (did, key) in snapshot.sender_key_entries.drain(..) {
-            // Install key material via `set_unchecked` â the restored
+            // Install key material via `set_unchecked` — the restored
             // key IS authoritative (it was persisted by this same
             // provider), and the floor is enforced by the registry.
             sender_key_store.set_unchecked(&ctx_id_hex, &did, key);
@@ -1194,19 +1174,19 @@ impl MlsCryptoProvider {
         // before returning the owned material to the caller (the legacy
         // `restore_crypto_state` path installs that material into the contexts
         // map immediately after; the atomic core seeds the actor from it). This
-        // preserves the original ordering â the keypair rotates before any
-        // per-context entry becomes observable â so a reader never sees a
+        // preserves the original ordering — the keypair rotates before any
+        // per-context entry becomes observable — so a reader never sees a
         // partial pairing of new wrapping key with stale context state.
         //
         // ADR-049 PR-7 hardening H3: the wrapping keypair is a SINGLE
         // `ArcSwap<WrappingKeypair>` slot, so the public and secret halves
-        // rotate in ONE atomic `.store()` â an in-flight reader always sees a
+        // rotate in ONE atomic `.store()` — an in-flight reader always sees a
         // consistent pair (either old/old or new/new). This closes the
         // prior two-store window where one slot could be observed rotated
         // while the other lagged.
         //
         // Legacy snapshots (pre-wrapping-key persistence) have default
-        // [0u8; 32] â skip restore in that case to keep the fresh keypair.
+        // [0u8; 32] — skip restore in that case to keep the fresh keypair.
         if snapshot.wrapping_public_key != [0u8; 32] && snapshot.wrapping_secret_key.len() == 32 {
             // SECURITY: Wrap the intermediate secret in Zeroizing so it is
             // zeroed on drop even if a `?` return occurs below.
@@ -1242,7 +1222,7 @@ impl MlsCryptoProvider {
     }
 
     // #2148 (ADR-049 birth-into-actor): the provider `group_context_extension`
-    // reader was DELETED â it read the resident MLS group out of the `contexts`
+    // reader was DELETED — it read the resident MLS group out of the `contexts`
     // map (now gone) via the deleted `with_context`. Every caller reads the
     // extension off the OWNED group directly instead: the WELCOME seam reads
     // `joined_group.group_context_extension()` before seeding, and the
@@ -1252,12 +1232,12 @@ impl MlsCryptoProvider {
 
     // ADR-049 PR-6 (read-authority switch): the provider `export_sender_key_epochs`
     // and single-sender `sender_key_epoch` follower-read twins are DELETED. The
-    // authoritative per-sender epoch floors now live in â and are read from â the
+    // authoritative per-sender epoch floors now live in — and are read from — the
     // Supervisor-owned Class-M registry (`Supervisor::export_sender_key_epochs`).
 
-    /// Returns this provider's local member DID â the key under which the local
+    /// Returns this provider's local member DID — the key under which the local
     /// sender's epoch is recorded in the authoritative floor registry, and the
-    /// value the recv seam's F-3 `debug_assert_ne!` checks against. `pub(crate)` â
+    /// value the recv seam's F-3 `debug_assert_ne!` checks against. `pub(crate)` —
     /// internal read with no FFI surface.
     #[must_use]
     pub(crate) fn local_did(&self) -> &str {
@@ -1268,7 +1248,7 @@ impl MlsCryptoProvider {
     // `export_recv_sequence_floors`, and `validate_and_merge_recv_sequence_floors` twins are
     // DELETED. The authoritative floors now live in the Supervisor-owned Class-M registry,
     // whose `validate_and_merge_*` sinks (`context/supervisor/floors.rs`) enforce the same
-    // Â§23.17.2 Inv-2/Inv-3/Inv-4 + epoch-poisoning-overshoot merge; the restore/import guard
+    // §23.17.2 Inv-2/Inv-3/Inv-4 + epoch-poisoning-overshoot merge; the restore/import guard
     // routes the snapshot floors there via the returned `RestoredFloors`.
 }
 
@@ -1343,7 +1323,7 @@ mod tests {
 
     /// Birth a fresh owned context on `provider`, seed it onto a throwaway actor
     /// state, and export the crypto through the actor
-    /// [`PerContextState::export_crypto_state`] seam â sourcing the node-resident
+    /// [`PerContextState::export_crypto_state`] seam — sourcing the node-resident
     /// wrapping keypair (public + secret) from the provider exactly as the
     /// production actor-export caller does.
     fn actor_export(
@@ -1360,7 +1340,7 @@ mod tests {
     /// #2148 (ADR-049 birth-into-actor): birth an owned context onto a throwaway
     /// actor, let `mutate` enrich its actor-owned crypto (remote sender keys,
     /// wrapping keys, epoch counter), then export the durable snapshot with the
-    /// given Class-M floor params â the actor-native replacement for the deleted
+    /// given Class-M floor params — the actor-native replacement for the deleted
     /// "create+generate on the provider, mutate `contexts[ctx]`, then export"
     /// setup the restore-format tests used.
     fn birth_mutate_export(
@@ -1379,7 +1359,7 @@ mod tests {
     }
 
     /// Borrow the Encrypted-mode crypto sub-state of an actor `PerContextState`
-    /// (panics on Broadcast) â the actor-seam analogue of the provider's
+    /// (panics on Broadcast) — the actor-seam analogue of the provider's
     /// `with_context` closure, for tests that inspect the live MLS group / stores.
     fn actor_crypto(state: &PerContextState) -> &crate::context::actor::ContextCryptoState {
         match &state.mode {
@@ -1390,7 +1370,7 @@ mod tests {
         }
     }
 
-    /// Mutable sibling of [`actor_crypto`] â hands out the `&mut ContextCryptoState`
+    /// Mutable sibling of [`actor_crypto`] — hands out the `&mut ContextCryptoState`
     /// that the field-granular Class-C send/receive seams (e.g.
     /// `ContextCryptoState::seal` / `build_encrypted_envelope_actor`) operate on.
     fn actor_crypto_mut(
@@ -1440,25 +1420,29 @@ mod tests {
         );
 
         // Type witness: the secret half is `Zeroizing<[u8; 32]>`, not a bare
-        // secret. This binding is load-bearing â it fails to compile if the
+        // secret. This binding is load-bearing — it fails to compile if the
         // signature ever regresses to a plain `[u8; 32]`.
         let _sec_witness: zeroize::Zeroizing<[u8; 32]> = sec1;
     }
 
     /// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): a normal sender-key rotation on the
     /// actor's `PerContextState` advances the local sender-key epoch by exactly
-    /// one (Â§9.16.4/Â§9.16.5, relocated verbatim from the deleted provider
+    /// one (§9.16.4/§9.16.5, relocated verbatim from the deleted provider
     /// `rotate_sender_key`).
     ///
-    /// COVERAGE FLAG (orchestrator / atomic-core): the Â§15(c) fault-INJECTION
-    /// half of the former `arm_rotation_failure_once_forces_fail_closed_then_normal`
-    /// is NOT relocated here. `arm_rotation_failure_once` / `force_rotation_failure`
-    /// are provider-resident, and the deleted provider `rotate_sender_key` was
-    /// their ONLY consumer â the actor `rotate_sender_key` (state.rs) does not read
-    /// the flag. Restoring the Class-S fail-closed injection coverage requires
-    /// re-homing that one-shot fault seam onto the actor rotate (a `state.rs`
-    /// change, per the Prep-E carry-forward) and asserting it as an atomic-core
-    /// test (map C8 "Class-S rotation fail-closed via Prep-E `arm_rotation_failure_once`").
+    /// COVERAGE (§15(c) fail-closed injection): RESTORED on the actor. #2148
+    /// re-homed the one-shot rotation fault seam onto the actor's
+    /// `PerContextState` (`arm_rotation_failure_once` plus the `#[cfg(any(test,
+    /// feature = "testing"))]` early-return in
+    /// `PerContextState::rotate_sender_key`) and DELETED the now-orphaned
+    /// provider `force_rotation_failure` field / `arm_rotation_failure_once`
+    /// method (their only consumer, the provider `rotate_sender_key`, was
+    /// already gone). The Class-S fail-closed branch is now exercised
+    /// end-to-end by `state.rs`'s
+    /// `arm_rotation_failure_once_forces_fail_closed_then_normal` (arm → next
+    /// actor rotation fails closed with the epoch/key uncommitted → a
+    /// subsequent rotation advances normally). This test covers only the
+    /// NORMAL epoch-advance.
     #[test]
     fn rotate_sender_key_advances_epoch_on_actor() {
         let provider = make_provider();
@@ -1492,7 +1476,7 @@ mod tests {
     }
 
     // #2148 (ADR-049 birth-into-actor): `create_mls_group_and_destroy` was
-    // DELETED â the provider `create_mls_group` / `destroy_mls_group` /
+    // DELETED — the provider `create_mls_group` / `destroy_mls_group` /
     // `with_context`-based encrypt path no longer exist; the actor owns the group
     // and disposes it via `ContextCryptoState::dispose_secrets` (covered by the
     // `golden_destroy_*` tests in `context::actor::state`).
@@ -1532,11 +1516,11 @@ mod tests {
         use scp_clock::TestClock;
         use scp_mls::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
 
-        // Security intent (ADR-057 Â§Prereq-1): the eager join gate
+        // Security intent (ADR-057 §Prereq-1): the eager join gate
         // `validate_key_package` must re-check the accepted KeyPackage
-        // `Lifetime` against the provider's injected hardened clock â mirroring
+        // `Lifetime` against the provider's injected hardened clock — mirroring
         // its accept-family sibling `ProductionMlsBackend::validate_key_package`
-        // â so a KeyPackage that is temporally invalid under the SCP clock is
+        // — so a KeyPackage that is temporally invalid under the SCP clock is
         // rejected even though openmls's own internal `is_valid` (against the
         // real system clock) accepts it.
 
@@ -1576,7 +1560,7 @@ mod tests {
 
         // Positive control: with the provider clock at the real present, the
         // same KeyPackage passes the lifetime gate (and every other check),
-        // proving the rejection above is caused by the injected clock offset â
+        // proving the rejection above is caused by the injected clock offset —
         // not by an unrelated defect in the KeyPackage bytes.
         let live_provider = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         assert!(
@@ -1591,7 +1575,7 @@ mod tests {
     fn add_member_rejects_malformed_key_package_bytes() {
         // #2148: member addition runs on the actor-owned group. Security intent:
         // `add_member` must reject key material that is not a valid MLS
-        // KeyPackage â garbage bytes fail TLS deserialization.
+        // KeyPackage — garbage bytes fail TLS deserialization.
         let provider = make_provider();
         let ctx_id = make_context_id();
         let mut actor = take_into_actor(&provider, &ctx_id);
@@ -1639,7 +1623,7 @@ mod tests {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
-        // Self-removal (leave) returns empty commit bytes â the local node
+        // Self-removal (leave) returns empty commit bytes — the local node
         // does not produce a Commit for its own departure.
         let mut actor = take_into_actor(&provider, &ctx_id);
         let output = actor.remove_member(TEST_DID, TEST_DID).unwrap();
@@ -1698,8 +1682,8 @@ mod tests {
     #[test]
     fn remove_member_sender_key_errors_without_context() {
         // Relocated onto the actor seam: the provider's "no context registered"
-        // error becomes the actor's mode guard â a context with no MLS group
-        // (Broadcast mode, `encrypted_crypto_mut` â CryptoFailed) rejects a
+        // error becomes the actor's mode guard — a context with no MLS group
+        // (Broadcast mode, `encrypted_crypto_mut` → CryptoFailed) rejects a
         // per-member sender-key removal.
         let mut actor = PerContextState::new_for_test_broadcast(
             make_context_id(),
@@ -1710,7 +1694,7 @@ mod tests {
     }
 
     // #2148 (ADR-049 birth-into-actor): `generate_sender_key_errors_without_context`
-    // was DELETED â the provider `generate_sender_key` method no longer exists
+    // was DELETED — the provider `generate_sender_key` method no longer exists
     // (the local sender key is minted inside the owned birth constructor).
 
     #[test]
@@ -1752,7 +1736,7 @@ mod tests {
     // tests (`distribute_sender_key_hpke_seals_when_wrapping_key_available`,
     // `distribute_sender_key_no_wrapping_key_still_stores_locally`,
     // `process_incoming_sender_key_roundtrip`,
-    // `drain_pending_sender_key_messages_clears_queue`) were DELETED â they drove
+    // `drain_pending_sender_key_messages_clears_queue`) were DELETED — they drove
     // the deleted provider `distribute_sender_key` / `add_member` / `contexts`.
     // The join-time sender-key PUSH round-trip is covered on the actor-owned state
     // by `golden_distribute_and_process_recover_identical_key` in
@@ -1776,7 +1760,7 @@ mod tests {
 
         // #2148: `process_incoming_sender_key` is a node-level HPKE-open +
         // authentication check that reads only the provider's node-resident
-        // wrapping keypair â it needs no per-context group resident.
+        // wrapping keypair — it needs no per-context group resident.
         let bob_provider = MlsCryptoProvider::new(
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
             Arc::new(SystemClock),
@@ -1822,7 +1806,7 @@ mod tests {
     fn export_crypto_state_returns_empty_for_unknown_context() {
         // Relocated onto the actor seam (ADR-049 PR-7): an Encrypted
         // `PerContextState` with no seeded MLS group is the actor-side analogue
-        // of a context the provider never created â its
+        // of a context the provider never created — its
         // `export_crypto_state` returns an empty blob (Ok, not an error).
         let unknown_ctx = [0xFFu8; 32];
         let state =
@@ -1841,7 +1825,7 @@ mod tests {
     // pinned the DELETED provider insert-path `restore_crypto_state`'s
     // empty-data-is-a-silent-`Ok(default)` behavior. The relocated restore
     // reader is the owned-return `build_restored_owned`, whose empty-snapshot
-    // contract is the OPPOSITE (a hard `CryptoFailed` error â the actor seed
+    // contract is the OPPOSITE (a hard `CryptoFailed` error — the actor seed
     // path must always yield material) and is pinned by
     // `build_restored_owned_rejects_empty_snapshot`. There is no surviving
     // insert-path no-op to test, so this test is intentionally not relocated.
@@ -1893,7 +1877,7 @@ mod tests {
         // Rebuild the owned material on a fresh provider via the RETAINED restore
         // reader (`build_restored_owned`), then seed an actor and verify the
         // round-trip is FUNCTIONAL (the seeded encrypted actor holds a live MLS
-        // group + sender key) and byte-faithful. The full sealâopen functional
+        // group + sender key) and byte-faithful. The full seal→open functional
         // round-trip across the restored group is pinned by
         // `context::actor::state`'s `golden_seal_open_cross_roundtrip` (which
         // seals from a restored, seeded actor state).
@@ -2059,7 +2043,7 @@ mod tests {
         );
         assert!(owned.mls_group.epoch().is_ok());
 
-        // (b) #2148: the material is handed OUT, never installed â the provider
+        // (b) #2148: the material is handed OUT, never installed — the provider
         // holds no per-context state (the `contexts` / `taken_context_ids` maps
         // are deleted), so there is nothing to assert residency on.
 
@@ -2089,7 +2073,7 @@ mod tests {
     // asserted that the DELETED insert path (`restore_crypto_state`) and the
     // owned-return path (`build_restored_owned`) reconstruct byte-identical
     // material + set-equal floors from one snapshot. With the insert path gone
-    // there is no second path to compare against â `build_restored_owned` is now
+    // there is no second path to compare against — `build_restored_owned` is now
     // the sole restore reader. Its full 8-field + both-floor-axes reconstruction
     // (with the anti-transposition checks the parity test carried) is pinned
     // directly by `build_restored_owned_returns_owned_material_without_insert`.
@@ -2097,7 +2081,7 @@ mod tests {
     /// ADR-049 PR-7 Prep D (SCP-CRYPTOMOVE-000d), D2 cold-restart replay:
     /// a legacy snapshot with NO per-sender epoch map must yield the legacy
     /// back-compat floor (`sender_key_epoch.max(1)` per installed sender) on the
-    /// owned restore reader â pinning that the owned seam does not weaken the D2
+    /// owned restore reader — pinning that the owned seam does not weaken the D2
     /// rollback floor. (The former insert-path counterpart, `restore_crypto_state`,
     /// is deleted; `build_restored_owned` is now the sole restore reader.)
     #[test]
@@ -2138,7 +2122,7 @@ mod tests {
     /// ADR-049 PR-7 Prep D (SCP-CRYPTOMOVE-000d): the owned path must always
     /// yield material, so an empty snapshot is an ERROR (unlike the legacy
     /// `restore_crypto_state`, whose empty-data no-op still returns
-    /// `Ok(default)` â see `restore_crypto_state_noop_on_empty_data`).
+    /// `Ok(default)` — see `restore_crypto_state_noop_on_empty_data`).
     #[test]
     fn build_restored_owned_rejects_empty_snapshot() {
         let provider = make_provider();
@@ -2155,18 +2139,18 @@ mod tests {
     /// Prep-D pass-through pin (ADR-049 PR-6): the floors that
     /// `export_crypto_state` now takes as parameters must land in the exported
     /// snapshot exactly as the provider's own `export_sender_key_epochs` /
-    /// `export_recv_sequence_floors` twins report them â the byte-preserving
+    /// `export_recv_sequence_floors` twins report them — the byte-preserving
     /// no-op that freezes the signature ahead of the atomic read-authority swap.
     ///
-    /// Whole-blob byte equality across an export â restore â export cycle is NOT
+    /// Whole-blob byte equality across an export → restore → export cycle is NOT
     /// a sound assertion: `mls_storage_entries` and `member_wrapping_keys`
     /// serialize from `HashMap` iteration, whose order is nondeterministic, so
     /// the blob's byte layout legitimately varies run to run (the existing
     /// `export_restore_crypto_state_roundtrip` test asserts field/functional
     /// equality, not bytes, for the same reason). This test instead pins the one
-    /// property Prep D actually changes â that the per-sender epoch floors and
+    /// property Prep D actually changes — that the per-sender epoch floors and
     /// the intra-epoch `(epoch, sequence)` floors are threaded from the twins
-    /// into the snapshot with no loss and no epoch/sequence transposition â by
+    /// into the snapshot with no loss and no epoch/sequence transposition — by
     /// deserializing the blob and comparing those fields, as order-insensitive
     /// sets, against the twin outputs.
     #[test]
@@ -2308,7 +2292,7 @@ mod tests {
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, restored) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
-        // The removed-member floor survives in RestoredFloors â¦
+        // The removed-member floor survives in RestoredFloors …
         assert!(
             restored
                 .sender_epochs
@@ -2317,7 +2301,7 @@ mod tests {
             "removed-member floor (9) must survive restart in RestoredFloors, got {:?}",
             restored.sender_epochs
         );
-        // â¦ and no key material reappears for the removed member.
+        // … and no key material reappears for the removed member.
         assert!(
             owned.sender_key_store.get(&ctx_id_hex, carol_did).is_none(),
             "removed key must not reappear after restore"
@@ -2367,7 +2351,7 @@ mod tests {
 
         // The legacy snapshot had no per-sender epoch map, so restore seeds every
         // sender WITH KEY MATERIAL from the global `sender_key_epoch` counter (7)
-        // as a conservative lower bound â RETURNED in RestoredFloors for the
+        // as a conservative lower bound — RETURNED in RestoredFloors for the
         // registry, closing the one-shot rollback window.
         assert!(
             restored
@@ -2497,7 +2481,7 @@ mod tests {
     fn export_fails_on_destroyed_group() {
         // Relocated onto the actor seam (ADR-049 PR-7): seed a live actor, confirm
         // it exports non-empty, then `destroy_mls_group` on the actor and confirm
-        // the export goes empty â destroying the group clears exportability.
+        // the export goes empty — destroying the group clears exportability.
         let provider = make_provider();
         let ctx_id = make_context_id();
 
@@ -2541,7 +2525,7 @@ mod tests {
 
         let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
 
-        // Rebuild the owned material on a fresh provider twice â the second call
+        // Rebuild the owned material on a fresh provider twice — the second call
         // must also yield working material (owned-return path, no insert to
         // clobber). Seed an actor from the second result and confirm it is a
         // coherent live encrypted state.
@@ -2609,7 +2593,7 @@ mod tests {
         let exported = actor_export(&provider, &ctx_id, Vec::new(), Vec::new()).unwrap();
         assert!(!exported.is_empty());
 
-        // Create a fresh provider (simulates restart â gets a NEW random keypair).
+        // Create a fresh provider (simulates restart — gets a NEW random keypair).
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let fresh_public = provider2.wrapping_keypair.load().public;
         assert_ne!(
@@ -2647,7 +2631,7 @@ mod tests {
     /// `open()`. Used by the H9 ceiling tests.
     /// String whose SHA-256 is the `context_id` returned by
     /// [`setup_alice_bob_two_party`]. The sender-layer AEAD AAD binds the raw
-    /// context-id string (Â§9.16.1), and both `seal` and `open` assert the
+    /// context-id string (§9.16.1), and both `seal` and `open` assert the
     /// supplied 32-byte id is `context_id_bytes(ctx_str)`, so the fixture must
     /// derive its id from a real string rather than an arbitrary 32-byte value.
     const TEST_CTX_STR: &str = "h9-ceiling-ctx";
@@ -2655,27 +2639,31 @@ mod tests {
     fn setup_alice_bob_two_party() -> (PerContextState, PerContextState, [u8; 32], String) {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-        // Stand up the joined pair over the REAL reserve â creator-add â sign â
-        // HPKE-seal â join path, born DIRECTLY onto actor-owned state via the
+        // Stand up the joined pair over the REAL reserve → creator-add → sign →
+        // HPKE-seal → join path, born DIRECTLY onto actor-owned state via the
         // #2148 owned-return constructors (no provider `take_crypto_state`
         // round-trip). The helper also pulls Alice's sender key to Bob, so Bob's
-        // installed sender-key epoch for Alice is 1 â the H9 high-water mark these
+        // installed sender-key epoch for Alice is 1 — the H9 high-water mark these
         // tests anchor on. The returned providers are unused here, so they are
         // discarded.
-        let (_alice_p, alice_state, _bob_p, bob_state, context_id) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(
-                TEST_CTX_STR,
-                alice_did,
-                bob_did,
-            );
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state,
+            bob_state,
+            ctx_bytes: context_id,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+            TEST_CTX_STR,
+            alice_did,
+            bob_did,
+        );
 
         (alice_state, bob_state, context_id, alice_did.to_string())
     }
 
     /// Build a minimal `InnerEnvelope` with a deterministic signing key.
     /// The actor seal/open seam (`PerContextState::open`) does not verify inner
-    /// signatures â signature verification is deferred to the receive/dispatch
-    /// path â so an arbitrary key suffices for the H9 receive-ceiling tests.
+    /// signatures — signature verification is deferred to the receive/dispatch
+    /// path — so an arbitrary key suffices for the H9 receive-ceiling tests.
     fn build_test_inner(
         context_id_str: &str,
         sender_did: &str,
@@ -2707,19 +2695,19 @@ mod tests {
 
     #[test]
     fn seal_open_binds_raw_context_id_string_not_hex() {
-        // Â§9.16.1: the sender-layer AEAD AAD MUST bind the RAW context_id
+        // §9.16.1: the sender-layer AEAD AAD MUST bind the RAW context_id
         // string (UTF-8, BE32 length-prefixed), NOT the hex encoding of its
         // 32-byte hash. This is the #1909 fix and the cross-implementation interop
         // contract. Proof: a `seal`ed message opens with the raw string but
         // FAILS to open when the hex-of-bytes string is supplied as the AAD
-        // source â the exact value native used to (incorrectly) bind.
+        // source — the exact value native used to (incorrectly) bind.
         let (mut alice_actor, mut bob_actor, ctx_id, alice_did) = setup_alice_bob_two_party();
         let routing_id = ctx_routing_id(&ctx_id);
 
         // Two independently-sealed messages. MLS forward secrecy deletes the
         // per-message decryption secret on the FIRST `open` of a given
         // ciphertext, so the negative and positive cases must each consume
-        // their own freshly-sealed blob â re-opening one blob twice would fail
+        // their own freshly-sealed blob — re-opening one blob twice would fail
         // at the MLS layer for an unrelated (forward-secrecy) reason.
         let inner1 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 0);
         let inner2 = build_test_inner(TEST_CTX_STR, &alice_did, 0, 1);
@@ -2733,25 +2721,25 @@ mod tests {
         // Negative: opening with the hex-of-bytes string supplies a
         // `context_id_str` of `hex(ctx_id)` instead of the raw `TEST_CTX_STR`
         // the message was sealed under. The OLD (spec-violating) native code
-        // bound `hex(ctx_id)` as the AAD; the Â§9.16.1 fix binds the RAW string,
+        // bound `hex(ctx_id)` as the AAD; the §9.16.1 fix binds the RAW string,
         // so reconstructing the AAD from `hex(ctx_id)` yields a DIFFERENT AAD
-        // and the sender-layer AEAD authentication fails â proving the bound
+        // and the sender-layer AEAD authentication fails — proving the bound
         // value is the raw string, not the hex.
         //
         // ADR-056 note: `hex(ctx_id)` is a canonical 64-hex string, so the
         // top-of-`open` resolve-consistency guard (`context_id_to_bytes`)
-        // now resolves it back to `ctx_id` and PASSES â `hex(digest)` IS the
+        // now resolves it back to `ctx_id` and PASSES — `hex(digest)` IS the
         // canonical id-string form of `digest`. The rejection therefore comes
         // from the AEAD layer (the AAD mismatch), one layer deeper than the
         // pre-ADR-056 hash-consistency guard, but it still proves the same
-        // Â§9.16.1 contract: the AAD binds the raw string, not its hex. The
+        // §9.16.1 contract: the AAD binds the raw string, not its hex. The
         // dedicated guard-rejection path is covered by
         // `open_rejects_context_id_str_that_does_not_resolve_to_context_id`.
         let hex_ctx = hex::encode(ctx_id);
         bob_actor
             .open(&SystemClock, &hex_ctx, &sealed_neg)
             .expect_err(
-                "opening with hex(ctx_id) as the AAD source must fail â the message was sealed \
+                "opening with hex(ctx_id) as the AAD source must fail — the message was sealed \
              under the RAW context_id string, so the rebuilt AAD does not authenticate",
             );
 
@@ -2774,7 +2762,7 @@ mod tests {
         // 32-byte `context_id` is `context_id_to_bytes(context_id_str)`
         // (ADR-056) and fails CLOSED if they diverge. This guard fires at the
         // very top of `open`, BEFORE any outer-envelope deserialization, MLS
-        // decrypt, or sender-layer AEAD work â so the rejection is the fast-path
+        // decrypt, or sender-layer AEAD work — so the rejection is the fast-path
         // resolve-consistency error, distinct from an AEAD authentication
         // failure.
         let (_alice_actor, mut bob_actor, ctx_id, _alice_did) = setup_alice_bob_two_party();
@@ -2793,7 +2781,7 @@ mod tests {
         // The outer bytes are deliberately garbage: the guard must reject the
         // mismatched id/string pair BEFORE it ever attempts to deserialize or
         // decrypt them. If the guard did not fire first, this call would
-        // instead surface an "outer envelope deserialization" error â proving
+        // instead surface an "outer envelope deserialization" error — proving
         // by its absence that the fail-fast assert ran ahead of the AEAD layer.
         let bogus_outer = [0xABu8; 64];
         let err = bob_actor
@@ -2821,7 +2809,7 @@ mod tests {
         // `context_id` keying argument, and fails CLOSED if they diverge. This
         // guard fires at the very top of `seal`'s `with_context` closure,
         // BEFORE any inner-envelope serialization, sender-layer AEAD, or MLS
-        // encrypt work â so the rejection is the fast-path resolve-consistency
+        // encrypt work — so the rejection is the fast-path resolve-consistency
         // error, not a downstream crypto failure.
         let (mut alice_actor, _bob_actor, ctx_id, alice_did) = setup_alice_bob_two_party();
         let routing_id = ctx_routing_id(&ctx_id);
@@ -2861,24 +2849,24 @@ mod tests {
     // `with_context_distinguishes_never_created_from_taken`,
     // `taken_context_write_paths_fail_closed`) were DELETED. They tested the
     // provider's `contexts` / `taken_context_ids` / `take_crypto_state` /
-    // `with_context` mechanics, all of which are deleted â the provider holds no
+    // `with_context` mechanics, all of which are deleted — the provider holds no
     // per-context state, so there is no residency, take, or overwrite guard to
     // assert. The sole double-birth authority is now the supervisor registry's
     // atomic first-writer-wins insert.
 
     // -----------------------------------------------------------------------
-    // Â§9.10.4 privacy: app-data outer-envelope routing_id is zeroed.
+    // §9.10.4 privacy: app-data outer-envelope routing_id is zeroed.
     //
     // App-data sends seal ONE blob and fan it out to N per-member pseudonym
     // transport addresses. If the cleartext outer-envelope `routing_id` field
     // embedded the relay-derivable `context_routing_id`, a curious relay could
     // read it off every pseudonym-addressed app-data blob and re-correlate all
-    // senders â defeating the pseudonym scheme. The production helper
+    // senders — defeating the pseudonym scheme. The production helper
     // `build_encrypted_envelope` therefore zeroes that field for app-data.
     // Control messages (recovery / sender-key dist) legitimately keep
     // `context_routing_id` because their inner field == their transport address
     // (the shared bootstrap channel every member subscribes to), so there is no
-    // leak â those sites are guarded below.
+    // leak — those sites are guarded below.
     // -----------------------------------------------------------------------
 
     fn app_data_recipients(
@@ -2908,17 +2896,21 @@ mod tests {
         // `context_id_bytes(ctx_str)`. The helper pulls Alice's sender key to Bob
         // so Bob can decrypt Alice's app-data sends. The returned providers are
         // unused here, so they are discarded.
-        let (_alice_p, alice_state, _bob_p, bob_state, context_id) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(
-                ctx_str, alice_did, bob_did,
-            );
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state,
+            bob_state,
+            ctx_bytes: context_id,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+            ctx_str, alice_did, bob_did,
+        );
 
         (alice_state, bob_state, context_id, alice_did.to_string())
     }
 
     /// The cleartext outer-envelope `routing_id` produced by
     /// `build_encrypted_envelope` for application data is the 32-byte zero
-    /// sentinel â NOT the relay-derivable `context_routing_id`. A relay
+    /// sentinel — NOT the relay-derivable `context_routing_id`. A relay
     /// deserializing the single envelope layer therefore reads no shared
     /// correlator off a pseudonym-addressed app-data blob.
     #[test]
@@ -2933,7 +2925,7 @@ mod tests {
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
         // `build_encrypted_envelope_actor` is the production app-data seal that
-        // zeroes the outer routing_id (Â§9.10.4), driven on Alice's owned actor
+        // zeroes the outer routing_id (§9.10.4), driven on Alice's owned actor
         // state.
         let wire = crate::context::messaging_helpers::build_encrypted_envelope_actor(
             &clock,
@@ -3014,8 +3006,8 @@ mod tests {
     }
 
     /// Control-path guard: a control message (Recovery type) sealed with
-    /// `context_routing_id` â exactly as the recovery / sender-key dist sites
-    /// do â STILL embeds `context_routing_id` in its inner envelope. This is
+    /// `context_routing_id` — exactly as the recovery / sender-key dist sites
+    /// do — STILL embeds `context_routing_id` in its inner envelope. This is
     /// correct: for control traffic the inner field equals the transport
     /// address (the shared bootstrap channel every member subscribes to), so
     /// there is no relay correlator leak. The guard proves `seal` faithfully
@@ -3025,7 +3017,7 @@ mod tests {
     #[test]
     fn control_message_seal_still_embeds_context_routing_id() {
         // The context id must be derived from a real string: `seal` binds the
-        // raw `inner.context_id` into the AEAD AAD (Â§9.16.1) and asserts the
+        // raw `inner.context_id` into the AEAD AAD (§9.16.1) and asserts the
         // supplied 32-byte id is its SHA-256, so a hex-of-bytes inner id (which
         // is not the preimage of `ctx_id`) would be rejected.
         let ctx_str = "ctx-control-routing-id";
@@ -3066,7 +3058,7 @@ mod tests {
         assert_ne!(
             decoded.routing_id,
             vec![0u8; 32],
-            "control routing_id must NOT be zeroed â that would break the shared channel"
+            "control routing_id must NOT be zeroed — that would break the shared channel"
         );
     }
 
@@ -3099,7 +3091,7 @@ mod tests {
     /// The production creator write path
     /// ([`MlsCryptoProvider::create_mls_group_with_context`]) commits the
     /// `scp_context_params` (`0xFF02`) extension into the group's
-    /// `group_context`, byte-identical to the parameters supplied (Â§5.13.3,
+    /// `group_context`, byte-identical to the parameters supplied (§5.13.3,
     /// FFI-02).
     #[test]
     fn create_mls_group_with_context_commits_extension() {
@@ -3123,14 +3115,14 @@ mod tests {
             "created context group must carry the committed ScpContextExtension"
         );
     }
-    // #2148 (ADR-049 birth-into-actor): DELETED provider-mechanic tests â
+    // #2148 (ADR-049 birth-into-actor): DELETED provider-mechanic tests —
     // `create_mls_group_has_no_context_extension` (bare `create_mls_group` gone),
     // `create_mls_group_with_context_refuses_overwrite` (owned birth reserves no
-    // slot, so there is no overwrite guard â the supervisor registry is the sole
+    // slot, so there is no overwrite guard — the supervisor registry is the sole
     // double-birth authority), and the additive owned-vs-insert byte-parity
     // suite (`create_mls_group_with_context_owned_matches_insert_path`,
     // `install_joined_group_owned_matches_insert_path`,
-    // `build_restored_owned_is_side_effect_free_on_contexts_map`) â the insert
+    // `build_restored_owned_is_side_effect_free_on_contexts_map`) — the insert
     // path they compared against is deleted, so there is no second path to
     // compare. The surviving owned constructors' determinism is exercised by the
     // migrated birth/restore tests above and the actor `golden_*` suite.

@@ -1764,9 +1764,15 @@ pub async fn create_context(
     // above BIRTHS the MLS group + local sender key as OWNED material (Encrypted
     // mode only) and RETURNS it — no provider map is touched, so there is no
     // insert-then-`take_crypto_state` round-trip and no cross-map check-then-insert
-    // to race (#2167 TOCTOU is impossible by construction; the supervisor registry's
-    // atomic check-then-insert is the sole double-birth guard). SEED the owned
-    // crypto onto the actor's `PerContextState` BEFORE the actor spawns — structurally
+    // to race (#2167 TOCTOU is impossible by construction). Deleting the provider's
+    // `contexts`/`taken_context_ids` maps removes ONE redundant guard; it does NOT
+    // make the registry write-lock insert the sole double-birth authority. The
+    // durable double-birth / divergence authority is the global `bootstrap_spawn_lock`
+    // (serializes all births node-wide) together with the supervisor's Precheck A
+    // (live-actor) + Precheck D (durable first-writer-wins), which run UNDER that
+    // lock; the registry write-lock insert at spawn guards only the in-memory
+    // registry slot. SEED the owned crypto onto the actor's `PerContextState`
+    // BEFORE the actor spawns — structurally
     // identical to the restore seam, leaving NO window where a live actor holds an
     // empty group. The send-sequence counter starts fresh at 0 for a newly-born
     // group (`OwnedMlsCryptoState::send_sequence == 0`), which `from_persisted`
@@ -1924,8 +1930,9 @@ fn generate_initial_access_key_store(
 /// `ContextError::CryptoFailed` (from `From<FloorAdvanceError>`, the §23.17
 /// replay-protection rejection the registry's `validate_and_merge_*` sink
 /// returns) if a per-sender floor regresses (import path) or overshoots (both
-/// paths); the just-built owned crypto is dropped (zeroizes) on rejection and the
-/// registry is left unchanged (atomic).
+/// paths); the just-built owned crypto is dropped on rejection (the `SenderKey`
+/// zeroizes; the `ScpMlsGroup` / Ed25519 signer is freed, not zeroized - #82) and
+/// the registry is left unchanged (atomic).
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
     ctx_id_bytes: &[u8; 32],
@@ -1991,12 +1998,13 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // rejection to `ContextError::CryptoFailed`.
     //
     // Rollback: on rejection the just-built `owned` material is dropped at the `?`
-    // return (its `ScpMlsGroup` / `SenderKey` zeroize on drop) so no
-    // floor-regressed / half-restored state persists (BUG-1 atomicity). The
-    // registry itself is left UNCHANGED (validate-before-apply, across both axes).
-    // The `taken_context_ids` marker set by `build_restored_owned` is intentionally
-    // LEFT in place (fail-closed — a rejected restore must NOT resurrect a
-    // divergent second group for this id).
+    // return (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
+    // zeroized - #82) so no floor-regressed / half-restored state persists (BUG-1
+    // atomicity). The registry itself is left UNCHANGED (validate-before-apply,
+    // across both axes). Fail-closed by construction: a rejected restore is never
+    // seeded onto an actor and writes no durable snapshot, so it cannot resurrect a
+    // divergent second group for this id (there is no provider `taken_context_ids`
+    // marker; #2148 deleted it, and `build_restored_owned` sets none).
     deps.supervisor
         .validate_and_merge_all_floors(
             ctx_id_bytes,
@@ -2323,7 +2331,8 @@ pub async fn import_context(
     // `context_params` field against the MLS group embedded in `mls_crypto_state`;
     // this closes that gap. A group with no `0xFF02` (not an SCP context) or any
     // rule 2-6 mismatch is rejected as a forged/corrupt import; the owned material
-    // is dropped (zeroizes) so no forged crypto is ever seeded (mirrors the
+    // is dropped (the `SenderKey` zeroizes; the group / signer is freed, not
+    // zeroized - #82) so no forged crypto is ever seeded (mirrors the
     // restore path's own rejection and the Welcome-join pre-install rejection). A
     // keyless (needs-reconnect) snapshot has `None` owned material and no group to
     // bind, so it is skipped — its group arrives later via a reconnect Welcome,
@@ -2340,11 +2349,13 @@ pub async fn import_context(
             "context import",
         )
     {
-        // On rejection the `imported_owned` material is dropped here (its
-        // `ScpMlsGroup` / `SenderKey` zeroize on drop) so no forged crypto is
-        // seeded; the `taken_context_ids` marker stays (fail-closed). Read the
-        // extension from the OWNED group (ADR-049 PR-7 C3 — no longer
-        // provider-resident).
+        // On rejection the `imported_owned` material is dropped here (the
+        // `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not zeroized -
+        // #82) so no forged crypto is seeded; fail-closed by construction - the
+        // rejected crypto is never seeded onto the actor and no durable snapshot is
+        // written (there is no longer a provider `taken_context_ids` marker; #2148
+        // deleted it). Read the extension from the OWNED group (ADR-049 PR-7 C3 - no
+        // longer provider-resident).
         return Err(ContextError::ImportRejected { reason });
     }
 
@@ -2703,9 +2714,11 @@ pub async fn import_context(
     // 6b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 import seed: SEED the OWNED crypto
     //     material rebuilt + floor-gated + binding-verified above directly onto
     //     the imported actor state before spawn — no provider round-trip, no
-    //     `take_crypto_state` (`build_restored_owned` already recorded
-    //     `taken_context_ids`, the CM-006 double-owner guard, without touching the
-    //     provider `contexts` map). A keyless / needs-reconnect snapshot yielded
+    //     `take_crypto_state` (`build_restored_owned` hands the crypto out as
+    //     OWNED material and touches no provider map; the double-birth guard is the
+    //     supervisor registry's atomic first-writer-wins insert, not a provider
+    //     `taken_context_ids` marker - #2148 deleted that map). A keyless /
+    //     needs-reconnect snapshot yielded
     //     `None` — nothing to seed; the actor keeps its default-empty encrypted
     //     mode until a reconnect Welcome arrives. (Import is encrypted-only — a
     //     broadcast export is rejected at the top of this function.)
@@ -3028,10 +3041,11 @@ pub async fn restore_context(
         // routes the cold-restart (empty-registry) floors through the SAME sink,
         // closing the D2 replay window on first boot. FAIL-CLOSED via
         // `.map_err(..)?`. On rejection the just-built `owned` material is dropped
-        // here (its `ScpMlsGroup` / `SenderKey` zeroize on drop); the
-        // `taken_context_ids` marker set by `build_restored_owned` is intentionally
-        // LEFT in place (fail-closed — a rejected restore is torn down as
-        // unrecoverable and the id must NOT resurrect a divergent second group).
+        // here (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
+        // zeroized - #82); fail-closed by construction - a rejected restore is never
+        // seeded and writes no durable snapshot, so the id cannot resurrect a
+        // divergent second group. #2148 deleted the provider `taken_context_ids`
+        // marker this comment referenced, and `build_restored_owned` sets none.
         deps.supervisor
             .validate_and_merge_all_floors(
                 &ctx_id_bytes,
@@ -3052,9 +3066,10 @@ pub async fn restore_context(
         // holds on load: a restored group that is not a `0xFF02`-carrying SCP
         // context, or whose committed params diverge, is a corrupt snapshot and
         // is rejected. Read the extension from the OWNED group (it is no longer
-        // provider-resident). On rejection the `owned` material is dropped
-        // (zeroizes) and the taken marker stays (fail-closed) so no divergent
-        // crypto is ever seeded.
+        // provider-resident). On rejection the `owned` material is dropped (the
+        // `SenderKey` zeroizes; the group / signer is freed, not zeroized - #82);
+        // fail-closed by construction - the rejected crypto is never seeded, so no
+        // divergent crypto persists (no provider taken-marker exists post-#2148).
         if let Err(reason) = verify_scp_context_binding(
             owned
                 .mls_group

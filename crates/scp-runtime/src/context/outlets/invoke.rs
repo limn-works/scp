@@ -8763,7 +8763,7 @@ mod tests {
         #[test]
         fn ac10_seal_for_a_preserves_operator_sig() {
             use crate::context::actor::state::PerContextState;
-            use crate::crypto::mls::two_party_test_support::stand_up_two_party;
+            use crate::crypto::mls::two_party_test_support::{TwoPartyPair, stand_up_two_party};
             use crate::envelope::inner::sign::create_inner_envelope_raw;
             use crate::envelope::inner::{
                 InnerEnvelopeParams, MessageType, SCP_INNER_ENVELOPE_VERSION,
@@ -8779,8 +8779,12 @@ mod tests {
             // state via the #2148 owned-return constructors (no provider
             // `take_crypto_state` round-trip) — the actor seal/open seam every
             // other two-party crypto test now drives.
-            let (_alice_p, mut alice_a, _bob_p, mut bob_a, a_ctx_bytes) =
-                stand_up_two_party(a_ctx_str, alice_did, bob_did);
+            let TwoPartyPair {
+                alice_state: mut alice_a,
+                bob_state: mut bob_a,
+                ctx_bytes: a_ctx_bytes,
+                ..
+            } = stand_up_two_party(a_ctx_str, alice_did, bob_did);
             let routing_id = a_ctx_bytes.to_vec();
 
             let chunk = operator_signed_chunk();

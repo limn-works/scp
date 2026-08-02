@@ -153,6 +153,11 @@ fn context_crypto_state_default_exhaustive_field_witness() {
         nonce_dedup,
         member_wrapping_keys,
         recv_sequence_tracker,
+        // The `#[cfg(any(test, feature = "testing"))]` `force_rotation_failure`
+        // fault-injection seam is `pub(crate)` — inaccessible from this
+        // integration-test crate. The in-lib exhaustive witness
+        // (`context_crypto_state_default_populates_every_field`) covers it.
+        ..
     } = c;
 
     // MLS group and sender key default to `None` per ADR-049 actor

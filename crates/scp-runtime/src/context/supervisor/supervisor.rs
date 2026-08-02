@@ -4539,6 +4539,14 @@ impl Supervisor {
             // leak the loser's spawned task and diverge crypto state.
             let _guard = self.write_lock.lock().await;
             if self.actors.contains_key(&ctx_id_str) {
+                // Losing duplicate birth: this `state` never becomes a live
+                // actor, so dispose its seeded crypto (#2148 F6) — `destroy_group`
+                // eagerly frees the group (the OpenMLS signer is freed, NOT
+                // zeroized — #82). `state` drops on the very next line regardless,
+                // so this is defense-in-depth / forward-compat with #82, matching
+                // the close-seam teardown. A no-op for a broadcast /
+                // never-seeded state.
+                state.dispose_secrets();
                 return Err(ContextError::CreationFailed(format!(
                     "context '{ctx_id_str}' is already registered"
                 )));
@@ -5236,8 +5244,9 @@ impl Supervisor {
     /// [`Self::spawn_actor_from_welcome`] materialized after the irreversible
     /// KeyPackage consume: it drops the actor handle (whose owned
     /// `PerContextState` holds the MLS crypto — #2148 birth-into-actor — so the
-    /// group + sender key ZEROIZE when the actor task ends) AND deletes the
-    /// persisted Class-S snapshot (`delete_context`).
+    /// sender key ZEROIZES and the group/signer is FREED (not zeroized — #82)
+    /// when the actor task ends) AND deletes the persisted Class-S snapshot
+    /// (`delete_context`).
     ///
     /// The FFI bridges call this as the compensating teardown when a
     /// post-irreversible-commit join step fails (e.g. a concurrent close/leave
@@ -5268,7 +5277,8 @@ impl Supervisor {
         //    the joiner's MLS crypto is OWNED by the actor's `PerContextState`
         //    (born owned at the WELCOME seam, never provider-resident), so
         //    dropping the actor handle closes its mailbox — the actor task ends
-        //    and its state drops, ZEROIZING the group + sender key. There is no
+        //    and its state drops: the sender key ZEROIZES (`ZeroizeOnDrop`) and
+        //    the group/signer is FREED (not zeroized — #82). There is no
         //    provider map to also destroy (the deleted `destroy_mls_group` arm).
         let removed = self.actors.remove(context_id).is_some();
         let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
@@ -5282,7 +5292,9 @@ impl Supervisor {
         }
         // 3. Drop the authoritative Class-M floor registry entry (ADR-049). A
         //    discarded welcome-join is permanently gone (its actor-owned crypto
-        //    zeroized on the handle drop above, its durable snapshot deleted), so
+        //    freed on the handle drop above — `SenderKey`s zeroize, the MLS
+        //    group/signer is freed but not zeroized (#82); its durable snapshot
+        //    deleted), so
         //    the floors are moot and pruning is sound; see
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
         //    transient safety argument.
@@ -10480,7 +10492,9 @@ impl Supervisor {
     /// local cleanup only).
     ///
     /// Destroys per-context sender keys + MLS groups + event logs in
-    /// that order (zeroize secrets before tearing down structure),
+    /// that order (release secrets before tearing down structure;
+    /// `SenderKey`s zeroize, the MLS group/signer is freed — not
+    /// zeroized, #82),
     /// removes the contexts from the supervisor's registry, clears the
     /// standing-context tracking + local-DID registry + per-identity
     /// wrapping keys, and aborts background tasks (TTL timers,
@@ -13741,8 +13755,11 @@ impl Supervisor {
                     //     persists NO snapshot, and registers NO actor; the only spent
                     //     cost is the already-burned single-use KeyPackage (the same
                     //     accepted cost as any post-consume failure). The rejected
-                    //     `joined_group` is dropped here (zeroizing its key material)
-                    //     with nothing half-installed to roll back. Passing verifies
+                    //     `joined_group` is dropped here, which FREES its key material
+                    //     (MlsGroup secrets + Ed25519 signer `Vec<u8>` + MemoryStorage)
+                    //     but does NOT zeroize the signer (upstream #82); disposing
+                    //     explicitly here would be inert since it drops immediately —
+                    //     nothing half-installed to roll back. Passing verifies
                     //     that `build_welcome_joiner_state` below only ever builds
                     //     authority the group itself attests. A group with no `0xFF02`
                     //     (not an SCP context) or any rule 2-6 mismatch is refused
@@ -13767,17 +13784,31 @@ impl Supervisor {
                     //    TOCTOU is impossible by construction). The crypto is held in the
                     //    local `owned` binding until it is seeded onto `state` at 2b; a
                     //    failure on any early-return between here and the spawn DROPS it
-                    //    (zeroizing the `ScpMlsGroup` / `SenderKey`). The supervisor
-                    //    registry's atomic first-writer-wins check-then-insert (under
-                    //    `write_lock`, at step 5's `spawn_actor_with_state`) is the SOLE
-                    //    and sufficient double-birth guard.
-                    let owned = deps.crypto.install_joined_group(joined_group);
+                    //    with `state` (the `SenderKey` zeroizes via `ZeroizeOnDrop`; the
+                    //    `ScpMlsGroup`'s signer is FREED — never zeroized — on both the
+                    //    bare drop and the explicit `dispose_secrets`/`destroy_group`
+                    //    rollback branches, since `SignatureKeyPair` has no `Zeroize`, #82).
+                    //    Double-birth / durable-divergence is guarded by the whole
+                    //    entrypoint running under the global `bootstrap_spawn_lock`
+                    //    together with Precheck A (live-actor) + Precheck D (durable
+                    //    first-writer-wins); the registry write-lock insert at step 5
+                    //    guards only the in-memory registry slot, NOT durability (this
+                    //    path PERSISTS at step 4, BEFORE it registers at step 5 — see
+                    //    step 5's note).
+                    let mut owned = deps.crypto.install_joined_group(joined_group);
 
                     // 3. Build the Welcome-derived PerContextState (EMPTY encrypted mode).
-                    //    On any failure, `owned` drops here (zeroizing the joined group);
-                    //    nothing is provider-resident and no durable snapshot exists yet,
-                    //    so there is nothing to tear down.
-                    let mut state = Self::build_welcome_joiner_state(
+                    //    On failure, dispose `owned` FIRST (#2148 F6) — it is the live
+                    //    owner of the born crypto here (not yet seeded onto `state`). A
+                    //    bare drop already frees the joined group's in-memory storage and
+                    //    the Ed25519 signer's `Vec<u8>`; `dispose_secrets`
+                    //    (`destroy_group`) frees the same material eagerly (signer freed,
+                    //    NOT zeroized — #82; the `SenderKey` zeroizes on its own drop).
+                    //    On this branch `owned` drops immediately after, so the dispose is
+                    //    defense-in-depth / forward-compat. Nothing is provider-resident
+                    //    and no durable snapshot exists yet, so there is nothing else to
+                    //    tear down.
+                    let mut state = match Self::build_welcome_joiner_state(
                         &deps,
                         &context_id,
                         &params,
@@ -13785,7 +13816,13 @@ impl Supervisor {
                         &owning_did,
                         local_pseudonym,
                         joined_epoch,
-                    )?;
+                    ) {
+                        Ok(state) => state,
+                        Err(e) => {
+                            owned.dispose_secrets();
+                            return Err(e);
+                        }
+                    };
 
                     // 2b. SEED the owned crypto onto the actor `state`.
                     //     `build_welcome_joiner_state` deliberately built an EMPTY
@@ -13795,7 +13832,8 @@ impl Supervisor {
                     //     SOLE crypto authority — the durability check (3b) and the
                     //     fail-closed persist (4) read the export off `state`. Every
                     //     early-return below now DROPS the seeded crypto with `state`
-                    //     (zeroizing), so no provider teardown is needed and a retry
+                    //     (the `SenderKey` zeroizes; the MLS group/signer is freed, not
+                    //     zeroized — #82), so no provider teardown is needed and a retry
                     //     re-drives a fresh Welcome.
                     state.seed_encrypted_crypto_from_owned(owned);
 
@@ -13813,10 +13851,19 @@ impl Supervisor {
                     //     documented to stand up (§9(b)) could receive but never send.
                     //     `state.handle` and this `handle` clone share one
                     //     `Arc<ArcSwap<ContextState>>`, so the actor's own handle observes
-                    //     `Active` too. On a transition failure the seeded `state`
-                    //     (owning the crypto) drops on the early return — zeroizing the
-                    //     group + sender key; nothing is persisted or registered yet.
-                    handle.transition_to(&scp_protocol::context::ContextState::Active)?;
+                    //     `Active` too. On a transition failure dispose the seeded `state`
+                    //     FIRST (#2148 F6): `state` owns the born crypto here.
+                    //     `dispose_secrets` (`destroy_group`) eagerly frees the group NOW;
+                    //     the signer is freed, NOT zeroized (#82) — same as the bare drop
+                    //     that follows this early return (the `SenderKey` zeroizes on its
+                    //     own drop), so this is defense-in-depth. Nothing is persisted or
+                    //     registered yet.
+                    if let Err(e) =
+                        handle.transition_to(&scp_protocol::context::ContextState::Active)
+                    {
+                        state.dispose_secrets();
+                        return Err(e);
+                    }
 
                     // 3b. Entrypoint-level crypto durability check — BEFORE the persist
                     //     (BLACK-2J-03 / crypto L2 / simplifier). `build_snapshot_for_persist`
@@ -13830,10 +13877,14 @@ impl Supervisor {
                     //     export is DETERMINISTIC between the seed above and here (no mutation
                     //     in between), so re-reading the live export tells us exactly what a
                     //     snapshot WOULD carry. Check it here, BEFORE persisting: on a
-                    //     non-durable export the seeded `state` drops on the early return
-                    //     (zeroizing the crypto) — nothing has been persisted yet, so there
-                    //     is no durable snapshot to delete (strictly cleaner than
-                    //     persist-then-delete, same fail-closed guarantee).
+                    //     non-durable export dispose the seeded `state` FIRST (#2148 F6) —
+                    //     `state` owns the born crypto. `dispose_secrets` (`destroy_group`)
+                    //     eagerly frees the group NOW; the signer is freed, NOT zeroized
+                    //     (#82) — same as the bare drop that follows this early return (the
+                    //     `SenderKey` zeroizes on its own drop), so this is defense-in-depth.
+                    //     Nothing has been persisted yet, so there is no durable snapshot to
+                    //     delete (strictly cleaner than persist-then-delete, same
+                    //     fail-closed guarantee).
                     // ADR-049 PR-6 (read-authority switch): floors sourced from
                     // the AUTHORITATIVE Supervisor-owned Class-M registry
                     // (`deps.supervisor.export_*`) and threaded into
@@ -13872,6 +13923,7 @@ impl Supervisor {
                             ),
                         )
                     {
+                        state.dispose_secrets();
                         return Err(ContextError::PersistenceFailed(format!(
                             "spawn-from-Welcome: the joined group for '{context_id}' produces no \
                          durable MLS crypto export (export failed / needs_reconnect) — a \
@@ -13885,8 +13937,10 @@ impl Supervisor {
                     //    (`build_snapshot_for_persist` reads `state.export_crypto_state`),
                     //    so a crash after this point rehydrates a fully-keyed context. A
                     //    persist failure deletes any partial durable snapshot and returns
-                    //    `Err`; the seeded `state` (owning the crypto) drops on the early
-                    //    return (zeroizing) — never a live half-keyed actor and never an
+                    //    `Err`; before the early return, dispose the seeded `state`'s
+                    //    crypto (#2148 F6) — `destroy_group` eagerly frees the group (the
+                    //    OpenMLS signer is freed, NOT zeroized — #82; same as the bare drop
+                    //    that follows) — never a live half-keyed actor and never an
                     //    orphaned/clobbered durable snapshot.
                     if let Err(e) = crate::context::messaging_helpers::persist_state_fail_closed(
                         &state,
@@ -13895,6 +13949,7 @@ impl Supervisor {
                     )
                     .await
                     {
+                        state.dispose_secrets();
                         let _ = deps.persistence.delete_context(&context_id).await;
                         return Err(e);
                     }
@@ -13902,15 +13957,25 @@ impl Supervisor {
                     // 5. Spawn the owned-state actor + register its send handle. On failure
                     //    (e.g. a racing duplicate registration) delete the durable snapshot
                     //    so no orphaned durable state survives the `Err`; `spawn_actor_with_state`
-                    //    consumes `state`, so on its `Err` return the seeded crypto is dropped
-                    //    (zeroizing) — it never returns to any provider. This atomic first-writer-wins
-                    //    registration (under `write_lock`) is the SOLE double-birth guard —
-                    //    the deleted provider `taken_context_ids` / `Entry::Vacant` guard was a
-                    //    redundant re-check of this same property (#2167 subsumed). Drop any
-                    //    stale crash-window state for this id FIRST (under `bootstrap_spawn_lock`,
-                    //    mirroring the create / import / standing bootstraps): a
-                    //    previously-poisoned+despawned same-id context must not leave the
-                    //    freshly-spawned joiner actor inheriting a sticky poison window.
+                    //    consumes `state`, and its dup-registration reject arm disposes the
+                    //    seeded crypto (eager free; signer freed, not zeroized — #82) before
+                    //    dropping it — it never returns to any provider. IMPORTANT: this path PERSISTS at
+                    //    step 4 BEFORE it registers here, so durable double-birth correctness
+                    //    rests on the whole entrypoint running under the global
+                    //    `bootstrap_spawn_lock` with Precheck A (live-actor) + Precheck D
+                    //    (durable first-writer-wins) rejecting a duplicate BEFORE the step-4
+                    //    persist — NOT on this step-5 write-lock insert, which guards only the
+                    //    in-memory registry slot. (The deleted provider `taken_context_ids` /
+                    //    `Entry::Vacant` guard was a redundant re-check of the durable
+                    //    property those prechecks own; #2167 subsumed.) The persist-before-
+                    //    register order (step 4 then step 5) is deliberate and durability-safe
+                    //    under `bootstrap_spawn_lock` + Precheck A/D; it must NOT be reordered
+                    //    (a persist-after-register would open a crash window that loses the
+                    //    context). Drop any stale crash-window state
+                    //    for this id FIRST (under `bootstrap_spawn_lock`, mirroring the
+                    //    create / import / standing bootstraps): a previously-poisoned+despawned
+                    //    same-id context must not leave the freshly-spawned joiner actor
+                    //    inheriting a sticky poison window.
                     self.reset_crash_window(&context_id);
                     let owned_deps = deps.clone_for_spawn();
                     if let Err(e) = self.spawn_actor_with_state(state, owned_deps, None).await {
@@ -13927,8 +13992,14 @@ impl Supervisor {
                 Err(_elapsed) => {
                     // Timeout elapsed while the global `bootstrap_spawn_lock` was held.
                     // The timed future is CANCELLED at the elapse, dropping any in-flight
-                    // seeded `state` (and with it the owned crypto — zeroizing); there is
-                    // no provider-resident crypto to tear down (#2148 birth-into-actor).
+                    // seeded `state` (and with it the owned crypto). This outer arm cannot
+                    // reach into the cancelled future to `dispose_secrets`, so the born
+                    // crypto is bare-dropped here: the `SenderKey` zeroizes on drop, but
+                    // the OpenMLS Ed25519 signer's secret bytes linger un-zeroized in the
+                    // freed group storage until overwritten — an accepted best-effort gap
+                    // on this rare cancellation path, identical to a crash's residency
+                    // (#2148 F6; scp-mls #82: `SignatureKeyPair` has no `Zeroize`). There
+                    // is no provider-resident crypto to tear down (#2148 birth-into-actor).
                     // Delete any persisted snapshot: an idempotent `let _ =` no-op when the
                     // elapse landed before step 4 ran, so it is safe regardless of how far
                     // the timed region progressed — no orphaned durable snapshot survives.
@@ -21291,7 +21362,8 @@ mod tests {
         );
 
         // #2148 (ADR-049 birth-into-actor): rollback = the owned material is
-        // dropped (zeroized) on the Err path and never seeded onto an actor. The
+        // dropped on the Err path (the `SenderKey` zeroizes; the MLS group/signer
+        // is freed, not zeroized — #82) and never seeded onto an actor. The
         // provider holds NO per-context state (the `contexts` map and the
         // `context_crypto_present` residency probe are deleted), so there is no
         // provider residency to assert — the floor-registry state above is the
@@ -21475,8 +21547,13 @@ mod tests {
         // Real two-party join, born DIRECTLY onto actor-owned state: Bob's actor
         // holds the group + Alice's pulled sender key at epoch 1, Alice's actor
         // owns her group + sender key.
-        let (_alice_crypto, mut alice_actor, bob_crypto, mut bob_actor, ctx_bytes) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
         // Wrap Bob's provider in a fresh Supervisor (empty registry) and build his
         // production ActorDeps. App-data delivery never touches the provider's
@@ -21609,8 +21686,13 @@ mod tests {
         const BOB: &str = "did:dht:z6MkBobCatchUpBobCatchUpBobCatchUpBob12";
         let ctx_str = "e2e-decrypt-and-dispatch-catch-up";
 
-        let (_alice_crypto, mut alice_actor, bob_crypto, mut bob_actor, ctx_bytes) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
         // Alice rotates her sender key (epoch 1 → 2) on her owned actor state and
         // redistributes it to Bob, who installs it on HIS owned actor state via
@@ -21718,8 +21800,11 @@ mod tests {
 
         // Real two-party join, born directly onto actor-owned state: Alice's
         // actor owns the joined MLS group + her sender key.
-        let (alice_crypto, mut alice_state, _bob_crypto, _bob_actor, _ctx_bytes) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider: alice_crypto,
+            mut alice_state,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
         let alice_sup = supervisor_with_crypto(Arc::clone(&alice_crypto));
         let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives async dispatch from a sync #[test]; not a production async bridge
@@ -21807,8 +21892,13 @@ mod tests {
         const CHARLIE: &str = "did:dht:z6MkCharliePullCharliePullCharliePul12";
         let ctx_str = "sender-key-pull-receive-path";
 
-        let (alice_crypto, mut alice_actor, _bob_crypto, mut bob_actor, ctx_bytes) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider: alice_crypto,
+            alice_state: mut alice_actor,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
         let ctx_hex = hex::encode(ctx_bytes);
         let routing_id = scp_protocol::context::context_routing_id(ctx_str).to_vec();
 

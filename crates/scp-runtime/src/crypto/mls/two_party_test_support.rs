@@ -30,11 +30,12 @@
 //! fixtures and the app-data / agent-binding pipeline fixtures depend on.
 //!
 //! The helper is SYNC (its callers are sync `#[test]` functions) and drives the
-//! async join on an internal current-thread runtime. It returns
-//! `(alice_provider, alice_state, bob_provider, bob_state, ctx_bytes)`: each
-//! [`PerContextState`] already OWNS its per-context crypto (seeded from the
-//! owned constructor), and each `Arc<MlsCryptoProvider>` is retained solely for
-//! its node-resident wrapping keypair.
+//! async join on an internal current-thread runtime. It returns a
+//! [`TwoPartyPair`] (named fields `alice_provider` / `alice_state` /
+//! `bob_provider` / `bob_state` / `ctx_bytes`): each [`PerContextState`] already
+//! OWNS its per-context crypto (seeded from the owned constructor), and each
+//! `Arc<MlsCryptoProvider>` is retained solely for its node-resident wrapping
+//! keypair.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // `spawn_actor_from_welcome` returns a deliberately large state-building future;
@@ -198,17 +199,33 @@ fn encrypted_crypto_mut(state: &mut PerContextState) -> &mut ContextCryptoState 
     }
 }
 
+/// Result of [`stand_up_two_party`]: a fully-joined Alice(creator)/Bob(joiner)
+/// pair, each party's per-context crypto born onto its OWN actor-owned
+/// [`PerContextState`], plus the shared 32-byte context id (#2148 F12 —
+/// replaces the former positional 5-tuple return).
+pub struct TwoPartyPair {
+    /// Alice's provider, retained solely for its node-resident wrapping keypair.
+    pub alice_provider: Arc<MlsCryptoProvider>,
+    /// Alice's actor state (OWNS her group + sender key).
+    pub alice_state: PerContextState,
+    /// Bob's provider, retained solely for its node-resident wrapping keypair.
+    pub bob_provider: Arc<MlsCryptoProvider>,
+    /// Bob's actor state (OWNS his group + Alice's pulled sender key at epoch 1).
+    pub bob_state: PerContextState,
+    /// The shared context id, `context_id_bytes(ctx_str)`.
+    pub ctx_bytes: [u8; 32],
+}
+
 /// Stands up a two-party joined pair (Alice creator, Bob joiner) over the REAL
 /// reserve → creator-add → `ConfirmConsume` join path, born DIRECTLY onto
 /// actor-owned [`PerContextState`] via the owned-return constructors + the
 /// production `seed_encrypted_crypto_from_owned` primitive, then has Bob PULL
 /// Alice's sender key via the §9.16.2 request/response protocol answered through
 /// the ACTOR-native [`ContextCryptoState::handle_sender_key_request`] (Bob's
-/// installed sender-key for Alice becomes epoch 1). Returns
-/// `(alice_provider, alice_state, bob_provider, bob_state, ctx_bytes)` where each
-/// [`PerContextState`] OWNS the per-context crypto for the group keyed by
-/// `context_id_bytes(ctx_str)` and each provider is retained solely for its
-/// node-resident wrapping keypair.
+/// installed sender-key for Alice becomes epoch 1). Returns a [`TwoPartyPair`]
+/// where each [`PerContextState`] OWNS the per-context crypto for the group
+/// keyed by `context_id_bytes(ctx_str)` and each provider is retained solely for
+/// its node-resident wrapping keypair.
 ///
 /// # Panics
 ///
@@ -222,17 +239,7 @@ fn encrypted_crypto_mut(state: &mut PerContextState) -> &mut ContextCryptoState 
 // confirm-join → owned-birth bob → §9.16.2 pull) driven end to end; splitting it
 // would obscure the linear join narrative, so allow the length.
 #[allow(clippy::too_many_lines)]
-pub fn stand_up_two_party(
-    ctx_str: &str,
-    alice_did: &str,
-    bob_did: &str,
-) -> (
-    Arc<MlsCryptoProvider>,
-    PerContextState,
-    Arc<MlsCryptoProvider>,
-    PerContextState,
-    [u8; 32],
-) {
+pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoPartyPair {
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_str);
 
     tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only two-party fixture drives async MLS provider calls from sync #[test] callers; not a production async bridge
@@ -389,6 +396,12 @@ pub fn stand_up_two_party(
             // actor state, independent of the supervisor and runtime.
             drop(bob_sup);
 
-            (alice_crypto, alice_state, bob_crypto, bob_state, ctx_bytes)
+            TwoPartyPair {
+                alice_provider: alice_crypto,
+                alice_state,
+                bob_provider: bob_crypto,
+                bob_state,
+                ctx_bytes,
+            }
         })
 }

@@ -891,9 +891,14 @@ pub async fn finalize_close(
 
     // #2148 (ADR-049 birth-into-actor): now that the close transition has landed,
     // dispose the ACTOR-owned MLS crypto for Ephemeral/Summary scope (the provider
-    // holds none). `dispose_secrets` runs OpenMLS `destroy_group` — deleting the
-    // epoch secrets a bare drop would leave resident — then zeroizes the sender
-    // key material. Full scope retains keys (readable after close), so it is
+    // holds none). Each `ScpMlsGroup` owns its own in-memory `InMemoryMlsProvider`,
+    // freed when `PerContextState` drops — but a closed actor STAYS registered (its
+    // `state` is NOT dropped here), so without an explicit dispose the crypto would
+    // linger live. `dispose_secrets` runs OpenMLS `destroy_group`, which eagerly
+    // frees the group NOW; the Ed25519 signer is freed, NOT zeroized
+    // (`SignatureKeyPair` has no `Zeroize`, scp-mls #82) — same as a bare drop,
+    // just eager; the sender key zeroizes on its own drop. Full scope retains keys
+    // (readable after close), so it is
     // skipped. A broadcast context carries no `ContextCryptoState`
     // (`crypto_mut() == None`), a clean no-op there.
     let memory_scope = handle.params().memory_scope;
@@ -911,12 +916,17 @@ pub async fn finalize_close(
     let _ = deps.persistence.delete_context(&context_id).await;
 
     // Prune the authoritative Class-M floor registry entry (ADR-049):
-    // an explicit close is a PERMANENT teardown — the FSM is terminally `Closed`
-    // (anti-resurrection refuses re-create of a terminal id) and the durable
-    // Class-S snapshot was just deleted — so the registry floors are moot and
-    // must be dropped, mirroring the provider's per-context floor-map prune
-    // inside `destroy_mls_group` (which `ttl::finalize_close` ran above for
-    // Ephemeral/Summary scope) and co-located with the snapshot delete. Pruned
+    // an explicit close is a PERMANENT teardown. While this closed actor stays
+    // REGISTERED, Precheck A (live-actor) blocks any resurrection of this id; the
+    // durable Class-S snapshot is deleted just below (Ephemeral/Summary are
+    // non-durable by design). There is therefore no terminal on-disk marker to
+    // refuse against once the snapshot is gone — if this closed actor later
+    // despawns/crashes the id becomes free to re-create, which is acceptable
+    // here (a locally-driven, non-durable close, not a remote exploit). So the
+    // registry floors are moot and must be dropped, mirroring the per-context
+    // floor teardown inside `dispose_secrets`/`destroy_group` (which
+    // `ttl::finalize_close` ran above for Ephemeral/Summary scope) and
+    // co-located with the snapshot delete. Pruned
     // regardless of memory scope: a `Closed` context accepts no further inbound,
     // so the floors serve no purpose even when Full-scope crypto is retained.
     // See `Supervisor::remove_context_floors` for the permanent-vs-transient
