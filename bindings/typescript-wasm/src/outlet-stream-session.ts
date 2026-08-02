@@ -266,7 +266,7 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
    * live-consumer claim so a fresh session can be constructed on it, and
    * best-effort zeroizes the in-tab signing-seed copy. Idempotent — safe to call
    * from every terminal path, from {@link close}, from the async-iterator
-   * {@link return}, and from `Symbol.asyncDispose`.
+   * {@link return}, and from the `using` / `await using` disposal hooks.
    */
   #markClosed(): void {
     if (this.#closed) {
@@ -302,8 +302,24 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
     return { done: true, value: undefined };
   }
 
-  /** `using`/`await using` disposal hook — releases the claim + zeroizes the seed. */
-  [Symbol.asyncDispose](): void {
+  /**
+   * `await using` disposal hook — releases the `(client, contextId)` claim when
+   * the enclosing block exits. MUST return a `PromiseLike` (`async`) or `await
+   * using session = new BrowserInvokerStreamSession(...)` fails to type-check
+   * (TS2851). The work is synchronous and idempotent; the `async` is only to
+   * satisfy the `AsyncDisposable` contract.
+   */
+  async [Symbol.asyncDispose](): Promise<void> {
+    this.#markClosed();
+  }
+
+  /**
+   * `using` disposal hook — releases the `(client, contextId)` claim when the
+   * enclosing block exits. Synchronous counterpart of {@link Symbol.asyncDispose}
+   * so a plain `using session = new BrowserInvokerStreamSession(...)` works too;
+   * both defer to the idempotent {@link close}.
+   */
+  [Symbol.dispose](): void {
     this.#markClosed();
   }
 
