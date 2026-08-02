@@ -827,7 +827,7 @@ QUERY {
 
 **Properties:**
 
-- **No protocol changes.** PUBLISH and QUERY are existing relay operations. DID documents are stored and retrieved like any other blob. Relays require no awareness that a blob contains a DID document. SCPR framing (§9.10.12) is a client-side payload convention, not a relay behavior — the relay stores the frame bytes opaquely.
+- **No relay protocol changes; one SDK-side addition.** PUBLISH and QUERY are existing relay operations, and the relay stores and retrieves a DID document like any other opaque blob — it needs no awareness that a blob contains a DID document. What Model A adds is entirely client-side: the SDK transport adapter gains a **public-record raw-blob path** (`publish_raw` / `query_raw`, §9.10.12) distinct from its `OuterEnvelope` message path, because a raw SCPR blob is not an `OuterEnvelope` and cannot ride the `OuterEnvelope`-typed `send` / `query` path. SCPR framing (§9.10.12) is a client-side payload convention, not a relay behavior — the relay stores the frame bytes opaquely.
 - **Self-verifying blob payload.** The DID relay blob is an SCPR kind-1 frame (§9.10.12) carrying the BEP44 `(value, signature, seq)` triple, not the bare document bytes. Because the signature and sequence travel inside the blob, a resolver verifies the record from the blob alone — no DHT round-trip is required to obtain the signature.
 - **Relay-agnostic.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for suppression resistance.
 - **Size budget.** DID documents range from 2-30KB depending on attestation count and service endpoint list. The relay blob size limit is 256KB (ADR-004). Well within bounds.
@@ -852,7 +852,9 @@ The full resolution sequence:
 1. Compute did_routing_id = SHA-256("scp:did:" || did_string)
 2. Extract public_key from DID string (z-base-32 decode per did:dht spec)
 3. In parallel:
-   a. QUERY did_routing_id on known SCP relays
+   a. QUERY did_routing_id on known SCP relays via the SDK public-record
+      raw-blob path (query_raw, §9.10.12 — the relay returns raw SCPR
+      blobs, not OuterEnvelopes)
       (identity's published relays if known, else bootstrap relays from §18.5.1)
    b. DhtClient.resolve(public_key) on Mainline DHT
 4. For each response, obtain the (value, signature, seq) triple:
@@ -860,7 +862,9 @@ The full resolution sequence:
       (value, signature, seq). DHT response: the triple is native.
       Framing bytes are unsigned and MUST NOT be trusted — only the
       triple is used.
-   b. Verify BEP44 signature over (value, seq) against public_key
+   b. Verify the BEP44 signature over the BEP44-canonical bencoded buffer
+      bencode(salt?, seq, value) — seq before value, per BEP44 (BitTorrent
+      BEP 44 is authoritative for this ordering) — against public_key
    c. Verify seq >= last_known_seq for this DID
 5. Accept the valid response with highest sequence number
 6. Cache result per §9.10.7 caching policy
@@ -879,7 +883,7 @@ The parallel query model (step 3) requires clear rules for when queries are canc
 - **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
 - **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
 - **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
-- **Relay blob fails SCPR decoding.** A relay blob that does not decode as a valid SCPR kind-1 frame (§9.10.12) — truncated, wrong magic, wrong/reserved kind, or an inconsistent `value_len` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed; the resolver falls through to the other layer exactly as for an invalid signature.
+- **Relay blob fails SCPR decoding.** A relay blob that does not decode as a valid SCPR kind-1 frame (§9.10.12) — truncated, carrying trailing bytes, wrong magic, unrecognized version, wrong/unrecognized kind, or a `value_len` that fails the exact-length check (`total_frame_len == 82 + value_len`) — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other layer exactly as for an invalid signature.
 - **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
 
 ### 3.10.5 Publishing Protocol
@@ -889,13 +893,17 @@ Identity owners publish to both layers on every DID document create or update:
 ```
 On DID document create or update:
 1. Serialize DID document
-2. Sign via BEP44 (Ed25519 signature over bencoded value concatenated with
-   sequence number, per BEP44 spec)
+2. Sign via BEP44 (Ed25519 signature over the BEP44-canonical bencoded buffer
+   bencode(salt?, seq, value) — the sequence number precedes the value,
+   `3:seqi<seq>e1:v<value>`, per the BEP44 spec, which is authoritative for
+   this ordering; did:dht uses no salt)
 3. In parallel:
    a. Wrap (value, signature, seq) in an SCPR kind-1 frame (§9.10.12) and
-      PUBLISH the frame bytes to SCP relays (own relays + bootstrap relays),
-      blob_ttl: 604800. The SCPR wrapper is around `value` for transport
-      only — it is NEVER part of the bencoded signed bytes.
+      PUBLISH the frame bytes to SCP relays (own relays + bootstrap relays)
+      via the SDK public-record raw-blob path (publish_raw, §9.10.12 — a raw
+      blob, NOT wrapped in an OuterEnvelope), blob_ttl: 604800. The SCPR
+      wrapper is around `value` for transport only — it is NEVER part of the
+      bencoded signed bytes.
    b. DhtClient.publish(public_key, signature, doc_bytes, seq) to Mainline DHT
 4. RepublishManager schedules:
    - Relay republishing: every 6 days (blob_ttl is 7 days, 1-day margin)

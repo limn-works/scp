@@ -154,7 +154,7 @@ With no runtime nullifier gate there is no `allow_in_memory_*` feature to name, 
 **Unit 3 (live SCP-CAPSEL fixes + completeness).**
 9. **Slice 9 — E2 credentials (SCP-CAPINJECT-009).** `FfiCredentialStore` enum seam + durable backend + **delete `impl Default` (live fix)**; InMemory → test-harness-only.
 10. **Slice 10 — E3 blob (SCP-CAPINJECT-010).** **Delete `impl Default for BlobStorageBackend` (live fix)**; require the arm at init.
-11. **Slice 11 — E4 relay querier (SCP-CAPINJECT-011).** Implement the real `MultiRelayQuerier` per §3.10.12; `NoOpRelayQuerier` → test-harness-only. Also brings a `DhtMode::Disabled` node's relay-resolution path online (§Non-goals D-B).
+11. **Slice 11 — E4 relay querier (SCP-CAPINJECT-011).** Implement the real `MultiRelayQuerier` per §3.10.12; demote only the test double `InMemoryRelayQuerier` to test-harness-only — `NoOpRelayQuerier` stays a shipped production arm (the honest not-a-DID-source case, §10.4). Also brings a `DhtMode::Disabled` node's relay-resolution path online (§Non-goals D-B).
 
 **Out of scope (RFC #2130 / #1729 / #1777): pre-rotation custody realization** — the `PreRotationCustodyProvider` seam, per-profile KMS/HSM + encrypted-offline floors, §5/§6 ceremony, native + Python/TS hardware backends, and the ADR-054 §4 hardware-wrap amendment. Not slices of this ADR.
 
