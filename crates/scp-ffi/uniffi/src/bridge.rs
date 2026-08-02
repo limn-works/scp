@@ -18926,6 +18926,23 @@ impl Scp {
                     .await;
                 }
 
+                // Post-commit discovery registration (mirrors
+                // `context_join_from_welcome`): an imported context must be
+                // discoverable just like a created one. The import path is
+                // ENCRYPTED-only (broadcast exports are rejected upstream with
+                // SCP-CTX-2092), so the routing id is unconditionally the
+                // importer's derived §9.10.4 pseudonym — no broadcast fallback.
+                // `relay_url` is `None` (the connected relay lives on the
+                // caller-held `TransportManager` handle, not the bridge
+                // instance). Infallible + idempotent, so it needs no rollback.
+                let known = scp_ffi_common::bridge_instance::KnownContext {
+                    routing_id: local_pseudonym,
+                    relay_url: None,
+                    member_did: identity.did.clone(),
+                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                };
+                bi.core.register_known_context(&context_id, known);
+
                 Ok(context_id)
             })
             .await
