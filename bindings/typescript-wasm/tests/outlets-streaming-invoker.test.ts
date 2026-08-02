@@ -454,6 +454,66 @@ test("a wrong-key chunk driven THROUGH the session rejects with SCP-OUTLET-6110 
   operator.closeContext(CTX);
 });
 
+test("a wrong-key chunk sharing ONE #ingestFrame with a prior VALID chunk clears #pending (SCP-OUTLET-6110, never yields the buffered chunk)", async () => {
+  const { invoker, operator, relay, invokerInbound } = await buildPair();
+  const CTX = FIX.contextId;
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+
+  // The discriminating multi-chunk-single-frame case the single-chunk-per-frame
+  // 6110 test above CANNOT exercise: there #pending is already empty at the
+  // throw, so the `#pending.length = 0` clear is a no-op. Here a VALID chunk
+  // (seq 0) is buffered in #pending FIRST, then a wrong-key chunk fails verify
+  // in the SAME #ingestFrame drain — so the clear is load-bearing.
+  //
+  // A single #ingestFrame processes every event `drainEvents` returns. To batch
+  // two chunks into ONE ingest we pre-decrypt the VALID frame into the client's
+  // per-context buffer, then let the session's own ingest decrypt the wrong-key
+  // frame: that ingest's single `drainEvents()` then yields BOTH the pre-buffered
+  // valid chunk and the freshly-decrypted wrong-key chunk, in FIFO order.
+  operator.sendMessage(CTX, hexToBytes(FIX.chunks[0]?.wireHex ?? ""));
+  operator.sendMessage(CTX, hexToBytes(FIX.wrongKeyChunkWireHex));
+  relay.pump();
+  const frames = invokerInbound.splice(0);
+  expect(frames).toHaveLength(2);
+  const [validFrame, wrongKeyFrame] = frames as [Uint8Array, Uint8Array];
+
+  // Pre-decrypt the VALID frame so its MessageReceived event is buffered FIRST
+  // (FIFO). The session's ingest of the wrong-key frame then drains BOTH in one
+  // batch — the valid chunk is pushed to #pending, then the wrong-key chunk
+  // fails verify in the same loop.
+  invoker.handleRelayFrame(validFrame);
+
+  const chunkFrames: Uint8Array[] = [wrongKeyFrame];
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => chunkFrames.shift() ?? null,
+  };
+  const session = new BrowserInvokerStreamSession(
+    sessionOpts(invoker, coordinator, caveatsBinding),
+  );
+
+  const seen: number[] = [];
+  let thrown: unknown;
+  try {
+    for await (const chunk of session) {
+      seen.push(chunk.sequence);
+    }
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(OutletError);
+  expect((thrown as OutletError).code).toBe("SCP-OUTLET-6110");
+  // The valid seq-0 chunk was in #pending when the wrong-key chunk in the SAME
+  // ingest failed verify: it was NEVER yielded (seen stays empty), and the
+  // #pending clear means a subsequent pull returns done, not the buffered chunk.
+  expect(seen).toEqual([]);
+  expect(await session.next()).toEqual({ done: true, value: undefined });
+
+  invoker.closeContext(CTX);
+  operator.closeContext(CTX);
+});
+
 test("a second live session on the same (client, context) is refused (SCP-VALID-7028)", async () => {
   const { invoker, operator } = await buildPair();
   const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
