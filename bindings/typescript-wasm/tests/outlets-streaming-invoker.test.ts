@@ -34,6 +34,7 @@ import {
   OutletError,
   outletStreamComputeCaveatsBinding,
   outletStreamComputeCreditPreimage,
+  outletStreamSignCredit,
   outletStreamVerifyChunkSignature,
   ScpBrowserClient,
   type SenderKeyDistribution,
@@ -404,6 +405,42 @@ test("grantCredit requires a validated Credit — a bad grant throws InvalidGran
   expect(() => new Credit(3.5)).toThrow(InvalidGrant);
   expect(() => new Credit(2 ** 32)).toThrow(InvalidGrant);
   expect(new Credit(4).value).toBe(4);
+});
+
+test("the raw credit predicates reject an out-of-range grant (InvalidGrant) before touching wasm", () => {
+  const requestId = hexToBytes(FIX.requestIdHex);
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+  const seed = hexToBytes(FIX.invokerSeedHex);
+  const epoch = BigInt(FIX.streamEpoch);
+
+  // wasm-bindgen would silently coerce these into a `u32`; the wrapper guard
+  // rejects them up front with the uniform InvalidGrant, matching the branded
+  // `Credit` bound the session's grantCredit enforces.
+  for (const bad of [0, -1, 3.5, 2 ** 32]) {
+    expect(() =>
+      outletStreamSignCredit({
+        signingKeySeed: seed,
+        contextId: FIX.contextId,
+        outletId: FIX.outletId,
+        requestId,
+        grant: bad,
+        monotonicSeq: 0n,
+        streamEpoch: epoch,
+        caveatsBinding,
+      }),
+    ).toThrow(InvalidGrant);
+    expect(() =>
+      outletStreamComputeCreditPreimage({
+        contextId: FIX.contextId,
+        outletId: FIX.outletId,
+        requestId,
+        grant: bad,
+        monotonicSeq: 0n,
+        streamEpoch: epoch,
+        caveatsBinding,
+      }),
+    ).toThrow(InvalidGrant);
+  }
 });
 
 test("a chunk signed by a non-operator key is rejected on-device", async () => {

@@ -15,7 +15,7 @@ import {
   WebSocketRelaySocket,
   type WebSocketRelaySocketOptions,
 } from "./adapters/websocket-relay-socket";
-import { mapBridgeError, type ScpError, ValidationError } from "./errors";
+import { InvalidGrant, mapBridgeError, type ScpError, ValidationError } from "./errors";
 import type {
   AddMemberOutput,
   ContextStatus,
@@ -597,6 +597,20 @@ export interface OutletStreamCreditPreimageParams {
 }
 
 /**
+ * Fail-fast guard for the raw `grant` predicate parameter: a non-zero `u32`,
+ * i.e. an integer in `[1, 2**32)`. wasm-bindgen would otherwise SILENTLY coerce
+ * an out-of-range / non-integer JS number into a `u32` (truncating or wrapping),
+ * so this rejects it up front with the uniform {@link InvalidGrant} — giving the
+ * lower-level `scp-protocol` seam parity with the branded `Credit` surface the
+ * session's `grantCredit` enforces.
+ */
+function assertGrantU32(grant: number): void {
+  if (typeof grant !== "number" || !Number.isInteger(grant) || grant < 1 || grant >= 2 ** 32) {
+    throw new InvalidGrant(`grant must be a non-zero u32 in [1, 2**32), got ${String(grant)}`);
+  }
+}
+
+/**
  * Signs an outlet-stream **credit grant** with the invoker's Ed25519 signing key
  * IN-TAB (§5.4.5, `SCP-OUTLET-CREDIT-V1`). Returns the JSON-serialized
  * `OutletStreamCredit` (`request_id` ‖ `grant` ‖ `monotonic_seq` ‖ `sig`) — the
@@ -606,6 +620,8 @@ export interface OutletStreamCreditPreimageParams {
  * `signingKeySeed` is the invoker's 32-byte outlet-signing seed, held on-device.
  * `grant` is a `u32`; `monotonicSeq` and `streamEpoch` are `u64` → `bigint`.
  *
+ * @throws {InvalidGrant} if `grant` is not a non-zero `u32` (integer in
+ *   `[1, 2**32)`) — parity with the session's branded `Credit` surface.
  * @throws {ValidationError} `SCP-VALID-7010` if `signingKeySeed` is not 32 bytes,
  *   `requestId` is not 16 bytes, or `caveatsBinding` is not 32 bytes.
  */
@@ -621,6 +637,7 @@ export function outletStreamSignCredit(params: OutletStreamSignCreditParams): Ui
     streamEpoch,
     caveatsBinding,
   } = params;
+  assertGrantU32(grant);
   return call(() =>
     wasmSignCredit(
       signingKeySeed,
@@ -642,6 +659,8 @@ export function outletStreamSignCredit(params: OutletStreamSignCreditParams): Ui
  * check a credit's `sig` under the invoker's public key. `grant` is a `u32`;
  * `monotonicSeq` and `streamEpoch` are `u64` → `bigint`.
  *
+ * @throws {InvalidGrant} if `grant` is not a non-zero `u32` (integer in
+ *   `[1, 2**32)`) — parity with the session's branded `Credit` surface.
  * @throws {ValidationError} `SCP-VALID-7010` if `requestId` is not 16 bytes or
  *   `caveatsBinding` is not 32 bytes.
  */
@@ -651,6 +670,7 @@ export function outletStreamComputeCreditPreimage(
   assertInitialized();
   const { contextId, outletId, requestId, grant, monotonicSeq, streamEpoch, caveatsBinding } =
     params;
+  assertGrantU32(grant);
   return call(() =>
     wasmComputeCreditPreimage(
       contextId,
