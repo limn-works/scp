@@ -275,17 +275,30 @@ async fn handle_leave_context_actor(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: String,
-    params: scp_protocol::context::params::ContextParams,
+    _params: scp_protocol::context::params::ContextParams,
     caller_did: scp_did::DID,
     member_did: scp_did::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
+    // Drive the leave through a CLONE of the actor's own `cell.handle`,
+    // NOT a freshly-constructed `ContextHandle::new(...)`. `ContextHandle`
+    // holds its lifecycle state in a lock-free `Arc<ArcSwap<ContextState>>`,
+    // so a clone SHARES the interior cell. When `leave_context` calls
+    // `handle.transition_to(&ContextState::Closing)` (for the last-member
+    // case where should_close is true), that transition lands on the SHARED
+    // cell and `cell.handle.state()` then observes `Closing` — making the
+    // context replaceable at the `import_context` replaceability gate.
+    //
+    // A separate `ContextHandle::new` owns its OWN fresh `Arc`, so the
+    // Closing transition lands on a throwaway cell and `cell.handle` stays
+    // `Active` forever — which makes a subsequent import reject with
+    // "context already exists" (the gate sees a live context). The same
+    // bug was present on `CloseContext` and fixed by cloning (see the
+    // comment on `handle_close_context_actor`).
+    //
+    // The payload `_params` is unused: `cell.handle` already carries the
+    // authoritative creation-time params.
+    let handle = cell.handle.clone();
 
     let leave_fut = crate::context::lifecycle_helpers::leave_context(
         cell,
