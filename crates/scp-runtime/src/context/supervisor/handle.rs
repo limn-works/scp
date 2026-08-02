@@ -989,12 +989,12 @@ mod tests {
     #[tokio::test]
     async fn my_key_package_store_returns_registered_handle() {
         use crate::context::supervisor::key_package_actor::KeyPackageStoreDeps;
-        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use crate::crypto::mls::provider::NodeMlsFactory;
         use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
 
         let (sup, handle) = test_handle();
         let did = DID("did:dht:z6MkAliceKpStore".to_owned());
-        let crypto = Arc::new(MlsCryptoProvider::new(
+        let crypto = Arc::new(NodeMlsFactory::new(
             did.0.clone(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

@@ -38,5 +38,5 @@ pub mod storage_adapter;
 #[cfg(test)]
 pub(crate) mod two_party_test_support;
 
-pub use provider::MlsCryptoProvider;
+pub use provider::NodeMlsFactory;
 pub use storage::{MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider};

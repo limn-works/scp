@@ -39,7 +39,7 @@ pub mod crypto {
         };
         // Node-only async durable-storage bridge from scp-runtime.
         pub use scp_runtime::crypto::mls::{
-            MlsCryptoProvider, MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider, backend,
+            MlsStorageBridge, MlsStorageBridgeError, NodeMlsFactory, ScpMlsProvider, backend,
             production_backend, provider, storage, storage_adapter,
         };
     }

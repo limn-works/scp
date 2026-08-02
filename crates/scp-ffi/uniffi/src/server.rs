@@ -125,7 +125,7 @@ impl From<BroadcastKeyError> for ScpError {
 /// node startup.
 ///
 /// Connects to the node's local relay (with bearer token authentication)
-/// and initializes the `ContextManager` with `MlsCryptoProvider` and
+/// and initializes the `ContextManager` with `NodeMlsFactory` and
 /// `RelayTransportProvider` so that context operations (create, join, send)
 /// work immediately. If the `ContextManager` was already initialized
 /// (e.g., by a prior `configure_relay_transport` or `context_create` call),

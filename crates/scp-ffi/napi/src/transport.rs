@@ -414,7 +414,7 @@ pub(crate) async fn transport_disconnect_on(
 /// encrypt → sign → send pipeline.
 ///
 /// The `local_did` parameter is used as the MLS credential identity for the
-/// `MlsCryptoProvider`. Pass any valid `did:dht:` string (typically the
+/// `NodeMlsFactory`. Pass any valid `did:dht:` string (typically the
 /// DID of the first identity you plan to create).
 ///
 /// # Errors

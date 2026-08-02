@@ -52,7 +52,7 @@ use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportPro
 use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
 use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
 use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers
@@ -172,7 +172,7 @@ fn new_manager() -> std::sync::Arc<Supervisor> {
     // passthrough methods (`is_member`, `list_proposals`, etc.) that
     // forward to the per-domain `*_helpers`.
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),
@@ -486,7 +486,7 @@ async fn ac4_majority_propose_approve_execute() {
 fn new_manager_with_real_event_log() -> std::sync::Arc<Supervisor> {
     use scp_runtime::context::providers::MerkleEventLogProvider;
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

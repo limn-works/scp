@@ -523,7 +523,7 @@ pub async fn recovery_notify_contact(
 /// `manager_methods::persist_context_snapshot` but reads fields off
 /// the actor's `PerContextState` rather than the legacy lock-shaped
 /// type. The MLS crypto state export still goes through the
-/// supervisor-scoped `MlsCryptoProvider` (matches the legacy path);
+/// supervisor-scoped `NodeMlsFactory` (matches the legacy path);
 /// this collapses into `state.mode` after the MLS provider dissolution
 /// in a later Phase 2 sub-chunk.
 fn persist_state_best_effort<'d, 'c>(

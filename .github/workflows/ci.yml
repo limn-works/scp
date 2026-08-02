@@ -583,7 +583,7 @@ jobs:
   # Exercises the napi bridge in its PRODUCTION configuration: default features
   # (`server` on) but WITHOUT `testing` / `scp-core/testing` /
   # `scp-runtime/testing`. This is the config the feature-free context-export
-  # tests target — `MlsCryptoProvider::validate_creator_identity` only accepts
+  # tests target — `NodeMlsFactory::validate_creator_identity` only accepts
   # `did:dht:z*` identities here (no `did:test:` / `did:key:` test gate), so a
   # callback-shaped custody signer must round-trip and fail-closed for real.
   # Without this lane the production/bare napi test target could silently

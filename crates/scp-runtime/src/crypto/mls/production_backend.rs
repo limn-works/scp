@@ -7,10 +7,10 @@
 //! [`ProductionMlsBackend`] is a stateless struct that delegates every
 //! primitive to the existing [`scp_mls::group`], [`scp_mls::encrypt`], and
 //! [`scp_mls::ratchet`] free functions — the same `OpenMLS` primitives the
-//! pre-refactor `MlsCryptoProvider` calls. This guarantees byte-identical
+//! pre-refactor `NodeMlsFactory` calls. This guarantees byte-identical
 //! output for equivalent inputs (see the unit test suite below), which is a
 //! hard requirement of the commit 4 plan: later commits replace
-//! `MlsCryptoProvider` with handler functions that call this trait, and the
+//! `NodeMlsFactory` with handler functions that call this trait, and the
 //! migration MUST NOT perturb wire bytes.
 //!
 //! # Signer-state serialization
@@ -59,7 +59,7 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 /// Production `MlsBackend` backed by `OpenMLS`.
 ///
 /// Stateless on the wire-primitive surface — every MLS primitive delegates to
-/// the same free-function family the pre-refactor `MlsCryptoProvider` uses,
+/// the same free-function family the pre-refactor `NodeMlsFactory` uses,
 /// preserving byte-identical output through the trait split. The owned state is
 /// the durable consumed-init-key set (`consumed_init_key_store`), a crypto-layer
 /// single-use backstop attached once after construction via
@@ -68,7 +68,7 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 ///
 /// # Why the store is attached after construction (not a constructor arg)
 ///
-/// The backend is built inside `MlsCryptoProvider::new` / `with_backends`,
+/// The backend is built inside `NodeMlsFactory::new` / `with_backends`,
 /// which run BEFORE the supervisor exists and therefore before the
 /// supervisor-owned `mls_storage` is available — the provider (carrying this
 /// backend) is passed INTO `Supervisor::with_providers`, which only then has
@@ -105,7 +105,7 @@ pub struct ProductionMlsBackend {
     /// Injected hardened [`Clock`] used to stamp `KeyPackage` / group-leaf
     /// `Lifetime`s on generation and to re-validate accepted `Lifetime`s on the
     /// receive/add paths (ADR-057 §Prereq-1). In production this is the SAME
-    /// `Arc` the owning `MlsCryptoProvider` and the actor-deps clock share, so
+    /// `Arc` the owning `NodeMlsFactory` and the actor-deps clock share, so
     /// there is one hardened clock per node — never openmls's internal one.
     clock: Arc<dyn Clock>,
     /// Durable consumed-init-key set. `None` until
@@ -335,7 +335,7 @@ impl MlsBackend for ProductionMlsBackend {
         wrapping_pubkey: Option<&[u8; 32]>,
     ) -> Result<ScpMlsGroup, MlsError> {
         // Delegate to the free function; byte-identical to
-        // `MlsCryptoProvider::create_mls_group` (which also calls the same
+        // `NodeMlsFactory::create_mls_group` (which also calls the same
         // primitive). The creator's own leaf `Lifetime` is stamped from the
         // injected hardened clock (ADR-057 §Prereq-1).
         group::create_group_with_wrapping_key(credential, wrapping_pubkey, self.clock.as_ref())
@@ -446,7 +446,7 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         wrapping_pubkey: Option<&[u8; 32]>,
     ) -> Result<Vec<u8>, MlsError> {
-        // Match the existing `MlsCryptoProvider::advance_epoch` semantics:
+        // Match the existing `NodeMlsFactory::advance_epoch` semantics:
         // the pre-refactor code defaulted the wrapping key to zero-bytes
         // when the provider had not yet generated one (rare but possible
         // during test flows). Mirror that behaviour byte-for-byte.
@@ -710,12 +710,12 @@ fn assert_groups_equivalent(left: &ScpMlsGroup, right: &ScpMlsGroup) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
-// Tests — byte-identical output with MlsCryptoProvider MLS primitive calls
+// Tests — byte-identical output with NodeMlsFactory MLS primitive calls
 // ---------------------------------------------------------------------------
 //
 // These tests feed identical inputs to `ProductionMlsBackend` and the existing
 // `group::*` / `encrypt::*` / `ratchet::*` primitives (the same primitives
-// `MlsCryptoProvider` delegates to) and assert byte-identical output on the
+// `NodeMlsFactory` delegates to) and assert byte-identical output on the
 // MLS primitive surface. Because MLS Welcome / Commit / Ciphertext bytes all
 // embed fresh randomness (HPKE ephemeral, AEAD nonces, ratcheted key
 // schedule), strict byte equality on identical random inputs requires the
@@ -1027,7 +1027,7 @@ mod tests {
         // form directly and assert both arms — a valid KeyPackage returns
         // `Ok(ValidatedKeyPackage)`, and an expired-lifetime KeyPackage returns
         // `MlsError::KeyPackageLifetimeInvalid` (the stateless form's variant; the
-        // retained `MlsCryptoProvider::validate_key_package` wrapper maps the same
+        // retained `NodeMlsFactory::validate_key_package` wrapper maps the same
         // condition to `ContextError::InvalidKeyPackage`, asserted in
         // `provider::tests::validate_key_package_rejects_expired_lifetime_at_gate`).
         use scp_clock::TestClock;
@@ -1066,7 +1066,7 @@ mod tests {
         let backend = joinable_backend();
 
         // `advance_epoch` always proposes a wrapping-extension update on
-        // the leaf (mirrors `MlsCryptoProvider::advance_epoch`). For Bob
+        // the leaf (mirrors `NodeMlsFactory::advance_epoch`). For Bob
         // to accept the commit, Alice's group, Bob's KeyPackage, and the
         // subsequent `advance_epoch` call MUST agree on the wrapping
         // extension being present. We pass the same `wrap_pub` to

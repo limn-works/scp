@@ -82,8 +82,8 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 /// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
 /// [`ScpCredential`] from the joiner's DID and TLS-serializes a fresh
 /// `KeyPackage` bundle produced by `generate_key_package_with_context_params`.
-/// The output bytes are what `MlsCryptoProvider::validate_key_package` and
-/// `MlsCryptoProvider::add_member` require — the old `FfiBridgeCrypto` stub
+/// The output bytes are what `NodeMlsFactory::validate_key_package` and
+/// `NodeMlsFactory::add_member` require — the old `FfiBridgeCrypto` stub
 /// used to accept `None`, but real MLS rejects it.
 ///
 /// Uses `None` for the wrapping key so the leaf **declares the `0xFF02`
@@ -10673,7 +10673,7 @@ impl Scp {
                 let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
 
                 // Generate a real MLS key package for the joining member. The
-                // `MlsCryptoProvider` requires `Some(bytes)` — the old DID-less
+                // `NodeMlsFactory` requires `Some(bytes)` — the old DID-less
                 // `FfiBridgeCrypto` stub accepted `None`, but commit 4 replaced
                 // it with real MLS crypto across every bridge entry point.
                 let kp_bytes = generate_mls_key_package_bytes(&identity.did)?;
@@ -15944,7 +15944,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `configure_relay_transport`.
     ///
-    /// Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
+    /// Routes through `&*self.inner`. Installs a real `NodeMlsFactory`
     /// and `RelayTransportProvider` on this instance's `ContextManager`.
     pub async fn configure_relay_transport(
         &self,
@@ -15982,7 +15982,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `configure_local_transport`.
     ///
-    /// Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+    /// Routes through `&*self.inner`. Installs a real `NodeMlsFactory` and
     /// an in-process loopback `LocalTransportProvider` on this instance's
     /// `ContextManager`. Unlike `configure_relay_transport`, this performs no
     /// network I/O — it wires test infrastructure so `context_send` and

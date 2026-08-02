@@ -1975,7 +1975,7 @@ mod tests {
     ///
     /// After ADR-049 §15, the `ContextCryptoProvider` trait is
     /// deleted and tests bind to a real
-    /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+    /// [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
     /// — fail-injection and stub-seal overrides move to
     /// backend-injection in ADR-049 §15.
     fn test_context_manager() -> Arc<crate::context::supervisor::Supervisor> {
@@ -2036,7 +2036,7 @@ mod tests {
         // ADR-049 §15: `ContextManager` is gone. Build the
         // `Supervisor` directly via `test_supervisor`.
         crate::context::test_supervisor(
-            Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
                 TEST_DID.to_owned(),
                 std::sync::Arc::new(scp_clock::SystemClock),
             )),
@@ -2101,8 +2101,8 @@ mod tests {
     /// PSK rotation (spec §9.12 step 6) seals its recovery notification
     /// against a synthetic `identity-private-state` context. Pre-PR-7 the
     /// per-context MLS crypto was provider-resident, so seeding an MLS group
-    /// directly on the supervisor's shared `MlsCryptoProvider` sufficed for
-    /// [`MlsCryptoProvider::seal`] to succeed. ADR-049 PR-7
+    /// directly on the supervisor's shared `NodeMlsFactory` sufficed for
+    /// [`NodeMlsFactory::seal`] to succeed. ADR-049 PR-7
     /// (SCP-CRYPTOMOVE-001) moved that crypto state onto the per-context
     /// actor by a one-way take, and `dispatch_recovery_send_notification`
     /// routes through [`Supervisor::dispatch_trust_recovery_command`], which

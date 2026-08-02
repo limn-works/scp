@@ -46,16 +46,16 @@ wires an in-memory MLS storage backend and no-op persistence:
 ```rust,ignore
 use std::sync::Arc;
 use scp_runtime::context::test_supervisor;
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 use scp_protocol::context::{ContextParams, ContextState};
 
 // `test_supervisor` returns an `Arc<Supervisor>` with the given providers and
 // an in-memory MLS store (a dev/test opt-in — production supplies a real
-// `Storage`). `crypto` is a shared `Arc<MlsCryptoProvider>`; `transport` and
+// `Storage`). `crypto` is a shared `Arc<NodeMlsFactory>`; `transport` and
 // `event_log` are boxed provider trait objects; `key_resolver` maps a DID +
 // verification method to its Ed25519 verifying key (ADR-039).
 let supervisor = test_supervisor(
-    Arc::new(MlsCryptoProvider::new(
+    Arc::new(NodeMlsFactory::new(
         "did:dht:z6Mk...creator".to_owned(),
         Arc::new(scp_clock::SystemClock),
     )),
@@ -146,8 +146,8 @@ Provider traits (injected, dyn-erased)
   OpenMlsStorageAdapter      dyn-compatible async KV under the OpenMLS bridge
 
 Convenience
-  MlsCryptoProvider          concrete MLS crypto provider (OpenMLS + HPKE);
-                             held as Arc<MlsCryptoProvider> in ActorDeps
+  NodeMlsFactory          concrete MLS crypto provider (OpenMLS + HPKE);
+                             held as Arc<NodeMlsFactory> in ActorDeps
   MerkleEventLogProvider     Merkle event log with optional persistence
   test_supervisor            in-memory Supervisor for tests/local setups
 ```

@@ -1,11 +1,11 @@
 //! Context creation shared types and errors.
 //!
 //! Pure sync data types and associated errors. The crypto provider itself
-//! (`MlsCryptoProvider`) and the async builder implementation
+//! (`NodeMlsFactory`) and the async builder implementation
 //! (`create_context`, `CreateContextPhases`) live in
 //! `scp-runtime::context::builder` and `scp-runtime::crypto::mls::provider`.
 //! After ADR-049 commit 12c.9e, the `ContextCryptoProvider` trait was
-//! deleted — callers name the concrete `MlsCryptoProvider` directly.
+//! deleted — callers name the concrete `NodeMlsFactory` directly.
 
 use super::ContextError;
 use crate::envelope::inner::InnerEnvelope;
@@ -17,7 +17,7 @@ use crate::envelope::inner::InnerEnvelope;
 /// The receive-side anti-replay floor for a single sender.
 ///
 /// The `(sender_key_epoch, sequence)` high-water mark that
-/// `MlsCryptoProvider::open` (in `scp-runtime`) advanced the anti-replay tracker
+/// `NodeMlsFactory::open` (in `scp-runtime`) advanced the anti-replay tracker
 /// to (spec §23.17.3).
 ///
 /// A named-field newtype rather than a bare `(u64, u64)` tuple so the two
@@ -43,7 +43,7 @@ pub struct ReceiveFloor {
 
 /// Result of successfully opening and verifying a received envelope.
 ///
-/// Returned by `MlsCryptoProvider::open` (in `scp-runtime`) for application messages.
+/// Returned by `NodeMlsFactory::open` (in `scp-runtime`) for application messages.
 /// Contains the deserialized inner envelope (with all integrity checks
 /// passed) and the sender's DID extracted from MLS credentials.
 #[derive(Debug, Clone)]
@@ -54,7 +54,7 @@ pub struct OpenedEnvelope {
     pub sender_did: String,
     /// The receive-side [`ReceiveFloor`] (`sender_key_epoch`, `sequence`) this
     /// envelope advanced the anti-replay tracker to inside
-    /// `MlsCryptoProvider::open` (spec §23.17.3).
+    /// `NodeMlsFactory::open` (spec §23.17.3).
     ///
     /// ADR-049 PR-4: surfaced SOLELY so the supervisor floor-registry follower
     /// mirror-forward (`decrypt_and_dispatch`) can track the just-advanced
@@ -66,7 +66,7 @@ pub struct OpenedEnvelope {
     pub receive_floor: ReceiveFloor,
 }
 
-/// Discriminated result of `MlsCryptoProvider::open` (in `scp-runtime`).
+/// Discriminated result of `NodeMlsFactory::open` (in `scp-runtime`).
 ///
 /// After MLS decryption, the plaintext may be an application message,
 /// an MLS control message, or a management message (e.g., sender key
@@ -90,16 +90,16 @@ pub enum OpenResult {
 /// 4-byte magic prefix for management messages inside MLS application payloads.
 ///
 /// ASCII `SCPM` (Shared Context Protocol Management). Prepended by
-/// `MlsCryptoProvider::mls_encrypt_management` (in `scp-runtime`) and detected by
-/// `MlsCryptoProvider::open` (in `scp-runtime`) to distinguish management traffic
+/// `NodeMlsFactory::mls_encrypt_management` (in `scp-runtime`) and detected by
+/// `NodeMlsFactory::open` (in `scp-runtime`) to distinguish management traffic
 /// from application messages.
 pub const MANAGEMENT_MSG_MAGIC: [u8; 4] = [0x53, 0x43, 0x50, 0x4D];
 
 /// Maximum management payload size in bytes (64 KiB).
 ///
 /// Management payloads MUST NOT exceed this limit (§9.16.1). Enforced on
-/// both send side (`MlsCryptoProvider::mls_encrypt_management` (in `scp-runtime`)) and
-/// receive side (`MlsCryptoProvider::open` (in `scp-runtime`)).
+/// both send side (`NodeMlsFactory::mls_encrypt_management` (in `scp-runtime`)) and
+/// receive side (`NodeMlsFactory::open` (in `scp-runtime`)).
 pub const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536;
 
 /// Attempts to strip the [`MANAGEMENT_MSG_MAGIC`] prefix from an MLS
@@ -112,7 +112,7 @@ pub const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536;
 /// outer-envelope processing, sender-key decryption, or any post-dispatch
 /// application code — is permitted to strip, test, or depend on the
 /// magic prefix. Crypto-provider implementations of
-/// `MlsCryptoProvider::open` (in `scp-runtime`) MUST use this helper rather than
+/// `NodeMlsFactory::open` (in `scp-runtime`) MUST use this helper rather than
 /// re-implementing the check inline, so the single-responsibility
 /// invariant for management-message framing stays enforceable.
 ///

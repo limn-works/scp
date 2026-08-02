@@ -9,12 +9,12 @@
 //!
 //! External dependencies (transport, event log) are injected via traits
 //! ([`ContextTransportProvider`], [`ContextEventLogProvider`]). The crypto
-//! layer is the concrete [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+//! layer is the concrete [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
 //! — the old `ContextCryptoProvider` trait was deleted in ADR-049 §15;
 //! the builder names the concrete type directly.
 
 use super::ContextHandle;
-use crate::crypto::mls::provider::MlsCryptoProvider;
+use crate::crypto::mls::provider::NodeMlsFactory;
 use scp_protocol::context::templates::validate_against_template;
 use scp_protocol::context::{
     CapabilityCeiling, ContextError, ContextMode, ContextParams, ContextState, ScpContextExtension,
@@ -912,7 +912,7 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 pub async fn create_context(
     context_id: String,
     params: ContextParams,
-    crypto: &MlsCryptoProvider,
+    crypto: &NodeMlsFactory,
     transport: &dyn ContextTransportProvider,
     event_log_provider: &dyn ContextEventLogProvider,
     creator_did: &str,
@@ -1131,7 +1131,7 @@ mod tests {
     use super::*;
     use scp_protocol::context::{ContextParams, MemoryScope};
 
-    /// Test DID for the real [`MlsCryptoProvider`].
+    /// Test DID for the real [`NodeMlsFactory`].
     ///
     /// The prior `MockCryptoProvider` fail-injection scaffold was deleted
     /// along with the `ContextCryptoProvider` trait in ADR-049 §15.
@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     /// Smoke verifying that ADR-049 §15's
-    /// [`MlsCryptoProvider::with_backends`] seam compiles and that
+    /// [`NodeMlsFactory::with_backends`] seam compiles and that
     /// inherent backend accessors return the injected pointers.
     /// Functional fail-injection tests (one per orchestration path)
     /// extend this seam with mock `MlsBackend`/`HpkeBackend` impls
@@ -1203,10 +1203,10 @@ mod tests {
     async fn create_context_fail_paths_use_backend_injection() {
         use crate::crypto::hpke_backend::ProductionHpkeBackend;
         use crate::crypto::mls::production_backend::ProductionMlsBackend;
-        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use crate::crypto::mls::provider::NodeMlsFactory;
         use std::sync::Arc;
 
-        let provider = MlsCryptoProvider::with_backends(
+        let provider = NodeMlsFactory::with_backends(
             TEST_DID.to_owned(),
             Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
                 scp_clock::SystemClock,
@@ -1260,7 +1260,7 @@ mod tests {
 
         // Drive real creation crypto. A real MLS provider + no-op transport /
         // event log isolates the keying behavior under test.
-        let crypto = MlsCryptoProvider::new(
+        let crypto = NodeMlsFactory::new(
             TEST_DID.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         );
@@ -1311,7 +1311,7 @@ mod tests {
         // A real 64-hex context id (the shape `generate_context_id` emits).
         let id = hex::encode([0x2au8; 32]);
         let id_bytes = context_id_bytes(&id);
-        let crypto = MlsCryptoProvider::new(
+        let crypto = NodeMlsFactory::new(
             TEST_DID.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         );

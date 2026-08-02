@@ -48,7 +48,7 @@ const PROVIDER_SRC: &str =
 
 // Actor per-context state source — owns the `ContextCryptoState::{seal,open}`
 // steady-state crypto seam. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) moved the seal /
-// open bodies off the `MlsCryptoProvider` (deleted) onto the actor-owned
+// open bodies off the `NodeMlsFactory` (deleted) onto the actor-owned
 // `PerContextState` here, so the seal-internal envelope-pipeline assertions scan
 // this source (the moved code), not `PROVIDER_SRC`. This is a repoint to the new
 // home of the same seal/open pipeline, not a weakening.
@@ -1564,7 +1564,7 @@ fn open_calls_decrypt_sender_layer() {
 }
 
 // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) + #2148 (birth-into-actor): the steady-state
-// crypto methods were MOVED off `MlsCryptoProvider` onto the actor-owned
+// crypto methods were MOVED off `NodeMlsFactory` onto the actor-owned
 // `PerContextState`, and #2148 additionally DELETED the provider's per-context
 // birth/restore/teardown seam — the `contexts` / `taken_context_ids` /
 // `broadcast_keys` maps and every method that read or wrote them. This asserts
@@ -1618,7 +1618,7 @@ fn provider_steady_state_crypto_methods_are_deleted() {
         let def = format!("fn {method}(");
         assert!(
             !PROVIDER_SRC.contains(&def),
-            "MlsCryptoProvider must NOT define `{method}` — the per-context crypto \
+            "NodeMlsFactory must NOT define `{method}` — the per-context crypto \
              seam is actor-owned (ADR-049 PR-7 + #2148 birth-into-actor); the provider \
              holds no per-context state and no dual-home twin"
         );
@@ -1636,7 +1636,7 @@ fn provider_steady_state_crypto_methods_are_deleted() {
     ] {
         assert!(
             !PROVIDER_SRC.contains(field),
-            "MlsCryptoProvider must NOT carry the per-context field `{field}` — #2148 \
+            "NodeMlsFactory must NOT carry the per-context field `{field}` — #2148 \
              (birth-into-actor) dissolves the provider's per-context state; the actor's \
              `PerContextState` is the sole per-context crypto home"
         );

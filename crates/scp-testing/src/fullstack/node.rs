@@ -1,7 +1,7 @@
 //! Full-stack test node wrapping a real `Supervisor` with real crypto.
 //!
 //! Each `FullStackNode` owns a [`Supervisor`] bound to a concrete
-//! [`MlsCryptoProvider`](scp_core::crypto::mls::provider::MlsCryptoProvider).
+//! [`NodeMlsFactory`](scp_core::crypto::mls::provider::NodeMlsFactory).
 //! Every node drives its operations through the supervisor's actor mailbox. The
 //! creator side (Alice) owns the per-context state in its context actor; the
 //! joiner side (Bob, Carol) stands up its OWN live per-context actor via
@@ -732,7 +732,7 @@ impl FullStackNode {
     /// For each existing member `incumbent`, the incumbent issues a signed
     /// [`SenderKeyRequest`](scp_core::crypto::sender_keys::SenderKeyRequest)
     /// carrying a FRESH EPHEMERAL wrapping key, the joiner (`self`) answers via
-    /// [`MlsCryptoProvider::handle_sender_key_request`](scp_core::crypto::mls::provider::MlsCryptoProvider::handle_sender_key_request),
+    /// [`NodeMlsFactory::handle_sender_key_request`](scp_core::crypto::mls::provider::NodeMlsFactory::handle_sender_key_request),
     /// and the incumbent opens the response with its ephemeral secret and stores
     /// the joiner's key in its OWN provider. This is the real request/response
     /// round trip, not a shortcut: the joiner's response goes through the H1

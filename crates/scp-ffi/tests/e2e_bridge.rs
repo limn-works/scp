@@ -330,7 +330,7 @@ fn multiple_contexts_independent() {
 ///
 /// This is the acceptance criterion from issue #501: "create context through
 /// bridge → verify MLS group exists." The bridge uses `NoOpCryptoProvider`
-/// whose `create_mls_group` succeeds (real `MlsCryptoProvider` integration
+/// whose `create_mls_group` succeeds (real `NodeMlsFactory` integration
 /// is a separate concern). The test verifies the full bridge path:
 /// identity creation → context creation → `ContextManager` state is populated.
 #[test]

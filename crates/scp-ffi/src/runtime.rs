@@ -65,7 +65,7 @@ use scp_core::context::providers::{
     MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
 };
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -862,7 +862,7 @@ impl Drop for PyBridgeInstance {
 
 /// Initializes the global [`ContextManager`] with production providers.
 ///
-/// Uses `MlsCryptoProvider` (real OpenMLS-backed encryption, sender keys, and
+/// Uses `NodeMlsFactory` (real OpenMLS-backed encryption, sender keys, and
 /// group management — ported from NAPI bridge #1305, closes #1324),
 /// `NotConfiguredTransportProvider` (returns descriptive errors until transport
 /// is configured via `transport_connect`), and the persistent
@@ -871,7 +871,7 @@ impl Drop for PyBridgeInstance {
 /// convergent event log is readable by `Supervisor::participation_record`
 /// (§7.3.2) and the other supervisor log queries — not a no-op.
 ///
-/// The `local_did` is passed to `MlsCryptoProvider::new` which uses it as
+/// The `local_did` is passed to `NodeMlsFactory::new` which uses it as
 /// the MLS credential identity for group operations and sender key generation.
 ///
 /// The key resolver rejects all lookups with an error rather than silently
@@ -886,7 +886,7 @@ impl Drop for PyBridgeInstance {
 /// restarts without requiring callers to manually wire persistence.
 /// See issue #329.
 ///
-/// The `local_did` is consumed only by `MlsCryptoProvider::new` — the
+/// The `local_did` is consumed only by `NodeMlsFactory::new` — the
 /// `BridgeInstance` itself carries no DID (spec §12.2.3).
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
@@ -901,7 +901,7 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     }
 
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -934,14 +934,14 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
 pub fn init_context_manager_with(
     bi: &PyBridgeInstance,
     _local_did: &str,
-    crypto: Arc<MlsCryptoProvider>,
+    crypto: Arc<NodeMlsFactory>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) {
     // `_local_did` is retained in the signature for API stability: callers
     // construct `crypto` with the DID before calling into this function
-    // (it is the `MlsCryptoProvider` that carries the DID; see spec §12.2.3).
+    // (it is the `NodeMlsFactory` that carries the DID; see spec §12.2.3).
     if bi.core.has_supervisor() {
         return;
     }
@@ -962,7 +962,7 @@ pub fn init_context_manager_with(
 /// Identical to [`init_context_manager`] except the transport provider is
 /// `LocalTransportProvider` (silently succeeds on all send/publish calls)
 /// instead of `NotConfiguredTransportProvider` (rejects everything). Like
-/// production initialization, it installs a real `MlsCryptoProvider` bound to
+/// production initialization, it installs a real `NodeMlsFactory` bound to
 /// `local_did` so encryption is exercised end to end against an in-process
 /// loopback transport.
 ///
@@ -995,7 +995,7 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
             .set(StorageProvider::new_in_memory_encrypted());
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -1042,7 +1042,7 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
             .storage_provider
             .set(StorageProvider::new_in_memory_encrypted());
     }
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         "did:test:pyo3-bridge-test".to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -1238,7 +1238,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// never defaults storage; the caller (bridge layer) must supply it first.
 fn build_supervisor(
     bi: &PyBridgeInstance,
-    crypto: Arc<MlsCryptoProvider>,
+    crypto: Arc<NodeMlsFactory>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
@@ -1266,7 +1266,7 @@ fn build_supervisor(
             document_vm_key_resolver(std::sync::Arc::clone(r))
         });
     // Share the provider's exact hardened `Clock` Arc with the supervisor so the
-    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`
     // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
     // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
     let clock = crypto.clock();
@@ -2272,7 +2272,7 @@ pub fn register_context(
     // Production uses NotConfiguredTransportProvider — publish_context
     // returns an error that create_context logs as a warning (best-effort;
     // context is valid locally even without relay publication, #501).
-    // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1324).
+    // Passes the creator DID to NodeMlsFactory for real MLS encryption (#1324).
     #[cfg(test)]
     init_context_manager_for_test(bi);
     #[cfg(not(test))]
@@ -2825,7 +2825,7 @@ mod tests {
             .expect("in-memory storage construction is infallible");
         let supervisor_arc = build_supervisor(
             &isolated,
-            Arc::new(MlsCryptoProvider::new(
+            Arc::new(NodeMlsFactory::new(
                 "did:test:pyo3-bridge-test".to_owned(),
                 std::sync::Arc::new(scp_clock::SystemClock),
             )),

@@ -1473,7 +1473,7 @@ pub struct Supervisor {
     // in [`Self::new`] and their accessors do not return `Option`.
     // -----------------------------------------------------------------
     /// Shared crypto provider. Populated by [`Self::with_providers`].
-    crypto: OnceLock<Arc<crate::crypto::mls::provider::MlsCryptoProvider>>,
+    crypto: OnceLock<Arc<crate::crypto::mls::provider::NodeMlsFactory>>,
     /// Shared transport provider. Populated by [`Self::with_providers`].
     transport: OnceLock<Arc<dyn ContextTransportProvider>>,
     /// Shared event-log provider. Populated by [`Self::with_providers`].
@@ -1959,7 +1959,7 @@ impl Supervisor {
     /// # Arguments
     ///
     /// * `crypto` — production
-    ///   [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
+    ///   [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory).
     /// * `transport` — production transport (typically
     ///   [`NotConfiguredTransportProvider`](crate::context::builder::NotConfiguredTransportProvider),
     ///   [`LocalTransportProvider`](crate::context::builder::LocalTransportProvider), or a real
@@ -1991,7 +1991,7 @@ impl Supervisor {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // FFI bridges need to compose providers in one call
     pub fn with_providers(
-        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         key_resolver: KeyResolver,
@@ -2054,7 +2054,7 @@ impl Supervisor {
     /// already-public surface; it does not widen any other injection point.
     #[allow(clippy::too_many_arguments)] // provider bootstrap mirrors `with_providers`
     pub fn with_providers_and_journal(
-        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         key_resolver: KeyResolver,
@@ -2238,13 +2238,11 @@ impl Supervisor {
     // -------------------------------------------------------------------
 
     /// Cheap reference to the supervisor's shared
-    /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
+    /// [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory).
     /// Returns `None` if [`Self::with_providers`] was not used (e.g. a
     /// supervisor built via `Self::for_query_shim` / `Self::new`).
     #[must_use]
-    pub(crate) fn crypto_ref(
-        &self,
-    ) -> Option<&Arc<crate::crypto::mls::provider::MlsCryptoProvider>> {
+    pub(crate) fn crypto_ref(&self) -> Option<&Arc<crate::crypto::mls::provider::NodeMlsFactory>> {
         self.crypto.get()
     }
 
@@ -2456,8 +2454,8 @@ impl Supervisor {
     // -------------------------------------------------------------------
     // ADR-049 §15 — per-identity wrapping-key accessors.
     //
-    // The plan §"MlsCryptoProvider dissolution" lifts the wrapping
-    // keypair off [`crate::crypto::mls::provider::MlsCryptoProvider`]
+    // The plan §"NodeMlsFactory dissolution" lifts the wrapping
+    // keypair off [`crate::crypto::mls::provider::NodeMlsFactory`]
     // (where it was held in `Mutex<[u8;32]>` / `Mutex<Zeroizing<...>>`
     // fields) onto the supervisor's per-identity
     // `wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>` map. The
@@ -2755,7 +2753,7 @@ impl Supervisor {
     /// Self-sources every collaborator from the `OnceLock`s populated by
     /// [`Self::with_providers`]: the `MlsBackend` / `HpkeBackend` pair is
     /// read transitively through `crypto.mls_backend()` /
-    /// `crypto.hpke_backend()` (the [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+    /// `crypto.hpke_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
     /// owns the only instance — no second supervisor field, so there is
     /// one source of truth per ADR §6). The OpenMLS storage adapter is
     /// the supervisor's `mls_storage` slot. The `KeyPackageStoreHandle`
@@ -2820,7 +2818,7 @@ impl Supervisor {
         let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
 
         let crypto = Arc::clone(self.crypto_ref().ok_or_else(not_init)?);
-        // mls/hpke stay transitive — the MlsCryptoProvider owns the only
+        // mls/hpke stay transitive — the NodeMlsFactory owns the only
         // backend pair (ADR §6); no Supervisor field mirrors them.
         let mls = Arc::clone(crypto.mls_backend());
         let hpke = Arc::clone(crypto.hpke_backend());
@@ -13362,7 +13360,7 @@ impl Supervisor {
     ///    consumes the single-use KeyPackage (two independent single-use
     ///    anchors preserved).
     /// 2. INSTALL the joined group into the live crypto provider
-    ///    ([`MlsCryptoProvider::install_joined_group`](crate::crypto::mls::provider::MlsCryptoProvider::install_joined_group)),
+    ///    ([`NodeMlsFactory::install_joined_group`](crate::crypto::mls::provider::NodeMlsFactory::install_joined_group)),
     ///    plus a locally-minted sender key (spec §9.16.1).
     /// 3. Build the joiner's Welcome-derived
     ///    [`PerContextState`](crate::context::actor::state::PerContextState)
@@ -16153,7 +16151,7 @@ mod tests {
     }
 
     /// ADR-049 §15: per-identity wrapping-key accessors lift
-    /// the keypair off `MlsCryptoProvider`. Verifies that `set` →
+    /// the keypair off `NodeMlsFactory`. Verifies that `set` →
     /// `get` returns the same bytes via the supervisor's
     /// `DashMap<DID, ArcSwap<WrappingKeyPair>>`.
     #[tokio::test]
@@ -16461,10 +16459,10 @@ mod tests {
     ) -> Arc<Supervisor> {
         // Minimal providers — the spawn-registry tests only care about
         // the supervisor's actor map, not the providers' behaviour.
-        // `MlsCryptoProvider::new` takes a String DID; the stub DID is
+        // `NodeMlsFactory::new` takes a String DID; the stub DID is
         // never used by the spawn tests because no
         // `create_context` call runs.
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -16526,7 +16524,7 @@ mod tests {
     /// deleted `create_mls_group[_with_context]` + `generate_sender_key` +
     /// `take_crypto_state` triad. The provider holds no per-context state.
     fn take_into_actor(
-        crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: &Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         ctx: &[u8; 32],
         ext: &scp_protocol::context::ScpContextExtension,
     ) -> crate::context::actor::state::PerContextState {
@@ -16543,7 +16541,7 @@ mod tests {
     }
 
     fn actor_export(
-        crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: &Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         ctx: &[u8; 32],
         ext: &scp_protocol::context::ScpContextExtension,
         sender_key_epochs: Vec<(String, u64)>,
@@ -16561,7 +16559,7 @@ mod tests {
     /// `supervisor` floor registry starts empty. A no-op resolver suffices —
     /// `decrypt_and_dispatch` defers signature verification to `ContextManager`.
     fn supervisor_with_crypto(
-        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
     ) -> Arc<Supervisor> {
         supervisor_with_crypto_and_resolver(
             crypto,
@@ -16575,7 +16573,7 @@ mod tests {
     /// check the request signature.
     #[cfg(feature = "testing")]
     fn supervisor_with_crypto_and_resolver(
-        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         key_resolver: KeyResolver,
     ) -> Arc<Supervisor> {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
@@ -18360,7 +18358,7 @@ mod tests {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
 
         // Build a supervisor with the skewed clock AND the fail-first event log.
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestM1Convergent".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -18506,7 +18504,7 @@ mod tests {
         };
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestM1Reset".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -19594,7 +19592,7 @@ mod tests {
         clock: Arc<dyn Clock>,
         persistence: Box<dyn ContextPersistence>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestM3Import".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -19920,10 +19918,10 @@ mod tests {
     /// `build_actor_deps` self-sources the exact same handles.
     fn build_deps_fixture() -> (
         Arc<Supervisor>,
-        Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestBuildDeps".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -19962,7 +19960,7 @@ mod tests {
 
     /// `build_actor_deps` populates every `ActorDeps` field from the
     /// supervisor's own slots; mls/hpke are the single backend pair owned
-    /// by the `MlsCryptoProvider` (ADR-049 §6 — no second source).
+    /// by the `NodeMlsFactory` (ADR-049 §6 — no second source).
     #[tokio::test]
     async fn build_actor_deps_reads_single_backend_pair() {
         let (supervisor, crypto, mls_storage) = build_deps_fixture();
@@ -20513,7 +20511,7 @@ mod tests {
         // Install the global capture subscriber so the payload-redaction
         // test can observe the watchdog's log (emitted on a worker thread).
         install_capture_subscriber();
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -24714,7 +24712,7 @@ mod tests {
         creator_key: ed25519_dalek::VerifyingKey,
         event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxSaga".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -24822,7 +24820,7 @@ mod tests {
         creator_key: ed25519_dalek::VerifyingKey,
         persistence: Box<dyn ContextPersistence>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxSagaPersist".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -25099,7 +25097,7 @@ mod tests {
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         persistence: Option<Box<dyn ContextPersistence>>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxFaultJournal".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -27226,7 +27224,7 @@ mod tests {
         let journal: Arc<dyn SagaJournal> =
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkRecoverySupervisor".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -28299,7 +28297,7 @@ mod tests {
         let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
             Arc::clone(&journal_storage),
         ));
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxWave8".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -28542,7 +28540,7 @@ mod tests {
         let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
             Arc::clone(&journal_storage),
         ));
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxWave15".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -29853,7 +29851,7 @@ mod tests {
     fn supervisor_with_void_counter(
         voids: &Arc<std::sync::atomic::AtomicUsize>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkDrainTerminal".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -30208,7 +30206,7 @@ mod open_outlet_stream_tests {
     }
 
     fn build_supervisor(captured: &Arc<AtomicUsize>) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             invoker().0,
             Arc::new(scp_clock::SystemClock),
         ));
@@ -31878,7 +31876,7 @@ mod streaming_saga_tests {
         journal: Arc<dyn SagaJournal>,
         event_log: Box<dyn ContextEventLogProvider>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ss_creator(),
             Arc::new(scp_clock::SystemClock),
         ));

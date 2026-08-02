@@ -449,7 +449,7 @@ mod live_supervisor_send {
     use crate::context::builder::ContextTransportProvider;
     use crate::context::supervisor::key_package_actor::KeyPackageCommand;
     use crate::context::supervisor::{MessageSigner, Supervisor};
-    use crate::crypto::mls::provider::MlsCryptoProvider;
+    use crate::crypto::mls::provider::NodeMlsFactory;
     use scp_clock::SystemClock;
 
     /// Shared buffer of `(routing_id, payload)` pairs the recording transport
@@ -541,7 +541,7 @@ mod live_supervisor_send {
     /// in-memory event log / MLS storage via `test_supervisor`) and returns it
     /// alongside the shared capture buffer.
     fn alice_supervisor(sent: SentBuffer) -> Arc<Supervisor> {
-        let crypto = Arc::new(MlsCryptoProvider::new(
+        let crypto = Arc::new(NodeMlsFactory::new(
             ALICE_DID.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

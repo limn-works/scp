@@ -57,7 +57,7 @@ use crate::context::invitation_helpers::{SnapshotRuntimeFacts, build_metadata_sn
 use crate::context::persistence::ContextPersistence;
 use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::state::context_id_to_bytes;
-use crate::crypto::mls::provider::MlsCryptoProvider;
+use crate::crypto::mls::provider::NodeMlsFactory;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 
 const ALICE_DID: &str = "did:dht:z6MkAliceSpawnFromWelcomeCreator";
@@ -385,7 +385,7 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 /// double for the crash-safety test.
 fn bob_supervisor(
     persistence: Option<Box<dyn ContextPersistence>>,
-) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
+) -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
     bob_supervisor_with_resolver(persistence, pair_resolver())
 }
 
@@ -395,8 +395,8 @@ fn bob_supervisor(
 fn bob_supervisor_with_resolver(
     persistence: Option<Box<dyn ContextPersistence>>,
     resolver: KeyResolver,
-) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+) -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
+    let crypto = Arc::new(NodeMlsFactory::new(
         BOB_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -422,8 +422,8 @@ fn bob_supervisor_with_resolver(
 /// `invite_member` round-trip (Test M), which resolves the INVITEE (`BOB`)
 /// #active to seal to. Returns the supervisor and a clone of Alice's crypto
 /// provider (so the test can drive the installed group).
-fn alice_supervisor() -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+fn alice_supervisor() -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
+    let crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -539,7 +539,7 @@ async fn run_join_with(
     // KP, producing the real Welcome addressed to that KP's init key. When
     // `committed` is `Some`, the group carries the honest `0xFF02` extension;
     // otherwise it is a wrapping-only (non-SCP) group.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -732,7 +732,7 @@ async fn spawn_from_welcome_seeds_the_real_joined_group_epoch() {
 /// # Bidirectional round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
 ///
 /// This test used to drive the bidirectional payload round-trip via
-/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the provider.
+/// `NodeMlsFactory::mls_encrypt_management` / `open` DIRECTLY on the provider.
 /// PR-7 moved the seal/open crypto off the provider and onto the live actor, so
 /// the bare-provider `take_into_actor` seam would double-take an
 /// already-actor-resident context and panic — the round-trip is no longer
@@ -885,7 +885,7 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -967,12 +967,9 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
 /// `(alice_crypto, welcome_bytes)`. The committed extension binds `context_id`,
 /// so a join under a DIFFERENT id (or with divergent params) is refused by the
 /// FFI-02 binding check; every caller here joins under the SAME `context_id`.
-fn alice_welcome_for(
-    context_id: &str,
-    kp_public_bytes: &[u8],
-) -> (Arc<MlsCryptoProvider>, Vec<u8>) {
+fn alice_welcome_for(context_id: &str, kp_public_bytes: &[u8]) -> (Arc<NodeMlsFactory>, Vec<u8>) {
     let ctx_bytes = context_id_to_bytes(context_id);
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -1194,7 +1191,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 /// into a keyless `needs_reconnect` snapshot that persists SUCCESSFULLY) is
 /// fatal for a JOINER, which cannot reconnect-derive.
 ///
-/// The concrete `MlsCryptoProvider` always returns a NON-EMPTY export for a
+/// The concrete `NodeMlsFactory` always returns a NON-EMPTY export for a
 /// just-installed group, so the export-failure branch cannot be induced through
 /// the full entrypoint with the real provider (install guarantees a live group).
 /// This unit test therefore pins the fail-closed DECISION directly on the pure
@@ -1231,7 +1228,7 @@ fn welcome_snapshot_crypto_durability_predicate_fails_closed_on_empty_or_error()
 
 /// The entrypoint's crypto-durability gate (step 3b) fails the spawn CLOSED when
 /// the joined group produces a non-durable crypto export — WITHOUT persisting a
-/// keyless snapshot and WITHOUT standing up an actor. The real `MlsCryptoProvider`
+/// keyless snapshot and WITHOUT standing up an actor. The real `NodeMlsFactory`
 /// always exports a non-empty blob for a just-installed group, so this branch is
 /// otherwise unreachable through the full entrypoint; a one-shot test seam
 /// (`arm_export_failure_once`) forces the NEXT export to fail so the WIRING —
@@ -1654,7 +1651,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
 /// # Round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
 ///
 /// This test used to additionally drive a bob→alice payload round-trip via
-/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the provider.
+/// `NodeMlsFactory::mls_encrypt_management` / `open` DIRECTLY on the provider.
 /// PR-7 moved the seal/open crypto onto the live actor, so the bare-provider
 /// `take_into_actor` seam double-takes an already-actor-resident context and
 /// panics. The full round-trip over the real actor mailbox + transport lives at
@@ -2294,7 +2291,7 @@ async fn structurally_inconsistent_bundle_is_rejected() {
 /// # Bidirectional round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
 ///
 /// This test used to additionally drive a bidirectional payload round-trip via
-/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the
+/// `NodeMlsFactory::mls_encrypt_management` / `open` DIRECTLY on the
 /// providers. PR-7 moved the seal/open crypto onto the live actor, so the
 /// bare-provider `take_into_actor` seam double-takes an already-actor-resident
 /// context and panics. The full both-directions payload proof over the real actor
@@ -2454,8 +2451,8 @@ impl ContextTransportProvider for BroadcastWatchTransport {
 /// otherwise.
 fn alice_supervisor_with_transport(
     transport: Box<dyn ContextTransportProvider>,
-) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+) -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
+    let crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -2813,7 +2810,7 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     // real Welcome. The committed extension rides through the add Commit unchanged
     // as part of the group's cryptographic identity, so it still binds creator =
     // Alice regardless of who issued the add.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -3045,7 +3042,7 @@ impl ContextTransportProvider for AcceptingSendTransport {
 /// `NotConfiguredTransportProvider`, whose `send_message` fails closed).
 /// Mirrors [`bob_supervisor`] otherwise.
 fn bob_supervisor_with_transport(transport: Box<dyn ContextTransportProvider>) -> Arc<Supervisor> {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+    let crypto = Arc::new(NodeMlsFactory::new(
         BOB_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -3102,7 +3099,7 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
 
     // Alice (bare creator provider) creates the honest SCP context group and
     // adds Bob's reserved KP, producing the real Welcome addressed to that KP.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));

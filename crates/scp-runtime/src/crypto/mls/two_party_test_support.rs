@@ -11,8 +11,8 @@
 //!
 //! ADR-049 #2148 (birth-into-actor) slice 2: the pair is born DIRECTLY onto
 //! actor-owned [`PerContextState`] via the owned-return MLS constructors
-//! ([`MlsCryptoProvider::create_mls_group_with_context`] /
-//! [`MlsCryptoProvider::install_joined_group`]) plus the production
+//! ([`NodeMlsFactory::create_mls_group_with_context`] /
+//! [`NodeMlsFactory::install_joined_group`]) plus the production
 //! [`PerContextState::seed_encrypted_crypto_from_owned`] seed primitive — never
 //! through a provider-resident insert + `take_crypto_state` round-trip. The
 //! returned providers are kept ONLY as the node-resident source of each party's
@@ -34,7 +34,7 @@
 //! [`TwoPartyPair`] (named fields `alice_provider` / `alice_state` /
 //! `bob_provider` / `bob_state` / `ctx_bytes`): each [`PerContextState`] already
 //! OWNS its per-context crypto (seeded from the owned constructor), and each
-//! `Arc<MlsCryptoProvider>` is retained solely for its node-resident wrapping
+//! `Arc<NodeMlsFactory>` is retained solely for its node-resident wrapping
 //! keypair.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -59,7 +59,7 @@ use zeroize::Zeroizing;
 
 use crate::context::actor::{ContextCryptoState, ContextModeState, PerContextState};
 
-use super::provider::MlsCryptoProvider;
+use super::provider::NodeMlsFactory;
 use super::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
@@ -168,8 +168,8 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 pub fn bob_supervisor(
     bob_did: &str,
     resolver: KeyResolver,
-) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+) -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
+    let crypto = Arc::new(NodeMlsFactory::new(
         bob_did.to_owned(),
         Arc::new(scp_clock::SystemClock),
     ));
@@ -205,11 +205,11 @@ fn encrypted_crypto_mut(state: &mut PerContextState) -> &mut ContextCryptoState 
 /// replaces the former positional 5-tuple return).
 pub struct TwoPartyPair {
     /// Alice's provider, retained solely for its node-resident wrapping keypair.
-    pub alice_provider: Arc<MlsCryptoProvider>,
+    pub alice_provider: Arc<NodeMlsFactory>,
     /// Alice's actor state (OWNS her group + sender key).
     pub alice_state: PerContextState,
     /// Bob's provider, retained solely for its node-resident wrapping keypair.
-    pub bob_provider: Arc<MlsCryptoProvider>,
+    pub bob_provider: Arc<NodeMlsFactory>,
     /// Bob's actor state (OWNS his group + Alice's pulled sender key at epoch 1).
     pub bob_state: PerContextState,
     /// The shared context id, `context_id_bytes(ctx_str)`.
@@ -284,7 +284,7 @@ pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoP
             // production seed primitive — no provider-resident insert. The owned
             // constructor mints her sender key (epoch 1).
             let params = joiner_params();
-            let alice_crypto = Arc::new(MlsCryptoProvider::new(
+            let alice_crypto = Arc::new(NodeMlsFactory::new(
                 alice_did.to_owned(),
                 Arc::new(scp_clock::SystemClock),
             ));

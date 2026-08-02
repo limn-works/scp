@@ -1,6 +1,6 @@
-//! Production `MlsCryptoProvider` implementation backed by `OpenMLS`.
+//! Production `NodeMlsFactory` implementation backed by `OpenMLS`.
 //!
-//! [`MlsCryptoProvider`] bridges the historical inherent API to the actor-era
+//! [`NodeMlsFactory`] bridges the historical inherent API to the actor-era
 //! [`MlsBackend`](super::backend::MlsBackend) and
 //! [`HpkeBackend`](crate::crypto::hpke_backend::HpkeBackend) primitives.
 //!
@@ -10,9 +10,9 @@
 //! now a node-level MLS-birth / HPKE helper — local DID, injected clock,
 //! MLS/HPKE backends, and the node-resident X25519 wrapping keypair
 //! (`ArcSwap<...>` for atomic rotation; §9.16.1). The birth constructors
-//! ([`MlsCryptoProvider::create_mls_group_with_context`],
-//! [`MlsCryptoProvider::install_joined_group`]) and the restore seam
-//! ([`MlsCryptoProvider::build_restored_owned`]) return
+//! ([`NodeMlsFactory::create_mls_group_with_context`],
+//! [`NodeMlsFactory::install_joined_group`]) and the restore seam
+//! ([`NodeMlsFactory::build_restored_owned`]) return
 //! [`OwnedMlsCryptoState`] the CREATE / WELCOME / restore caller seeds onto the
 //! spawning actor's `PerContextState` — the actor is the sole per-context crypto
 //! authority. Removing the shared maps closes the #2167 cross-map TOCTOU by
@@ -25,7 +25,7 @@
 //!
 //! Inline `OpenMLS` calls in primitive paths route through the injected
 //! [`MlsBackend`](super::backend::MlsBackend) so test harnesses can substitute
-//! a fail-injecting backend via [`MlsCryptoProvider::with_backends`].
+//! a fail-injecting backend via [`NodeMlsFactory::with_backends`].
 //!
 //! See ADR-001 for the MLS wrapper design and ADR-007 for sender keys; ADR-049
 //! for the actor refactor + dissolution ladder.
@@ -225,7 +225,7 @@ impl MlsCryptoSnapshot {
     ///
     /// [`export_crypto_state`](crate::context::actor::state::PerContextState::export_crypto_state) calls this once at its
     /// end (belt-and-suspenders) after serializing the snapshot.
-    /// [`build_restored_owned`](crate::crypto::mls::provider::MlsCryptoProvider::build_restored_owned) does NOT call it:
+    /// [`build_restored_owned`](crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned) does NOT call it:
     /// restore consumes each secret field incrementally as it moves the material
     /// into the live crypto state (`drain`/`mem::replace`/per-field `zeroize` at
     /// the point of use), so there is no single end-of-function sweep to make. On
@@ -278,9 +278,9 @@ impl Drop for MlsCryptoSnapshot {
 /// to a context's actor (#2148 ADR-049 birth-into-actor).
 ///
 /// This is the boundary payload between the provider and the actor. The
-/// provider births it DIRECTLY — [`MlsCryptoProvider::create_mls_group_with_context`]
-/// (CREATE), [`MlsCryptoProvider::install_joined_group`] (WELCOME), and
-/// [`MlsCryptoProvider::build_restored_owned`] (restore / respawn / import) each
+/// provider births it DIRECTLY — [`NodeMlsFactory::create_mls_group_with_context`]
+/// (CREATE), [`NodeMlsFactory::install_joined_group`] (WELCOME), and
+/// [`NodeMlsFactory::build_restored_owned`] (restore / respawn / import) each
 /// assemble one and return it — and the CREATE / WELCOME / restore caller seeds
 /// it onto the spawning actor's `PerContextState` via
 /// [`seed_encrypted_crypto_from_owned`](crate::context::actor::state::PerContextState::seed_encrypted_crypto_from_owned).
@@ -367,7 +367,7 @@ impl OwnedMlsCryptoState {
     /// key ([`generate_sender_key`], spec §9.16.1) and defaults the seven
     /// identical fields every birth seam shares (`sender_key_epoch = 1`,
     /// `send_sequence = 0`, empty stores/maps). The distinct restore shape is
-    /// built by [`MlsCryptoProvider::build_restored_owned`], which is left
+    /// built by [`NodeMlsFactory::build_restored_owned`], which is left
     /// unchanged.
     pub(crate) fn fresh_birth(mls_group: ScpMlsGroup) -> Self {
         Self {
@@ -397,7 +397,7 @@ impl OwnedMlsCryptoState {
 
 /// Per-context Class-M floors reconstructed from a persisted snapshot.
 ///
-/// Returned by [`MlsCryptoProvider::build_restored_owned`](crate::crypto::mls::provider::MlsCryptoProvider::build_restored_owned) for the caller to
+/// Returned by [`NodeMlsFactory::build_restored_owned`](crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned) for the caller to
 /// merge into the authoritative Supervisor-owned floor registry (ADR-049 PR-6).
 ///
 /// `restore_crypto_state` installs the MLS group + sender-key MATERIAL into the
@@ -423,7 +423,7 @@ pub struct RestoredFloors {
 ///
 /// Node-resident X25519 wrapping keypair (§9.16.1), held as one unit so the
 /// public and secret halves rotate and are read atomically (ADR-049 PR-7
-/// hardening H3). Stored behind a single [`ArcSwap`] on [`MlsCryptoProvider`].
+/// hardening H3). Stored behind a single [`ArcSwap`] on [`NodeMlsFactory`].
 struct WrappingKeypair {
     /// X25519 wrapping public key for sender key HPKE (§9.16.1). Published in
     /// the MLS `LeafNode` `scp_wrapping_key` extension.
@@ -440,7 +440,7 @@ struct WrappingKeypair {
 ///
 /// # Construction
 ///
-/// Create with [`MlsCryptoProvider::new`], providing the local member's DID.
+/// Create with [`NodeMlsFactory::new`], providing the local member's DID.
 /// The DID is used to generate SCP credentials for MLS group operations.
 ///
 /// # Concurrency
@@ -459,8 +459,13 @@ struct WrappingKeypair {
 /// secret half across two `.load()` calls could observe a torn pair (public of
 /// generation N with secret of N+1) if a rotation interleaved. That is closed by
 /// construction here: every read goes through a single `.load()` of the combined
-/// slot (see [`MlsCryptoProvider::wrapping_keypair`]).
-pub struct MlsCryptoProvider {
+/// slot (see [`NodeMlsFactory::wrapping_keypair`]).
+///
+/// Renamed from `MlsCryptoProvider` in #2185: after #2148 (birth-into-actor)
+/// this type holds NO per-context state - it is a node-level MLS-birth + HPKE
+/// helper (node DID, injected clock, MLS/HPKE backends, node wrapping keypair);
+/// per-context crypto lives on the actor's `PerContextState` by move.
+pub struct NodeMlsFactory {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
     /// Injected hardened [`Clock`] (ADR-057 §Prereq-1). Used for the provider's
@@ -472,10 +477,10 @@ pub struct MlsCryptoProvider {
     clock: Arc<dyn Clock>,
     /// Injected MLS primitive backend (ADR-049 §15). Production
     /// callers receive a [`ProductionMlsBackend`] from
-    /// [`MlsCryptoProvider::new`]; tests inject failure-driven mocks via
-    /// [`MlsCryptoProvider::with_backends`]. The provider's orchestration
+    /// [`NodeMlsFactory::new`]; tests inject failure-driven mocks via
+    /// [`NodeMlsFactory::with_backends`]. The provider's orchestration
     /// methods route every inline `OpenMLS` primitive through this trait —
-    /// state still lives on the provider's lock-free containers below.
+    /// the factory itself holds no per-context state (post-#2148).
     mls_backend: Arc<dyn MlsBackend>,
     /// Injected HPKE primitive backend (ADR-049 §15). Same
     /// injection contract as `mls_backend` — production wires
@@ -507,7 +512,7 @@ pub struct MlsCryptoProvider {
 }
 
 #[allow(clippy::significant_drop_tightening)]
-impl MlsCryptoProvider {
+impl NodeMlsFactory {
     /// Creates a new production crypto provider for the given local DID.
     ///
     /// Constructs the production [`MlsBackend`] / [`HpkeBackend`]
@@ -530,7 +535,7 @@ impl MlsCryptoProvider {
         )
     }
 
-    /// Creates an `MlsCryptoProvider` with caller-supplied backends.
+    /// Creates a `NodeMlsFactory` with caller-supplied backends.
     ///
     /// Test seam introduced by ADR-049 §15. Production code
     /// uses [`Self::new`]; failure-injection tests instantiate mock
@@ -613,7 +618,7 @@ impl MlsCryptoProvider {
 }
 
 #[allow(clippy::significant_drop_tightening)]
-impl MlsCryptoProvider {
+impl NodeMlsFactory {
     // #2148 (ADR-049 birth-into-actor): the `context_crypto_present` residency
     // probe was DELETED — the provider holds no per-context state, so there is no
     // residency to probe. Actor-owned crypto presence is asserted on the actor's
@@ -636,7 +641,7 @@ impl MlsCryptoProvider {
         // `did:key:*` prefixes so the extensive test suite — which used
         // non-dht test DIDs with the deleted `ContextCryptoProvider`
         // mocks before ADR-049 §15 — continues to work with
-        // the inherent `MlsCryptoProvider` API. Production builds (no
+        // the inherent `NodeMlsFactory` API. Production builds (no
         // `testing` feature) still require `did:dht:z*`.
         let accepted = self.local_did.starts_with("did:dht:z")
             || (cfg!(any(test, feature = "testing"))
@@ -804,7 +809,7 @@ impl MlsCryptoProvider {
                 return Ok(());
             }
             return Err(ContextError::InvalidKeyPackage(
-                "production MlsCryptoProvider requires MLS key package bytes".to_string(),
+                "production NodeMlsFactory requires MLS key package bytes".to_string(),
             ));
         };
 
@@ -1270,8 +1275,8 @@ mod tests {
     /// Test helper: encrypt a message using the old `encrypt_message` path
     /// (sender key + MLS encrypt). Used by provider-level tests that test
     /// the crypto layer directly without the full envelope pipeline.
-    fn make_provider() -> MlsCryptoProvider {
-        MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock))
+    fn make_provider() -> NodeMlsFactory {
+        NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock))
     }
 
     fn make_context_id() -> [u8; 32] {
@@ -1300,7 +1305,7 @@ mod tests {
 
     /// #2148 (ADR-049 birth-into-actor): BIRTH a fresh owned group + local sender
     /// key on `provider` (via the owned-return
-    /// [`MlsCryptoProvider::create_bare_group_owned`]) and seed it onto a
+    /// [`NodeMlsFactory::create_bare_group_owned`]) and seed it onto a
     /// throwaway actor [`PerContextState`] (Encrypted mode). This is the
     /// actor-native replacement for the deleted `create_mls_group` +
     /// `generate_sender_key` + `take_crypto_state` triad: crypto is never
@@ -1311,7 +1316,7 @@ mod tests {
     /// requires every added leaf to declare `0xFF02` support. The seal/open path
     /// binds its OWN `ctx_str` in the AEAD AAD, independent of the group's
     /// committed extension, so a bare group exercises those seams identically.
-    fn take_into_actor(provider: &MlsCryptoProvider, ctx: &[u8; 32]) -> PerContextState {
+    fn take_into_actor(provider: &NodeMlsFactory, ctx: &[u8; 32]) -> PerContextState {
         let owned = provider
             .create_bare_group_owned()
             .expect("birth owned crypto material");
@@ -1327,7 +1332,7 @@ mod tests {
     /// wrapping keypair (public + secret) from the provider exactly as the
     /// production actor-export caller does.
     fn actor_export(
-        provider: &MlsCryptoProvider,
+        provider: &NodeMlsFactory,
         ctx: &[u8; 32],
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
@@ -1344,7 +1349,7 @@ mod tests {
     /// "create+generate on the provider, mutate `contexts[ctx]`, then export"
     /// setup the restore-format tests used.
     fn birth_mutate_export(
-        provider: &MlsCryptoProvider,
+        provider: &NodeMlsFactory,
         ctx: &[u8; 32],
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, ReceiveFloor)>,
@@ -1390,7 +1395,7 @@ mod tests {
     /// self-consistent `(public, secret)` pair from ONE atomic `ArcSwap` load,
     /// stable across repeated calls, and must observe the SAME node-resident
     /// keypair as the test-gated
-    /// [`MlsCryptoProvider::wrapping_keypair_snapshot`] ground truth. Also pins
+    /// [`NodeMlsFactory::wrapping_keypair_snapshot`] ground truth. Also pins
     /// the contract that the secret half returns `Zeroizing` (no bare
     /// `[u8; 32]` secret escapes the provider) via a load-bearing type witness.
     #[test]
@@ -1471,7 +1476,7 @@ mod tests {
         // `did:test:*` so legacy mock-based tests still work; pick a
         // truly malformed DID string to prove rejection.
         let provider =
-            MlsCryptoProvider::new("invalid:format:whatever".to_string(), Arc::new(SystemClock));
+            NodeMlsFactory::new("invalid:format:whatever".to_string(), Arc::new(SystemClock));
         assert!(provider.validate_creator_identity().is_err());
     }
 
@@ -1546,7 +1551,7 @@ mod tests {
         // `now < not_after` check fails.
         let future_now = SystemClock.now_secs() + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS * 2;
         let provider =
-            MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(TestClock::new(future_now)));
+            NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(TestClock::new(future_now)));
 
         let result = provider.validate_key_package(&bob_cred.did, Some(&kp_bytes));
         let err = result.expect_err(
@@ -1562,7 +1567,7 @@ mod tests {
         // same KeyPackage passes the lifetime gate (and every other check),
         // proving the rejection above is caused by the injected clock offset —
         // not by an unrelated defect in the KeyPackage bytes.
-        let live_provider = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let live_provider = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         assert!(
             live_provider
                 .validate_key_package(&bob_cred.did, Some(&kp_bytes))
@@ -1761,7 +1766,7 @@ mod tests {
         // #2148: `process_incoming_sender_key` is a node-level HPKE-open +
         // authentication check that reads only the provider's node-resident
         // wrapping keypair — it needs no per-context group resident.
-        let bob_provider = MlsCryptoProvider::new(
+        let bob_provider = NodeMlsFactory::new(
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
             Arc::new(SystemClock),
         );
@@ -1881,7 +1886,7 @@ mod tests {
         // round-trip across the restored group is pinned by
         // `context::actor::state`'s `golden_seal_open_cross_roundtrip` (which
         // seals from a restored, seeded actor state).
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, _floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
         // Verify sender key state is restored (on the owned material).
@@ -2020,7 +2025,7 @@ mod tests {
         assert!(!exported.is_empty());
 
         // Fresh provider: build the owned material (no insert, no take).
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
         // (a) Owned 8 fields match the snapshot. mls_group functional-equiv is
@@ -2103,7 +2108,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider_b = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider_b = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (_owned_b, floors_b) = provider_b
             .build_restored_owned(&ctx_id, &legacy_bytes)
             .unwrap();
@@ -2246,7 +2251,7 @@ mod tests {
 
         // Restart: fresh provider, rebuild the owned material via the retained
         // restore reader. The floor comes back in RestoredFloors.
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, restored) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
         assert!(
             restored
@@ -2289,7 +2294,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, restored) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
         // The removed-member floor survives in RestoredFloors …
@@ -2344,7 +2349,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, restored) = provider2
             .build_restored_owned(&ctx_id, &legacy_bytes)
             .expect("legacy snapshot (empty epoch map) must restore cleanly");
@@ -2409,7 +2414,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (_owned, restored) = provider2
             .build_restored_owned(&ctx_id, &legacy_bytes)
             .expect("legacy restore must succeed");
@@ -2458,7 +2463,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, restored) = provider2
             .build_restored_owned(&ctx_id, &legacy_bytes)
             .unwrap();
@@ -2529,7 +2534,7 @@ mod tests {
         // must also yield working material (owned-return path, no insert to
         // clobber). Seed an actor from the second result and confirm it is a
         // coherent live encrypted state.
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (_owned1, _f1) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
         let (owned2, _f2) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
@@ -2558,7 +2563,7 @@ mod tests {
             .export_crypto_state(Vec::new(), Vec::new(), wpub, &*wsec)
             .unwrap();
 
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let (owned, _floors) = provider2.build_restored_owned(&ctx_id, &exported).unwrap();
 
         // Verify epoch is preserved on the restored owned material.
@@ -2594,7 +2599,7 @@ mod tests {
         assert!(!exported.is_empty());
 
         // Create a fresh provider (simulates restart — gets a NEW random keypair).
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        let provider2 = NodeMlsFactory::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let fresh_public = provider2.wrapping_keypair.load().public;
         assert_ne!(
             fresh_public, original_public,
@@ -3089,7 +3094,7 @@ mod tests {
     }
 
     /// The production creator write path
-    /// ([`MlsCryptoProvider::create_mls_group_with_context`]) commits the
+    /// ([`NodeMlsFactory::create_mls_group_with_context`]) commits the
     /// `scp_context_params` (`0xFF02`) extension into the group's
     /// `group_context`, byte-identical to the parameters supplied (§5.13.3,
     /// FFI-02).
