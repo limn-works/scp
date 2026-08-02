@@ -631,7 +631,10 @@ fn handle_shutdown_self_actor(
     {
         let mut view = cell.class_c_view();
         if let Some(crypto) = view.mode_mut().crypto_mut() {
-            crypto.dispose_secrets();
+            // #2199: shutdown teardown builds no attestation — discard the observed
+            // `DisposalOutcome` (the `#[must_use]` guards that the close/TTL seams,
+            // which DO build the attestation, consume it).
+            let _ = crypto.dispose_secrets();
         }
     }
     // No per-actor background timer tasks to cancel: the TTL + governance

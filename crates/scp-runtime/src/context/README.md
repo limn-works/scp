@@ -108,8 +108,11 @@ MLS commit-broadcast retry queue (§9 fail-closed, see
   `ContextEventLogProvider`, and the local/no-op provider impls).
 - `providers/` — production provider impls (`MerkleEventLogProvider`,
   the `ProtocolRepository` persistence bridges).
-- `export_import.rs`, `persistence.rs`, `key_destruction.rs`, `policy.rs`,
+- `export_import.rs`, `persistence.rs`, `policy.rs`,
   `app_sandbox.rs`, `governance/`, `outlets/` — feature-specific surfaces.
+  (`key_destruction.rs` was removed in #2199: after #2148 disposal is
+  actor-owned and the truthful `KeyDestructionAttestation` is built at the
+  `ttl_close_helpers::finalize_close` seam — no orchestrator module.)
 - `mod.rs` — `ContextHandle` (the thread-safe lifecycle handle callers hold)
   and the `test_supervisor` convenience constructor.
 

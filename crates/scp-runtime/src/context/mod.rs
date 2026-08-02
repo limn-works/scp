@@ -45,7 +45,6 @@ pub mod governance;
 pub(crate) mod governance_helpers;
 pub(crate) mod governance_logic;
 pub mod invitation_helpers;
-pub mod key_destruction;
 pub(crate) mod lifecycle_helpers;
 pub(crate) mod lifecycle_logic;
 pub(crate) mod manager_methods;

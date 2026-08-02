@@ -4,12 +4,17 @@
 //!
 //! - [`ContextCloseReason`] -- Why a context is closing (TTL expired,
 //!   governance decision, all members left).
-//! - `CloseOrchestrator` (in `scp-runtime`) -- Dispatches close to the correct
-//!   destruction path based on [`MemoryScope`].
 //! - [`SummaryVerificationWindow`] -- Tracks a configurable verification period
 //!   during which participants verify a summary against the event log.
 //! - [`CloseEvent`] -- Structured event recorded in the context event log when
 //!   a close is initiated, a summary is verified, or keys are destroyed.
+//!
+//! The runtime-side `CloseOrchestrator` / `KeyDestructionOrchestrator` that once
+//! dispatched close by [`MemoryScope`] were DELETED in #2199 (they were 100%
+//! dead after #2148 moved crypto disposal onto the context actor). The truthful
+//! key-destruction attestation is now built inline at the actor finalize seam
+//! (`scp_runtime::context::ttl_close_helpers::finalize_close`) from the observed
+//! disposal outcome. The pure-data close types here are retained.
 //!
 //! # Close Sequencing
 //!
@@ -20,17 +25,21 @@
 //!
 //! # Memory Scope Dispatch
 //!
-//! - **Ephemeral:** Keys destroyed immediately via `KeyDestructionOrchestrator`
-//!   (in `scp-runtime`).
-//! - **Summary:** Verification window opens; participants verify summary; after
-//!   the window closes, keys are destroyed as ephemeral.
+//! - **Ephemeral:** Keys destroyed immediately (actor-owned crypto disposal at
+//!   the finalize seam; #2148).
+//! - **Summary:** Specced (spec §5.11 / ADR-018 AC6) as: a verification window
+//!   opens, participants verify the summary, and keys are destroyed as ephemeral
+//!   after the window closes. That window is NOT yet wired — the live
+//!   `finalize_close` seam currently disposes Summary-scope crypto immediately
+//!   (identically to Ephemeral). The `SummaryVerificationWindow` types below are
+//!   retained specced primitives; wiring the window is tracked in #2225.
 //! - **Full:** All keys and data are preserved. No destruction occurs.
 
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::memory_scope::{BlobId, ContextId, KeyDestructionLevel, KeyDestructionResult};
+use super::memory_scope::{ContextId, KeyDestructionLevel};
 use super::{ContextError, MemoryScope};
 use scp_did::DID;
 
@@ -451,88 +460,29 @@ pub enum CloseEvent {
 }
 
 // ---------------------------------------------------------------------------
-// CloseRequest
-// ---------------------------------------------------------------------------
-
-/// Parameters for initiating a context close via `CloseOrchestrator`
-/// (in `scp-runtime`).
-///
-/// Groups the arguments for `CloseOrchestrator::initiate_close` into a
-/// single struct to keep the public API ergonomic.
-pub struct CloseRequest<'r> {
-    /// The context being closed.
-    pub context_id: &'r str,
-    /// Why the context is closing.
-    pub reason: ContextCloseReason,
-    /// The context's memory scope (determines the destruction path).
-    pub memory_scope: MemoryScope,
-    /// Relay URLs where encrypted event data is stored.
-    pub relay_urls: &'r [String],
-    /// Blob identifiers of encrypted event data to request deletion for.
-    pub blob_ids: &'r [BlobId],
-    /// Platform-provided key destruction attestation level.
-    pub attestation_level: KeyDestructionLevel,
-    /// Current member count (used for summary verification window).
-    pub member_count: usize,
-    /// Duration of the summary verification window in seconds. `None` uses
-    /// [`DEFAULT_VERIFICATION_WINDOW_SECS`].
-    pub verification_window_secs: Option<u64>,
-    /// Current Unix timestamp (seconds).
-    pub now: u64,
-}
-
-// ---------------------------------------------------------------------------
-// CloseOrchestrator — moved to scp-runtime
+// CloseOrchestrator / CloseAction / CloseRequest — DELETED (#2199)
 // ---------------------------------------------------------------------------
 //
-// After ADR-049 commit 12c.9e, `CloseOrchestrator` lives in
-// `scp_runtime::context::key_destruction` because it operates on the
-// concrete `NodeMlsFactory`, which is defined in scp-runtime (forward
-// dep of scp-protocol). The pure-data close types (`CloseEvent`,
-// `CloseAction`, `ContextCloseReason`, `CloseRequest`,
-// `SummaryVerificationWindow`, …) remain here because they have no
-// crypto-provider dependency and are used across the protocol → runtime
-// → FFI stack.
-
-// ---------------------------------------------------------------------------
-// CloseAction
-// ---------------------------------------------------------------------------
-
-/// The result of `CloseOrchestrator::initiate_close` (in `scp-runtime`),
-/// describing the next step for the caller.
-#[derive(Debug)]
-pub enum CloseAction {
-    /// Keys were destroyed immediately (Ephemeral scope). The caller should
-    /// transition the context to `Closed` and record the event.
-    KeysDestroyed {
-        /// The close reason.
-        reason: ContextCloseReason,
-        /// The key destruction result (attestation + relay deletion requests).
-        result: KeyDestructionResult,
-        /// The close event to record in the event log.
-        event: CloseEvent,
-    },
-    /// A summary verification window was opened (Summary scope). The caller
-    /// should allow participants to verify the summary during the window,
-    /// then call `CloseOrchestrator::complete_summary_close` (in `scp-runtime`) after the
-    /// window closes.
-    VerificationWindowOpened {
-        /// The close reason.
-        reason: ContextCloseReason,
-        /// The verification window tracker.
-        window: SummaryVerificationWindow,
-        /// The event to record in the event log.
-        event: CloseEvent,
-    },
-    /// All data was preserved (Full scope). The caller should transition the
-    /// context to `Closed` and record the event.
-    Preserved {
-        /// The close reason.
-        reason: ContextCloseReason,
-        /// The close event to record in the event log.
-        event: CloseEvent,
-    },
-}
+// The runtime-side `CloseOrchestrator` / `KeyDestructionOrchestrator` and their
+// pure-data I/O types (`CloseAction`, `CloseRequest`, `KeyDestructionResult`)
+// were DELETED in #2199. After #2148 (ADR-049 birth-into-actor) the sole
+// production caller was a UniFFI-bridge block that built a FABRICATED
+// pre-disposal `KeyDestructionAttestation` (hardcoded `mls_group_destroyed =
+// sender_keys_destroyed = true` off a fake default `ContextParams`) and then
+// discarded it in a log line. #2199 deleted that block; the orchestrators were
+// then 100% dead (every constructor lived only in `mod tests`), so they and
+// their orchestrator-only plumbing types were removed. The TRUTHFUL
+// attestation is now built inline at the actor finalize seam
+// (`scp_runtime::context::ttl_close_helpers::finalize_close`) from the OBSERVED
+// `DisposalOutcome`.
+//
+// The SPECCED close-orchestration data types below/above — `ContextCloseReason`,
+// `CloseEvent`, `SummaryVerificationWindow` (+ its dispute-resolution machinery,
+// #365 / ADR-018 AC6 / spec §5.11) — are RETAINED: they are protocol/event-log
+// types with meaning independent of the deleted orchestrator. Their current
+// lack of a live wiring path is a pre-existing completeness gap tracked in
+// #2225 (wire-or-respec, per artifact-flow — not license to delete a specced
+// feature).
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -548,10 +498,11 @@ pub enum CloseAction {
 mod tests {
     use super::*;
 
-    // Note: `MockCryptoProvider` and all `CloseOrchestrator` integration
-    // tests moved to `scp_runtime::context::key_destruction` in ADR-049
-    // commit 12c.9e — the orchestrator now binds to the concrete
-    // `NodeMlsFactory` which lives in scp-runtime.
+    // Note: the runtime-side `CloseOrchestrator` / `KeyDestructionOrchestrator`
+    // and their integration tests were DELETED in #2199 (attestation honesty
+    // gating) — after #2148 disposal is actor-owned and the truthful
+    // `KeyDestructionAttestation` is built at the `ttl_close_helpers::finalize_close`
+    // seam, so the orchestrator had no production caller.
 
     // -----------------------------------------------------------------------
     // ContextCloseReason tests
