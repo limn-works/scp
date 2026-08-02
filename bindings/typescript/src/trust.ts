@@ -13,7 +13,7 @@
  * 1. **Protocol enforcement** — mechanical pass/fail (UCAN validity,
  *    signatures, capability ceiling, nonce, revocation, expiry).
  * 2. **Behavioral validation** — verified facts from the event log
- *    (participation history, tool usage).
+ *    (participation history, outlet usage).
  * 3. **Attestation authenticity** — verified signatures and evidence
  *    freshness from attestations.
  * 4. **Trust evaluation inputs** — endorsements, challenge results, and
@@ -109,8 +109,8 @@ export interface BehavioralRecord {
   totalDuration: number;
   /** Number of governance actions taken against the subject. */
   governanceActionsAgainst: number;
-  /** Tool invocation history as `{ type, count }` records. */
-  toolInvocations: readonly { readonly type: string; readonly count: number }[];
+  /** Outlet invocation history as `{ type, count }` records. */
+  outletInvocations: readonly { readonly type: string; readonly count: number }[];
   /** Role change history. */
   roleHistory: readonly Record<string, unknown>[];
   /** Endorsement accuracy score (0.0–1.0), if available. */
@@ -691,20 +691,23 @@ export async function evaluateTrust(
     // uses snake_case `actor_did`, the key the bridge's filter parser expects.
     const raw = await scp.eventLogQuery(handle, JSON.stringify({ actor_did: subjectDid }));
     const events = raw as readonly { readonly eventType: string }[];
-    // This thin facade only computes toolInvocations from the raw event stream.
-    // contextsParticipated, totalDuration, and governanceActionsAgainst are not
-    // computable from the NAPI event objects returned by eventLogQuery — they
-    // require aggregate queries not yet exposed over the bridge. Values are set
-    // to 0 (not computed) rather than fabricated. Use the Python SDK for full
-    // behavioral analysis, or await a future native TS aggregate endpoint.
+    // This thin facade only computes outletInvocations from the raw event
+    // stream. contextsParticipated, totalDuration, and governanceActionsAgainst
+    // are not computable from the NAPI event objects returned by eventLogQuery —
+    // they require aggregate queries not yet exposed over the bridge. Values are
+    // set to 0 (not computed) rather than fabricated. Use the Python SDK for
+    // full behavioral analysis, or await a future native TS aggregate endpoint.
     behavioralRecord = {
       contextsParticipated: 0,
       totalDuration: 0,
       governanceActionsAgainst: 0,
-      // Each ToolInvoked event becomes one entry with count: 1.
-      // No aggregation by tool ID — thin facade over the bridge.
-      toolInvocations: events
-        .filter((e) => e.eventType === "ToolInvoked")
+      // Each OutletInvoked event becomes one entry with count: 1. This is the
+      // canonical event type emitted by scp-event-log (EventType::OutletInvoked)
+      // and matches the Python/Swift/Kotlin SDKs — the prior `ToolInvoked`
+      // filter never matched, so this field was always empty (SCP-OUT-006).
+      // No aggregation by outlet ID — thin facade over the bridge.
+      outletInvocations: events
+        .filter((e) => e.eventType === "OutletInvoked")
         .map((e) => ({ type: e.eventType, count: 1 })),
       roleHistory: [],
       endorsementAccuracy: undefined,
