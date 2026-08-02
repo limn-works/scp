@@ -97,17 +97,23 @@ pub trait RelayQuerier: Send + Sync {
     /// Returns EVERY SCPR-decodable record stored at `routing_id`, **without**
     /// verification (framing grants no authority, §9.10.12). The caller (the
     /// [`RealMultiRelayQuerier`](crate::relay_querier::RealMultiRelayQuerier)
-    /// composer) BEP44-verifies each candidate and selects the first valid one.
+    /// composer) BEP44-verifies each candidate and selects the **highest-seq
+    /// valid one** (§3.10.7).
     ///
-    /// Returning a `Vec` — not a single record — is load-bearing: a
-    /// decodable-but-bad-signature blob co-located *before* a valid one at the
-    /// same routing ID must NOT shadow it. Because raw publish is unauthenticated
-    /// and the routing ID is DID-derivable, an attacker can plant a well-framed
-    /// bad-signature frame; returning only the first decodable record would let
-    /// that frame permanently suppress the genuine one (an intra-relay
-    /// suppression denial-of-service, defeating §3.10.6/§3.10.8). The relay
-    /// implementation MUST bound the
-    /// number of candidates it collects (see `TransportRelayQuerier`).
+    /// Returning a `Vec` — not a single record — is load-bearing: the
+    /// composer iterates every candidate and selects the highest-seq-valid
+    /// one, defeating both:
+    /// - A decodable-but-bad-signature blob co-located before the genuine
+    ///   record (an attacker plants a well-framed frame; `verify_relay_record`
+    ///   skips it).
+    /// - A stale-but-validly-signed blob co-located before the current record
+    ///   (an attacker replays an old triple; highest-seq selection skips it,
+    ///   since `seq` is inside the BEP44 signed payload and an attacker cannot
+    ///   forge a higher seq without the owner's private key).
+    ///
+    /// Both variants are intra-relay suppression denial-of-service attacks
+    /// (§3.10.8). The relay implementation MUST bound the number of candidates
+    /// it collects (see `TransportRelayQuerier`).
     ///
     /// # Arguments
     ///

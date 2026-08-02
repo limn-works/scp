@@ -24,8 +24,10 @@
 //! [`TransportRelayQuerier`]: https://docs.rs/scp-transport
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use tracing::warn;
+use tokio::task::JoinSet;
+use tracing::{debug, warn};
 
 use crate::IdentityError;
 use crate::dht::extract_public_key;
@@ -40,13 +42,23 @@ use crate::resolver::{MultiRelayQuerier, RelayRecord};
 /// without constraining any realistic honest-relay workload.
 const MAX_CANDIDATES_PER_RELAY: usize = 16;
 
+/// Per-relay wall-clock budget applied to each concurrent relay query.
+///
+/// With [`JoinSet`] concurrent fan-out each relay query races under this
+/// independent deadline. Without it a single hung relay stalls the
+/// `join_next()` loop until the resolver's outer `LAYER_TIMEOUT` (10 s)
+/// fires and cancels the entire composer future — discarding any valid `best`
+/// already collected from faster relays. At 5 s each task completes (or is
+/// dropped) well before the outer backstop, preserving already-found results.
+const PER_RELAY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The production [`MultiRelayQuerier`] composer over any single-relay
 /// [`RelayQuerier`] (§3.10.2, §3.10.4 step 3a).
 ///
-/// Queries the provided relay URLs in priority order (identity's known relays
-/// first, then bootstrap relays per §3.10.4). For each relay it fetches **all**
-/// decodable candidates (the `Vec` [`RelayQuerier`] contract, bounded by
-/// [`MAX_CANDIDATES_PER_RELAY`]) and selects the one with the highest BEP44
+/// Queries the provided relay URLs concurrently (§3.10.8: "suppression by one
+/// relay source does not prevent resolution"). For each relay it fetches the
+/// returned candidates — up to [`MAX_CANDIDATES_PER_RELAY`] per relay (the `Vec`
+/// [`RelayQuerier`] contract) — and selects the one with the highest BEP44
 /// `seq` among those that pass `verify_relay_record`: BEP44 signature verifies
 /// against the DID's Ed25519 key (§9.6.1) AND the embedded identity key
 /// self-certifies against the DID suffix. Invalid candidates are logged at WARN
@@ -55,8 +67,10 @@ const MAX_CANDIDATES_PER_RELAY: usize = 16;
 ///
 /// # Shadow-defeat (intra-relay suppression, §3.10.8)
 ///
-/// Iterating *every* candidate at a routing ID — not just the first decodable
-/// one — is load-bearing against two attacks:
+/// Iterating the returned candidates at a routing ID — up to
+/// [`MAX_CANDIDATES_PER_RELAY`] per relay, not just the first decodable one — is
+/// load-bearing against two attacks that afflict **honest relays** with
+/// co-located stale/junk frames:
 ///
 /// 1. **Bad-signature shadow.** A decodable-but-bad-signature frame co-located
 ///    before the genuine record must not shadow it; since raw publish is
@@ -70,10 +84,25 @@ const MAX_CANDIDATES_PER_RELAY: usize = 16;
 ///    attacker captures an old triple (seq=1, pre-rotation `#active` key) and
 ///    republishes it co-located before the current record (seq=5). Without
 ///    highest-seq selection, first-valid returns the stale record and the
-///    resolver never sees the fresher one. Selecting highest-seq among all
-///    valid candidates closes this attack: `seq` is inside the BEP44 signed
+///    resolver never sees the fresher one. Selecting highest-seq among the
+///    verified candidates closes this attack: `seq` is inside the BEP44 signed
 ///    payload, so an attacker cannot forge a higher seq without the owner's
 ///    private key (§3.10.7).
+///
+/// # Threat-model boundary (the cap is a `DoS` budget, not a suppression control)
+///
+/// The [`MAX_CANDIDATES_PER_RELAY`] cap bounds the Ed25519 verification budget
+/// per relay. Shadow-defeat therefore holds for **honest** relays: their
+/// co-located junk/stale frames sit alongside O(1) genuine records, well within
+/// the cap. It does NOT hold against a **malicious** relay that deliberately
+/// returns ≥[`MAX_CANDIDATES_PER_RELAY`] junk frames before the genuine record —
+/// such a relay can push the real record past the cap and suppress it. This is
+/// not a new capability: a malicious relay can suppress resolution with zero
+/// effort simply by returning an empty `Vec`. A relay actively trying to
+/// suppress is already in the threat model (§3.10.8 "relay suppresses
+/// document"), and cross-relay + DHT fan-out is the defense against it — not the
+/// intra-relay candidate scan. The cap trades an unbounded-verification `DoS` for
+/// a suppression vector that a malicious relay already possesses for free.
 ///
 /// # Layering
 ///
@@ -116,24 +145,66 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
             let routing_id = did_routing_id(&did);
             let public_key = extract_public_key(&did)?;
 
+            // Query all relays CONCURRENTLY, each guarded by PER_RELAY_TIMEOUT
+            // (§3.10.8: "suppression by one relay source does not prevent
+            // resolution"). Without per-relay timeout, a single hung relay would
+            // stall the join_next() collection loop until the resolver's outer
+            // LAYER_TIMEOUT fires, cancelling the entire composer future and
+            // discarding any `best` already collected from faster relays. With
+            // per-relay timeout each task completes within PER_RELAY_TIMEOUT
+            // regardless of reachability, so the outer timeout is a backstop that
+            // rarely fires. Accumulation order is unspecified (tasks complete as
+            // they finish), but highest-seq selection is order-independent. On a
+            // seq tie the first-received result is retained (strict `>`); this is
+            // acceptable — two valid records at the same seq are byte-identical
+            // (same signed `(value, signature, seq)` payload), only `relay_url`
+            // provenance differs.
+            //
+            // `routing_id` is `[u8; 32]` (Copy); each task gets its own copy.
+            let mut tasks: JoinSet<(String, Vec<_>)> = JoinSet::new();
+            for relay_url in relay_urls {
+                let inner = Arc::clone(&inner);
+                tasks.spawn(async move {
+                    let candidates = match tokio::time::timeout(
+                        PER_RELAY_TIMEOUT,
+                        inner.query(&relay_url, &routing_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            debug!(relay_url = %relay_url, error = %e, "relay query failed — skipping relay");
+                            Vec::new()
+                        }
+                        Err(_elapsed) => {
+                            debug!(relay_url = %relay_url, "relay query timed out — skipping relay");
+                            Vec::new()
+                        }
+                    };
+                    (relay_url, candidates)
+                });
+            }
+
             // Track the highest-seq valid record across all relays (§3.10.4 step 5
             // / §3.10.7: "the highest valid sequence number wins").
             let mut best: Option<RelayRecord> = None;
 
-            for relay_url in &relay_urls {
-                // Fetch EVERY decodable candidate at this routing ID (the `Vec`
-                // contract) so a co-located frame — bad-signature or stale-but-valid
-                // — cannot shadow the genuine current record.
-                let candidates = match inner.query(relay_url, &routing_id).await {
-                    Ok(candidates) => candidates,
+            while let Some(join_result) = tasks.join_next().await {
+                // Transport errors and relay timeouts are already handled inside
+                // the spawned task: they return an empty Vec and skip the relay
+                // without aborting the sweep. A JoinError here is a task panic —
+                // a bug, but still must not abort the sweep.
+                let (relay_url, candidates) = match join_result {
+                    Ok(task_output) => task_output,
                     Err(e) => {
-                        warn!(relay_url, did = %did, error = %e, "relay query failed");
+                        warn!(error = %e, "relay query task panicked unexpectedly");
                         continue;
                     }
                 };
 
                 // Apply a defensive cap: an untrusted relay must not be able to
-                // drive O(N) Ed25519 verifications per resolve (§3.10.8).
+                // drive O(N) Ed25519 verifications per resolve (§3.10.8). This is
+                // a `DoS` budget, not a suppression control — see the type doc.
                 for record in candidates.into_iter().take(MAX_CANDIDATES_PER_RELAY) {
                     // Shared verify: BEP44 signature + UTF-8/JSON + self-cert.
                     // Cross-DID substitution is cryptographically impossible:
@@ -147,7 +218,7 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
                         &record.signature,
                         record.seq,
                     ) {
-                        warn!(relay_url, did = %did, error = %e, "relay candidate failed verification — skipping");
+                        warn!(relay_url = %relay_url, did = %did, error = %e, "relay candidate failed verification — skipping");
                         continue;
                     }
 
@@ -209,7 +280,7 @@ mod tests {
     /// Returns the valid record from relay-b when relay-a has none.
     /// The `relay_url` field in the returned record matches the serving relay.
     #[tokio::test]
-    async fn returns_first_valid_record_with_relay_url() {
+    async fn returns_valid_record_with_relay_url() {
         let (vk, sk) = make_ed25519_keypair();
         let did = did_from_public_key(&vk);
         let routing_id = did_routing_id(&did);
@@ -375,6 +446,55 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none(), "self-certification failure => no record");
+    }
+
+    /// Cross-relay shadow-defeat — stale-valid (§3.10.7): relay-a holds a
+    /// validly-signed STALE record (seq=3) and relay-b holds the current record
+    /// (seq=10). The composer must return relay-b's seq=10, not relay-a's seq=3.
+    /// Without cross-relay highest-seq accumulation, an attacker controlling an
+    /// earlier-priority relay (or a relay that serves a stale but genuine old
+    /// triple captured from any public resolution) could downgrade resolution to
+    /// the stale record and suppress a key rotation.
+    #[tokio::test]
+    async fn cross_relay_highest_seq_wins_over_stale_relay() {
+        let (vk, sk) = make_ed25519_keypair();
+        let did = did_from_public_key(&vk);
+        let routing_id = did_routing_id(&did);
+
+        // relay-a (higher priority, queried first) holds seq=3 — stale.
+        let stale = signed_record(&did, vk.as_bytes(), &sk, 3);
+        // relay-b (lower priority) holds seq=10 — current.
+        let fresh = signed_record(&did, vk.as_bytes(), &sk, 10);
+
+        let inner = InMemoryRelayQuerier::new();
+        inner
+            .insert("wss://relay-a.example.com/scp/v1", &routing_id, stale)
+            .await;
+        inner
+            .insert("wss://relay-b.example.com/scp/v1", &routing_id, fresh)
+            .await;
+
+        let composer = RealMultiRelayQuerier::new(Arc::new(inner));
+        let result = composer
+            .query(
+                &did,
+                &[
+                    "wss://relay-a.example.com/scp/v1".to_owned(),
+                    "wss://relay-b.example.com/scp/v1".to_owned(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let record = result.expect("at least one valid record must be found");
+        assert_eq!(
+            record.seq, 10,
+            "cross-relay highest-seq (10) must beat lower-priority relay's stale seq (3)"
+        );
+        assert_eq!(
+            record.relay_url, "wss://relay-b.example.com/scp/v1",
+            "result must come from the relay that held the freshest record"
+        );
     }
 
     /// An empty relay list returns `Ok(None)` immediately without querying.
