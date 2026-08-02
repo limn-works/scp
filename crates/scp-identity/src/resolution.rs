@@ -13,10 +13,15 @@
 //!
 //! 1. Compute `did_routing_id = SHA-256("scp:did:" || did_string)`.
 //! 2. Extract `public_key` from the DID string (z-base-32 decode).
-//! 3. QUERY relay with `routing_id`, receiving ALL decodable candidates.
-//! 4. For each candidate: verify BEP44 signature against `public_key`.
-//! 5. Accept the FIRST candidate whose signature verifies (shadow-defeat).
-//! 6. Cache the result (24h active, 7d inactive via [`DidCache`](crate::cache::DidCache)).
+//! 3. QUERY relay with `routing_id`, receiving ALL decodable candidates
+//!    (bounded — see [`RelayQuerier`] and [`crate::relay_querier::RealMultiRelayQuerier`]).
+//! 4. For each candidate: verify BEP44 signature + UTF-8/JSON + self-cert
+//!    via [`verify_relay_record`].
+//! 5. Return the HIGHEST-SEQ valid candidate — iterating every candidate
+//!    so neither a bad-signature frame nor a stale-but-valid frame can shadow
+//!    the genuine current record (§3.10.8 intra-relay suppression).
+//!    Caching and cross-layer seq arbitration are owned by
+//!    [`DualLayerResolver`](crate::resolver::DualLayerResolver) (§3.10.4/§3.10.7).
 //!
 //! The [`RelayQuerier`] trait abstracts relay QUERY operations so that
 //! `scp-core` does not depend on `scp-transport`. Production implementations
@@ -147,9 +152,9 @@ pub(crate) fn verify_relay_record(
 ) -> Result<DidDocument, IdentityError> {
     verify_bep44_signature(public_key, signature, value, seq)?;
 
-    let doc_json = String::from_utf8(value.to_vec())
+    let doc_json = std::str::from_utf8(value)
         .map_err(|e| IdentityError::DocumentDeserializationError(format!("invalid UTF-8: {e}")))?;
-    let document = DidDocument::from_json(&doc_json)
+    let document = DidDocument::from_json(doc_json)
         .map_err(|e| IdentityError::DocumentDeserializationError(e.to_string()))?;
 
     verify_self_certification(did, &document)?;

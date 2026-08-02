@@ -119,14 +119,17 @@ pub struct RelayRecord {
 /// multiple relays.
 ///
 /// The relay querier sends a QUERY with `routing_id = did_routing_id(did_string)`
-/// and `limit = 1` to known SCP relays. It returns the first valid BEP44-signed
-/// blob found, or `None` if no relay has the document.
+/// and a bounded multi-candidate limit to known SCP relays (§3.10.2). It
+/// returns the **highest-seq valid** BEP44-signed record found across all
+/// queried relays and candidates, or `None` if no relay has the document.
+/// Both bad-signature and stale-but-valid co-located frames are defeated by
+/// iterating every candidate and selecting highest-seq (§3.10.7, §3.10.8).
 ///
 /// Named `MultiRelayQuerier` to distinguish from [`super::resolution::RelayQuerier`]
 /// which operates on a single relay URL. This trait takes a slice of relay URLs
-/// and selects the best result.
+/// and returns the single best result.
 ///
-/// See §3.10.2 for the relay-based resolution protocol.
+/// See §3.10.2 and §3.10.4 for the relay-based resolution protocol.
 pub trait MultiRelayQuerier: Send + Sync {
     /// Queries SCP relays for a DID document.
     ///

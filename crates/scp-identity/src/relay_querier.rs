@@ -13,7 +13,7 @@
 //!   [`RelayQueryRecord`](crate::resolution::RelayQueryRecord).
 //! - [`MultiRelayQuerier`](crate::resolver::MultiRelayQuerier) — the MULTI-relay
 //!   trait the [`DualLayerResolver`](crate::resolver::DualLayerResolver) composes.
-//!   It takes a slice of relay URLs and returns the first valid record.
+//!   It takes a slice of relay URLs and returns the highest-seq valid record.
 //!
 //! Because [`RealMultiRelayQuerier`] needs only the `scp-identity`
 //! `RelayQuerier` trait, [`did_routing_id`](crate::resolution::did_routing_id),
@@ -32,33 +32,58 @@ use crate::dht::extract_public_key;
 use crate::resolution::{RelayQuerier, did_routing_id, verify_relay_record};
 use crate::resolver::{MultiRelayQuerier, RelayRecord};
 
+/// Maximum number of candidates to verify per relay per resolve call.
+///
+/// Bounds the Ed25519 verification budget against a malicious or compromised
+/// relay that returns a huge candidate list. An honest relay in the typical
+/// case stores O(1) co-located frames; this cap provides defense-in-depth
+/// without constraining any realistic honest-relay workload.
+const MAX_CANDIDATES_PER_RELAY: usize = 16;
+
 /// The production [`MultiRelayQuerier`] composer over any single-relay
 /// [`RelayQuerier`] (§3.10.2, §3.10.4 step 3a).
 ///
 /// Queries the provided relay URLs in priority order (identity's known relays
 /// first, then bootstrap relays per §3.10.4). For each relay it fetches **all**
-/// decodable candidates (the `Vec` [`RelayQuerier`] contract) and returns the
-/// FIRST valid one: a record whose BEP44 signature verifies against the DID's
-/// Ed25519 key (§9.6.1) AND whose embedded identity key self-certifies against
-/// the DID suffix. Invalid candidates are logged at WARN and skipped — WITHIN a
-/// relay's candidate list AND across relays.
+/// decodable candidates (the `Vec` [`RelayQuerier`] contract, bounded by
+/// [`MAX_CANDIDATES_PER_RELAY`]) and selects the one with the highest BEP44
+/// `seq` among those that pass `verify_relay_record`: BEP44 signature verifies
+/// against the DID's Ed25519 key (§9.6.1) AND the embedded identity key
+/// self-certifies against the DID suffix. Invalid candidates are logged at WARN
+/// and skipped — WITHIN a relay's candidate list AND across relays. The overall
+/// best across all relays is returned.
 ///
 /// # Shadow-defeat (intra-relay suppression, §3.10.8)
 ///
 /// Iterating *every* candidate at a routing ID — not just the first decodable
-/// one — is load-bearing. A decodable-but-bad-signature frame co-located before
-/// the genuine record must not shadow it; since raw publish is unauthenticated
-/// and the routing ID is DID-derivable, an attacker could otherwise plant one
-/// well-framed bad-signature blob to permanently suppress relay resolution.
+/// one — is load-bearing against two attacks:
+///
+/// 1. **Bad-signature shadow.** A decodable-but-bad-signature frame co-located
+///    before the genuine record must not shadow it; since raw publish is
+///    unauthenticated and the routing ID is DID-derivable, an attacker could
+///    plant one well-framed bad-signature blob to permanently suppress relay
+///    resolution on an honest relay.
+///
+/// 2. **Stale-valid shadow (version rollback).** Old DID documents are
+///    legitimately signed by the DID key and their `(value, signature, seq)`
+///    triples are public (previously published, cached by any resolver). An
+///    attacker captures an old triple (seq=1, pre-rotation `#active` key) and
+///    republishes it co-located before the current record (seq=5). Without
+///    highest-seq selection, first-valid returns the stale record and the
+///    resolver never sees the fresher one. Selecting highest-seq among all
+///    valid candidates closes this attack: `seq` is inside the BEP44 signed
+///    payload, so an attacker cannot forge a higher seq without the owner's
+///    private key (§3.10.7).
 ///
 /// # Layering
 ///
-/// This composer performs **no** cache read/write and **no** sequence-number
-/// freshness check — the [`DualLayerResolver`](crate::resolver::DualLayerResolver)
-/// owns cross-layer sequence arbitration, rollback rejection, and caching
-/// (§3.10.4/§3.10.7). It verifies each record only to select the first VALID
-/// one; the resolver independently re-verifies the returned record (defense in
-/// depth), via the same shared [`verify_relay_record`] path.
+/// This composer owns **intra-relay candidate selection** (highest-seq among
+/// valid candidates at each relay's candidate list). The
+/// [`DualLayerResolver`](crate::resolver::DualLayerResolver) owns
+/// **cross-layer sequence arbitration** (relay result vs DHT result), rollback
+/// rejection against the cached high-water mark, and caching (§3.10.4/§3.10.7).
+/// The resolver independently re-verifies the returned record (defense in
+/// depth) via the same shared [`verify_relay_record`] path.
 pub struct RealMultiRelayQuerier<Q: RelayQuerier> {
     /// The single-relay querier (production: `TransportRelayQuerier`).
     inner: Arc<Q>,
@@ -91,10 +116,14 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
             let routing_id = did_routing_id(&did);
             let public_key = extract_public_key(&did)?;
 
+            // Track the highest-seq valid record across all relays (§3.10.4 step 5
+            // / §3.10.7: "the highest valid sequence number wins").
+            let mut best: Option<RelayRecord> = None;
+
             for relay_url in &relay_urls {
                 // Fetch EVERY decodable candidate at this routing ID (the `Vec`
-                // contract) so a bad-signature frame co-located before the
-                // genuine record cannot shadow it.
+                // contract) so a co-located frame — bad-signature or stale-but-valid
+                // — cannot shadow the genuine current record.
                 let candidates = match inner.query(relay_url, &routing_id).await {
                     Ok(candidates) => candidates,
                     Err(e) => {
@@ -103,10 +132,14 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
                     }
                 };
 
-                for record in candidates {
+                // Apply a defensive cap: an untrusted relay must not be able to
+                // drive O(N) Ed25519 verifications per resolve (§3.10.8).
+                for record in candidates.into_iter().take(MAX_CANDIDATES_PER_RELAY) {
                     // Shared verify: BEP44 signature + UTF-8/JSON + self-cert.
-                    // The embedded identity key must match the DID suffix, so
-                    // record substitution is cryptographically impossible.
+                    // Cross-DID substitution is cryptographically impossible:
+                    // the embedded identity key must match the DID suffix, and
+                    // `seq` is inside the signed payload so an attacker cannot
+                    // forge a higher seq without the owner's private key.
                     if let Err(e) = verify_relay_record(
                         &did,
                         &public_key,
@@ -118,18 +151,21 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
                         continue;
                     }
 
-                    // First valid record wins. The resolver re-verifies and owns
-                    // sequence arbitration + caching.
-                    return Ok(Some(RelayRecord {
-                        value: record.value,
-                        signature: record.signature,
-                        seq: record.seq,
-                        relay_url: relay_url.clone(),
-                    }));
+                    // Highest-seq valid record wins (§3.10.4 step 5, §3.10.7).
+                    if best.as_ref().is_none_or(|b| record.seq > b.seq) {
+                        best = Some(RelayRecord {
+                            value: record.value,
+                            signature: record.signature,
+                            seq: record.seq,
+                            relay_url: relay_url.clone(),
+                        });
+                    }
                 }
             }
 
-            Ok(None)
+            // The resolver re-verifies the returned record (defense in depth)
+            // and owns cross-layer sequence arbitration + caching.
+            Ok(best)
         }
     }
 }
@@ -170,7 +206,7 @@ mod tests {
         }
     }
 
-    /// Returns the first valid record when relay-b has it and relay-a has none.
+    /// Returns the valid record from relay-b when relay-a has none.
     /// The `relay_url` field in the returned record matches the serving relay.
     #[tokio::test]
     async fn returns_first_valid_record_with_relay_url() {
@@ -240,12 +276,13 @@ mod tests {
         );
     }
 
-    /// Intra-relay shadow-defeat (§3.10.8): a decodable but bad-signature frame
-    /// co-located FIRST at the SAME `routing_id` on the SAME relay must NOT shadow
-    /// the valid frame stored after it. The composer must iterate every candidate
-    /// and still return the valid record — otherwise an attacker planting one
-    /// well-framed bad-signature blob (raw publish is unauthenticated, the
-    /// `routing_id` is DID-derivable) permanently suppresses relay resolution.
+    /// Intra-relay shadow-defeat — bad-signature (§3.10.8): a decodable but
+    /// bad-signature frame co-located FIRST at the SAME `routing_id` on the
+    /// SAME relay must NOT shadow the valid frame stored after it. The composer
+    /// must iterate every candidate and still return the valid record —
+    /// otherwise an attacker planting one well-framed bad-signature blob
+    /// (raw publish is unauthenticated, the `routing_id` is DID-derivable)
+    /// permanently suppresses relay resolution.
     #[tokio::test]
     async fn skips_bad_candidate_colocated_before_valid_at_same_relay() {
         let (vk, sk) = make_ed25519_keypair();
@@ -274,6 +311,45 @@ mod tests {
         let record = result.expect("valid co-located record must still resolve");
         assert_eq!(record.seq, 3);
         assert_eq!(record.relay_url, "wss://relay-a.example.com/scp/v1");
+    }
+
+    /// Intra-relay shadow-defeat — stale-valid (§3.10.7, §3.10.8): a
+    /// validly-signed STALE record (seq=1) co-located BEFORE the current record
+    /// (seq=5) at the SAME relay must NOT shadow the fresh record. The composer
+    /// must return the HIGHEST-SEQ valid candidate, not the first. Old DID
+    /// documents have good BEP44 signatures (the owner signed them once); an
+    /// attacker with access to a captured old triple can replay it at the
+    /// DID-derivable `routing_id` to roll back a key rotation.
+    #[tokio::test]
+    async fn highest_seq_wins_over_stale_colocated_at_same_relay() {
+        let (vk, sk) = make_ed25519_keypair();
+        let did = did_from_public_key(&vk);
+        let routing_id = did_routing_id(&did);
+
+        // Stale record (seq=1) inserted FIRST — this is the shadow-attack vector.
+        let stale = signed_record(&did, vk.as_bytes(), &sk, 1);
+        // Fresh record (seq=5) inserted SECOND — must win per §3.10.7.
+        let fresh = signed_record(&did, vk.as_bytes(), &sk, 5);
+
+        let inner = InMemoryRelayQuerier::new();
+        inner
+            .insert("wss://relay-a.example.com/scp/v1", &routing_id, stale)
+            .await;
+        inner
+            .insert("wss://relay-a.example.com/scp/v1", &routing_id, fresh)
+            .await;
+
+        let composer = RealMultiRelayQuerier::new(Arc::new(inner));
+        let result = composer
+            .query(&did, &["wss://relay-a.example.com/scp/v1".to_owned()])
+            .await
+            .unwrap();
+
+        let record = result.expect("at least one valid record must be found");
+        assert_eq!(
+            record.seq, 5,
+            "fresh record (seq=5) must win over stale (seq=1) — first-valid would return 1"
+        );
     }
 
     /// Self-certification failure: a record signed with the correct key but
