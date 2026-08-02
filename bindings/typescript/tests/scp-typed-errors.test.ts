@@ -133,7 +133,6 @@ describe("SCP typed-error mapping", () => {
     expect((thrown as OutletError).code).toBe("SCP-OUTLET-6002");
   });
 
-
   it("maps a sync identity error from a sync method (identityRemove)", () => {
     const { scp, native } = mountMockScp();
     native.__stub("identityRemove", () => {

@@ -95,7 +95,6 @@ export type {
   AggregationInput,
   Attestation,
   BehavioralRecord,
-  CapabilityValidation,
   ChallengeResult,
   Endorsement,
   TrustEvaluation,
@@ -154,7 +153,7 @@ export type {
   ShadowIdentity,
   ShadowStatus,
 } from "./bridge";
-export { evaluateTrust as bridgeEvaluateTrust, bridgeRegister } from "./bridge";
+export { bridgeRegister, evaluateTrust as bridgeEvaluateTrust } from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)

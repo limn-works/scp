@@ -34,6 +34,7 @@ import type {
   AttestationType,
   AttestorInfo,
   CachedAttestation,
+  CapabilityValidation,
   ChallengeVerification,
   ConsequenceRule,
   EventLogEntry,
@@ -99,37 +100,6 @@ export interface AggregatedTrustInput {
 // ---------------------------------------------------------------------------
 // Four-layer trust evaluation (spec §7.2–7.5, ADR-017)
 // ---------------------------------------------------------------------------
-
-/**
- * Layer 1: Protocol enforcement results (mechanical, pass/fail).
- *
- * All fields must be `true` for the subject to be considered protocol-
- * compliant. Each field is set independently from the classified UCAN
- * validation failure, mirroring the Python `CapabilityValidation` dataclass.
- */
-export interface CapabilityValidation {
-  /** UCAN tokens parse and have valid structure. */
-  tokensValid: boolean;
-  /** All signatures verify against the claimed DIDs. */
-  signaturesValid: boolean;
-  /**
-   * Requested capabilities are within the context's ceiling.
-   *
-   * Evaluated against `att[0]` only. A token with multiple `att` entries does
-   * not have all entries checked — only the first declared capability URI
-   * (`att[0].with`) is sent to the bridge. Full multi-att ceiling validation
-   * requires a single bridge call that validates all URIs while consuming the
-   * nonce only once; until that bridge op exists, only `att[0]` is checked.
-   * Tracked as SCP-302.
-   */
-  withinCeiling: boolean;
-  /** Nonce validation passed (step 9: no reuse, not stale, valid format). */
-  nonceValid: boolean;
-  /** No tokens have been revoked. */
-  notRevoked: boolean;
-  /** Token time bounds are valid (not expired, not pre-dated, valid range). */
-  timeBoundsValid: boolean;
-}
 
 /** Layer 2: Behavioral validation (verified facts from the event log). */
 export interface BehavioralRecord {
@@ -542,9 +512,10 @@ async function validateOneCapUri(
   handle: unknown,
   token: string,
   capUri: string,
+  presentingAgentDid: string,
 ): Promise<CapabilityValidation | null> {
   try {
-    await scp.ucanValidate(handle, token, capUri);
+    await scp.ucanValidate(handle, token, capUri, presentingAgentDid);
     return null; // success
   } catch (error) {
     // The NAPI bridge emits UCAN errors in the form
@@ -624,6 +595,7 @@ async function evaluateLayer1(
   scp: SCP,
   handle: unknown,
   capabilityTokens: readonly string[] | undefined,
+  presentingAgentDid: string,
 ): Promise<CapabilityValidation> {
   if (capabilityTokens === undefined || capabilityTokens.length === 0) {
     return { ...ALL_LAYER1_FIELDS_FALSE };
@@ -649,7 +621,7 @@ async function evaluateLayer1(
       return { ...ALL_LAYER1_FIELDS_FALSE };
     }
 
-    const narrowed = await validateOneCapUri(scp, handle, token, capUri);
+    const narrowed = await validateOneCapUri(scp, handle, token, capUri, presentingAgentDid);
     if (narrowed !== null) {
       // Fail-fast: return the narrowed verdict immediately.
       return narrowed;
@@ -709,7 +681,7 @@ export async function evaluateTrust(
   const contextId = context.contextId;
 
   // Layer 1: validate capability tokens (if any) against the context handle.
-  const capabilityValidation = await evaluateLayer1(scp, handle, capabilityTokens);
+  const capabilityValidation = await evaluateLayer1(scp, handle, capabilityTokens, subjectDid);
 
   // Layer 2: query behavioral record from the event log.
   let behavioralRecord: BehavioralRecord | null = null;
