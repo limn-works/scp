@@ -20,11 +20,21 @@
 //! This slice provides the pure data type, its byte-exact serialization, and the
 //! `0xFF03` `LeafNode`-extension helpers ONLY. It carries **no** signer, **no**
 //! verifier, and **no** runtime wiring — those are later CRYPTO-22 slices. The
-//! signature is stored/parsed as an opaque `[u8; 64]`; [`signing_preimage`] and
-//! [`signing_hash`] expose the bytes a later signer signs over.
+//! signature is stored/parsed as an opaque `[u8; 64]`.
 //!
-//! [`signing_preimage`]: KeyPackageAttestation::signing_preimage
+//! # What a later signer signs
+//!
+//! The **only** signable output is [`signing_hash`]: the 32-byte
+//! `SHA-256(signing_preimage())` prehash. A later CRYPTO-22 slice's signer MUST
+//! compute the Ed25519 signature over that 32-byte hash — and over **nothing
+//! else**. It MUST NOT sign the raw `signing_preimage()` bytes, and it MUST NOT
+//! sign the [`to_extension_body`] output. `signing_preimage()` is
+//! crate-internal (`pub(crate)`): it exists only to build the hash and to
+//! reproduce the §25.23 Vector 37 known-answer test. Signing the wrong bytes
+//! would silently diverge from Vector 37 and from every other binding.
+//!
 //! [`signing_hash`]: KeyPackageAttestation::signing_hash
+//! [`to_extension_body`]: KeyPackageAttestation::to_extension_body
 //!
 //! # Serialization (§9.5.1 canonical construction)
 //!
@@ -42,6 +52,7 @@
 
 use openmls::prelude::*;
 use scp_did::SigningKeyId;
+use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 use sha2::{Digest, Sha256};
 
 use crate::error::MlsError;
@@ -163,47 +174,52 @@ pub struct KeyPackageAttestation {
 }
 
 impl KeyPackageAttestation {
-    /// Writes the eight attestation fields — **without** the domain separator —
-    /// into `buf` using the §9.5.1 canonical field encoding.
+    /// Returns the eight attestation fields as [`CanonicalField`]s in §9.5.2
+    /// order, ready for the shared §9.5.1 canonical builder
+    /// ([`canonical_hash_bytes`]).
     ///
-    /// This is the shared core of [`signing_preimage`](Self::signing_preimage)
-    /// (which prepends the domain) and [`to_extension_body`](Self::to_extension_body)
-    /// (which appends the signature). The two variable-length fields (`did`,
-    /// `signing_key_id`) carry a 4-byte big-endian length prefix; the four public
-    /// keys are raw 32-byte values; the two timestamps are 8-byte big-endian.
-    ///
-    /// Infallible by contract: `did`/`signing_key_id` are far below the
-    /// `u32::MAX` length-prefix ceiling, so the `u32::try_from` fallback branch
-    /// (an impossible >4 GiB field) is unreachable in practice and never panics.
-    fn write_canonical_fields(&self, buf: &mut Vec<u8>) {
-        // Field 1: did — 4-byte BE length prefix + UTF-8 bytes.
-        let did = self.did.as_bytes();
-        buf.extend_from_slice(&u32::try_from(did.len()).unwrap_or(u32::MAX).to_be_bytes());
-        buf.extend_from_slice(did);
-        // Fields 2–5: the four raw 32-byte public keys, no length prefix.
-        buf.extend_from_slice(&self.leaf_signature_key);
-        buf.extend_from_slice(&self.leaf_encryption_key);
-        buf.extend_from_slice(&self.init_key);
-        buf.extend_from_slice(&self.wrapping_key);
-        // Field 6: signing_key_id — 4-byte BE length prefix + UTF-8 ("#active"/"#agent").
-        let skid = self.signing_key_id.as_bytes();
-        buf.extend_from_slice(&u32::try_from(skid.len()).unwrap_or(u32::MAX).to_be_bytes());
-        buf.extend_from_slice(skid);
-        // Fields 7–8: the two timestamps, 8-byte BE.
-        buf.extend_from_slice(&self.issued_at.to_be_bytes());
-        buf.extend_from_slice(&self.expires_at.to_be_bytes());
+    /// This is the single canonicalization codepath shared by
+    /// [`signing_preimage`](Self::signing_preimage) (which passes the domain
+    /// separator) and [`to_extension_body`](Self::to_extension_body) (which
+    /// passes an empty domain and appends the signature). The two
+    /// variable-length fields (`did`, `signing_key_id`) are encoded as
+    /// [`CanonicalField::VarBytes`] (4-byte big-endian length prefix + bytes);
+    /// the four public keys are [`CanonicalField::Fixed32`] (raw 32 bytes, no
+    /// prefix); the two timestamps are [`CanonicalField::U64`] (8-byte
+    /// big-endian).
+    const fn canonical_fields(&self) -> [CanonicalField<'_>; 8] {
+        [
+            // Field 1: did.
+            CanonicalField::VarBytes(self.did.as_bytes()),
+            // Fields 2–5: the four raw 32-byte public keys.
+            CanonicalField::Fixed32(&self.leaf_signature_key),
+            CanonicalField::Fixed32(&self.leaf_encryption_key),
+            CanonicalField::Fixed32(&self.init_key),
+            CanonicalField::Fixed32(&self.wrapping_key),
+            // Field 6: signing_key_id ("#active"/"#agent").
+            CanonicalField::VarBytes(self.signing_key_id.as_bytes()),
+            // Fields 7–8: the two timestamps.
+            CanonicalField::U64(self.issued_at),
+            CanonicalField::U64(self.expires_at),
+        ]
     }
 
     /// Returns the §9.5.1 canonical **signing preimage**: the domain separator
     /// followed by the eight fields (§9.5.2). This is the byte string whose
     /// SHA-256 is the [`signing_hash`](Self::signing_hash) that the Ed25519
     /// signature covers. For §25.23 Vector 37 this is exactly 211 bytes.
+    ///
+    /// Crate-internal: the only external signable output is
+    /// [`signing_hash`](Self::signing_hash). This method exists to build that
+    /// hash and to reproduce the §25.23 Vector 37 known-answer test.
+    ///
+    /// Infallible: the shared builder only errors on a >`u32::MAX` `VarBytes`
+    /// field (`did`/`signing_key_id` are orders of magnitude smaller), so
+    /// `unwrap_or_default` is a total function here and never panics.
     #[must_use]
-    pub fn signing_preimage(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(SCP_KEYPACKAGE_ATTESTATION_DOMAIN.len() + 181);
-        buf.extend_from_slice(SCP_KEYPACKAGE_ATTESTATION_DOMAIN);
-        self.write_canonical_fields(&mut buf);
-        buf
+    pub(crate) fn signing_preimage(&self) -> Vec<u8> {
+        canonical_hash_bytes(SCP_KEYPACKAGE_ATTESTATION_DOMAIN, &self.canonical_fields())
+            .unwrap_or_default()
     }
 
     /// Returns the 32-byte signing hash `SHA-256(signing_preimage())` (§9.5.1).
@@ -222,10 +238,18 @@ impl KeyPackageAttestation {
     /// length-prefixed binary encoding (explicitly NOT MessagePack/JCS) so all
     /// bindings produce byte-identical bytes. For §25.23 Vector 37 this is exactly
     /// 245 bytes (181 field bytes + 64 signature bytes).
+    ///
+    /// This is NOT a signable input: the Ed25519 signature is computed over
+    /// [`signing_hash`](Self::signing_hash), never over this body.
+    ///
+    /// Infallible: as with [`signing_preimage`](Self::signing_preimage), the
+    /// shared builder cannot error for these bounded fields, so
+    /// `unwrap_or_default` never panics.
     #[must_use]
     pub fn to_extension_body(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(181 + SIGNATURE_SIZE);
-        self.write_canonical_fields(&mut buf);
+        // Empty domain: the extension body is the canonical field encoding with
+        // NO domain separator (b"" prepends nothing), then the raw signature.
+        let mut buf = canonical_hash_bytes(b"", &self.canonical_fields()).unwrap_or_default();
         buf.extend_from_slice(&self.signature);
         buf
     }
@@ -605,6 +629,82 @@ mod tests {
         assert!(KeyPackageAttestation::from_extension_body(&body).is_err());
     }
 
+    /// Helper: hand-builds an `0xFF03`-style body from raw component byte
+    /// slices, so a test can inject a malformed `did` / `signing_key_id`
+    /// (invalid UTF-8, oversized length prefix) that [`to_extension_body`]
+    /// could never emit.
+    fn build_body(
+        did_len_prefix: [u8; 4],
+        did: &[u8],
+        skid_len_prefix: [u8; 4],
+        skid: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&did_len_prefix);
+        body.extend_from_slice(did);
+        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // leaf_signature_key
+        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // leaf_encryption_key
+        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // init_key
+        body.extend_from_slice(&[0u8; PUBLIC_KEY_SIZE]); // wrapping_key
+        body.extend_from_slice(&skid_len_prefix);
+        body.extend_from_slice(skid);
+        body.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+        body.extend_from_slice(&1_700_086_400u64.to_be_bytes());
+        body.extend_from_slice(&[0u8; SIGNATURE_SIZE]);
+        body
+    }
+
+    #[test]
+    fn from_extension_body_rejects_non_utf8_did() {
+        // did bytes 0xFF 0xFE are not valid UTF-8.
+        let bad_did: &[u8] = &[0xFF, 0xFE];
+        let body = build_body(
+            u32::try_from(bad_did.len()).unwrap().to_be_bytes(),
+            bad_did,
+            u32::try_from(b"#active".len()).unwrap().to_be_bytes(),
+            b"#active",
+        );
+        assert!(
+            KeyPackageAttestation::from_extension_body(&body).is_err(),
+            "non-UTF-8 did must be rejected, not panic"
+        );
+    }
+
+    #[test]
+    fn from_extension_body_rejects_non_utf8_signing_key_id() {
+        // signing_key_id bytes 0xFF 0xFE are not valid UTF-8 (rejected at the
+        // UTF-8 check, before the "#active"/"#agent" fragment check).
+        let bad_skid: &[u8] = &[0xFF, 0xFE];
+        let did = b"did:dht:z6MkLeafAttest";
+        let body = build_body(
+            u32::try_from(did.len()).unwrap().to_be_bytes(),
+            did,
+            u32::try_from(bad_skid.len()).unwrap().to_be_bytes(),
+            bad_skid,
+        );
+        assert!(
+            KeyPackageAttestation::from_extension_body(&body).is_err(),
+            "non-UTF-8 signing_key_id must be rejected, not panic"
+        );
+    }
+
+    #[test]
+    fn from_extension_body_rejects_oversized_signing_key_id_length_prefix() {
+        // Oversized length prefix on the signing_key_id field specifically
+        // (the `did` field parses cleanly first, isolating the skid overrun).
+        let did = b"did:dht:z6MkLeafAttest";
+        let body = build_body(
+            u32::try_from(did.len()).unwrap().to_be_bytes(),
+            did,
+            [0xFF, 0xFF, 0xFF, 0xFF], // claims ~4 GiB skid — overruns the buffer
+            b"#active",
+        );
+        assert!(
+            KeyPackageAttestation::from_extension_body(&body).is_err(),
+            "oversized signing_key_id length prefix must be rejected, not panic"
+        );
+    }
+
     #[test]
     fn from_extension_body_rejects_unknown_signing_key_id() {
         // Hand-build a body with a bogus signing_key_id fragment ("#0").
@@ -692,11 +792,5 @@ mod tests {
             b"SCP-KEYPACKAGE-ATTESTATION-V1:"
         );
         assert_eq!(SCP_KEYPACKAGE_ATTESTATION_DOMAIN.len(), 30);
-    }
-
-    /// `AttestationTrigger` is a distinct two-variant enum (used by later slices).
-    #[test]
-    fn attestation_trigger_variants_distinct() {
-        assert_ne!(AttestationTrigger::Add, AttestationTrigger::Update);
     }
 }
