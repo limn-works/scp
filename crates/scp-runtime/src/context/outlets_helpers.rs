@@ -569,6 +569,16 @@ pub struct InvocationCaveatBinding {
 /// insufficient-funds reverse-map arms already use).
 const SCP_OUTLET_6080_MARKER: &str = "SCP-OUTLET-6080";
 
+/// The `SCP-OUTLET-6089` "invoker is not a member" marker string.
+///
+/// Stamped into the `PermissionDenied` message by the
+/// [`reserve_outlet_stream_economy`] membership gate and matched back out by
+/// [`reserve_error_to_open_rejection`]. Kept as one const so the producer and
+/// the reverse-map consumer move together — a permanent membership/authorization
+/// denial must map to a NON-retryable class, never the retryable transport
+/// rate-limit the catch-all uses (mirrors the 6080 marker discipline).
+const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
+
 /// Fail-closed `ContextState::Active` gate for the outlet forward-debit reserve
 /// paths (#2196).
 ///
@@ -1235,7 +1245,7 @@ pub async fn reserve_outlet_stream_economy(
             .rollback(invoker_did, velocity_token);
         gov.hard_rate_limit_mut().refund(invoker_did);
         return Err(ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6089: invoker {invoker_did} is not a member of context \
+            "{SCP_OUTLET_6089_MARKER}: invoker {invoker_did} is not a member of context \
              '{context_id}' — cannot open a stream"
         )));
     }
@@ -3041,6 +3051,23 @@ pub fn reserve_error_to_open_rejection(
                 .to_owned();
             OpenStreamRejection::ContextNotActive { current_state }
         }
+        // #2196 error-masking fix — the membership gate emits SCP-OUTLET-6089
+        // (invoker is not a member of the context) as a plain `PermissionDenied`.
+        // `open_outlet_stream_phase1` runs no membership check before the reserve,
+        // so a non-member same-context open flows here. It is a PERMANENT
+        // authorization denial — map it to the non-retryable authorization-denied
+        // class (`authorization.denied` → CODE_AUTHORIZATION_DENIED,
+        // SCP-OUTLET-6110, RetryPolicy::Never), NOT the retryable transport
+        // rate-limit the catch-all uses. Routed through `CaveatPostInputViolation`
+        // (its non-schema slug branch yields CODE_AUTHORIZATION_DENIED), matching
+        // how `invocation_error_to_open_rejection` maps `InvokerNotAuthorized`.
+        ContextError::PermissionDenied(msg) if msg.contains(SCP_OUTLET_6089_MARKER) => {
+            OpenStreamRejection::CaveatPostInputViolation {
+                slug: error_codes::SLUG_AUTHORIZATION_DENIED.to_owned(),
+            }
+        }
+        // A persist failure / mailbox fault / any other reserve error is GENUINELY
+        // transient — keep it on the retryable transport-fault path.
         _ => OpenStreamRejection::AdmissionRateLimited {
             slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
         },
@@ -5511,6 +5538,62 @@ mod tests {
                     "the seeded open-time record is left un-bumped ({target})"
                 );
             }
+        }
+
+        /// #2196 error-masking — a non-member same-context open produces the
+        /// canonical SCP-OUTLET-6089 membership denial, and the supervisor-side
+        /// reverse-map (`reserve_error_to_open_rejection`) must route that
+        /// PERMANENT authorization failure to a NON-retryable class, NOT the
+        /// retryable transport rate-limit the catch-all uses. Feeds the REAL
+        /// reserve error through the reverse-map so the producer marker + consumer
+        /// match move together.
+        #[tokio::test]
+        async fn non_member_open_maps_to_non_retryable_authorization() {
+            use scp_protocol::context::outlets::error_codes;
+            use scp_protocol::context::outlets::errors::RetryPolicy;
+
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut state = PerContextState::new_for_test_encrypted([CTX_BYTE; 32], NOW, invoker());
+            state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("transition to Active");
+            state
+                .governance
+                .budget_tracker
+                .grant(&invoker(), Amount::new(1000));
+            // NOTE: no `add_member` — the invoker is not on the roster, so the
+            // membership gate (not the active gate) fires with 6089.
+            let mut cell = ClassSCell::new(state);
+
+            let err = reserve(&mut cell, &deps, 10, 4, None)
+                .await
+                .expect_err("a non-member cannot open a stream");
+            let ContextError::PermissionDenied(msg) = &err else {
+                panic!("expected PermissionDenied(SCP-OUTLET-6089), got {err:?}");
+            };
+            assert!(
+                msg.contains("SCP-OUTLET-6089"),
+                "the reserve emits the canonical 6089 membership marker: {msg}"
+            );
+
+            let rejection = super::super::reserve_error_to_open_rejection(&err);
+            assert_ne!(
+                rejection.error_code(),
+                error_codes::CODE_TRANSPORT_FAULT,
+                "a permanent membership denial must NOT surface the retryable \
+                 transport-fault code (the pre-fix catch-all bug)"
+            );
+            assert_eq!(
+                rejection.error_code(),
+                error_codes::CODE_AUTHORIZATION_DENIED,
+                "6089 maps to the authorization-denied class (SCP-OUTLET-6110)"
+            );
+            assert_eq!(
+                error_codes::error_code_to_retry_policy(rejection.error_code()),
+                Some(RetryPolicy::Never),
+                "a 6089 membership denial must be NON-retryable"
+            );
         }
     }
 }
