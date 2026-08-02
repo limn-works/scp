@@ -1,0 +1,164 @@
+{
+  "version": "1.0",
+  "vectors": [
+    {
+      "name": "stream_receipt_kat",
+      "spec": {
+        "caller_context_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "target_context_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "caller_did": "did:example:caller",
+        "nonce": "33333333333333333333333333333333",
+        "outlet_registration_id": "calc.stream",
+        "stream_manifest_hash": "5555555555555555555555555555555555555555555555555555555555555555",
+        "outlet_invoked_event_id": "evt-outlet-invoked-1",
+        "chain_depth": 3,
+        "timestamp_ms": 1709654400000,
+        "target_signing_seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        "expected_preimage_hex": "34ec3d62b54c757e2286c1384c36fd51b6aaeb74bf57034a5d0794e90ee8a990",
+        "expected_signature_hex": "eaa9813d9f3a4efec4c8adbb53a10f1a349df092d97f42c574fe53407b2be2bcab642d639fa4bfd7e4a641b554d0933dd7927fdf45e09558a51a57eef9fef305"
+      }
+    },
+    {
+      "name": "seal_phase",
+      "spec": {
+        "context_id": "ctx-target-seal",
+        "outlet_id": "outlet-xctx-seal",
+        "invoker_did": "did:key:z6MkStreamSagaVectorInvokerReference",
+        "estimated_chunk_count": 3,
+        "ucan_cid": "cid-seal_phase",
+        "request_id": "51515151515151515151515151515151",
+        "expected_caveats_binding": "81e13f2359c168126845c65e93373b736e8b6b2b17edef4bf636f139df0e6212",
+        "chunks": [
+          { "sequence": 0, "value": { "n": 0 } },
+          { "sequence": 1, "value": { "n": 1 } },
+          { "sequence": 2, "value": { "n": 2 } }
+        ],
+        "expected_stream_manifest_hash": "eaa73cad3864f513df6f5e7245510b9ad8b69b581fa252ff6784e6f62cbdc358",
+        "receipt": {
+          "caller_context_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "target_context_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "caller_did": "did:example:xctx-caller",
+          "nonce": "cccccccccccccccccccccccccccccccc",
+          "outlet_registration_id": "outlet-xctx-seal",
+          "outlet_invoked_event_id": "evt-seal-phase-1",
+          "chain_depth": 2,
+          "timestamp_ms": 1709654400000
+        },
+        "target_signing_seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+      }
+    },
+    {
+      "name": "xctx_10_chunk",
+      "spec": {
+        "context_id": "ctx-target-xctx",
+        "outlet_id": "outlet-xctx-tenchunk",
+        "invoker_did": "did:key:z6MkStreamSagaVectorInvokerReference",
+        "estimated_chunk_count": 10,
+        "ucan_cid": "cid-xctx_10_chunk",
+        "request_id": "10101010101010101010101010101010",
+        "expected_caveats_binding": "e0a4c0b3fb57f65c27dc9917a293fb4b00147bb83ad328e6eeadef5b0fd21bc0",
+        "chunks": [
+          { "sequence": 0, "value": { "n": 0 } },
+          { "sequence": 1, "value": { "n": 1 } },
+          { "sequence": 2, "value": { "n": 2 } },
+          { "sequence": 3, "value": { "n": 3 } },
+          { "sequence": 4, "value": { "n": 4 } },
+          { "sequence": 5, "value": { "n": 5 } },
+          { "sequence": 6, "value": { "n": 6 } },
+          { "sequence": 7, "value": { "n": 7 } },
+          { "sequence": 8, "value": { "n": 8 } },
+          { "sequence": 9, "value": { "n": 9 } }
+        ],
+        "expected_stream_manifest_hash": "3da9ea2ec9db4cfb3897771270f04eda016ec3b9da77016a6827ebe3de878fc7",
+        "dual_log_identity": true,
+        "receipt": {
+          "caller_context_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "target_context_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "caller_did": "did:example:xctx-caller",
+          "nonce": "cccccccccccccccccccccccccccccccc",
+          "outlet_registration_id": "outlet-xctx-tenchunk",
+          "outlet_invoked_event_id": "evt-xctx-10-chunk-1",
+          "chain_depth": 2,
+          "timestamp_ms": 1709654400000
+        },
+        "target_signing_seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+      }
+    },
+    {
+      "name": "truncated_close",
+      "spec": {
+        "context_id": "ctx-target-trunc",
+        "outlet_id": "outlet-xctx-trunc",
+        "invoker_did": "did:key:z6MkStreamSagaVectorInvokerReference",
+        "estimated_chunk_count": 10,
+        "ucan_cid": "cid-truncated_close",
+        "request_id": "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c",
+        "expected_caveats_binding": "b6cec67c5b8903349567364f4103c3802ebb36d63a7a814b260051b7e129cc8a",
+        "chunks": [
+          { "sequence": 0, "value": { "n": 0 } },
+          { "sequence": 1, "value": { "n": 1 } },
+          { "sequence": 2, "value": { "n": 2 } },
+          { "sequence": 3, "value": { "n": 3 } },
+          { "sequence": 4, "value": { "n": 4 } },
+          { "sequence": 5, "value": { "n": 5 } },
+          { "sequence": 6, "value": { "n": 6 } },
+          { "sequence": 7, "value": { "n": 7 } },
+          { "sequence": 8, "value": { "n": 8 } },
+          { "sequence": 9, "value": { "n": 9 } }
+        ],
+        "crash_after_index": 5,
+        "billed_count": 5,
+        "exec_invocations": 1,
+        "expected_full_manifest_hash": "512c831c00e81bf468a1ba487b4b0a97d6240fdd1aec0f4bbc72dfa07ce0d2e0",
+        "expected_prefix_manifest_hash": "e746e95f2054ca4448db0ebcea6d46000b03c42744ffb672127f24e6bd2e3a1b",
+        "receipt": {
+          "caller_context_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "target_context_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "caller_did": "did:example:xctx-caller",
+          "nonce": "cccccccccccccccccccccccccccccccc",
+          "outlet_registration_id": "outlet-xctx-trunc",
+          "outlet_invoked_event_id": "evt-truncated-close-1",
+          "chain_depth": 2,
+          "timestamp_ms": 1709654400000
+        },
+        "target_signing_seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+      }
+    },
+    {
+      "name": "receive_side_drain_lossy",
+      "spec": {
+        "context_id": "ctx-target-lossy",
+        "outlet_id": "outlet-xctx-lossy",
+        "invoker_did": "did:key:z6MkStreamSagaVectorInvokerReference",
+        "estimated_chunk_count": 3,
+        "ucan_cid": "cid-receive_side_drain_lossy",
+        "request_id": "06060606060606060606060606060606",
+        "expected_caveats_binding": "73ae9ff7e72d200237bf27b4086eb9b7504d9c53241a43c520081901f57b2a3b",
+        "chunks": [
+          { "sequence": 0, "value": { "n": 0 } },
+          { "sequence": 1, "value": { "n": 1 } },
+          { "sequence": 3, "value": { "n": 3 } }
+        ],
+        "expected_end_status": "Cancelled",
+        "expected_error_code": "SCP-OUTLET-6131"
+      }
+    },
+    {
+      "name": "aggregate_schema_violation",
+      "spec": {
+        "aggregate_schema": {
+          "type": "object",
+          "properties": {
+            "total": { "type": "number" },
+            "unit": { "type": "string" }
+          },
+          "required": ["total", "unit"]
+        },
+        "conforming_aggregate": { "total": 10, "unit": "widgets" },
+        "violating_aggregate": { "total": "not-a-number" },
+        "expected_end_status": "Error",
+        "expected_error_code": "SCP-OUTLET-6140"
+      }
+    }
+  ]
+}
