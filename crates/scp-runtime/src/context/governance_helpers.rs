@@ -3381,7 +3381,9 @@ pub async fn execute_reconfigure_governance(
         )
         .await?;
 
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    // Two durable leaves appended: GovernanceReconfigured + GovernanceDeadlockRecovery.
+    // Each must be counted to prevent §9.9.3 checkpoint-position drift (governance_logic.rs:156-158).
+    *cell.class_c_view().checkpoint_events_since_mut() += 2;
     Ok(())
 }
 
