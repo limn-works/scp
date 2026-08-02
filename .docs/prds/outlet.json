@@ -1675,7 +1675,7 @@
         }
       ],
       "details": {
-        "auditNote": "Downgraded from done (audit): fix not effective \u2014 the specified manager/outlets.rs no longer exists and no complete From<InvocationError> for OutletError mapping is present; dispatch.rs still masks permanent errors as retryable. Tracked in #2219; recovery in #2196."
+        "auditNote": "Downgraded from done (audit): fix not effective \u2014 the specified manager/outlets.rs no longer exists and no complete From<InvocationError> for OutletError mapping is present. The related stream-open error-masking (permanent failures reported as retryable) is a separate site fixed by #2196. Tracked in #2219."
       }
     },
     {
