@@ -900,6 +900,7 @@ The protocol provides layered metadata privacy protections. Each layer addresses
 - **Blocking layer:** AES-256 sender-side keys enable cryptographic blocking without MLS group changes (§9.16)
 - **Cross-context key isolation:** Independent MLS key material per context (§9.10.9)
 - **Delivery layer:** Relay-side delivery jitter breaks timing correlation between PUBLISH and delivery (§9.10.10)
+- **Public-record format:** Relay public-record frame (SCPR) for unencrypted self-certifying records such as DID documents — the structural counterpart to the encrypted outer envelope (§9.10.12)
 
 This section specifies what the protocol protects, how it protects it, and what residual risks remain.
 
@@ -1139,6 +1140,58 @@ Even with all protections in this section, the following metadata leaks remain:
 - **Push notification timing:** Apple/Google learn that a device received a notification at a specific time. Content and source remain opaque (§10.7).
 - **DHT participation patterns:** On desktop, DHT routing traffic is mixed with resolution queries, but a network observer can see DHT participation.
 - **Relay trust:** Relays see blob sizes (bucketed), TTLs, and pseudonyms. A relay colluding with a context member could correlate pseudonyms to identities for that context only.
+
+### 9.10.12 Relay Public-Record Frame (SCPR)
+
+The **SCPR frame** is the unencrypted counterpart to the §9.10.2 Minimal Outer Envelope: where the outer envelope is *confidential by encryption*, an SCPR record is *self-certifying by signature*. Its first — and, at this slice, only defined — record kind is the DID document (§3.10.2). It is specified here in §9.10 because §9.10 is where relay-stored record formats live: the outer envelope (§9.10.2) is the encrypted format, and SCPR is the public-record format.
+
+**Why raw binary, not MessagePack/CBOR.** SCPR uses a raw, length-prefixed binary layout under the §9.5.1 length-prefix discipline rather than a self-describing codec (MessagePack, CBOR). Self-describing codecs admit multiple valid encodings of the same logical value (map-key ordering, integer width, string-vs-binary tags), which would (a) break byte-identical cross-binding decoding — two SDKs could emit different bytes for the same record — and (b) perturb the exact `value` bytes handed to BEP44 verification, since the signed payload must be reproduced octet-for-octet. SCPR therefore fixes exactly one canonical encoding.
+
+**Frame layout:**
+
+```
+SCPR-RECORD :=
+  magic:    [u8; 4]  = 0x53 0x43 0x50 0x52   # ASCII "SCPR"
+  version:  u8        = 1
+  kind:     u8                                 # record-kind discriminator
+  <kind-specific body>
+```
+
+- **magic** — the raw 4-byte ASCII string "SCPR" (mirroring the SCPM management magic, §9.16.1), written with no length prefix (a fixed-width field, §9.5.1).
+- **version** — a `u8`, starting at 1. Any change to field encoding bumps the version.
+- **kind** — a `u8` record-kind discriminator:
+
+  | kind | Record | Status |
+  |------|--------|--------|
+  | 1 | DID-record | Defined |
+  | 2 | KeyPackage | Reserved — not defined |
+  | 3 | Context-metadata | Reserved — not defined |
+  | 4 | Revocation | Reserved — not defined |
+
+  Kinds 2–4 MUST NOT be emitted; their bodies are undefined. (KeyPackages today misuse `OuterEnvelope.encrypted_blob` as an unencrypted carrier and SHOULD migrate to SCPR kind 2 in a future slice.)
+
+**DID-record body (kind 1):**
+
+```
+  seq:       u64                 # 8 bytes big-endian — BEP44 sequence
+  signature: [u8; 64]            # Ed25519 BEP44 signature, raw fixed-width, NO length prefix
+  value_len: u32                 # 4 bytes big-endian — length of value
+  value:     [u8; value_len]     # BEP44-signed payload = encoded DID document (opaque; owned by did:dht §18.2.2A)
+```
+
+Per the §9.5.1 encoding rules: the fixed-width fields (`seq` as a `u64`, `signature` as `[u8; 64]`) are written raw with no length prefix, while the sole variable-length field, `value`, carries a 4-byte big-endian `u32` length prefix (`value_len`). The fixed portion is therefore `6` (header: 4 magic + 1 version + 1 kind) `+ 8 + 64 + 4 = 82` bytes, and the total frame length is `82 + value_len`. `value_len` MUST NOT exceed `Max blob size` (262144, §9.18.11) `− 82`. There is deliberately **no** `sig_len` field: a BEP44 Ed25519 signature is unconditionally 64 bytes for kind 1, and §9.5.1 gives fixed-width fields no length prefix; a different signature length would be a new kind or version, not a per-frame field.
+
+**Framing is outside the signed authority.** The BEP44 signature covers only the bencoded `(seq, value)` pair (plus the salt where the DID method uses one), per §3.10.5. The `magic`, `version`, `kind`, and `value_len` fields are unsigned transport framing. A decoder MUST NOT derive any security-relevant conclusion from the framing bytes. After decoding a kind-1 frame into `(value, signature, seq)`, the resolver MUST BEP44-verify the triple against the Ed25519 key encoded in the DID string (§9.6.1) **before** any use; a frame whose triple does not verify is discarded exactly as an invalid DHT record is (§3.10.4). Because the routing ID is derived from the DID string while verification is against that DID's key, record substitution is cryptographically impossible (§3.10.8).
+
+**BEP44 byte-identity across layers (§3.10.5).** SCPR wraps `value` for relay transport only; it never enters, reorders, or alters the signed bytes. A DHT-native `(value, signature, seq)` triple and the same triple decoded from an SCPR frame are byte-identical and verify identically. The §3.10.4 rule that two valid records sharing a sequence number MUST be byte-identical holds across both layers.
+
+**Publish / query contract.**
+
+- **Publish** = wrap the `(value, signature, seq)` triple in an SCPR frame and PUBLISH the frame bytes via the existing relay PUBLISH operation (§3.10.2). This is not a relay protocol change: the relay stores opaque bytes. The DID relay blob MUST be the SCPR kind-1 frame carrying `(value, signature, seq)`, not the bare DID-document bytes.
+- **Query** = the relay QUERY operation returns the raw SCPR blob(s) stored at the routing ID; the resolver decodes each at a **single** site into `(value, signature, seq)` and then BEP44-verifies.
+- **Distinct from the outer envelope.** A public-record routing ID carries SCPR frames, not `OuterEnvelope`s; a resolver MUST NOT deserialize one as the other. DID records occupy their own routing-ID space, `SHA-256("scp:did:" || did_string)` (§3.10.2), disjoint from context routing IDs.
+
+**TTL.** SCPR records reuse the shared relay `blob_ttl` (§9.10.2), bounded by `Max blob TTL` = 604800s / 7d (§9.18.11). There is no kind-specific TTL and no change to `Max blob TTL`. TTL governs storage lifetime; the BEP44 `seq` governs supersession (§3.10.7). Record permanence is achieved by republication on the 6-day cycle (§3.10.2), not by TTL.
 
 ## 9.11 Key Continuity Verification
 
@@ -1774,6 +1827,9 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | SCPM management magic | `[0x53, 0x43, 0x50, 0x4D]` | 4-byte ASCII prefix distinguishing management from application messages in MLS plaintext | §9.16.1 |
 | Management payload max size | 65,536 bytes (64 KiB) | Maximum management message payload after SCPM prefix | §9.16.1 |
 | Epoch poisoning max advance | 1,000 | Maximum allowed epoch jump in a single sender key distribution | §9.16.1 |
+| SCPR record magic | `[0x53, 0x43, 0x50, 0x52]` | 4-byte ASCII "SCPR" prefix of the relay public-record frame (§9.10.12). Unsigned framing — grants no authority. | §9.10.12 |
+| SCPR frame version | 1 | Current SCPR frame version; bumped on any field-encoding change | §9.10.12 |
+| SCPR DID-record kind | 1 | Record-kind discriminator for the DID-record body; kinds 2–4 reserved/undefined | §9.10.12 |
 | Buffer event max age | 3,600s (1h) | Maximum estimated age for buffer events in consequence evaluation | §7.3.7 |
 | Buffer event future tolerance | 5s | Maximum future tolerance for buffer event timestamps | §7.3.7 |
 | Broadcast replay max authors | 10,000 | Maximum unique senders tracked in broadcast replay detector | §9.16.5 |

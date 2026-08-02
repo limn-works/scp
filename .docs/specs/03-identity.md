@@ -811,7 +811,7 @@ The `"scp:did:"` domain separator prevents collision with other routing ID deriv
 PUBLISH {
     routing_id: did_routing_id,
     blob_ttl: 604800,
-    blob: <BEP44-signed DID document>
+    blob: <SCPR kind-1 DID-record frame (§9.10.12), carrying (value, signature, seq)>
 }
 ```
 
@@ -827,7 +827,8 @@ QUERY {
 
 **Properties:**
 
-- **No protocol changes.** PUBLISH and QUERY are existing relay operations. DID documents are stored and retrieved like any other blob. Relays require no awareness that a blob contains a DID document.
+- **No protocol changes.** PUBLISH and QUERY are existing relay operations. DID documents are stored and retrieved like any other blob. Relays require no awareness that a blob contains a DID document. SCPR framing (§9.10.12) is a client-side payload convention, not a relay behavior — the relay stores the frame bytes opaquely.
+- **Self-verifying blob payload.** The DID relay blob is an SCPR kind-1 frame (§9.10.12) carrying the BEP44 `(value, signature, seq)` triple, not the bare document bytes. Because the signature and sequence travel inside the blob, a resolver verifies the record from the blob alone — no DHT round-trip is required to obtain the signature.
 - **Relay-agnostic.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for suppression resistance.
 - **Size budget.** DID documents range from 2-30KB depending on attestation count and service endpoint list. The relay blob size limit is 256KB (ADR-004). Well within bounds.
 - **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager already handles periodic DHT republishing on a 2-hour cycle; relay republishing adds a separate 6-day cycle for relay-stored DID documents.
@@ -854,9 +855,13 @@ The full resolution sequence:
    a. QUERY did_routing_id on known SCP relays
       (identity's published relays if known, else bootstrap relays from §18.5.1)
    b. DhtClient.resolve(public_key) on Mainline DHT
-4. For each response:
-   a. Verify BEP44 signature against public_key
-   b. Verify seq >= last_known_seq for this DID
+4. For each response, obtain the (value, signature, seq) triple:
+   a. Relay response: decode the SCPR kind-1 frame (§9.10.12) into
+      (value, signature, seq). DHT response: the triple is native.
+      Framing bytes are unsigned and MUST NOT be trusted — only the
+      triple is used.
+   b. Verify BEP44 signature over (value, seq) against public_key
+   c. Verify seq >= last_known_seq for this DID
 5. Accept the valid response with highest sequence number
 6. Cache result per §9.10.7 caching policy
    (24h refresh for active contacts, 7d for inactive)
@@ -874,6 +879,7 @@ The parallel query model (step 3) requires clear rules for when queries are canc
 - **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
 - **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
 - **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
+- **Relay blob fails SCPR decoding.** A relay blob that does not decode as a valid SCPR kind-1 frame (§9.10.12) — truncated, wrong magic, wrong/reserved kind, or an inconsistent `value_len` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed; the resolver falls through to the other layer exactly as for an invalid signature.
 - **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
 
 ### 3.10.5 Publishing Protocol
@@ -886,14 +892,17 @@ On DID document create or update:
 2. Sign via BEP44 (Ed25519 signature over bencoded value concatenated with
    sequence number, per BEP44 spec)
 3. In parallel:
-   a. PUBLISH to SCP relays (own relays + bootstrap relays), blob_ttl: 604800
+   a. Wrap (value, signature, seq) in an SCPR kind-1 frame (§9.10.12) and
+      PUBLISH the frame bytes to SCP relays (own relays + bootstrap relays),
+      blob_ttl: 604800. The SCPR wrapper is around `value` for transport
+      only — it is NEVER part of the bencoded signed bytes.
    b. DhtClient.publish(public_key, signature, doc_bytes, seq) to Mainline DHT
 4. RepublishManager schedules:
    - Relay republishing: every 6 days (blob_ttl is 7 days, 1-day margin)
    - DHT republishing: every 2 hours (existing cycle, unchanged)
 ```
 
-Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically.
+Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically. SCPR wraps `value` for transport but does not enter the signed bytes; the `(value, signature, seq)` triple carried to both layers is byte-identical (§9.10.12).
 
 ### 3.10.6 Anti-Segmentation Invariant
 
@@ -987,6 +996,7 @@ The dual-layer architecture is designed to be self-reinforcing as the SCP networ
 | DID document QUERY from relays | Phase 2 | `scp-core` | Extends existing DID resolution path with relay QUERY before/parallel to DHT. |
 | `DidResolver` trait | Phase 2 | `scp-core` | Unified interface composing relay + DHT resolution. |
 | Parallel dual-layer resolution | Phase 2 | `scp-core` | Orchestration of parallel queries with first-valid-wins semantics. |
+| SCPR DID-record frame (§9.10.12) | Phase 2 | `scp-protocol` | Deterministic binary encode/decode of the relay public-record frame kind 1. Pure sync wasm-compatible type; consumed by the relay publisher + DID resolver in `scp-identity`. |
 
 ## 3.11 DID Authentication for External Services (SCPID)
 

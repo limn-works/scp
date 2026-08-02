@@ -424,7 +424,7 @@
     },
     {
       "id": "SCP-CAPINJECT-011",
-      "title": "E4 relay querier: implement the real MultiRelayQuerier per §3.10.12 (the relay-resolution layer), demote NoOpRelayQuerier/InMemoryRelayQuerier to test-harness-only",
+      "title": "E4 relay querier: implement the real MultiRelayQuerier per §3.10.12 (the relay-resolution layer, resolving via SCPR kind-1 frames §9.10.12); demote only the pure test double InMemoryRelayQuerier to test-harness-only (NoOpRelayQuerier stays a shipped production arm)",
       "gate": "gate-capinject-11",
       "priority": "P0",
       "severity": "major",
@@ -435,10 +435,10 @@
         "crates/scp-identity/src/lib.rs",
         "crates/scp-identity/Cargo.toml"
       ],
-      "description": "ADR-062 Slice 11 (Unit 3, E4 MED; §Decision 5, spec §3.10.12). E4 is a COMPLETENESS / defense-in-depth gap, NOT a nullifier (resolved from spec+code): `NoOpRelayQuerier` (resolver.rs:309) `query` returns `Ok(None)`; the `DualLayerResolver` falls back to DHT-only and returns honest not-found `Ok(None)` when both layers find nothing — it NEVER fabricates a false document (§3.10.4 'MUST NOT fabricate'). It FAILS CLOSED. Every conformant identity publishes to the DHT (the §3.10.6 publish-both MUST), so authenticity/reachability/freshness are all preserved; only the §3.10.8 dual-layer suppression *resilience* (defense-in-depth availability) is reduced, which §3.10.6 permits (dual-layer resolution is a SHOULD). Therefore `NoOpRelayQuerier` SHIPS HONESTLY as the DHT-only interim (it need NOT be gated/absent at Slice 6; G1-green Slices 6-11 is sound). This story's remediation is COMPLETENESS: implement the REAL `MultiRelayQuerier` (queries the identity's relays per §3.10.4/§3.10.12) so resolution uses BOTH layers per §3.10.6 and the dual-layer suppression resilience is restored; once the real querier is the default, demote `NoOpRelayQuerier` + the test `InMemoryRelayQuerier` (resolver.rs:910) to test-harness-only. This also completes A2's Disabled-node story: a `DhtMode::Disabled` node (DHT-layer-off) resolves peers via the real relay layer landed here. blockedBy [] (independent of the DHT-client/pre-rotation work — this is the relay-query layer). Scope exception: the real querier + resolver wiring + NoOp demotion are one resolution-layer change.",
+      "description": "ADR-062 Slice 11 (Unit 3, E4 MED; §Decision 5, spec §3.10.12). E4 is a COMPLETENESS / defense-in-depth gap, NOT a nullifier (resolved from spec+code): `NoOpRelayQuerier` (resolver.rs:309) `query` returns `Ok(None)`; the `DualLayerResolver` falls back to DHT-only and returns honest not-found `Ok(None)` when both layers find nothing — it NEVER fabricates a false document (§3.10.4 'MUST NOT fabricate'). It FAILS CLOSED. Every conformant identity publishes to the DHT (the §3.10.6 publish-both MUST), so authenticity/reachability/freshness are all preserved; only the §3.10.8 dual-layer suppression *resilience* (defense-in-depth availability) is reduced, which §3.10.6 permits (dual-layer resolution is a SHOULD). Therefore `NoOpRelayQuerier` SHIPS HONESTLY as the DHT-only interim (it need NOT be gated/absent at Slice 6; G1-green Slices 6-11 is sound). This story's remediation is COMPLETENESS: implement the REAL `MultiRelayQuerier` (queries the identity's relays per §3.10.4/§3.10.12, decoding each returned relay blob as an SCPR kind-1 DID-record frame §9.10.12 into the (value, signature, seq) triple before BEP44 verification) so resolution uses BOTH layers per §3.10.6 and the dual-layer suppression resilience is restored. CORRECTION vs. the original story: `NoOpRelayQuerier` STAYS a shipped, documented production arm — it is the honest not-a-DID-source case, since the loopback/node relay path is a protocol-unaware blob pipe (§10.4), not a DID-QUERY source, and node resolution flows through its real DHT arm (see build_shared_cache_key_resolver in scp-node/src/self_host.rs). Only the pure test double `InMemoryRelayQuerier` (the `#[cfg(test)]` one at resolver.rs:910 and the currently `pub` one exported from resolution.rs) demotes to `#[cfg(any(test, feature = \"testing\"))]`. This also completes A2's Disabled-node story: a `DhtMode::Disabled` node (DHT-layer-off) resolves peers via the real relay layer landed here. blockedBy [] (independent of the DHT-client/pre-rotation work — this is the relay-query layer). Scope exception: the real querier + resolver wiring + InMemoryRelayQuerier demotion are one resolution-layer change.",
       "acceptanceCriteria": [
-        "A real `MultiRelayQuerier` implementation exists that queries the identity's relays (§3.10.4/§3.10.12): `grep -rn 'impl MultiRelayQuerier for' crates/scp-identity/src/relay_querier.rs` matches a real (non-NoOp, non-InMemory) querier that performs relay QUERY, and the resolver composes both the relay layer and the DHT layer (grep the resolver's dual-layer path).",
-        "NoOpRelayQuerier + InMemoryRelayQuerier are test-harness-only: outside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]`, `grep -rn 'NoOpRelayQuerier\\|InMemoryRelayQuerier' crates/scp-identity/src` returns 0 references as the SHIPPED resolver arm (they may exist as test doubles gated by test/testing).",
+        "A real `MultiRelayQuerier` implementation exists that queries the identity's relays and decodes the returned blobs as SCPR kind-1 DID-record frames (§9.10.12) into (value, signature, seq) before BEP44 verification (§3.10.4/§3.10.12): `grep -rn 'impl MultiRelayQuerier for' crates/scp-identity/src/relay_querier.rs` matches a real (non-NoOp, non-InMemory) querier that performs relay QUERY and SCPR-decodes the result, and the resolver composes both the relay layer and the DHT layer (grep the resolver's dual-layer path).",
+        "Only the pure test double InMemoryRelayQuerier demotes to test-harness-only; NoOpRelayQuerier STAYS a shipped production resolver arm (the honest not-a-DID-source case, §10.4) and is deliberately NOT grep-restricted. Machine-verifiable: outside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]`, `grep -rn 'InMemoryRelayQuerier' crates/scp-identity/src` returns 0 references as a SHIPPED type (it may exist only as a test double gated by test/testing).",
         "Dual-layer resolution is exercised: a test resolves a DID published to a relay (not the DHT) and asserts the relay layer returns it (proving relay-resolution is live, not NoOp), and a test asserts suppression on one layer is defeated by the other (§3.10.8).",
         "NoOpRelayQuerier's fail-closed property is documented + asserted as the honest interim (not treated as a nullifier): a test asserts `NoOpRelayQuerier::query` returns `Ok(None)` (never a fabricated document) and that the resolver returns honest not-found `Ok(None)` when both layers find nothing (§3.10.4) — establishing E4 was fail-CLOSED before this slice, and this slice adds the relay layer for defense-in-depth, not to fix a false-answer bug.",
         "A2 completion — a Disabled node resolves via the real relay layer: a test constructs a `DhtMode::Disabled` node (DHT-layer-off) and asserts it resolves a peer whose DID document is published to a relay (the resolution path a Disabled node relies on once the real `MultiRelayQuerier` exists), confirming the SCP-CAPINJECT-001 sequencing note that a Disabled node's resolution comes online here.",
@@ -447,7 +447,7 @@
       ],
       "actionItems": [
         "Implement a real MultiRelayQuerier (relay QUERY per §3.10.4/§3.10.12); wire it into the resolver's dual-layer resolution.",
-        "Demote NoOpRelayQuerier + InMemoryRelayQuerier to test-harness-only (test/testing-gated).",
+        "Demote only the pure test double InMemoryRelayQuerier to test-harness-only (test/testing-gated); keep NoOpRelayQuerier as a shipped production arm.",
         "Write the dual-layer resolution + suppression-resilience tests; run full CI + review roster."
       ],
       "blockedBy": [],
@@ -461,6 +461,10 @@
           "section": "### 3.10.12 Phase Integration"
         },
         {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay Public-Record Frame (SCPR)"
+        },
+        {
           "file": ".docs/specs/17-persistence-and-storage.md",
           "section": "### 17.17.2 Security Classification of Development Arms"
         }
@@ -470,7 +474,7 @@
         "adr": "ADR-062",
         "unit": "3",
         "slice": "Slice 11 (E4 relay querier — §3.10.12)",
-        "scopeException": "real querier + resolver wiring + NoOp demotion are one resolution-layer change"
+        "scopeException": "real querier + resolver wiring + InMemoryRelayQuerier demotion are one resolution-layer change"
       }
     }
   ]
