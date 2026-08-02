@@ -567,7 +567,9 @@ fn handle_flush_snapshot_actor<'d>(
 ///
 /// Per-actor body of the relocated sweep. Destroys this actor's
 /// per-context sender keys + MLS group + event log (in that order so
-/// secrets zeroize before structure tears down). Mirrors the
+/// secrets are released before structure tears down; the `SenderKey`s
+/// zeroize on drop, the MLS group/signer is freed — not zeroized, #82).
+/// Mirrors the
 /// per-context body of `shutdown_all_contexts_legacy`.
 ///
 /// Best-effort: each destroy failure logs via `tracing::debug!` (the
@@ -595,35 +597,24 @@ fn handle_shutdown_self_actor(
     let context_id = cell.handle.context_id().to_owned();
     let ctx_id_bytes = context_id_to_bytes(&context_id);
 
-    // Provider-side teardown (retained): a no-op for an actor-owned (taken)
-    // context, but still covers a context whose crypto never migrated off the
-    // provider (e.g. a birth-window failure before `take_crypto_state`).
-    if let Err(e) = deps.crypto.destroy_sender_key(&ctx_id_bytes) {
-        tracing::debug!(
-            context_id = %context_id,
-            error = %e,
-            "failed to destroy sender key during shutdown — may already be gone"
-        );
-    }
-    if let Err(e) = deps.crypto.destroy_mls_group(&ctx_id_bytes) {
-        tracing::debug!(
-            context_id = %context_id,
-            error = %e,
-            "failed to destroy MLS group during shutdown — may already be gone"
-        );
-    }
-
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) H4 — whole-crypto disposal at the actor
-    // destroy seam. Now that the actor is the SOLE owner of the per-context crypto
-    // (the provider `destroy_*` above is a no-op for a taken context), tear the
-    // ACTOR-OWNED material down explicitly through the field-granular Class-C view
-    // (teardown is best-effort, not a fail-closed persist obligation). This
-    // matches the disposal hygiene the deleted provider gave by dropping its whole
-    // `contexts` entry, and — critically — deletes the OpenMLS epoch secrets that a
-    // bare `PerContextState` drop would leave resident in OpenMLS storage. A
-    // broadcast context carries no `ContextCryptoState` (`crypto_mut() == None`) so
-    // this is a clean no-op there. NOT marked `mutated`: shutdown must not persist
-    // an emptied crypto over the durable snapshot (a later respawn rehydrates it).
+    // #2148 (ADR-049 birth-into-actor) actor destroy seam — whole-crypto disposal.
+    // The actor is the SOLE owner of the per-context crypto (the provider holds
+    // NONE — its `destroy_mls_group` / `destroy_sender_key` teardown methods are
+    // DELETED), so tear the ACTOR-OWNED material down explicitly through the
+    // field-granular Class-C view (teardown is best-effort, not a fail-closed
+    // persist obligation). Each `ScpMlsGroup` owns its own in-memory
+    // `InMemoryMlsProvider`, so the epoch/group secrets are freed the moment the
+    // `PerContextState` itself drops — a bare drop is NOT a leak of group storage.
+    // The reason to dispose explicitly here is EAGER release: this close leaves
+    // the `PerContextState` alive (a later respawn rehydrates it), so nothing else
+    // frees the crypto until the state eventually drops — `dispose_secrets`
+    // (OpenMLS `destroy_group`) releases it NOW. The Ed25519 signer is FREED, not
+    // zeroized (`SignatureKeyPair` has no `Zeroize`, scp-mls #82) — same as a bare
+    // drop, just eager.
+    // A broadcast context carries no `ContextCryptoState` (`crypto_mut() == None`)
+    // so this is a clean no-op there. NOT marked `mutated`: shutdown must not
+    // persist an emptied crypto over the durable snapshot (a later respawn
+    // rehydrates it).
     {
         let mut view = cell.class_c_view();
         if let Some(crypto) = view.mode_mut().crypto_mut() {
@@ -638,7 +629,7 @@ fn handle_shutdown_self_actor(
 
     // Clone the event-log provider `Arc` so the async tail owns it (no `&deps`
     // borrow crosses the await). The event-log destroy still runs after the
-    // MLS-group destroy (secrets zeroize before structure).
+    // MLS-group destroy (crypto released before the event-log structure).
     let event_log = std::sync::Arc::clone(&deps.event_log);
     async move {
         if let Err(e) = event_log.destroy_event_log(&ctx_id_bytes).await {

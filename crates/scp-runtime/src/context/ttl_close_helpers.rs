@@ -35,6 +35,7 @@
 
 use scp_did::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::MemoryScope;
 use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::ContextHandle;
@@ -111,6 +112,11 @@ pub struct TtlExpiryOutcome {
 /// turn, so the generation gate is no longer required — there is no
 /// concurrent close-and-recreate window for a sibling actor to slip a
 /// new context into.
+// A single cohesive TTL-expiry flow: derive the convergent deadline, run the
+// sync terminal transition + actor-owned key disposal, fail-closed persist, then
+// the bounded relay/leaf I/O. Splitting the phases across helpers would obscure
+// the ordering the SEC-1 rework pins.
+#[allow(clippy::too_many_lines)]
 pub async fn handle_ttl_expiry(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
@@ -168,18 +174,24 @@ pub async fn handle_ttl_expiry(
     //    runs on `handle`, a clone sharing the same `Arc<ArcSwap<ContextState>>`
     //    as `cell.handle`, so the snapshot the combinator builds captures
     //    `Expired`.
-    let terminal_result =
-        ttl::apply_ttl_terminal_transition(handle, deps.crypto.as_ref(), prior_completed);
+    // #2148 (ADR-049 birth-into-actor): key destruction runs on the ACTOR-owned
+    // crypto via the field-granular Class-C view (the provider holds none). The
+    // view borrow is scoped tightly so `cell` is free for the fail-closed persist
+    // below.
+    let terminal_result = {
+        let mut view = cell.class_c_view();
+        let crypto_state = view.mode_mut().crypto_mut();
+        ttl::apply_ttl_terminal_transition(handle, crypto_state, prior_completed)
+    };
 
     // Prune the authoritative Class-M floor registry entry (ADR-049) on a
     // GENUINE terminal expiry. Gated on `state_transitioned()` so an aborted /
     // failed transition (A3 `None`-deadline abort already returned above; a wrong-
     // state transition failure sets no step and destroys no keys) NEVER prunes a
     // still-live context's floors. When the transition landed, the context is
-    // terminally `Expired` — restore skips non-`Active` snapshots and B8 refuses
     // re-create, so it is permanently gone — and `apply_ttl_terminal_transition`
-    // just ran the provider's `destroy_mls_group` floor-map prune (Ephemeral /
-    // Summary scope), so this registry prune mirrors it. Pruned regardless of
+    // just disposed the actor-owned crypto (Ephemeral / Summary scope), so this
+    // registry prune co-locates the Class-M teardown with it. Pruned regardless of
     // memory scope (a terminal context accepts no further inbound). Idempotent: a
     // bounded expiry RETRY re-enters here and remove-on-absent is a no-op. See
     // `Supervisor::remove_context_floors` for the permanent-vs-transient safety
@@ -839,10 +851,10 @@ pub fn convergent_ttl_deadline(
 /// (`deps.clock.now_secs()`) — see the body for why the TTL deadline is NOT the
 /// right quantity for this (explicit-only) path.
 pub async fn finalize_close(
-    // Retained for signature parity with the expiry-path helpers and for the
-    // actor-owned call convention; the explicit close reads nothing off it (the
-    // close instant is the local clock, the FSM transition rides `handle`).
-    _cell: &mut ClassSCell,
+    // #2148 (ADR-049 birth-into-actor): the actor-owned crypto lives here — for
+    // an Ephemeral/Summary explicit close it is disposed through the cell after
+    // the FSM transition lands (the provider holds no per-context state).
+    cell: &mut ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
@@ -867,14 +879,35 @@ pub async fn finalize_close(
     // leaf's instant is legitimately a local `now`.
     let close_ts = deps.clock.now_secs();
 
+    // FSM transition (`Closing → Closed`) + terminal leaf + best-effort relay
+    // ciphertext delete. Returns Ok only if the transition landed.
     ttl::finalize_close(
         handle,
-        deps.crypto.as_ref(),
         deps.transport.as_ref(),
         deps.event_log.as_ref(),
         close_ts,
     )
     .await?;
+
+    // #2148 (ADR-049 birth-into-actor): now that the close transition has landed,
+    // dispose the ACTOR-owned MLS crypto for Ephemeral/Summary scope (the provider
+    // holds none). Each `ScpMlsGroup` owns its own in-memory `InMemoryMlsProvider`,
+    // freed when `PerContextState` drops — but a closed actor STAYS registered (its
+    // `state` is NOT dropped here), so without an explicit dispose the crypto would
+    // linger live. `dispose_secrets` runs OpenMLS `destroy_group`, which eagerly
+    // frees the group NOW; the Ed25519 signer is freed, NOT zeroized
+    // (`SignatureKeyPair` has no `Zeroize`, scp-mls #82) — same as a bare drop,
+    // just eager; the sender key zeroizes on its own drop. Full scope retains keys
+    // (readable after close), so it is
+    // skipped. A broadcast context carries no `ContextCryptoState`
+    // (`crypto_mut() == None`), a clean no-op there.
+    let memory_scope = handle.params().memory_scope;
+    if memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary {
+        let mut view = cell.class_c_view();
+        if let Some(crypto) = view.mode_mut().crypto_mut() {
+            crypto.dispose_secrets();
+        }
+    }
 
     // Delete persisted state after finalize (best-effort). Mirrors
     // the legacy path which only ran the delete when a persistence
@@ -883,12 +916,17 @@ pub async fn finalize_close(
     let _ = deps.persistence.delete_context(&context_id).await;
 
     // Prune the authoritative Class-M floor registry entry (ADR-049):
-    // an explicit close is a PERMANENT teardown — the FSM is terminally `Closed`
-    // (anti-resurrection refuses re-create of a terminal id) and the durable
-    // Class-S snapshot was just deleted — so the registry floors are moot and
-    // must be dropped, mirroring the provider's per-context floor-map prune
-    // inside `destroy_mls_group` (which `ttl::finalize_close` ran above for
-    // Ephemeral/Summary scope) and co-located with the snapshot delete. Pruned
+    // an explicit close is a PERMANENT teardown. While this closed actor stays
+    // REGISTERED, Precheck A (live-actor) blocks any resurrection of this id; the
+    // durable Class-S snapshot is deleted just below (Ephemeral/Summary are
+    // non-durable by design). There is therefore no terminal on-disk marker to
+    // refuse against once the snapshot is gone — if this closed actor later
+    // despawns/crashes the id becomes free to re-create, which is acceptable
+    // here (a locally-driven, non-durable close, not a remote exploit). So the
+    // registry floors are moot and must be dropped, mirroring the per-context
+    // floor teardown inside `dispose_secrets`/`destroy_group` (which
+    // `ttl::finalize_close` ran above for Ephemeral/Summary scope) and
+    // co-located with the snapshot delete. Pruned
     // regardless of memory scope: a `Closed` context accepts no further inbound,
     // so the floors serve no purpose even when Full-scope crypto is retained.
     // See `Supervisor::remove_context_floors` for the permanent-vs-transient

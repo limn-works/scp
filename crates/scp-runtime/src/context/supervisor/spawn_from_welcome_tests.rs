@@ -309,6 +309,27 @@ fn honest_ext(context_id: &str, params: &ContextParams) -> ScpContextExtension {
     .expect("honest context extension serializes")
 }
 
+/// #2148 (ADR-049 birth-into-actor): produce Alice's real Welcome for Bob by
+/// seeding her OWNED group onto a throwaway actor state and adding Bob's reserved
+/// KeyPackage through the actor-native `add_member` seam (member addition mutates
+/// the actor-owned MLS group — the provider holds no per-context state). Alice's
+/// state is discarded; only the Welcome bytes matter.
+fn alice_welcome_for_bob(
+    ctx_bytes: &[u8; 32],
+    owned: crate::crypto::mls::provider::OwnedMlsCryptoState,
+    kp_bytes: &[u8],
+) -> scp_protocol::context::builder::AddMemberOutput {
+    let mut alice_state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+        *ctx_bytes,
+        0,
+        DID::from(ALICE_DID),
+    );
+    alice_state.seed_encrypted_crypto_from_owned(owned);
+    alice_state
+        .add_member(BOB_DID, Some(kp_bytes), &scp_clock::SystemClock)
+        .expect("alice adds bob's reserved key package on her owned group")
+}
+
 /// Publishes Bob's wrapping key on `sup` so his pooled KeyPackages carry the
 /// `0xFF01` wrapping-key leaf extension, exercising the wrapping-key-PRESENT path
 /// (see [`BOB_WRAP`]); the `0xFF02` context-params capability is declared
@@ -522,20 +543,19 @@ async fn run_join_with(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    match &committed {
-        Some(committed_params) => alice_crypto
-            .create_mls_group_with_context(
-                &group_ctx_bytes,
-                &honest_ext(&group_ctx_id, committed_params),
-            )
-            .expect("alice creates the SCP context group (0xFF02)"),
-        None => alice_crypto
-            .create_mls_group(&group_ctx_bytes)
-            .expect("alice creates a wrapping-only group (no 0xFF02)"),
-    }
-    let add_output = alice_crypto
-        .add_member(&group_ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
+    let alice_owned = committed.as_ref().map_or_else(
+        || {
+            alice_crypto
+                .create_bare_group_owned()
+                .expect("alice creates a wrapping-only group (no 0xFF02)")
+        },
+        |committed_params| {
+            alice_crypto
+                .create_mls_group_with_context(&honest_ext(&group_ctx_id, committed_params))
+                .expect("alice creates the SCP context group (0xFF02)")
+        },
+    );
+    let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);
 
     let request_ctx_id = request_ctx_id.unwrap_or_else(|| group_ctx_id.clone());
     let request_ctx_bytes = context_id_to_bytes(&request_ctx_id);
@@ -869,12 +889,10 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto
-        .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &joiner_params()))
+    let alice_owned = alice_crypto
+        .create_mls_group_with_context(&honest_ext(&ctx_id, &joiner_params()))
         .unwrap();
-    let add_output = alice_crypto
-        .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .unwrap();
+    let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
     let welcome = add_output.welcome_bytes;
 
     // Both spawns present Bob's SAME #active custody (the replay opens an
@@ -958,12 +976,10 @@ fn alice_welcome_for(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto
-        .create_mls_group_with_context(&ctx_bytes, &honest_ext(context_id, &joiner_params()))
+    let alice_owned = alice_crypto
+        .create_mls_group_with_context(&honest_ext(context_id, &joiner_params()))
         .expect("alice creates the SCP context group (0xFF02)");
-    let add_output = alice_crypto
-        .add_member(&ctx_bytes, BOB_DID, Some(kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
+    let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, kp_public_bytes);
     (alice_crypto, add_output.welcome_bytes)
 }
 
@@ -2801,12 +2817,10 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto
-        .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &params))
+    let alice_owned = alice_crypto
+        .create_mls_group_with_context(&honest_ext(&ctx_id, &params))
         .expect("alice creates the honest SCP context group committing creator=Alice");
-    let add_output = alice_crypto
-        .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
+    let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
 
     // Mallory's forged bundle: creator_did = Mallory, signed with Mallory's key,
     // params = Alice's REAL params. Hints == Mallory so the HPKE open succeeds and
@@ -3092,15 +3106,10 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto
-        .create_mls_group_with_context(
-            &group_ctx_bytes,
-            &honest_ext(&group_ctx_id, &joiner_params()),
-        )
+    let alice_owned = alice_crypto
+        .create_mls_group_with_context(&honest_ext(&group_ctx_id, &joiner_params()))
         .expect("alice creates the SCP context group (0xFF02)");
-    let add_output = alice_crypto
-        .add_member(&group_ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
+    let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);
 
     // Seal the creator-signed §5.12.3 bundle to Bob's #active and spawn.
     let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;

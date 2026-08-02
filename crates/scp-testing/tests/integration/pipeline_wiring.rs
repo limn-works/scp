@@ -1563,19 +1563,28 @@ fn open_calls_decrypt_sender_layer() {
     );
 }
 
-// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the 11 steady-state crypto methods were
-// MOVED off `MlsCryptoProvider` onto the actor-owned `PerContextState`. This
-// asserts the provider retains ZERO definitions of any of them — a one-way move
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) + #2148 (birth-into-actor): the steady-state
+// crypto methods were MOVED off `MlsCryptoProvider` onto the actor-owned
+// `PerContextState`, and #2148 additionally DELETED the provider's per-context
+// birth/restore/teardown seam — the `contexts` / `taken_context_ids` /
+// `broadcast_keys` maps and every method that read or wrote them. This asserts
+// the provider retains ZERO definitions of any of them: a one-way dissolution
 // (no dual-home), so a future refactor cannot silently re-add a provider-resident
-// twin that would seal/open behind the actor's back (double-owner, divergent
-// sequence, resurrected sender key). Birth/restore-seam methods (create_mls_group,
-// add_member, install_joined_group, take_crypto_state, build_restored_owned,
-// with_context, wrapping_keypair, destroy_mls_group, destroy_sender_key,
-// validate_key_package, store_member_sender_key) are RETAINED and deliberately not
-// listed. Additive coverage; weakens nothing.
+// twin that would seal/open/birth behind the actor's back (double-owner,
+// divergent sequence, resurrected sender key, #2167-style cross-map TOCTOU).
+//
+// The RETAINED node-level surface — `create_mls_group_with_context` /
+// `install_joined_group` (owned-return birth), `create_bare_group_owned` (test),
+// `build_restored_owned`, `process_incoming_sender_key`, `validate_key_package`,
+// `wrapping_keypair`(`_snapshot`), `make_credential`, `validate_creator_identity`,
+// `local_did`, backends/clock — is deliberately NOT listed (none carry per-context
+// state). The listed names are ONLY genuinely-deleted symbols; the checks below
+// use `fn NAME(`, which does not match `fn create_mls_group_with_context(` or
+// `fn install_joined_group(`. Closed positive list; additive coverage.
 #[test]
 fn provider_steady_state_crypto_methods_are_deleted() {
-    const MOVED_METHODS: [&str; 11] = [
+    const DELETED_METHODS: &[&str] = &[
+        // Steady-state crypto seam relocated onto the actor (PR-7).
         "seal",
         "open",
         "advance_epoch",
@@ -1587,13 +1596,49 @@ fn provider_steady_state_crypto_methods_are_deleted() {
         "export_crypto_state",
         "restore_crypto_state",
         "drain_pending_sender_key_messages",
+        // #2148 per-context birth/restore/teardown seam DELETED with the maps.
+        "take_crypto_state",
+        "with_context",
+        "context_crypto_present",
+        "create_mls_group", // bare; `create_mls_group_with_context` survives (no match)
+        "create_group_into_slot",
+        "generate_sender_key",
+        "init_broadcast_key",
+        "destroy_mls_group",
+        "destroy_sender_key",
+        "add_member", // and add_member_from_bytes — member add mutates the actor group
+        "add_member_from_bytes",
+        "distribute_sender_key",
+        "store_member_sender_key",
+        "set_sender_key_unchecked",
+        "handle_sender_key_request",
+        "group_context_extension", // provider reader deleted; actor twin survives (STATE_SRC)
     ];
-    for method in MOVED_METHODS {
+    for method in DELETED_METHODS {
         let def = format!("fn {method}(");
         assert!(
             !PROVIDER_SRC.contains(&def),
-            "MlsCryptoProvider must NOT define `{method}` — the steady-state crypto \
-             seam moved onto the actor `PerContextState` (ADR-049 PR-7, one-way move)"
+            "MlsCryptoProvider must NOT define `{method}` — the per-context crypto \
+             seam is actor-owned (ADR-049 PR-7 + #2148 birth-into-actor); the provider \
+             holds no per-context state and no dual-home twin"
+        );
+    }
+
+    // #2148: the provider holds NO per-context state fields. The three per-context
+    // maps are DELETED — removing them closes the #2167 cross-map TOCTOU by
+    // construction (there is no check-then-insert to race). Match the FIELD
+    // DECLARATION form (`name: Type`) so prose/comment mentions of the retired
+    // names do not false-positive.
+    for field in [
+        "contexts: DashMap",
+        "taken_context_ids: DashSet",
+        "broadcast_keys: DashMap",
+    ] {
+        assert!(
+            !PROVIDER_SRC.contains(field),
+            "MlsCryptoProvider must NOT carry the per-context field `{field}` — #2148 \
+             (birth-into-actor) dissolves the provider's per-context state; the actor's \
+             `PerContextState` is the sole per-context crypto home"
         );
     }
 }

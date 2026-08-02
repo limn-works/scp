@@ -195,7 +195,9 @@ pub struct ScpMlsGroup {
     /// The MLS provider (crypto + storage) for this group.
     pub(crate) provider: InMemoryMlsProvider,
     /// The local member's Ed25519 signing key pair, wrapped in
-    /// [`EagerDropSigner`] for best-effort zeroization on drop.
+    /// [`EagerDropSigner`] for eager release on [`destroy_group`]: the private
+    /// key `Vec<u8>` is FREED, not zeroized (`OpenMLS` `SignatureKeyPair` has no
+    /// `Zeroize`; upstream issue #82), just earlier than a bare drop would.
     /// Inner `Option` is `None` after [`destroy_group`] drops the
     /// private key material.
     pub(crate) signer: EagerDropSigner,
@@ -232,7 +234,8 @@ impl ScpMlsGroup {
     /// # Errors
     ///
     /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed
-    /// (the signer is taken on destruction for eager zeroization).
+    /// (the signer is taken on destruction for eager release: freed, not
+    /// zeroized, since `SignatureKeyPair` has no `Zeroize`; upstream issue #82).
     pub fn signer_key_pair(&self) -> Result<&SignatureKeyPair, MlsError> {
         self.signer.as_ref().ok_or(MlsError::GroupDestroyed)
     }
