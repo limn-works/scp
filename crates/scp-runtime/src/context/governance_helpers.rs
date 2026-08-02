@@ -836,6 +836,72 @@ pub async fn execute_suspend_member(
 }
 
 // ---------------------------------------------------------------------------
+// emit_key_epoch_advance_best_effort (shared loop helper)
+// ---------------------------------------------------------------------------
+
+/// Emits one `KeyEpochAdvance` event-log leaf per author (best-effort).
+///
+/// Returns the count of successfully appended leaves, for use in the
+/// caller's `checkpoint_events_since` counter increment. Best-effort:
+/// failures are logged with `tracing::warn!` and do not propagate.
+///
+/// `old_epoch` is derived as `new_epoch.saturating_sub(1)` (rotations
+/// always increment by exactly 1 — pre-validated, sound by construction).
+async fn emit_key_epoch_advance_best_effort(
+    deps: &ActorDeps,
+    context_id_bytes: &[u8; 32],
+    context_id: &str,
+    rotations: &[(String, u64)], // (author_did, new_epoch)
+    timestamp_secs: u64,
+    label: &str, // e.g. "governance ban" or "RotateContentKeys" — for error messages
+) -> u64 {
+    let mut kea_success_count: u64 = 0;
+    for (author_did, new_epoch) in rotations {
+        let old_epoch = new_epoch.saturating_sub(1);
+        match scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::KeyEpochAdvancePayload {
+                old_epoch,
+                new_epoch: *new_epoch,
+            },
+        ) {
+            Ok(payload) => {
+                if let Err(e) = deps
+                    .event_log
+                    .append_context_event_with_payload(
+                        context_id_bytes,
+                        scp_event_log::EventType::KeyEpochAdvance,
+                        author_did.as_str(),
+                        payload,
+                        timestamp_secs,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        author_did = %author_did,
+                        error = %e,
+                        label = label,
+                        "KeyEpochAdvance event-log append failed (best-effort)"
+                    );
+                } else {
+                    kea_success_count += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    author_did = %author_did,
+                    error = %e,
+                    label = label,
+                    "KeyEpochAdvance payload encode failed (best-effort)"
+                );
+            }
+        }
+    }
+    kea_success_count
+}
+
+// ---------------------------------------------------------------------------
 // execute_revoke (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
@@ -983,47 +1049,21 @@ pub async fn execute_revoke(
     // whose broadcast key was rotated by the governance ban.  Each rotation
     // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
     // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
-    let mut kea_success_count: u64 = 0;
-    for rotation in &rotated_authors {
-        let old_epoch = rotation.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::KeyEpochAdvancePayload {
-                old_epoch,
-                new_epoch: rotation.new_epoch,
-            },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        rotation.author_did.as_str(),
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        author_did = %rotation.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed after governance ban (best-effort)"
-                    );
-                } else {
-                    kea_success_count += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    author_did = %rotation.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed after governance ban (best-effort)"
-                );
-            }
-        }
-    }
+    let kea_success_count = {
+        let rotations: Vec<(String, u64)> = rotated_authors
+            .iter()
+            .map(|r| (r.author_did.clone(), r.new_epoch))
+            .collect();
+        emit_key_epoch_advance_best_effort(
+            deps,
+            &context_id_bytes,
+            context_id,
+            &rotations,
+            timestamp_secs,
+            "governance ban",
+        )
+        .await
+    };
     // Coalesced Class-C counter bump: 1 for AccessRevoked + each KeyEpochAdvance
     // leaf that actually appended. The counter must track the true durable-leaf
     // count (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position
@@ -3200,47 +3240,21 @@ pub async fn execute_rotate_content_keys(
     // on the per-author block path; it is dead data in this governance path.
     // `old_epoch` is derived as `new_epoch - 1` because `rotate_all_author_keys`
     // always increments by exactly 1 (pre-validated, sound by construction).
-    let mut kea_success_count: u64 = 0;
-    for advance in &key_advances {
-        let old_epoch = advance.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
-            &scp_event_log::payload::KeyEpochAdvancePayload {
-                old_epoch,
-                new_epoch: advance.new_epoch,
-            },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        advance.author_did.as_str(),
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        author_did = %advance.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed after RotateContentKeys (best-effort)"
-                    );
-                } else {
-                    kea_success_count += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    author_did = %advance.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed after RotateContentKeys (best-effort)"
-                );
-            }
-        }
-    }
+    let kea_success_count = {
+        let rotations: Vec<(String, u64)> = key_advances
+            .iter()
+            .map(|a| (a.author_did.clone(), a.new_epoch))
+            .collect();
+        emit_key_epoch_advance_best_effort(
+            deps,
+            &context_id_bytes,
+            context_id,
+            &rotations,
+            timestamp_secs,
+            "RotateContentKeys",
+        )
+        .await
+    };
     // Coalesced Class-C counter bump: 1 for ContentKeysRotated + each
     // KeyEpochAdvance leaf that actually appended. The counter must track the
     // true durable-leaf count (governance_logic.rs:156-158) to prevent §9.9.3
