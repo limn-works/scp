@@ -12,17 +12,15 @@
 use std::process::Command;
 
 /// Returns the path to the compiled `scp-relay` binary.
+///
+/// Resolves the compile-time `CARGO_BIN_EXE_scp-relay` variable Cargo bakes into
+/// integration-test builds for a binary in the same package. Using compile-time
+/// `env!` (not a runtime `std::env::var` lookup) keeps the path correct under
+/// `cargo test`, `cargo nextest run`, relocated target dirs
+/// (`CARGO_TARGET_DIR`/shared-target), and git worktrees alike — `cargo nextest`
+/// does not re-export `CARGO_BIN_EXE_*` into the test's runtime environment.
 fn relay_bin() -> std::path::PathBuf {
-    // `cargo test` sets this for integration tests in the same package.
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_scp-relay") {
-        return std::path::PathBuf::from(path);
-    }
-    // Fallback: look in target/debug.
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop(); // crates/
-    path.pop(); // repo root
-    path.push("target/debug/scp-relay");
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_scp-relay"))
 }
 
 /// AC 9: An invalid backend value causes a non-zero exit with an error
