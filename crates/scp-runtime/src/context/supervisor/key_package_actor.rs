@@ -59,7 +59,7 @@
 //!    init-key marker in the backend.
 //!    This backstop covers every join that flows through
 //!    `MlsBackend::join_from_welcome` (the fused-confirm path); the legacy
-//!    `MlsCryptoProvider::join_from_welcome` calls `group::join_group_from_bytes`
+//!    `NodeMlsFactory::join_from_welcome` calls `group::join_group_from_bytes`
 //!    directly and is production-unreachable (it is `#[cfg(any(test, feature =
 //!    "testing"))]`-gated), slated for deletion when the spawn-from-Welcome
 //!    entrypoint lands — so there is no LIVE production gap, only a test/feature-

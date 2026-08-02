@@ -21,7 +21,7 @@ use scp_protocol::context::{ContextError, ContextState};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::config::{ContextConfig, ContextCreation};
 use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers (mirrors governance_integration.rs)
@@ -109,7 +109,7 @@ fn alice() -> DID {
 
 fn new_manager() -> Arc<Supervisor> {
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

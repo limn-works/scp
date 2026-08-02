@@ -33,9 +33,9 @@
 //!
 //! [`super::production_backend::ProductionMlsBackend`] delegates to the
 //! existing [`scp_mls::group`] and [`scp_mls::encrypt`] free functions — the same
-//! primitives the pre-refactor `MlsCryptoProvider` calls today. The
+//! primitives the pre-refactor `NodeMlsFactory` calls today. The
 //! byte-identical output test in `production_backend.rs` feeds the same input
-//! to both the backend and a bare `MlsCryptoProvider` and asserts equality on
+//! to both the backend and a bare `NodeMlsFactory` and asserts equality on
 //! the produced ciphertext / Welcome / Commit bytes.
 
 use std::sync::Arc;
@@ -334,7 +334,7 @@ pub trait MlsBackend: Send + Sync {
     /// bookkeeping. On a successful join the init key is durably added to the
     /// set. The backstop covers every join that flows through THIS method
     /// (`MlsBackend::join_from_welcome`); the legacy
-    /// `MlsCryptoProvider::join_from_welcome` path calls
+    /// `NodeMlsFactory::join_from_welcome` path calls
     /// `group::join_group_from_bytes` directly and is production-unreachable
     /// (test/feature-gated, `#[cfg(any(test, feature = "testing"))]`), slated for
     /// deletion when the spawn-from-Welcome entrypoint lands — so there is no

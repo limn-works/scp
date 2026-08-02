@@ -6357,7 +6357,7 @@ mod commit_broadcast_retry_tests {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ADMIN.to_owned(),
             Arc::new(scp_clock::SystemClock),
         ));

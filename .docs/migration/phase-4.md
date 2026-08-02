@@ -152,7 +152,7 @@ at the FFI boundary; length mismatches return `ScpError::Validation`.
 ### 5. UniFFI `ContextManager` requires a local DID (#1342)
 
 `FfiBridgeCrypto` is deleted. The UniFFI bridge constructs
-`MlsCryptoProvider::new(did)` exactly like PyO3 and NAPI. Every context
+`NodeMlsFactory::new(did)` exactly like PyO3 and NAPI. Every context
 operation (`context_create`, `context_join`, `context_import`) requires
 a DID to have been registered via `scp.registerLocalDid(…)` first.
 

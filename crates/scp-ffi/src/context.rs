@@ -2471,7 +2471,7 @@ impl crate::scp::PyScp {
         // first operation (e.g. a device joining a context without creating one).
         // init_context_manager is idempotent (CoreFields::set_context_manager
         // uses OnceLock internally — first call wins). #1073
-        // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1324).
+        // Passes the joiner DID to NodeMlsFactory for real MLS encryption (#1324).
         #[cfg(test)]
         crate::runtime::init_context_manager_for_test(bi);
         #[cfg(not(test))]
@@ -2488,7 +2488,7 @@ impl crate::scp::PyScp {
 
             // Generate a real MLS key package for the joining member (#1324).
             // The key package contains the joiner's SCP credential (DID) and is
-            // validated by MlsCryptoProvider::validate_key_package before MLS
+            // validated by NodeMlsFactory::validate_key_package before MLS
             // group addition.
             let kp_bytes = generate_mls_key_package_bytes(identity_did)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

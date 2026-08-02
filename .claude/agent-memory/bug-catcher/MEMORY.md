@@ -184,3 +184,33 @@ Notes:
 - payment_receipts bound: `if len>=DEFAULT_BUFFER_CAPACITY {pop_front()} push_back()` — correct ring buffer.
 - Tests: scp-ffi-wasm 337/337 pass; runtime eventlog_convergence 6 pass +1 documented-ignore; wasm_conformance 55 pass +1 documented-ignore (negative controls confirm divergence-detection works).
 - PRE-EXISTING (NOT a branch regression): scp-event-log --lib checkpoint/metrics tests fail with `InvalidSignature: unsupported DID format did:key:...` — IDENTICAL on origin/main (dabf13364). Branch doesn't touch checkpoint.rs or scp-identity. Local-toolchain/feature-flag env issue, CI-only resolver. Does NOT gate this branch.
+### Known Bug Patterns (Jun 2026 — fix/sdk-coverage-fail-closed-and-parity review)
+- **economy_verify_payment_receipts wire-shape mismatch (HIGH, cross-SDK contract):**
+  Canonical Rust wire shape (scp_runtime::economy::receipt::verification_results_to_json):
+  `{"all_valid": bool, "results": [ {"receipt_id","ok","valid","result"} | {"ok":false,"error"} ]}`.
+  NO top-level `ok`; error-arm entries lack `receipt_id`/`valid`; reject field is `error` not `reason`.
+  - TS `bindings/typescript/src/economy.ts`: `PaymentReceiptVerificationResult` declares required
+    top-level `ok: boolean` (undefined at runtime); `PaymentReceiptVerificationEntry` makes
+    `receipt_id`/`valid` required + invents `reason?` (real field is `error`). Both PUBLIC exports
+    (index.ts). `economyVerifyPaymentReceipts` does unchecked `JSON.parse(raw) as ...`. TS integration
+    test only asserts `all_valid` so it never catches the bogus `ok`.
+  - Python `test_sdk_parity_additions.py` mocks `{"all_valid":...,"receipts":[...]}` (wrong key —
+    should be `results`) and asserts `result["receipts"][0]`. Wrapper json.loads-passes through so test
+    is green against a fabricated shape; a real bridge returns `results` → consumer KeyError. False-premise.
+- **VERIFIED CLEAN:** evaluateTrust Layer-1/2 classify on message regex `/\[SCP-PERM-\d+\]/` /
+  `/\[SCP-CTX-\d+\]/` (correct — NAPI throws plain Error bypassing mapBridgeError); __PASSED_BEFORE
+  has all 7 category keys incl unknown (no undefined access); TS prefix lists match Python exactly;
+  __extractCoreError em-dash split safe (no UcanError Display contains " — "). discover_contexts
+  to_thread over sync py_context_discover correct. check-sdk-coverage missing-key check falls through
+  to inner-loop `None`→continue (no double count). assertTestHookAllowed positive allowlist correct.
+- **VERIFIED CLEAN @ HEAD (re-review):** PaymentReceiptVerificationEntry TS type
+  matches verification_results_to_json EXACTLY (Ok={receipt_id,ok,valid,result{...,
+  verified_currency string via as_str, verified_amount number}}; Err={ok:false,error}
+  only → optional `?` markings correct). economyVerifyPaymentReceipts TS is SYNC
+  (NAPI export returns napi::Result<String>, own block_on) so JSON.parse not await —
+  correct. types.ts old TrustEvaluation/BehavioralRecord/AttestationSummary deleted,
+  no dangling refs (governanceActionsBy at types.ts:843 is Participation, unrelated).
+  index.ts removed ContextReconnectResult/ReconnectReport/UcanFailureCategory exports —
+  no consumers. rotationEventJson getter surfaces NAPI migrate() Some(json) end-to-end.
+  Gate PASS (0 err, 1 coverage-exempt), gate self-tests 4/4, TS check clean, 62 TS
+  tests pass, Python parity tests sound. NO BUGS.

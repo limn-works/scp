@@ -85,7 +85,7 @@ interface IdentityAdvancedBindings {
      * Returns the JSON-serialized `DidRotationEvent` produced when the
      * given handle was minted by [identityMigrate]. SDK callers MUST
      * distribute the event to active context members per spec
-     * §3.2.1 step 4b. Returns `null` for handles that did not change
+     * spec §9.12, ADR-003 §4b. Returns `null` for handles that did not change
      * the DID (e.g., create, rotate-key, agent-key ops, load).
      *
      * Mirrors the UniFFI-generated `Identity.rotationEventJson()`
@@ -282,7 +282,7 @@ class IdentityAdvancedBridge internal constructor(
      * Migrates an identity to a new DID.
      *
      * **Deprecated.** This overload silently drops the
-     * `DidRotationEvent` that spec §3.2.1 step 4b requires the caller
+     * `DidRotationEvent` that spec §9.12, ADR-003 §4b requires the caller
      * to distribute to every active context where the OLD DID is a
      * member. Without distribution, peers will reject subsequent
      * messages signed by the new DID's `#active` key as unauthorized,
@@ -298,7 +298,7 @@ class IdentityAdvancedBridge internal constructor(
      */
     @Deprecated(
         message =
-            "Drops the DidRotationEvent required by spec §3.2.1 step 4b. " +
+            "Drops the DidRotationEvent required by spec §9.12, ADR-003 §4b. " +
                 "Use migrateWithRotationEvent and distribute the rotation event to " +
                 "all active contexts where the OLD DID is a member; pre-context callers " +
                 "may discard the event explicitly.",
@@ -313,7 +313,7 @@ class IdentityAdvancedBridge internal constructor(
      *
      * SDK callers MUST distribute
      * [IdentityMigrateResult.rotationEventJson] to all active
-     * contexts where the OLD DID is a member (spec §3.2.1 step 4b).
+     * contexts where the OLD DID is a member (spec §9.12, ADR-003 §4b).
      * Without distribution, peers will reject subsequent messages
      * signed by the new DID's `#active` key as unauthorized.
      *
@@ -469,7 +469,7 @@ class IdentityAdvancedBridge internal constructor(
 }
 
 // ---------------------------------------------------------------------------
-// Identity migration result (§3.2.1, ADR-003 §4b)
+// Identity migration result (§9.12, ADR-003 §4b)
 // ---------------------------------------------------------------------------
 
 /**
@@ -477,7 +477,7 @@ class IdentityAdvancedBridge internal constructor(
  *
  * The new opaque identity handle PLUS the JSON-serialized
  * `DidRotationEvent` that SDK callers MUST distribute to active
- * context members (spec §3.2.1 step 4b).
+ * context members (spec §9.12, ADR-003 §4b).
  *
  * Mirrors the rotation-event accessor on the other SDKs:
  * Python `Identity.rotation_event_json`, TypeScript

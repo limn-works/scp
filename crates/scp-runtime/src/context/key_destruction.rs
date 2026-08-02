@@ -5,7 +5,7 @@
 //! [`scp_protocol::context::memory_scope`] and
 //! [`scp_protocol::context::close`]. After ADR-049 §15 the
 //! orchestrators operate directly on the concrete
-//! [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider),
+//! [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory),
 //! so they cannot live in `scp-protocol` (which is a forward dependency
 //! of `scp-runtime`).
 //!
@@ -32,47 +32,60 @@ use scp_protocol::context::memory_scope::{
     RelayDeletionRequest,
 };
 
-use crate::crypto::mls::provider::MlsCryptoProvider;
-
 // ---------------------------------------------------------------------------
 // KeyDestructionOrchestrator
 // ---------------------------------------------------------------------------
 
-/// Orchestrates key destruction for ephemeral (and summary, post-window)
-/// context close.
+/// Orchestrates the relay-deletion + attestation side of ephemeral (and
+/// summary, post-window) context close.
 ///
-/// Coordinates the destruction of MLS group state (tree secrets, all epoch
-/// key schedules, application key material) and sender keys, then issues
-/// relay deletion requests for all encrypted event data.
+/// #2148 (ADR-049 birth-into-actor): the actual MLS-group + sender-key
+/// destruction is performed by the ACTOR that owns the context's crypto — the
+/// `LifecycleCommand::CloseContext` the caller dispatches BEFORE invoking this
+/// orchestrator routes through the actor's close handler, which disposes the
+/// actor-owned `ContextCryptoState` (running `OpenMLS` `destroy_group` +
+/// zeroizing the sender key material) for Ephemeral/Summary scope. The provider holds NO
+/// per-context crypto (its `destroy_mls_group` / `destroy_sender_key` methods are
+/// DELETED), so this orchestrator no longer touches crypto directly. It issues
+/// the relay deletion requests for the encrypted event data and produces the
+/// destruction attestation.
 ///
 /// See ADR-018 acceptance criteria 5 and 6.
-pub struct KeyDestructionOrchestrator<'a> {
-    /// Crypto provider for MLS group and sender key destruction.
-    crypto: &'a MlsCryptoProvider,
-}
+#[derive(Default)]
+pub struct KeyDestructionOrchestrator;
 
-impl<'a> KeyDestructionOrchestrator<'a> {
-    /// Creates a new orchestrator with the given crypto provider.
+impl KeyDestructionOrchestrator {
+    /// Creates a new orchestrator.
     #[must_use]
-    pub const fn new(crypto: &'a MlsCryptoProvider) -> Self {
-        Self { crypto }
+    pub const fn new() -> Self {
+        Self
     }
 
-    /// Destroys all key material for an ephemeral context close.
+    /// Issues relay deletion requests + builds the destruction attestation for
+    /// an ephemeral context close.
     ///
-    /// Performs the following steps in order:
-    /// 1. Destroys MLS group state (tree secrets, all epoch key schedules,
-    ///    application key material) via the crypto provider.
-    /// 2. Destroys all sender keys for this context via the crypto provider.
-    /// 3. Issues [`RelayDeletionRequest`]s for all encrypted event data.
+    /// #2148 (ADR-049 birth-into-actor): the MLS group + sender-key destruction
+    /// itself is performed by the context's ACTOR (via the `CloseContext`
+    /// command the caller dispatched first); this method issues the
+    /// [`RelayDeletionRequest`]s for all encrypted event data and records the
+    /// attestation.
     ///
     /// The `attestation_level` parameter records the platform's attestation
     /// level for key destruction. This is metadata -- not a gate.
     ///
+    /// OBSERVABILITY NOTE (#2148 F10): the returned attestation's
+    /// `mls_group_destroyed` / `sender_keys_destroyed = true` are observability
+    /// MARKERS, not verified facts. Their truth is guaranteed by the actor's
+    /// SEPARATE crypto disposal (`CloseContext` → `dispose_secrets` /
+    /// `destroy_group`), which the close orchestrator dispatches and awaits
+    /// BEFORE this attestation is recorded; this function does not itself
+    /// destroy any key material or verify that disposal ran. Gating on observed
+    /// disposal is a separate tracked concern, deliberately not done here.
+    ///
     /// # Errors
     ///
-    /// Returns [`ContextError::CryptoFailed`] if MLS group or sender key
-    /// destruction fails.
+    /// Infallible in practice (returns `Result` for signature stability with the
+    /// summary-window caller).
     pub fn destroy_ephemeral_keys(
         &self,
         context_id: &str,
@@ -81,26 +94,7 @@ impl<'a> KeyDestructionOrchestrator<'a> {
         attestation_level: KeyDestructionLevel,
         now: u64,
     ) -> Result<KeyDestructionResult, ContextError> {
-        // ADR-056: resolve the context-id string through the canonical
-        // chokepoint so destruction targets the SAME 32-byte digest the live
-        // MLS group and sender keys are keyed under. The raw `SHA-256(id)`
-        // primitive would address a different (nonexistent) group, so
-        // `destroy_mls_group` / `destroy_sender_key` would silently no-op and
-        // report KeysDestroyed while the real group SURVIVES — a fail-open on
-        // Ephemeral close.
-        let ctx_bytes = crate::context::state::context_id_to_bytes(context_id);
-
-        // Step 1: Destroy MLS group state.
-        self.crypto
-            .destroy_mls_group(&ctx_bytes)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        // Step 2: Destroy all sender keys for this context.
-        self.crypto
-            .destroy_sender_key(&ctx_bytes)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        // Step 3: Issue relay deletion requests for all encrypted event data.
+        // Issue relay deletion requests for all encrypted event data.
         let deletion_requests: Vec<RelayDeletionRequest> = relay_urls
             .iter()
             .map(|url| RelayDeletionRequest {
@@ -115,6 +109,9 @@ impl<'a> KeyDestructionOrchestrator<'a> {
             context_id: context_id.to_owned(),
             level: attestation_level,
             attested_at: now,
+            // Observability markers, not verified facts — the actor's separate
+            // `CloseContext` → `dispose_secrets` disposal (awaited before this
+            // attestation) is what makes them true (#2148 F10; see fn doc).
             mls_group_destroyed: true,
             sender_keys_destroyed: true,
         };
@@ -141,19 +138,21 @@ impl<'a> KeyDestructionOrchestrator<'a> {
 ///
 /// The orchestrator does not own the context state machine transitions --
 /// those are handled by the caller (e.g., `close_context` and
-/// `finalize_close` in `ttl.rs`). This module provides the destruction
-/// logic only.
-pub struct CloseOrchestrator<'a> {
-    /// Key destruction orchestrator for Ephemeral and Summary scopes.
-    key_destruction: KeyDestructionOrchestrator<'a>,
+/// `finalize_close` in `ttl.rs`) and, for the actual crypto teardown, by the
+/// context's actor (#2148 birth-into-actor). This module provides the
+/// relay-deletion + attestation logic only.
+#[derive(Default)]
+pub struct CloseOrchestrator {
+    /// Relay-deletion + attestation orchestrator for Ephemeral and Summary scopes.
+    key_destruction: KeyDestructionOrchestrator,
 }
 
-impl<'a> CloseOrchestrator<'a> {
-    /// Creates a new close orchestrator with the given crypto provider.
+impl CloseOrchestrator {
+    /// Creates a new close orchestrator.
     #[must_use]
-    pub const fn new(crypto: &'a MlsCryptoProvider) -> Self {
+    pub const fn new() -> Self {
         Self {
-            key_destruction: KeyDestructionOrchestrator::new(crypto),
+            key_destruction: KeyDestructionOrchestrator::new(),
         }
     }
 
@@ -271,17 +270,13 @@ impl<'a> CloseOrchestrator<'a> {
 mod tests {
     use super::*;
 
-    const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
-
     #[test]
     fn destroy_ephemeral_keys_happy_path() {
-        let crypto = MlsCryptoProvider::new(
-            TEST_DID.to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        let orchestrator = KeyDestructionOrchestrator::new(&crypto);
+        // #2148 (ADR-049 birth-into-actor): the orchestrator no longer holds a
+        // crypto provider — it issues relay-deletion requests + the attestation;
+        // the actor destroys its own crypto via the dispatched CloseContext.
+        let orchestrator = KeyDestructionOrchestrator::new();
 
-        // No groups registered — destroy is idempotent on MlsCryptoProvider.
         let result = orchestrator.destroy_ephemeral_keys(
             "ctx-1",
             &["wss://relay1.example.com".to_owned()],
@@ -300,11 +295,7 @@ mod tests {
 
     #[test]
     fn initiate_close_full_scope_preserves_data() {
-        let crypto = MlsCryptoProvider::new(
-            TEST_DID.to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        let orchestrator = CloseOrchestrator::new(&crypto);
+        let orchestrator = CloseOrchestrator::new();
 
         let action = orchestrator
             .initiate_close(
@@ -325,11 +316,7 @@ mod tests {
 
     #[test]
     fn initiate_close_ephemeral_scope_destroys_keys() {
-        let crypto = MlsCryptoProvider::new(
-            TEST_DID.to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        let orchestrator = CloseOrchestrator::new(&crypto);
+        let orchestrator = CloseOrchestrator::new();
 
         let action = orchestrator
             .initiate_close(
@@ -356,11 +343,7 @@ mod tests {
 
     #[test]
     fn initiate_close_summary_scope_opens_window() {
-        let crypto = MlsCryptoProvider::new(
-            TEST_DID.to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        let orchestrator = CloseOrchestrator::new(&crypto);
+        let orchestrator = CloseOrchestrator::new();
 
         let action = orchestrator
             .initiate_close(
@@ -385,106 +368,15 @@ mod tests {
         }
     }
 
-    /// ADR-056 forward-secrecy regression guard: the ephemeral-close key
-    /// DESTRUCTION path MUST resolve its MLS-keying bytes through the canonical
-    /// [`context_id_to_bytes`](crate::context::state::context_id_to_bytes)
-    /// chokepoint, NOT the raw
-    /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive.
-    ///
-    /// For a REAL 64-hex member-context id the chokepoint DECODES the string to
-    /// its 32-byte digest, while the raw primitive RE-HASHES it
-    /// (`SHA-256(hex(digest))`). The live MLS group and sender key are keyed
-    /// under the DIGEST, so a regression to the raw primitive would call
-    /// `destroy_mls_group(SHA-256(id))` — a no-op against an unkeyed slot —
-    /// while the real group SURVIVES. That is precisely the ADR-056 fail-open
-    /// ("ephemeral close no longer fails open under a phantom group").
-    ///
-    /// The happy-path tests above use `"ctx-*"` labels, for which the
-    /// chokepoint and the raw primitive coincide, so they cannot catch this
-    /// regression. This test seeds the group + sender key under the DIGEST of a
-    /// real 64-hex id, drives the production destruction path with the STRING
-    /// id, and asserts the group was PRESENT before and GONE after — under the
-    /// digest. Because `export_crypto_state` returns a non-empty snapshot only
-    /// for a keyed context (empty vec otherwise), a destruction that keyed off
-    /// `SHA-256(id)` would leave the digest slot populated and FAIL the
-    /// post-destruction emptiness assertion (mutation-resistant).
-    #[test]
-    fn destroy_ephemeral_keys_real_context_via_chokepoint_not_raw_primitive() {
-        use crate::context::state::context_id_to_bytes;
-
-        // A REAL (64-hex) member-context id: `hex(digest)` of a 32-byte digest,
-        // exactly the form `generate_context_id` emits.
-        let digest = [0xABu8; 32];
-        let id = hex::encode(digest);
-        assert_eq!(id.len(), 64, "fixture id must be a real 64-hex context id");
-
-        // Precondition: the canonical resolver DECODES the 64-hex id to its
-        // digest, while the raw primitive RE-HASHES it. The two must differ,
-        // otherwise this test could not distinguish the keying paths and would
-        // be meaningless.
-        let chokepoint_bytes = context_id_to_bytes(&id);
-        let raw_bytes = scp_protocol::context::context_id_bytes(&id);
-        assert_eq!(
-            chokepoint_bytes, digest,
-            "the chokepoint must decode a 64-hex id to its digest"
-        );
-        assert_ne!(
-            chokepoint_bytes, raw_bytes,
-            "test precondition: digest must differ from SHA-256(hex(digest))"
-        );
-
-        // Seed an MLS group AND a sender key under the DIGEST — the slot the
-        // live context (and the chokepoint) key on.
-        let crypto = MlsCryptoProvider::new(
-            TEST_DID.to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        );
-        crypto
-            .create_mls_group(&digest)
-            .expect("create_mls_group under the digest");
-        crypto
-            .generate_sender_key(&digest)
-            .expect("generate_sender_key under the digest");
-
-        // The group MUST be present under the digest before destruction — proves
-        // this is a real destroy, not a phantom no-op against an empty slot.
-        assert!(
-            crypto.context_crypto_present(&digest),
-            "precondition: crypto state must be keyed under the digest before destruction"
-        );
-
-        // Drive the REAL ephemeral-close destruction path, passing the STRING id
-        // so production resolves id -> bytes via the chokepoint at :91.
-        let orchestrator = KeyDestructionOrchestrator::new(&crypto);
-        let result = orchestrator
-            .destroy_ephemeral_keys(
-                &id,
-                &["wss://relay.example.com".to_owned()],
-                &[[0x42; 32]],
-                KeyDestructionLevel::SoftwareOnly,
-                1_700_000_000,
-            )
-            .expect("destroy_ephemeral_keys must succeed");
-        assert!(result.attestation.mls_group_destroyed);
-        assert!(result.attestation.sender_keys_destroyed);
-
-        // The group/sender-key MUST be GONE under the digest after destruction.
-        // If production had resolved via the raw `SHA-256(id)` primitive,
-        // `destroy_mls_group(SHA-256(id))` would have addressed an unkeyed slot
-        // (a silent no-op) and the digest slot would still be populated — this
-        // assertion FAILS in that case (the ADR-056 fail-open).
-        assert!(
-            !crypto.context_crypto_present(&digest),
-            "ADR-056 FAIL-OPEN: the MLS group SURVIVED under the digest after \
-             ephemeral close — destruction keyed off the wrong slot (raw SHA-256(id) \
-             instead of the chokepoint digest)"
-        );
-
-        // Belt-and-suspenders: nothing was ever keyed under SHA-256(id), so that
-        // slot is (and remains) empty regardless of the resolution path.
-        assert!(
-            !crypto.context_crypto_present(&raw_bytes),
-            "no state should ever exist under SHA-256(id) — the pre-ADR-056 double-hash slot"
-        );
-    }
+    // #2148 (ADR-049 birth-into-actor): the former
+    // `destroy_ephemeral_keys_real_context_via_chokepoint_not_raw_primitive`
+    // test was DELETED. It exercised a provider mechanic that no longer exists —
+    // the orchestrator used to resolve the context-id string to bytes and call
+    // the provider's `destroy_mls_group` / `destroy_sender_key` under the decoded
+    // digest. The orchestrator no longer touches crypto at all (the context's
+    // actor disposes its own owned crypto via the dispatched `CloseContext`), so
+    // there is no provider-residency to assert and no id-resolution to guard here.
+    // The ADR-056 decode-not-rehash keying invariant is now proved at the birth
+    // seam / actor level (see `builder::create_context` tests), not the close
+    // orchestrator.
 }

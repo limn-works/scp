@@ -787,3 +787,473 @@ public extension Context {
         )
     }
 }
+
+// MARK: - Cross-context STREAMING saga (§5.4.5 / §6.2.4, SCP-OUT-047)
+
+// The STREAMING sibling of the unary block-until-terminal
+// ``Context/invokeOutletCrossContextSaga(targetContext:callerDid:outletRegistrationId:input:assertedNonceHex:timestampMs:chainDepth:ucanProofId:)``.
+// Per the ADR-049 §3a streaming wait-model amendment, the streaming saga returns
+// its chunk receiver PROMPTLY at the Commit-transition (the caller consumes
+// chunks as produced) and reaches `Committed` ASYNCHRONOUSLY at seal-close — it
+// MUST NOT block until the stream terminates (an LLM stream can exceed the unary
+// saga's ~95s bound; the credit ceiling bounds chunk COUNT, not wall-clock). The
+// UniFFI open (`outletStreamingSagaOpen`) returns a durable `sagaId` promptly,
+// and the SDK drives the stream by polling `outletStreamingSagaPollNext(sagaId)`
+// behind ``StreamingSagaHandle`` — modelled on the same-context
+// ``InvocationHandle``, MINUS the live control plane (there is no cross-context
+// grantCredit / cancel — §6.2.5 / SCP-OUT-046, cancel_ack_ceiling = u64::MAX).
+//
+// This mirrors the CANONICAL Python reference `StreamingSagaHandle`
+// (`bindings/python/scp_sdk/outlets.py`) exactly. Runtime-level guarantees
+// (billed-count / execute-exactly-once) are proven Rust-side and are NOT
+// re-asserted at this SDK layer.
+
+/// The narrow UniFFI cross-context streaming-saga surface the
+/// ``StreamingSagaHandle`` drives.
+///
+/// The production conformer (``ContextSagaStreamBridge``) forwards to the UniFFI
+/// `Scp` object, capturing the source + target ``ContextHandle`` (so a mock
+/// never needs to fabricate one); tests inject a scripted mock replaying §5.4.5
+/// wire chunks.
+protocol StreamingSagaNative: Sendable {
+    // swiftlint:disable:next function_parameter_count
+    func openSaga(
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: UInt64,
+        chainDepth: UInt8,
+        ucanToken: String,
+        proofTokens: [String]?,
+        ucanProofId: String?,
+        timeoutMs: UInt32?,
+        estimatedChunkCount: UInt32?
+    ) async throws -> String
+
+    func pollNext(sagaId: String) async throws -> Data?
+}
+
+/// Production ``StreamingSagaNative`` — forwards to the UniFFI `Scp` object,
+/// capturing the co-resident source + target ``ContextHandle`` for `openSaga`.
+struct ContextSagaStreamBridge: StreamingSagaNative {
+    let scp: SCP
+    let sourceHandle: ContextHandle
+    let targetHandle: ContextHandle
+
+    // swiftlint:disable:next function_parameter_count
+    func openSaga(
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: UInt64,
+        chainDepth: UInt8,
+        ucanToken: String,
+        proofTokens: [String]?,
+        ucanProofId: String?,
+        timeoutMs: UInt32?,
+        estimatedChunkCount: UInt32?
+    ) async throws -> String {
+        try await scp.outletStreamingSagaOpen(
+            sourceHandle: sourceHandle,
+            targetHandle: targetHandle,
+            callerDid: callerDid,
+            outletRegistrationId: outletRegistrationId,
+            inputJson: inputJson,
+            assertedNonceHex: assertedNonceHex,
+            timestampMs: timestampMs,
+            chainDepth: chainDepth,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens,
+            ucanProofId: ucanProofId,
+            timeoutMs: timeoutMs,
+            estimatedChunkCount: estimatedChunkCount
+        )
+    }
+
+    func pollNext(sagaId: String) async throws -> Data? {
+        try await scp.outletStreamingSagaPollNext(sagaId: sagaId)
+    }
+}
+
+/// The immutable `openSaga` argument set, captured at
+/// ``Context/invokeOutletCrossContextStreamingSaga(targetContext:callerDid:outletRegistrationId:input:assertedNonceHex:timestampMs:chainDepth:ucanToken:proofTokens:ucanProofId:timeoutMs:estimatedChunkCount:)``
+/// and replayed on the (lazy) first open. Mirrors the FFI open param order.
+struct StreamingSagaOpenParams {
+    let callerDid: String
+    let outletRegistrationId: String
+    let input: Data
+    let assertedNonceHex: String
+    let timestampMs: UInt64
+    let chainDepth: UInt8
+    let ucanToken: String
+    let proofTokens: [String]?
+    let ucanProofId: String?
+    let timeoutMs: UInt32?
+    let estimatedChunkCount: UInt32?
+
+    /// Renders the captured `input` bytes as the UTF-8 JSON string the bridge
+    /// consumes — deferred to open so a bad-UTF-8 input surfaces on the first
+    /// await / iteration, not from the non-throwing open method.
+    func inputJson() throws -> String {
+        guard let json = String(data: input, encoding: .utf8) else {
+            throw ScpError.Outlet(
+                msg: "Outlet input is not valid UTF-8",
+                code: "SCP-OUTLET-6001"
+            )
+        }
+        return json
+    }
+}
+
+/// The async-sequence + drainable handle for a §6.2.4 cross-context STREAMING
+/// saga (SCP-OUT-047).
+///
+/// Returned by
+/// ``Context/invokeOutletCrossContextStreamingSaga(targetContext:callerDid:outletRegistrationId:input:assertedNonceHex:timestampMs:chainDepth:ucanToken:proofTokens:ucanProofId:timeoutMs:estimatedChunkCount:)``.
+/// Modelled on the same-context ``InvocationHandle``, minus the live control
+/// plane (there is no cross-context grantCredit / cancel — §6.2.5 / SCP-OUT-046).
+/// It is simultaneously:
+///
+/// - An `AsyncSequence` — `for try await chunk in handle` opens the saga on the
+///   first pull (`outletStreamingSagaOpen` returns the durable `sagaId` PROMPTLY
+///   at the Commit-transition, NOT block-until-terminal), then yields each
+///   ``OutletStreamChunk`` polled from `outletStreamingSagaPollNext(sagaId)` up to
+///   and including the terminal. Iteration stops on a terminal-flagged chunk
+///   (`End` / terminal `Error`) OR on `nil` (an abnormal sender-drop terminal).
+/// - The home of the explicit ``aggregate()`` drain verb — drains to the terminal
+///   and returns the ``Aggregate`` from the `End` chunk; a terminal `Error` chunk
+///   throws the typed ``ScpError/Outlet(msg:code:)`` it carried.
+///
+/// The saga is opened LAZILY — the open method returns immediately without
+/// starting the saga; the open (which drives the saga to the Commit-transition
+/// and reserves escrow) happens on first iteration / ``aggregate()``. An open
+/// rejection — the §6.2.4 caller-principal binding, a Prepare/Commit saga
+/// terminal (surfaced as the generated ``ScpError`` saga case), or an input/UCAN
+/// rejection — surfaces there, and the receiver is never handed out.
+///
+/// The handle is single-consumer: a concurrent second drive is DETECTED and
+/// rejected on the common path (the `draining` guard is held across the poll
+/// await) with ``OutletError/protocolViolation(msg:code:)``. Callers MUST NOT
+/// share a handle across tasks — the guard is released between chunks, so this
+/// reliably catches the common concurrent-drive footgun but is not a hard
+/// concurrency barrier. The handle is an `actor`, so each drain step and the
+/// terminal cache are race-free.
+public actor StreamingSagaHandle {
+    private let bridge: any StreamingSagaNative
+    private let params: StreamingSagaOpenParams
+
+    /// Memoized durable saga id, set once the saga is opened. Doubles as the
+    /// poll key. `nil` until the (lazy) first open. Private storage behind the
+    /// public ``sagaId`` accessor (the distinct name avoids the actor
+    /// stored-vs-computed property name collision).
+    private var sagaIdStorage: String?
+    /// Memoizes the in-flight open so concurrent first-touches open only one saga.
+    private var openTask: Task<String, Error>?
+    /// Set once a terminal chunk (End / terminal Error) is observed, or the
+    /// sender drops without a terminal.
+    private var closed = false
+    /// In-flight re-entrancy guard: `true` while a drain poll is outstanding.
+    private var draining = false
+    /// Captured terminal state, read back by ``aggregate()``.
+    private var aggregateResult: Aggregate?
+    private var terminalError: ScpError?
+    /// Captured ``OutletError/streamGap(msg:code:)`` terminal, re-thrown by a
+    /// re-``aggregate()`` after a gap closed the drain.
+    private var streamGapError: OutletError?
+    /// §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk must
+    /// carry. The bridge forwards A's operator-signed chunks VERBATIM over a
+    /// lossless ordered channel (no re-sequencing), so a non-contiguous sequence
+    /// is a ``OutletError/streamGap(msg:code:)`` (defense-in-depth). There is no
+    /// live cancel plane, so the gap is a purely local terminal — the SDK does
+    /// NOT sign a receiver cancel (unlike the same-context handle).
+    private var expectedSequence: UInt64 = 0
+
+    init(bridge: any StreamingSagaNative, params: StreamingSagaOpenParams) {
+        self.bridge = bridge
+        self.params = params
+    }
+
+    /// The durable supervisor-minted saga id, available once the saga has been
+    /// opened (after the first iteration / ``aggregate()``); `nil` before.
+    public var sagaId: String? {
+        sagaIdStorage
+    }
+
+    /// Opens the saga exactly once (idempotent), returning the durable saga id.
+    private func ensureOpen() async throws -> String {
+        if let sagaIdStorage {
+            return sagaIdStorage
+        }
+        if let openTask {
+            return try await openTask.value
+        }
+        let bridge = self.bridge
+        let params = self.params
+        let task = Task<String, Error> {
+            let inputJson = try params.inputJson()
+            return try await bridge.openSaga(
+                callerDid: params.callerDid,
+                outletRegistrationId: params.outletRegistrationId,
+                inputJson: inputJson,
+                assertedNonceHex: params.assertedNonceHex,
+                timestampMs: params.timestampMs,
+                chainDepth: params.chainDepth,
+                ucanToken: params.ucanToken,
+                proofTokens: params.proofTokens,
+                ucanProofId: params.ucanProofId,
+                timeoutMs: params.timeoutMs,
+                estimatedChunkCount: params.estimatedChunkCount
+            )
+        }
+        openTask = task
+        do {
+            let id = try await task.value
+            sagaIdStorage = id
+            return id
+        } catch {
+            // Clear the memoized task so a later call can retry the open; the
+            // rejection (caller-principal binding, saga terminal, UCAN denial)
+            // surfaces to this caller unchanged, and the receiver is never handed
+            // out (`sagaIdStorage` stays nil).
+            openTask = nil
+            throw error
+        }
+    }
+
+    /// Drains one chunk from the shared single-consumer stream, or `nil` at the
+    /// terminal. The concurrent-consumer guard and the terminal cache live here.
+    func drainNext() async throws -> OutletStreamChunk? {
+        if closed {
+            return nil
+        }
+        if draining {
+            throw OutletError.protocolViolation(
+                msg: "StreamingSagaHandle is already being drained by another consumer; a "
+                    + "cross-context streaming saga has a single shared drain — do not iterate "
+                    + "or aggregate it from two tasks concurrently",
+                code: "SCP-OUTLET-6100"
+            )
+        }
+        draining = true
+        defer { draining = false }
+
+        let id = try await ensureOpen()
+        let raw = try await bridge.pollNext(sagaId: id)
+        guard let raw else {
+            // Abnormal terminal: the sender dropped without a terminal chunk.
+            closed = true
+            return nil
+        }
+        let chunk = try OutletStreamChunk.parse(raw)
+        if chunk.sequence != expectedSequence {
+            // §5.4.5 "Ordering and gaps": a non-contiguous sequence is a
+            // receiver-detected StreamGap. There is NO live cross-context cancel
+            // plane (§6.2.5 / SCP-OUT-046), so the gap is a purely local terminal
+            // — mark closed and throw WITHOUT returning the offending chunk and
+            // WITHOUT a bridge cancel round-trip.
+            closed = true
+            let gap = OutletError.streamGap(
+                msg: "cross-context streaming-saga sequence gap: expected \(expectedSequence), "
+                    + "got \(chunk.sequence) (§5.4.5)",
+                code: "SCP-OUTLET-6131"
+            )
+            streamGapError = gap
+            throw gap
+        }
+        expectedSequence += 1
+        if chunk.isTerminal {
+            // Terminal chunk closes the stream. Capture the terminal state for
+            // aggregate(), mark closed, then still return the terminal chunk so
+            // an iterating consumer observes it.
+            closed = true
+            switch chunk.kind {
+            case "end":
+                aggregateResult = chunk.makeAggregate()
+            case "error":
+                terminalError = ScpError.Outlet(msg: chunk.errorMessage, code: chunk.errorCode)
+            default:
+                break
+            }
+        }
+        return chunk
+    }
+
+    /// Drains the saga stream to its terminal and returns the ``Aggregate``.
+    ///
+    /// Idempotent: if the stream has already been drained (by full iteration),
+    /// the captured ``Aggregate`` is returned without re-draining. A terminal
+    /// `Error` chunk throws the typed ``ScpError/Outlet(msg:code:)`` it carried;
+    /// a stream that ends without an `End` chunk throws
+    /// ``OutletError/protocolViolation(msg:code:)``.
+    public func aggregate() async throws -> Aggregate {
+        while !closed {
+            _ = try await drainNext()
+        }
+        if let streamGapError {
+            throw streamGapError
+        }
+        if let terminalError {
+            throw terminalError
+        }
+        guard let aggregateResult else {
+            throw OutletError.protocolViolation(
+                msg: "cross-context streaming saga closed without an End chunk",
+                code: "SCP-OUTLET-6100"
+            )
+        }
+        return aggregateResult
+    }
+}
+
+// MARK: - StreamingSagaHandle AsyncSequence conformance
+
+extension StreamingSagaHandle: AsyncSequence {
+    public typealias Element = OutletStreamChunk
+
+    /// A single-consumer async iterator over the SHARED drain. Every iterator
+    /// created from a handle drives the same underlying saga stream — draining
+    /// from two concurrently throws ``OutletError/protocolViolation(msg:code:)``
+    /// on the second driver.
+    public struct AsyncIterator: AsyncIteratorProtocol {
+        let handle: StreamingSagaHandle
+
+        public func next() async throws -> OutletStreamChunk? {
+            try await handle.drainNext()
+        }
+    }
+
+    public nonisolated func makeAsyncIterator() -> AsyncIterator {
+        AsyncIterator(handle: self)
+    }
+}
+
+// MARK: - Context cross-context streaming-saga entry points
+
+public extension Context {
+    /// Opens the §5.4.5 / §6.2.4 cross-context STREAMING outlet-invocation saga
+    /// (SCP-OUT-047) and returns its ``StreamingSagaHandle``.
+    ///
+    /// The STREAMING sibling of
+    /// ``invokeOutletCrossContextSaga(targetContext:callerDid:outletRegistrationId:input:assertedNonceHex:timestampMs:chainDepth:ucanProofId:)``.
+    /// Where the unary saga BLOCKS until `Committed` and returns the result
+    /// inline, this returns its chunk receiver PROMPTLY at the Commit-transition
+    /// and reaches `Committed` ASYNCHRONOUSLY at seal-close (ADR-049 §3a). The
+    /// returned handle is an `AsyncSequence` of ``OutletStreamChunk`` and exposes
+    /// the explicit ``StreamingSagaHandle/aggregate()`` drain verb; the streaming
+    /// FFI ops are wrapped behind it. This method performs no I/O and does not
+    /// block — the saga opens lazily on the first iteration / ``aggregate()``,
+    /// where an open rejection (the §6.2.4 caller-principal binding, a saga
+    /// terminal `ScpError`, or an input/UCAN rejection) surfaces.
+    ///
+    /// There is NO live control plane (grantCredit / cancel) for the
+    /// cross-context saga stream — per §6.2.5 / SCP-OUT-046 the credit window is
+    /// fixed at open via `estimatedChunkCount` (cancel_ack_ceiling = u64::MAX).
+    ///
+    /// The `chainDepth` (`UInt8`) and `timestampMs` (`UInt64`) parameters cannot
+    /// encode an out-of-range or negative value, so no manual range validation is
+    /// performed — Swift's type system enforces the bridge's `u8` / `u64`
+    /// boundaries by construction.
+    ///
+    /// - Parameters:
+    ///   - targetContext: The ``Context`` hosting the target outlet (the
+    ///     executing / target side); its handle is the `targetHandle`. The
+    ///     receiver's own handle is the `sourceHandle` — the explicit
+    ///     argument labels prevent a silent caller/target handle-swap.
+    ///   - callerDid: The invoking principal's DID (bound to the bridge principal).
+    ///   - outletRegistrationId: The target outlet's registration id.
+    ///   - input: The outlet input as serialized JSON data (a non-UTF-8 input
+    ///     surfaces ``ScpError/Outlet(msg:code:)`` `SCP-OUTLET-6001` on the first
+    ///     drain).
+    ///   - assertedNonceHex: The caller-asserted freshness nonce (32 hex chars).
+    ///   - timestampMs: The caller-asserted freshness timestamp (Unix ms).
+    ///   - chainDepth: The caller-asserted inbound chain depth (0 for a direct
+    ///     invocation).
+    ///   - ucanToken: The invocation UCAN authorizing the outlet call.
+    ///   - proofTokens: Optional UCAN delegation-chain proof tokens.
+    ///   - ucanProofId: Optional id of the spending UCAN proof.
+    ///   - timeoutMs: Optional per-stream timeout in milliseconds.
+    ///   - estimatedChunkCount: Optional invoker-declared upper bound on billable
+    ///     chunks — the fixed credit window.
+    /// - Returns: The lazily-opening ``StreamingSagaHandle``.
+    ///
+    /// ## Provenance
+    ///
+    /// - Spec section 6.2.4 / §5.4.5, ADR-049 §3a (SCP-OUT-047)
+    nonisolated func invokeOutletCrossContextStreamingSaga(
+        targetContext: Context,
+        callerDid: String,
+        outletRegistrationId: String,
+        input: Data,
+        assertedNonceHex: String,
+        timestampMs: UInt64,
+        chainDepth: UInt8,
+        ucanToken: String,
+        proofTokens: [String]? = nil,
+        ucanProofId: String? = nil,
+        timeoutMs: UInt32? = nil,
+        estimatedChunkCount: UInt32? = nil
+    ) -> StreamingSagaHandle {
+        let params = StreamingSagaOpenParams(
+            callerDid: callerDid,
+            outletRegistrationId: outletRegistrationId,
+            input: input,
+            assertedNonceHex: assertedNonceHex,
+            timestampMs: timestampMs,
+            chainDepth: chainDepth,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens,
+            ucanProofId: ucanProofId,
+            timeoutMs: timeoutMs,
+            estimatedChunkCount: estimatedChunkCount
+        )
+        return StreamingSagaHandle(
+            bridge: ContextSagaStreamBridge(
+                scp: scp,
+                sourceHandle: handle,
+                targetHandle: targetContext.handle
+            ),
+            params: params
+        )
+    }
+
+    /// Drives the key-bearing in-session reconnect/repair truncated-close for a
+    /// cross-context streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+    ///
+    /// This is IN-SESSION reconnect/repair of a seal that stalled or went
+    /// `NeedsRepair` while THIS bridge process is still alive (e.g. a client
+    /// reconnects to the same live node). The saga registry is per-instance and
+    /// in-memory, so this does NOT survive a process/node restart — cross-restart
+    /// recovery replays the durable saga journal via a separate operator path,
+    /// not this surface.
+    ///
+    /// On FFI reconnect this authenticates the caller, surfaces the target
+    /// context's Active Signing Key (resolved per-call from custody, never
+    /// envelope-asserted), and seals a witness-absent durable prefix to resolve
+    /// the saga `Committed` — WITHOUT re-opening the stream or re-invoking the
+    /// outlet executor.
+    ///
+    /// `callerDid` MUST be an identity hosted by this bridge instance (the §6.2.4
+    /// channel-authenticated principal) AND the invoker pinned at open — recovery
+    /// is money-moving, so a hosted-but-non-invoker caller is rejected with
+    /// ``ScpError/Permission(msg:code:)`` (`SCP-PERM-3001`, the SAME invoker gate
+    /// the same-context grant/cancel/terminate siblings enforce) BEFORE the
+    /// signing key is resolved.
+    ///
+    /// - Parameters:
+    ///   - sagaId: The durable supervisor-minted saga id to recover.
+    ///   - callerDid: The invoker DID (channel-authenticated, invoker-pinned).
+    /// - Throws: ``ScpError/Context(msg:code:)`` if `callerDid` is not hosted by
+    ///   this instance or `sagaId` is unknown; ``ScpError/Permission(msg:code:)``
+    ///   (`SCP-PERM-3001`) if `callerDid` is hosted but is not the pinned invoker;
+    ///   a saga terminal ``ScpError`` (`SagaNeedsRepair`) if the seal cannot
+    ///   complete.
+    ///
+    /// ## Provenance
+    ///
+    /// - Spec section 6.2.4 / §5.4.5, ADR-049 §3a (SCP-OUT-047)
+    func recoverStreamingSagaTruncatedClose(sagaId: String, callerDid: String) async throws {
+        try await scp.outletStreamingSagaRecoverTruncatedClose(sagaId: sagaId, callerDid: callerDid)
+    }
+}

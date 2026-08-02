@@ -1473,7 +1473,7 @@ pub struct Supervisor {
     // in [`Self::new`] and their accessors do not return `Option`.
     // -----------------------------------------------------------------
     /// Shared crypto provider. Populated by [`Self::with_providers`].
-    crypto: OnceLock<Arc<crate::crypto::mls::provider::MlsCryptoProvider>>,
+    crypto: OnceLock<Arc<crate::crypto::mls::provider::NodeMlsFactory>>,
     /// Shared transport provider. Populated by [`Self::with_providers`].
     transport: OnceLock<Arc<dyn ContextTransportProvider>>,
     /// Shared event-log provider. Populated by [`Self::with_providers`].
@@ -1959,7 +1959,7 @@ impl Supervisor {
     /// # Arguments
     ///
     /// * `crypto` — production
-    ///   [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
+    ///   [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory).
     /// * `transport` — production transport (typically
     ///   [`NotConfiguredTransportProvider`](crate::context::builder::NotConfiguredTransportProvider),
     ///   [`LocalTransportProvider`](crate::context::builder::LocalTransportProvider), or a real
@@ -1991,7 +1991,7 @@ impl Supervisor {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // FFI bridges need to compose providers in one call
     pub fn with_providers(
-        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         key_resolver: KeyResolver,
@@ -2054,7 +2054,7 @@ impl Supervisor {
     /// already-public surface; it does not widen any other injection point.
     #[allow(clippy::too_many_arguments)] // provider bootstrap mirrors `with_providers`
     pub fn with_providers_and_journal(
-        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         key_resolver: KeyResolver,
@@ -2238,13 +2238,11 @@ impl Supervisor {
     // -------------------------------------------------------------------
 
     /// Cheap reference to the supervisor's shared
-    /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
+    /// [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory).
     /// Returns `None` if [`Self::with_providers`] was not used (e.g. a
     /// supervisor built via `Self::for_query_shim` / `Self::new`).
     #[must_use]
-    pub(crate) fn crypto_ref(
-        &self,
-    ) -> Option<&Arc<crate::crypto::mls::provider::MlsCryptoProvider>> {
+    pub(crate) fn crypto_ref(&self) -> Option<&Arc<crate::crypto::mls::provider::NodeMlsFactory>> {
         self.crypto.get()
     }
 
@@ -2456,8 +2454,8 @@ impl Supervisor {
     // -------------------------------------------------------------------
     // ADR-049 §15 — per-identity wrapping-key accessors.
     //
-    // The plan §"MlsCryptoProvider dissolution" lifts the wrapping
-    // keypair off [`crate::crypto::mls::provider::MlsCryptoProvider`]
+    // The plan §"NodeMlsFactory dissolution" lifts the wrapping
+    // keypair off [`crate::crypto::mls::provider::NodeMlsFactory`]
     // (where it was held in `Mutex<[u8;32]>` / `Mutex<Zeroizing<...>>`
     // fields) onto the supervisor's per-identity
     // `wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>` map. The
@@ -2755,7 +2753,7 @@ impl Supervisor {
     /// Self-sources every collaborator from the `OnceLock`s populated by
     /// [`Self::with_providers`]: the `MlsBackend` / `HpkeBackend` pair is
     /// read transitively through `crypto.mls_backend()` /
-    /// `crypto.hpke_backend()` (the [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+    /// `crypto.hpke_backend()` (the [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
     /// owns the only instance — no second supervisor field, so there is
     /// one source of truth per ADR §6). The OpenMLS storage adapter is
     /// the supervisor's `mls_storage` slot. The `KeyPackageStoreHandle`
@@ -2820,7 +2818,7 @@ impl Supervisor {
         let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
 
         let crypto = Arc::clone(self.crypto_ref().ok_or_else(not_init)?);
-        // mls/hpke stay transitive — the MlsCryptoProvider owns the only
+        // mls/hpke stay transitive — the NodeMlsFactory owns the only
         // backend pair (ADR §6); no Supervisor field mirrors them.
         let mls = Arc::clone(crypto.mls_backend());
         let hpke = Arc::clone(crypto.hpke_backend());
@@ -4539,6 +4537,14 @@ impl Supervisor {
             // leak the loser's spawned task and diverge crypto state.
             let _guard = self.write_lock.lock().await;
             if self.actors.contains_key(&ctx_id_str) {
+                // Losing duplicate birth: this `state` never becomes a live
+                // actor, so dispose its seeded crypto (#2148 F6) — `destroy_group`
+                // eagerly frees the group (the OpenMLS signer is freed, NOT
+                // zeroized — #82). `state` drops on the very next line regardless,
+                // so this is defense-in-depth / forward-compat with #82, matching
+                // the close-seam teardown. A no-op for a broadcast /
+                // never-seeded state.
+                state.dispose_secrets();
                 return Err(ContextError::CreationFailed(format!(
                     "context '{ctx_id_str}' is already registered"
                 )));
@@ -5234,46 +5240,47 @@ impl Supervisor {
     /// Unlike [`Self::despawn_actor`] — which removes ONLY the in-memory actor
     /// handle — this fully reverses everything
     /// [`Self::spawn_actor_from_welcome`] materialized after the irreversible
-    /// KeyPackage consume, mirroring that entrypoint's OWN post-consume
-    /// rollback arms: it destroys the installed MLS crypto group
-    /// (`destroy_mls_group`) AND deletes the persisted Class-S snapshot
-    /// (`delete_context`) in addition to dropping the actor handle.
+    /// KeyPackage consume: it drops the actor handle (whose owned
+    /// `PerContextState` holds the MLS crypto — #2148 birth-into-actor — so the
+    /// sender key ZEROIZES and the group/signer is FREED (not zeroized — #82)
+    /// when the actor task ends) AND deletes the persisted Class-S snapshot
+    /// (`delete_context`).
     ///
     /// The FFI bridges call this as the compensating teardown when a
     /// post-irreversible-commit join step fails (e.g. a concurrent close/leave
     /// removed the bridge state before the authenticated ceiling could be
-    /// synced). A bare `despawn_actor` there would leave the resident MLS
-    /// crypto group AND the durable snapshot behind, so on restart the
-    /// "torn-down" context would RESURRECT (FFI/runtime divergence) and the
-    /// residual snapshot would block a fresh re-join via Precheck-D
-    /// (first-writer-wins durable collision). Tearing down all three leaves the
-    /// join strictly MORE recoverable: a re-join with a fresh KeyPackage
-    /// reservation now succeeds.
+    /// synced). A bare `despawn_actor` there would leave the durable snapshot
+    /// behind, so on restart the "torn-down" context would RESURRECT
+    /// (FFI/runtime divergence) and the residual snapshot would block a fresh
+    /// re-join via Precheck-D (first-writer-wins durable collision). Tearing
+    /// down the handle, snapshot, and floor registry entry leaves the join
+    /// strictly MORE recoverable: a re-join with a fresh KeyPackage reservation
+    /// now succeeds.
     ///
     /// The single-use KeyPackage the join burned is NOT restored — that
     /// consume is irreversible by construction (a KeyPackage is one-shot), and
     /// re-joining draws a fresh reservation anyway.
     ///
-    /// Like the internal rollback arms, the crypto-destroy and snapshot-delete
-    /// are best-effort (`let _ =`): each is an idempotent no-op when the
-    /// corresponding step never ran, and a compensating teardown must never
-    /// itself fail. Both are synchronous, so they run under `write_lock`
-    /// (no `.await` while held) — making the teardown atomic with respect to
-    /// concurrent register/despawn.
+    /// Like the internal rollback arms, the snapshot-delete is best-effort
+    /// (`let _ =`): an idempotent no-op when the join never persisted, and a
+    /// compensating teardown must never itself fail. The handle drop + floor
+    /// reap are synchronous, so the teardown runs under `write_lock` — atomic
+    /// with respect to concurrent register/despawn.
     ///
     /// Returns `true` if a live actor handle was registered and removed,
     /// `false` if no entry existed for `context_id`.
     pub async fn discard_joined_context(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
-        // 1. Drop the in-memory actor handle (identical to `despawn_actor`).
+        // 1. Drop the in-memory actor handle. #2148 (ADR-049 birth-into-actor):
+        //    the joiner's MLS crypto is OWNED by the actor's `PerContextState`
+        //    (born owned at the WELCOME seam, never provider-resident), so
+        //    dropping the actor handle closes its mailbox — the actor task ends
+        //    and its state drops: the sender key ZEROIZES (`ZeroizeOnDrop`) and
+        //    the group/signer is FREED (not zeroized — #82). There is no
+        //    provider map to also destroy (the deleted `destroy_mls_group` arm).
         let removed = self.actors.remove(context_id).is_some();
-        // 2. Destroy the resident MLS crypto group so no keyed state lingers
-        //    (mirrors `spawn_actor_from_welcome`'s `destroy_mls_group` arm).
         let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
-        if let Some(crypto) = self.crypto_ref() {
-            let _ = crypto.destroy_mls_group(&context_id_bytes);
-        }
-        // 3. Delete the durable Class-S snapshot the join persisted so a
+        // 2. Delete the durable Class-S snapshot the join persisted so a
         //    restart cannot resurrect the context and Precheck-D does not block
         //    a fresh re-join (mirrors the `delete_context` rollback arm; the
         //    helper-persistence slot is the same backend the join persisted to,
@@ -5281,15 +5288,16 @@ impl Supervisor {
         if let Some(persistence) = self.persistence_ref() {
             let _ = persistence.delete_context(context_id).await;
         }
-        // 4. Drop the authoritative Class-M floor registry entry (ADR-049) —
-        //    the registry twin of the provider's per-context crypto teardown
-        //    inside `destroy_mls_group` (step 2). A discarded welcome-join
-        //    is permanently gone (its crypto group + durable snapshot were just
-        //    destroyed), so the floors are moot and pruning is sound; see
+        // 3. Drop the authoritative Class-M floor registry entry (ADR-049). A
+        //    discarded welcome-join is permanently gone (its actor-owned crypto
+        //    freed on the handle drop above — `SenderKey`s zeroize, the MLS
+        //    group/signer is freed but not zeroized (#82); its durable snapshot
+        //    deleted), so
+        //    the floors are moot and pruning is sound; see
         //    `Supervisor::remove_context_floors` for the full permanent-vs-
         //    transient safety argument.
         self.remove_context_floors(&context_id_bytes);
-        // 5. Drop the per-context stream admission-tracker registry entry on
+        // 4. Drop the per-context stream admission-tracker registry entry on
         //    the same permanent-teardown sweep (spec §5.4.5) — the streaming
         //    twin of the floor-registry reap above. An in-flight pump holding
         //    its own Arc keeps the tracker alive; this only drops the
@@ -9624,6 +9632,30 @@ impl Supervisor {
             .unwrap_or_default()
     }
 
+    /// TEST-ONLY: the latest journaled [`SagaState`] for `saga_id` while it is
+    /// still unresolved, or `None` once it has been resolved
+    /// (Committed / Aborted) or was never journaled — reading the supervisor's
+    /// OWN durable saga journal via the SAME `load_unresolved` the crash-recovery
+    /// sweep uses.
+    ///
+    /// This exists so an FFI-level e2e test (SCP-OUT-047 AC6) can observe the
+    /// PRE-Committed (`Committing`) journal state a streaming-saga open leaves at
+    /// the Commit-transition — before the off-mailbox seal task resolves it to
+    /// `Committed` at stream-close — proving the FFI open returned promptly
+    /// rather than blocking until the stream terminated. It reads the journal
+    /// only (no actor mailbox, no mutation), so it is safe to call from any
+    /// runtime. A `load_unresolved` error is folded to "not found" (`None`).
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn test_saga_journal_state(&self, saga_id: &SagaId) -> Option<SagaState> {
+        self.saga_journal
+            .load_unresolved()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|e| &e.saga_id == saga_id)
+            .map(|e| e.state)
+    }
+
     /// Build the journal `evidence` bytes for a cross-context outlet-invocation
     /// saga — the `MessagePack` of the eight-field
     /// [`CrossContextOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared)
@@ -10482,7 +10514,9 @@ impl Supervisor {
     /// local cleanup only).
     ///
     /// Destroys per-context sender keys + MLS groups + event logs in
-    /// that order (zeroize secrets before tearing down structure),
+    /// that order (release secrets before tearing down structure;
+    /// `SenderKey`s zeroize, the MLS group/signer is freed — not
+    /// zeroized, #82),
     /// removes the contexts from the supervisor's registry, clears the
     /// standing-context tracking + local-DID registry + per-identity
     /// wrapping keys, and aborts background tasks (TTL timers,
@@ -13326,7 +13360,7 @@ impl Supervisor {
     ///    consumes the single-use KeyPackage (two independent single-use
     ///    anchors preserved).
     /// 2. INSTALL the joined group into the live crypto provider
-    ///    ([`MlsCryptoProvider::install_joined_group`](crate::crypto::mls::provider::MlsCryptoProvider::install_joined_group)),
+    ///    ([`NodeMlsFactory::install_joined_group`](crate::crypto::mls::provider::NodeMlsFactory::install_joined_group)),
     ///    plus a locally-minted sender key (spec §9.16.1).
     /// 3. Build the joiner's Welcome-derived
     ///    [`PerContextState`](crate::context::actor::state::PerContextState)
@@ -13743,8 +13777,11 @@ impl Supervisor {
                     //     persists NO snapshot, and registers NO actor; the only spent
                     //     cost is the already-burned single-use KeyPackage (the same
                     //     accepted cost as any post-consume failure). The rejected
-                    //     `joined_group` is dropped here (zeroizing its key material)
-                    //     with nothing half-installed to roll back. Passing verifies
+                    //     `joined_group` is dropped here, which FREES its key material
+                    //     (MlsGroup secrets + Ed25519 signer `Vec<u8>` + MemoryStorage)
+                    //     but does NOT zeroize the signer (upstream #82); disposing
+                    //     explicitly here would be inert since it drops immediately —
+                    //     nothing half-installed to roll back. Passing verifies
                     //     that `build_welcome_joiner_state` below only ever builds
                     //     authority the group itself attests. A group with no `0xFF02`
                     //     (not an SCP context) or any rule 2-6 mismatch is refused
@@ -13760,18 +13797,39 @@ impl Supervisor {
                     )
                     .map_err(ContextError::CryptoFailed)?;
 
-                    // 2. Install the joined group into the live crypto provider (Vacant-
-                    //    guarded; refuses to overwrite a live group) + a locally-minted
-                    //    sender key. From here the crypto is resident but the context is
-                    //    NOT yet reachable for send/receive — no actor handle is registered
-                    //    until step 5, so a crash in this window cannot expose a half-keyed
-                    //    live context.
-                    deps.crypto
-                        .install_joined_group(&context_id_bytes, joined_group)?;
+                    // 2. #2148 (ADR-049 birth-into-actor) WELCOME seam: BIRTH the
+                    //    joiner's crypto as OWNED material — the joined group (moved in
+                    //    here, consuming `joined_group`) plus a locally-minted sender key
+                    //    (spec §9.16.1; the Welcome carries no sender key). This touches
+                    //    NO provider map: there is no insert-then-`take_crypto_state`
+                    //    round-trip and no cross-map check-then-insert to race (#2167
+                    //    TOCTOU is impossible by construction). The crypto is held in the
+                    //    local `owned` binding until it is seeded onto `state` at 2b; a
+                    //    failure on any early-return between here and the spawn DROPS it
+                    //    with `state` (the `SenderKey` zeroizes via `ZeroizeOnDrop`; the
+                    //    `ScpMlsGroup`'s signer is FREED — never zeroized — on both the
+                    //    bare drop and the explicit `dispose_secrets`/`destroy_group`
+                    //    rollback branches, since `SignatureKeyPair` has no `Zeroize`, #82).
+                    //    Double-birth / durable-divergence is guarded by the whole
+                    //    entrypoint running under the global `bootstrap_spawn_lock`
+                    //    together with Precheck A (live-actor) + Precheck D (durable
+                    //    first-writer-wins); the registry write-lock insert at step 5
+                    //    guards only the in-memory registry slot, NOT durability (this
+                    //    path PERSISTS at step 4, BEFORE it registers at step 5 — see
+                    //    step 5's note).
+                    let mut owned = deps.crypto.install_joined_group(joined_group);
 
-                    // 3. Build the Welcome-derived PerContextState. On any failure, roll the
-                    //    just-installed group back so nothing keyed is left resident. (No
-                    //    durable snapshot exists yet, so no `delete_context` is needed here.)
+                    // 3. Build the Welcome-derived PerContextState (EMPTY encrypted mode).
+                    //    On failure, dispose `owned` FIRST (#2148 F6) — it is the live
+                    //    owner of the born crypto here (not yet seeded onto `state`). A
+                    //    bare drop already frees the joined group's in-memory storage and
+                    //    the Ed25519 signer's `Vec<u8>`; `dispose_secrets`
+                    //    (`destroy_group`) frees the same material eagerly (signer freed,
+                    //    NOT zeroized — #82; the `SenderKey` zeroizes on its own drop).
+                    //    On this branch `owned` drops immediately after, so the dispose is
+                    //    defense-in-depth / forward-compat. Nothing is provider-resident
+                    //    and no durable snapshot exists yet, so there is nothing else to
+                    //    tear down.
                     let mut state = match Self::build_welcome_joiner_state(
                         &deps,
                         &context_id,
@@ -13783,42 +13841,22 @@ impl Supervisor {
                     ) {
                         Ok(state) => state,
                         Err(e) => {
-                            let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                            owned.dispose_secrets();
                             return Err(e);
                         }
                     };
 
-                    // 2b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 WELCOME seam: TAKE the
-                    //     just-installed joined group's crypto out of the provider and
-                    //     SEED it onto the actor state. This is a BIRTH seam, exactly
-                    //     like CREATE: `install_joined_group` (step 2, a RETAINED
-                    //     provider birth-seam) births the group + local sender key into
-                    //     the provider; `take_crypto_state` then hands it to the actor
-                    //     ONE-WAY (removes the `contexts` entry AND records
-                    //     `taken_context_ids`, so a subsequent provider birth/take for
-                    //     this id fails closed — CM-001 double-owner guard). No crypto is
-                    //     ever handed back to the provider. `build_welcome_joiner_state`
-                    //     deliberately built an EMPTY encrypted mode; `seed` installs the
-                    //     owned group + sender key and resumes `send_sequence` via
-                    //     `from_persisted` (a freshly-installed joiner group starts at 0).
-                    //     From here the actor `state` is the SOLE crypto authority — the
-                    //     durability check (3b) and the fail-closed persist (4) read the
-                    //     export off `state`, not the provider.
-                    //
-                    //     Rollback semantics past this point: the crypto now lives in
-                    //     `state`, so every early-return below DROPS it (zeroizing the
-                    //     `ScpMlsGroup` / `SenderKey`); the `destroy_mls_group` calls
-                    //     become defensive no-ops (the group is no longer provider-
-                    //     resident) and the `taken_context_ids` marker is LEFT in place
-                    //     (fail-closed — the id must not resurrect a divergent second
-                    //     group; a retry re-drives a fresh Welcome).
-                    let owned = match deps.crypto.take_crypto_state(&context_id_bytes) {
-                        Ok(owned) => owned,
-                        Err(e) => {
-                            let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
-                            return Err(e);
-                        }
-                    };
+                    // 2b. SEED the owned crypto onto the actor `state`.
+                    //     `build_welcome_joiner_state` deliberately built an EMPTY
+                    //     encrypted mode; `seed` installs the owned group + sender key and
+                    //     resumes `send_sequence` via `from_persisted` (a freshly-born
+                    //     joiner group starts at 0). From here the actor `state` is the
+                    //     SOLE crypto authority — the durability check (3b) and the
+                    //     fail-closed persist (4) read the export off `state`. Every
+                    //     early-return below now DROPS the seeded crypto with `state`
+                    //     (the `SenderKey` zeroizes; the MLS group/signer is freed, not
+                    //     zeroized — #82), so no provider teardown is needed and a retry
+                    //     re-drives a fresh Welcome.
                     state.seed_encrypted_crypto_from_owned(owned);
 
                     let handle = state.handle.clone();
@@ -13835,12 +13873,17 @@ impl Supervisor {
                     //     documented to stand up (§9(b)) could receive but never send.
                     //     `state.handle` and this `handle` clone share one
                     //     `Arc<ArcSwap<ContextState>>`, so the actor's own handle observes
-                    //     `Active` too. On a transition failure roll the installed group back
-                    //     (nothing is persisted or registered yet) and fail closed.
+                    //     `Active` too. On a transition failure dispose the seeded `state`
+                    //     FIRST (#2148 F6): `state` owns the born crypto here.
+                    //     `dispose_secrets` (`destroy_group`) eagerly frees the group NOW;
+                    //     the signer is freed, NOT zeroized (#82) — same as the bare drop
+                    //     that follows this early return (the `SenderKey` zeroizes on its
+                    //     own drop), so this is defense-in-depth. Nothing is persisted or
+                    //     registered yet.
                     if let Err(e) =
                         handle.transition_to(&scp_protocol::context::ContextState::Active)
                     {
-                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                        state.dispose_secrets();
                         return Err(e);
                     }
 
@@ -13853,21 +13896,25 @@ impl Supervisor {
                     //     reconnect-derive — it would need a fresh Welcome — so a keyless
                     //     snapshot means a live send-capable actor with NO durable keys. The
                     //     snapshot's crypto blob is a 1:1 copy of `export_crypto_state`, and the
-                    //     export is DETERMINISTIC between the install above and here (no mutation
+                    //     export is DETERMINISTIC between the seed above and here (no mutation
                     //     in between), so re-reading the live export tells us exactly what a
                     //     snapshot WOULD carry. Check it here, BEFORE persisting: on a
-                    //     non-durable export roll the just-installed group back and return
-                    //     `Err` — nothing has been persisted yet, so there is no durable
-                    //     snapshot to delete (strictly cleaner than persist-then-delete, same
+                    //     non-durable export dispose the seeded `state` FIRST (#2148 F6) —
+                    //     `state` owns the born crypto. `dispose_secrets` (`destroy_group`)
+                    //     eagerly frees the group NOW; the signer is freed, NOT zeroized
+                    //     (#82) — same as the bare drop that follows this early return (the
+                    //     `SenderKey` zeroizes on its own drop), so this is defense-in-depth.
+                    //     Nothing has been persisted yet, so there is no durable snapshot to
+                    //     delete (strictly cleaner than persist-then-delete, same
                     //     fail-closed guarantee).
                     // ADR-049 PR-6 (read-authority switch): floors sourced from
                     // the AUTHORITATIVE Supervisor-owned Class-M registry
                     // (`deps.supervisor.export_*`) and threaded into
                     // `export_crypto_state` as the durable-blob params; the
                     // provider floor mirrors are deleted.
-                    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 WELCOME seam: the crypto is
-                    // now OWNED by the seeded actor `state` (taken from the provider in
-                    // step 2b), so read the export off `state` — identical to what
+                    // #2148 (ADR-049 birth-into-actor) WELCOME seam: the crypto is
+                    // OWNED by the seeded actor `state` (born owned at step 2), so read
+                    // the export off `state` — identical to what
                     // `build_snapshot_for_persist` (step 4) will persist. The X25519
                     // wrapping keypair is node-level and enters as params from the
                     // RETAINED `deps.crypto.wrapping_keypair()` accessor.
@@ -13898,7 +13945,7 @@ impl Supervisor {
                             ),
                         )
                     {
-                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                        state.dispose_secrets();
                         return Err(ContextError::PersistenceFailed(format!(
                             "spawn-from-Welcome: the joined group for '{context_id}' produces no \
                          durable MLS crypto export (export failed / needs_reconnect) — a \
@@ -13908,12 +13955,15 @@ impl Supervisor {
                     }
 
                     // 4. Persist the initial Class-S snapshot FAIL-CLOSED, BEFORE the spawn
-                    //    is acked. The snapshot captures the installed MLS crypto state
-                    //    (`build_snapshot_for_persist` reads `deps.crypto.export_crypto_state`),
+                    //    is acked. The snapshot captures the seeded actor MLS crypto state
+                    //    (`build_snapshot_for_persist` reads `state.export_crypto_state`),
                     //    so a crash after this point rehydrates a fully-keyed context. A
-                    //    persist failure tears the installed group back out AND deletes any
-                    //    partial durable snapshot, then returns `Err` — never a live
-                    //    half-keyed actor and never an orphaned/clobbered durable snapshot.
+                    //    persist failure deletes any partial durable snapshot and returns
+                    //    `Err`; before the early return, dispose the seeded `state`'s
+                    //    crypto (#2148 F6) — `destroy_group` eagerly frees the group (the
+                    //    OpenMLS signer is freed, NOT zeroized — #82; same as the bare drop
+                    //    that follows) — never a live half-keyed actor and never an
+                    //    orphaned/clobbered durable snapshot.
                     if let Err(e) = crate::context::messaging_helpers::persist_state_fail_closed(
                         &state,
                         &deps,
@@ -13921,23 +13971,36 @@ impl Supervisor {
                     )
                     .await
                     {
-                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                        state.dispose_secrets();
                         let _ = deps.persistence.delete_context(&context_id).await;
                         return Err(e);
                     }
 
                     // 5. Spawn the owned-state actor + register its send handle. On failure
-                    //    (e.g. a racing duplicate registration) roll the group back AND delete
-                    //    the durable snapshot so no orphaned durable state survives the `Err`.
-                    //    Drop any stale crash-window state for this id FIRST (under
-                    //    `bootstrap_spawn_lock`, mirroring the create / import / standing
-                    //    bootstraps): a previously-poisoned+despawned same-id context must not
-                    //    leave the freshly-spawned joiner actor inheriting a sticky poison
-                    //    window.
+                    //    (e.g. a racing duplicate registration) delete the durable snapshot
+                    //    so no orphaned durable state survives the `Err`; `spawn_actor_with_state`
+                    //    consumes `state`, and its dup-registration reject arm disposes the
+                    //    seeded crypto (eager free; signer freed, not zeroized — #82) before
+                    //    dropping it — it never returns to any provider. IMPORTANT: this path PERSISTS at
+                    //    step 4 BEFORE it registers here, so durable double-birth correctness
+                    //    rests on the whole entrypoint running under the global
+                    //    `bootstrap_spawn_lock` with Precheck A (live-actor) + Precheck D
+                    //    (durable first-writer-wins) rejecting a duplicate BEFORE the step-4
+                    //    persist — NOT on this step-5 write-lock insert, which guards only the
+                    //    in-memory registry slot. (The deleted provider `taken_context_ids` /
+                    //    `Entry::Vacant` guard was a redundant re-check of the durable
+                    //    property those prechecks own; #2167 subsumed.) The persist-before-
+                    //    register order (step 4 then step 5) is deliberate and durability-safe
+                    //    under `bootstrap_spawn_lock` + Precheck A/D; it must NOT be reordered
+                    //    (a persist-after-register would open a crash window that loses the
+                    //    context). Drop any stale crash-window state
+                    //    for this id FIRST (under `bootstrap_spawn_lock`, mirroring the
+                    //    create / import / standing bootstraps): a previously-poisoned+despawned
+                    //    same-id context must not leave the freshly-spawned joiner actor
+                    //    inheriting a sticky poison window.
                     self.reset_crash_window(&context_id);
                     let owned_deps = deps.clone_for_spawn();
                     if let Err(e) = self.spawn_actor_with_state(state, owned_deps, None).await {
-                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
                         let _ = deps.persistence.delete_context(&context_id).await;
                         return Err(e);
                     }
@@ -13950,18 +14013,24 @@ impl Supervisor {
                 Ok(inner) => inner,
                 Err(_elapsed) => {
                     // Timeout elapsed while the global `bootstrap_spawn_lock` was held.
-                    // Roll back exactly as the post-consume error arms do: destroy any
-                    // installed group and delete any persisted snapshot. Both are
-                    // idempotent `let _ =` no-ops when the elapse landed before that
-                    // step ran, so this is safe regardless of how far the timed region
-                    // progressed — no half-keyed crypto or orphaned durable snapshot
-                    // survives. Mirrors the `TransportTimeout` the import / restore /
-                    // respawn bootstraps return on their own `LIFECYCLE_TIMEOUT` elapse.
-                    // The actor is registered only by step 5's
-                    // `spawn_actor_with_state`, which resolves the timed future to
-                    // `Ok(..)` (never `Elapsed`) once it returns, so this arm is reached
-                    // only with NO registered actor for `context_id`.
-                    let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                    // The timed future is CANCELLED at the elapse, dropping any in-flight
+                    // seeded `state` (and with it the owned crypto). This outer arm cannot
+                    // reach into the cancelled future to `dispose_secrets`, so the born
+                    // crypto is bare-dropped here: the `SenderKey` zeroizes on drop, but
+                    // the OpenMLS Ed25519 signer's secret bytes linger un-zeroized in the
+                    // freed group storage until overwritten — an accepted best-effort gap
+                    // on this rare cancellation path, identical to a crash's residency
+                    // (#2148 F6; scp-mls #82: `SignatureKeyPair` has no `Zeroize`). There
+                    // is no provider-resident crypto to tear down (#2148 birth-into-actor).
+                    // Delete any persisted snapshot: an idempotent `let _ =` no-op when the
+                    // elapse landed before step 4 ran, so it is safe regardless of how far
+                    // the timed region progressed — no orphaned durable snapshot survives.
+                    // Mirrors the `TransportTimeout` the import / restore / respawn
+                    // bootstraps return on their own `LIFECYCLE_TIMEOUT` elapse. The actor
+                    // is registered only by step 5's `spawn_actor_with_state`, which
+                    // resolves the timed future to `Ok(..)` (never `Elapsed`) once it
+                    // returns, so this arm is reached only with NO registered actor for
+                    // `context_id`.
                     let _ = deps.persistence.delete_context(&context_id).await;
                     Err(ContextError::TransportTimeout(format!(
                         "spawn-from-Welcome exceeded {:?} budget for context {context_id}",
@@ -16082,7 +16151,7 @@ mod tests {
     }
 
     /// ADR-049 §15: per-identity wrapping-key accessors lift
-    /// the keypair off `MlsCryptoProvider`. Verifies that `set` →
+    /// the keypair off `NodeMlsFactory`. Verifies that `set` →
     /// `get` returns the same bytes via the supervisor's
     /// `DashMap<DID, ArcSwap<WrappingKeyPair>>`.
     #[tokio::test]
@@ -16390,10 +16459,10 @@ mod tests {
     ) -> Arc<Supervisor> {
         // Minimal providers — the spawn-registry tests only care about
         // the supervisor's actor map, not the providers' behaviour.
-        // `MlsCryptoProvider::new` takes a String DID; the stub DID is
+        // `NodeMlsFactory::new` takes a String DID; the stub DID is
         // never used by the spawn tests because no
         // `create_context` call runs.
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -16433,13 +16502,35 @@ mod tests {
     /// steady-state crypto twins (`seal` / `rotate_sender_key` / `drain_pending_
     /// sender_key_messages` / …) live on the actor, so tests that drive them move
     /// the party onto the actor first. One-way: the provider loses the context.
+    /// A minimal valid `0xFF02` extension bound to `ctx` for test births. The
+    /// export/restore tests below only exercise the crypto MATERIAL + floors, not
+    /// the §5.13.3 binding, so any well-formed extension suffices.
+    fn test_ctx_ext(ctx: &[u8; 32]) -> scp_protocol::context::ScpContextExtension {
+        let params = scp_protocol::context::ContextParams::default();
+        scp_protocol::context::ScpContextExtension::for_root(
+            hex::encode(ctx),
+            DID(String::new()),
+            params.mode,
+            &params.governance,
+            params.ceiling_policy,
+            &scp_protocol::context::roles::CapabilityCeiling::new(params.ceiling.clone()),
+        )
+        .expect("build test 0xFF02 extension")
+    }
+
+    /// #2148 (ADR-049 birth-into-actor): BIRTH an owned context group on `crypto`
+    /// via the owned-return `create_mls_group_with_context` and seed it onto a
+    /// throwaway actor `PerContextState` — the actor-native replacement for the
+    /// deleted `create_mls_group[_with_context]` + `generate_sender_key` +
+    /// `take_crypto_state` triad. The provider holds no per-context state.
     fn take_into_actor(
-        crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: &Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         ctx: &[u8; 32],
+        ext: &scp_protocol::context::ScpContextExtension,
     ) -> crate::context::actor::state::PerContextState {
         let owned = crypto
-            .take_crypto_state(ctx)
-            .expect("take owned crypto material off the provider");
+            .create_mls_group_with_context(ext)
+            .expect("birth owned crypto material");
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             *ctx,
             0,
@@ -16450,13 +16541,14 @@ mod tests {
     }
 
     fn actor_export(
-        crypto: &Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: &Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         ctx: &[u8; 32],
+        ext: &scp_protocol::context::ScpContextExtension,
         sender_key_epochs: Vec<(String, u64)>,
         recv_sequence_floors: Vec<(String, scp_protocol::context::builder::ReceiveFloor)>,
     ) -> Result<Vec<u8>, ContextError> {
         let (wpub, wsec) = crypto.wrapping_keypair_snapshot();
-        let state = take_into_actor(crypto, ctx);
+        let state = take_into_actor(crypto, ctx, ext);
         state.export_crypto_state(sender_key_epochs, recv_sequence_floors, wpub, &*wsec)
     }
 
@@ -16467,7 +16559,7 @@ mod tests {
     /// `supervisor` floor registry starts empty. A no-op resolver suffices —
     /// `decrypt_and_dispatch` defers signature verification to `ContextManager`.
     fn supervisor_with_crypto(
-        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
     ) -> Arc<Supervisor> {
         supervisor_with_crypto_and_resolver(
             crypto,
@@ -16481,7 +16573,7 @@ mod tests {
     /// check the request signature.
     #[cfg(feature = "testing")]
     fn supervisor_with_crypto_and_resolver(
-        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         key_resolver: KeyResolver,
     ) -> Arc<Supervisor> {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
@@ -18266,7 +18358,7 @@ mod tests {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
 
         // Build a supervisor with the skewed clock AND the fail-first event log.
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestM1Convergent".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -18412,7 +18504,7 @@ mod tests {
         };
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestM1Reset".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -19500,7 +19592,7 @@ mod tests {
         clock: Arc<dyn Clock>,
         persistence: Box<dyn ContextPersistence>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestM3Import".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -19826,10 +19918,10 @@ mod tests {
     /// `build_actor_deps` self-sources the exact same handles.
     fn build_deps_fixture() -> (
         Arc<Supervisor>,
-        Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        Arc<crate::crypto::mls::provider::NodeMlsFactory>,
         Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestBuildDeps".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -19868,7 +19960,7 @@ mod tests {
 
     /// `build_actor_deps` populates every `ActorDeps` field from the
     /// supervisor's own slots; mls/hpke are the single backend pair owned
-    /// by the `MlsCryptoProvider` (ADR-049 §6 — no second source).
+    /// by the `NodeMlsFactory` (ADR-049 §6 — no second source).
     #[tokio::test]
     async fn build_actor_deps_reads_single_backend_pair() {
         let (supervisor, crypto, mls_storage) = build_deps_fixture();
@@ -20419,7 +20511,7 @@ mod tests {
         // Install the global capture subscriber so the payload-redaction
         // test can observe the watchdog's log (emitted on a worker thread).
         install_capture_subscriber();
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -20995,10 +21087,6 @@ mod tests {
             &scp_protocol::context::roles::CapabilityCeiling::new(ctx_params.ceiling.clone()),
         )
         .expect("build scp_context_params (0xFF02) extension for respawn fixture");
-        crypto
-            .create_mls_group_with_context(&ctx_id_bytes, &ctx_extension)
-            .unwrap();
-        crypto.generate_sender_key(&ctx_id_bytes).unwrap();
 
         // ADR-049 PR-6: the AUTHORITATIVE per-sender floor lives in the
         // Supervisor-owned Class-M registry. Advance it to epoch 5 — the
@@ -21027,6 +21115,7 @@ mod tests {
         snap.mls_crypto_state = actor_export(
             &crypto,
             &ctx_id_bytes,
+            &ctx_extension,
             sup.export_sender_key_epochs(&ctx_id_bytes),
             sup.export_recv_sequence_floors(&ctx_id_bytes),
         )
@@ -21116,8 +21205,6 @@ mod tests {
         // Origin node: keyed context + non-trivially advanced registry floors.
         let origin = supervisor_with_providers();
         let origin_crypto = origin.crypto_ref().expect("origin crypto").clone();
-        origin_crypto.create_mls_group(&ctx).unwrap();
-        origin_crypto.generate_sender_key(&ctx).unwrap();
         origin
             .check_and_advance_sender_epoch(&ctx, sender, 4, MAX_EPOCH_ADVANCE)
             .unwrap();
@@ -21137,6 +21224,7 @@ mod tests {
         let blob = actor_export(
             &origin_crypto,
             &ctx,
+            &test_ctx_ext(&ctx),
             origin.export_sender_key_epochs(&ctx),
             origin.export_recv_sequence_floors(&ctx),
         )
@@ -21246,14 +21334,13 @@ mod tests {
         // Exporter snapshot carries a LOW sender-epoch floor (=2).
         let exporter = supervisor_with_providers();
         let exporter_crypto = exporter.crypto_ref().expect("exporter crypto").clone();
-        exporter_crypto.create_mls_group(&ctx).unwrap();
-        exporter_crypto.generate_sender_key(&ctx).unwrap();
         exporter
             .check_and_advance_sender_epoch(&ctx, sender, 2, MAX_EPOCH_ADVANCE)
             .unwrap();
         let blob = actor_export(
             &exporter_crypto,
             &ctx,
+            &test_ctx_ext(&ctx),
             exporter.export_sender_key_epochs(&ctx),
             exporter.export_recv_sequence_floors(&ctx),
         )
@@ -21296,14 +21383,14 @@ mod tests {
             "the live floor (9) must survive the rejected import"
         );
 
-        // Provider rolled back: the just-restored group was destroyed on the Err
-        // path, so the importer's provider holds NO crypto state for `ctx`. Probe
-        // via the retained `context_crypto_present` (the serializing
-        // `export_crypto_state` twin is deleted post-ADR-049 PR-7).
-        assert!(
-            !importer_crypto.context_crypto_present(&ctx),
-            "the restored crypto must be rolled back (group destroyed) on rejection"
-        );
+        // #2148 (ADR-049 birth-into-actor): rollback = the owned material is
+        // dropped on the Err path (the `SenderKey` zeroizes; the MLS group/signer
+        // is freed, not zeroized — #82) and never seeded onto an actor. The
+        // provider holds NO per-context state (the `contexts` map and the
+        // `context_crypto_present` residency probe are deleted), so there is no
+        // provider residency to assert — the floor-registry state above is the
+        // observable evidence the rejected import left nothing behind.
+        let _ = &importer_crypto;
     }
 
     /// ADR-049 A2 — a cold restart of a context whose per-sender epoch high-water
@@ -21325,8 +21412,6 @@ mod tests {
 
         let origin = supervisor_with_providers();
         let origin_crypto = origin.crypto_ref().expect("origin crypto").clone();
-        origin_crypto.create_mls_group(&ctx).unwrap();
-        origin_crypto.generate_sender_key(&ctx).unwrap();
         origin
             .check_and_advance_sender_epoch(&ctx, sender, high, high)
             .unwrap();
@@ -21344,6 +21429,7 @@ mod tests {
         let blob = actor_export(
             &origin_crypto,
             &ctx,
+            &test_ctx_ext(&ctx),
             origin.export_sender_key_epochs(&ctx),
             origin.export_recv_sequence_floors(&ctx),
         )
@@ -21399,8 +21485,6 @@ mod tests {
         // regress below importer live recv).
         let exporter = supervisor_with_providers();
         let exporter_crypto = exporter.crypto_ref().expect("exporter crypto").clone();
-        exporter_crypto.create_mls_group(&ctx).unwrap();
-        exporter_crypto.generate_sender_key(&ctx).unwrap();
         exporter
             .check_and_advance_sender_epoch(&ctx, sender, 9, MAX_EPOCH_ADVANCE)
             .unwrap();
@@ -21418,6 +21502,7 @@ mod tests {
         let blob = actor_export(
             &exporter_crypto,
             &ctx,
+            &test_ctx_ext(&ctx),
             exporter.export_sender_key_epochs(&ctx),
             exporter.export_recv_sequence_floors(&ctx),
         )
@@ -21481,12 +21566,21 @@ mod tests {
         const BOB: &str = "did:dht:z6MkBobE2eReceiverBobE2eReceiverBob123";
         let ctx_str = "e2e-decrypt-and-dispatch-fail-closed";
 
-        // Real two-party join: Bob holds the group + Alice's sender key at epoch 1.
-        let (alice_crypto, bob_crypto, ctx_bytes) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        // Real two-party join, born DIRECTLY onto actor-owned state: Bob's actor
+        // holds the group + Alice's pulled sender key at epoch 1, Alice's actor
+        // owns her group + sender key.
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
-        // Wrap Bob's post-join provider in a fresh Supervisor (empty registry) and
-        // build his production ActorDeps.
+        // Wrap Bob's provider in a fresh Supervisor (empty registry) and build his
+        // production ActorDeps. App-data delivery never touches the provider's
+        // per-context crypto (Bob's crypto lives on his actor state), so the
+        // groupless `bob_deps.crypto` is only read for `local_did`.
         let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
         let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Bob's ActorDeps from a sync #[test]; not a production async bridge
             .enable_all()
@@ -21495,10 +21589,6 @@ mod tests {
         let bob_deps = rt
             .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
             .expect("build bob's actor deps");
-
-        // Move Alice onto the actor seam (the provider `seal` twin is deleted
-        // post-ADR-049 PR-7); she seals from her actor-owned crypto.
-        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
 
         // Alice seals an Application envelope; the sender-layer header carries her
         // current (epoch, send_sequence). First seal → sequence 0, second → 1.
@@ -21530,12 +21620,8 @@ mod tests {
         let msg_a = seal_app(b"first-application-message"); // header sequence 0
         let msg_b = seal_app(b"second-application-message"); // header sequence 1
 
-        // Move Bob onto the actor seam and hand `decrypt_and_dispatch` his
-        // actor-owned crypto state: post-ADR-049 PR-7 the receive seam opens
-        // through the actor's `&mut ContextCryptoState` (a `None` means "no
-        // group"). App-data delivery never touches the provider's per-context
-        // crypto, so the emptied `bob_deps.crypto` is only read for `local_did`.
-        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        // Hand `decrypt_and_dispatch` Bob's actor-owned crypto state: the receive
+        // seam opens through the actor's `&mut ContextCryptoState`.
         let bob_cs = match &mut bob_actor.mode {
             crate::context::actor::ContextModeState::Encrypted(c) => c,
             crate::context::actor::ContextModeState::Broadcast(_) => {
@@ -21622,21 +21708,25 @@ mod tests {
         const BOB: &str = "did:dht:z6MkBobCatchUpBobCatchUpBobCatchUpBob12";
         let ctx_str = "e2e-decrypt-and-dispatch-catch-up";
 
-        let (alice_crypto, bob_crypto, ctx_bytes) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
-        // Move Alice onto the actor seam (the provider rotate/drain twins are
-        // deleted post-ADR-049 PR-7). Alice rotates her sender key (epoch 1 → 2)
-        // and redistributes it to Bob, who installs it via the retained
-        // receive-side provider methods — exactly what the live flow does.
-        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+        // Alice rotates her sender key (epoch 1 → 2) on her owned actor state and
+        // redistributes it to Bob, who installs it on HIS owned actor state via
+        // the actor-native receive-side seams — exactly what the live flow does.
+        let bob_secret: [u8; 32] = *bob_crypto.wrapping_keypair_snapshot().1;
         alice_actor.rotate_sender_key(ALICE).unwrap();
         alice_actor.distribute_sender_key(ALICE, ALICE).ok();
         for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
             if let Ok((key, _epoch)) =
-                bob_crypto.process_incoming_sender_key(&ctx_bytes, ALICE, &msg)
+                bob_actor.process_incoming_sender_key(&bob_secret, ALICE, &msg)
             {
-                bob_crypto.set_sender_key_unchecked(&ctx_bytes, ALICE, key);
+                bob_actor.set_sender_key_unchecked(ALICE, key);
             }
         }
 
@@ -21680,10 +21770,9 @@ mod tests {
             .seal(ALICE, &inner, &routing_id, 3600)
             .expect("alice seals at the rotated epoch");
 
-        // Hand Bob's actor-owned crypto state to the receive seam (it now opens
-        // through the actor's `&mut ContextCryptoState`); the rotated key Bob
-        // installed above is carried onto the actor by `take_into_actor`.
-        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
+        // Hand Bob's actor-owned crypto state (carrying the rotated key installed
+        // above) to the receive seam; it opens through the actor's
+        // `&mut ContextCryptoState`.
         let bob_cs = match &mut bob_actor.mode {
             crate::context::actor::ContextModeState::Encrypted(c) => c,
             crate::context::actor::ContextModeState::Broadcast(_) => {
@@ -21731,9 +21820,13 @@ mod tests {
         const BOB: &str = "did:dht:z6MkBobHeartbeatBobHeartbeatBobHeartbe1";
         let ctx_str = "heartbeat-mutated-regression";
 
-        // Real two-party join: Alice owns the joined MLS group + her sender key.
-        let (alice_crypto, _bob_crypto, ctx_bytes) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        // Real two-party join, born directly onto actor-owned state: Alice's
+        // actor owns the joined MLS group + her sender key.
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider: alice_crypto,
+            mut alice_state,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
 
         let alice_sup = supervisor_with_crypto(Arc::clone(&alice_crypto));
         let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives async dispatch from a sync #[test]; not a production async bridge
@@ -21744,11 +21837,10 @@ mod tests {
             .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
             .expect("build alice's actor deps");
 
-        // Move Alice's joined crypto onto the actor. Activate the context and seed
-        // Alice as a member with `messages:write` directly (mirroring the
+        // Activate the context on Alice's owned actor state and seed Alice as a
+        // member with `messages:write` directly (mirroring the
         // `writable_encrypted_state` fixture) so the heartbeat's require-active and
         // send-authorization gates pass without a governance round-trip.
-        let mut alice_state = take_into_actor(&alice_crypto, &ctx_bytes);
         alice_state
             .handle
             .transition_to(&ContextState::Active)
@@ -21822,8 +21914,13 @@ mod tests {
         const CHARLIE: &str = "did:dht:z6MkCharliePullCharliePullCharliePul12";
         let ctx_str = "sender-key-pull-receive-path";
 
-        let (alice_crypto, bob_crypto, ctx_bytes) =
-            crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider: alice_crypto,
+            alice_state: mut alice_actor,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
         let ctx_hex = hex::encode(ctx_bytes);
         let routing_id = scp_protocol::context::context_routing_id(ctx_str).to_vec();
 
@@ -21876,7 +21973,6 @@ mod tests {
 
         // Bob seals both requests through his actor-owned MLS group as management
         // envelopes (in MLS-generation order: mismatch first, then well-formed).
-        let mut bob_actor = take_into_actor(&bob_crypto, &ctx_bytes);
         let bob_cs = match &mut bob_actor.mode {
             crate::context::actor::ContextModeState::Encrypted(c) => c.as_mut(),
             crate::context::actor::ContextModeState::Broadcast(_) => panic!("expected encrypted"),
@@ -21892,8 +21988,7 @@ mod tests {
             .mls_encrypt_management(&ok_dist, &routing_id, 3600)
             .expect("bob seals the well-formed request");
 
-        // Alice opens on the production receive seam.
-        let mut alice_actor = take_into_actor(&alice_crypto, &ctx_bytes);
+        // Alice opens on the production receive seam using her owned actor state.
         let alice_cs = match &mut alice_actor.mode {
             crate::context::actor::ContextModeState::Encrypted(c) => c.as_mut(),
             crate::context::actor::ContextModeState::Broadcast(_) => panic!("expected encrypted"),
@@ -24617,7 +24712,7 @@ mod tests {
         creator_key: ed25519_dalek::VerifyingKey,
         event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxSaga".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -24725,7 +24820,7 @@ mod tests {
         creator_key: ed25519_dalek::VerifyingKey,
         persistence: Box<dyn ContextPersistence>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxSagaPersist".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -25002,7 +25097,7 @@ mod tests {
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         persistence: Option<Box<dyn ContextPersistence>>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxFaultJournal".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -27129,7 +27224,7 @@ mod tests {
         let journal: Arc<dyn SagaJournal> =
             Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkRecoverySupervisor".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -28202,7 +28297,7 @@ mod tests {
         let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
             Arc::clone(&journal_storage),
         ));
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxWave8".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -28445,7 +28540,7 @@ mod tests {
         let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(
             Arc::clone(&journal_storage),
         ));
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxWave15".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -29756,7 +29851,7 @@ mod tests {
     fn supervisor_with_void_counter(
         voids: &Arc<std::sync::atomic::AtomicUsize>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkDrainTerminal".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -30111,7 +30206,7 @@ mod open_outlet_stream_tests {
     }
 
     fn build_supervisor(captured: &Arc<AtomicUsize>) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             invoker().0,
             Arc::new(scp_clock::SystemClock),
         ));
@@ -31781,7 +31876,7 @@ mod streaming_saga_tests {
         journal: Arc<dyn SagaJournal>,
         event_log: Box<dyn ContextEventLogProvider>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ss_creator(),
             Arc::new(scp_clock::SystemClock),
         ));

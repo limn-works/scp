@@ -5,7 +5,7 @@
  * reframed): the shipped wasm MUST be a `--release` build. openmls's decrypt
  * path carries a `debug_assert!` that a `--dev` (debug-assertions-on) build
  * re-arms — a tampered ciphertext would then abort the tab instead of surfacing
- * a typed `[SCP-CRYPTO-4010]` `DecryptionFailed`. `--release` compiles that
+ * a typed `[SCP-CRYPTO-4041]` `DecryptionFailed`. `--release` compiles that
  * assert out, so `process_message` returns a typed `Err` on tampered ciphertext.
  *
  * The profile flag is a constant here so the `check-release-only` guard asserts
@@ -39,7 +39,7 @@ export const FORBIDDEN_PROFILE_FLAGS: readonly string[] = ["--dev", "--debug", "
  * never drift. Together with the root `[profile.release] debug-assertions = false`
  * pin in `Cargo.toml` (from #1444), `--release` is what guarantees the shipped
  * wasm has debug-assertions OFF, so openmls's decrypt `debug_assert!` is compiled
- * out and a tampered ciphertext surfaces a typed `[SCP-CRYPTO-4010]` error rather
+ * out and a tampered ciphertext surfaces a typed `[SCP-CRYPTO-4041]` error rather
  * than aborting the tab (ADR-057 Prereq-4).
  */
 export function assertReleaseOnly(args: readonly string[]): void {

@@ -271,7 +271,7 @@ const fn _assert_send_sync() {
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn test_supervisor(
-    crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+    crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
     transport: Box<dyn builder::ContextTransportProvider>,
     event_log: Box<dyn builder::ContextEventLogProvider>,
     key_resolver: scp_protocol::context::governance::KeyResolver,

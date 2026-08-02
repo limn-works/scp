@@ -37,7 +37,7 @@ use scp_protocol::trust::{AttestationType, ParticipationFacts};
 use scp_runtime::context::builder::{ContextEventLogProvider, NotConfiguredTransportProvider};
 use scp_runtime::context::providers::MerkleEventLogProvider;
 use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 use scp_runtime::crypto::mls::storage_adapter::{
     OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
 };
@@ -161,7 +161,7 @@ async fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
     }
 
     Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             ADMIN.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),
@@ -263,7 +263,7 @@ async fn participation_record_empty_attestations_yields_zero_count() {
 #[test]
 fn participation_record_empty_log_errors() {
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             ADMIN.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),
@@ -349,7 +349,7 @@ async fn participation_record_is_context_isolated() {
         .expect("append B gov");
 
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             ADMIN.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),
@@ -453,7 +453,7 @@ impl ContextEventLogProvider for EventsButNoRootProvider {
 #[test]
 fn participation_record_fails_closed_on_root_error_with_events() {
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             ADMIN.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

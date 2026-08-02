@@ -82,8 +82,8 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 /// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
 /// [`ScpCredential`] from the joiner's DID and TLS-serializes a fresh
 /// `KeyPackage` bundle produced by `generate_key_package_with_context_params`.
-/// The output bytes are what `MlsCryptoProvider::validate_key_package` and
-/// `MlsCryptoProvider::add_member` require — the old `FfiBridgeCrypto` stub
+/// The output bytes are what `NodeMlsFactory::validate_key_package` and
+/// `NodeMlsFactory::add_member` require — the old `FfiBridgeCrypto` stub
 /// used to accept `None`, but real MLS rejects it.
 ///
 /// Uses `None` for the wrapping key so the leaf **declares the `0xFF02`
@@ -966,6 +966,30 @@ impl fmt::Debug for UniffiKeyCustody {
             #[cfg(feature = "testing")]
             Self::InMemory(_) => f.write_str("UniffiKeyCustody::InMemory([redacted])"),
             Self::Callback(_) => f.write_str("UniffiKeyCustody::Callback([platform])"),
+        }
+    }
+}
+
+impl UniffiKeyCustody {
+    /// Exports the raw Ed25519 signing key for `handle` by dispatching to the
+    /// active backend — the enum analogue of the per-backend
+    /// `export_ed25519_signing_key` used by [`resolve_uniffi_signing_key`].
+    ///
+    /// Needed by the streaming-saga in-session reconnect/repair recover path
+    /// (SCP-OUT-047), which resolves the TARGET context creator's Active Signing
+    /// Key from the
+    /// per-instance identity custody registry (a `UniffiKeyCustody`) by DID —
+    /// there is no `ContextHandle` on the reconnect leg. Private key material
+    /// never crosses the FFI boundary; it is used in-process to seal the durable
+    /// prefix and dropped (ADR-006).
+    pub(crate) async fn export_ed25519_signing_key(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
+        match self {
+            #[cfg(feature = "testing")]
+            Self::InMemory(imc) => imc.0.export_ed25519_signing_key(handle).await,
+            Self::Callback(cb) => cb.export_ed25519_signing_key(handle).await,
         }
     }
 }
@@ -2584,8 +2608,8 @@ pub struct Identity {
     pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// JSON-serialized `scp_did::DidRotationEvent` produced when this
     /// handle was minted by [`Scp::identity_migrate`]. SDK callers MUST
-    /// distribute the event to active context members per spec §3.2.1
-    /// step 4b. `None` for handles produced by `identity_create`,
+    /// distribute the event to active context members per spec §9.12,
+    /// ADR-003 §4b. `None` for handles produced by `identity_create`,
     /// `rotate_key`, agent-key ops, or external load — those do not
     /// change the DID, so no `DidRotationEvent` is constructed.
     pub(crate) rotation_event_json: Option<String>,
@@ -2648,7 +2672,7 @@ impl Identity {
     /// Returns the JSON-serialized `DidRotationEvent` if this handle
     /// was produced by [`Scp::identity_migrate`]; `None` otherwise.
     /// SDK callers MUST distribute the event to active context members
-    /// per spec §3.2.1 step 4b.
+    /// per spec §9.12, ADR-003 §4b.
     #[must_use]
     pub fn rotation_event_json(&self) -> Option<String> {
         self.rotation_event_json.clone()
@@ -5924,7 +5948,7 @@ async fn resolve_identity_signing_key(
     })
 }
 
-async fn resolve_uniffi_signing_key(
+pub(crate) async fn resolve_uniffi_signing_key(
     handle: &ContextHandle,
 ) -> Result<ed25519_dalek::SigningKey, ScpError> {
     let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
@@ -5982,7 +6006,7 @@ async fn resolve_uniffi_signing_key(
 /// - `NeedsRepair` → [`ScpError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpError::SagaBusy`] (`SCP-SAGA-13066`).
-fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpError {
+pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpError {
     use scp_ffi_common::saga_errors::{SagaErrorKind, decompose_saga_error};
     let parts = decompose_saga_error(err);
     match parts.kind {
@@ -6011,7 +6035,7 @@ fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpError {
 /// wire form (§6.2.4 wire envelope). Any other length is a malformed envelope,
 /// NOT a "pad it" situation. Both failure modes surface as
 /// [`ScpError::Validation`] (`SCP-VALID-7001`).
-fn decode_asserted_nonce(asserted_nonce_hex: &str) -> Result<[u8; 16], ScpError> {
+pub(crate) fn decode_asserted_nonce(asserted_nonce_hex: &str) -> Result<[u8; 16], ScpError> {
     let bytes = hex::decode(asserted_nonce_hex).map_err(|e| ScpError::Validation {
         msg: format!(
             "asserted_nonce_hex is not valid hex: {e} — supply the 16-byte §6.2.4 envelope \
@@ -6048,7 +6072,7 @@ fn decode_asserted_nonce(asserted_nonce_hex: &str) -> Result<[u8; 16], ScpError>
 /// prove the request leg is authenticated AS that member) — so axis (a) is the
 /// load-bearing addition this seam contributes. Enforcing here, before the
 /// entry point, also means the saga never observes an unauthenticated caller.
-async fn enforce_caller_principal_binding(
+pub(crate) async fn enforce_caller_principal_binding(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     supervisor: &Arc<scp_core::context::supervisor::Supervisor>,
     caller_context_id: &str,
@@ -10649,7 +10673,7 @@ impl Scp {
                 let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
 
                 // Generate a real MLS key package for the joining member. The
-                // `MlsCryptoProvider` requires `Some(bytes)` — the old DID-less
+                // `NodeMlsFactory` requires `Some(bytes)` — the old DID-less
                 // `FfiBridgeCrypto` stub accepted `None`, but commit 4 replaced
                 // it with real MLS crypto across every bridge entry point.
                 let kp_bytes = generate_mls_key_package_bytes(&identity.did)?;
@@ -10918,18 +10942,14 @@ impl Scp {
                 let memory_scope = core_handle.params().memory_scope;
                 let now = scp_clock::SystemClock.now_secs();
 
-                // Build a fresh `MlsCryptoProvider` for key-destruction scoped to
-                // the initiator's DID. The bridge no longer caches a global stub
-                // crypto provider (commit 4 removed `FfiBridgeCrypto`). The
-                // `CloseOrchestrator` only uses this provider to destroy MLS group
-                // and sender-key material for the context being closed; a fresh
-                // per-call instance is correct.
-                let crypto_provider = scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-                    identity_did,
-                    std::sync::Arc::new(scp_clock::SystemClock),
-                );
-                let orchestrator =
-                    scp_core::context::key_destruction::CloseOrchestrator::new(&crypto_provider);
+                // #2148 (ADR-049 birth-into-actor): the `CloseOrchestrator` no
+                // longer holds a crypto provider. The actual MLS-group +
+                // sender-key destruction is performed by the context's ACTOR — the
+                // `LifecycleCommand::CloseContext` dispatched above routes through
+                // the actor's close handler, which disposes the actor-owned crypto
+                // for Ephemeral/Summary scope. This orchestrator only computes the
+                // relay-deletion + attestation `CloseAction` for observability.
+                let orchestrator = scp_core::context::key_destruction::CloseOrchestrator::new();
 
                 let close_action = orchestrator
                     .initiate_close(
@@ -15924,7 +15944,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `configure_relay_transport`.
     ///
-    /// Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
+    /// Routes through `&*self.inner`. Installs a real `NodeMlsFactory`
     /// and `RelayTransportProvider` on this instance's `ContextManager`.
     pub async fn configure_relay_transport(
         &self,
@@ -15962,7 +15982,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `configure_local_transport`.
     ///
-    /// Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+    /// Routes through `&*self.inner`. Installs a real `NodeMlsFactory` and
     /// an in-process loopback `LocalTransportProvider` on this instance's
     /// `ContextManager`. Unlike `configure_relay_transport`, this performs no
     /// network I/O — it wires test infrastructure so `context_send` and

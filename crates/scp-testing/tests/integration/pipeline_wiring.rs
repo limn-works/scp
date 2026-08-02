@@ -48,7 +48,7 @@ const PROVIDER_SRC: &str =
 
 // Actor per-context state source — owns the `ContextCryptoState::{seal,open}`
 // steady-state crypto seam. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) moved the seal /
-// open bodies off the `MlsCryptoProvider` (deleted) onto the actor-owned
+// open bodies off the `NodeMlsFactory` (deleted) onto the actor-owned
 // `PerContextState` here, so the seal-internal envelope-pipeline assertions scan
 // this source (the moved code), not `PROVIDER_SRC`. This is a repoint to the new
 // home of the same seal/open pipeline, not a weakening.
@@ -1563,19 +1563,28 @@ fn open_calls_decrypt_sender_layer() {
     );
 }
 
-// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the 11 steady-state crypto methods were
-// MOVED off `MlsCryptoProvider` onto the actor-owned `PerContextState`. This
-// asserts the provider retains ZERO definitions of any of them — a one-way move
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) + #2148 (birth-into-actor): the steady-state
+// crypto methods were MOVED off `NodeMlsFactory` onto the actor-owned
+// `PerContextState`, and #2148 additionally DELETED the provider's per-context
+// birth/restore/teardown seam — the `contexts` / `taken_context_ids` /
+// `broadcast_keys` maps and every method that read or wrote them. This asserts
+// the provider retains ZERO definitions of any of them: a one-way dissolution
 // (no dual-home), so a future refactor cannot silently re-add a provider-resident
-// twin that would seal/open behind the actor's back (double-owner, divergent
-// sequence, resurrected sender key). Birth/restore-seam methods (create_mls_group,
-// add_member, install_joined_group, take_crypto_state, build_restored_owned,
-// with_context, wrapping_keypair, destroy_mls_group, destroy_sender_key,
-// validate_key_package, store_member_sender_key) are RETAINED and deliberately not
-// listed. Additive coverage; weakens nothing.
+// twin that would seal/open/birth behind the actor's back (double-owner,
+// divergent sequence, resurrected sender key, #2167-style cross-map TOCTOU).
+//
+// The RETAINED node-level surface — `create_mls_group_with_context` /
+// `install_joined_group` (owned-return birth), `create_bare_group_owned` (test),
+// `build_restored_owned`, `process_incoming_sender_key`, `validate_key_package`,
+// `wrapping_keypair`(`_snapshot`), `make_credential`, `validate_creator_identity`,
+// `local_did`, backends/clock — is deliberately NOT listed (none carry per-context
+// state). The listed names are ONLY genuinely-deleted symbols; the checks below
+// use `fn NAME(`, which does not match `fn create_mls_group_with_context(` or
+// `fn install_joined_group(`. Closed positive list; additive coverage.
 #[test]
 fn provider_steady_state_crypto_methods_are_deleted() {
-    const MOVED_METHODS: [&str; 11] = [
+    const DELETED_METHODS: &[&str] = &[
+        // Steady-state crypto seam relocated onto the actor (PR-7).
         "seal",
         "open",
         "advance_epoch",
@@ -1587,13 +1596,49 @@ fn provider_steady_state_crypto_methods_are_deleted() {
         "export_crypto_state",
         "restore_crypto_state",
         "drain_pending_sender_key_messages",
+        // #2148 per-context birth/restore/teardown seam DELETED with the maps.
+        "take_crypto_state",
+        "with_context",
+        "context_crypto_present",
+        "create_mls_group", // bare; `create_mls_group_with_context` survives (no match)
+        "create_group_into_slot",
+        "generate_sender_key",
+        "init_broadcast_key",
+        "destroy_mls_group",
+        "destroy_sender_key",
+        "add_member", // and add_member_from_bytes — member add mutates the actor group
+        "add_member_from_bytes",
+        "distribute_sender_key",
+        "store_member_sender_key",
+        "set_sender_key_unchecked",
+        "handle_sender_key_request",
+        "group_context_extension", // provider reader deleted; actor twin survives (STATE_SRC)
     ];
-    for method in MOVED_METHODS {
+    for method in DELETED_METHODS {
         let def = format!("fn {method}(");
         assert!(
             !PROVIDER_SRC.contains(&def),
-            "MlsCryptoProvider must NOT define `{method}` — the steady-state crypto \
-             seam moved onto the actor `PerContextState` (ADR-049 PR-7, one-way move)"
+            "NodeMlsFactory must NOT define `{method}` — the per-context crypto \
+             seam is actor-owned (ADR-049 PR-7 + #2148 birth-into-actor); the provider \
+             holds no per-context state and no dual-home twin"
+        );
+    }
+
+    // #2148: the provider holds NO per-context state fields. The three per-context
+    // maps are DELETED — removing them closes the #2167 cross-map TOCTOU by
+    // construction (there is no check-then-insert to race). Match the FIELD
+    // DECLARATION form (`name: Type`) so prose/comment mentions of the retired
+    // names do not false-positive.
+    for field in [
+        "contexts: DashMap",
+        "taken_context_ids: DashSet",
+        "broadcast_keys: DashMap",
+    ] {
+        assert!(
+            !PROVIDER_SRC.contains(field),
+            "NodeMlsFactory must NOT carry the per-context field `{field}` — #2148 \
+             (birth-into-actor) dissolves the provider's per-context state; the actor's \
+             `PerContextState` is the sole per-context crypto home"
         );
     }
 }
@@ -2161,6 +2206,73 @@ fn c7_pyo3_outlet_stream_cancel_uses_runtime_derived_cursor() {
         !body.contains("next_seq"),
         "PyO3 streaming cancel must NOT construct or pass a next_seq — the cursor \
          is runtime-derived (§5.4.5 CRITICAL #3)."
+    );
+}
+
+// §5.4.5 / §6.2.4 cross-context streaming saga (SCP-OUT-047 pass 1). The PyO3
+// reference bridge's streaming-saga OPEN MUST (a) run the §6.2.4 caller-principal
+// binding (`enforce_caller_principal_binding`) BEFORE anything irreversible — so
+// the saga never observes an unauthenticated caller and no receiver is handed out
+// on a mismatch — and (b) drive the runtime producer
+// `start_cross_context_streaming_outlet_invocation_saga`. Its RECOVER export MUST
+// reach the key-bearing truncated-close driver.
+//
+// This is the PyO3-reference assertion and is ENFORCED (not ignored — this file
+// forbids stale `#[ignore]`s): the PyO3 impl exists as of SCP-OUT-047 pass 1, so
+// the gate is live from day one. Pass 3 ADDS the sibling NAPI/UniFFI assertions
+// (mirroring the C7/C8 same-context streaming pattern above) when those bridges
+// gain the operation.
+#[test]
+fn out047_pyo3_streaming_saga_open_binds_caller_and_reaches_start_saga() {
+    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "outlet_streaming_saga_open_impl")
+        .expect("outlet_streaming_saga_open_impl body must exist");
+    assert!(
+        body.contains("enforce_caller_principal_binding"),
+        "PyO3 streaming-saga open must run the §6.2.4 caller-principal binding \
+         BEFORE the saga runs — else an unauthenticated caller could open a \
+         cross-context stream (ADR-049 §3a channel-auth)."
+    );
+    assert!(
+        body.contains("start_cross_context_streaming_outlet_invocation_saga"),
+        "PyO3 streaming-saga open must reach \
+         Supervisor::start_cross_context_streaming_outlet_invocation_saga — the \
+         runtime producer that returns the receiver at the Commit-transition. \
+         Without it the §5.4.5 cross-context streaming producer is unwired."
+    );
+}
+
+// SCP-OUT-047 pass 1: the PyO3 recover export MUST reach the key-bearing
+// truncated-close recovery driver (which reaches
+// `Supervisor::recover_streaming_saga_truncated_close`) and MUST authenticate the
+// reconnect caller. ENFORCED (PyO3 impl exists); pass 3 adds the sibling
+// assertions.
+#[test]
+fn out047_pyo3_streaming_saga_recover_reaches_truncated_close() {
+    let body = extract_fn_body(
+        PYO3_OUTLET_STREAM_SRC,
+        "outlet_streaming_saga_recover_truncated_close_impl",
+    )
+    .expect("outlet_streaming_saga_recover_truncated_close_impl body must exist");
+    assert!(
+        body.contains("drive_recover_truncated_close"),
+        "PyO3 streaming-saga recover must reach the shared \
+         drive_recover_truncated_close driver (which reaches \
+         Supervisor::recover_streaming_saga_truncated_close) — the key-bearing \
+         crash-recovery seal (SCP-OUT-046 #136 AC7)."
+    );
+    assert!(
+        body.contains("identity_registry_contains"),
+        "PyO3 streaming-saga recover must AUTHENTICATE the reconnect caller \
+         (identity-registry check) before sealing — the caller MUST be the \
+         channel-authenticated principal (§6.2.4)."
+    );
+    assert!(
+        body.contains("resolve_context_signing_key"),
+        "PyO3 streaming-saga recover must SURFACE the target context's Active \
+         Signing Key per-call from custody (resolve_context_signing_key) before \
+         sealing — the recovery receipt is signed with a custody-resolved key, \
+         NEVER an envelope-asserted one (§6.2.4). Structurally pins the \
+         FFI-layer key-surfacing, not just the runtime seal."
     );
 }
 

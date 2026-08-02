@@ -57,7 +57,7 @@ use crate::context::invitation_helpers::{SnapshotRuntimeFacts, build_metadata_sn
 use crate::context::persistence::ContextPersistence;
 use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::state::context_id_to_bytes;
-use crate::crypto::mls::provider::MlsCryptoProvider;
+use crate::crypto::mls::provider::NodeMlsFactory;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 
 const ALICE_DID: &str = "did:dht:z6MkAliceSpawnFromWelcomeCreator";
@@ -309,6 +309,27 @@ fn honest_ext(context_id: &str, params: &ContextParams) -> ScpContextExtension {
     .expect("honest context extension serializes")
 }
 
+/// #2148 (ADR-049 birth-into-actor): produce Alice's real Welcome for Bob by
+/// seeding her OWNED group onto a throwaway actor state and adding Bob's reserved
+/// KeyPackage through the actor-native `add_member` seam (member addition mutates
+/// the actor-owned MLS group — the provider holds no per-context state). Alice's
+/// state is discarded; only the Welcome bytes matter.
+fn alice_welcome_for_bob(
+    ctx_bytes: &[u8; 32],
+    owned: crate::crypto::mls::provider::OwnedMlsCryptoState,
+    kp_bytes: &[u8],
+) -> scp_protocol::context::builder::AddMemberOutput {
+    let mut alice_state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+        *ctx_bytes,
+        0,
+        DID::from(ALICE_DID),
+    );
+    alice_state.seed_encrypted_crypto_from_owned(owned);
+    alice_state
+        .add_member(BOB_DID, Some(kp_bytes), &scp_clock::SystemClock)
+        .expect("alice adds bob's reserved key package on her owned group")
+}
+
 /// Publishes Bob's wrapping key on `sup` so his pooled KeyPackages carry the
 /// `0xFF01` wrapping-key leaf extension, exercising the wrapping-key-PRESENT path
 /// (see [`BOB_WRAP`]); the `0xFF02` context-params capability is declared
@@ -364,7 +385,7 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 /// double for the crash-safety test.
 fn bob_supervisor(
     persistence: Option<Box<dyn ContextPersistence>>,
-) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
+) -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
     bob_supervisor_with_resolver(persistence, pair_resolver())
 }
 
@@ -374,8 +395,8 @@ fn bob_supervisor(
 fn bob_supervisor_with_resolver(
     persistence: Option<Box<dyn ContextPersistence>>,
     resolver: KeyResolver,
-) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+) -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
+    let crypto = Arc::new(NodeMlsFactory::new(
         BOB_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -401,8 +422,8 @@ fn bob_supervisor_with_resolver(
 /// `invite_member` round-trip (Test M), which resolves the INVITEE (`BOB`)
 /// #active to seal to. Returns the supervisor and a clone of Alice's crypto
 /// provider (so the test can drive the installed group).
-fn alice_supervisor() -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+fn alice_supervisor() -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
+    let crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -518,24 +539,23 @@ async fn run_join_with(
     // KP, producing the real Welcome addressed to that KP's init key. When
     // `committed` is `Some`, the group carries the honest `0xFF02` extension;
     // otherwise it is a wrapping-only (non-SCP) group.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    match &committed {
-        Some(committed_params) => alice_crypto
-            .create_mls_group_with_context(
-                &group_ctx_bytes,
-                &honest_ext(&group_ctx_id, committed_params),
-            )
-            .expect("alice creates the SCP context group (0xFF02)"),
-        None => alice_crypto
-            .create_mls_group(&group_ctx_bytes)
-            .expect("alice creates a wrapping-only group (no 0xFF02)"),
-    }
-    let add_output = alice_crypto
-        .add_member(&group_ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
+    let alice_owned = committed.as_ref().map_or_else(
+        || {
+            alice_crypto
+                .create_bare_group_owned()
+                .expect("alice creates a wrapping-only group (no 0xFF02)")
+        },
+        |committed_params| {
+            alice_crypto
+                .create_mls_group_with_context(&honest_ext(&group_ctx_id, committed_params))
+                .expect("alice creates the SCP context group (0xFF02)")
+        },
+    );
+    let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);
 
     let request_ctx_id = request_ctx_id.unwrap_or_else(|| group_ctx_id.clone());
     let request_ctx_bytes = context_id_to_bytes(&request_ctx_id);
@@ -712,7 +732,7 @@ async fn spawn_from_welcome_seeds_the_real_joined_group_epoch() {
 /// # Bidirectional round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
 ///
 /// This test used to drive the bidirectional payload round-trip via
-/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the provider.
+/// `NodeMlsFactory::mls_encrypt_management` / `open` DIRECTLY on the provider.
 /// PR-7 moved the seal/open crypto off the provider and onto the live actor, so
 /// the bare-provider `take_into_actor` seam would double-take an
 /// already-actor-resident context and panic — the round-trip is no longer
@@ -865,16 +885,14 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto
-        .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &joiner_params()))
+    let alice_owned = alice_crypto
+        .create_mls_group_with_context(&honest_ext(&ctx_id, &joiner_params()))
         .unwrap();
-    let add_output = alice_crypto
-        .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .unwrap();
+    let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
     let welcome = add_output.welcome_bytes;
 
     // Both spawns present Bob's SAME #active custody (the replay opens an
@@ -949,21 +967,16 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
 /// `(alice_crypto, welcome_bytes)`. The committed extension binds `context_id`,
 /// so a join under a DIFFERENT id (or with divergent params) is refused by the
 /// FFI-02 binding check; every caller here joins under the SAME `context_id`.
-fn alice_welcome_for(
-    context_id: &str,
-    kp_public_bytes: &[u8],
-) -> (Arc<MlsCryptoProvider>, Vec<u8>) {
+fn alice_welcome_for(context_id: &str, kp_public_bytes: &[u8]) -> (Arc<NodeMlsFactory>, Vec<u8>) {
     let ctx_bytes = context_id_to_bytes(context_id);
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto
-        .create_mls_group_with_context(&ctx_bytes, &honest_ext(context_id, &joiner_params()))
+    let alice_owned = alice_crypto
+        .create_mls_group_with_context(&honest_ext(context_id, &joiner_params()))
         .expect("alice creates the SCP context group (0xFF02)");
-    let add_output = alice_crypto
-        .add_member(&ctx_bytes, BOB_DID, Some(kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
+    let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, kp_public_bytes);
     (alice_crypto, add_output.welcome_bytes)
 }
 
@@ -1178,7 +1191,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 /// into a keyless `needs_reconnect` snapshot that persists SUCCESSFULLY) is
 /// fatal for a JOINER, which cannot reconnect-derive.
 ///
-/// The concrete `MlsCryptoProvider` always returns a NON-EMPTY export for a
+/// The concrete `NodeMlsFactory` always returns a NON-EMPTY export for a
 /// just-installed group, so the export-failure branch cannot be induced through
 /// the full entrypoint with the real provider (install guarantees a live group).
 /// This unit test therefore pins the fail-closed DECISION directly on the pure
@@ -1215,7 +1228,7 @@ fn welcome_snapshot_crypto_durability_predicate_fails_closed_on_empty_or_error()
 
 /// The entrypoint's crypto-durability gate (step 3b) fails the spawn CLOSED when
 /// the joined group produces a non-durable crypto export — WITHOUT persisting a
-/// keyless snapshot and WITHOUT standing up an actor. The real `MlsCryptoProvider`
+/// keyless snapshot and WITHOUT standing up an actor. The real `NodeMlsFactory`
 /// always exports a non-empty blob for a just-installed group, so this branch is
 /// otherwise unreachable through the full entrypoint; a one-shot test seam
 /// (`arm_export_failure_once`) forces the NEXT export to fail so the WIRING —
@@ -1638,7 +1651,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
 /// # Round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
 ///
 /// This test used to additionally drive a bob→alice payload round-trip via
-/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the provider.
+/// `NodeMlsFactory::mls_encrypt_management` / `open` DIRECTLY on the provider.
 /// PR-7 moved the seal/open crypto onto the live actor, so the bare-provider
 /// `take_into_actor` seam double-takes an already-actor-resident context and
 /// panics. The full round-trip over the real actor mailbox + transport lives at
@@ -2278,7 +2291,7 @@ async fn structurally_inconsistent_bundle_is_rejected() {
 /// # Bidirectional round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
 ///
 /// This test used to additionally drive a bidirectional payload round-trip via
-/// `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the
+/// `NodeMlsFactory::mls_encrypt_management` / `open` DIRECTLY on the
 /// providers. PR-7 moved the seal/open crypto onto the live actor, so the
 /// bare-provider `take_into_actor` seam double-takes an already-actor-resident
 /// context and panics. The full both-directions payload proof over the real actor
@@ -2438,8 +2451,8 @@ impl ContextTransportProvider for BroadcastWatchTransport {
 /// otherwise.
 fn alice_supervisor_with_transport(
     transport: Box<dyn ContextTransportProvider>,
-) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+) -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
+    let crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -2797,16 +2810,14 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     // real Welcome. The committed extension rides through the add Commit unchanged
     // as part of the group's cryptographic identity, so it still binds creator =
     // Alice regardless of who issued the add.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto
-        .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &params))
+    let alice_owned = alice_crypto
+        .create_mls_group_with_context(&honest_ext(&ctx_id, &params))
         .expect("alice creates the honest SCP context group committing creator=Alice");
-    let add_output = alice_crypto
-        .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
+    let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
 
     // Mallory's forged bundle: creator_did = Mallory, signed with Mallory's key,
     // params = Alice's REAL params. Hints == Mallory so the HPKE open succeeds and
@@ -3031,7 +3042,7 @@ impl ContextTransportProvider for AcceptingSendTransport {
 /// `NotConfiguredTransportProvider`, whose `send_message` fails closed).
 /// Mirrors [`bob_supervisor`] otherwise.
 fn bob_supervisor_with_transport(transport: Box<dyn ContextTransportProvider>) -> Arc<Supervisor> {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+    let crypto = Arc::new(NodeMlsFactory::new(
         BOB_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -3088,19 +3099,14 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
 
     // Alice (bare creator provider) creates the honest SCP context group and
     // adds Bob's reserved KP, producing the real Welcome addressed to that KP.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+    let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto
-        .create_mls_group_with_context(
-            &group_ctx_bytes,
-            &honest_ext(&group_ctx_id, &joiner_params()),
-        )
+    let alice_owned = alice_crypto
+        .create_mls_group_with_context(&honest_ext(&group_ctx_id, &joiner_params()))
         .expect("alice creates the SCP context group (0xFF02)");
-    let add_output = alice_crypto
-        .add_member(&group_ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
+    let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);
 
     // Seal the creator-signed §5.12.3 bundle to Bob's #active and spawn.
     let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;

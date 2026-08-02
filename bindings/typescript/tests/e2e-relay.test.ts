@@ -20,7 +20,7 @@
  *
  * NOTE: Full decrypt roundtrip (send -> relay -> subscribe -> MLS decrypt)
  * cannot be tested in a single-process NAPI bridge because the single
- * `MlsCryptoProvider` instance cannot decrypt its own ciphertext (MLS
+ * `NodeMlsFactory` instance cannot decrypt its own ciphertext (MLS
  * self-decryption is not supported -- the group's encryption state has
  * already advanced past the sent message). The full decrypt roundtrip is
  * verified at the Rust layer in the `encrypted_relay_roundtrip` integration

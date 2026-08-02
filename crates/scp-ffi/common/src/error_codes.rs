@@ -805,8 +805,33 @@ pub const VALID_7020: &str = "SCP-VALID-7020";
 pub const VALID_7021: &str = "SCP-VALID-7021";
 /// Event log verify validation error.
 pub const VALID_7022: &str = "SCP-VALID-7022";
+/// SDK-wrapper local guard: the in-tab client is not initialized.
+///
+/// The caller must `await initScp()` — or use `ScpBrowserClient.connect`, which
+/// awaits it — before constructing a client. Thrown TS-side by the
+/// `@limn-works/scp-ts-wasm` wrapper, never minted by an FFI bridge.
+pub const VALID_7025: &str = "SCP-VALID-7025";
+/// SDK-wrapper local guard: a managed transport was passed to `create()`.
+///
+/// A `WebSocketRelaySocket` (the managed transport for `connect()`) was passed to
+/// `create()`, leaving it unattached. Thrown TS-side by the
+/// `@limn-works/scp-ts-wasm` wrapper, never minted by an FFI bridge.
+pub const VALID_7026: &str = "SCP-VALID-7026";
 /// Governance action validation error.
 pub const VALID_7027: &str = "SCP-VALID-7027";
+/// SDK-wrapper local guard: a second live `BrowserInvokerStreamSession`.
+///
+/// A second session was constructed on a `(client, contextId)` that already has
+/// one (a session drains the client's whole per-context buffer, so it requires a
+/// dedicated client/context). Thrown TS-side by `@limn-works/scp-ts-wasm`, never
+/// by a bridge.
+pub const VALID_7028: &str = "SCP-VALID-7028";
+/// SDK-wrapper local guard: a stream drain was iterated re-entrantly.
+///
+/// A `BrowserInvokerStreamSession` drain was entered from two async contexts
+/// concurrently — caller misuse, distinct from the lifecycle-closed
+/// `SCP-OUTLET-6100`. Thrown TS-side by `@limn-works/scp-ts-wasm`, never by a bridge.
+pub const VALID_7029: &str = "SCP-VALID-7029";
 /// MCP validation error.
 pub const VALID_7030: &str = "SCP-VALID-7030";
 /// MCP transport validation error.

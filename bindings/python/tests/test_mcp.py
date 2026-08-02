@@ -32,7 +32,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scp_sdk.errors import ValidationError
+from scp_sdk.errors import McpError
 from scp_sdk.mcp import (
     DEFAULT_STDIO_ALLOWLIST,
     McpClient,
@@ -201,44 +201,44 @@ class TestValidateClientConnect:
     """Tests for :func:`validate_client_connect` — the pure-Python guard."""
 
     def test_rejects_invalid_transport(self) -> None:
-        with pytest.raises(ValidationError, match="transport must be"):
+        with pytest.raises(McpError, match="transport must be"):
             validate_client_connect("http", command=["echo"])
 
     def test_stdio_requires_command(self) -> None:
-        with pytest.raises(ValidationError, match="command is required"):
+        with pytest.raises(McpError, match="command is required"):
             validate_client_connect("stdio")
 
     def test_sse_requires_url(self) -> None:
-        with pytest.raises(ValidationError, match="url is required"):
+        with pytest.raises(McpError, match="url is required"):
             validate_client_connect("sse")
 
     def test_validation_error_codes(self) -> None:
-        with pytest.raises(ValidationError) as exc_info:
+        with pytest.raises(McpError) as exc_info:
             validate_client_connect("invalid")
         assert exc_info.value.code == "SCP-MCP-10002"
 
-        with pytest.raises(ValidationError) as exc_info:
+        with pytest.raises(McpError) as exc_info:
             validate_client_connect("stdio")
         assert exc_info.value.code == "SCP-MCP-10004"
 
-        with pytest.raises(ValidationError) as exc_info:
+        with pytest.raises(McpError) as exc_info:
             validate_client_connect("sse")
         assert exc_info.value.code == "SCP-MCP-10005"
 
     def test_rejects_absolute_path(self) -> None:
-        with pytest.raises(ValidationError, match="bare binary name"):
+        with pytest.raises(McpError, match="bare binary name"):
             validate_client_connect("stdio", command=["/usr/bin/node"])
 
     def test_rejects_relative_path(self) -> None:
-        with pytest.raises(ValidationError, match="bare binary name"):
+        with pytest.raises(McpError, match="bare binary name"):
             validate_client_connect("stdio", command=["./node"])
 
     def test_rejects_path_traversal(self) -> None:
-        with pytest.raises(ValidationError, match="bare binary name"):
+        with pytest.raises(McpError, match="bare binary name"):
             validate_client_connect("stdio", command=["../../bin/node"])
 
     def test_path_rejection_error_code(self) -> None:
-        with pytest.raises(ValidationError) as exc_info:
+        with pytest.raises(McpError) as exc_info:
             validate_client_connect("stdio", command=["/tmp/evil/node"])
         assert exc_info.value.code == "SCP-MCP-10006"
 
@@ -248,7 +248,7 @@ class TestValidateClientConnect:
             "allowed": sorted(DEFAULT_STDIO_ALLOWLIST),
             "unrestricted": False,
         }
-        with pytest.raises(ValidationError, match="allowlist"):
+        with pytest.raises(McpError, match="allowlist"):
             validate_client_connect(
                 "stdio",
                 command=["my-custom-server"],
@@ -298,7 +298,7 @@ class TestScpMcpClientConnectValidation:
 
         scp = MagicMock()
         scp._native = MagicMock()
-        with pytest.raises(ValidationError):
+        with pytest.raises(McpError):
             await SCP.mcp_client_connect_stdio(scp, [])
 
     @pytest.mark.asyncio
@@ -307,7 +307,7 @@ class TestScpMcpClientConnectValidation:
 
         scp = MagicMock()
         scp._native = MagicMock()
-        with pytest.raises(ValidationError):
+        with pytest.raises(McpError):
             await SCP.mcp_client_connect_sse(scp, "")
 
 
@@ -496,14 +496,14 @@ class TestStdioAllowlistApi:
         from scp_sdk.scp import SCP
 
         scp = SCP(storage={"type": "in_memory"})
-        with pytest.raises(ValidationError, match="i_trust_all_commands"):
+        with pytest.raises(McpError, match="i_trust_all_commands"):
             scp.mcp_disable_stdio_allowlist()
 
     def test_disable_rejects_false_confirmation(self) -> None:
         from scp_sdk.scp import SCP
 
         scp = SCP(storage={"type": "in_memory"})
-        with pytest.raises(ValidationError, match="i_trust_all_commands"):
+        with pytest.raises(McpError, match="i_trust_all_commands"):
             scp.mcp_disable_stdio_allowlist(i_trust_all_commands=False)
 
     def test_reset_round_trips(self) -> None:

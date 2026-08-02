@@ -626,7 +626,7 @@ where
     let transport: Box<dyn scp_core::context::builder::ContextTransportProvider> = Box::new(
         scp_transport::provider::RelayTransportProvider::new(adapter),
     );
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         node_did.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -635,7 +635,7 @@ where
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1000);
 
     // Share the provider's exact hardened `Clock` Arc with the supervisor so the
-    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`
     // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
     // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
     let clock = crypto.clock();

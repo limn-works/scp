@@ -75,7 +75,7 @@ const ws = new WebSocket("wss://relay.example");
 ws.binaryType = "arraybuffer";
 
 // A JsSocket is just `{ send(frame: Uint8Array): void }` — throw when not open so
-// the client surfaces SCP-TRANS-5010 rather than silently dropping a frame.
+// the client surfaces SCP-TRANS-5005 rather than silently dropping a frame.
 const socket = {
   send(frame: Uint8Array) {
     if (ws.readyState !== WebSocket.OPEN) throw new Error("relay socket not open");
@@ -108,7 +108,7 @@ ws.onmessage = (evt) => client.handleRelayFrame(new Uint8Array(evt.data as Array
   determinism holds and is KAT-pinned (ADR-057 A1).
 - **Fail-closed decrypt rests on the `--release` build** (ADR-057 Prereq-4): the shipped
   wasm is always built `--release` so openmls's decrypt `debug_assert!` is compiled out
-  and a tampered ciphertext surfaces a typed `[SCP-CRYPTO-4010]` error, not a tab-abort.
+  and a tampered ciphertext surfaces a typed `[SCP-CRYPTO-4041]` error, not a tab-abort.
 
 ## License
 

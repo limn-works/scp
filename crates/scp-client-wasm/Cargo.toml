@@ -53,8 +53,17 @@ serde_json = { workspace = true }
 # `VerifyingKey` from its 32 raw bytes before delegating to `scp-protocol`. A
 # leaf crypto crate already present transitively (via scp-protocol / scp-mls);
 # a direct edge here is inside the ADR-057 wasm fence (it is not scp-runtime /
-# scp-identity / tokio) and compiles for wasm32.
+# scp-identity / tokio) and compiles for wasm32. The
+# `outlet_stream_sign_credit` invoker-signing predicate (SCP-OUT-048) also
+# reconstructs the invoker's `SigningKey` from a 32-byte seed via this crate.
 ed25519-dalek = { workspace = true }
+
+# Best-effort zeroization of the transient private-key seed copies in the
+# `outlet_stream_sign_*` invoker-signing predicates (SCP-OUT-048). Hygiene, not
+# a load-bearing guarantee — ADR-057 §Consequences "As-built caveat (Slice 3)"
+# records that a private key momentarily in wasm memory is not a property
+# confidentiality currently rests on. Pure Rust, wasm-safe, inside the fence.
+zeroize = { workspace = true }
 
 # wasm-bindgen is needed on BOTH targets: on wasm32 it generates the real JS
 # glue; on native it provides an inert `JsValue` / `#[wasm_bindgen]` so the

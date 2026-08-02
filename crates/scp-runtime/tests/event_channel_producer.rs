@@ -31,7 +31,7 @@ use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers (same pattern as content_access_integration.rs)
@@ -143,7 +143,7 @@ fn supervisor_with_event_channel() -> (
             )),
         );
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),
@@ -351,7 +351,7 @@ async fn supervisor_leave_emits_member_left_audit_event_to_subscriber() {
 #[tokio::test]
 async fn supervisor_without_channel_yields_no_subscriber() {
     let supervisor = scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

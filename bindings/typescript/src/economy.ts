@@ -125,3 +125,43 @@ export function formatAmount(
   }
   return formatWithDecimals(amount, decimals);
 }
+
+// ---------------------------------------------------------------------------
+// Payment receipt verification
+// ---------------------------------------------------------------------------
+
+/** One entry in the per-receipt verification results array. */
+export interface PaymentReceiptVerificationEntry {
+  /** Whether the adapter successfully processed this receipt. */
+  ok: boolean;
+  /** Receipt identifier — present only when ok is true. */
+  receiptId?: string;
+  /** Whether the receipt was cryptographically valid — present only when ok is true. */
+  valid?: boolean;
+  /** Structured verification detail — present only when ok is true. */
+  result?: Readonly<Record<string, unknown>>;
+  /** Error message — present only when ok is false. */
+  error?: string;
+}
+
+/**
+ * Result of verifying a batch of payment receipts via
+ * {@link SCP.economyVerifyPaymentReceipts}.
+ *
+ * Mirrors the canonical wire shape produced by
+ * `verification_results_to_json` in `scp-runtime/economy/receipt.rs`.
+ * `allValid` is `true` iff every entry reached the adapter and was
+ * reported valid (vacuously `true` for an empty batch). Inspect `results`
+ * for per-receipt detail. An entry with `ok === true` means the adapter
+ * responded — NOT that the payment is valid; check `valid` / `allValid`
+ * for actual validity.
+ */
+export interface PaymentReceiptVerificationResult {
+  /**
+   * `true` iff every receipt both reached the adapter and the adapter
+   * reported it valid. Vacuously `true` for an empty batch.
+   */
+  allValid: boolean;
+  /** Per-receipt verification outcomes. */
+  results: PaymentReceiptVerificationEntry[];
+}

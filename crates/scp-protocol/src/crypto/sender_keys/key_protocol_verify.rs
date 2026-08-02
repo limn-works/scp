@@ -620,7 +620,7 @@ where
 ///
 /// This is the non-custody (software-key) variant of
 /// `key_protocol::open_sender_key_response` (in `scp-runtime`), for use when
-/// the wrapping secret key is held in software (e.g. in `MlsCryptoProvider`)
+/// the wrapping secret key is held in software (e.g. in `NodeMlsFactory`)
 /// rather than inside a `KeyCustody` boundary. Custody-held keys must use
 /// [`crate::crypto::hpke::custody::open_with_external_dh`].
 ///

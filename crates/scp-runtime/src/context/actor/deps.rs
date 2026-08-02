@@ -101,7 +101,7 @@ use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::crypto::hpke_backend::HpkeBackend;
 use crate::crypto::mls::backend::MlsBackend;
-use crate::crypto::mls::provider::MlsCryptoProvider;
+use crate::crypto::mls::provider::NodeMlsFactory;
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 use crate::economy::adapter::PaymentAdapterDyn;
 
@@ -143,7 +143,7 @@ pub struct ActorDeps {
     /// supervisor-owned Class-M epoch/replay floors, which must outlive the
     /// actor-task unwind (ADR-049 Decision 9). Cloned into each actor's
     /// `ActorDeps` at spawn time.
-    pub crypto: Arc<MlsCryptoProvider>,
+    pub crypto: Arc<NodeMlsFactory>,
     /// Transport provider (relay, subscription, publish).
     pub transport: Arc<dyn ContextTransportProvider>,
     /// Context snapshot persistence backend.

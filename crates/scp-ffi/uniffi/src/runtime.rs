@@ -50,7 +50,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use scp_clock::SystemClock;
 use scp_core::context::builder::ContextEventLogProvider;
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -359,6 +359,21 @@ pub struct UniffiBridgeInstance {
     /// instance shutdown drops every live stream (and its billing pump `Arc`) via
     /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+
+    /// Per-instance §5.4.5 / §6.2.4 cross-context STREAMING-saga registry
+    /// (SCP-OUT-047, pass 3a), keyed by the durable `saga_id` string. Each
+    /// [`StreamingSagaEntry`](scp_ffi_common::streaming_saga::StreamingSagaEntry)
+    /// holds the runtime's promptly-returned plaintext operator-signed chunk
+    /// receiver plus the pinned `saga_id`, operating (target) context id, invoker
+    /// DID, and `request_id`. Mirrors the `PyO3` reference bridge's
+    /// `PyBridgeInstance::outlet_streaming_saga_registry` and the NAPI bridge's
+    /// `NapiBridgeInstance::outlet_streaming_saga_registry` — a per-instance
+    /// field, NOT a `static` (`check-no-bridge-globals.sh` /
+    /// `check-handle-affinity.sh` forbid the alternative). A saga opened on one
+    /// instance is invisible to another; instance shutdown drops every live saga
+    /// stream via [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) outlet_streaming_saga_registry:
+        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
 }
 
 impl std::fmt::Debug for UniffiBridgeInstance {
@@ -407,6 +422,7 @@ impl UniffiBridgeInstance {
             durable_providers: Some(durable_providers),
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -441,6 +457,7 @@ impl UniffiBridgeInstance {
             durable_providers: Some(durable_providers),
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -588,6 +605,7 @@ impl UniffiBridgeInstance {
             durable_providers: Some(durable_providers),
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -810,7 +828,7 @@ impl UniffiBridgeInstance {
     /// Per-instance equivalent of the module-level
     /// `init_context_manager_with_did` free function.
     ///
-    /// Installs an `MlsCryptoProvider(local_did)` and
+    /// Installs a `NodeMlsFactory(local_did)` and
     /// `NotConfiguredTransportProvider` on this instance. No-op if a
     /// `ContextManager` is already attached.
     #[allow(dead_code)]
@@ -823,7 +841,7 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             did,
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -858,7 +876,7 @@ impl UniffiBridgeInstance {
     /// Per-instance equivalent of the module-level
     /// `init_context_manager_with_relay_transport` free function.
     ///
-    /// Installs an `MlsCryptoProvider(local_did)` and a
+    /// Installs a `NodeMlsFactory(local_did)` and a
     /// `RelayTransportProvider` wrapping the supplied `NativeRelayAdapter` on
     /// this instance. No-op if a `ContextManager` is already attached.
     #[allow(dead_code)]
@@ -875,7 +893,7 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             did,
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -903,7 +921,7 @@ impl UniffiBridgeInstance {
         self.core.set_supervisor(supervisor_arc);
     }
 
-    /// Per-instance initializer that installs an `MlsCryptoProvider(local_did)`
+    /// Per-instance initializer that installs a `NodeMlsFactory(local_did)`
     /// and an in-process loopback `LocalTransportProvider` on this instance.
     ///
     /// Mirrors [`UniffiBridgeInstance::init_context_manager_with_relay_transport`]
@@ -922,7 +940,7 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             did,
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -1218,6 +1236,10 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // Drop every live streaming-outlet session (and its billing pump `Arc`)
         // on shutdown, matching the PyO3 / NAPI bridges.
         self.outlet_stream_registry.clear();
+        // Drop every live cross-context streaming saga (releasing each saga's
+        // chunk receiver `Arc`) on shutdown, matching the PyO3 / NAPI bridges
+        // (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
         // Clear identity-link-attestation and context-handle registries.
         // Migrated off module-level `OnceLock` statics in bridge.rs in
         // #1549 Phase 4 PR 2 commit 6. Dropping `Arc<ContextHandle>`
@@ -1426,7 +1448,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// retained sender has no receivers, so `send` returns `Err` and the event is
 /// simply dropped without blocking context operations.
 fn build_supervisor(
-    crypto: Arc<MlsCryptoProvider>,
+    crypto: Arc<NodeMlsFactory>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
@@ -1443,7 +1465,7 @@ fn build_supervisor(
     // is dropped immediately; the retained sender keeps the channel open.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     // Share the provider's exact hardened `Clock` Arc with the supervisor so the
-    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`
     // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
     // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
     let clock = crypto.clock();

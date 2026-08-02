@@ -32,15 +32,15 @@ from scp_sdk.errors import (
     TransportError,
     UcanPermissionError,
     ValidationError,
+    _coded_bridge_error,
 )
-from scp_sdk.outlets import _translate_bridge_error
 
 # ---------------------------------------------------------------------------
-# _translate_bridge_error tests (still in scp_sdk.outlets)
+# _coded_bridge_error tests (centralized in scp_sdk.errors; used by outlets)
 # ---------------------------------------------------------------------------
 
 
-class TestTranslateBridgeError:
+class TestCodedBridgeError:
     """Tests for the bridge-to-SDK exception translator."""
 
     @pytest.mark.parametrize(
@@ -51,7 +51,6 @@ class TestTranslateBridgeError:
             ("UcanError", UcanPermissionError),
             ("CryptoError", CryptoError),
             ("TransportError", TransportError),
-            ("OutletError", OutletError),
             ("ValidationError", ValidationError),
         ],
     )
@@ -64,20 +63,50 @@ class TestTranslateBridgeError:
         bridge_cls = type(bridge_name, (Exception,), {})
         bridge_exc = bridge_cls("something went wrong")
 
-        result = _translate_bridge_error(bridge_exc)
+        result = _coded_bridge_error(bridge_exc)
 
         assert isinstance(result, expected_sdk_cls)
         assert result.message == "something went wrong"
 
-    def test_unknown_bridge_error_falls_back_to_context_error(self) -> None:
-        """An unmapped bridge exception class name falls back to ContextError."""
+    def test_unknown_bridge_error_falls_back_to_scperror(self) -> None:
+        """An unmapped bridge exception class name with no code falls back to ScpError."""
         bridge_cls = type("SomeUnknownBridgeError", (Exception,), {})
         bridge_exc = bridge_cls("unexpected failure")
 
-        result = _translate_bridge_error(bridge_exc)
+        result = _coded_bridge_error(bridge_exc)
 
-        assert isinstance(result, ContextError)
+        assert isinstance(result, ScpError)
+        assert not isinstance(result, ContextError)
         assert "unexpected failure" in result.message
+
+    def test_extracts_scp_code_from_leading_bracket(self) -> None:
+        """Code at position 0 is recovered into .code; the prefix is stripped from .message."""
+        bridge_cls = type("ContextError", (Exception,), {})
+        bridge_exc = bridge_cls("[SCP-CTX-2023] context error: state lookup failed")
+
+        result = _coded_bridge_error(bridge_exc)
+
+        assert result.code == "SCP-CTX-2023"
+        # The leading "[SCP-xxx-nnn] " bracket is stripped so ScpError.__str__
+        # (which prepends f"[{code}] ") does not double the prefix.
+        assert result.message == "context error: state lookup failed"
+
+    def test_embedded_code_is_not_captured(self) -> None:
+        """A [SCP-...] token buried in the message body must not masquerade as the code."""
+        bridge_cls = type("ContextError", (Exception,), {})
+        bridge_exc = bridge_cls("failed to process token: [SCP-CTX-2076] embedded")
+
+        result = _coded_bridge_error(bridge_exc)
+
+        assert result.code != "SCP-CTX-2076"
+
+    def test_already_typed_scperror_returned_unchanged(self) -> None:
+        """An already-typed ScpError passthrough must preserve the original instance."""
+        original = ContextError("already typed", code="SCP-CTX-2099")
+
+        result = _coded_bridge_error(original)
+
+        assert result is original
 
 
 # ---------------------------------------------------------------------------

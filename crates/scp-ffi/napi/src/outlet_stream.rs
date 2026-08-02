@@ -79,7 +79,12 @@ use scp_core::context::outlets::{
 };
 
 use scp_ffi_common::error_codes as codes;
-use scp_ffi_common::validate::{validate_did, validate_outlet_id, validate_ucan_token};
+use scp_ffi_common::streaming_saga::{
+    StreamingSagaEntry, drive_recover_truncated_close, serialize_saga_chunk,
+};
+use scp_ffi_common::validate::{
+    validate_context_id, validate_did, validate_outlet_id, validate_ucan_token,
+};
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -1067,6 +1072,596 @@ pub(crate) fn outlet_stream_compute_caveats_binding_impl(
         effective_caveats_jcs,
     );
     Ok(binding.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Cross-context streaming saga (§5.4.5, §6.2.4, SCP-OUT-047) — open / poll /
+// recover. The streaming ANALOG of the unary cross-context saga export in
+// `outlets.rs`, sharing its `enforce_caller_principal_binding`,
+// `resolve_context_signing_key`, `decode_asserted_nonce`, and `map_saga_error`
+// verbatim, and the SAME `NapiStreamExecutor` / `resolve_stream_signer` /
+// `NapiStreamRevocationChecker` this module already defines. Mirrors the
+// CANONICAL `PyO3` reference bridge's `outlet_stream.rs` cross-context section.
+//
+// Like the NAPI unary cross-context saga (and the 037 same-context open) this is
+// HANDLE-based: the caller/target contexts cross the FFI boundary as instance-
+// affine `NapiContextHandle`s (NOT context-id strings, as in the string-based
+// `PyO3` bridge) so `napi_check_handle!` enforces handle affinity — the SAME
+// divergence from the string-based reference that the unary saga already makes.
+// The logical param order matches the reference: caller ctx, target ctx,
+// caller_did, outlet, input, nonce, timestamp, chain_depth, ucan, proofs,
+// proof_id, timeout, estimated_chunk_count.
+// ---------------------------------------------------------------------------
+
+/// The control-plane "no active cross-context streaming saga" rejection for an
+/// unknown, stale, typo'd, or already-evicted saga id. DISTINCT from a genuine
+/// terminal (which `poll_next` reports as `None`) so a bad handle is never
+/// mistaken for a clean stream end.
+fn no_active_saga_err(saga_id: &str) -> ScpNapiError {
+    ScpNapiError::Context {
+        message: format!("no active cross-context streaming saga '{saga_id}'"),
+        code: codes::CTX_2001.to_owned(),
+    }
+}
+
+/// §5.4.5 / §6.2.4 cross-context streaming-saga open (SCP-OUT-047). The
+/// streaming sibling of `outlet_invoke_cross_context_saga_on` and
+/// [`outlet_stream_open_on`]: it validates the invocation UCAN at the bridge
+/// (once, at open) against the TARGET context, drives
+/// [`Supervisor::start_cross_context_streaming_outlet_invocation_saga`](scp_core::context::supervisor::Supervisor::start_cross_context_streaming_outlet_invocation_saga)
+/// to the Commit-transition, and stores the promptly-returned receiver in the
+/// per-instance saga registry keyed by the durable `saga_id`. Returns the
+/// `saga_id` string PROMPTLY (AC1 — the Commit-transition, NOT a
+/// block-until-terminal; the seal pumps off-mailbox).
+///
+/// Body ORDER is security-critical (identical to the `PyO3` reference):
+///   (a) validate inputs (active handles + well-formed ids/dids/outlet/nonce);
+///   (b) `enforce_caller_principal_binding` on the CALLER axis (§6.2.4 Caller
+///       authentication / ADR-049 §3a) BEFORE anything irreversible;
+///   (c) `validate_ucan_for_outlet` against the TARGET context B, then resolve
+///       the effective §7.3.8 caveats + `ucan_cid` and compute the §5.4.5
+///       `caveats_binding` from a FRESH `request_id`;
+///   (d) resolve `SagaSigningKeys { target, caller }` from each context's Active
+///       Signing Key (via custody — the key never enters the runtime, ADR-006);
+///   (e) build the executor over the TARGET handler;
+///   (f) drive the saga to the Commit-transition;
+///   (g) register the receiver and return the `saga_id`.
+#[allow(clippy::too_many_arguments)] // Flat §6.2.4 streaming envelope — agent-first named params.
+#[allow(clippy::too_many_lines)] // UCAN validate + caveat binding + full OpenStreamParams + saga drive.
+pub(crate) async fn outlet_streaming_saga_open_on(
+    bi: &NapiBridgeInstance,
+    source_handle: &NapiContextHandle,
+    target_handle: &NapiContextHandle,
+    caller_did: String,
+    outlet_registration_id: String,
+    input_json: String,
+    asserted_nonce_hex: String,
+    timestamp_ms: u64,
+    chain_depth: u8,
+    ucan_token: String,
+    proof_tokens: Option<Vec<String>>,
+    ucan_proof_id: Option<String>,
+    timeout_ms: Option<u32>,
+    estimated_chunk_count: Option<u32>,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, source_handle, target_handle);
+
+    let caller_context_id = source_handle.context_id();
+    let target_context_id = target_handle.context_id();
+    let caller_creator_did = source_handle.creator_did();
+    let target_creator_did = target_handle.creator_did();
+
+    // Both contexts MUST be Active before this money-moving open touches any
+    // state. Read the AUTHORITATIVE lifecycle state from the per-context
+    // supervisor actor (`read_context_state`) — NOT the bridge-cached
+    // `NapiContextHandle::state()`, which LAGS: on close the core handle flips to
+    // `Closing` immediately, but the FFI cache stays `"active"` until the async
+    // finalize completes. A stale-cache read would let a `Closing` context (actor
+    // alive, members intact) pass this gate and DEBIT ESCROW. Mirrors the PyO3
+    // reference's authoritative `read_context_state`. A missing actor (`None`) is
+    // treated as non-active (fail-closed).
+    //
+    // LOAD-BEARING (not defense-in-depth): the runtime streaming-saga reserve
+    // path (`reserve_outlet_stream_economy`) debits the invoker's escrow with NO
+    // context-lifecycle Active gate — its only pre-debit gates are membership
+    // (13050 / 6089), the established interface (13062), and the saga context-set
+    // reservation; it never surfaces SCP-OUTLET-6080 "context not active" the way
+    // the SESSION and send/governance/TTL paths do. This bridge check is the sole
+    // barrier stopping a non-active source/target from debiting escrow. Checked
+    // BEFORE input validation, the caller-principal binding, and the saga drive,
+    // so a non-active context is rejected before any receiver is handed out.
+    // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis).
+    let supervisor = crate::runtime::supervisor(bi)?;
+    let source_state = supervisor.read_context_state(&caller_context_id).await;
+    if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
+        return Err(ScpNapiError::Outlet {
+            message: format!(
+                "cannot start cross-context streaming saga: caller context in \
+                 {source_state:?} state"
+            ),
+            code: codes::OUTLET_6010.to_owned(),
+        }
+        .into());
+    }
+    let target_state = supervisor.read_context_state(&target_context_id).await;
+    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
+        return Err(ScpNapiError::Outlet {
+            message: format!(
+                "cannot start cross-context streaming saga: target context in \
+                 {target_state:?} state"
+            ),
+            code: codes::OUTLET_6011.to_owned(),
+        }
+        .into());
+    }
+
+    // ----- (a) validate inputs ------------------------------------------------
+    validate_context_id(&caller_context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_context_id(&target_context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&caller_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_outlet_id(&outlet_registration_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_ucan_token(&ucan_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    // NOTE (SCP-OUT-047 review F3): the streaming-saga open carries NO
+    // `spending_ucan` (the cross-context escrow is B-side; spending authorization
+    // is carried by `ucan_proof_id`, resolved target-side at Prepare-B, exactly
+    // as the unary `outlet_invoke_cross_context_saga` sibling does).
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate_ucan_token(t).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+        }
+    }
+    let asserted_nonce = crate::outlets::decode_asserted_nonce(&asserted_nonce_hex)?;
+    let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Outlet {
+            message: format!("invalid input JSON: {e}"),
+            code: codes::OUTLET_6002.to_owned(),
+        })
+    })?;
+
+    // ----- (b) caller-principal binding (CALLER axis) — BEFORE anything else --
+    //
+    // Runs before ANY per-context state mutation or outlet read, so an
+    // unauthenticated caller is rejected before it can touch B's state (identical
+    // to the `PyO3` reference's ordering). `supervisor` was resolved above for the
+    // authoritative lifecycle gate; reuse it.
+    crate::outlets::enforce_caller_principal_binding(
+        bi,
+        supervisor,
+        &caller_context_id,
+        &caller_did,
+    )
+    .await?;
+
+    // The outlet lives in the TARGET context B — ensure its per-context FFI/UCAN
+    // state is registered (idempotent) so the outlet registry lookup below sees
+    // the registered outlet. AFTER the caller-principal binding, so an
+    // unauthenticated caller never triggers this lazy registration.
+    crate::runtime::ensure_registered(bi, target_handle).map_err(napi::Error::from)?;
+
+    // ----- (c) validate the invocation UCAN against the TARGET context --------
+    //
+    // The outlet's registered kind + per-context UCAN state (revocation list,
+    // nonce tracker, ceiling, proof chain) are B's — IDENTICAL to
+    // `outlet_stream_open_on`, just rebased onto `target_context_id`. Validated
+    // ONCE at open (§5.4.5 "UCAN check locus").
+    let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: format!("failed to build proof resolver: {e}"),
+                code: codes::PERM_3001.to_owned(),
+            })
+        })?;
+    crate::outlets::validate_ucan_for_outlet(
+        bi,
+        &target_context_id,
+        &outlet_registration_id,
+        &caller_did,
+        &ucan_token,
+        &proof_resolver,
+    )
+    .map_err(napi::Error::from)?;
+
+    // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
+    // narrowed `nb`. `ucan_cid` keys the owned Class-S counters and anchors the
+    // §5.4.5 caveats binding.
+    let invocation_ucan =
+        scp_core::crypto::ucan::validate::parse_ucan(&ucan_token).map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: format!("invalid invocation UCAN for '{outlet_registration_id}': {e}"),
+                code: codes::PERM_3001.to_owned(),
+            })
+        })?;
+    let ucan_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&invocation_ucan.encoded);
+    let caveats = {
+        use scp_core::crypto::ucan::validate::CaveatResolver as _;
+        scp_core::crypto::ucan::validate::TokenNbCaveatResolver
+            .resolve_caveats(&invocation_ucan)
+            .unwrap_or_else(scp_core::trust::caveats::InvocationCaveats::empty)
+    };
+    let has_caveats = caveats != scp_core::trust::caveats::InvocationCaveats::empty();
+
+    // §5.4.5 caveats binding. The runtime RECOMPUTES this at open from
+    // `(ucan_cid, request_id, invoker_did, declared_estimate.unwrap_or(0),
+    // JCS(caveats))` and rejects a mismatch — identical to the same-context open.
+    let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+    let caveats_jcs = caveats.to_canonical_json_bytes().map_err(|e| {
+        napi::Error::from(ScpNapiError::Context {
+            message: format!("failed to canonicalize effective caveats: {e}"),
+            code: codes::CTX_2001.to_owned(),
+        })
+    })?;
+    let caveats_binding = compute_caveats_binding(
+        ucan_cid.as_bytes(),
+        &request_id,
+        &caller_did,
+        estimated_chunk_count.unwrap_or(0),
+        &caveats_jcs,
+    );
+
+    // ----- Outlet registration data (from the TARGET context B) ---------------
+    let cost_per_chunk = crate::runtime::with_context(bi, &target_context_id, |rt| {
+        let registration = rt
+            .outlet_registry
+            .get(&outlet_registration_id)
+            .ok_or_else(|| ScpNapiError::Outlet {
+                message: format!(
+                    "outlet '{outlet_registration_id}' not registered in context \
+                         '{target_context_id}'"
+                ),
+                code: codes::OUTLET_6002.to_owned(),
+            })?;
+        Ok(registration
+            .cost
+            .as_ref()
+            .map_or(scp_core::economy::Amount::new(0), |c| c.amount))
+    })
+    .map_err(napi::Error::from)?;
+    let operator_did = crate::runtime::with_context(bi, &target_context_id, |rt| {
+        rt.outlet_registry
+            .get(&outlet_registration_id)
+            .map(|r| r.operator_did.0.clone())
+            .ok_or_else(|| ScpNapiError::Outlet {
+                message: format!("outlet '{outlet_registration_id}' not registered"),
+                code: codes::OUTLET_6002.to_owned(),
+            })
+    })
+    .map_err(napi::Error::from)?;
+    let (registry, handler) = crate::runtime::with_context(bi, &target_context_id, |rt| {
+        Ok((
+            rt.outlet_registry.clone(),
+            rt.outlet_handlers.get(&outlet_registration_id).cloned(),
+        ))
+    })
+    .map_err(napi::Error::from)?;
+
+    // The OPERATOR (of the target outlet) signs every chunk; the INVOKER (caller)
+    // pubkey verifies grants + cancels. Both resolved through this instance's
+    // custody (co-resident single-tenant).
+    let operator_signer: Arc<dyn StreamSigner> = Arc::new(
+        resolve_stream_signer(bi, &operator_did)
+            .await
+            .map_err(napi::Error::from)?,
+    );
+    let invoker_pk = *resolve_stream_signer(bi, &caller_did)
+        .await
+        .map_err(napi::Error::from)?
+        .verifying_key();
+
+    let supervisor = crate::runtime::supervisor(bi)?.clone();
+    let stream_epoch = supervisor
+        .local_mls_epoch(&target_context_id)
+        .await
+        .unwrap_or(0);
+
+    let executor: Arc<dyn OutletExecutor> = Arc::new(NapiStreamExecutor {
+        handler,
+        outlet_id: outlet_registration_id.clone(),
+        context_id: target_context_id.clone(),
+        invoker_did: caller_did.clone(),
+    });
+
+    // LIVE revocation view (B's per-context list) for the runtime pump's
+    // authoritative re-check timer.
+    let revocation_checker: Arc<
+        dyn scp_core::crypto::ucan::validate::RevocationChecker + Send + Sync,
+    > = Arc::new(NapiStreamRevocationChecker {
+        states: Arc::clone(&bi.ucan_registry),
+        context_id: target_context_id.clone(),
+    });
+
+    let identity = StreamIdentity {
+        context_id: target_context_id.clone(),
+        outlet_id: outlet_registration_id.clone(),
+        stream_epoch,
+        caveats_binding,
+    };
+
+    // The caps + the four timing/window policy fields are SERVER POLICY: the
+    // saga's `open_outlet_stream_phase1` OVERWRITES them AUTHORITATIVELY from the
+    // TARGET context's `ContextParams` — placeholders the runtime discards
+    // (identical to the same-context open).
+    let params = OpenStreamParams {
+        identity,
+        caps: AdmissionCaps {
+            per_invoker: 0,
+            per_origin_invoker: 0,
+            per_outlet: 0,
+        },
+        invoker_did: caller_did.clone(),
+        // The immediate invoker IS the origin invoker on this co-resident open.
+        origin_invoker_did: caller_did.clone(),
+        cost_per_chunk,
+        available_balance: scp_core::economy::Amount::new(0),
+        reserved_escrow: scp_core::economy::Amount::new(0),
+        declared_estimated_chunk_count: estimated_chunk_count,
+        credit_window: 0,
+        caveats: caveats.clone(),
+        invoker_pk,
+        operator_signer,
+        stream_credit_stall_secs: 0,
+        stream_cancel_ack_secs: 0,
+        stream_ucan_recheck_secs: 0,
+        ucan_cid: ucan_cid.clone(),
+        request_id,
+        revocation_checker,
+        economic_policy_snapshot: None,
+    };
+
+    // §7.3.8 value-caveat binding — `Some` iff the token carries caveats.
+    let value_caveat_binding = if has_caveats {
+        Some(scp_core::context::outlets::InvocationCaveatBinding { caveats, ucan_cid })
+    } else {
+        None
+    };
+
+    // ----- (d) signing keys: each co-resident context's Active Signing Key ----
+    let target_signing_key =
+        crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
+            .await?;
+    let caller_signing_key =
+        crate::outlets::resolve_context_signing_key(bi, &caller_creator_did, &caller_context_id)
+            .await?;
+
+    // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
+    let caller_context_bytes = scp_core::context::state::context_id_to_bytes(&caller_context_id);
+    let target_context_bytes = scp_core::context::state::context_id_to_bytes(&target_context_id);
+
+    let outlet_id_typed: scp_core::context::outlets::OutletId = outlet_registration_id.clone();
+    let caller_did_typed: scp_did::DID = caller_did.clone().into();
+
+    // ----- (f) drive the saga to the Commit-transition ------------------------
+    //
+    // `await` resolves at the Commit-transition (AC1) — the seal task is SPAWNED,
+    // so this returns the receiver PROMPTLY, before the stream drains. Box the
+    // multi-phase saga future so it does not bloat this method's own future
+    // (`clippy::large_futures`).
+    let handle = Box::pin(
+        supervisor.start_cross_context_streaming_outlet_invocation_saga(
+            caller_context_bytes,
+            target_context_bytes,
+            caller_did_typed,
+            outlet_registration_id.clone(),
+            ucan_proof_id,
+            &registry,
+            &outlet_id_typed,
+            input_value,
+            chain_depth,
+            asserted_nonce,
+            timestamp_ms,
+            timeout_ms,
+            executor,
+            value_caveat_binding,
+            scp_core::context::supervisor::SagaSigningKeys {
+                target: &target_signing_key,
+                caller: &caller_signing_key,
+            },
+            params,
+        ),
+    )
+    .await
+    .map_err(|e| napi::Error::from(crate::outlets::map_saga_error(e)))?;
+
+    // ----- (g) register the promptly-returned receiver ------------------------
+    let saga_id = handle.saga_id;
+    let receiver = handle.receiver;
+    let handle_id = saga_id.0.clone();
+    bi.outlet_streaming_saga_registry.insert(
+        handle_id.clone(),
+        StreamingSagaEntry {
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            saga_id,
+            target_context_id,
+            invoker_did: caller_did,
+            request_id,
+        },
+    );
+    Ok(handle_id)
+}
+
+/// Drains one chunk from a live cross-context streaming saga, awaiting the seal
+/// task until a chunk arrives or the stream closes. Returns the JSON-serialized
+/// [`OutletStreamChunk`] bytes (A's plaintext operator-signed frame, forwarded
+/// verbatim), or `None` at the channel-closed sentinel.
+///
+/// Mirrors [`outlet_stream_poll_next_on`]: an unknown/evicted saga id is a
+/// DISTINCT [`no_active_saga_err`] (never `None`), and a terminal chunk EVICTS
+/// the entry so a run-to-terminal caller cannot leak it. Takes NO `caller_did`:
+/// possession of the `saga_id` handle IS the read capability (single-consumer
+/// channel handed to the opener at the Commit-transition).
+pub(crate) async fn outlet_streaming_saga_poll_next_on(
+    bi: &NapiBridgeInstance,
+    saga_id: &str,
+) -> napi::Result<Option<Vec<u8>>> {
+    // Clone the receiver `Arc` OUT of the DashMap shard guard BEFORE awaiting
+    // recv — never hold a DashMap ref across the `.await`.
+    let receiver = {
+        let Some(entry) = bi.outlet_streaming_saga_registry.get(saga_id) else {
+            return Err(napi::Error::from(no_active_saga_err(saga_id)));
+        };
+        Arc::clone(&entry.receiver)
+    };
+    let chunk = receiver.lock().await.recv().await;
+    if let Some(chunk) = chunk {
+        let (bytes, terminal) = serialize_saga_chunk(&chunk).map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("failed to serialize saga stream chunk: {e}"),
+                code: codes::CTX_2001.to_owned(),
+            })
+        })?;
+        if terminal {
+            bi.outlet_streaming_saga_registry.remove(saga_id);
+        }
+        Ok(Some(bytes))
+    } else {
+        // Abnormal terminal: the seal task dropped the sender without a terminal
+        // chunk. Evict so the receiver + entry drop.
+        bi.outlet_streaming_saga_registry.remove(saga_id);
+        Ok(None)
+    }
+}
+
+/// Key-bearing in-session reconnect/repair truncated-close for a cross-context
+/// streaming saga (SCP-OUT-046 #136 AC7). AUTHENTICATES the reconnect caller and
+/// supplies the TARGET's Active Signing Key to
+/// [`Supervisor::recover_streaming_saga_truncated_close`](scp_core::context::supervisor::Supervisor::recover_streaming_saga_truncated_close)
+/// via the shared [`drive_recover_truncated_close`] driver. Seals B's durable
+/// prefix and resolves the saga `Committed` WITHOUT re-opening the stream or
+/// re-invoking the executor.
+///
+/// This is IN-SESSION reconnect/repair of a seal that stalled or went
+/// `NeedsRepair` while THIS bridge process is still ALIVE (e.g. a client
+/// reconnects to the same live node). The saga registry is per-instance and
+/// IN-MEMORY, so this does NOT survive a process/node restart — cross-restart
+/// recovery replays the durable saga journal via a separate operator path
+/// (§17.16), NOT this FFI surface.
+///
+/// Auth (TWO gates, both required, in order):
+///   1. `caller_did` MUST be an identity THIS bridge instance hosts (the
+///      co-resident channel-authenticated principal, §6.2.4).
+///   2. `caller_did` MUST equal the `invoker_did` pinned at open (CRITICAL #1 —
+///      recovery is MONEY-MOVING, so it carries the SAME `SCP-PERM-3001` invoker
+///      gate as the same-context grant/cancel/terminate siblings). The
+///      hosted-identity check ALONE would let ANY co-resident identity settle a
+///      stranger's saga.
+///
+/// The Active Signing Key is resolved PER-CALL from the target context's custody
+/// (never envelope-asserted) and never before BOTH gates pass. On success the
+/// registry entry is EVICTED (the saga is now Committed).
+pub(crate) async fn outlet_streaming_saga_recover_truncated_close_on(
+    bi: &NapiBridgeInstance,
+    saga_id: &str,
+    caller_did: &str,
+) -> napi::Result<()> {
+    validate_did(caller_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    // Authenticate the reconnect caller: it MUST be an identity hosted by this
+    // bridge instance (§6.2.4 Caller authentication), never an envelope-asserted
+    // value.
+    if !crate::runtime::identity_registry_contains(bi, caller_did) {
+        return Err(ScpNapiError::Context {
+            message: format!(
+                "caller_did '{caller_did}' is not an identity hosted by this bridge instance — \
+                 the streaming-saga reconnect recovery caller MUST be the channel-authenticated \
+                 principal (§6.2.4 Caller authentication), not an envelope-asserted value"
+            ),
+            code: codes::CTX_2001.to_owned(),
+        }
+        .into());
+    }
+
+    // Look up the live saga entry for the durable `saga_id`, pinning its target
+    // context, the `SagaId`, and the `invoker_did` pinned at open.
+    let (saga_id_typed, target_context_id, invoker_did) = {
+        let Some(entry) = bi.outlet_streaming_saga_registry.get(saga_id) else {
+            return Err(napi::Error::from(no_active_saga_err(saga_id)));
+        };
+        (
+            entry.saga_id.clone(),
+            entry.target_context_id.clone(),
+            entry.invoker_did.clone(),
+        )
+    };
+
+    // CRITICAL #1: recovery is MONEY-MOVING, so ONLY the invoker pinned at open
+    // may drive it — the SAME `SCP-PERM-3001` gate the same-context siblings
+    // enforce. Rejected BEFORE the signing key is resolved or the driver runs, so
+    // a non-invoker never triggers a settle and the entry is left INTACT.
+    if caller_did != invoker_did {
+        return Err(napi::Error::from(caller_not_invoker_err(
+            caller_did,
+            &invoker_did,
+        )));
+    }
+
+    // Resolve the TARGET context's Active Signing Key per-call from custody
+    // (never envelope-asserted): its creator_did off the per-context FFI state,
+    // then the raw signing key via the shared saga resolver.
+    let target_creator_did =
+        crate::runtime::with_context(bi, &target_context_id, |rt| Ok(rt.core.creator_did.clone()))
+            .map_err(napi::Error::from)?;
+    let target_key =
+        crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
+            .await?;
+    let signing_key =
+        scp_core::context::actor::commands::SigningKeyBytes::from_signing_key(&target_key);
+    let supervisor = crate::runtime::supervisor(bi)?.clone();
+    drive_recover_truncated_close(&supervisor, saga_id_typed, &target_context_id, signing_key)
+        .await
+        .map_err(|e| napi::Error::from(crate::outlets::map_saga_error(e)))?;
+
+    // Evict on SUCCESS: the saga is now `Committed` and its prefix sealed. A
+    // stale second recover then surfaces "no active saga" instead of re-driving
+    // the settle.
+    bi.outlet_streaming_saga_registry.remove(saga_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Test-only registry seam (SCP-OUT-047 — recover invoker gate)
+// ---------------------------------------------------------------------------
+
+/// TEST-ONLY helpers on [`Scp`](crate::scp::Scp). NOT a `#[napi]` block, so
+/// nothing here is exported to Node/Bun or counted by the bridge-symmetry gate.
+/// Gated on the same test/testing features as `Scp::new_in_memory_for_test`.
+#[cfg(any(test, feature = "testing"))]
+impl crate::scp::Scp {
+    /// Injects a live cross-context streaming-saga registry entry pinned to
+    /// `invoker_did`, so the recover invoker-gate (CRITICAL #1) can be exercised
+    /// without driving a full committed cross-context saga (whose actor-state /
+    /// budget injection has no bridge-public wiring — same rationale as the
+    /// unary-saga bridge tests). The receiver's sender is dropped immediately
+    /// (recover never polls it).
+    pub fn insert_test_streaming_saga_entry(
+        &self,
+        saga_id: &str,
+        target_context_id: &str,
+        invoker_did: &str,
+    ) {
+        let (_tx, rx) = mpsc::channel(1);
+        self.inner.outlet_streaming_saga_registry.insert(
+            saga_id.to_owned(),
+            StreamingSagaEntry {
+                receiver: Arc::new(tokio::sync::Mutex::new(rx)),
+                saga_id: scp_core::context::supervisor::SagaId(saga_id.to_owned()),
+                target_context_id: target_context_id.to_owned(),
+                invoker_did: invoker_did.to_owned(),
+                request_id: [0u8; 16],
+            },
+        );
+    }
+
+    /// TEST-ONLY: reports whether a streaming-saga registry entry for `saga_id`
+    /// is still present — lets a test assert the recover invoker-gate rejection
+    /// did NOT evict a stranger's saga.
+    #[must_use]
+    pub fn test_streaming_saga_entry_present(&self, saga_id: &str) -> bool {
+        self.inner
+            .outlet_streaming_saga_registry
+            .contains_key(saga_id)
+    }
 }
 
 #[cfg(test)]

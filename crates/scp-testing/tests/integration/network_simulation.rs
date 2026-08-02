@@ -1,10 +1,10 @@
 // ADR-049 §15: ContextCryptoProvider trait deleted; DemoCrypto
 // was a bespoke mock with `seal`/`open` overrides that bypassed encryption
 // for demo purposes. ADR-049 §15 introduces backend injection on
-// `MlsCryptoProvider::with_backends`, which is the seam this file should
+// `NodeMlsFactory::with_backends`, which is the seam this file should
 // rewire to. The full rewire (every test scenario re-expressed via mock
 // `MlsBackend` / `HpkeBackend` impls and the real
-// `MlsCryptoProvider::with_backends` constructor) is tracked alongside the
+// `NodeMlsFactory::with_backends` constructor) is tracked alongside the
 // commit-12 deletion of `ContextManager`. Entire file is gated out until
 // the rewire lands.
 #![cfg(any())]
@@ -140,7 +140,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to MlsCryptoProvider::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
+#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to NodeMlsFactory::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
 #[allow(clippy::too_many_lines)]
 async fn end_to_end_network_demo() {
     println!();
@@ -1101,7 +1101,7 @@ fn demo_signing_key(did: &scp_did::DID) -> ed25519_dalek::SigningKey {
 }
 
 #[tokio::test]
-#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to MlsCryptoProvider::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
+#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to NodeMlsFactory::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
 #[allow(clippy::too_many_lines)]
 async fn application_layer_demo() {
     use scp_core::context::manager::ContextManager;

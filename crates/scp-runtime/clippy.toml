@@ -12,7 +12,7 @@
 # the dynamic version; this list catches the structural version.
 #
 # Pre-existing sites outside the actor path (tests, non-actor providers,
-# and legacy `MlsCryptoProvider`) carry `#[allow(clippy::disallowed_types)]`
+# and legacy `NodeMlsFactory`) carry `#[allow(clippy::disallowed_types)]`
 # annotations with a pointer to the commit that deletes them. By the time
 # the actor refactor completes (commit 12), the only remaining
 # `std::sync::Mutex` uses are in code that is test-only.

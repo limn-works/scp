@@ -17,7 +17,7 @@
 //! sender-key distribution framing (H3).
 //!
 //! The legacy provider single-slot join (`prepare_key_package_for_join` +
-//! `MlsCryptoProvider::join_from_welcome`) has been retired; these tests drive
+//! `NodeMlsFactory::join_from_welcome`) has been retired; these tests drive
 //! the production `Supervisor` API. The comprehensive spawn-from-Welcome KATs
 //! (signature / binding / rollback / replay) live in the runtime unit suite
 //! `spawn_from_welcome_tests.rs`.
@@ -26,10 +26,8 @@ use scp_core::context::{Capability, ContextMode, ContextParams};
 use scp_core::crypto::envelope_seal::{
     derive_invitation_routing_id, derive_key_package_routing_id,
 };
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_did::DID;
 use scp_testing::fullstack::FullStackNetwork;
-use zeroize::Zeroizing;
 
 /// `SingleAdmin` encrypted `ContextParams` whose ceiling grants the creator the
 /// `MemberInvite` + `GovernancePropose` capabilities `invite_member` routes
@@ -139,7 +137,7 @@ async fn cross_process_welcome_delivery() {
 /// This is the fullstack owner of the joiner→creator APPLICATION round-trip
 /// property that the runtime unit test
 /// `spawn_from_welcome_application_data_round_trips_joiner_to_creator` used to
-/// prove by driving `MlsCryptoProvider::seal` / `open` DIRECTLY on the provider.
+/// prove by driving `NodeMlsFactory::seal` / `open` DIRECTLY on the provider.
 /// PR-7 moved the per-context seal/open crypto off the provider and onto the live
 /// actor, so the unit-level bare-provider fixture can no longer drive a real
 /// seal/open round-trip (its `take_into_actor` double-take panics once the crypto
@@ -238,7 +236,7 @@ async fn welcome_joiner_application_data_round_trips_to_creator() {
 /// property the runtime unit tests
 /// `spawn_from_welcome_group_round_trips_both_directions` and
 /// `invite_member_round_trip_stands_up_a_bidirectional_joiner` used to prove by
-/// driving `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the
+/// driving `NodeMlsFactory::mls_encrypt_management` / `open` DIRECTLY on the
 /// provider (both directions, group-keyed management).
 ///
 /// # Why APPLICATION traffic (not the units' group-keyed management path)
@@ -444,64 +442,12 @@ async fn join_time_sender_key_distribution_uses_management_channel() {
          this is the regression H3 closes (silent distribution loss on join)"
     );
 }
-
-// ---------------------------------------------------------------------------
-// 2. welcome_bytes_nonempty — AddMemberOutput contains data
-// ---------------------------------------------------------------------------
-
-/// The real production `MlsCryptoProvider::add_member` (unchanged by the
-/// 2F-residual migration) produces a substantial Welcome + Commit when adding a
-/// member's reserved `KeyPackage`. The `KeyPackage` is sourced from a real
-/// `KeyPackageStoreActor` reservation (the retired legacy path was the only
-/// thing that changed — the add itself is identical).
-#[tokio::test]
-async fn welcome_bytes_nonempty_with_key_package() {
-    let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
-    let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-    let context_id = [0x01u8; 32];
-
-    // Bob reserves a real KeyPackage from his own supervisor's store. Publish
-    // his wrapping keypair first so the pooled KP carries the 0xFF01 leaf.
-    let network = FullStackNetwork::new();
-    let bob = network.create_node(bob_did);
-    let (wpub, wsec) = bob.crypto.provider.wrapping_keypair_snapshot();
-    bob.manager
-        .set_wrapping_keys(
-            DID::from(bob_did),
-            wpub.to_vec(),
-            Zeroizing::new(wsec.to_vec()),
-        )
-        .await
-        .unwrap();
-    let (_reservation_id, bob_kp_bytes) = bob
-        .manager
-        .reserve_key_package(DID::from(bob_did))
-        .await
-        .unwrap();
-
-    // A bare creator provider creates a group and adds Bob's reserved KP.
-    let alice_crypto = MlsCryptoProvider::new(
-        alice_did.to_string(),
-        std::sync::Arc::new(scp_clock::SystemClock),
-    );
-    alice_crypto.create_mls_group(&context_id).unwrap();
-    alice_crypto.generate_sender_key(&context_id).unwrap();
-
-    let output = alice_crypto
-        .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
-        .unwrap();
-
-    assert!(
-        output.welcome_bytes.len() > 100,
-        "Welcome should be substantial (got {} bytes)",
-        output.welcome_bytes.len()
-    );
-    assert!(
-        output.commit_bytes.len() > 10,
-        "Commit should be non-trivial (got {} bytes)",
-        output.commit_bytes.len()
-    );
-}
+// #2148 (ADR-049 birth-into-actor): `welcome_bytes_nonempty_with_key_package`
+// was DELETED. It drove the low-level provider `create_mls_group` /
+// `generate_sender_key` / `add_member` directly — all deleted, as member
+// addition now mutates the ACTOR-owned MLS group. Welcome production is covered
+// internally by `spawn_from_welcome_tests` and end-to-end by the high-level
+// `add_member` fullstack tests.
 
 // ---------------------------------------------------------------------------
 // 3. routing_id_determinism

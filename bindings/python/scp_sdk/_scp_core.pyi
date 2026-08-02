@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 #       +-- TransportError
 #       +-- UcanError
 #       +-- ValidationError
+#       +-- StorageError
+#       +-- AttestationError
+#       +-- McpError
+#       +-- GovernanceError
+#       +-- EconomyError
 
 class ScpError(Exception):
     """Base exception for all SCP protocol errors."""
@@ -80,6 +85,31 @@ class UcanError(ScpError):
 
 class ValidationError(ScpError):
     """Input validation failed (malformed data, schema mismatch, constraint violation)."""
+
+    ...
+
+class StorageError(ScpError):
+    """A persistent-storage operation failed (SCP-STORAGE range, 8000-8999)."""
+
+    ...
+
+class AttestationError(ScpError):
+    """A device or identity attestation operation failed (SCP-ATTEST range, 9000-9999)."""
+
+    ...
+
+class McpError(ScpError):
+    """An MCP protocol or tool-invocation operation failed (SCP-MCP range, 10000-10999)."""
+
+    ...
+
+class GovernanceError(ScpError):
+    """A context governance proposal or voting operation failed (SCP-GOV range, 11000-11999)."""
+
+    ...
+
+class EconomyError(ScpError):
+    """A payment, budget, or economic-policy operation failed (SCP-ECON range, 12000-12999)."""
 
     ...
 
@@ -715,6 +745,26 @@ class SCP:
         ucan_proof_id: Any = ...,
     ) -> SagaResult: ...
     def outlet_register(self, context_id: Any, registration: Any) -> Any: ...
+    def outlet_streaming_saga_open(
+        self,
+        caller_context_id: Any,
+        target_context_id: Any,
+        caller_did: Any,
+        outlet_registration_id: Any,
+        input: Any,
+        asserted_nonce_hex: Any,
+        timestamp_ms: Any,
+        chain_depth: Any,
+        ucan_token: Any,
+        proof_tokens: Any = ...,
+        ucan_proof_id: Any = ...,
+        timeout_ms: Any = ...,
+        estimated_chunk_count: Any = ...,
+    ) -> str: ...
+    def outlet_streaming_saga_poll_next(self, saga_id: Any) -> bytes | None: ...
+    def outlet_streaming_saga_recover_truncated_close(
+        self, saga_id: Any, caller_did: Any
+    ) -> None: ...
     def outlet_stream_open(
         self,
         context_id: Any,

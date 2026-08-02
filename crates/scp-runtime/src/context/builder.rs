@@ -9,12 +9,12 @@
 //!
 //! External dependencies (transport, event log) are injected via traits
 //! ([`ContextTransportProvider`], [`ContextEventLogProvider`]). The crypto
-//! layer is the concrete [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+//! layer is the concrete [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
 //! — the old `ContextCryptoProvider` trait was deleted in ADR-049 §15;
 //! the builder names the concrete type directly.
 
 use super::ContextHandle;
-use crate::crypto::mls::provider::MlsCryptoProvider;
+use crate::crypto::mls::provider::NodeMlsFactory;
 use scp_protocol::context::templates::validate_against_template;
 use scp_protocol::context::{
     CapabilityCeiling, ContextError, ContextMode, ContextParams, ContextState, ScpContextExtension,
@@ -697,40 +697,20 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
 // Opaque resource handles -- represent ownership for rollback tracking
 // ---------------------------------------------------------------------------
 
-/// Opaque handle representing ownership of a created MLS group.
-///
-/// Exists solely to carry type-level evidence that an MLS group was created
-/// and needs rollback. The actual MLS group state lives inside the
-/// `ContextCryptoProvider`; this handle tracks that the provider holds
-/// state on behalf of this creation flow.
-#[derive(Debug)]
-pub struct MlsGroupHandle {
-    _private: (),
-}
-
-impl MlsGroupHandle {
-    /// Creates a new handle (builder-internal only).
-    const fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
-/// Opaque handle representing ownership of a created sender key (or broadcast key).
-///
-/// Like [`MlsGroupHandle`], the actual key material lives inside the
-/// `ContextCryptoProvider`; this handle tracks that the provider holds
-/// sender key state for this context.
-#[derive(Debug)]
-pub struct SenderKeyHandle {
-    _private: (),
-}
-
-impl SenderKeyHandle {
-    /// Creates a new handle (builder-internal only).
-    const fn new() -> Self {
-        Self { _private: () }
-    }
-}
+// #2148 (ADR-049 birth-into-actor): the `MlsGroupHandle` / `SenderKeyHandle`
+// rollback-evidence types were DELETED. Crypto is no longer provider-resident
+// during creation — `create_context` births the group + sender key as OWNED
+// material (`create_mls_group_with_context` → `OwnedMlsCryptoState`) and hands
+// it back to the caller, which seeds the spawning actor directly. There is no
+// provider-side crypto to roll back. On a post-birth creation failure the owned
+// material is disposed on the rollback branch (`OwnedMlsCryptoState::dispose_secrets`,
+// F6) — a bare drop FREES the group's in-memory OpenMLS storage but does NOT
+// zeroize the Ed25519 signer (OpenMLS `SignatureKeyPair` has no `Zeroize`;
+// scp-mls `EagerDropSigner` / issue #82). `destroy_group` eagerly frees the same
+// material (signer freed, NOT zeroized — #82); on this rollback branch the owner
+// drops immediately after, so the explicit dispose is defense-in-depth /
+// forward-compat with #82. The `SenderKey` zeroizes on its own `ZeroizeOnDrop`.
+// Only the event log retains a provider-resident rollback handle.
 
 /// Opaque handle representing ownership of a created event log.
 ///
@@ -761,26 +741,20 @@ impl EventLogHandle {
 ///
 /// See ADR-008 section "Two-phase commit steps" for the step ordering.
 ///
-/// ## Design note: `Option<Handle>` vs `Option<T>` vs `bool`
+/// ## Design note: `Option<Handle>` vs `bool`
 ///
-/// The ADR-008 spec shows `Option<MlsGroup>`, `Option<SenderKey>`,
-/// `Option<EventLog>`. In this implementation, the actual resource state
-/// (MLS groups, sender keys, event logs) lives inside the provider traits
-/// (`ContextCryptoProvider`, [`ContextEventLogProvider`]) which own and
-/// manage the state. The receipt holds opaque handle types
-/// ([`MlsGroupHandle`], [`SenderKeyHandle`], [`EventLogHandle`]) that
-/// carry type-level evidence of resource creation without duplicating
-/// provider-owned state. `published` remains a `bool` because transport
-/// publication has no recoverable local state -- rollback issues a
-/// best-effort DELETE to remote relays.
+/// #2148 (ADR-049 birth-into-actor): crypto (MLS group + sender key) is no
+/// longer provider-resident during creation, so the receipt tracks only the
+/// two resources that DO leave recoverable state outside the returned owned
+/// crypto material: the event log (`Option<EventLogHandle>`, provider-resident)
+/// and transport publication (`bool` — no recoverable local state, rollback
+/// issues a best-effort DELETE to remote relays). A post-birth creation failure
+/// disposes the `OwnedMlsCryptoState` on the rollback branch (`dispose_secrets`,
+/// which eagerly frees the group via `destroy_group` — signer freed, NOT
+/// zeroized, #82; the `SenderKey` zeroizes on drop), so there is nothing
+/// crypto-shaped left for the receipt to roll back.
 #[derive(Debug, Default)]
 pub struct CreationReceipt {
-    /// Handle to the MLS group created during step 2 (Encrypted mode only).
-    /// `None` for Broadcast mode or if step 2 has not completed.
-    pub mls_group: Option<MlsGroupHandle>,
-    /// Handle to the sender key (Encrypted) or broadcast key (Broadcast)
-    /// created during step 2/3. `None` if the key step has not completed.
-    pub sender_key: Option<SenderKeyHandle>,
     /// Handle to the event log initialised during step 4.
     /// `None` if the event log step has not completed.
     pub event_log: Option<EventLogHandle>,
@@ -794,14 +768,22 @@ impl CreationReceipt {
     /// Rollback is best-effort: if a destruction step fails, it is ignored
     /// so that subsequent rollback steps still execute. This ensures that a
     /// failure during rollback does not leave additional orphaned state.
+    ///
+    /// #2148 (ADR-049 birth-into-actor): the crypto (MLS group / sender key)
+    /// rollback arms are GONE — crypto is never provider-resident during
+    /// creation. A post-birth failure disposes the owned material on the caller's
+    /// rollback branch (`dispose_secrets` eagerly frees the group via
+    /// `destroy_group` — signer freed, NOT zeroized, #82; the `SenderKey`
+    /// zeroizes on drop). On this branch the owner drops immediately after, so
+    /// the dispose is defense-in-depth / forward-compat with #82. Only the event
+    /// log + publication are reversed here.
     pub async fn rollback(
         &self,
         context_id: &[u8; 32],
-        crypto: &MlsCryptoProvider,
         transport: &dyn ContextTransportProvider,
         event_log: &dyn ContextEventLogProvider,
     ) {
-        // Reverse order: published -> event_log -> sender_key -> mls_group
+        // Reverse order: published -> event_log
         if self.published {
             // Best-effort: relays are untrusted, orphaned blobs are encrypted
             // with destroyed keys.
@@ -809,12 +791,6 @@ impl CreationReceipt {
         }
         if self.event_log.is_some() {
             let _ = event_log.destroy_event_log(context_id).await;
-        }
-        if self.sender_key.is_some() {
-            let _ = crypto.destroy_sender_key(context_id);
-        }
-        if self.mls_group.is_some() {
-            let _ = crypto.destroy_mls_group(context_id);
         }
     }
 }
@@ -909,7 +885,11 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 ///
 /// # Returns
 ///
-/// A [`ContextHandle`] in the `Active` state on success.
+/// On success, a [`ContextHandle`] in the `Active` state together with the
+/// owned per-context crypto material: `Some(OwnedMlsCryptoState)` for
+/// Encrypted mode (the freshly-born MLS group + local sender key, for the
+/// caller to seed onto the spawning actor) or `None` for Broadcast mode
+/// (whose broadcast key lives on the actor's `BroadcastState`, not here).
 ///
 /// # Errors
 ///
@@ -932,12 +912,18 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 pub async fn create_context(
     context_id: String,
     params: ContextParams,
-    crypto: &MlsCryptoProvider,
+    crypto: &NodeMlsFactory,
     transport: &dyn ContextTransportProvider,
     event_log_provider: &dyn ContextEventLogProvider,
     creator_did: &str,
     creation_timestamp_secs: u64,
-) -> Result<ContextHandle, ContextCreationError> {
+) -> Result<
+    (
+        ContextHandle,
+        Option<crate::crypto::mls::provider::OwnedMlsCryptoState>,
+    ),
+    ContextCreationError,
+> {
     // ------------------------------------------------------------------
     // Phase 1 -- Validate (no side effects)
     // ------------------------------------------------------------------
@@ -964,14 +950,27 @@ pub async fn create_context(
     // it remains available to build the `scp_context_params` extension below.
     let handle = ContextHandle::new(context_id.clone(), params.clone());
 
-    // Step 2: Create MLS group (Encrypted) or init broadcast key (Broadcast).
-    match params.mode {
+    // Step 2: Birth the per-context crypto as OWNED material.
+    //
+    // #2148 (ADR-049 birth-into-actor): the MLS group + local sender key are
+    // no longer installed into a provider map. The Encrypted path mints them
+    // via `create_mls_group_with_context` (owned-return) and hands the
+    // `OwnedMlsCryptoState` back to the caller
+    // (`lifecycle_helpers::create_context`), which seeds it onto the spawning
+    // actor's `PerContextState`. The local sender key is minted INSIDE this
+    // owned birth (no separate rotate step). A birth failure returns `Err`
+    // with nothing installed to roll back. Broadcast contexts have no MLS
+    // group and no provider-resident broadcast key: the actor's
+    // `BroadcastState` (seeded by `Supervisor::init_broadcast_context` in
+    // `lifecycle_helpers::create_context`) is the authoritative broadcast-key
+    // home — so nothing crypto-shaped is born here.
+    let owned_crypto = match params.mode {
         ContextMode::Encrypted => {
             // Bind the context parameters into the MLS `group_context` via the
             // `scp_context_params` (`0xFF02`) extension so every joiner reads
             // the same creator-committed parameters, folded into the key
             // schedule (spec §5.13.3, finding FFI-02). A root context has no
-            // parents. Built before the side-effecting group create so a
+            // parents. Built before the side-effect-free owned birth so a
             // canonical-encoding failure aborts with nothing to roll back.
             let context_extension = ScpContextExtension::for_root(
                 context_id,
@@ -986,44 +985,26 @@ pub async fn create_context(
                     "building scp_context_params extension: {e}"
                 ))
             })?;
-            if let Err(e) = crypto.create_mls_group_with_context(&id_bytes, &context_extension) {
-                receipt
-                    .rollback(&id_bytes, crypto, transport, event_log_provider)
-                    .await;
-                return Err(e);
-            }
-            receipt.mls_group = Some(MlsGroupHandle::new());
+            // Owned birth. On `Err` the `?` drops nothing — no group / sender
+            // key was installed into any provider map.
+            Some(crypto.create_mls_group_with_context(&context_extension)?)
         }
-        ContextMode::Broadcast => {
-            if let Err(e) = crypto.init_broadcast_key(&id_bytes) {
-                receipt
-                    .rollback(&id_bytes, crypto, transport, event_log_provider)
-                    .await;
-                return Err(e);
-            }
-            // No MLS group for Broadcast mode -- mls_group stays None.
-        }
-    }
-
-    // Step 3: Generate sender key (Encrypted) -- broadcast key already done
-    // in step 2 for Broadcast mode.
-    if params.mode == ContextMode::Encrypted
-        && let Err(e) = crypto.generate_sender_key(&id_bytes)
-    {
-        receipt
-            .rollback(&id_bytes, crypto, transport, event_log_provider)
-            .await;
-        return Err(e);
-    }
-    // Mark sender_key for both modes: Encrypted has an explicit key,
-    // Broadcast's key was initialised in step 2. Rollback destroys it
-    // either way.
-    receipt.sender_key = Some(SenderKeyHandle::new());
+        ContextMode::Broadcast => None,
+    };
 
     // Step 4: Initialise event log.
     if let Err(e) = event_log_provider.init_event_log(&id_bytes).await {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto's OpenMLS
+        // group (`destroy_group`) before `owned` drops on this rollback. A bare
+        // drop already frees the in-memory group storage; the signer is freed
+        // either way, NOT zeroized (#82) — so this explicit dispose is
+        // defense-in-depth / forward-compat with #82. `SenderKey` zeroizes on
+        // its own drop.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
         receipt
-            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .rollback(&id_bytes, transport, event_log_provider)
             .await;
         return Err(e);
     }
@@ -1052,8 +1033,13 @@ pub async fn create_context(
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active) {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
+        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
         receipt
-            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .rollback(&id_bytes, transport, event_log_provider)
             .await;
         return Err(e.into());
     }
@@ -1071,9 +1057,16 @@ pub async fn create_context(
         )
         .await
     {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
+        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // The handle is Active but `owned_crypto` is still live (returned to the
+        // caller on success at step 9), so it is the live owner here.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
         // Even though the handle is Active, we must roll back everything.
         receipt
-            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .rollback(&id_bytes, transport, event_log_provider)
             .await;
         return Err(e);
     }
@@ -1102,14 +1095,23 @@ pub async fn create_context(
         )
         .await
     {
+        // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
+        // freed, NOT zeroized — #82) before it drops on this rollback (see step 4).
+        // `owned_crypto` is still live (returned to the caller on success at
+        // step 9), so it is the live owner here.
+        if let Some(mut owned) = owned_crypto {
+            owned.dispose_secrets();
+        }
         receipt
-            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .rollback(&id_bytes, transport, event_log_provider)
             .await;
         return Err(e.into());
     }
 
-    // Step 9: Return the handle.
-    Ok(handle)
+    // Step 9: Return the handle plus the owned crypto material (Encrypted
+    // mode) for the caller to seed onto the spawning actor. Broadcast contexts
+    // return `None` — their broadcast key lives on the actor's `BroadcastState`.
+    Ok((handle, owned_crypto))
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,7 +1131,7 @@ mod tests {
     use super::*;
     use scp_protocol::context::{ContextParams, MemoryScope};
 
-    /// Test DID for the real [`MlsCryptoProvider`].
+    /// Test DID for the real [`NodeMlsFactory`].
     ///
     /// The prior `MockCryptoProvider` fail-injection scaffold was deleted
     /// along with the `ContextCryptoProvider` trait in ADR-049 §15.
@@ -1190,7 +1192,7 @@ mod tests {
     }
 
     /// Smoke verifying that ADR-049 §15's
-    /// [`MlsCryptoProvider::with_backends`] seam compiles and that
+    /// [`NodeMlsFactory::with_backends`] seam compiles and that
     /// inherent backend accessors return the injected pointers.
     /// Functional fail-injection tests (one per orchestration path)
     /// extend this seam with mock `MlsBackend`/`HpkeBackend` impls
@@ -1201,10 +1203,10 @@ mod tests {
     async fn create_context_fail_paths_use_backend_injection() {
         use crate::crypto::hpke_backend::ProductionHpkeBackend;
         use crate::crypto::mls::production_backend::ProductionMlsBackend;
-        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use crate::crypto::mls::provider::NodeMlsFactory;
         use std::sync::Arc;
 
-        let provider = MlsCryptoProvider::with_backends(
+        let provider = NodeMlsFactory::with_backends(
             TEST_DID.to_owned(),
             Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
                 scp_clock::SystemClock,
@@ -1258,11 +1260,11 @@ mod tests {
 
         // Drive real creation crypto. A real MLS provider + no-op transport /
         // event log isolates the keying behavior under test.
-        let crypto = MlsCryptoProvider::new(
+        let crypto = NodeMlsFactory::new(
             TEST_DID.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         );
-        let handle = create_context(
+        let (handle, owned_crypto) = create_context(
             id.clone(),
             ContextParams::default(),
             &crypto,
@@ -1275,18 +1277,19 @@ mod tests {
         .expect("create_context should succeed for a canonical 64-hex id");
         assert_eq!(handle.context_id(), id, "handle carries the canonical id");
 
-        // Crypto-keying-site assertion: the MLS group / crypto state created by
-        // `create_context` lives under the DECODED digest. `export_crypto_state`
-        // returns the serialized state for a keyed context and an EMPTY vec for
-        // an unkeyed one (no entry under that key).
+        // #2148 (ADR-049 birth-into-actor): crypto is born as OWNED material
+        // and returned (never installed into a provider map — the provider's
+        // `contexts` map and `context_crypto_present` residency probe are
+        // DELETED). The keying-under-decoded-digest property that this test
+        // originally proved via provider residency is now proved directly by
+        // `context_id_to_bytes(&id) == digest` above (the SINGLE keying
+        // chokepoint every seed / send / receive routes through): the actor's
+        // `PerContextState.context_id` is set from exactly that resolver, and
+        // the owned crypto seeded here carries no separate key. An Encrypted
+        // create MUST yield owned crypto material.
         assert!(
-            crypto.context_crypto_present(&digest),
-            "crypto state MUST be keyed under the decoded digest"
-        );
-        assert!(
-            !crypto.context_crypto_present(&sha256_of_id),
-            "crypto state MUST NOT be keyed under SHA-256(id) — that would be the \
-             pre-ADR-056 double-hash, diverging from state.context_id and the §6.2.4 wire digest"
+            owned_crypto.is_some(),
+            "an Encrypted create must return born-owned MLS crypto material"
         );
     }
 
@@ -1308,7 +1311,7 @@ mod tests {
         // A real 64-hex context id (the shape `generate_context_id` emits).
         let id = hex::encode([0x2au8; 32]);
         let id_bytes = context_id_bytes(&id);
-        let crypto = MlsCryptoProvider::new(
+        let crypto = NodeMlsFactory::new(
             TEST_DID.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         );

@@ -1421,7 +1421,17 @@ fn discovery_and_provenance_coverage() {
 // the §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a), exposed
 // across all three native bridges (PyO3 / UniFFI / NAPI). Pure coverage
 // expansion, not a swap for the removed `economy_adjust_relay_price`.
-const MIN_PARITY_OPERATIONS: usize = 106;
+//
+// Subsequently RAISED 106 -> 109 by the three `outlet_streaming_saga_*` ops
+// (`outlet_streaming_saga_open` / `outlet_streaming_saga_poll_next` /
+// `outlet_streaming_saga_recover_truncated_close`): the §5.4.5 / §6.2.4
+// cross-context STREAMING outlet-invocation saga (SCP-OUT-047, ADR-049 §3a).
+// The PyO3 reference exports landed in SCP-OUT-047 pass 1; the NAPI + UniFFI
+// exports landed in pass 3a, making all three ops parity-complete across every
+// native bridge (PyO3 / UniFFI / NAPI) and removing the pass-1 bridge-alias
+// exemptions. Pure coverage expansion, not a swap for the removed
+// `economy_adjust_relay_price`.
+const MIN_PARITY_OPERATIONS: usize = 109;
 
 // ---------------------------------------------------------------------------
 // Ratchet meta-tests — detect weakening of enforcement

@@ -19,7 +19,7 @@ re-export shim (ADR-057 Amendment; enforced by
 This module (`crates/scp-runtime/src/crypto/mls/`) keeps only the **async
 durable-storage bridge** — the `tokio`-coupled, node-only pieces:
 
-- `provider.rs` — `MlsCryptoProvider`
+- `provider.rs` — `NodeMlsFactory`
 - `backend.rs` — the `MlsBackend` trait + raw-output types
 - `production_backend.rs` — `ProductionMlsBackend`
 - `storage.rs` — the OpenMLS `StorageProvider` bridge (`ScpMlsProvider`,
@@ -31,19 +31,19 @@ durable-storage bridge** — the `tokio`-coupled, node-only pieces:
 The provider is split so the actor runtime can share stateless primitives and
 inject test doubles:
 
-- **`MlsCryptoProvider`** (`provider.rs`) — the concrete MLS crypto provider
+- **`NodeMlsFactory`** (`provider.rs`) — the concrete MLS crypto provider
   (the `ContextCryptoProvider` trait was deleted in ADR-049; the provider is
-  now a concrete type held as `Arc<MlsCryptoProvider>`). It owns the
+  now a concrete type held as `Arc<NodeMlsFactory>`). It owns the
   per-context crypto state — a `DashMap` of per-context MLS state, a `DashMap`
   of broadcast sender keys, and each identity's X25519 wrapping keypair in an
   `ArcSwap` for atomic rotation (Decision 12, §9.16.1) — but delegates every
   raw MLS/HPKE primitive to two injected trait objects:
   - `mls_backend: Arc<dyn MlsBackend>` (`backend.rs`)
   - `hpke_backend: Arc<dyn HpkeBackend>` (`../hpke_backend.rs`)
-  Build the production provider with `MlsCryptoProvider::new(local_did, clock)`
+  Build the production provider with `NodeMlsFactory::new(local_did, clock)`
   — `clock` is an `Arc<dyn scp_clock::Clock>` (e.g. `Arc::new(scp_clock::SystemClock)`)
   — which wires `ProductionMlsBackend` + `ProductionHpkeBackend`; tests inject
-  failure-driven mocks via `MlsCryptoProvider::with_backends`.
+  failure-driven mocks via `NodeMlsFactory::with_backends`.
 - **`ProductionMlsBackend`** (`production_backend.rs`) — a stateless struct
   that delegates each primitive to the `scp_mls` crate's `group` / `encrypt` /
   `ratchet` free functions (e.g. `scp_mls::group::create_group_with_wrapping_key`).
@@ -149,8 +149,8 @@ Merkle event log (§9.9.3).
 
 ## Where this sits
 
-`MlsCryptoProvider` is injected into the `Supervisor` at construction and
-cloned into each `ContextActor`'s `ActorDeps` (`Arc<MlsCryptoProvider>`), so
+`NodeMlsFactory` is injected into the `Supervisor` at construction and
+cloned into each `ContextActor`'s `ActorDeps` (`Arc<NodeMlsFactory>`), so
 handler bodies call `seal` / `open` / `advance_epoch` without reaching back
 through the supervisor. See `../../context/README.md` for the actor model and
 this crate's `CLAUDE.md` for the injection + Send-discipline rules.

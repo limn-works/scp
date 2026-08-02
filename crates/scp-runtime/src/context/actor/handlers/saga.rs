@@ -4112,7 +4112,7 @@ mod tests {
         issuer_key: ed25519_dalek::VerifyingKey,
         persistence: Box<dyn ContextPersistence>,
     ) -> ActorDeps {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestSagaActor".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -4159,7 +4159,7 @@ mod tests {
         event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
         persistence: Box<dyn ContextPersistence>,
     ) -> ActorDeps {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestSagaActor".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -6376,7 +6376,7 @@ mod tests {
         issuer_key: ed25519_dalek::VerifyingKey,
         payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
     ) -> ActorDeps {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestSagaActor".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

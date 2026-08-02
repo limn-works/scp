@@ -1095,7 +1095,7 @@ fn outlet_invoke_cross_context_impl(
 /// - `NeedsRepair` → [`ScpPyError::SagaNeedsRepair`] (durable repair handle,
 ///   `SCP-SAGA-13065`).
 /// - `Busy` → [`ScpPyError::SagaBusy`] (`SCP-SAGA-13066`).
-fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpPyError {
+pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpPyError {
     use scp_ffi_common::saga_errors::{SagaErrorKind, decompose_saga_error};
     let parts = decompose_saga_error(err);
     match parts.kind {
@@ -1125,7 +1125,7 @@ fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpPyError {
 /// signed under the correct per-context Active Signing Key (spec §6.2.4
 /// "Signer authorization": the receipt key MUST be the one authorized to act
 /// for `target_context_id`).
-fn resolve_context_signing_key(
+pub(crate) fn resolve_context_signing_key(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> PyResult<ed25519_dalek::SigningKey> {
@@ -1142,7 +1142,7 @@ fn resolve_context_signing_key(
 /// NOT a "pad it" situation; and we never accept a Python int (which would
 /// invite an ambiguous endianness/width interpretation). Both failure modes
 /// surface as `ValidationError`.
-fn decode_asserted_nonce(asserted_nonce_hex: &str) -> PyResult<[u8; 16]> {
+pub(crate) fn decode_asserted_nonce(asserted_nonce_hex: &str) -> PyResult<[u8; 16]> {
     let bytes = hex::decode(asserted_nonce_hex).map_err(|e| ScpPyError::ValidationError {
         message: format!(
             "asserted_nonce_hex is not valid hex: {e} — supply the 16-byte §6.2.4 envelope \
@@ -1181,7 +1181,7 @@ fn decode_asserted_nonce(asserted_nonce_hex: &str) -> PyResult<[u8; 16]> {
 /// request leg is authenticated AS that member) — so axis (a) is the
 /// load-bearing addition this seam contributes. Enforcing here, before the
 /// entry point, also means the saga never observes an unauthenticated caller.
-fn enforce_caller_principal_binding(
+pub(crate) fn enforce_caller_principal_binding(
     bi: &PyBridgeInstance,
     supervisor: &std::sync::Arc<scp_core::context::supervisor::Supervisor>,
     tokio_rt: &tokio::runtime::Runtime,

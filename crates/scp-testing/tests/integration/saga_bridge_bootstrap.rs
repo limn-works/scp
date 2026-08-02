@@ -50,7 +50,7 @@ use scp_core::context::supervisor::{
     JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState, Supervisor,
 };
 use scp_core::context::{ContextMode, ContextParams, ContextState, LocalTransportProvider};
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 use scp_did::DID;
 use scp_ffi_common::bridge_instance::CoreFields;
@@ -146,7 +146,7 @@ fn bridge_supervisor(
 ) -> Arc<Supervisor> {
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
     Supervisor::with_providers_and_journal(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             creator_did.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

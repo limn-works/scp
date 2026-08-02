@@ -12,7 +12,7 @@
  * The wasm surface throws JS exceptions whose message carries a stable
  * `[SCP-{CATEGORY}-{NUMBER}]` prefix (`crates/scp-client-wasm/src/error.rs`).
  * The client maps those through {@link mapBridgeError} — the SAME string-prefix
- * dispatch the NAPI tier uses — so a wasm `SCP-CTX-2005` classifies to
+ * dispatch the NAPI tier uses — so a wasm `SCP-CTX-2086` classifies to
  * `ContextError` exactly as a native one does. Classification is by code prefix,
  * never by cross-package object identity (the bounded dual-package `instanceof`
  * residual D1 accepts). `mapBridgeError` is re-exported for cross-tier API
@@ -31,6 +31,7 @@ export {
   EconomyError,
   GovernanceError,
   IdentityError,
+  InvalidGrant,
   McpError,
   mapBridgeError,
   OutletError,

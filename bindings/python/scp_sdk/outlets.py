@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, final
 
@@ -44,44 +45,43 @@ from scp_sdk.errors import (
     StreamAlreadyClosed,
     StreamGap,
     ValidationError,
+    _coded_bridge_error,
+    _saga_terminal_from_bridge,
 )
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Generator
 
     from scp_sdk.identity import Identity
-    from scp_sdk.scp import SCP
-
-try:
-    import _scp_core  # type: ignore[import-not-found]
-except ImportError:
-    _scp_core = None  # type: ignore[assignment]
 
 
-def _resolve_bridge(scp: SCP) -> Any:
-    """Return the effective bridge object for outlet operations.
-
-    Tests patch ``scp_sdk.outlets._scp_core`` with a ``MagicMock`` whose
-    ``outlet_*`` attributes stand in for the live bridge. In production
-    those attributes do not exist on the real ``_scp_core`` module
-    (Phase 4 PR 4 consolidated them onto :class:`SCP`), so we fall
-    through to ``scp._native`` and dispatch on the SCP instance.
-    """
-    mod = _scp_core
-    if mod is not None and hasattr(mod, "_mock_name"):
-        return mod
-    return scp._native
+#: Matches the leading ``[SCP-CAT-NNNN]`` code the bridge's ``ScpPyError``
+#: ``Display`` prepends to its message (``[SCP-PERM-3001] context error: ...``).
+#: Anchored at the start so only the bridge's own code prefix is extracted; an
+#: unbracketed message yields no match and the SDK class default stands.
+_LEADING_BRIDGE_CODE: Final = re.compile(r"^\[(SCP-[A-Z]+-\d+)\]")
 
 
 def _translate_bridge_error(exc: Exception) -> Exception:
     """Translate a ``_scp_core`` bridge exception to an SDK exception.
 
-    Uses :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP` to look up the SDK type
-    by the bridge exception's class name.  Falls back to
-    :class:`~scp_sdk.errors.ContextError` for unmapped types.
+    Uses :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP` to look up the SDK type by
+    the bridge exception's class name (falling back to
+    :class:`~scp_sdk.errors.ContextError` for unmapped types), and preserves
+    the bridge's structured ``SCP-CAT-NNNN`` code as the SDK exception's
+    ``.code`` so a caller can branch on it — not merely read it out of the
+    message text. The bridge's ``ScpPyError`` ``Display`` prepends the code in
+    brackets (``[SCP-PERM-3001] ...``); that leading code is extracted and
+    passed through, so a money-moving rejection (e.g. a non-invoker
+    grant/cancel/recover) surfaces ``.code == "SCP-PERM-3001"`` rather than the
+    receiving SDK class's generic default. An unbracketed bridge message carries
+    no recoverable code, so the SDK class default applies.
     """
     sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
-    return sdk_cls(str(exc))
+    message = str(exc)
+    match = _LEADING_BRIDGE_CODE.match(message)
+    code = match.group(1) if match is not None else None
+    return sdk_cls(message, code)
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +627,7 @@ class InvocationHandle:
                     # Open rejections (UCAN denial, input-schema violation,
                     # escrow InsufficientFunds/overflow) surface on the first
                     # await / iteration / control call as the matching SDK type.
-                    raise _translate_bridge_error(exc) from exc
+                    raise _coded_bridge_error(exc) from exc
                 self._handle_id = str(handle_id)
             return self._handle_id
 
@@ -652,7 +652,7 @@ class InvocationHandle:
             except Exception as exc:
                 # A mid-drain bridge rejection (unknown handle, transport fault)
                 # surfaces on `async for` / `aggregate` as the matching SDK type.
-                raise _translate_bridge_error(exc) from exc
+                raise _coded_bridge_error(exc) from exc
             if raw is None:
                 # Abnormal terminal: sender dropped without a terminal chunk.
                 self._closed = True
@@ -765,7 +765,7 @@ class InvocationHandle:
                 grant.value,
             )
         except Exception as exc:
-            raise _translate_bridge_error(exc) from exc
+            raise _coded_bridge_error(exc) from exc
 
     async def cancel(self) -> None:
         """Request cancellation of the live stream (§5.4.5 cancellation).
@@ -810,7 +810,7 @@ class InvocationHandle:
                 self._params.caller_did,
             )
         except Exception as exc:
-            raise _translate_bridge_error(exc) from exc
+            raise _coded_bridge_error(exc) from exc
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -885,6 +885,275 @@ class Outlets:
 
 
 # ---------------------------------------------------------------------------
+# Cross-context STREAMING saga (§5.4.5 / §6.2.4, SCP-OUT-047)
+# ---------------------------------------------------------------------------
+#
+# The STREAMING sibling of the unary block-until-terminal
+# :meth:`scp_sdk.SCP.outlet_invoke_cross_context_saga`. Per the ADR-049 §3a
+# streaming wait-model amendment, the streaming saga returns its chunk receiver
+# PROMPTLY at the Commit-transition (the caller consumes chunks as produced) and
+# reaches ``Committed`` ASYNCHRONOUSLY at seal-close — it MUST NOT block until
+# the stream terminates (an LLM stream can exceed the unary saga's ~95s bound;
+# the credit ceiling bounds chunk count, not wall-clock). The bridge open
+# (``outlet_streaming_saga_open``) returns a durable ``saga_id`` promptly, and
+# the SDK drives the stream by polling ``outlet_streaming_saga_poll_next(saga_id)``
+# behind :class:`StreamingSagaHandle` — modelled on the same-context
+# :class:`InvocationHandle` async iterator.
+#
+# There is NO live control plane (grant_credit / cancel) for the cross-context
+# saga stream: per §6.2.5 / SCP-OUT-046 the cross-context stream runs with
+# ``cancel_ack_ceiling = u64::MAX`` (no live mid-stream OutletCancel channel).
+# The handle is therefore async-iterable + awaitable ONLY — the credit window is
+# fixed at open via ``estimated_chunk_count``.
+
+
+def _translate_saga_open_error(exc: Exception) -> Exception:
+    """Translate an ``outlet_streaming_saga_open`` bridge exception to an SDK type.
+
+    The streaming-saga open can reject at the §6.2.4 caller-principal binding or
+    a Prepare/Commit-transition as one of the three saga terminals
+    (:class:`~scp_sdk.errors.SagaAbortedError` — e.g. an unhosted / non-member
+    ``caller_did`` with ``SCP-SAGA-13050``; :class:`~scp_sdk.errors.SagaBusyError`;
+    :class:`~scp_sdk.errors.SagaNeedsRepairError`), OR with a plain input / UCAN
+    rejection (``ValidationError`` / ``UcanError`` / ``ContextError``). Saga
+    terminals are mapped STRUCTURALLY via
+    :func:`~scp_sdk.errors._saga_terminal_from_bridge` (preserving the
+    ``retry_after_ms`` / ``saga_id`` / ``contended_context`` datum); anything
+    else falls through to :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP`.
+    """
+    translated = _saga_terminal_from_bridge(exc)
+    return translated if translated is not None else _translate_bridge_error(exc)
+
+
+@dataclass
+class _StreamingSagaOpenParams:
+    """The immutable ``outlet_streaming_saga_open`` argument set, captured at
+    :meth:`scp_sdk.SCP.outlet_invoke_cross_context_streaming_saga` and replayed
+    on the (lazy) first open. Mirrors the FFI open param order exactly."""
+
+    caller_context_id: str
+    target_context_id: str
+    caller_did: str
+    outlet_registration_id: str
+    input: dict[str, Any]
+    asserted_nonce_hex: str
+    timestamp_ms: int
+    chain_depth: int
+    ucan_token: str
+    proof_tokens: list[str] | None = None
+    ucan_proof_id: str | None = None
+    timeout_ms: int | None = None
+    estimated_chunk_count: int | None = None
+
+
+class StreamingSagaHandle:
+    """The async-iterable + awaitable handle for a §6.2.4 cross-context
+    STREAMING saga (SCP-OUT-047).
+
+    Returned by
+    :meth:`scp_sdk.SCP.outlet_invoke_cross_context_streaming_saga`. Modelled on
+    the same-context :class:`InvocationHandle`, minus the live control plane
+    (there is no cross-context grant_credit / cancel — §6.2.5 / SCP-OUT-046).
+    It is simultaneously:
+
+    - **Async-iterable** — ``async for chunk in handle`` opens the saga on the
+      first pull (``outlet_streaming_saga_open`` returns the durable ``saga_id``
+      PROMPTLY at the Commit-transition, NOT block-until-terminal), then yields
+      each :class:`OutletStreamChunk` polled from
+      ``outlet_streaming_saga_poll_next(saga_id)`` up to and including the
+      terminal. Iteration stops on a terminal-flagged chunk (``End`` / terminal
+      ``Error``) OR on ``None`` (an abnormal sender-drop terminal).
+    - **Awaitable** — ``await handle`` (equivalently
+      :meth:`~StreamingSagaHandle.aggregate`) drains to the terminal and returns
+      the :class:`Aggregate` from the ``End`` chunk; a terminal ``Error`` chunk
+      raises the typed :class:`~scp_sdk.errors.OutletError` it carried.
+
+    The saga is opened LAZILY — the ``outlet_invoke_cross_context_streaming_saga``
+    call returns immediately without starting the saga; the open (which drives
+    the saga to the Commit-transition and reserves escrow) happens on first
+    iteration / ``await``. The blocking PyO3 calls (``open`` runs the saga to the
+    Commit-transition; ``poll_next`` blocks on ``recv()``) are dispatched via
+    :func:`asyncio.to_thread` so they never block the event loop, and any bridge
+    rejection is translated to the matching SDK type — saga terminals
+    (:class:`~scp_sdk.errors.SagaAbortedError` /
+    :class:`~scp_sdk.errors.SagaBusyError` /
+    :class:`~scp_sdk.errors.SagaNeedsRepairError`) on the open, and
+    ``ContextError`` for an unknown / evicted ``saga_id`` on a poll.
+
+    A stream has a single consumer: draining it from two coroutines
+    concurrently raises :class:`~scp_sdk.errors.ProtocolError` on the second
+    driver rather than silently splitting the chunk sequence.
+    """
+
+    __slots__ = (
+        "_aggregate",
+        "_closed",
+        "_draining",
+        "_error",
+        "_expected_sequence",
+        "_native",
+        "_open_lock",
+        "_params",
+        "_saga_id",
+    )
+
+    def __init__(self, native: Any, params: _StreamingSagaOpenParams) -> None:
+        self._native = native
+        self._params = params
+        # The durable saga id, minted by the supervisor and returned by open.
+        # Doubles as the poll_next key. ``None`` until the (lazy) first open.
+        self._saga_id: str | None = None
+        self._open_lock = asyncio.Lock()
+        # Set once a terminal chunk (End / terminal Error) is observed, or the
+        # sender drops without a terminal (poll_next -> None).
+        self._closed = False
+        # In-flight re-entrancy guard: True while a poll is outstanding, so a
+        # second concurrent driver fails loud instead of stealing chunks.
+        self._draining = False
+        # Captured terminal state, read back by aggregate().
+        self._aggregate: Aggregate | None = None
+        self._error: OutletError | None = None
+        # §5.4.5 receiver-side monotonicity cursor: the sequence the NEXT chunk
+        # must carry. The bridge forwards A's operator-signed chunks VERBATIM
+        # over a lossless ordered mpsc channel (no re-sequencing), so a
+        # non-contiguous sequence is a StreamGap (defense-in-depth). There is no
+        # live cancel plane, so the gap is a local terminal — the SDK does not
+        # sign a receiver cancel (unlike the same-context handle).
+        self._expected_sequence = 0
+
+    @property
+    def saga_id(self) -> str | None:
+        """The durable supervisor-minted saga id, available once the saga has
+        been opened (after the first iteration / ``await``); ``None`` before."""
+        return self._saga_id
+
+    async def _ensure_open(self) -> str:
+        """Open the saga exactly once (idempotent), returning the durable
+        ``saga_id``. Guarded by a lock so concurrent first-touches open only one
+        saga.
+        """
+        if self._saga_id is not None:
+            return self._saga_id
+        async with self._open_lock:
+            if self._saga_id is None:
+                p = self._params
+                try:
+                    saga_id = await asyncio.to_thread(
+                        self._native.outlet_streaming_saga_open,
+                        p.caller_context_id,
+                        p.target_context_id,
+                        p.caller_did,
+                        p.outlet_registration_id,
+                        p.input,
+                        p.asserted_nonce_hex,
+                        p.timestamp_ms,
+                        p.chain_depth,
+                        p.ucan_token,
+                        p.proof_tokens,
+                        p.ucan_proof_id,
+                        p.timeout_ms,
+                        p.estimated_chunk_count,
+                    )
+                except Exception as exc:
+                    # Open rejections — the §6.2.4 caller-principal binding
+                    # (unhosted / non-member caller_did), a Prepare/Commit saga
+                    # terminal, or an input/UCAN rejection — surface on the first
+                    # await / iteration as the matching SDK type. The receiver is
+                    # NEVER handed out (self._saga_id stays None).
+                    raise _translate_saga_open_error(exc) from exc
+                self._saga_id = str(saga_id)
+            return self._saga_id
+
+    def __aiter__(self) -> AsyncIterator[OutletStreamChunk]:
+        return self
+
+    async def __anext__(self) -> OutletStreamChunk:
+        if self._closed:
+            raise StopAsyncIteration
+        if self._draining:
+            raise ProtocolError(
+                "StreamingSagaHandle is already being drained by another consumer; "
+                "a cross-context streaming saga has a single shared drain — do not "
+                "iterate or await it from two coroutines concurrently",
+                code="SCP-OUTLET-6100",
+            )
+        self._draining = True
+        try:
+            saga_id = await self._ensure_open()
+            try:
+                raw = await asyncio.to_thread(self._native.outlet_streaming_saga_poll_next, saga_id)
+            except Exception as exc:
+                # A mid-drain bridge rejection (unknown / evicted saga_id,
+                # serialization fault) surfaces as the matching SDK type.
+                raise _translate_bridge_error(exc) from exc
+            if raw is None:
+                # Abnormal terminal: the sender dropped without a terminal chunk.
+                self._closed = True
+                raise StopAsyncIteration
+            chunk = OutletStreamChunk._from_bridge_bytes(bytes(raw))
+            if chunk.sequence != self._expected_sequence:
+                # §5.4.5 "Ordering and gaps": a non-contiguous sequence is a
+                # receiver-detected StreamGap. There is NO live cross-context
+                # cancel plane (§6.2.5 / SCP-OUT-046), so the gap is a purely
+                # local terminal — mark closed and raise WITHOUT yielding the
+                # offending chunk and WITHOUT a bridge cancel round-trip.
+                self._closed = True
+                gap = StreamGap(
+                    f"cross-context streaming-saga sequence gap: expected "
+                    f"{self._expected_sequence}, got {chunk.sequence} (§5.4.5)",
+                )
+                self._error = gap
+                raise gap
+            self._expected_sequence += 1
+            if chunk.is_terminal:
+                # Terminal chunk closes the stream. Capture the terminal state
+                # for aggregate(), mark closed, then still YIELD the terminal
+                # chunk so an iterating consumer observes it.
+                self._closed = True
+                if chunk.kind == "end":
+                    self._aggregate = Aggregate(
+                        value=chunk.payload.get("aggregate"),
+                        provenance=_as_dict(chunk.payload.get("provenance")),
+                        execution_time_ms=int(chunk.payload.get("execution_time_ms", 0)),
+                    )
+                elif chunk.kind == "error":
+                    self._error = OutletError(
+                        str(chunk.payload.get("message", "outlet stream error")),
+                        code=str(chunk.payload.get("code", "SCP-OUTLET-6000")),
+                    )
+            return chunk
+        finally:
+            self._draining = False
+
+    def __await__(self) -> Generator[Any, None, Aggregate]:
+        return self.aggregate().__await__()
+
+    async def aggregate(self) -> Aggregate:
+        """Drain the saga stream to its terminal and return the :class:`Aggregate`.
+
+        Idempotent: if the stream has already been drained (by ``await`` or by
+        full iteration), the captured :class:`Aggregate` is returned without
+        re-draining. A terminal ``Error`` chunk raises the typed
+        :class:`~scp_sdk.errors.OutletError` it carried; a stream that ends
+        without an ``End`` chunk (an abnormal sender-drop) raises
+        :class:`~scp_sdk.errors.ProtocolError`.
+        """
+        while not self._closed:
+            try:
+                await self.__anext__()
+            except StopAsyncIteration:
+                break
+        if self._error is not None:
+            raise self._error
+        if self._aggregate is None:
+            raise ProtocolError(
+                "cross-context streaming saga closed without an End chunk",
+                code="SCP-OUTLET-6100",
+            )
+        return self._aggregate
+
+
+# ---------------------------------------------------------------------------
 # Bidirectional consent protocol (spec section 6.2.0.1)
 # ---------------------------------------------------------------------------
 
@@ -899,5 +1168,6 @@ __all__ = [
     "OutletStreamChunk",
     "Outlets",
     "SagaResult",
+    "StreamingSagaHandle",
     "TestVector",
 ]

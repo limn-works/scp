@@ -1603,7 +1603,7 @@ pub async fn create_context(
     // every member as the base for the TTL expiry deadline
     // (= creation + params.ttl), which IS computed identically on each member.
     let creation_timestamp_secs = deps.clock.now_secs();
-    let handle = crate::context::builder::create_context(
+    let (handle, created_owned_crypto) = crate::context::builder::create_context(
         context_id.clone(),
         params.clone(),
         deps.crypto.as_ref(),
@@ -1760,25 +1760,33 @@ pub async fn create_context(
         mode,
     };
 
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 CREATE seam: the builder
-    // (`builder::create_context` above) BIRTHS the MLS group + local sender key
-    // into the provider (Encrypted mode only). TAKE that freshly-born crypto out
-    // of the provider (one-way: `take_crypto_state` removes the `contexts` entry
-    // AND records the id in `taken_context_ids`, so a subsequent provider
-    // birth/take fails closed — CM-001 double-owner guard) and SEED it onto the
-    // actor's `PerContextState` before the actor spawns. Seeding BEFORE spawn (vs
-    // in-dispatch) keeps the create path structurally identical to the restore
-    // seam and leaves NO window where a live actor holds an empty group. The
-    // send-sequence counter starts fresh at 0 for a newly-born group
-    // (`OwnedMlsCryptoState::send_sequence == 0`), which `from_persisted` inside
-    // `seed_encrypted_crypto_from_owned` installs. Broadcast contexts have NO MLS
-    // group (`create_is_broadcast` — the builder ran `init_broadcast_key`, not a
-    // group create), so there is nothing to take and the `Broadcast` mode stands.
-    if !create_is_broadcast {
-        let owned = deps
-            .crypto
-            .take_crypto_state(&context_id_bytes)
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+    // #2148 (ADR-049 birth-into-actor) CREATE seam: `builder::create_context`
+    // above BIRTHS the MLS group + local sender key as OWNED material (Encrypted
+    // mode only) and RETURNS it — no provider map is touched, so there is no
+    // insert-then-`take_crypto_state` round-trip and no cross-map check-then-insert
+    // to race (#2167 TOCTOU is impossible by construction). Deleting the provider's
+    // `contexts`/`taken_context_ids` maps removes ONE redundant guard; it does NOT
+    // make the registry write-lock insert the sole double-birth authority. The
+    // durable double-birth / divergence authority is the global `bootstrap_spawn_lock`
+    // (serializes all births node-wide) together with the supervisor's Precheck A
+    // (live-actor) + Precheck D (durable first-writer-wins), which run UNDER that
+    // lock; the registry write-lock insert at spawn guards only the in-memory
+    // registry slot. SEED the owned crypto onto the actor's `PerContextState`
+    // BEFORE the actor spawns — structurally
+    // identical to the restore seam, leaving NO window where a live actor holds an
+    // empty group. The send-sequence counter starts fresh at 0 for a newly-born
+    // group (`OwnedMlsCryptoState::send_sequence == 0`), which `from_persisted`
+    // inside `seed_encrypted_crypto_from_owned` installs. Broadcast contexts carry
+    // `None` (the builder births no MLS group; the actor's `BroadcastState`, seeded
+    // by `init_broadcast_context` above, is the authoritative broadcast-key home),
+    // so nothing is seeded and the `Broadcast` mode stands. The two are exactly
+    // anti-correlated (Encrypted ⇔ `Some` ⇔ `!create_is_broadcast`).
+    debug_assert_eq!(
+        created_owned_crypto.is_some(),
+        !create_is_broadcast,
+        "owned crypto is present iff the context is Encrypted (non-broadcast)"
+    );
+    if let Some(owned) = created_owned_crypto {
         per_context.seed_encrypted_crypto_from_owned(owned);
     }
 
@@ -1922,8 +1930,9 @@ fn generate_initial_access_key_store(
 /// `ContextError::CryptoFailed` (from `From<FloorAdvanceError>`, the §23.17
 /// replay-protection rejection the registry's `validate_and_merge_*` sink
 /// returns) if a per-sender floor regresses (import path) or overshoots (both
-/// paths); the just-built owned crypto is dropped (zeroizes) on rejection and the
-/// registry is left unchanged (atomic).
+/// paths); the just-built owned crypto is dropped on rejection (the `SenderKey`
+/// zeroizes; the `ScpMlsGroup` / Ed25519 signer is freed, not zeroized - #82) and
+/// the registry is left unchanged (atomic).
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
     ctx_id_bytes: &[u8; 32],
@@ -1936,16 +1945,14 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // "live capture" to take — the live floors are ALREADY in the registry and
     // are the max-merge target.
     //
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 fold: the crypto is now ACTOR-owned,
-    // so this helper no longer inserts into the provider `contexts` map (the
-    // deleted `restore_crypto_state` insert-path). It builds the restored crypto
-    // as OWNED material via `build_restored_owned` (which records
-    // `taken_context_ids` — CM-006 double-owner guard — and does NOT touch
-    // `contexts`) and RETURNS it for the caller to seed (`import_context`) or drop
-    // (`PrepareForReplace`, terminal). Any stale provider-resident crypto for this
-    // id is torn down first so the actor is the SOLE crypto authority.
-    let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
-    let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
+    // #2148 (ADR-049 birth-into-actor): the crypto is ACTOR-owned end to end —
+    // the provider holds NO per-context state at all (its `contexts` map and the
+    // `destroy_mls_group` / `destroy_sender_key` teardown methods are DELETED).
+    // This helper builds the restored crypto as OWNED material via
+    // `build_restored_owned` (which touches no provider map) and RETURNS it for
+    // the caller to seed (`import_context`) or drop (`PrepareForReplace`,
+    // terminal). There is no stale provider-resident crypto to tear down first —
+    // by construction no provider residency can exist.
 
     // Build the restored transient crypto as OWNED material (MLS group +
     // sender-key MATERIAL) and recover the Class-M floors the snapshot carried —
@@ -1991,12 +1998,13 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // rejection to `ContextError::CryptoFailed`.
     //
     // Rollback: on rejection the just-built `owned` material is dropped at the `?`
-    // return (its `ScpMlsGroup` / `SenderKey` zeroize on drop) so no
-    // floor-regressed / half-restored state persists (BUG-1 atomicity). The
-    // registry itself is left UNCHANGED (validate-before-apply, across both axes).
-    // The `taken_context_ids` marker set by `build_restored_owned` is intentionally
-    // LEFT in place (fail-closed — a rejected restore must NOT resurrect a
-    // divergent second group for this id).
+    // return (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
+    // zeroized - #82) so no floor-regressed / half-restored state persists (BUG-1
+    // atomicity). The registry itself is left UNCHANGED (validate-before-apply,
+    // across both axes). Fail-closed by construction: a rejected restore is never
+    // seeded onto an actor and writes no durable snapshot, so it cannot resurrect a
+    // divergent second group for this id (there is no provider `taken_context_ids`
+    // marker; #2148 deleted it, and `build_restored_owned` sets none).
     deps.supervisor
         .validate_and_merge_all_floors(
             ctx_id_bytes,
@@ -2323,7 +2331,8 @@ pub async fn import_context(
     // `context_params` field against the MLS group embedded in `mls_crypto_state`;
     // this closes that gap. A group with no `0xFF02` (not an SCP context) or any
     // rule 2-6 mismatch is rejected as a forged/corrupt import; the owned material
-    // is dropped (zeroizes) so no forged crypto is ever seeded (mirrors the
+    // is dropped (the `SenderKey` zeroizes; the group / signer is freed, not
+    // zeroized - #82) so no forged crypto is ever seeded (mirrors the
     // restore path's own rejection and the Welcome-join pre-install rejection). A
     // keyless (needs-reconnect) snapshot has `None` owned material and no group to
     // bind, so it is skipped — its group arrives later via a reconnect Welcome,
@@ -2340,11 +2349,13 @@ pub async fn import_context(
             "context import",
         )
     {
-        // On rejection the `imported_owned` material is dropped here (its
-        // `ScpMlsGroup` / `SenderKey` zeroize on drop) so no forged crypto is
-        // seeded; the `taken_context_ids` marker stays (fail-closed). Read the
-        // extension from the OWNED group (ADR-049 PR-7 C3 — no longer
-        // provider-resident).
+        // On rejection the `imported_owned` material is dropped here (the
+        // `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not zeroized -
+        // #82) so no forged crypto is seeded; fail-closed by construction - the
+        // rejected crypto is never seeded onto the actor and no durable snapshot is
+        // written (there is no longer a provider `taken_context_ids` marker; #2148
+        // deleted it). Read the extension from the OWNED group (ADR-049 PR-7 C3 - no
+        // longer provider-resident).
         return Err(ContextError::ImportRejected { reason });
     }
 
@@ -2703,9 +2714,11 @@ pub async fn import_context(
     // 6b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 import seed: SEED the OWNED crypto
     //     material rebuilt + floor-gated + binding-verified above directly onto
     //     the imported actor state before spawn — no provider round-trip, no
-    //     `take_crypto_state` (`build_restored_owned` already recorded
-    //     `taken_context_ids`, the CM-006 double-owner guard, without touching the
-    //     provider `contexts` map). A keyless / needs-reconnect snapshot yielded
+    //     `take_crypto_state` (`build_restored_owned` hands the crypto out as
+    //     OWNED material and touches no provider map; the double-birth guard is the
+    //     supervisor registry's atomic first-writer-wins insert, not a provider
+    //     `taken_context_ids` marker - #2148 deleted that map). A keyless /
+    //     needs-reconnect snapshot yielded
     //     `None` — nothing to seed; the actor keeps its default-empty encrypted
     //     mode until a reconnect Welcome arrives. (Import is encrypted-only — a
     //     broadcast export is rejected at the top of this function.)
@@ -2984,36 +2997,20 @@ pub async fn restore_context(
     let (grace_store, needs_reconnect) =
         restore_grace_store_from_snapshot(context_id, &ctx_snapshot);
 
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2 restore/respawn/cold-restart seam:
+    // #2148 (ADR-049 birth-into-actor) restore/respawn/cold-restart seam:
     // rehydrate the per-context MLS crypto as OWNED material and SEED it directly
     // onto the actor's `PerContextState` below (`build_restored_owned` → merge
-    // floors → `seed_encrypted_crypto_from_owned`), instead of installing it into
-    // the provider's `contexts` map. This is the RESPAWN
+    // floors → `seed_encrypted_crypto_from_owned`). This is the RESPAWN
     // (`Supervisor::respawn_from_snapshot`) AND COLD-RESTART
     // (`restore_all_contexts`) path — both reach here through `restore_context`.
-    // `build_restored_owned` records the id in `taken_context_ids` (H2/CM-006
-    // double-owner guard — a subsequent provider birth/take for this id now fails
-    // closed) and restores the node-level wrapping keypair as a `&self` side
-    // effect (OBS-2 — NOT side-effect-free), WITHOUT inserting into `contexts`.
-    // NO re-take on a warm respawn: the id may already be in `taken_context_ids`
-    // (the crashed actor took it), and the marker insert is idempotent.
-    //
-    // C3 ripple (deferred): the UNTRUSTED-import path (`import_context` /
-    // `PrepareForReplace`) still restores through the provider-insert
-    // `restore_crypto_state_with_floor_guard`; those callers flip to owned-seed
-    // in C3.
+    // `build_restored_owned` restores the node-level wrapping keypair as a `&self`
+    // side effect (OBS-2 — NOT side-effect-free) but touches NO provider
+    // per-context state (the provider holds none — its `contexts` map is DELETED).
+    // The actor is the SOLE crypto authority by construction; there is no
+    // provider-resident second home to tear down first.
     let mut restored_owned: Option<crate::crypto::mls::provider::OwnedMlsCryptoState> = None;
     if !ctx_snapshot.mls_crypto_state.is_empty() {
         let ctx_id_bytes = context_id_to_bytes(context_id);
-        // Tear down any stale provider-resident crypto for this id before
-        // building the owned material. In the owned-seed model the actor is the
-        // SOLE crypto authority; a lingering provider `contexts` entry would be a
-        // second home (`with_context` reads `contexts` before consulting
-        // `taken_context_ids`). The AUTHORITATIVE Class-M floors live in the
-        // Supervisor-owned registry (never torn down by a provider teardown), so
-        // this does not touch the merge target below.
-        let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
-        let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
 
         // §23.17 Invariant 2 (trusted-local self-respawn / process-restart):
         // reconstruct the per-context MLS crypto MATERIAL + the Class-M floors the
@@ -3044,10 +3041,11 @@ pub async fn restore_context(
         // routes the cold-restart (empty-registry) floors through the SAME sink,
         // closing the D2 replay window on first boot. FAIL-CLOSED via
         // `.map_err(..)?`. On rejection the just-built `owned` material is dropped
-        // here (its `ScpMlsGroup` / `SenderKey` zeroize on drop); the
-        // `taken_context_ids` marker set by `build_restored_owned` is intentionally
-        // LEFT in place (fail-closed — a rejected restore is torn down as
-        // unrecoverable and the id must NOT resurrect a divergent second group).
+        // here (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
+        // zeroized - #82); fail-closed by construction - a rejected restore is never
+        // seeded and writes no durable snapshot, so the id cannot resurrect a
+        // divergent second group. #2148 deleted the provider `taken_context_ids`
+        // marker this comment referenced, and `build_restored_owned` sets none.
         deps.supervisor
             .validate_and_merge_all_floors(
                 &ctx_id_bytes,
@@ -3068,9 +3066,10 @@ pub async fn restore_context(
         // holds on load: a restored group that is not a `0xFF02`-carrying SCP
         // context, or whose committed params diverge, is a corrupt snapshot and
         // is rejected. Read the extension from the OWNED group (it is no longer
-        // provider-resident). On rejection the `owned` material is dropped
-        // (zeroizes) and the taken marker stays (fail-closed) so no divergent
-        // crypto is ever seeded.
+        // provider-resident). On rejection the `owned` material is dropped (the
+        // `SenderKey` zeroizes; the group / signer is freed, not zeroized - #82);
+        // fail-closed by construction - the rejected crypto is never seeded, so no
+        // divergent crypto persists (no provider taken-marker exists post-#2148).
         if let Err(reason) = verify_scp_context_binding(
             owned
                 .mls_group
@@ -3938,7 +3937,7 @@ mod restore_reconcile_tests {
     }
 
     fn build_supervisor(persistence: Box<dyn ContextPersistence>) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkRestoreReconcile".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -4254,7 +4253,7 @@ mod restore_reconcile_tests {
 
         // Real MLS crypto provider so `add_member` succeeds, plus a key_resolver
         // that resolves the joiner's verifying key for the spending-UCAN sig.
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkJoinMoneyOrder".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -4296,10 +4295,9 @@ mod restore_reconcile_tests {
         let context_id = "ctx-paid-join-money-order".to_owned();
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
 
-        // Create the MLS group so the joiner's `add_member` can succeed.
-        deps.crypto
-            .create_mls_group(&context_id_bytes)
-            .expect("create_mls_group");
+        // #2148 (ADR-049 birth-into-actor): no MLS group is birthed — this join
+        // is rejected at the economics auto-accept guard (SCP-ECON-12030) BEFORE
+        // any crypto `add_member` runs, so no group is needed.
 
         // Build per-context state with a per_join cost so a spending UCAN is
         // required and the escrow path runs.
@@ -4467,7 +4465,7 @@ mod restore_reconcile_tests {
     /// (and its former rollback-on-append-failure) is gone.
     #[tokio::test]
     async fn finalize_send_succeeds_without_durable_message_sent_append() {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkFinalizeSendSeq".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -4633,7 +4631,7 @@ mod restore_reconcile_tests {
     async fn complete_paid_action_buffers_receipt_and_mints_no_durable_leaf() {
         use scp_protocol::context::membership::ContextEvent;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkPayConverge".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

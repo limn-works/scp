@@ -1,29 +1,41 @@
-//! Shared two-party joined-pair bootstrap for provider-level unit tests.
+//! Shared two-party joined-pair bootstrap for actor-level crypto unit tests.
 //!
 //! [`stand_up_two_party`] stands up Alice (creator) and Bob (joiner) over the
 //! REAL end-to-end join path — Bob reserves a `KeyPackage` from his own
-//! `KeyPackageStoreActor`, Alice adds that KP and emits a Welcome, and Bob
-//! confirms the join at the PROVIDER level (the real fused `ConfirmConsume` join
-//! → the joined `ScpMlsGroup`) and installs it via `install_joined_group`. It
-//! deliberately does NOT drive the full [`Supervisor::spawn_actor_from_welcome`]
-//! entrypoint, which moves the joiner's crypto ONE-WAY into a spawned actor
-//! (ADR-049 PR-7 C2) — this fixture must return providers that still OWN their
-//! per-context crypto so consumers can `take_crypto_state` each onto an actor.
+//! `KeyPackageStoreActor`, Alice adds that KP on her OWNED actor state and emits
+//! a Welcome, and Bob confirms the join at the PROVIDER level (the real fused
+//! `ConfirmConsume` join → the joined `ScpMlsGroup`). It deliberately does NOT
+//! drive the full [`Supervisor::spawn_actor_from_welcome`] entrypoint — this
+//! fixture births the pair directly onto actor-owned state so consumers receive
+//! ready-to-seal [`PerContextState`]s, not providers to move.
 //!
-//! Alice is a BARE `MlsCryptoProvider` that hand-seals the bundle (no creator
-//! `Supervisor` needed); Bob is driven through a real joiner `Supervisor`. After
-//! the join, Bob PULLS Alice's sender key via the §9.16.2 request/response
-//! protocol (the provider PUSH drain is deleted post-ADR-049 PR-7) so Bob can
-//! decrypt Alice's application sends — the exact behaviour the H9
-//! receive-ceiling fixtures and the app-data / agent-binding pipeline fixtures
-//! depend on.
+//! ADR-049 #2148 (birth-into-actor) slice 2: the pair is born DIRECTLY onto
+//! actor-owned [`PerContextState`] via the owned-return MLS constructors
+//! ([`NodeMlsFactory::create_mls_group_with_context`] /
+//! [`NodeMlsFactory::install_joined_group`]) plus the production
+//! [`PerContextState::seed_encrypted_crypto_from_owned`] seed primitive — never
+//! through a provider-resident insert + `take_crypto_state` round-trip. The
+//! returned providers are kept ONLY as the node-resident source of each party's
+//! X25519 wrapping keypair (`wrapping_keypair_snapshot`); they never own the
+//! per-context crypto.
+//!
+//! Alice creates the honest SCP context group (`0xFF02`) on her owned state and
+//! adds Bob's reserved KP through the actor-native
+//! [`PerContextState::add_member`]; Bob is driven through a real joiner
+//! `Supervisor`. After the join, Bob PULLS Alice's sender key via the §9.16.2
+//! request/response protocol answered through the ACTOR-native
+//! [`ContextCryptoState::handle_sender_key_request`] (which emits the wrapped
+//! `SenderKeyDistributionMessage::KeyResponse` envelope), so Bob can decrypt
+//! Alice's application sends — the exact behaviour the H9 receive-ceiling
+//! fixtures and the app-data / agent-binding pipeline fixtures depend on.
 //!
 //! The helper is SYNC (its callers are sync `#[test]` functions) and drives the
-//! async join on an internal current-thread runtime. After the join the joiner's
-//! MLS group lives in Bob's provider (`install_joined_group`), so each returned
-//! `Arc<MlsCryptoProvider>` still owns its per-context crypto material and can be
-//! destructively `take_crypto_state`'d onto the actor seam (where the deleted
-//! steady-state twins now live) even after the `Supervisor` and runtime drop.
+//! async join on an internal current-thread runtime. It returns a
+//! [`TwoPartyPair`] (named fields `alice_provider` / `alice_state` /
+//! `bob_provider` / `bob_state` / `ctx_bytes`): each [`PerContextState`] already
+//! OWNS its per-context crypto (seeded from the owned constructor), and each
+//! `Arc<NodeMlsFactory>` is retained solely for its node-resident wrapping
+//! keypair.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // `spawn_actor_from_welcome` returns a deliberately large state-building future;
@@ -34,6 +46,7 @@
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
+use scp_clock::Clock as _;
 use scp_did::DID;
 use scp_platform::KeyCustody;
 use scp_platform::in_memory::InMemoryStorage;
@@ -41,9 +54,12 @@ use scp_platform::testing::InMemoryKeyCustody;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling};
 use scp_protocol::context::{ContextMode, ContextParams, ScpContextExtension};
+use scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage;
 use zeroize::Zeroizing;
 
-use super::provider::MlsCryptoProvider;
+use crate::context::actor::{ContextCryptoState, ContextModeState, PerContextState};
+
+use super::provider::NodeMlsFactory;
 use super::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
@@ -152,8 +168,8 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 pub fn bob_supervisor(
     bob_did: &str,
     resolver: KeyResolver,
-) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(
+) -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
+    let crypto = Arc::new(NodeMlsFactory::new(
         bob_did.to_owned(),
         Arc::new(scp_clock::SystemClock),
     ));
@@ -173,12 +189,43 @@ pub fn bob_supervisor(
     (sup, crypto)
 }
 
+/// Borrows the Encrypted-mode [`ContextCryptoState`] out of an actor
+/// [`PerContextState`] (panics on Broadcast) — the seam the actor-native
+/// answer half [`ContextCryptoState::handle_sender_key_request`] runs on.
+fn encrypted_crypto_mut(state: &mut PerContextState) -> &mut ContextCryptoState {
+    match &mut state.mode {
+        ContextModeState::Encrypted(crypto) => crypto,
+        ContextModeState::Broadcast(_) => panic!("expected encrypted mode"),
+    }
+}
+
+/// Result of [`stand_up_two_party`]: a fully-joined Alice(creator)/Bob(joiner)
+/// pair, each party's per-context crypto born onto its OWN actor-owned
+/// [`PerContextState`], plus the shared 32-byte context id (#2148 F12 —
+/// replaces the former positional 5-tuple return).
+pub struct TwoPartyPair {
+    /// Alice's provider, retained solely for its node-resident wrapping keypair.
+    pub alice_provider: Arc<NodeMlsFactory>,
+    /// Alice's actor state (OWNS her group + sender key).
+    pub alice_state: PerContextState,
+    /// Bob's provider, retained solely for its node-resident wrapping keypair.
+    pub bob_provider: Arc<NodeMlsFactory>,
+    /// Bob's actor state (OWNS his group + Alice's pulled sender key at epoch 1).
+    pub bob_state: PerContextState,
+    /// The shared context id, `context_id_bytes(ctx_str)`.
+    pub ctx_bytes: [u8; 32],
+}
+
 /// Stands up a two-party joined pair (Alice creator, Bob joiner) over the REAL
-/// reserve → creator-add → `ConfirmConsume` → `install_joined_group` path, then
-/// has Bob PULL Alice's sender key via the §9.16.2 request/response protocol
-/// (Bob's sender-key high-water for Alice becomes epoch 1). Returns
-/// `(alice, bob, ctx_bytes)` where both providers still OWN the per-context
-/// crypto for the group keyed by `context_id_bytes(ctx_str)`.
+/// reserve → creator-add → `ConfirmConsume` join path, born DIRECTLY onto
+/// actor-owned [`PerContextState`] via the owned-return constructors + the
+/// production `seed_encrypted_crypto_from_owned` primitive, then has Bob PULL
+/// Alice's sender key via the §9.16.2 request/response protocol answered through
+/// the ACTOR-native [`ContextCryptoState::handle_sender_key_request`] (Bob's
+/// installed sender-key for Alice becomes epoch 1). Returns a [`TwoPartyPair`]
+/// where each [`PerContextState`] OWNS the per-context crypto for the group
+/// keyed by `context_id_bytes(ctx_str)` and each provider is retained solely for
+/// its node-resident wrapping keypair.
 ///
 /// # Panics
 ///
@@ -188,11 +235,11 @@ pub fn bob_supervisor(
 // gate already caps the effective visibility to the crate, and `clippy::
 // redundant_pub_crate` (nursery) rejects a redundant `pub(crate)` under an
 // already-crate-scoped module.
-pub fn stand_up_two_party(
-    ctx_str: &str,
-    alice_did: &str,
-    bob_did: &str,
-) -> (Arc<MlsCryptoProvider>, Arc<MlsCryptoProvider>, [u8; 32]) {
+// One cohesive bootstrap flow (reserve → owned-birth alice → actor add_member →
+// confirm-join → owned-birth bob → §9.16.2 pull) driven end to end; splitting it
+// would obscure the linear join narrative, so allow the length.
+#[allow(clippy::too_many_lines)]
+pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoPartyPair {
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_str);
 
     tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only two-party fixture drives async MLS provider calls from sync #[test] callers; not a production async bridge
@@ -200,16 +247,19 @@ pub fn stand_up_two_party(
         .build()
         .unwrap()
         .block_on(async move {
+            let clock = scp_clock::SystemClock;
             let bob = DID::from(bob_did);
 
-            // Bob's joiner supervisor + a clone of his provider (holds the group
-            // after the join and after the supervisor is dropped).
+            // Bob's joiner supervisor + a clone of his provider. The provider is
+            // retained ONLY as the node-resident source of Bob's X25519 wrapping
+            // keypair (`wrapping_keypair_snapshot`); the joined crypto is born onto
+            // Bob's actor state below, never installed into the provider.
             let (bob_sup, bob_crypto) = bob_supervisor(bob_did, pair_resolver(alice_did, bob_did));
 
             // Publish Bob's OWN provider wrapping keypair BEFORE the KeyPackage
             // store spawns, so the pooled KP's `0xFF01` wrapping-leaf pubkey and
             // the secret `bob_crypto` opens distributed sender keys with stay the
-            // SAME keypair across the reserve → spawn-from-Welcome migration
+            // SAME keypair across the reserve → join migration
             // (`wrapping_keypair_snapshot`). This makes Alice's sender-key
             // distribution — a real X25519 DH to that wrapping key — decryptable by
             // Bob. The KP also declares `0xFF02` (`scp_context_params`)
@@ -228,23 +278,33 @@ pub fn stand_up_two_party(
                 .await
                 .expect("bob reserves a real KeyPackage from his own store");
 
-            // Alice (bare creator provider) creates the honest SCP context group
-            // (committing her DID + params into `0xFF02`), mints her sender key,
-            // and adds Bob's reserved KP — producing the real Welcome.
+            // Alice (bare creator provider) BIRTHS the honest SCP context group
+            // (committing her DID + params into `0xFF02`) DIRECTLY onto owned
+            // actor state via `create_mls_group_with_context` + the
+            // production seed primitive — no provider-resident insert. The owned
+            // constructor mints her sender key (epoch 1).
             let params = joiner_params();
-            let alice_crypto = Arc::new(MlsCryptoProvider::new(
+            let alice_crypto = Arc::new(NodeMlsFactory::new(
                 alice_did.to_owned(),
                 Arc::new(scp_clock::SystemClock),
             ));
-            alice_crypto
-                .create_mls_group_with_context(&ctx_bytes, &honest_ext(ctx_str, alice_did, &params))
-                .expect("alice creates the SCP context group (0xFF02)");
-            alice_crypto
-                .generate_sender_key(&ctx_bytes)
-                .expect("alice mints her sender key");
-            let add_output = alice_crypto
-                .add_member(&ctx_bytes, bob_did, Some(&kp_public_bytes))
-                .expect("alice adds bob's reserved key package");
+            let alice_owned = alice_crypto
+                .create_mls_group_with_context(&honest_ext(ctx_str, alice_did, &params))
+                .expect("alice births the owned SCP context group (0xFF02)");
+            let mut alice_state = PerContextState::new_for_test_encrypted(
+                ctx_bytes,
+                0,
+                DID::from(alice_did.to_owned()),
+            );
+            alice_state.seed_encrypted_crypto_from_owned(alice_owned);
+
+            // Alice adds Bob's reserved KP through the ACTOR-native `add_member`
+            // on her OWNED group — producing the real Welcome and advancing her
+            // local tree to include Bob (so the §9.16.2 H1 membership gate below
+            // sees Bob as a current member).
+            let add_output = alice_state
+                .add_member(bob_did, Some(&kp_public_bytes), &clock)
+                .expect("alice adds bob's reserved key package on her owned group");
 
             // Bob's #active custody holds the SAME seed the resolver returns for
             // `bob_did` — used below to sign Bob's §9.16.2 sender-key pull request.
@@ -255,13 +315,12 @@ pub fn stand_up_two_party(
                 .expect("import bob's #active seed into custody");
 
             // Bob confirms the join at the PROVIDER level (the real fused
-            // `ConfirmConsume` join → the joined `ScpMlsGroup`) and installs it
-            // into his provider via `install_joined_group`, KEEPING the crypto
-            // provider-resident. The full `spawn_actor_from_welcome` entrypoint
-            // moves the crypto ONE-WAY into a spawned actor (ADR-049 PR-7 C2),
-            // which would leave `bob_crypto` empty; this fixture must return
-            // providers that still OWN their per-context crypto so consumers'
-            // `take_crypto_state` seam can move each into an actor exactly once.
+            // `ConfirmConsume` join → the joined `ScpMlsGroup`), then BIRTHS the
+            // joined crypto DIRECTLY onto owned actor state via
+            // `install_joined_group` + the production seed primitive — no
+            // provider-resident insert, no `take_crypto_state` round-trip. The
+            // owned constructor mints Bob's own sender key (epoch 1) locally
+            // (§9.16.1 — the Welcome carries no sender key).
             let bob_deps = bob_sup
                 .build_actor_deps(&bob)
                 .await
@@ -275,56 +334,53 @@ pub fn stand_up_two_party(
                 })
                 .await
                 .expect("bob confirms the join and receives the joined MLS group");
-            bob_crypto
-                .install_joined_group(&ctx_bytes, joined_group)
-                .expect("install bob's joined group into his provider");
-
-            // Bob mints his own sender key (the install already seeded one; this
-            // rotates it to a fresh value, matching the old fixture), then Bob
-            // acquires Alice's sender key so he can decrypt her application sends.
-            bob_crypto
-                .generate_sender_key(&ctx_bytes)
-                .expect("bob mints his sender key");
+            let bob_owned = bob_crypto.install_joined_group(joined_group);
+            let mut bob_state = PerContextState::new_for_test_encrypted(
+                ctx_bytes,
+                0,
+                DID::from(bob_did.to_owned()),
+            );
+            bob_state.seed_encrypted_crypto_from_owned(bob_owned);
 
             // Bob PULLS Alice's sender key via the §9.16.2 request/response
-            // protocol. Post-ADR-049 PR-7 the provider PUSH `drain_pending_
-            // sender_key_messages` twin is DELETED; the pull path uses only the
-            // retained receive-side provider methods (`handle_sender_key_request`
-            // / `store_member_sender_key` / `set_sender_key_unchecked`) and keeps
-            // BOTH parties as providers so the golden `take_into_actor` seam can
-            // destructively move each into an actor exactly once.
+            // protocol, answered through the ACTOR-native
+            // `ContextCryptoState::handle_sender_key_request` on Alice's seeded
+            // state (H1 membership gate reads Alice's MLS group tree). The answer
+            // is the wrapped `SenderKeyDistributionMessage::KeyResponse` envelope
+            // (the actor wire shape), which Bob decodes, opens via his ephemeral
+            // wrapping key in custody, and installs on his actor state through the
+            // actor-native `set_sender_key_unchecked` seam.
             let request = crate::crypto::sender_keys::key_protocol::request_sender_key(
                 &bob_custody,
                 &bob_handle,
                 bob_did,
                 alice_did,
                 0, // bob's initial sender-key epoch (not validated by the responder)
-                &scp_clock::SystemClock,
+                &clock,
             )
             .await
             .expect("bob builds a signed sender-key request for alice's key");
             let blocked = std::collections::HashSet::new();
-            let response_bytes = alice_crypto
+            let response_bytes = encrypted_crypto_mut(&mut alice_state)
                 .handle_sender_key_request(
                     &ctx_bytes,
+                    alice_did,
+                    clock.now_secs(),
                     &request.request_message,
                     bob_signing_key().verifying_key().as_bytes(),
                     &blocked,
                 )
                 .expect("alice accepts bob's sender-key request (H1 membership gate)")
                 .expect("alice returns a response for a non-blocked member");
-            // Decoded as a BARE `SenderKeyResponse` (NOT the tagged
-            // `SenderKeyDistributionMessage` envelope) by design: this fixture
-            // answers via the test-only PROVIDER copy
-            // `MlsCryptoProvider::handle_sender_key_request`, which serializes a
-            // bare `SenderKeyResponse` (`to_vec_named`) and — per its own doc —
-            // carries NO framing obligation to the actor's
-            // `SenderKeyDistributionMessage` wire shape. So `from_bytes` would find
-            // no `msg_type` tag; the bare decode is the correct match here. (The
-            // actor-path fixture in `spawn_from_welcome_tests.rs` decodes the
-            // wrapped envelope instead.)
-            let response: scp_protocol::crypto::sender_keys::SenderKeyResponse =
-                rmp_serde::from_slice(&response_bytes).expect("decode alice's SenderKeyResponse");
+            // Decode the WRAPPED `SenderKeyDistributionMessage::KeyResponse`
+            // envelope the actor answer half emits (`to_bytes`), then extract the
+            // inner `SenderKeyResponse` to open via Bob's ephemeral wrapping key.
+            let response = match SenderKeyDistributionMessage::from_bytes(&response_bytes)
+                .expect("decode alice's SenderKeyDistributionMessage envelope")
+            {
+                SenderKeyDistributionMessage::KeyResponse(response) => response,
+                other => panic!("expected a KeyResponse envelope, got {other:?}"),
+            };
             let ctx_id_hex = hex::encode(ctx_bytes);
             let alice_key = crate::crypto::sender_keys::key_protocol::open_sender_key_response(
                 &bob_custody,
@@ -334,17 +390,18 @@ pub fn stand_up_two_party(
             )
             .await
             .expect("bob opens alice's HPKE-sealed sender key");
-            // ADR-049 PR-6: store returns the authenticated (key, epoch); install
-            // is a separate explicit `set_sender_key_unchecked`.
-            let (alice_key, _epoch) = bob_crypto
-                .store_member_sender_key(&ctx_bytes, alice_did, alice_key, response.epoch)
-                .expect("bob verifies + returns alice's pulled sender key");
-            bob_crypto.set_sender_key_unchecked(&ctx_bytes, alice_did, alice_key);
+            bob_state.set_sender_key_unchecked(alice_did, alice_key);
 
-            // Drop the joiner supervisor; the installed group persists in
-            // `bob_crypto` (a separate `Arc` clone of the same provider).
+            // Drop the joiner supervisor; each party's crypto lives on its owned
+            // actor state, independent of the supervisor and runtime.
             drop(bob_sup);
 
-            (alice_crypto, bob_crypto, ctx_bytes)
+            TwoPartyPair {
+                alice_provider: alice_crypto,
+                alice_state,
+                bob_provider: bob_crypto,
+                bob_state,
+                ctx_bytes,
+            }
         })
 }

@@ -36,6 +36,7 @@ import type {
   TransportStatus,
   UcanToken,
 } from "../types";
+import { assertTestEnvironment } from "./test-guard";
 
 // ---------------------------------------------------------------------------
 // Shared CapabilityValidation projection
@@ -587,7 +588,7 @@ export interface Bridge {
     issuerPublicKeyHex: string,
   ): Promise<boolean>;
 
-  // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+  // Recovery and custody migration (spec §9.12, §3.2.1)
   identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;
   identityExecuteCustodyMigration(
     did: string,
@@ -709,7 +710,7 @@ export interface Bridge {
    * Awaits in-flight tasks up to `timeoutMillis` milliseconds, aborts any
    * remaining tasks when the deadline expires, clears registries,
    * disconnects transport, and runs shutdown hooks. The unit is
-   * milliseconds after the #1549 Phase 4 unit unification — pass `1000`
+   * milliseconds (Phase 4 unit unification) — pass `1000`
    * for a 1-second deadline, not `1`.
    *
    * Returns a `Promise<void>` — **callers must `await` it**. Previously
@@ -740,7 +741,7 @@ export interface BridgeIdentityHandle {
    * JSON-serialized `scp_did::DidRotationEvent`, present only on
    * handles produced by `identityMigrate` (spec §9.12, ADR-003 §4b/4c).
    * SDK callers MUST distribute this event to active context members
-   * per spec §3.2.1 step 4b. `undefined` for any handle minted by
+   * per spec §9.12 (Identity Key migration). `undefined` for any handle minted by
    * other operations (`identityCreate`, `identityRotateKey`, agent-key
    * ops, external load) — those do not change the DID, so no
    * `DidRotationEvent` is constructed.
@@ -920,4 +921,28 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
     _nativeBridgeForScp.set(scp, bridge);
   }
   return bridge;
+}
+
+/**
+ * **Test-only.** Injects a pre-built `Bridge` into the per-instance WeakMap
+ * so that `getBridge(scp)` returns it without loading any platform addon.
+ *
+ * Guarded by a positive test-environment check: throws unless `NODE_ENV` is
+ * `"test"` or `"development"`, or `BUN_TEST` is set (which `bun:test` sets
+ * automatically). The primary security boundary is the production bundle:
+ * tsup dead-code-eliminates this helper entirely from `dist/` (it is not
+ * re-exported from `src/index.ts`), and the `package.json` `exports` map
+ * prevents deep imports of `internal/bridge`. The env guard is defence-in-depth
+ * for non-bundled / dev-server usage.
+ *
+ * Intended use: construct a mock `Bridge` with spy stubs for specific
+ * operations (e.g. `bridgeEvaluateTrust`), then call
+ * `__setBridgeForTests(scp, mockBridge)` before invoking module-level helpers
+ * (`evaluateTrust`, `bridgeCreateShadow`, …) under test.
+ *
+ * @internal Phase 4 PR 4 — used by `identity-lifecycle.test.ts` routing tests.
+ */
+export function __setBridgeForTests(scp: SCP, bridge: Bridge): void {
+  assertTestEnvironment("__setBridgeForTests");
+  _nativeBridgeForScp.set(scp, bridge);
 }

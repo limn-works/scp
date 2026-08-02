@@ -113,7 +113,19 @@ BAN_ENTRIES=(
     "MutationStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
     "QueryStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
     "RwLock<ContextInner>|crates/scp-runtime|*.rs|ADR-049 §Decision 12: ContextHandle's read-path RwLock<ContextInner> was replaced by lock-free Arc<ArcSwap<ContextState>>; the RwLock<ContextInner> shape must not reappear"
-    "pending_joins|crates/scp-runtime/src/crypto|*.rs|ADR-049 2F-residual deleted the legacy single-slot Welcome-join primitive (prepare_key_package_for_join + MlsCryptoProvider::join_from_welcome); joins flow through the KeyPackageStoreActor reserve/confirm protocol"
+    "pending_joins|crates/scp-runtime/src/crypto|*.rs|ADR-049 2F-residual deleted the legacy single-slot Welcome-join primitive (prepare_key_package_for_join + NodeMlsFactory::join_from_welcome); joins flow through the KeyPackageStoreActor reserve/confirm protocol"
+    # #2148 (birth-into-actor): the six provider-dissolution symbols
+    # (take_crypto_state / with_context / create_group_into_slot method defs, and
+    # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned
+    # here. They are enforced, soundly and non-redundantly, by the typed
+    # provider-scoped structural test
+    # `pipeline_wiring.rs::provider_steady_state_crypto_methods_are_deleted`
+    # (definition-shaped `fn NAME(` + `name: Type` field-absence over PROVIDER_SRC)
+    # PLUS the compiler (a call to a deleted method fails to compile). A second
+    # source-text scanner for the same deletion is negative value (root CLAUDE.md
+    # non-convergent-enforcement), and a `\.with_context\(` token additionally
+    # false-positives on anyhow's ubiquitous `.with_context()` — a landmine. See
+    # #2148 F5.
 )
 
 # ---------------------------------------------------------------------------

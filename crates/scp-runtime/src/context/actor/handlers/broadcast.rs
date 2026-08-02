@@ -767,7 +767,7 @@ mod tests {
                 }
             });
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:example:broadcast-actor".to_owned(),
             Arc::new(scp_clock::SystemClock),
         ));

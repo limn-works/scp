@@ -10,11 +10,16 @@ All SDKs implement the same error hierarchy. Language-specific idioms (exception
 ScpError (root)
 ├── IdentityError        — DID creation, resolution, key rotation failures
 ├── ContextError         — Context lifecycle (create, join, leave, close) failures
-├── PermissionError      — UCAN capability validation failures (Python: `UcanPermissionError` to avoid shadowing `builtins.PermissionError`)
+├── UcanPermissionError  — UCAN capability validation failures (avoids shadowing `builtins.PermissionError` in Python and the global `PermissionError` in TypeScript)
 ├── CryptoError          — Encryption, decryption, signature failures
 ├── TransportError       — Network, relay, connection failures
 ├── OutletError          — Outlet registration, invocation, verification failures
-└── ValidationError      — Input validation, schema, parameter failures
+├── ValidationError      — Input validation, schema, parameter failures
+├── StorageError         — Persistent-storage operation failures (SCP-STORAGE range)
+├── AttestationError     — Device and identity attestation failures (SCP-ATTEST range)
+├── McpError             — MCP protocol and tool-invocation failures (SCP-MCP range)
+├── GovernanceError      — Context governance proposal and voting failures (SCP-GOV range)
+└── EconomyError         — Payment, budget, and economic-policy failures (SCP-ECON range)
 ```
 
 ### Error requirements
@@ -116,6 +121,84 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13066` | supervisor | `Busy` terminal — participant context set overlaps an in-flight saga (per-participant-context-set gating, §5.15.4) |
 | `SCP-SAGA-13067` | supervisor | Generic saga terminal abort with no specific sub-code (e.g. Prepare-phase 30s timeout, journal I/O failure) — the message string carries the specific cause |
 | `SCP-SAGA-13068` | supervisor | `ParticipantUnavailable` — Prepare-phase abort: participant actor unavailable to complete the Prepare exchange — inbox closed/terminated (transient, retryable) |
+
+### Registered SCP-CTX- / SCP-CRYPTO- / SCP-TRANS- / SCP-VALID- codes (native registry vs. browser participant)
+
+The native FFI-common registry (`crates/scp-ffi/common/src/error_codes.rs`) is
+the Rust materialization of the per-number meanings for the **native** bridges
+(`PyO3`, napi-rs, `UniFFI`). The browser participant surface
+(`crates/scp-client-wasm/src/error.rs`, plus the `@limn-works/scp-ts-wasm` SDK
+wrapper) **cannot** import that registry — the ADR-057 wasm/tokio fence keeps
+`scp-client-wasm` off `scp_ffi_common` — so it hand-writes its
+`[SCP-{CATEGORY}-{NUMBER}]` literals, which MUST agree with this ledger.
+
+**Scope of the guarantee (be precise — #2144).** Error codes are emitted from
+FIVE surfaces: the native registry, the Swift SDK (`bindings/swift/**`), the
+Kotlin SDK (`bindings/kotlin/**`), the ts-native SDK (`bindings/typescript/src/**`),
+and this ts-wasm surface. `scripts/check-error-codes.sh` machine-checks band
+ranges and native-registry uniqueness, but its Phase-2 cross-surface collision
+detector has a documented KNOWN LIMITATION: it does **not** inspect the
+SDK-wrapper literals (Swift/Kotlin/TS/Python), which "must be reviewed manually
+against error_codes.rs to prevent collisions." A **full cross-surface
+`SCP-<band>-<n>` union** was computed by hand across all five surfaces, and every
+**browser-owned** code registered below was assigned a number **absent from that
+union** — i.e. cross-surface-unique as of this change. The ONE deliberate
+exception is `SCP-CTX-2095`, whose meaning (pseudonym-registry-empty) is
+identical on native + Swift + Kotlin + ts-native + this surface.
+
+This is NOT a claim that *every* SCP code has one meaning across all surfaces:
+pre-existing cross-language overlaps predate and are out of scope for #2144 (e.g.
+`SCP-VALID-7010`/`7011`/`7012` mean UCAN-validation in the native registry but
+are reused by the Swift/ts-native SDKs for their own validation conditions, and
+`SCP-CTX-2003` is overloaded — see below). #2144 fixes only the browser
+participant's own allocations so they stop colliding; the broader cross-language
+reconciliation — auditing the full cross-surface namespace and strengthening the
+compliance mechanism (`check-error-codes.sh` Phase-2 does not machine-check
+SDK-wrapper or match-arm literals; see its documented KNOWN LIMITATION) — is
+tracked in discussion #2208, not addressed here.
+
+This table documents the allocation; it is not a new enforcement mechanism. The
+scp-client-wasm mapping is additionally guarded by an exhaustive positive
+allowlist test in `crates/scp-client-wasm/src/error.rs` (which also pins the
+`lib.rs` direct-emitter literals via the shared `WASM_INPUT_VALIDATION_CODE`
+constant).
+
+| Code | Owner | Condition |
+|------|-------|-----------|
+| `SCP-CTX-2001` | native FFI-common registry (also Swift/Kotlin/ts-native SDKs) | Context operation failed (generic) — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2002` | native FFI-common registry | Context not found — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2003` | native FFI-common registry — **cross-surface OVERLOADED (pre-existing, out of #2144 scope)** | native = "Context already exists"; Swift = "message stream already active"; Kotlin = "not a member". NOT reused by `scp-client-wasm` precisely because of this overload |
+| `SCP-CTX-2004` | native FFI-common registry | Context creation failed — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2005` | native FFI-common registry | Context join failed — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2040` | native FFI-common registry | Context operation error (native `CTX_2040`) — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2082` | `scp-client-wasm` (browser participant) | Unknown / not-held context (`ClientError::UnknownContext`) |
+| `SCP-CTX-2083` | `scp-client-wasm` (browser participant) | Context already exists in this client (`ClientError::ContextAlreadyExists`) — browser-owned; does NOT reuse the overloaded native `2003` |
+| `SCP-CTX-2084` | `scp-client-wasm` (browser participant) | Unsupported membership change — a received Commit removes a member (out of ADR-057 Slice 2 convergent scope) (`ClientError::UnsupportedMembershipChange`) |
+| `SCP-CTX-2085` | `scp-client-wasm` (browser participant) | Driver invariant violation / malformed driver argument (`ClientError::Driver`) |
+| `SCP-CTX-2086` | `scp-client-wasm` (browser participant) | No retained pending join material — join must reconstruct from the durable snapshot (`ClientError::NoPendingJoinMaterial`). (Sits at 2086 because 2080/2081 are taken by the Kotlin SDK.) |
+| `SCP-CTX-2095` | native FFI-common registry + Swift + Kotlin + ts-native + `scp-client-wasm` (**shared meaning, all surfaces**) | Pseudonym registry empty — peers have not announced routing IDs (§9.10.4); native `ContextError::PseudonymRegistryEmpty`, browser `ClientError::PseudonymRegistryEmpty` |
+| `SCP-CRYPTO-4010` | native FFI-common registry (also Kotlin SDK) | MLS group create error — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CRYPTO-4020` | `scp-client-wasm` (browser participant) | Sender-key (§9.16) layer failure (`ClientError::SenderKey`) |
+| `SCP-CRYPTO-4030` | `scp-client-wasm` (browser participant) | Event-log append / proof failure (`ClientError::EventLog`) |
+| `SCP-CRYPTO-4040` | `scp-client-wasm` (browser participant) | Convergent committer-timestamp AAD failure — missing or malformed (ADR-057) (`ClientError::Mls(ConvergentTimestampMissing \| ConvergentTimestampMalformed)`) |
+| `SCP-CRYPTO-4041` | `scp-client-wasm` (browser participant) | Generic MLS group operation failure — create/add/join/encrypt/decrypt/commit catch-all (`ClientError::Mls(_)`) |
+| `SCP-TRANS-5005` | `scp-client-wasm` (browser participant) | Injected outbound `Socket`/`RelaySink` failed to enqueue a relay frame — WebSocket closed / JS exception (`ClientError::Transport`) |
+| `SCP-TRANS-5010` | native FFI-common registry (also Kotlin SDK) | Transport subscription error — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-VALID-7010` | native FFI-common registry (**pre-existing cross-language overlap**: reused by Swift/Kotlin/ts-native SDKs for their own validation conditions) | UCAN token validation error — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-VALID-7011` | native FFI-common registry (**pre-existing cross-language overlap** with Swift/Kotlin/ts-native) | UCAN mint validation error — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-VALID-7028` | `scp-client-wasm` (browser participant) | Browser participant wire/input (de)serialization or byte-shape validation failure — `ClientError::Codec` (MLS wire codec) plus the wasm free-function input validators (`requestId`/`operatorPk`/`caveatsBinding` length, `OutletStreamChunk` decode, event-log & wrapping-key MessagePack serde). Emitted via the shared `WASM_INPUT_VALIDATION_CODE` constant |
+| `SCP-VALID-7029` | `scp-client-wasm` (browser participant) | Frame content type did not match its relay channel — §9.10.4 mis-routed frame, defense-in-depth (`ClientError::ChannelContentMismatch`) |
+| `SCP-VALID-7025` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | wasm module not initialized — `initScp()` (or `ScpBrowserClient.connect`) must be awaited before constructing/using a client |
+| `SCP-VALID-7026` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | `WebSocketRelaySocket` (the managed transport) passed to `create()` instead of `ScpBrowserClient.connect()` — it would be left unattached |
+
+The browser participant reuses **only** `SCP-CTX-2095` from the shared band —
+its condition is semantically identical on all five surfaces. Every other
+browser condition took a distinct browser-owned number (`2082-2086`,
+`4020/4030/4040/4041`, `5005`, `7028/7029`, and the SDK-wrapper `7025/7026`),
+each verified absent from the native/Swift/Kotlin/ts-native union so no
+browser-owned code string collides with any other surface as of this change.
+Notably `SCP-CTX-2083` (already-exists) does **not** reuse native `2003`, because
+`2003` is already overloaded across native/Swift/Kotlin.
 
 ### Registered SCP-STORAGE- codes
 
