@@ -31,6 +31,7 @@ scp-did = { path = "../scp-did" }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
 scp-transport = { path = "../scp-transport" }
 scp-event-log = { path = "../scp-event-log" }
+scp-protocol = { path = "../scp-protocol" }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 openmls = { workspace = true }
@@ -47,6 +48,7 @@ rmp-serde = { workspace = true }
 tls_codec = "0.4"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+serde = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

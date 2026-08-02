@@ -900,7 +900,8 @@
       ],
       "details": {
         "sealPath": "seal_envelope: serialize inner envelope -> MLS encrypt -> wrap in outer envelope with routing_id, recipient_hint, blob_ttl",
-        "openPath": "open_envelope: MLS decrypt -> deserialize inner envelope -> strip padding -> verify payload_hash == SHA256(stripped_payload) -> verify inner signature -> verify generation number -> return verified inner envelope"
+        "openPath": "open_envelope: MLS decrypt -> deserialize inner envelope -> strip padding -> verify payload_hash == SHA256(stripped_payload) -> verify inner signature -> verify generation number -> return verified inner envelope",
+        "superseded_by": ["SCP-OUT-002", "SCP-OUT-003"]
       },
       "result": "seal_envelope and open_envelope with full integrity verification. 13 tests (12 + 1 proptest). All passing."
     },
@@ -1100,7 +1101,8 @@
         "newMemberJoin": "When a new member joins the group, they observe each existing member's current sender_key_epoch from the group state. The new member publishes a SenderKeyRequest for each author whose key they need. Each author's SDK responds automatically (checking block list). Same O(N) total work as push-based, but demand-driven and naturally load-balanced.",
         "hpkeAssembly": "HPKE: (1) generate ephemeral X25519 keypair (software-generated), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. Ephemeral public key included in response.",
         "hpkeOpen": "Uses key_custody.dh_agree(wrapping_key_handle, ephemeral_pk) to compute shared secret inside custody boundary, then KDF + AEAD in software to recover sender key. Wrapping private key never leaves KeyCustody.",
-        "blockNotificationVerification": "Receiver MUST verify Ed25519 signature by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039. Discard without action if verification fails. Log discarded notification for anomaly detection."
+        "blockNotificationVerification": "Receiver MUST verify Ed25519 signature by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039. Discard without action if verification fails. Log discarded notification for anomaly detection.",
+        "superseded_by": ["SCP-OUT-002"]
       },
       "result": "Implemented pull-based sender key protocol: SenderKeyEpochAdvance, SenderKeyRequest/Response with HPKE, block notifications, rotate_sender_key_for_block. 15 tests."
     },
@@ -1430,7 +1432,8 @@
         "Broadcast mode acceptance criteria": "When `mode == Broadcast`:\n- No MLS group is created. Context uses per-author AES-256-GCM broadcast keys instead of MLS group keys.\n- Subscriber count is unlimited (no MLS group size bound).\n- The context's public `routing_id` is derived as `SHA-256(context_id)` — deterministic and discoverable by any agent that knows the context_id.\n- Authors are bounded participants who hold `MessagesWrite` capability. Each author maintains their own broadcast key with independent epoch rotation.\n- Subscribers hold `MessagesRead` capability and receive broadcast keys via HPKE-wrapped key distribution (no MLS Welcome messages).\n- `create_context` skips MLS group creation (step 2) and instead initializes the creator's broadcast key at epoch 0.\n- `join_context` for subscribers registers DID-authenticated subscription without MLS add_member.\n- `send_message` encrypts with the author's current broadcast key, wraps in `BroadcastEnvelope` (§5.14.5), and publishes to the public routing_id.\n- All other context lifecycle operations (close, expire, TTL, event log) operate identically regardless of mode.",
         "TemplateId enum": "```rust\npub enum TemplateId {\n    BilateralEphemeral,\n    BilateralPersistent,\n    Coordination,\n    GroupDiscussion,\n    PublicBroadcast,\n    GatedBroadcast,\n}\n```\nTemplates are protocol constants — not user-extensible. When present, all other ContextParams fields must match the template definition exactly.",
         "Implementation notes": "Language: Rust. Crate: scp-core. Module: scp-core/context/. Async runtime: tokio (TTL timers, MLS operations, transport). State persistence: Via ProtocolRepository (§17.4), which wraps the scp-platform Storage trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.",
-        "Concurrency model": "All public handle types (Identity, Context, TransportManager) are safe to share across threads/tasks. In Rust: Send + Sync. In Python: safe to use from any asyncio task on the same event loop. In Swift: Sendable. In Go: safe for concurrent use. In Kotlin: safe across coroutines. Individual operations are serialized internally — concurrent sends on the same context are safe and ordered. No SDK user should ever need an external lock to use SCP types safely."
+        "Concurrency model": "All public handle types (Identity, Context, TransportManager) are safe to share across threads/tasks. In Rust: Send + Sync. In Python: safe to use from any asyncio task on the same event loop. In Swift: Sendable. In Go: safe for concurrent use. In Kotlin: safe across coroutines. Individual operations are serialized internally — concurrent sends on the same context are safe and ordered. No SDK user should ever need an external lock to use SCP types safely.",
+        "superseded_by": ["SCP-OUT-002"]
       },
       "result": "Implemented context types: ContextState FSM, ContextHandle, ContextParams, all parameter enums. 52 tests."
     },
@@ -2528,9 +2531,9 @@
       ],
       "description": "Implement PyO3 bridge functions for outlet registration/invocation, transport connection, UCAN token management, and event log queries. Each function maps directly to one scp-core function. Types exposed as opaque PyO3 classes with attribute access.",
       "acceptanceCriteria": [
-        "`py_outlet_register(handle, registration) -> str` — registers a outlet (returns outlet ID).",
+        "`outlet_register(handle, registration) -> str` — registers an outlet (returns outlet ID).",
         "`outlet_invoke(handle, outlet_id, input, identity) -> PyObject` — invokes an outlet (returns JSON-compatible output).",
-        "`py_outlet_verify(handle, outlet_id) -> PyOutletVerificationResult` — verifies a outlet against test vectors.",
+        "`outlet_verify(handle, outlet_id) -> PyOutletVerificationResult` — verifies an outlet against test vectors.",
         "`py_transport_connect(relay_url) -> None` — connects to an SCP relay.",
         "`py_transport_status() -> PyTransportStatus` — returns transport connection status.",
         "`py_ucan_validate(handle, token, capability) -> None` — validates a UCAN token (raises exception on failure).",
@@ -2556,7 +2559,9 @@
           "section": "## ADR-013: PyO3 Bridge Layer"
         }
       ],
-      "details": {},
+      "details": {
+        "superseded_by": ["SCP-OUT-005"]
+      },
       "result": "PyOutletRegistration, PyOutletVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof types + 10 bridge functions across outlets.rs, transport.rs, ucan.rs, event_log.rs"
     },
     {
@@ -2593,7 +2598,9 @@
           "section": "## ADR-013: PyO3 Bridge Layer"
         }
       ],
-      "details": {},
+      "details": {
+        "superseded_by": ["SCP-OUT-005", "SCP-OUT-006"]
+      },
       "result": "Implemented in iteration 3"
     },
     {
