@@ -1,9 +1,11 @@
 /**
  * Browser-invoker cross-context streaming-saga session (SCP-OUT-048), driven
  * against the REAL built wasm and the REAL relay wire, within the ADR-057 scope
- * fence: the browser SIGNS its own open/credit/cancel in-tab and DECRYPTS +
- * VERIFIES each re-encrypted chunk on-device, while a MOCKED node coordinator
- * plays the node's 047 saga (coordination is node-delegated).
+ * fence: the browser SIGNS its own open/credit in-tab and DECRYPTS + VERIFIES
+ * each re-encrypted chunk on-device, while a MOCKED node coordinator plays the
+ * node's 047 saga (coordination is node-delegated). Browser-initiated cancel is
+ * out of scope this slice (§5.4.5 runtime-derived next_seq; node-delegated per
+ * ADR-057) — a detected sequence gap surfaces StreamGap instead.
  *
  * The chunk data plane is a §25.2 reference-key KAT: the operator-signed chunks
  * are produced in Rust under the RFC 8032 §7.1 Test-Vector-1 operator key and
@@ -24,16 +26,18 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BrowserInvokerStreamSession,
+  Credit,
   InMemoryStorage,
+  InvalidGrant,
   type JsSocket,
   type NodeStreamCoordinator,
   OutletError,
-  outletStreamComputeCancelPreimage,
   outletStreamComputeCaveatsBinding,
   outletStreamComputeCreditPreimage,
   outletStreamVerifyChunkSignature,
   ScpBrowserClient,
   type SenderKeyDistribution,
+  ValidationError,
 } from "../src/index";
 import { loadRealWasm } from "./support/load-wasm";
 import { stubCustody } from "./support/stubs";
@@ -55,6 +59,10 @@ interface Fixture {
   wrongOperatorPkHex: string;
   invokerSeedHex: string;
   invokerPkHex: string;
+  /** §5.4.5 credit-grant preimage golden for (grant=4, monotonic_seq=0, stream_epoch). */
+  creditGrant: number;
+  creditMonotonicSeq: number;
+  creditPreimageHex: string;
   chunks: Array<{ sequence: number; wireHex: string }>;
   wrongKeyChunkWireHex: string;
 }
@@ -219,7 +227,6 @@ test("browser-invoker streaming round-trip: signs open + credit in-tab, decrypts
     grantCredit: async (signed) => {
       routedCredits.push(signed);
     },
-    cancel: async () => {},
     pollNext: async () => chunkFrames.shift() ?? null,
   };
 
@@ -249,19 +256,24 @@ test("browser-invoker streaming round-trip: signs open + credit in-tab, decrypts
   await session.open();
   expect(opened).toBe(true);
 
-  // Grant credit — SIGNED IN-TAB, routed to the node. The produced signature
+  // Grant credit — SIGNED IN-TAB, routed to the node. `grant` is a validated
+  // branded Credit (a raw number is a tsc error). The produced signature
   // verifies under the invoker's public key over the §5.4.5 credit preimage.
-  const signedCredit = await session.grantCredit(4);
+  const signedCredit = await session.grantCredit(new Credit(FIX.creditGrant));
   expect(routedCredits).toHaveLength(1);
-  const creditPreimage = outletStreamComputeCreditPreimage(
-    CTX,
-    FIX.outletId,
-    hexToBytes(FIX.requestIdHex),
-    4,
-    0n, // first grant's monotonic_seq
-    BigInt(FIX.streamEpoch),
+  const creditPreimage = outletStreamComputeCreditPreimage({
+    contextId: CTX,
+    outletId: FIX.outletId,
+    requestId: hexToBytes(FIX.requestIdHex),
+    grant: FIX.creditGrant,
+    monotonicSeq: BigInt(FIX.creditMonotonicSeq), // first grant's monotonic_seq
+    streamEpoch: BigInt(FIX.streamEpoch),
     caveatsBinding,
-  );
+  });
+  // Cross-target golden: the credit preimage matches the Rust-pinned fixture
+  // byte-for-byte (closes the "sign & compute share one builder so both drift
+  // together" blind spot — the Rust KAT re-derives this same value).
+  expect(Buffer.from(creditPreimage).toString("hex")).toBe(FIX.creditPreimageHex);
   expect(
     await ed25519Verify(hexToBytes(FIX.invokerPkHex), sigOf(signedCredit), creditPreimage),
   ).toBe(true);
@@ -289,55 +301,16 @@ test("browser-invoker streaming round-trip: signs open + credit in-tab, decrypts
   operator.closeContext(CTX);
 });
 
-test("a signed OutletStreamCancel verifies under the invoker public key (in-tab signing)", async () => {
-  await loadRealWasm();
-  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
-  const routedCancels: Uint8Array[] = [];
-  const coordinator: NodeStreamCoordinator = {
-    open: async () => {},
-    grantCredit: async () => {},
-    cancel: async (signed) => {
-      routedCancels.push(signed);
-    },
-    pollNext: async () => null,
-  };
-  // Cancel is pure in-tab signing + routing — no MLS context needed. A minimal
-  // client with a no-op socket satisfies the session constructor.
-  const client = ScpBrowserClient.create({
-    custody: stubCustody(FIX.invokerDid),
-    storage: new InMemoryStorage(),
-    socket: { send: () => {} },
-  });
-  const session = new BrowserInvokerStreamSession({
-    client,
-    coordinator,
-    contextId: FIX.contextId,
-    outletId: FIX.outletId,
-    requestId: hexToBytes(FIX.requestIdHex),
-    invokerDid: FIX.invokerDid,
-    invokerSigningSeed: hexToBytes(FIX.invokerSeedHex),
-    operatorPk: hexToBytes(FIX.operatorPkHex),
-    ucanToken: UCAN_TOKEN,
-    caveatsBinding,
-    streamEpoch: BigInt(FIX.streamEpoch),
-    estimatedChunkCount: FIX.estimatedChunkCount,
-  });
-
-  const signedCancel = await session.cancel();
-  expect(routedCancels).toHaveLength(1);
-  const cancelPreimage = outletStreamComputeCancelPreimage(
-    FIX.contextId,
-    FIX.outletId,
-    hexToBytes(FIX.requestIdHex),
-    0n, // no chunks consumed → next_seq cursor is 0
-    caveatsBinding,
-  );
-  expect(
-    await ed25519Verify(hexToBytes(FIX.invokerPkHex), sigOf(signedCancel), cancelPreimage),
-  ).toBe(true);
-
-  // A closed session refuses a second control-plane call.
-  await expect(session.cancel()).rejects.toBeInstanceOf(OutletError);
+test("grantCredit requires a validated Credit — a bad grant throws InvalidGrant at construction", () => {
+  // Browser-initiated cancel is out of scope this slice (§5.4.5 runtime-derived
+  // next_seq; node-delegated per ADR-057) — there is no session.cancel(). Credit
+  // is the one invoker-authored control-plane step, and it is a branded,
+  // validating newtype: a raw / out-of-range grant never reaches signing.
+  expect(() => new Credit(0)).toThrow(InvalidGrant);
+  expect(() => new Credit(-1)).toThrow(InvalidGrant);
+  expect(() => new Credit(3.5)).toThrow(InvalidGrant);
+  expect(() => new Credit(2 ** 32)).toThrow(InvalidGrant);
+  expect(new Credit(4).value).toBe(4);
 });
 
 test("a chunk signed by a non-operator key is rejected on-device", async () => {
@@ -378,4 +351,127 @@ test("a chunk signed by a non-operator key is rejected on-device", async () => {
       caveatsBinding,
     ),
   ).toBe(true);
+});
+
+/** Session options bound to a built invoker/coordinator (shared across the drain tests). */
+function sessionOpts(
+  invoker: ScpBrowserClient,
+  coordinator: NodeStreamCoordinator,
+  caveatsBinding: Uint8Array,
+): ConstructorParameters<typeof BrowserInvokerStreamSession>[0] {
+  return {
+    client: invoker,
+    coordinator,
+    contextId: FIX.contextId,
+    outletId: FIX.outletId,
+    requestId: hexToBytes(FIX.requestIdHex),
+    invokerDid: FIX.invokerDid,
+    invokerSigningSeed: hexToBytes(FIX.invokerSeedHex),
+    operatorPk: hexToBytes(FIX.operatorPkHex),
+    ucanToken: UCAN_TOKEN,
+    caveatsBinding,
+    streamEpoch: BigInt(FIX.streamEpoch),
+    estimatedChunkCount: FIX.estimatedChunkCount,
+  };
+}
+
+test("a §5.4.5 sequence gap rejects with SCP-OUTLET-6131 without yielding the offending chunk (no cancel routed)", async () => {
+  const { invoker, operator, relay, invokerInbound } = await buildPair();
+  const CTX = FIX.contextId;
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+
+  const chunkFrames: Uint8Array[] = [];
+  // NodeStreamCoordinator has NO cancel port this slice (cancel is node-delegated
+  // per ADR-057 / §5.4.5 runtime-derived next_seq), so there is nothing to route
+  // on a gap — the drain surfaces StreamGap and node-side reclamation cleans up.
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => chunkFrames.shift() ?? null,
+  };
+
+  // Operator forwards chunks 0, 1, then 3 — sequence 2 is MISSING (a gap).
+  for (const seq of [0, 1, 3]) {
+    operator.sendMessage(CTX, hexToBytes(FIX.chunks[seq]?.wireHex ?? ""));
+  }
+  relay.pump();
+  chunkFrames.push(...invokerInbound.splice(0));
+  expect(chunkFrames).toHaveLength(3);
+
+  const session = new BrowserInvokerStreamSession(
+    sessionOpts(invoker, coordinator, caveatsBinding),
+  );
+
+  const seen: number[] = [];
+  let thrown: unknown;
+  try {
+    for await (const chunk of session) {
+      seen.push(chunk.sequence);
+    }
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(OutletError);
+  expect((thrown as OutletError).code).toBe("SCP-OUTLET-6131");
+  // 0 and 1 were yielded; the non-contiguous chunk (seq 3) was NOT.
+  expect(seen).toEqual([0, 1]);
+  // The session is closed and #pending was cleared: a further pull returns done,
+  // never the buffered offending chunk.
+  expect(await session.next()).toEqual({ done: true, value: undefined });
+
+  invoker.closeContext(CTX);
+  operator.closeContext(CTX);
+});
+
+test("a wrong-key chunk driven THROUGH the session rejects with SCP-OUTLET-6110 and clears #pending", async () => {
+  const { invoker, operator, relay, invokerInbound } = await buildPair();
+  const CTX = FIX.contextId;
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+
+  const chunkFrames: Uint8Array[] = [];
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => chunkFrames.shift() ?? null,
+  };
+
+  // Operator forwards a chunk whose operator signature is INVALID (wrong key).
+  operator.sendMessage(CTX, hexToBytes(FIX.wrongKeyChunkWireHex));
+  relay.pump();
+  chunkFrames.push(...invokerInbound.splice(0));
+  expect(chunkFrames).toHaveLength(1);
+
+  const session = new BrowserInvokerStreamSession(
+    sessionOpts(invoker, coordinator, caveatsBinding),
+  );
+
+  await expect(session.next()).rejects.toMatchObject({ code: "SCP-OUTLET-6110" });
+  // #pending was cleared and the session closed: a subsequent pull returns done,
+  // never a residual chunk buffered before the verify failure.
+  expect(await session.next()).toEqual({ done: true, value: undefined });
+
+  invoker.closeContext(CTX);
+  operator.closeContext(CTX);
+});
+
+test("a second live session on the same (client, context) is refused (SCP-VALID-7028)", async () => {
+  const { invoker, operator } = await buildPair();
+  const caveatsBinding = hexToBytes(FIX.caveatsBindingHex);
+  const coordinator: NodeStreamCoordinator = {
+    open: async () => {},
+    grantCredit: async () => {},
+    pollNext: async () => null,
+  };
+  const first = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
+  expect(
+    () => new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding)),
+  ).toThrow(ValidationError);
+  // Draining the first to its terminal releases the claim, so a fresh session
+  // on the same (client, context) then constructs cleanly.
+  await first.aggregate().catch(() => {});
+  const second = new BrowserInvokerStreamSession(sessionOpts(invoker, coordinator, caveatsBinding));
+  expect(second.requestId).toBeInstanceOf(Uint8Array);
+
+  invoker.closeContext(FIX.contextId);
+  operator.closeContext(FIX.contextId);
 });

@@ -42,15 +42,16 @@ export {
   type WebSocketRelaySocketOptions,
 } from "./adapters/websocket-relay-socket";
 // The client façade, one-time init, and the pure §5.4.5 outlet-stream invoker
-// predicates (SCP-OUT-037 caveats/chunk + SCP-OUT-048 credit/cancel signing).
+// predicates (SCP-OUT-037 caveats/chunk + SCP-OUT-048 credit signing; cancel is
+// node-delegated per ADR-057, see BrowserInvokerStreamSession).
 export {
   type InitInput,
   initScp,
   isScpInitialized,
-  outletStreamComputeCancelPreimage,
+  type OutletStreamCreditPreimageParams,
+  type OutletStreamSignCreditParams,
   outletStreamComputeCaveatsBinding,
   outletStreamComputeCreditPreimage,
-  outletStreamSignCancel,
   outletStreamSignCredit,
   outletStreamVerifyChunkSignature,
   ScpBrowserClient,
@@ -58,6 +59,8 @@ export {
   type ScpBrowserConnectOptions,
   scpVersion,
 } from "./client";
+// The branded, validating stream-credit grant (mirrors the native `Credit`).
+export { Credit } from "./credit";
 // The cross-SDK error hierarchy + prefix dispatch (single-sourced from the
 // shared core, bundled in).
 export {
@@ -67,6 +70,7 @@ export {
   EconomyError,
   GovernanceError,
   IdentityError,
+  InvalidGrant,
   McpError,
   mapBridgeError,
   OutletError,
@@ -81,7 +85,6 @@ export {
 export {
   BrowserInvokerStreamSession,
   type BrowserInvokerStreamSessionOptions,
-  caveatsBindingFor,
   type NodeStreamCoordinator,
   type OutletStreamChunkView,
   type OutletStreamOpenRequest,
@@ -91,7 +94,6 @@ export {
 export type {
   AddMemberOutput,
   ContextStatus,
-  OutletStreamCancel,
   OutletStreamCredit,
   ReceivedEvent,
   ReceiveOutput,

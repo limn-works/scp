@@ -771,39 +771,50 @@ impl WasmScpClient {
 // These are the ONLY outlet-streaming operations the browser can host. They are
 // stateless `scp-protocol` predicates — no client state, no `scp-runtime`, no
 // stream pump — so they live here as free `#[wasm_bindgen]` functions (like
-// [`scp_version`]), mirroring the canonical `outlet_stream_*` ops the native
-// bridges expose. The browser INVOKER predicate set is:
+// [`scp_version`]). There is NO native FFI counterpart to the signing/preimage
+// predicates: on the native (PyO3/UniFFI/NAPI) bridges, credit signing is
+// runtime-internal (the runtime signs under the registry-held invoker key via
+// KeyCustody, gated by the §5.4.5 FFI caller-auth). These wasm predicates are the
+// browser-invoker's ON-DEVICE equivalent (there is no always-on runtime in a
+// tab), producing the SAME §5.4.5 `scp-protocol` wire the node's saga validates.
+// The browser INVOKER predicate set is:
 //
 // - [`outlet_stream_compute_caveats_binding`] — the 32-byte `caveats_binding`
 //   the invoker commits into its open-request UCAN.
 // - [`outlet_stream_verify_chunk_signature`] — verify each operator-signed chunk
 //   the invoker receives.
-// - [`outlet_stream_sign_credit`] / [`outlet_stream_sign_cancel`] — the invoker
-//   SIGNS its own credit-grant and cancel steps (§5.4.5). A credit grant and a
-//   streaming cancel are *invoker-authored* messages, so signing them is exactly
-//   the "participant signs its own steps" the ADR-057 fence permits — it is not
-//   coordination.
-// - [`outlet_stream_compute_credit_preimage`] / [`outlet_stream_compute_cancel_preimage`]
-//   — the 32-byte SHA-256 preimages the two signatures cover, exposed as a pure
-//   seam so a future WebCrypto/off-wasm signer (the browser custody-signing slice
-//   — see the seed-custody note below) can sign the preimage without the private
-//   key ever entering wasm.
+// - [`outlet_stream_sign_credit`] — the invoker SIGNS its own credit-grant step
+//   (§5.4.5). A credit grant is an *invoker-authored* message, so signing it is
+//   exactly the "participant signs its own steps" the ADR-057 fence permits — it
+//   is not coordination.
+// - [`outlet_stream_compute_credit_preimage`] — the 32-byte SHA-256 preimage the
+//   credit signature covers, exposed as a pure seam so a future WebCrypto/off-wasm
+//   signer (the browser custody-signing slice — see the seed-custody note below)
+//   can sign the preimage without the private key ever entering wasm.
+//
+// Browser-initiated streaming CANCEL is deliberately NOT part of this surface:
+// §5.4.5 (Cancel signature) binds a cancel's `next_seq` to the runtime's live
+// emission cursor ("never a value supplied by the caller"), which a remote
+// browser invoker cannot read — so cancel stays node-delegated (ADR-057;
+// outlet.json CRITICAL #3), deferred to a future cross-context-cancel slice. A
+// browser drain that detects a §5.4.5 sequence gap surfaces `StreamGap` and
+// node-side credit-stall / timeout reclaims the stream.
 //
 // # Signing decision — the caller-supplied seed momentarily lives in wasm memory
 //
-// [`outlet_stream_sign_credit`] / [`outlet_stream_sign_cancel`] reconstruct an
-// `ed25519_dalek::SigningKey` from a caller-supplied 32-byte seed to produce the
-// §5.4.5 signature. This momentarily holds a private-key seed in wasm linear
-// memory — the SAME as-built posture ADR-057 already documents and sanctions for
-// the MLS signing key in Slice 3 (§Consequences "As-built caveat (Slice 3)": the
-// ed25519 `SignatureKeyPair` "is generated and held inside `scp-mls` in wasm
-// linear memory … Until then it is defense-in-depth that is *not yet realized*,
-// not a property confidentiality currently rests on (in the tab threat model an
+// [`outlet_stream_sign_credit`] reconstructs an `ed25519_dalek::SigningKey` from
+// a caller-supplied 32-byte seed to produce the §5.4.5 signature. This
+// momentarily holds a private-key seed in wasm linear memory — the SAME as-built
+// posture ADR-057 already documents and sanctions for the MLS signing key in
+// Slice 3 (§Consequences "As-built caveat (Slice 3)": the ed25519
+// `SignatureKeyPair` "is generated and held inside `scp-mls` in wasm linear
+// memory … Until then it is defense-in-depth that is *not yet realized*, not a
+// property confidentiality currently rests on (in the tab threat model an
 // attacker able to read wasm memory can already read plaintext + group secrets
 // regardless)"). Routing signing off-wasm through WebCrypto (so the key never
-// enters wasm) is the browser custody-signing slice; the preimage predicates
-// above are the forward seam for it. The transient seed copies are best-effort
-// zeroized here as hygiene (not load-bearing — see the ADR threat model above).
+// enters wasm) is the browser custody-signing slice; the preimage predicate above
+// is the forward seam for it. The transient seed copies are best-effort zeroized
+// here as hygiene (not load-bearing — see the ADR threat model above).
 //
 // # Why NOT the pump / open / poll / seal / capture / escrow / receipt
 //
@@ -815,19 +826,19 @@ impl WasmScpClient {
 // MECHANICALLY: `scp-client` / this crate must not depend on `scp-runtime`, so
 // the pump/seal/escrow/receipt path is unreachable here by the dependency graph,
 // not by prose. The browser is a *participant* that "signs its own steps" (the
-// invoker's caveats-binding, credit, and cancel) but does not *coordinate*, host
-// escrow, or sign executor receipts. It also does NOT mint UCANs in wasm — it
-// computes the `caveats_binding` bound into a caller/node-supplied UCAN. The
-// transport that carries the open-request to the hosting node and the operator's
-// chunks back is out of this crate's scope today (it is the remote-invoker /
+// invoker's caveats-binding and credit) but does not *coordinate*, host escrow,
+// or sign executor receipts. It also does NOT mint UCANs in wasm — it computes
+// the `caveats_binding` bound into a caller/node-supplied UCAN. The transport
+// that carries the open-request to the hosting node and the operator's chunks
+// back is out of this crate's scope today (it is the remote-invoker /
 // cross-context transport slice; `scp-client` has no outlet invocation surface
 // yet), the same out-of-band-seam shape the sender-key hand-off above uses.
 //
 // # BigInt marshalling (note for the TS-wasm session, SCP-OUT-048 unit B)
 //
-// `monotonic_seq`, `stream_epoch`, and `next_seq` are `u64` and therefore marshal
-// across the wasm-bindgen boundary as JS `BigInt`, not `number`. The TS-wasm
-// wrapper must pass `BigInt` values for these parameters.
+// `monotonic_seq` and `stream_epoch` are `u64` and therefore marshal across the
+// wasm-bindgen boundary as JS `BigInt`, not `number`. The TS-wasm wrapper must
+// pass `BigInt` values for these parameters.
 
 /// Computes the §5.4.5 `caveats_binding` (pure; mirrors
 /// `outlet_stream_compute_caveats_binding`). Returns the 32-byte binding as a
@@ -927,7 +938,12 @@ pub fn outlet_stream_verify_chunk_signature(
 }
 
 /// Signs an outlet-stream credit grant with the invoker's Ed25519 signing key
-/// (pure; mirrors the native `outlet_stream_sign_credit`).
+/// (pure).
+///
+/// This is the browser-invoker's ON-DEVICE credit-signing equivalent — there is
+/// no native sign-credit FFI to mirror (on the native bridges credit signing is
+/// runtime-internal via `KeyCustody`); this predicate produces the same §5.4.5
+/// `scp-protocol` wire the node's saga validates.
 ///
 /// A browser invoker authors credit grants for a node-hosted stream: each grant
 /// authorizes the executor to emit `grant` additional billable chunks. This
@@ -935,8 +951,7 @@ pub fn outlet_stream_verify_chunk_signature(
 /// §5.4.5 credit-grant preimage via
 /// [`scp_protocol::context::outlets::stream::sign_credit_grant`], assembles the
 /// [`OutletStreamCredit`] (`request_id` ‖ `grant` ‖ `monotonic_seq` ‖ `sig`),
-/// and returns its JSON encoding — the same wire form the native bridges accept,
-/// so the TS SDK produces ONE credit form across bindings.
+/// and returns its JSON encoding.
 ///
 /// `monotonicSeq` and `streamEpoch` are `u64` → JS `BigInt`.
 ///
@@ -952,8 +967,8 @@ pub fn outlet_stream_verify_chunk_signature(
 /// `requestId` is not 16 bytes, or `caveatsBinding` is not 32 bytes.
 #[wasm_bindgen(js_name = "outletStreamSignCredit")]
 // Flat §5.4.5 credit envelope — agent-first named params over the wasm-bindgen
-// boundary (no borrowed structs across the JS seam); mirrors the native bridges'
-// flat outlet-stream signatures. `Vec<u8>` is marshalled by value by wasm-bindgen.
+// boundary (no borrowed structs across the JS seam). `Vec<u8>` is marshalled by
+// value by wasm-bindgen.
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn outlet_stream_sign_credit(
     signing_key_seed: Vec<u8>,
@@ -991,63 +1006,6 @@ pub fn outlet_stream_sign_credit(
     };
     serde_json::to_vec(&credit)
         .map_err(|e| JsValue::from_str(&format!("[SCP-VALID-7010] serializing credit: {e}")))
-}
-
-/// Signs an outlet-stream cancel with the invoker's Ed25519 signing key (pure;
-/// mirrors the native `outlet_stream_sign_cancel`).
-///
-/// A browser invoker authors a streaming cancel for a node-hosted stream. This
-/// reconstructs the invoker's `SigningKey` from `signingKeySeed`, signs the
-/// §5.4.5 cancel preimage via
-/// [`scp_protocol::context::outlets::stream::sign_cancel`], assembles the
-/// [`OutletStreamCancel`] (`request_id` ‖ `next_seq` ‖ `sig`), and returns its
-/// JSON encoding — the same wire form the native bridges accept.
-///
-/// `nextSeq` is a `u64` → JS `BigInt`.
-///
-/// # Security
-///
-/// `signingKeySeed` is a 32-byte private-key seed held momentarily in wasm
-/// memory (ADR-057 §Consequences "As-built caveat (Slice 3)"); see the section
-/// module doc. The transient seed copies are zeroized best-effort.
-///
-/// # Errors
-///
-/// Throws `[SCP-VALID-7010]` if `signingKeySeed` is not exactly 32 bytes,
-/// `requestId` is not 16 bytes, or `caveatsBinding` is not 32 bytes.
-#[wasm_bindgen(js_name = "outletStreamSignCancel")]
-#[allow(clippy::needless_pass_by_value)] // wasm-bindgen marshals `Vec<u8>` by value
-pub fn outlet_stream_sign_cancel(
-    signing_key_seed: Vec<u8>,
-    context_id: String,
-    outlet_id: String,
-    request_id: Vec<u8>,
-    next_seq: u64,
-    caveats_binding: Vec<u8>,
-) -> Result<Vec<u8>, JsValue> {
-    use scp_protocol::context::outlets::stream::{
-        CancelSigningInputs, OutletStreamCancel, sign_cancel,
-    };
-    let signing_key = signing_key_from_seed(signing_key_seed)?;
-    let request_id = request_id_16(&request_id)?;
-    let binding = caveats_binding_32(&caveats_binding)?;
-    let sig = sign_cancel(
-        &signing_key,
-        &CancelSigningInputs {
-            context_id: &context_id,
-            outlet_id: &outlet_id,
-            request_id: &request_id,
-            next_seq,
-            caveats_binding: &binding,
-        },
-    );
-    let cancel = OutletStreamCancel {
-        request_id,
-        next_seq,
-        sig,
-    };
-    serde_json::to_vec(&cancel)
-        .map_err(|e| JsValue::from_str(&format!("[SCP-VALID-7010] serializing cancel: {e}")))
 }
 
 /// Computes the §5.4.5 credit-grant signature preimage (pure; mirrors
@@ -1088,37 +1046,6 @@ pub fn outlet_stream_compute_credit_preimage(
         stream_epoch,
         &binding,
     );
-    Ok(preimage.to_vec())
-}
-
-/// Computes the §5.4.5 cancel signature preimage (pure; mirrors
-/// [`scp_protocol::context::outlets::stream::compute_cancel_sig_preimage`]).
-///
-/// The #1980-forward `WebCrypto` seam for cancels: returns the 32-byte SHA-256
-/// hash the invoker's cancel signature covers, WITHOUT touching any private key.
-/// `outletStreamSignCancel` is the in-wasm counterpart for the current
-/// seed-in-wasm posture.
-///
-/// `nextSeq` is a `u64` → JS `BigInt`.
-///
-/// # Errors
-///
-/// Throws `[SCP-VALID-7010]` if `requestId` is not 16 bytes or `caveatsBinding`
-/// is not 32 bytes.
-#[wasm_bindgen(js_name = "outletStreamComputeCancelPreimage")]
-#[allow(clippy::needless_pass_by_value)] // wasm-bindgen marshals `Vec<u8>` by value
-pub fn outlet_stream_compute_cancel_preimage(
-    context_id: String,
-    outlet_id: String,
-    request_id: Vec<u8>,
-    next_seq: u64,
-    caveats_binding: Vec<u8>,
-) -> Result<Vec<u8>, JsValue> {
-    use scp_protocol::context::outlets::stream::compute_cancel_sig_preimage;
-    let request_id = request_id_16(&request_id)?;
-    let binding = caveats_binding_32(&caveats_binding)?;
-    let preimage =
-        compute_cancel_sig_preimage(&context_id, &outlet_id, &request_id, next_seq, &binding);
     Ok(preimage.to_vec())
 }
 
@@ -1380,55 +1307,16 @@ mod pure_wrapper_tests {
         );
     }
 
-    /// `outletStreamSignCancel` produces an [`OutletStreamCancel`] whose `sig`
-    /// verifies under the invoker's public key + matching binding, and fails
-    /// closed under a wrong PK.
+    /// The credit preimage predicate reproduces the core helper byte-for-byte,
+    /// and the sign predicate signs exactly that preimage (verified by
+    /// reconstructing the signature from the preimage under the §25.2 reference
+    /// seed). Cancel is node-delegated (ADR-057; §5.4.5 runtime-derived
+    /// `next_seq`), so there is no browser cancel predicate to pin here.
     #[test]
-    fn sign_cancel_roundtrips() {
-        use scp_protocol::context::outlets::stream::{OutletStreamCancel, verify_cancel_signature};
-
-        let seed = REFERENCE_OPERATOR_SEED;
-        let invoker_pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
-        let request_id = [7u8; 16];
-        let binding = [3u8; 32];
-        let (ctx, outlet, next_seq) = ("ctx-1", "outlet-1", 4u64);
-
-        let bytes = outlet_stream_sign_cancel(
-            seed.to_vec(),
-            ctx.to_owned(),
-            outlet.to_owned(),
-            request_id.to_vec(),
-            next_seq,
-            binding.to_vec(),
-        )
-        .expect("valid inputs sign a cancel");
-
-        let cancel: OutletStreamCancel =
-            serde_json::from_slice(&bytes).expect("cancel JSON round-trips");
-        assert_eq!(cancel.request_id, request_id);
-        assert_eq!(cancel.next_seq, next_seq);
-
-        assert!(
-            verify_cancel_signature(&cancel, &invoker_pk, ctx, outlet, &binding),
-            "accepts under the correct invoker PK + matching binding"
-        );
-
-        let wrong_pk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key();
-        assert!(
-            !verify_cancel_signature(&cancel, &wrong_pk, ctx, outlet, &binding),
-            "rejects under a wrong invoker PK"
-        );
-    }
-
-    /// The two preimage predicates reproduce the core helpers byte-for-byte, and
-    /// the sign predicates sign exactly that preimage (verified by reconstructing
-    /// the signature from the preimage under the §25.2 reference seed).
-    #[test]
-    fn credit_and_cancel_preimages_match_core_helpers() {
+    fn credit_preimage_matches_core_helper() {
         use ed25519_dalek::Signer;
         use scp_protocol::context::outlets::stream::{
-            OutletStreamCancel, OutletStreamCredit, compute_cancel_sig_preimage,
-            compute_credit_sig_preimage,
+            OutletStreamCredit, compute_credit_sig_preimage,
         };
 
         let request_id = [7u8; 16];
@@ -1454,22 +1342,7 @@ mod pure_wrapper_tests {
             "credit preimage matches the core helper byte-for-byte"
         );
 
-        let cancel_pre = outlet_stream_compute_cancel_preimage(
-            ctx.to_owned(),
-            outlet.to_owned(),
-            request_id.to_vec(),
-            4,
-            binding.to_vec(),
-        )
-        .expect("cancel preimage");
-        let expected_cancel = compute_cancel_sig_preimage(ctx, outlet, &request_id, 4, &binding);
-        assert_eq!(
-            cancel_pre.as_slice(),
-            expected_cancel.as_slice(),
-            "cancel preimage matches the core helper byte-for-byte"
-        );
-
-        // The sign predicates sign exactly the preimage: reconstruct each
+        // The sign predicate signs exactly the preimage: reconstruct the
         // signature from the preimage under the reference seed and compare.
         let key = ed25519_dalek::SigningKey::from_bytes(&REFERENCE_OPERATOR_SEED);
         let credit_bytes = outlet_stream_sign_credit(
@@ -1489,29 +1362,13 @@ mod pure_wrapper_tests {
             key.sign(&expected_credit).to_bytes(),
             "signed credit sig == Ed25519(seed, credit_preimage)"
         );
-
-        let cancel_bytes = outlet_stream_sign_cancel(
-            REFERENCE_OPERATOR_SEED.to_vec(),
-            ctx.to_owned(),
-            outlet.to_owned(),
-            request_id.to_vec(),
-            4,
-            binding.to_vec(),
-        )
-        .expect("sign cancel");
-        let cancel: OutletStreamCancel = serde_json::from_slice(&cancel_bytes).unwrap();
-        assert_eq!(
-            cancel.sig,
-            key.sign(&expected_cancel).to_bytes(),
-            "signed cancel sig == Ed25519(seed, cancel_preimage)"
-        );
     }
 
     // -----------------------------------------------------------------------
     // SCP-OUT-039 (§5.4.5) — outlet streaming conformance vectors, WASM tier.
     //
     // WASM has NO tokio runtime (ADR-034 / ADR-057): it cannot open a stream,
-    // drive the credit/cancel control plane, or observe a `StreamTerminalStatus`.
+    // drive the credit control plane, or observe a `StreamTerminalStatus`.
     // Its conformance role is therefore WIRE INTEGRITY, not terminal status: for
     // EVERY chunk of EVERY vector it (a) recomputes the §5.4.5 `caveats_binding`
     // through the pure wrapper and asserts it equals the core helper byte-for-byte,
@@ -1940,55 +1797,8 @@ mod pure_wrapper_wasm_tests {
         );
     }
 
-    /// `outletStreamSignCancel` fails closed `[SCP-VALID-7010]` on a wrong-length
-    /// seed, request_id, or caveats binding.
-    #[wasm_bindgen_test]
-    fn sign_cancel_rejects_malformed_inputs() {
-        let err = outlet_stream_sign_cancel(
-            vec![0u8; 31],
-            "ctx".to_owned(),
-            "o".to_owned(),
-            vec![0u8; 16],
-            0,
-            vec![0u8; 32],
-        )
-        .expect_err("a 31-byte seed is rejected");
-        assert!(
-            err_message(err).contains("signing_key_seed must be 32 bytes"),
-            "wrong-length seed fails closed"
-        );
-
-        let err = outlet_stream_sign_cancel(
-            vec![0u8; 32],
-            "ctx".to_owned(),
-            "o".to_owned(),
-            vec![0u8; 8],
-            0,
-            vec![0u8; 32],
-        )
-        .expect_err("an 8-byte request_id is rejected");
-        assert!(
-            err_message(err).contains("request_id must be 16 bytes"),
-            "wrong-length request_id fails closed"
-        );
-
-        let err = outlet_stream_sign_cancel(
-            vec![0u8; 32],
-            "ctx".to_owned(),
-            "o".to_owned(),
-            vec![0u8; 16],
-            0,
-            vec![0u8; 31],
-        )
-        .expect_err("a 31-byte caveats binding is rejected");
-        assert!(
-            err_message(err).contains("caveats_binding must be 32 bytes"),
-            "wrong-length caveats binding fails closed"
-        );
-    }
-
-    /// The preimage predicates fail closed `[SCP-VALID-7010]` on a wrong-length
-    /// request_id or caveats binding (they take no seed).
+    /// The credit preimage predicate fails closed `[SCP-VALID-7010]` on a
+    /// wrong-length request_id or caveats binding (it takes no seed).
     #[wasm_bindgen_test]
     fn compute_preimages_reject_malformed_inputs() {
         let err = outlet_stream_compute_credit_preimage(
@@ -2019,32 +1829,6 @@ mod pure_wrapper_wasm_tests {
         assert!(
             err_message(err).contains("caveats_binding must be 32 bytes"),
             "credit preimage: wrong-length caveats binding fails closed"
-        );
-
-        let err = outlet_stream_compute_cancel_preimage(
-            "ctx".to_owned(),
-            "o".to_owned(),
-            vec![0u8; 8],
-            0,
-            vec![0u8; 32],
-        )
-        .expect_err("an 8-byte request_id is rejected");
-        assert!(
-            err_message(err).contains("request_id must be 16 bytes"),
-            "cancel preimage: wrong-length request_id fails closed"
-        );
-
-        let err = outlet_stream_compute_cancel_preimage(
-            "ctx".to_owned(),
-            "o".to_owned(),
-            vec![0u8; 16],
-            0,
-            vec![0u8; 31],
-        )
-        .expect_err("a 31-byte caveats binding is rejected");
-        assert!(
-            err_message(err).contains("caveats_binding must be 32 bytes"),
-            "cancel preimage: wrong-length caveats binding fails closed"
         );
     }
 }

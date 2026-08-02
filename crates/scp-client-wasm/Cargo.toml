@@ -54,9 +54,8 @@ serde_json = { workspace = true }
 # leaf crypto crate already present transitively (via scp-protocol / scp-mls);
 # a direct edge here is inside the ADR-057 wasm fence (it is not scp-runtime /
 # scp-identity / tokio) and compiles for wasm32. The
-# `outlet_stream_sign_credit` / `outlet_stream_sign_cancel` invoker-signing
-# predicates (SCP-OUT-048) also reconstruct the invoker's `SigningKey` from a
-# 32-byte seed via this crate.
+# `outlet_stream_sign_credit` invoker-signing predicate (SCP-OUT-048) also
+# reconstructs the invoker's `SigningKey` from a 32-byte seed via this crate.
 ed25519-dalek = { workspace = true }
 
 # Best-effort zeroization of the transient private-key seed copies in the

@@ -64,36 +64,27 @@ export interface ReceivedEvent {
 }
 
 /**
- * A §5.4.5 `OutletStreamCredit` — the invoker-authored credit grant, decoded
- * from the JSON {@link import("./client").outletStreamSignCredit} produces. The
- * browser signs it in-tab and routes it to the node coordinator (SCP-OUT-048);
- * the node's saga validates and applies it. Field names mirror the shared
- * `scp-protocol` wire type (`serde_bytes` byte fields decode as JSON number
- * arrays, surfaced here as `Uint8Array`).
+ * A §5.4.5 `OutletStreamCredit` — the invoker-authored credit grant, as it
+ * appears ON THE JSON WIRE that {@link import("./client").outletStreamSignCredit}
+ * produces. The browser signs it in-tab and routes it to the node coordinator
+ * (SCP-OUT-048); the node's saga validates and applies it.
+ *
+ * These field names and shapes are BYTE-ACCURATE to the shared `scp-protocol`
+ * `serde_json` wire, so `JSON.parse(new TextDecoder().decode(signed)) as
+ * OutletStreamCredit` is correct: keys are `snake_case`, the fixed-width byte
+ * fields (`request_id`, `sig`) serialize as JSON `number[]` (not `Uint8Array`),
+ * and the `u64` `monotonic_seq` serializes as a JSON `number` (a `u64` rendered
+ * as a JSON number — exact only up to `Number.MAX_SAFE_INTEGER`).
  */
 export interface OutletStreamCredit {
-  /** Stream identifier (16 bytes). */
-  readonly requestId: Uint8Array;
-  /** Additional billable chunks the executor may send. */
+  /** Stream identifier (16 bytes, JSON `number[]`). */
+  readonly request_id: number[];
+  /** Additional billable chunks the executor may send (`u32`). */
   readonly grant: number;
-  /** Per-stream monotonic grant counter (rejected as `CreditReplay` on regress). */
-  readonly monotonicSeq: bigint;
-  /** The invoker's Ed25519 signature over the §5.4.5 credit-grant preimage (64 bytes). */
-  readonly sig: Uint8Array;
-}
-
-/**
- * A §5.4.5 `OutletStreamCancel` — the invoker-authored stream cancellation,
- * decoded from the JSON {@link import("./client").outletStreamSignCancel}
- * produces. Signed in-tab, routed to the node coordinator (SCP-OUT-048).
- */
-export interface OutletStreamCancel {
-  /** Stream identifier (16 bytes). */
-  readonly requestId: Uint8Array;
-  /** The receiver-side cursor at which the invoker cancelled the stream. */
-  readonly nextSeq: bigint;
-  /** The invoker's Ed25519 signature over the §5.4.5 cancel preimage (64 bytes). */
-  readonly sig: Uint8Array;
+  /** Per-stream monotonic grant counter (`u64`; rejected as `CreditReplay` on regress). */
+  readonly monotonic_seq: number;
+  /** The invoker's Ed25519 signature over the §5.4.5 credit-grant preimage (64 bytes, JSON `number[]`). */
+  readonly sig: number[];
 }
 
 /**

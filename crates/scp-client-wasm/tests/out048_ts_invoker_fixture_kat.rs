@@ -21,7 +21,8 @@
 
 use ed25519_dalek::SigningKey;
 use scp_protocol::context::outlets::stream::{
-    ChunkPayload, OutletStreamChunk, compute_caveats_binding, sign_chunk,
+    ChunkPayload, OutletStreamChunk, compute_caveats_binding, compute_credit_sig_preimage,
+    sign_chunk,
 };
 use scp_protocol::context::params::MemoryScope;
 use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
@@ -48,6 +49,11 @@ const REQUEST_ID: [u8; 16] = [0x2a; 16];
 const UCAN_CID: &str = "bafyreiout048invokerfixtureucancidaaaaaaaaaaaaaaaaaa";
 const INVOKER_DID: &str = "did:key:z6MkInvokerOUT048FixtureKeyAAAAAAAAAAAAA";
 const ESTIMATED_CHUNK_COUNT: u32 = 11;
+/// The hosting context's MLS epoch pinned at open, bound into the credit preimage.
+const STREAM_EPOCH: u64 = 3;
+/// The first credit grant the TS round-trip test signs (`grant`=4, `monotonic_seq`=0).
+const CREDIT_GRANT: u32 = 4;
+const CREDIT_MONOTONIC_SEQ: u64 = 0;
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -117,6 +123,25 @@ fn ts_invoker_fixture_matches_reference_implementation() {
         &caveats_jcs,
     );
     assert_eq!(doc["caveatsBindingHex"], hex(&binding));
+
+    // §5.4.5 credit-grant preimage golden (a cross-SDK KAT — the TS
+    // `outletStreamComputeCreditPreimage` over these same inputs must reproduce
+    // `creditPreimageHex`). Re-derived INDEPENDENTLY from the scp-protocol
+    // primitive: sign and compute share one core builder, so pinning the compute
+    // output here closes the "both drift together" blind spot.
+    assert_eq!(doc["streamEpoch"], STREAM_EPOCH);
+    assert_eq!(doc["creditGrant"], CREDIT_GRANT);
+    assert_eq!(doc["creditMonotonicSeq"], CREDIT_MONOTONIC_SEQ);
+    let credit_preimage = compute_credit_sig_preimage(
+        CTX,
+        OUTLET,
+        &REQUEST_ID,
+        CREDIT_GRANT,
+        CREDIT_MONOTONIC_SEQ,
+        STREAM_EPOCH,
+        &binding,
+    );
+    assert_eq!(doc["creditPreimageHex"], hex(&credit_preimage));
 
     // The 11 operator-signed chunks (10 Data + terminal End), byte-for-byte.
     let chunks = doc["chunks"].as_array().expect("chunks is an array");
