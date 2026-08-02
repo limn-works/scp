@@ -29,7 +29,7 @@
 //! compute the Ed25519 signature over that 32-byte hash — and over **nothing
 //! else**. It MUST NOT sign the raw `signing_preimage()` bytes, and it MUST NOT
 //! sign the [`to_extension_body`] output. `signing_preimage()` is
-//! crate-internal (`pub(crate)`): it exists only to build the hash and to
+//! module-private: it exists only to build the hash and to
 //! reproduce the §25.23 Vector 37 known-answer test. Signing the wrong bytes
 //! would silently diverge from Vector 37 and from every other binding.
 //!
@@ -209,7 +209,7 @@ impl KeyPackageAttestation {
     /// SHA-256 is the [`signing_hash`](Self::signing_hash) that the Ed25519
     /// signature covers. For §25.23 Vector 37 this is exactly 211 bytes.
     ///
-    /// Crate-internal: the only external signable output is
+    /// Module-private: the only external signable output is
     /// [`signing_hash`](Self::signing_hash). This method exists to build that
     /// hash and to reproduce the §25.23 Vector 37 known-answer test.
     ///
@@ -217,7 +217,7 @@ impl KeyPackageAttestation {
     /// field (`did`/`signing_key_id` are orders of magnitude smaller), so
     /// `unwrap_or_default` is a total function here and never panics.
     #[must_use]
-    pub(crate) fn signing_preimage(&self) -> Vec<u8> {
+    fn signing_preimage(&self) -> Vec<u8> {
         canonical_hash_bytes(SCP_KEYPACKAGE_ATTESTATION_DOMAIN, &self.canonical_fields())
             .unwrap_or_default()
     }
@@ -341,6 +341,311 @@ impl KeyPackageAttestation {
             Some(ext) => Ok(Some(Self::from_extension_body(&ext.0)?)),
         }
     }
+}
+
+/// Clock-skew tolerance for the attestation freshness check (§9.14): 300
+/// seconds (5 minutes).
+///
+/// §9.7.1 verifier check 13 rejects any attestation whose `issued_at` is dated
+/// more than this far beyond the verifier's current time. §9.14 states: "Clock
+/// skew tolerance: 5 minutes. Messages with timestamps more than 5 minutes in
+/// the future are rejected."
+///
+/// This is numerically equal to
+/// [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`] (both 300s, both anchored to the
+/// §9.14 tolerance) but is a **distinct** semantic constant: this bounds how far
+/// an attestation's `issued_at` may lead the verifier's clock, whereas that one
+/// bounds how stale the resolver-cache document backing the current-key check
+/// (checks 1–2) may be. They are kept separate so a future change to one does
+/// not silently move the other.
+pub const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
+
+/// A specific, typed reason a [`KeyPackageAttestation`] failed
+/// [`verify_attestation`] (§9.7.1 "Verification (MUST) — the checks").
+///
+/// Exactly one variant per failing check, so a caller (and a wiring-slice
+/// verifier) learns *which* invariant broke without string parsing. The numbers
+/// in each variant's docs are the §9.7.1 check numbers.
+///
+/// Checks **1 and 2** (the `signing_key_id` names the DID's *current*
+/// `#active`/`#agent` verification method, and the resolving document is no
+/// older than [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`]) are **NOT** in this
+/// enum: they are the runtime caller's responsibility — the caller performs DID
+/// resolution and passes the already-resolved current key in
+/// [`AttestationVerificationContext::resolved_current_vm_pubkey`]. See
+/// [`verify_attestation`] for the exact caller contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AttestationVerifyError {
+    /// The caller declared an [`AttestationTrigger::Add`] but supplied no
+    /// `KeyPackage` `init_key` in the context — checks 7–8 cannot run, so the
+    /// join fails closed. This is a caller-contract violation (an Add MUST carry
+    /// a `KeyPackage`, RFC 9420 §7.1), not a numbered §9.7.1 check.
+    #[error("Add trigger requires the KeyPackage init_key, but none was supplied")]
+    MissingKeyPackageInitKey,
+
+    /// Check 3: the Ed25519 signature does not verify against the resolved
+    /// current verification method. This is also what makes **rotation =
+    /// revocation** (§9.12): an attestation signed by a rotated-away key fails
+    /// here once the caller resolves the DID's current key.
+    #[error("attestation signature does not verify against the resolved current key")]
+    SignatureInvalid,
+
+    /// Check 4: the attestation's `leaf_signature_key` does not equal the leaf's
+    /// actual `signature_key`.
+    #[error("attestation leaf_signature_key does not match the leaf's signature_key")]
+    LeafSignatureKeyMismatch,
+
+    /// Check 5: the attestation's `leaf_encryption_key` does not equal the
+    /// leaf's actual ratchet-tree `encryption_key`.
+    #[error("attestation leaf_encryption_key does not match the leaf's encryption_key")]
+    LeafEncryptionKeyMismatch,
+
+    /// Check 6: the attestation's `wrapping_key` does not equal the leaf's
+    /// `scp_wrapping_key` (`0xFF01`) extension value.
+    #[error("attestation wrapping_key does not match the leaf's scp_wrapping_key extension")]
+    WrappingKeyMismatch,
+
+    /// Check 7 (Add/Welcome only): the attestation's `init_key` does not equal
+    /// the `KeyPackage`'s `init_key` — the read-as-victim-at-join vector.
+    #[error("attestation init_key does not match the KeyPackage init_key")]
+    InitKeyMismatch,
+
+    /// Check 8 (Add/Welcome only): the `KeyPackage`'s `init_key` equals its
+    /// `encryption_key` — a malformed `KeyPackage` per RFC 9420 §10.1.
+    #[error("KeyPackage init_key equals encryption_key (RFC 9420 §10.1 malformed KeyPackage)")]
+    InitKeyEqualsEncryptionKey,
+
+    /// Check 9: the attestation's `did` does not equal the DID in the leaf's
+    /// `ScpCredential`.
+    #[error("attestation did does not match the leaf credential did")]
+    DidMismatch,
+
+    /// Check 10: the attestation's `signing_key_id` does not equal the
+    /// `signing_key_id` in the leaf's `ScpCredential`.
+    #[error("attestation signing_key_id does not match the leaf credential signing_key_id")]
+    SigningKeyIdMismatch,
+
+    /// Check 11: the attestation's `[issued_at, expires_at]` window does not
+    /// exactly equal the leaf's `Lifetime` `[not_before, not_after]`.
+    #[error("attestation validity window does not equal the leaf Lifetime window")]
+    LifetimeWindowMismatch,
+
+    /// Check 12: `expires_at - issued_at` exceeds
+    /// [`MAX_KEYPACKAGE_ATTESTATION_LIFETIME`].
+    #[error("attestation lifetime exceeds the protocol maximum")]
+    LifetimeTooLong,
+
+    /// Check 13a: `expires_at <= issued_at` (the window is non-positive).
+    #[error("attestation expires_at is not strictly after issued_at")]
+    ExpiresNotAfterIssued,
+
+    /// Check 13b: the attestation is expired at the verifier's current time
+    /// (`now > expires_at`).
+    #[error("attestation is expired at the verifier's current time")]
+    Expired,
+
+    /// Check 13c: `issued_at` is dated further into the future than the §9.14
+    /// clock-skew tolerance ([`CLOCK_SKEW_TOLERANCE_SECS`]).
+    #[error("attestation issued_at is too far in the future (beyond clock-skew tolerance)")]
+    IssuedInFuture,
+}
+
+/// The already-resolved ground-truth inputs [`verify_attestation`] checks a
+/// [`KeyPackageAttestation`] against (§9.7.1 "the checks").
+///
+/// Flat named-field bundle (per the SCP agent-first API standard) of everything
+/// the **pure** verifier needs; it performs **no** I/O, DID resolution, or leaf
+/// parsing. The wiring slice populates each field from the processing
+/// leaf/`KeyPackage`, the leaf's `ScpCredential`, and the DID resolver, then
+/// calls [`verify_attestation`].
+///
+/// # There is no `context_id` / same-context field — by design
+///
+/// A [`KeyPackageAttestation`] is **context-agnostic** (§9.5.2, §9.7.1): a
+/// `KeyPackage` is a pre-published, offline-mintable pre-key bundle, so the
+/// context it will be added to is unknowable at mint time. **§9.7.1 defines no
+/// "same-context" attestation check** — group/context binding is provided
+/// separately and structurally by the `scp_context_params` `GroupContext`
+/// extension (`0xFF02`, §5.13.3), which is enforced elsewhere, NOT by this
+/// verifier. This struct therefore carries no context field; adding one would be
+/// a fabricated check implying a guarantee the attestation does not make.
+#[derive(Debug, Clone, Copy)]
+pub struct AttestationVerificationContext<'a> {
+    /// The **current** `#active`/`#agent` public key the caller resolved from
+    /// the signer's DID document (raw 32-byte Ed25519). The signature (check 3)
+    /// is verified against this key.
+    ///
+    /// **Caller contract (§9.7.1 checks 1–2 — NOT re-checked here).** The caller
+    /// MUST resolve the verification method named by
+    /// `attestation.signing_key_id` from the signer's DID document, and that
+    /// document MUST be no older than
+    /// [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`] (300s). On an
+    /// [`AttestationTrigger::Add`] this resolution is **fail-closed** (a
+    /// resolution failure rejects the join; no stale/pre-rotation fallback). On
+    /// an [`AttestationTrigger::Update`] a *transient resolution failure* may use
+    /// the member's last-known-good document (bounded grace), but a resolution
+    /// *success* returning a rotated-away key MUST pass a rotated key here so
+    /// that check 3 fails (rotation = revocation). Passing a stale or
+    /// wrong-persona key silently defeats revocation — this pure function cannot
+    /// detect that and trusts the caller for it.
+    pub resolved_current_vm_pubkey: &'a [u8; PUBLIC_KEY_SIZE],
+    /// The leaf's actual `signature_key` (check 4).
+    pub leaf_signature_key: &'a [u8; PUBLIC_KEY_SIZE],
+    /// The leaf's actual ratchet-tree `encryption_key` (check 5).
+    pub leaf_encryption_key: &'a [u8; PUBLIC_KEY_SIZE],
+    /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension (check 6).
+    pub leaf_wrapping_key: &'a [u8; PUBLIC_KEY_SIZE],
+    /// The `KeyPackage`'s `init_key` — `Some` on an [`AttestationTrigger::Add`]
+    /// (checks 7–8), `None` on an [`AttestationTrigger::Update`] (a ratchet-tree
+    /// leaf has no `init_key`). Consistency with `trigger` is enforced by
+    /// [`verify_attestation`].
+    pub kp_init_key: Option<&'a [u8; PUBLIC_KEY_SIZE]>,
+    /// The DID carried in the leaf's `ScpCredential` (check 9).
+    pub leaf_credential_did: &'a str,
+    /// The `signing_key_id` carried in the leaf's `ScpCredential` (check 10).
+    pub leaf_credential_signing_key_id: SigningKeyId,
+    /// The leaf's `Lifetime.not_before` (check 11).
+    pub leaf_lifetime_not_before: u64,
+    /// The leaf's `Lifetime.not_after` (check 11).
+    pub leaf_lifetime_not_after: u64,
+    /// The verifier's current Unix time in seconds (check 13).
+    pub now: u64,
+    /// Which handshake event is being verified — the **structural** gate for the
+    /// Add-only `init_key` checks (7–8). Per §9.7.1 this gate is on the trigger,
+    /// **never** on `attestation.init_key == leaf_encryption_key` field equality.
+    pub trigger: AttestationTrigger,
+}
+
+/// Verifies a [`KeyPackageAttestation`] against already-resolved ground-truth
+/// inputs — the **pure** core of §9.7.1 "Verification (MUST) — the checks".
+///
+/// This function is deterministic, side-effect-free, and wasm-safe: it performs
+/// **no** DID resolution, network, or clock I/O. All resolution-dependent inputs
+/// (the current verification-method key, the leaf keys, the credential fields,
+/// the leaf `Lifetime`, and `now`) are supplied by the caller in `ctx`. It rides
+/// the browser MLS path, so it must stay allocation-light and dependency-free.
+///
+/// # Which checks this performs (pure) vs. the caller's job
+///
+/// Performs §9.7.1 checks **3–13**: signature (3); the four key bindings (4–6
+/// always, 7 on Add); the RFC 9420 §10.1 malformed-KeyPackage guard (8, Add);
+/// `did` (9) and `signing_key_id` (10) credential equality; the leaf-`Lifetime`
+/// window equality (11); the lifetime cap (12); and freshness/expiry/future-date
+/// (13). See [`AttestationVerifyError`] for the variant each check maps to.
+///
+/// Checks **1–2** — that `attestation.signing_key_id` names the DID's *current*
+/// `#active`/`#agent` verification method and that the resolving document is no
+/// older than [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`] — are the runtime
+/// caller's responsibility and are documented as a contract on
+/// [`AttestationVerificationContext::resolved_current_vm_pubkey`]. **This is what
+/// a later wiring slice (S4/S6/S7) MUST enforce before calling**, including the
+/// Add-vs-Update resolution-failure policy (§9.7.1 "Resolution failure policy").
+///
+/// # The `init_key` structural gate (anti-trap)
+///
+/// Checks 7–8 run **iff `ctx.trigger == AttestationTrigger::Add`** — the
+/// handshake structure — **never** because `attestation.init_key` happens to
+/// equal `leaf_encryption_key`. A bare creator/PCS-Update leaf legitimately
+/// carries `init_key == encryption_key`; keying the carve-out on that equality
+/// would reopen the read-as-victim vector (§9.5.2 field 4, §9.7.1). On an `Add`,
+/// `ctx.kp_init_key` MUST be `Some` (else [`AttestationVerifyError::MissingKeyPackageInitKey`]);
+/// on an `Update` it is ignored.
+///
+/// # Errors
+///
+/// Returns the [`AttestationVerifyError`] for the first failing check (checks
+/// are evaluated signature-first, then bindings, then credential equality, then
+/// the time/lifetime window).
+pub fn verify_attestation(
+    attestation: &KeyPackageAttestation,
+    ctx: &AttestationVerificationContext<'_>,
+) -> Result<(), AttestationVerifyError> {
+    use AttestationVerifyError as E;
+
+    // --- Check 3: signature over the §9.5.1 signing hash against the CURRENT
+    // key (rotation ⇒ revocation). The attestation's eight fields are all inside
+    // the signed hash, so this authenticates every field the bindings below
+    // compare; a tampered attestation field fails here.
+    scp_crypto::verify_ed25519_signature(
+        ctx.resolved_current_vm_pubkey,
+        &attestation.signing_hash(),
+        &attestation.signature,
+    )
+    .map_err(|_| E::SignatureInvalid)?;
+
+    // --- Checks 4–6: bind all three per-leaf keys (present on every leaf, both
+    // triggers). Compared against the leaf's ACTUAL keys, not attestation-vs-
+    // attestation, so a mismatch is a substituted leaf key.
+    if attestation.leaf_signature_key != *ctx.leaf_signature_key {
+        return Err(E::LeafSignatureKeyMismatch);
+    }
+    if attestation.leaf_encryption_key != *ctx.leaf_encryption_key {
+        return Err(E::LeafEncryptionKeyMismatch);
+    }
+    if attestation.wrapping_key != *ctx.leaf_wrapping_key {
+        return Err(E::WrappingKeyMismatch);
+    }
+
+    // --- Checks 7–8: init_key, Add/Welcome ONLY. Gated on the trigger
+    // (structure), NEVER on field-value equality (§9.7.1 anti-trap). An Update
+    // replaces a ratchet-tree leaf that has no init_key, so these do not run.
+    match ctx.trigger {
+        AttestationTrigger::Add => {
+            let kp_init_key = ctx.kp_init_key.ok_or(E::MissingKeyPackageInitKey)?;
+            // Check 7: the attestation binds the KeyPackage's init_key.
+            if attestation.init_key != *kp_init_key {
+                return Err(E::InitKeyMismatch);
+            }
+            // Check 8 (RFC 9420 §10.1): the KeyPackage's two HPKE keys must be
+            // distinct. Compared on the ACTUAL KeyPackage/leaf keys.
+            if *kp_init_key == *ctx.leaf_encryption_key {
+                return Err(E::InitKeyEqualsEncryptionKey);
+            }
+        }
+        AttestationTrigger::Update => {
+            // No init_key on a ratchet-tree leaf; checks 7–8 are correctly
+            // skipped. A bare leaf's init_key == encryption_key is legitimate.
+        }
+    }
+
+    // --- Check 9: did equals the leaf credential DID.
+    if attestation.did != ctx.leaf_credential_did {
+        return Err(E::DidMismatch);
+    }
+    // --- Check 10: signing_key_id equals the leaf credential signing_key_id.
+    if attestation.signing_key_id != ctx.leaf_credential_signing_key_id {
+        return Err(E::SigningKeyIdMismatch);
+    }
+
+    // --- Check 11: the attestation window equals the leaf Lifetime exactly (not
+    // a wider self-asserted one).
+    if attestation.issued_at != ctx.leaf_lifetime_not_before
+        || attestation.expires_at != ctx.leaf_lifetime_not_after
+    {
+        return Err(E::LifetimeWindowMismatch);
+    }
+
+    // --- Check 13a: strictly-positive window (also makes the check-12
+    // subtraction underflow-safe).
+    if attestation.expires_at <= attestation.issued_at {
+        return Err(E::ExpiresNotAfterIssued);
+    }
+    // --- Check 12: lifetime cap. `expires_at > issued_at` above ⇒ no underflow.
+    if attestation.expires_at - attestation.issued_at > MAX_KEYPACKAGE_ATTESTATION_LIFETIME {
+        return Err(E::LifetimeTooLong);
+    }
+    // --- Check 13b: unexpired at the verifier's current time (now == expires_at
+    // is still valid; not_after is inclusive).
+    if ctx.now > attestation.expires_at {
+        return Err(E::Expired);
+    }
+    // --- Check 13c: issued_at not dated beyond the §9.14 clock-skew tolerance.
+    // Saturating add so a near-`u64::MAX` `now` cannot overflow.
+    if attestation.issued_at > ctx.now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS) {
+        return Err(E::IssuedInFuture);
+    }
+
+    Ok(())
 }
 
 /// Builds [`Capabilities`] declaring both SCP `LeafNode` extension types.
@@ -792,5 +1097,366 @@ mod tests {
             b"SCP-KEYPACKAGE-ATTESTATION-V1:"
         );
         assert_eq!(SCP_KEYPACKAGE_ATTESTATION_DOMAIN.len(), 30);
+    }
+
+    // == verify_attestation (§9.7.1 "the checks") ============================
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::{RngCore, rngs::OsRng};
+
+    const ISSUED: u64 = 1_700_000_000;
+    const EXPIRES: u64 = 1_700_086_400; // ISSUED + 86_400 (1 day)
+    const NOW: u64 = 1_700_000_100; // inside [ISSUED, EXPIRES]
+
+    /// A fresh random 32-byte key (CSPRNG; test-only ground-truth material).
+    fn rand_key() -> [u8; PUBLIC_KEY_SIZE] {
+        let mut b = [0u8; PUBLIC_KEY_SIZE];
+        OsRng.fill_bytes(&mut b);
+        b
+    }
+
+    /// Signs `att` in place under `signer`, over its §9.5.1 `signing_hash()`
+    /// (the *only* correct signable input). The real signer is a later slice;
+    /// this test helper stands in for it.
+    fn sign_in_place(att: &mut KeyPackageAttestation, signer: &SigningKey) {
+        att.signature = signer.sign(&att.signing_hash()).to_bytes();
+    }
+
+    /// Owned ground-truth values a test can mutate, then borrow into a context
+    /// via [`Truth::ctx`]. Fields that are ALSO signed (`did`, `signing_key_id`,
+    /// `issued_at`, `expires_at`, `init_key` on Add) must be changed on the
+    /// attestation and re-signed to test their check; fields that are ONLY
+    /// context inputs (the resolved key, the leaf keys, `now`, the leaf
+    /// `Lifetime` bounds, `leaf_credential_*`) can be flipped here alone, leaving
+    /// a still-valid signature so the target check fails in isolation.
+    struct Truth {
+        signer_pubkey: [u8; PUBLIC_KEY_SIZE],
+        leaf_sig: [u8; PUBLIC_KEY_SIZE],
+        leaf_enc: [u8; PUBLIC_KEY_SIZE],
+        leaf_wrap: [u8; PUBLIC_KEY_SIZE],
+        kp_init: [u8; PUBLIC_KEY_SIZE],
+        did: String,
+        skid: SigningKeyId,
+        not_before: u64,
+        not_after: u64,
+        now: u64,
+        trigger: AttestationTrigger,
+    }
+
+    impl Truth {
+        fn ctx(&self) -> AttestationVerificationContext<'_> {
+            AttestationVerificationContext {
+                resolved_current_vm_pubkey: &self.signer_pubkey,
+                leaf_signature_key: &self.leaf_sig,
+                leaf_encryption_key: &self.leaf_enc,
+                leaf_wrapping_key: &self.leaf_wrap,
+                kp_init_key: match self.trigger {
+                    AttestationTrigger::Add => Some(&self.kp_init),
+                    AttestationTrigger::Update => None,
+                },
+                leaf_credential_did: &self.did,
+                leaf_credential_signing_key_id: self.skid,
+                leaf_lifetime_not_before: self.not_before,
+                leaf_lifetime_not_after: self.not_after,
+                now: self.now,
+                trigger: self.trigger,
+            }
+        }
+    }
+
+    /// A fully-valid, signed `(attestation, Truth, signer)` triple for the given
+    /// trigger. On `Update` the leaf has no `KeyPackage`, so the attestation's
+    /// `init_key` field carries `leaf_encryption_key` (a bare leaf) — this
+    /// exercises the anti-trap path where `init_key == encryption_key` is
+    /// legitimate.
+    fn valid_fixture(trigger: AttestationTrigger) -> (KeyPackageAttestation, Truth, SigningKey) {
+        let signer = SigningKey::generate(&mut OsRng);
+        let leaf_sig = rand_key();
+        let leaf_enc = rand_key();
+        let leaf_wrap = rand_key();
+        let kp_init = rand_key();
+        let att_init = match trigger {
+            AttestationTrigger::Add => kp_init,
+            AttestationTrigger::Update => leaf_enc,
+        };
+        let did = "did:dht:z6MkVerifyTest".to_owned();
+        let skid = SigningKeyId::Active;
+        let mut att = KeyPackageAttestation {
+            did: did.clone(),
+            leaf_signature_key: leaf_sig,
+            leaf_encryption_key: leaf_enc,
+            init_key: att_init,
+            wrapping_key: leaf_wrap,
+            signing_key_id: skid,
+            issued_at: ISSUED,
+            expires_at: EXPIRES,
+            signature: [0u8; SIGNATURE_SIZE],
+        };
+        sign_in_place(&mut att, &signer);
+        let truth = Truth {
+            signer_pubkey: signer.verifying_key().to_bytes(),
+            leaf_sig,
+            leaf_enc,
+            leaf_wrap,
+            kp_init,
+            did,
+            skid,
+            not_before: ISSUED,
+            not_after: EXPIRES,
+            now: NOW,
+            trigger,
+        };
+        (att, truth, signer)
+    }
+
+    // -- positive ------------------------------------------------------------
+
+    #[test]
+    fn valid_add_passes() {
+        let (att, truth, _s) = valid_fixture(AttestationTrigger::Add);
+        assert_eq!(verify_attestation(&att, &truth.ctx()), Ok(()));
+    }
+
+    #[test]
+    fn valid_update_passes() {
+        let (att, truth, _s) = valid_fixture(AttestationTrigger::Update);
+        assert_eq!(verify_attestation(&att, &truth.ctx()), Ok(()));
+    }
+
+    // -- check 3: signature / rotation = revocation --------------------------
+
+    #[test]
+    fn add_wrong_resolved_key_is_signature_error() {
+        // A rotated-away #active key: the caller resolves a DIFFERENT current
+        // key than the one that signed. Signature must fail (rotation revokes).
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.signer_pubkey = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn update_wrong_resolved_key_is_signature_error() {
+        // Rotation revokes on an Update's resolution SUCCESS too, exactly as on
+        // an Add (§9.7.1 check 1: a rotated key still rejects).
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Update);
+        truth.signer_pubkey = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn tampered_signature_is_signature_error() {
+        let (mut att, truth, _s) = valid_fixture(AttestationTrigger::Add);
+        att.signature[0] ^= 0x01;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::SignatureInvalid)
+        );
+    }
+
+    // -- checks 4–6: key bindings (flip the LEAF input, keep signature valid) -
+
+    #[test]
+    fn leaf_signature_key_mismatch() {
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.leaf_sig = rand_key();
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::LeafSignatureKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn leaf_encryption_key_mismatch() {
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.leaf_enc = rand_key();
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::LeafEncryptionKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn wrapping_key_mismatch() {
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.leaf_wrap = rand_key();
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::WrappingKeyMismatch)
+        );
+    }
+
+    // -- checks 7–8: init_key, Add-only --------------------------------------
+
+    #[test]
+    fn add_init_key_mismatch() {
+        // The KeyPackage's init_key (context input, unsigned) differs from the
+        // attested init_key — the read-as-victim-at-join substitution.
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.kp_init = rand_key();
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::InitKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn add_init_key_equals_encryption_key() {
+        // Malformed KeyPackage (RFC 9420 §10.1): init_key == encryption_key.
+        // Set the attested init_key to leaf_enc AND the KeyPackage init_key to
+        // leaf_enc so check 7 passes and check 8 fires; re-sign the changed field.
+        let (mut att, mut truth, signer) = valid_fixture(AttestationTrigger::Add);
+        att.init_key = truth.leaf_enc;
+        sign_in_place(&mut att, &signer);
+        truth.kp_init = truth.leaf_enc;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::InitKeyEqualsEncryptionKey)
+        );
+    }
+
+    #[test]
+    fn add_missing_kp_init_key_fails_closed() {
+        // Caller declares Add but supplies no KeyPackage init_key: fail closed.
+        let (att, truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let mut ctx = truth.ctx();
+        ctx.kp_init_key = None;
+        assert_eq!(
+            verify_attestation(&att, &ctx),
+            Err(AttestationVerifyError::MissingKeyPackageInitKey)
+        );
+    }
+
+    /// ANTI-TRAP: an Update leaf with `init_key == encryption_key` is legitimate
+    /// (a bare ratchet-tree leaf) and MUST be accepted — the Add-only checks
+    /// (7–8) are gated on the TRIGGER, never on that field equality (§9.7.1).
+    #[test]
+    fn update_with_init_key_equal_to_encryption_key_is_accepted() {
+        let (att, truth, _s) = valid_fixture(AttestationTrigger::Update);
+        assert_eq!(
+            att.init_key, att.leaf_encryption_key,
+            "the Update fixture must exhibit init_key == encryption_key to guard the trap"
+        );
+        assert_eq!(verify_attestation(&att, &truth.ctx()), Ok(()));
+    }
+
+    // -- checks 9–10: credential equality ------------------------------------
+
+    #[test]
+    fn did_mismatch() {
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.did = "did:dht:z6MkDifferent".to_owned();
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::DidMismatch)
+        );
+    }
+
+    #[test]
+    fn signing_key_id_mismatch() {
+        // Attestation signed under #active; credential claims #agent.
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        assert_eq!(att.signing_key_id, SigningKeyId::Active);
+        truth.skid = SigningKeyId::Agent;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::SigningKeyIdMismatch)
+        );
+    }
+
+    // -- check 11: window equals the leaf Lifetime ---------------------------
+
+    #[test]
+    fn lifetime_window_mismatch() {
+        // Flip the leaf Lifetime (context input) so it no longer equals the
+        // attested window; signature stays valid.
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.not_after = EXPIRES + 1;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::LifetimeWindowMismatch)
+        );
+    }
+
+    // -- checks 12–13: lifetime cap, freshness -------------------------------
+
+    #[test]
+    fn lifetime_too_long() {
+        // Window one second past the cap; leaf Lifetime matches (check 11 OK).
+        let (mut att, mut truth, signer) = valid_fixture(AttestationTrigger::Add);
+        att.expires_at = att.issued_at + MAX_KEYPACKAGE_ATTESTATION_LIFETIME + 1;
+        sign_in_place(&mut att, &signer);
+        truth.not_after = att.expires_at;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::LifetimeTooLong)
+        );
+    }
+
+    #[test]
+    fn lifetime_exactly_max_passes() {
+        // Boundary: a window of exactly the cap is accepted (`>` rejects).
+        let (mut att, mut truth, signer) = valid_fixture(AttestationTrigger::Add);
+        att.expires_at = att.issued_at + MAX_KEYPACKAGE_ATTESTATION_LIFETIME;
+        sign_in_place(&mut att, &signer);
+        truth.not_after = att.expires_at;
+        assert_eq!(verify_attestation(&att, &truth.ctx()), Ok(()));
+    }
+
+    #[test]
+    fn expires_not_after_issued() {
+        // Degenerate window (expires == issued); leaf Lifetime matches.
+        let (mut att, mut truth, signer) = valid_fixture(AttestationTrigger::Add);
+        att.expires_at = att.issued_at;
+        sign_in_place(&mut att, &signer);
+        truth.not_after = att.expires_at;
+        // `now` must not itself trip Expired before check 13a is reached: put it
+        // at the window so `now > expires_at` is false.
+        truth.now = att.issued_at;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::ExpiresNotAfterIssued)
+        );
+    }
+
+    #[test]
+    fn expired() {
+        // `now` past expiry (context input, unsigned).
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.now = EXPIRES + 1;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::Expired)
+        );
+    }
+
+    #[test]
+    fn issued_in_future_beyond_skew() {
+        // issued_at leads `now` by more than the §9.14 skew tolerance.
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.now = ISSUED - (CLOCK_SKEW_TOLERANCE_SECS + 1);
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::IssuedInFuture)
+        );
+    }
+
+    #[test]
+    fn issued_at_skew_boundary_is_inclusive() {
+        // Exactly at the skew boundary (issued_at == now + skew): accepted.
+        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        truth.now = ISSUED - CLOCK_SKEW_TOLERANCE_SECS;
+        assert_eq!(verify_attestation(&att, &truth.ctx()), Ok(()));
+        // One second tighter: rejected.
+        truth.now = ISSUED - CLOCK_SKEW_TOLERANCE_SECS - 1;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::IssuedInFuture)
+        );
     }
 }
