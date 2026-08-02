@@ -20,7 +20,7 @@
       "gate": "gate-cryptomove-0",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/actor/state.rs",
         "crates/scp-runtime/src/crypto/mls/provider.rs"
@@ -54,7 +54,7 @@
       "gate": "gate-cryptomove-0",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/crypto/mls/provider.rs"
       ],
@@ -84,7 +84,7 @@
       "gate": "gate-cryptomove-0",
       "priority": "P0",
       "severity": "moderate",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/crypto/mls/provider.rs",
         "crates/scp-runtime/src/crypto/mls/backend.rs",
@@ -119,7 +119,7 @@
       "gate": "gate-cryptomove-0",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/crypto/mls/provider.rs"
       ],
@@ -150,7 +150,7 @@
       "gate": "gate-cryptomove-0",
       "priority": "P0",
       "severity": "moderate",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/crypto/mls/provider.rs"
       ],
@@ -181,7 +181,7 @@
       "gate": "gate-cryptomove-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/lifecycle_helpers.rs",
         "crates/scp-runtime/src/context/messaging_helpers.rs",
