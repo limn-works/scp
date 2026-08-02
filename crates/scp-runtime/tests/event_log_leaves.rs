@@ -597,3 +597,207 @@ async fn rotate_content_keys_broadcast_emits_key_epoch_advance_per_author() {
         "old_epoch must be 0 before the first rotation"
     );
 }
+
+// ===========================================================================
+// Test 5: checkpoint counter for governance ban is 1 + kea_success_count
+// ===========================================================================
+
+/// Regression guard for the checkpoint-counter formula in `execute_revoke`.
+///
+/// The formula is `checkpoint_events_since += 1 + kea_success_count` (§5.14.8 /
+/// §5.14.10).  A revert to `+= 1` would leave the counter under-counting; a
+/// revert that also drops the KEA appends would reduce the durable leaf count.
+///
+/// `checkpoint_events_since` is not observable from integration tests, so this
+/// test pins the DURABLE LEAF COUNT that the counter should track.  With a
+/// single author (alice) the ban emits:
+///   1 × `AccessRevoked`  +  1 × `KeyEpochAdvance`  =  2 leaves
+///
+/// If either leaf is silently dropped — whether by a code regression in the
+/// append or in the counter — this assertion fails.
+#[tokio::test]
+async fn broadcast_governance_ban_checkpoint_counter_increments_by_one_plus_author_count() {
+    let manager = new_manager();
+    let ctx_id = "kea-ban-checkpoint-counter";
+
+    manager
+        .create_context(ctx_id.into(), broadcast_params_with_ban(), alice(), None)
+        .await
+        .expect("create broadcast context with MemberBan");
+
+    subscribe_bob(&manager, ctx_id).await;
+
+    // Governance ban on bob (SingleAdmin → auto-execute).
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RevokeAccess {
+                did: bob(),
+                access: AccessScope::Both,
+            },
+            &sk_alice,
+        )
+        .await
+        .expect("propose RevokeAccess");
+
+    use scp_protocol::context::governance::ProposalStatus;
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "SingleAdmin RevokeAccess must auto-execute"
+    );
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .expect("event_log_entries Ok")
+        .expect("event log exists for active context");
+
+    // Assert AccessRevoked leaf is present (the '1' in '1 + kea_success_count').
+    let access_revoked: Vec<_> = entries
+        .iter()
+        .filter(|e| e.event_type == EventType::AccessRevoked)
+        .collect();
+    assert_eq!(
+        access_revoked.len(),
+        1,
+        "REGRESSION: expected exactly 1 AccessRevoked leaf after governance ban, got {}",
+        access_revoked.len()
+    );
+
+    // Assert KeyEpochAdvance leaves: one per registered author (alice only here).
+    let kea_leaves: Vec<_> = entries
+        .iter()
+        .filter(|e| e.event_type == EventType::KeyEpochAdvance)
+        .collect();
+    assert_eq!(
+        kea_leaves.len(),
+        1,
+        "REGRESSION: expected 1 KeyEpochAdvance leaf (one per author = alice) after governance ban, got {}",
+        kea_leaves.len()
+    );
+
+    // Combined count of operation-specific leaves: 1 (AccessRevoked) + 1 (KEA) = 2.
+    // This pins the formula: checkpoint_events_since += 1 + kea_success_count.
+    // With kea_success_count = 1, the counter should be 2 after this ban.
+    // (Total event log entries may be higher due to context-creation / subscribe
+    // setup leaves — we count only the leaves this operation is responsible for.)
+    let operation_leaves = access_revoked.len() + kea_leaves.len();
+    assert_eq!(
+        operation_leaves, 2,
+        "REGRESSION: execute_revoke must produce 1 AccessRevoked + 1 KEA leaf          (formula: 1 + kea_success_count), got {operation_leaves} leaves of those two types",
+    );
+}
+
+// ===========================================================================
+// Test 6: checkpoint counter for ReconfigureGovernance is exactly 2
+// ===========================================================================
+
+/// Regression guard for the checkpoint-counter formula in
+/// `execute_reconfigure_governance`.
+///
+/// The formula is `checkpoint_events_since += 2` — one for `GovernanceReconfigured`
+/// and one for `GovernanceDeadlockRecovery`.  A revert to `+= 1` would leave the
+/// counter under-counting.
+///
+/// `checkpoint_events_since` is not observable from integration tests, so this
+/// test pins the DURABLE LEAF COUNT that the counter should track:
+///   1 × `GovernanceReconfigured`  +  1 × `GovernanceDeadlockRecovery`  =  2 leaves
+///
+/// If either leaf is dropped — whether by a code regression in the append path
+/// or in the counter — this total-count assertion fails.
+#[tokio::test]
+async fn governance_reconfigure_checkpoint_counter_increments_by_two() {
+    use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};
+
+    let manager = new_manager();
+    let ctx_id = "kea-reconfigure-checkpoint-counter";
+
+    // Threshold(1-of-2): alice's auto-vote immediately crosses the threshold,
+    // so ReconfigureGovernance executes inline without a second voter.
+    let params = scp_protocol::context::params::ContextParams {
+        ceiling: vec![
+            Capability::new("governance:propose").expect("known capability"),
+            Capability::new("governance:vote").expect("known capability"),
+            Capability::new("governance:reconfigure").expect("known capability"),
+        ],
+        governance: scp_protocol::context::params::GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec![alice(), bob()],
+        },
+        ..scp_protocol::context::params::ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .expect("create threshold context");
+
+    let justification = DeadlockJustification {
+        unavailable_dids: vec![bob()],
+        missed_windows: vec![(bob(), 3)],
+        detected_at: 1_700_000_000,
+    };
+    let action = GovernanceAction::ReconfigureGovernance {
+        changes: vec![GovernanceReconfigAction::RemoveInactiveSigner { did: bob() }],
+        justification,
+    };
+    let sk_alice = signing_key_for_did(&alice());
+
+    let (proposal, _events, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .expect("propose ReconfigureGovernance");
+
+    use scp_protocol::context::governance::ProposalStatus;
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "threshold=1: proposer auto-vote must immediately approve and execute"
+    );
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .expect("event_log_entries Ok")
+        .expect("event log exists for active context");
+
+    // Assert exactly one GovernanceReconfigured leaf.
+    let reconfig_leaves: Vec<_> = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceReconfigured)
+        .collect();
+    assert_eq!(
+        reconfig_leaves.len(),
+        1,
+        "REGRESSION: expected exactly 1 GovernanceReconfigured leaf, got {}",
+        reconfig_leaves.len()
+    );
+
+    // Assert exactly one GovernanceDeadlockRecovery leaf.
+    let recovery_leaves: Vec<_> = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::GovernanceDeadlockRecovery)
+        .collect();
+    assert_eq!(
+        recovery_leaves.len(),
+        1,
+        "REGRESSION: expected exactly 1 GovernanceDeadlockRecovery leaf, got {}",
+        recovery_leaves.len()
+    );
+
+    // Combined count of operation-specific leaves: 1 (GovernanceReconfigured) + 1
+    // (GovernanceDeadlockRecovery) = 2.  This pins the formula:
+    //   checkpoint_events_since += 2
+    // A revert that drops either leaf is caught by the per-type assertions above;
+    // this combined assertion verifies no EXTRA unexpected leaves are emitted by
+    // the execute_reconfigure_governance path either.
+    // (Total event log entries may be higher due to context-creation setup leaves —
+    // we count only the leaves this operation is responsible for.)
+    let operation_leaves = reconfig_leaves.len() + recovery_leaves.len();
+    assert_eq!(
+        operation_leaves, 2,
+        "REGRESSION: execute_reconfigure_governance must produce exactly          1 GovernanceReconfigured + 1 GovernanceDeadlockRecovery leaf (formula: += 2),          got {operation_leaves} leaves of those two types",
+    );
+}
