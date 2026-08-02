@@ -5412,7 +5412,7 @@ impl ClassSCell
     ) -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestClassSCell".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

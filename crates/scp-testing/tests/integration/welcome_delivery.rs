@@ -17,7 +17,7 @@
 //! sender-key distribution framing (H3).
 //!
 //! The legacy provider single-slot join (`prepare_key_package_for_join` +
-//! `MlsCryptoProvider::join_from_welcome`) has been retired; these tests drive
+//! `NodeMlsFactory::join_from_welcome`) has been retired; these tests drive
 //! the production `Supervisor` API. The comprehensive spawn-from-Welcome KATs
 //! (signature / binding / rollback / replay) live in the runtime unit suite
 //! `spawn_from_welcome_tests.rs`.
@@ -137,7 +137,7 @@ async fn cross_process_welcome_delivery() {
 /// This is the fullstack owner of the joiner→creator APPLICATION round-trip
 /// property that the runtime unit test
 /// `spawn_from_welcome_application_data_round_trips_joiner_to_creator` used to
-/// prove by driving `MlsCryptoProvider::seal` / `open` DIRECTLY on the provider.
+/// prove by driving `NodeMlsFactory::seal` / `open` DIRECTLY on the provider.
 /// PR-7 moved the per-context seal/open crypto off the provider and onto the live
 /// actor, so the unit-level bare-provider fixture can no longer drive a real
 /// seal/open round-trip (its `take_into_actor` double-take panics once the crypto
@@ -236,7 +236,7 @@ async fn welcome_joiner_application_data_round_trips_to_creator() {
 /// property the runtime unit tests
 /// `spawn_from_welcome_group_round_trips_both_directions` and
 /// `invite_member_round_trip_stands_up_a_bidirectional_joiner` used to prove by
-/// driving `MlsCryptoProvider::mls_encrypt_management` / `open` DIRECTLY on the
+/// driving `NodeMlsFactory::mls_encrypt_management` / `open` DIRECTLY on the
 /// provider (both directions, group-keyed management).
 ///
 /// # Why APPLICATION traffic (not the units' group-keyed management path)

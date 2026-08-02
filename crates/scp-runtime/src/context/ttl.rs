@@ -1129,12 +1129,12 @@ mod tests {
 
     use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 
-    /// Test DID used by the real [`MlsCryptoProvider`] in test bodies.
+    /// Test DID used by the real [`NodeMlsFactory`] in test bodies.
     ///
     /// The prior `MockCrypto` / `FailingMlsCrypto` / `TransientFailCrypto`
     /// scaffolds are deleted along with the `ContextCryptoProvider`
     /// trait in ADR-049 §15. Success-path tests now build a
-    /// real [`MlsCryptoProvider::new(TEST_DID.to_owned())`]; tests that
+    /// real [`NodeMlsFactory::new(TEST_DID.to_owned())`]; tests that
     /// asserted mock trackers (`mls_destroyed` counts, sender-key-destroyed
     /// counts) or fail-injection semantics are `#[ignore]`d pending
     /// `MlsBackend`-level fail-injection in ADR-049 §15.
@@ -1522,7 +1522,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Smoke tests — just exercise the real MlsCryptoProvider path.
+    // Smoke tests — just exercise the real NodeMlsFactory path.
     // Deeper behaviour was covered by mock trackers that no longer exist;
     // those tests are deferred to ADR-049 §15 (MlsBackend injection).
     // ---------------------------------------------------------------------------
@@ -1544,7 +1544,7 @@ mod tests {
         let handle = active_handle("ctx-eph", MemoryScope::Ephemeral);
         handle.transition_to(&ContextState::Closing).unwrap();
         let res = finalize_close(&handle, &transport, &event_log, 1_700_000_000).await;
-        // Real MlsCryptoProvider is idempotent on destroy for unregistered ctxs.
+        // Real NodeMlsFactory is idempotent on destroy for unregistered ctxs.
         assert!(res.is_ok());
     }
     // #2148 (ADR-049 birth-into-actor): the ADR-056 TTL-expiry chokepoint
@@ -1685,7 +1685,7 @@ mod tests {
     }
 
     // ADR-049 §15: backend-injection seam landed via
-    // `MlsCryptoProvider::with_backends`. Pre-existing tests that
+    // `NodeMlsFactory::with_backends`. Pre-existing tests that
     // asserted `MockCrypto` tracker behaviour (mls_destroyed counters,
     // sender-key-destroyed counters, fail-injection retry semantics)
     // are now expressed by passing a fail-injecting
@@ -1697,10 +1697,10 @@ mod tests {
     fn ttl_fail_injection_uses_backend_injection() {
         use crate::crypto::hpke_backend::ProductionHpkeBackend;
         use crate::crypto::mls::production_backend::ProductionMlsBackend;
-        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use crate::crypto::mls::provider::NodeMlsFactory;
         use std::sync::Arc;
 
-        let provider = MlsCryptoProvider::with_backends(
+        let provider = NodeMlsFactory::with_backends(
             TEST_DID.to_owned(),
             Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
                 scp_clock::SystemClock,

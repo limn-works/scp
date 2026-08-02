@@ -8,7 +8,7 @@
 //! The manager is initialized once (via `OnceLock`) with production provider
 //! implementations:
 //!
-//! - `MlsCryptoProvider` — Real OpenMLS-backed encryption, sender key
+//! - `NodeMlsFactory` — Real OpenMLS-backed encryption, sender key
 //!   generation, and group management. Wired in issue #1294.
 //! - `NotConfiguredTransportProvider` (from `scp-core`) — Returns descriptive
 //!   errors until transport is configured. See issue #501.
@@ -961,11 +961,11 @@ impl HandleInstance for crate::testing::NapiFullStackNode {
 /// production
 /// providers.
 ///
-/// Uses `MlsCryptoProvider` (real MLS encryption, #1294),
+/// Uses `NodeMlsFactory` (real MLS encryption, #1294),
 /// `NotConfiguredTransportProvider`, `MerkleEventLogProvider` (persistent,
 /// #484), and the bridge's configured persistence.
 ///
-/// The `local_did` is passed to `MlsCryptoProvider::new` which uses it as
+/// The `local_did` is passed to `NodeMlsFactory::new` which uses it as
 /// the MLS credential identity for group operations and sender key generation.
 ///
 /// Event log persistence is wired via `MerkleEventLogProvider::with_persistence`
@@ -973,7 +973,7 @@ impl HandleInstance for crate::testing::NapiFullStackNode {
 /// storage provider. This ensures event log entries are persisted on each
 /// append (issue #484 AC).
 ///
-/// The `local_did` is consumed only by `MlsCryptoProvider::new` — the
+/// The `local_did` is consumed only by `NodeMlsFactory::new` — the
 /// `BridgeInstance` container carries no DID of its own (spec §12.2.3).
 ///
 /// No-op if the bridge already has a `Supervisor` attached (first
@@ -987,7 +987,7 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -1077,7 +1077,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// retained sender has no receivers, so `send` returns `Err` and the event is
 /// simply dropped without blocking context operations.
 fn build_supervisor_arc(
-    crypto: Arc<scp_core::crypto::mls::provider::MlsCryptoProvider>,
+    crypto: Arc<scp_core::crypto::mls::provider::NodeMlsFactory>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Box<dyn ContextPersistence>,
@@ -1089,7 +1089,7 @@ fn build_supervisor_arc(
     // is dropped immediately; the retained sender keeps the channel open.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     // Share the provider's exact hardened `Clock` Arc with the supervisor so the
-    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`
     // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
     // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
     let clock = crypto.clock();
@@ -1162,7 +1162,7 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -1227,7 +1227,7 @@ pub fn init_supervisor_with_relay_transport(
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         did,
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
@@ -1336,7 +1336,7 @@ pub(crate) fn init_supervisor_for_test_on(bi: &NapiBridgeInstance) {
 /// Like [`init_supervisor_for_test_on`] but wires the MLS provider with a
 /// production-valid `did:dht:z*` `local_did` instead of the `did:test:` value.
 ///
-/// `MlsCryptoProvider::validate_creator_identity` only accepts `did:test:` /
+/// `NodeMlsFactory::validate_creator_identity` only accepts `did:test:` /
 /// `did:key:` under `scp-runtime`'s `testing` feature; a `did:dht:z*` identity
 /// is accepted in plain production builds. Tests that exercise behavior which
 /// MUST hold WITHOUT the in-memory-custody / `testing` features (e.g. the
@@ -1370,7 +1370,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
         return;
     };
     let supervisor_arc = build_supervisor_arc(
-        Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             local_did.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

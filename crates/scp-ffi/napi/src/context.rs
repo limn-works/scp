@@ -727,7 +727,7 @@ pub(crate) async fn context_create_on(
     let creator_did = identity.inner.did.clone();
 
     // Initialize the Supervisor if not already done (first context_create call).
-    // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).
+    // Passes the creator DID to NodeMlsFactory for real MLS encryption (#1294).
     crate::runtime::init_supervisor(bi, &creator_did);
 
     // Derive the context-scoped pseudonym routing ID (§9.10.4, SCP-214 criterion 5).
@@ -911,14 +911,14 @@ pub(crate) async fn context_join_on(
     // Ensure the Supervisor is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
     // init_supervisor is idempotent (OnceLock — first call wins). #1073
-    // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1294).
+    // Passes the joiner DID to NodeMlsFactory for real MLS encryption (#1294).
     crate::runtime::init_supervisor(bi, &identity_did);
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
 
     // Generate a real MLS key package for the joining member (#1294).
     // The key package contains the joiner's SCP credential (DID) and is
-    // validated by MlsCryptoProvider::validate_key_package before MLS
+    // validated by NodeMlsFactory::validate_key_package before MLS
     // group addition.
     let kp_bytes = generate_mls_key_package_bytes(&identity_did)?;
 
@@ -5919,7 +5919,7 @@ mod tests {
     ///
     /// Gated on `testing`: this test wires the supervisor with a
     /// `did:test:` MLS identity (`init_supervisor_for_test_on`) and `did:key:`
-    /// member DIDs, which `MlsCryptoProvider::validate_creator_identity` only
+    /// member DIDs, which `NodeMlsFactory::validate_creator_identity` only
     /// accepts under `scp-runtime`'s `testing` feature (pulled in transitively
     /// via `testing` → `dep:scp-testing` → `scp-core/testing`).
     /// It is NOT part of the feature-free export surface; the production/bare

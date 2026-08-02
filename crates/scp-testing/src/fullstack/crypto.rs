@@ -1,7 +1,7 @@
 //! E2E crypto side channel for the full-stack harness (ADR-049 §15).
 //!
 //! After ADR-049 §15 the `ContextCryptoProvider` trait is gone:
-//! `Supervisor` binds the concrete [`MlsCryptoProvider`], and the per-context
+//! `Supervisor` binds the concrete [`NodeMlsFactory`], and the per-context
 //! MLS / sender-key / access-key state is owned by the context actor (the
 //! creator side) or by the provider directly (the joiner side, which never
 //! spawns an actor for the context).
@@ -9,7 +9,7 @@
 //! `E2eCryptoProvider` is the harness-side helper that bridges the
 //! sealed-invitation / sender-key material between two in-process nodes through
 //! a shared [`KeyExchange`]. It does NOT re-introduce a trait impl: every MLS
-//! primitive runs on the real concrete [`MlsCryptoProvider`]; the `KeyExchange`
+//! primitive runs on the real concrete [`NodeMlsFactory`]; the `KeyExchange`
 //! only carries the cross-process bootstrap bytes that a real deployment would
 //! move over transport (the creator-signed, HPKE-sealed invitation bundle and
 //! the MLS-wrapped sender-key distribution messages the inviter pushes to the
@@ -45,14 +45,14 @@
 
 use std::sync::Arc;
 
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_did::DID;
 
 use super::exchange::KeyExchange;
 
 /// Harness-side crypto helper for one `FullStackNode`.
 ///
-/// Holds the node's concrete [`MlsCryptoProvider`] plus a handle on the
+/// Holds the node's concrete [`NodeMlsFactory`] plus a handle on the
 /// shared [`KeyExchange`]. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the per-context
 /// MLS group / sender-key decrypt state is owned by the context ACTOR (creator
 /// and joiner alike now stand up a live actor), so every receive-side MLS
@@ -62,7 +62,7 @@ use super::exchange::KeyExchange;
 pub struct E2eCryptoProvider {
     /// Real crypto provider — every MLS / sender-key / access-key
     /// primitive flows through this field.
-    pub provider: Arc<MlsCryptoProvider>,
+    pub provider: Arc<NodeMlsFactory>,
     /// Shared key-exchange side channel across `FullStackNetwork` nodes.
     pub(crate) exchange: Arc<std::sync::Mutex<KeyExchange>>,
     /// This node's DID.
@@ -74,7 +74,7 @@ impl E2eCryptoProvider {
     /// `exchange` with every other node in the same `FullStackNetwork`.
     #[must_use]
     pub fn new(did: DID, exchange: Arc<std::sync::Mutex<KeyExchange>>) -> Self {
-        let provider = Arc::new(MlsCryptoProvider::new(
+        let provider = Arc::new(NodeMlsFactory::new(
             did.as_ref().to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

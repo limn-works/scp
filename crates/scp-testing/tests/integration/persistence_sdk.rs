@@ -53,7 +53,7 @@ use scp_core::context::{
     Capability, ContextMode, ContextParams, ContextState, context_id_bytes, context_routing_id,
 };
 #[cfg(feature = "sqlite")]
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 #[cfg(feature = "sqlite")]
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 #[cfg(feature = "sqlite")]
@@ -201,7 +201,7 @@ async fn context_create_persists_membership_to_sqlite() {
         // ADR-049 §15 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(
+            Arc::new(NodeMlsFactory::new(
                 ALICE_DID.to_owned(),
                 std::sync::Arc::new(scp_clock::SystemClock),
             )),
@@ -280,7 +280,7 @@ async fn context_create_persists_membership_to_sqlite() {
 ///    `CoreFields::restore_all_persisted_contexts`.
 /// 7. Verify membership survived and the context handle is restored.
 ///
-/// The new supervisor uses a NEW `MlsCryptoProvider`, so the MLS group
+/// The new supervisor uses a NEW `NodeMlsFactory`, so the MLS group
 /// itself does not survive (`OpenMLS` key material lives in the provider
 /// and is not persisted through this path — MLS state persistence is
 /// tracked separately under SCP-PERSIST-050). This test asserts what
@@ -303,7 +303,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         // ADR-049 §15 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(
+            Arc::new(NodeMlsFactory::new(
                 ALICE_DID.to_owned(),
                 std::sync::Arc::new(scp_clock::SystemClock),
             )),
@@ -372,7 +372,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     // ADR-049 §15 — `Supervisor::with_providers` replaces the
     // deleted `ContextManager::with_persistence(..)` constructor.
     let manager2 = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             ALICE_DID.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

@@ -1329,7 +1329,7 @@ mod consequence_fail_closed_tests {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_platform::in_memory::InMemoryStorage;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ADMIN.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

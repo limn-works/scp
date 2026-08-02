@@ -107,7 +107,7 @@ impl std::fmt::Debug for SenderKeyDistribution {
 
 /// The sender-key epoch a freshly generated key starts at (§9.16.5).
 ///
-/// Mirrors the native `MlsCryptoProvider`, which seeds `sender_key_epoch = 1`
+/// Mirrors the native `NodeMlsFactory`, which seeds `sender_key_epoch = 1`
 /// at keygen. Starting at 1 (not 0) keeps the first application message's
 /// 8-byte big-endian epoch prefix as `0x0000000000000001`, whose leading 4
 /// bytes are `00 00 00 00` — disjoint from the 4-byte `SCPM_MAGIC` management
@@ -423,7 +423,7 @@ impl ContextCryptoState {
     /// HPKE-seals this participant's current sender key to a single recipient and
     /// frames it as an MLS-encrypted **management** message (§9.16.1/§9.16.2).
     ///
-    /// Mirrors the native `MlsCryptoProvider` push distribution: seal → wrap in a
+    /// Mirrors the native `NodeMlsFactory` push distribution: seal → wrap in a
     /// `SenderKeyDistributionMessage::KeyResponse` (with a zeroed `request_nonce`,
     /// since this is a proactive push, not a reply to a pull request) → prepend
     /// [`MANAGEMENT_MSG_MAGIC`] → MLS-encrypt. Advancing the MLS send ratchet

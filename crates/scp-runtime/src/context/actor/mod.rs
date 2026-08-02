@@ -1232,7 +1232,7 @@ mod tests {
         use scp_platform::in_memory::InMemoryStorage;
         use std::sync::Arc;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestActorNew".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -1932,7 +1932,7 @@ mod tests {
         use scp_platform::in_memory::InMemoryStorage;
         use std::sync::Arc;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestSec1Ttl".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -2007,7 +2007,7 @@ mod tests {
 
     /// Event log whose `append_event` FAILS on the first attempt then succeeds —
     /// a transient cleanup-step failure the actor must retry. (Key destruction
-    /// itself is not independently injectable: `MlsCryptoProvider::destroy_*`
+    /// itself is not independently injectable: `NodeMlsFactory::destroy_*`
     /// are inherent DashMap ops that always return `Ok`; a transient event-log
     /// failure exercises the IDENTICAL incomplete-cleanup → keep-alive → retry
     /// path SEC-1ii guards.)

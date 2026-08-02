@@ -40,7 +40,7 @@ use scp_protocol::context::params::{
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 const ALICE: &str = "did:dht:z6MkAlice";
 const BOB: &str = "did:dht:z6MkBob";
@@ -150,7 +150,7 @@ fn ceiling() -> Vec<Capability> {
 
 fn manager_with_transport(transport: Arc<RecordingTransport>) -> std::sync::Arc<Supervisor> {
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             ALICE.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

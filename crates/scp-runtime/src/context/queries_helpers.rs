@@ -1261,7 +1261,7 @@ mod equivocation_dedup_tests {
     async fn deps_with_counting_log(appends: Arc<AtomicUsize>) -> (ActorDeps, PerContextState) {
         use scp_platform::in_memory::InMemoryStorage;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestEquivDedup".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

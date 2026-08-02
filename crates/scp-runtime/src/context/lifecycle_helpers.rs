@@ -3937,7 +3937,7 @@ mod restore_reconcile_tests {
     }
 
     fn build_supervisor(persistence: Box<dyn ContextPersistence>) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkRestoreReconcile".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -4253,7 +4253,7 @@ mod restore_reconcile_tests {
 
         // Real MLS crypto provider so `add_member` succeeds, plus a key_resolver
         // that resolves the joiner's verifying key for the spending-UCAN sig.
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkJoinMoneyOrder".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -4465,7 +4465,7 @@ mod restore_reconcile_tests {
     /// (and its former rollback-on-append-failure) is gone.
     #[tokio::test]
     async fn finalize_send_succeeds_without_durable_message_sent_append() {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkFinalizeSendSeq".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -4631,7 +4631,7 @@ mod restore_reconcile_tests {
     async fn complete_paid_action_buffers_receipt_and_mints_no_durable_leaf() {
         use scp_protocol::context::membership::ContextEvent;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkPayConverge".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

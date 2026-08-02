@@ -81,7 +81,7 @@ use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportPro
 use scp_runtime::context::persistence::ContextPersistence;
 use scp_runtime::context::state::ContextSnapshot;
 use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // RecordingPersistence — the fail-on-demand persistence fixture.
@@ -274,7 +274,7 @@ fn build_supervisor(persistence: RecordingPersistence) -> Arc<Supervisor> {
             )),
         );
     Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             Arc::new(scp_clock::SystemClock),
         )),

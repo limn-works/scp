@@ -5,7 +5,7 @@
 //! [`scp_protocol::context::memory_scope`] and
 //! [`scp_protocol::context::close`]. After ADR-049 §15 the
 //! orchestrators operate directly on the concrete
-//! [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider),
+//! [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory),
 //! so they cannot live in `scp-protocol` (which is a forward dependency
 //! of `scp-runtime`).
 //!

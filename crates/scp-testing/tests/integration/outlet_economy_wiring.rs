@@ -1,6 +1,6 @@
 // ADR-049 §15: ContextCryptoProvider trait deleted. MockCrypto
 // here reimplements that trait for unit-test coverage of outlet economy
-// wiring. Rewiring to real `MlsCryptoProvider` requires backend injection
+// wiring. Rewiring to real `NodeMlsFactory` requires backend injection
 // File gated until then.
 #![cfg(any())]
 #![allow(

@@ -50,7 +50,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use scp_clock::SystemClock;
 use scp_core::context::builder::ContextEventLogProvider;
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -828,7 +828,7 @@ impl UniffiBridgeInstance {
     /// Per-instance equivalent of the module-level
     /// `init_context_manager_with_did` free function.
     ///
-    /// Installs an `MlsCryptoProvider(local_did)` and
+    /// Installs a `NodeMlsFactory(local_did)` and
     /// `NotConfiguredTransportProvider` on this instance. No-op if a
     /// `ContextManager` is already attached.
     #[allow(dead_code)]
@@ -841,7 +841,7 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             did,
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -876,7 +876,7 @@ impl UniffiBridgeInstance {
     /// Per-instance equivalent of the module-level
     /// `init_context_manager_with_relay_transport` free function.
     ///
-    /// Installs an `MlsCryptoProvider(local_did)` and a
+    /// Installs a `NodeMlsFactory(local_did)` and a
     /// `RelayTransportProvider` wrapping the supplied `NativeRelayAdapter` on
     /// this instance. No-op if a `ContextManager` is already attached.
     #[allow(dead_code)]
@@ -893,7 +893,7 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             did,
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -921,7 +921,7 @@ impl UniffiBridgeInstance {
         self.core.set_supervisor(supervisor_arc);
     }
 
-    /// Per-instance initializer that installs an `MlsCryptoProvider(local_did)`
+    /// Per-instance initializer that installs a `NodeMlsFactory(local_did)`
     /// and an in-process loopback `LocalTransportProvider` on this instance.
     ///
     /// Mirrors [`UniffiBridgeInstance::init_context_manager_with_relay_transport`]
@@ -940,7 +940,7 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             did,
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -1448,7 +1448,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// retained sender has no receivers, so `send` returns `Err` and the event is
 /// simply dropped without blocking context operations.
 fn build_supervisor(
-    crypto: Arc<MlsCryptoProvider>,
+    crypto: Arc<NodeMlsFactory>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
@@ -1465,7 +1465,7 @@ fn build_supervisor(
     // is dropped immediately; the retained sender keeps the channel open.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
     // Share the provider's exact hardened `Clock` Arc with the supervisor so the
-    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`
     // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
     // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
     let clock = crypto.clock();

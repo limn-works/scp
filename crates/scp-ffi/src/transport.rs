@@ -335,7 +335,7 @@ impl crate::scp::PyScp {
                 ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
             })?;
 
-        let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             local_did.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));
@@ -366,7 +366,7 @@ impl crate::scp::PyScp {
     ///
     /// Unlike the default transport (`NotConfiguredTransportProvider`, which
     /// rejects every send/publish), `LocalTransportProvider` silently succeeds
-    /// on all transport calls. A real `MlsCryptoProvider` bound to `local_did`
+    /// on all transport calls. A real `NodeMlsFactory` bound to `local_did`
     /// is still installed, so `context_send` and `broadcast_publish` can be
     /// exercised end to end (encryption included) without a real relay server.
     /// This is test infrastructure for E2E flows that do not need network I/O.

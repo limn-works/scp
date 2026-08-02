@@ -2145,7 +2145,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `configure_local_transport`.
      *
-     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+     * Routes through `&*self.inner`. Installs a real `NodeMlsFactory` and
      * an in-process loopback `LocalTransportProvider` on this instance's
      * `ContextManager`. Unlike `configure_relay_transport`, this performs no
      * network I/O — it wires test infrastructure so `context_send` and
@@ -2160,7 +2160,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `configure_relay_transport`.
      *
-     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
+     * Routes through `&*self.inner`. Installs a real `NodeMlsFactory`
      * and `RelayTransportProvider` on this instance's `ContextManager`.
      */
     func configureRelayTransport(relayUrl: String, localDid: String) async throws 
@@ -4198,7 +4198,7 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
     /**
      * Per-instance equivalent of the free-function `configure_local_transport`.
      *
-     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider` and
+     * Routes through `&*self.inner`. Installs a real `NodeMlsFactory` and
      * an in-process loopback `LocalTransportProvider` on this instance's
      * `ContextManager`. Unlike `configure_relay_transport`, this performs no
      * network I/O — it wires test infrastructure so `context_send` and
@@ -4218,7 +4218,7 @@ open func configureLocalTransport(localDid: String)throws   {try rustCallWithErr
     /**
      * Per-instance equivalent of the free-function `configure_relay_transport`.
      *
-     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
+     * Routes through `&*self.inner`. Installs a real `NodeMlsFactory`
      * and `RelayTransportProvider` on this instance's `ContextManager`.
      */
 open func configureRelayTransport(relayUrl: String, localDid: String)async throws   {

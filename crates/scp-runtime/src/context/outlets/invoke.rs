@@ -8756,7 +8756,7 @@ mod tests {
         }
 
         /// AC10 — seal ONE operator-signed chunk as an A-context MLS application
-        /// message via the EXISTING `MlsCryptoProvider::seal`/`open` (no invented
+        /// message via the EXISTING `NodeMlsFactory::seal`/`open` (no invented
         /// envelope): (a) a non-A-member cannot decrypt it, (b) an A member
         /// recovers the chunk with B's operator signature INTACT and verifying
         /// against B's pinned `context_id` — never re-signed by the bridge.

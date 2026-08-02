@@ -425,7 +425,7 @@ mod tests {
         adapter: Option<Arc<dyn PaymentAdapterDyn>>,
         persistence: Box<dyn crate::context::persistence::ContextPersistence>,
     ) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             INVOKER.to_owned(),
             Arc::new(scp_clock::SystemClock),
         ));

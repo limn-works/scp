@@ -39,7 +39,7 @@ use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
 use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers (same pattern as governance_integration.rs)
@@ -154,7 +154,7 @@ fn new_manager() -> std::sync::Arc<Supervisor> {
     // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
     // `Supervisor` directly via `test_supervisor`.
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         )),

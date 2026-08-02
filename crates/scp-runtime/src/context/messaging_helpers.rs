@@ -4533,7 +4533,7 @@ mod pseudonym_routing_tests {
         use scp_platform::in_memory::InMemoryStorage;
         use std::sync::Arc;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ALICE.to_owned(),
             std::sync::Arc::new(scp_clock::SystemClock),
         ));

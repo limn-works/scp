@@ -1,7 +1,7 @@
 //! Shared mock providers for scp-runtime examples.
 //!
 //! After ADR-049 commit 12c.9e, crypto is the concrete
-//! [`MlsCryptoProvider`]. Examples construct one per local DID; the
+//! [`NodeMlsFactory`]. Examples construct one per local DID; the
 //! old `MockCrypto` trait-impl scaffold was deleted along with the
 //! trait. The `MockTransport` / `MockEventLog` trait-based stubs
 //! remain because the transport and event-log traits are still
@@ -13,7 +13,7 @@ use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::{ContextError, ContextParams};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 /// Derives a deterministic signing key from a DID string for example use.
 pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
@@ -26,9 +26,9 @@ pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&seed)
 }
 
-/// Convenience constructor: real `MlsCryptoProvider` bound to a DID.
-pub fn example_crypto(did: &str) -> std::sync::Arc<MlsCryptoProvider> {
-    std::sync::Arc::new(MlsCryptoProvider::new(
+/// Convenience constructor: real `NodeMlsFactory` bound to a DID.
+pub fn example_crypto(did: &str) -> std::sync::Arc<NodeMlsFactory> {
+    std::sync::Arc::new(NodeMlsFactory::new(
         did.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ))

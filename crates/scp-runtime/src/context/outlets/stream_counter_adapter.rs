@@ -227,7 +227,7 @@ mod tests {
     /// counter state persists across independent adapter calls exactly because
     /// the actor owns it — the property the round-trip tests below assert.
     async fn supervisor_with_registered_context() -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             INVOKER.to_owned(),
             Arc::new(scp_clock::SystemClock),
         ));

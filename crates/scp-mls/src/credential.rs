@@ -92,7 +92,7 @@ impl ScpCredential {
         // Production requires `did:dht:z*`. Under `cfg(test)` / `testing`
         // feature also accept `did:key:*` and `did:test:*` so the broad
         // test suite (previously trait-mocked via MockCrypto) continues
-        // to work with the inherent `MlsCryptoProvider` API after ADR-049
+        // to work with the inherent `NodeMlsFactory` API after ADR-049
         // commit 12c.9e.
         let accepted = did.starts_with("did:dht:z")
             || (cfg!(any(test, feature = "testing"))
@@ -321,7 +321,7 @@ mod tests {
         // Use a method rejected in ALL build configurations. Under
         // `cfg(test)`/`testing` the constructor also accepts `did:key:` and
         // `did:test:` (fixture convenience for the inherent
-        // `MlsCryptoProvider` API), so the rejection test must use a method
+        // `NodeMlsFactory` API), so the rejection test must use a method
         // outside that set — `did:web:` is rejected in test and production.
         let result = ScpCredential::new(
             "did:web:example.com".to_string(),

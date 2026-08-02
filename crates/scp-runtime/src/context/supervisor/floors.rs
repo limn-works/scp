@@ -9,7 +9,7 @@
 //! **This registry is the AUTHORITATIVE Class-M home** for the sender-key epoch
 //! high-water floors and the receive-side `(epoch, sequence)` anti-replay floors
 //! (ADR-049 PR-6 read-authority switch). The provider's former mirrors —
-//! `MlsCryptoProvider`'s `recv_sequence_tracker` field and its `export_*` /
+//! `NodeMlsFactory`'s `recv_sequence_tracker` field and its `export_*` /
 //! `validate_and_merge_*` twins — are **DELETED**. Production now:
 //!
 //! - GATES fail-closed on this registry at the live receive seams
