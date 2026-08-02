@@ -1146,6 +1146,23 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("BrowserParticipant", "outlet_stream_verify_chunk_signature"): {
         "typescript-wasm": ["outletStreamVerifyChunkSignature"]
     },
+    # SCP-OUT-048: invoker credit/cancel signing predicates + the #1980-forward
+    # WebCrypto preimage seams. The scp-client-wasm free functions land in unit A;
+    # their @limn-works/scp-ts-wasm wrappers + the BrowserParticipant matrix rows
+    # (typescript-wasm: true) co-land in unit B, when these aliases resolve to the
+    # verified bindings/typescript-wasm symbols. Staged here per deliverable 3.
+    ("BrowserParticipant", "outlet_stream_sign_credit"): {
+        "typescript-wasm": ["outletStreamSignCredit"]
+    },
+    ("BrowserParticipant", "outlet_stream_sign_cancel"): {
+        "typescript-wasm": ["outletStreamSignCancel"]
+    },
+    ("BrowserParticipant", "outlet_stream_compute_credit_preimage"): {
+        "typescript-wasm": ["outletStreamComputeCreditPreimage"]
+    },
+    ("BrowserParticipant", "outlet_stream_compute_cancel_preimage"): {
+        "typescript-wasm": ["outletStreamComputeCancelPreimage"]
+    },
 }
 
 
