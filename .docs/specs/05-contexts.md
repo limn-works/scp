@@ -311,7 +311,7 @@ Every outlet failure — at registration, authorization, input validation, execu
 | `Transport` | `6160..6169` | Relay unavailable, cross-context bridge failure, rate limiting, concurrency caps. |
 | `Governance` | `6170..6179` | Deregistration, suspension, ceiling exceeded, active consequence. |
 
-**The compact code registry.** Only fourteen codes are allocated across the `6100..6199` sub-block — the design target is "compact," roughly one to two codes per class. Every allocated code has a class, a canonical **default slug**, and a default retry policy:
+**The compact code registry.** Only fifteen codes are allocated across the `6100..6199` sub-block — the design target is "compact," roughly one to two codes per class. Every allocated code has a class, a canonical **default slug**, and a default retry policy:
 
 | Code | Class | Default slug | Default retry |
 |------|-------|--------------|---------------|

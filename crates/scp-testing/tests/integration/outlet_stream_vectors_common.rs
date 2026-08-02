@@ -70,9 +70,10 @@ pub const EXPECTED_OPERATOR_PK: [u8; 32] = [
 /// `SCP-OUTLET-6131` — the consolidated execution-class code the receiver emits
 /// on a missing sequence (slug `execution.stream-gap`). Per §25.21 "two
 /// error-code traps", `SCP-OUTLET-6131` (`CODE_EXECUTION_CREDIT`) is SHARED by
-/// `execution.stream-gap`, `execution.credit-exhausted`, and
-/// `execution.stream-cap-exhausted`; the gap path uses the stream-gap slug. (The
-/// distinct credit-STALL code is `SCP-OUTLET-6133`, not this one.)
+/// `execution.stream-gap` and `execution.credit-exhausted` (both Immediate);
+/// `execution.stream-cap-exhausted` was split to its own `SCP-OUTLET-6132`
+/// (`CODE_EXECUTION_STREAM_CAP`, `WithBackoff`) per #2209. The gap path uses the
+/// stream-gap slug. (The distinct credit-STALL code is `SCP-OUTLET-6133`.)
 pub const CODE_STREAM_GAP: &str = CODE_EXECUTION_CREDIT;
 
 /// The §5.4.5 `stream_epoch` pinned into the caveats-binding-adjacent stream
