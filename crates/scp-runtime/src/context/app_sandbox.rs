@@ -868,15 +868,17 @@ pub async fn bind_app(
         context_handle,
     )?;
 
+    let mut capabilities: Vec<String> = scoped
+        .allowed_capabilities()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    capabilities.sort_unstable();
     let payload = encode_payload(&AppBoundPayload {
         app_did: scoped.app_did().to_string(),
         app_name: scoped.declaration().app_name.clone(),
         app_version: scoped.declaration().app_version.clone(),
-        capabilities: scoped
-            .allowed_capabilities()
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect(),
+        capabilities,
     })
     .map_err(|e| SandboxError::EventLogFailed(e.to_string()))?;
 
@@ -2597,5 +2599,100 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(SandboxError::EventLogFailed(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Payload field assertion test
+    // -----------------------------------------------------------------------
+
+    /// Recording mock that captures the full payload for field-level assertions.
+    struct RecordingEventLogWithPayload {
+        calls: Arc<Mutex<Vec<(EventType, String, EventPayload)>>>,
+    }
+
+    impl RecordingEventLogWithPayload {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn recorded(&self) -> Vec<(EventType, String, EventPayload)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for RecordingEventLogWithPayload {
+        async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event_type: EventType,
+            actor_did: &str,
+            payload: EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((event_type, actor_did.to_owned(), payload));
+            Ok(())
+        }
+
+        async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_app_payload_fields_match_scoped_handle() {
+        use scp_event_log::payload::{AppBoundPayload, decode_payload};
+
+        let (signing_key, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        sign_declaration(&mut decl, &signing_key).unwrap();
+
+        let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+        let role_caps = ceiling.clone();
+        let handle = ContextHandle::new("ctx-payload".to_owned(), ContextParams::default());
+        let log = RecordingEventLogWithPayload::new();
+
+        let scoped = bind_app(
+            &decl,
+            &ceiling,
+            &role_caps,
+            handle,
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await
+        .expect("bind_app should succeed");
+
+        let calls = log.recorded();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, EventType::AppBound);
+        assert_eq!(calls[0].1, "did:key:actor");
+
+        // Decode and verify payload fields match the ScopedHandle.
+        let payload: AppBoundPayload =
+            decode_payload(&calls[0].2).expect("payload should decode as AppBoundPayload");
+
+        assert_eq!(payload.app_did, scoped.app_did().to_string());
+        assert_eq!(payload.app_name, decl.app_name);
+        assert_eq!(payload.app_version, decl.app_version);
+
+        // Capabilities must be sorted (deterministic Merkle leaf convergence).
+        let mut expected: Vec<String> = scoped
+            .allowed_capabilities()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(payload.capabilities, expected);
     }
 }

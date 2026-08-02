@@ -10974,6 +10974,9 @@ impl Scp {
                 // Deregister the context handle from the MCP lookup registry.
                 deregister_context_handle(&bi, &handle.context_id);
 
+                // Clean up per-context app-binding registry on leave.
+                bi.bound_apps_registry.remove(&handle.context_id);
+
                 Ok(())
             })
             .await
@@ -11080,6 +11083,9 @@ impl Scp {
                 // Clean up per-context bridge connector state and economy state.
                 bi.core.remove_bridge_state(&handle.context_id);
                 bi.core.remove_economy_state(&handle.context_id);
+
+                // Clean up per-context app-binding registry.
+                bi.bound_apps_registry.remove(&handle.context_id);
 
                 // Deregister the context handle from the MCP lookup registry.
                 deregister_context_handle(&bi, &handle.context_id);
@@ -15807,7 +15813,9 @@ impl Scp {
         runtime()
             .spawn(async move {
                 use scp_core::context::actor::commands::QueriesCommand;
-                use scp_core::context::app_sandbox::{CapabilityDeclaration, bind_app};
+                use scp_core::context::app_sandbox::{
+                    CapabilityDeclaration, SandboxError, bind_app,
+                };
                 use scp_core::context::roles::Capability;
                 use scp_core::context::{ContextHandle as CoreContextHandle, ContextParams};
 
@@ -15884,9 +15892,18 @@ impl Scp {
                     timestamp_secs,
                 )
                 .await
-                .map_err(|e| ScpError::Context {
-                    msg: e.to_string(),
-                    code: codes::CTX_2030.to_owned(),
+                .map_err(|e| {
+                    let code = match &e {
+                        SandboxError::CeilingExceeded { .. }
+                        | SandboxError::InvalidDeclaration(_)
+                        | SandboxError::SignatureVerificationFailed => codes::CTX_2056,
+                        SandboxError::EventLogFailed(_) => codes::CTX_2057,
+                        _ => codes::CTX_2058,
+                    };
+                    ScpError::Context {
+                        msg: e.to_string(),
+                        code: code.to_owned(),
+                    }
                 })?;
 
                 let app_did = scoped.app_did().to_string();
@@ -15908,7 +15925,7 @@ impl Scp {
                 }))
                 .map_err(|e| ScpError::Context {
                     msg: format!("serialization failed: {e}"),
-                    code: codes::CTX_2030.to_owned(),
+                    code: codes::CTX_2058.to_owned(),
                 })
             })
             .await
@@ -15948,6 +15965,20 @@ impl Scp {
                 validate_did(trimmed_actor)?;
                 validate_did(trimmed_app)?;
 
+                let is_bound = bi
+                    .bound_apps_registry
+                    .get(&handle.context_id)
+                    .is_some_and(|ctx| ctx.contains_key(trimmed_app));
+                if !is_bound {
+                    return Err(ScpError::Context {
+                        msg: format!(
+                            "app '{}' is not currently bound to context '{}'",
+                            trimmed_app, handle.context_id
+                        ),
+                        code: codes::CTX_2059.to_owned(),
+                    });
+                }
+
                 let event_log = bi.protocol_repository.event_log_provider();
 
                 unbind_app(
@@ -15960,7 +15991,7 @@ impl Scp {
                 .await
                 .map_err(|e| ScpError::Context {
                     msg: e.to_string(),
-                    code: codes::CTX_2030.to_owned(),
+                    code: codes::CTX_2059.to_owned(),
                 })?;
 
                 // Remove the binding from the per-context registry.

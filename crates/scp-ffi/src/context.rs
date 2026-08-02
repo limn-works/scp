@@ -6211,6 +6211,8 @@ impl crate::scp::PyScp {
 
         let bi = &*self.inner;
 
+        validate::validate_did(actor_did).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
         let decl: CapabilityDeclaration = serde_json::from_str(declaration_json)
             .map_err(|e| PyValueError::new_err(format!("invalid declaration JSON: {e}")))?;
 
@@ -6256,12 +6258,13 @@ impl crate::scp::PyScp {
                 SandboxError::CeilingExceeded { .. }
                 | SandboxError::InvalidDeclaration(_)
                 | SandboxError::SignatureVerificationFailed => {
-                    PyRuntimeError::new_err(format!("[SCP-CTX-2055] bind_app rejected: {e}"))
+                    PyRuntimeError::new_err(format!("[{}] bind_app rejected: {e}", codes::CTX_2056))
                 }
-                SandboxError::EventLogFailed(_) => {
-                    PyRuntimeError::new_err(format!("[SCP-CTX-2056] event log append failed: {e}"))
-                }
-                _ => PyRuntimeError::new_err(format!("[SCP-CTX-2057] bind_app failed: {e}")),
+                SandboxError::EventLogFailed(_) => PyRuntimeError::new_err(format!(
+                    "[{}] event log append failed: {e}",
+                    codes::CTX_2057
+                )),
+                _ => PyRuntimeError::new_err(format!("[{}] bind_app failed: {e}", codes::CTX_2058)),
             })?;
 
         let app_did = scoped.app_did().to_string();
@@ -6303,6 +6306,23 @@ impl crate::scp::PyScp {
         use scp_core::context::app_sandbox::unbind_app;
 
         let bi = &*self.inner;
+
+        validate::validate_did(actor_did).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        validate::validate_did(app_did).map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let is_bound = crate::runtime::with_ffi_state(bi, context_id, |st| {
+            Ok(st.bound_apps.contains_key(app_did))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        if !is_bound {
+            return Err(PyRuntimeError::new_err(format!(
+                "[{}] app '{}' is not currently bound to context '{}'",
+                codes::CTX_2059,
+                app_did,
+                context_id
+            )));
+        }
+
         let event_log = crate::runtime::build_event_log_provider(bi);
         let context_id_owned = context_id.to_owned();
         let app_did_owned = app_did.to_owned();
@@ -6319,7 +6339,9 @@ impl crate::scp::PyScp {
             )
             .await
         })
-        .map_err(|e| PyRuntimeError::new_err(format!("[SCP-CTX-2058] unbind_app failed: {e}")))?;
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("[{}] unbind_app failed: {e}", codes::CTX_2059))
+        })?;
 
         // Remove the stored scoped handle.
         crate::runtime::with_ffi_state(bi, context_id, |st| {

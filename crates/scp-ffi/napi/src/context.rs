@@ -5139,6 +5139,8 @@ pub(crate) fn app_bind_on(
     use scp_core::context::roles::Capability;
     use scp_core::context::{ContextHandle, ContextParams};
 
+    validate_did(&actor_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
         .map_err(|e| NapiError::from_reason(format!("invalid declaration JSON: {e}")))?;
 
@@ -5181,12 +5183,13 @@ pub(crate) fn app_bind_on(
             SandboxError::CeilingExceeded { .. }
             | SandboxError::InvalidDeclaration(_)
             | SandboxError::SignatureVerificationFailed => {
-                NapiError::from_reason(format!("[SCP-CTX-2055] bind_app rejected: {e}"))
+                NapiError::from_reason(format!("[{}] bind_app rejected: {e}", codes::CTX_2056))
             }
-            SandboxError::EventLogFailed(_) => {
-                NapiError::from_reason(format!("[SCP-CTX-2056] event log append failed: {e}"))
-            }
-            _ => NapiError::from_reason(format!("[SCP-CTX-2057] bind_app failed: {e}")),
+            SandboxError::EventLogFailed(_) => NapiError::from_reason(format!(
+                "[{}] event log append failed: {e}",
+                codes::CTX_2057
+            )),
+            _ => NapiError::from_reason(format!("[{}] bind_app failed: {e}", codes::CTX_2058)),
         })?;
 
     let app_did = scoped.app_did().to_string();
@@ -5226,6 +5229,22 @@ pub(crate) fn app_unbind_on(
 ) -> napi::Result<()> {
     use scp_core::context::app_sandbox::unbind_app;
 
+    validate_did(&actor_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&app_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let is_bound = crate::runtime::with_context(bi, &context_id, |st| {
+        Ok(st.bound_apps.contains_key(&app_did))
+    })
+    .map_err(NapiError::from)?;
+    if !is_bound {
+        return Err(NapiError::from_reason(format!(
+            "[{}] app '{}' is not currently bound to context '{}'",
+            codes::CTX_2059,
+            app_did,
+            context_id
+        )));
+    }
+
     let event_log = crate::runtime::event_log_provider_from_existing_repo(bi);
     let context_id_c = context_id.clone();
     let app_did_c = app_did.clone();
@@ -5241,7 +5260,9 @@ pub(crate) fn app_unbind_on(
             )
             .await
         })
-        .map_err(|e| NapiError::from_reason(format!("[SCP-CTX-2058] unbind_app failed: {e}")))?;
+        .map_err(|e| {
+            NapiError::from_reason(format!("[{}] unbind_app failed: {e}", codes::CTX_2059))
+        })?;
 
     // Remove the stored scoped handle.
     crate::runtime::with_context(bi, &context_id, |st| {

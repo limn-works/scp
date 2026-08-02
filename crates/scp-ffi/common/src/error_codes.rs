@@ -375,6 +375,14 @@ pub const CTX_2053: &str = "SCP-CTX-2053";
 pub const CTX_2054: &str = "SCP-CTX-2054";
 /// `UniFFI` context send error.
 pub const CTX_2055: &str = "SCP-CTX-2055";
+/// App sandbox bind-rejected error (ceiling exceeded, invalid declaration, signature failed).
+pub const CTX_2056: &str = "SCP-CTX-2056";
+/// App sandbox event-log-failed error (durable append failed during bind or unbind).
+pub const CTX_2057: &str = "SCP-CTX-2057";
+/// App sandbox bind-other error (unexpected bind failure).
+pub const CTX_2058: &str = "SCP-CTX-2058";
+/// App sandbox unbind error.
+pub const CTX_2059: &str = "SCP-CTX-2059";
 /// `UniFFI` relay connection error.
 pub const CTX_2060: &str = "SCP-CTX-2060";
 /// `UniFFI` context export error.

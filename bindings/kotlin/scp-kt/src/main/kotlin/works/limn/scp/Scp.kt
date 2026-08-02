@@ -751,6 +751,32 @@ class SCP internal constructor(
         newSeconds = newSeconds,
     )
 
+    /** Forwards to [NativeScp.sandboxAppBind] on [inner]. */
+    suspend fun contextSandboxAppBind(
+        handle: ContextHandle,
+        declarationJson: String,
+        actorDid: String,
+        timestampSecs: ULong,
+    ): String = inner.sandboxAppBind(
+        handle = handle,
+        declarationJson = declarationJson,
+        actorDid = actorDid,
+        timestampSecs = timestampSecs,
+    )
+
+    /** Forwards to [NativeScp.sandboxAppUnbind] on [inner]. */
+    suspend fun contextSandboxAppUnbind(
+        handle: ContextHandle,
+        appDid: String,
+        actorDid: String,
+        timestampSecs: ULong,
+    ) = inner.sandboxAppUnbind(
+        handle = handle,
+        appDid = appDid,
+        actorDid = actorDid,
+        timestampSecs = timestampSecs,
+    )
+
     /**
      * Forwards to [NativeScp.contextSend] on [inner].
      *
