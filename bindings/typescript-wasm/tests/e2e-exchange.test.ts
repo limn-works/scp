@@ -151,10 +151,10 @@ test("two-party create/add/join/send/receive/converge through the real wasm + re
   expect(alice.contextStatus(CTX)).toBe("absent");
 });
 
-test("an op on an unknown context throws a typed ContextError (SCP-CTX-2001) through the real wasm", async () => {
+test("an op on an unknown context throws a typed ContextError (SCP-CTX-2082) through the real wasm", async () => {
   const relay = new TestRelay();
   const { client: alice } = await connectClient(relay, ALICE);
-  // The real wasm throws "[SCP-CTX-2001] …"; the wrapper's prefix dispatch maps
+  // The real wasm throws "[SCP-CTX-2082] …"; the wrapper's prefix dispatch maps
   // it to the typed ContextError with a stable .code — the error-path contract.
   let caught: unknown;
   try {
@@ -163,7 +163,7 @@ test("an op on an unknown context throws a typed ContextError (SCP-CTX-2001) thr
     caught = e;
   }
   expect(caught).toBeInstanceOf(ContextError);
-  expect((caught as ContextError).code).toBe("SCP-CTX-2001");
+  expect((caught as ContextError).code).toBe("SCP-CTX-2082");
 });
 
 test("create() rejects the managed WebSocketRelaySocket with a loud pointer to connect()", () => {

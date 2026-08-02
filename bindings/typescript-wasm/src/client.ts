@@ -302,7 +302,7 @@ export class ScpBrowserClient {
   /**
    * Creates a new encrypted context with this participant as sole member.
    *
-   * @throws {ContextError} `SCP-CTX-2002` if the id is already held.
+   * @throws {ContextError} `SCP-CTX-2083` if the id is already held.
    * @throws {CryptoError} on group-creation / leaf failure.
    * @throws {StorageError} `SCP-STORAGE-8010` if the snapshot write fails (poisons the context).
    */
@@ -347,8 +347,8 @@ export class ScpBrowserClient {
    * injected socket to every announced peer pseudonym (§9.10.4). No return value
    * — the ciphertext leaves via the socket, not the caller.
    *
-   * @throws {ContextError} `SCP-CTX-2040` if no peer has announced a pseudonym yet (retryable).
-   * @throws {TransportError} `SCP-TRANS-5010` if the socket rejects a frame.
+   * @throws {ContextError} `SCP-CTX-2095` if no peer has announced a pseudonym yet (retryable).
+   * @throws {TransportError} `SCP-TRANS-5005` if the socket rejects a frame.
    */
   sendMessage(contextId: string, plaintext: Uint8Array): void {
     call(() => this.#inner.sendMessage(contextId, plaintext));
@@ -448,7 +448,7 @@ export class ScpBrowserClient {
   mlsEpoch(contextId: string): bigint | undefined {
     // Gate on the non-throwing status predicate so a not-held/poisoned context
     // yields `undefined` like the siblings, instead of the wasm surface's
-    // `[SCP-CTX-2001]` / `[SCP-STORAGE-8013]` throw. Single-threaded driver, so
+    // `[SCP-CTX-2082]` / `[SCP-STORAGE-8013]` throw. Single-threaded driver, so
     // there is no status→epoch race.
     if (this.#inner.contextStatus(contextId) !== "live") {
       return undefined;
@@ -486,7 +486,7 @@ export class ScpBrowserClient {
  * `effectiveCaveatsJcs` MUST be the RFC 8785 JCS encoding of the post-narrowing
  * caveats (this consumes those bytes as produced; it does not canonicalize).
  *
- * @throws {ValidationError} `SCP-VALID-7010` if `requestId` is not exactly 16 bytes.
+ * @throws {ValidationError} `SCP-VALID-7028` if `requestId` is not exactly 16 bytes.
  */
 export function outletStreamComputeCaveatsBinding(
   ucanCid: Uint8Array,
@@ -513,7 +513,7 @@ export function outletStreamComputeCaveatsBinding(
  * `false` (a verification RESULT, not an error). `chunk` is the JSON-serialized
  * `OutletStreamChunk`; `operatorPk` and `caveatsBinding` are 32-byte values.
  *
- * @throws {ValidationError} `SCP-VALID-7010` on malformed input (unparseable
+ * @throws {ValidationError} `SCP-VALID-7028` on malformed input (unparseable
  *   chunk, a non-32-byte or non-Ed25519 `operatorPk`, a non-32-byte `caveatsBinding`).
  */
 export function outletStreamVerifyChunkSignature(
