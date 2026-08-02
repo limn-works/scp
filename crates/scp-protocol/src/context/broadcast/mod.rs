@@ -1646,6 +1646,12 @@ impl BroadcastContext {
             });
         }
 
+        // Sort by author_did for deterministic event-log leaf ordering across
+        // replicas and reconstructions. HashMap iteration order is randomized
+        // per process, so the same logical ban would otherwise produce
+        // a different Merkle root on different nodes or replays.
+        rotated_authors.sort_unstable_by(|a, b| a.author_did.cmp(&b.author_did));
+
         Ok(GovernanceBanResult {
             banned_did: did.to_owned(),
             rotated_authors,
