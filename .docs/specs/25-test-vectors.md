@@ -933,3 +933,72 @@ The vectors are replayed at every layer so a regression at any tier is caught:
 | SDK drains | Python / TypeScript / Swift / Kotlin SDK smoke tests | Land via the SDK half of SCP-OUT-039, consuming this same vector JSON. |
 
 Because the PyO3/NAPI/UniFFI handler-registration seam produces a single aggregate value (`BridgeStreamExecutor`, `crates/scp-ffi/src/outlet_stream.rs`), the three multi-emission vectors — `multi_chunk` (10 `Data` chunks plus an interleaved `Progress` chunk), `error_recoverable` (`Data` → non-terminal `Error` → `Data`), and `credit_stall` (needs a second billable chunk to park past the window) — cannot be produced by a single-shot handler and are therefore **not faked** at the bridge layer; they are covered at the runtime tiers (every real-bridge test documents this deferral explicitly). `error_terminal` is NOT deferred — a single-shot handler that returns `Err` maps to the framework terminal `Error` `SCP-OUTLET-6130`, so it is driven live at all three bridges. The receiver-side `sequence_gap` check is a Rust-layer receiver *test oracle* at every runtime/bridge tier because a lossless same-context pump cannot produce a gap; the runtime pump is the *producer* in the same-context case and therefore has no gap of its own to detect. The **permanent, transport-agnostic receiver check** is the SDK `InvocationHandle` drain (§5.4.5 "Ordering and gaps" — the receiver locus is the invoker-side SDK framework): it is dormant over the lossless same-context transport and becomes load-bearing when chunks are consumed over a lossy cross-context / relayed transport. The tracker's emitted code is the consolidated `SCP-OUTLET-6131` (`execution.stream-gap`), a test-local reimplementation of the §5.4.5 receiver rule. When slice-3 introduces a cross-context reassembly layer, any additional authoritative gap-detection there is **reconciled with the SDK-drain check as defense-in-depth** (mirroring the revocation dual-locus), NOT as a replacement for it — the SDK-drain receiver check remains the transport-agnostic invariant.
+
+## 25.22 KeyPackage Attestation Signing Vectors (§9.7.1, §9.5.2, §9.18.7)
+
+Domain: `"SCP-KEYPACKAGE-ATTESTATION-V1:"`
+
+### Vector 37: KeyPackage Attestation Signature + `0xFF03` Extension Body
+
+The `KeyPackageAttestation` (§9.5.2) binds **all four** of the leaf's public keys — the ephemeral MLS leaf `signature_key` (Ed25519), and three **distinct** X25519 HPKE keys: the LeafNode ratchet-tree `encryption_key`, the KeyPackage `init_key` (the Welcome-seal key), and the `scp_wrapping_key` (`0xFF01`) extension `wrapping_key` — to a DID. It is **context-agnostic** — eight fields, no `context_id`. The canonical hash uses the §9.5.1 construction; the Ed25519 signature is computed over the 32-byte hash with the reference key (§25.2). The `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is the eight fields in preimage order (deterministic length-prefixed binary — NOT MessagePack/JCS) followed by the raw 64-byte signature.
+
+This vector is fully regenerable from the inputs below. `leaf_signature_key` reuses the §25.2 secondary Ed25519 public key as a fixed, documented 32-byte value standing in for the ephemeral leaf `signature_key` being bound. The three X25519 public keys are each obtained by loading a **fixed, documented 32-byte seed** as a raw X25519 private scalar (`X25519PrivateKey.from_private_bytes(seed).public_key()`), yielding three distinct keys standing in for the leaf's distinct HPKE keys: `leaf_encryption_key` from the §25.2 **secondary Ed25519 seed** (`0x4ccd08…a6fb`); `init_key` from the fixed seed `0x11×32`; `wrapping_key` from the fixed seed `0x22×32`. These are distinct keys by construction — `init_key != encryption_key` (RFC 9420: the Welcome's `EncryptedGroupSecrets` is HPKE-sealed to the KeyPackage `init_key`, NOT the LeafNode `encryption_key`), and `wrapping_key` is the separate §9.16 sender-key wrapping key.
+
+```
+Input:
+  signing key:         reference Ed25519 key (§25.2, seed 0x9d61b1…7f60)
+  did:                 "did:dht:z6MkLeafAttest"                (22 bytes)
+  leaf_signature_key:  0x3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c   (32 bytes, §25.2 secondary Ed25519 public key)
+  leaf_encryption_key: 0xb6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20   (32 bytes, X25519 public from §25.2 secondary seed 0x4ccd08…a6fb as X25519 scalar — LeafNode ratchet-tree HPKE key)
+  init_key:            0x7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13   (32 bytes, X25519 public from fixed seed 0x11×32 as X25519 scalar — KeyPackage Welcome-seal HPKE key)
+  wrapping_key:        0x0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20   (32 bytes, X25519 public from fixed seed 0x22×32 as X25519 scalar — scp_wrapping_key 0xFF01 §9.16 sender-key wrapping key)
+  signing_key_id:      "#active"                               (7 bytes)
+  issued_at:           1700000000                              (== leaf Lifetime.not_before)
+  expires_at:          1700086400                              (== leaf Lifetime.not_after; issued_at + 86400)
+
+Canonical hash input (per §9.5.1 / §9.5.2 KeyPackageAttestation):
+  "SCP-KEYPACKAGE-ATTESTATION-V1:"                 (30 bytes, no length prefix)
+  || BE32(22) || "did:dht:z6MkLeafAttest"          (4 + 22 = 26 bytes — did)
+  || leaf_signature_key                            (32 bytes, fixed-length, no length prefix)
+  || leaf_encryption_key                           (32 bytes, fixed-length, no length prefix)
+  || init_key                                      (32 bytes, fixed-length, no length prefix)
+  || wrapping_key                                  (32 bytes, fixed-length, no length prefix)
+  || BE32(7)  || "#active"                         (4 + 7 = 11 bytes — signing_key_id)
+  || BE64(1700000000)                              (8 bytes — issued_at)
+  || BE64(1700086400)                              (8 bytes — expires_at)
+
+Total preimage: 30 + 26 + 32 + 32 + 32 + 32 + 11 + 8 + 8 = 211 bytes
+
+Preimage (hex, 211 bytes):
+  5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a
+  000000166469643a6468743a7a364d6b4c656166417474657374
+  3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
+  b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20
+  7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13
+  0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20
+  0000000723616374697665
+  000000006553f100
+  0000000065554280
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  50cf61db5a97e0ddbd762de07e107684dfd0f00cfe53bad2750a70103ac38957
+
+Ed25519 signature over the 32-byte hash, reference key (64 bytes):
+  fcf01ea58941c9e88acc14ef1ada7d00ac4c0239c75655160fc5b248ee0299e0
+  18526235bc9b6d2a3efa37ab8db5d86b45b58deb5ad24540229d2804052e3509
+
+scp_keypackage_attestation (0xFF03) extension body = 8 fields in preimage order
+(NO domain separator) || 64-byte signature (181 + 64 = 245 bytes):
+  000000166469643a6468743a7a364d6b4c656166417474657374
+  3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
+  b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20
+  7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13
+  0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20
+  0000000723616374697665
+  000000006553f100
+  0000000065554280
+  fcf01ea58941c9e88acc14ef1ada7d00ac4c0239c75655160fc5b248ee0299e0
+  18526235bc9b6d2a3efa37ab8db5d86b45b58deb5ad24540229d2804052e3509
+```
+
+Ed25519 is deterministic (RFC 8032), so the reference implementation reproduces these exact signature bytes on every run. Verify with Ed25519-verify(reference_public_key, hash, signature) per §25.17 step 5. Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.

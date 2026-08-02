@@ -190,7 +190,7 @@ Messages may arrive out of order due to relay batching, multi-relay delivery, or
 
 ## 23.10 KeyPackage Pre-Publication
 
-To support offline member addition (a member can be added to a group even when they are not currently connected), the SDK pre-publishes `KeyPackage`s to relays. This ensures that an admin can add an offline member using a valid, pre-stored KeyPackage rather than waiting for the member to come online. KeyPackages are single-use and signed by the credential key (`#active` or `#agent`) matching the member's `ScpCredential.signing_key_id` (ADR-039). This is consistent with standard MLS behavior where the leaf node signature key matches the credential key, and avoids requiring the hardware-backed `#0` for routine background operations.
+To support offline member addition (a member can be added to a group even when they are not currently connected), the SDK pre-publishes `KeyPackage`s to relays. This ensures that an admin can add an offline member using a valid, pre-stored KeyPackage rather than waiting for the member to come online. KeyPackages are single-use. Each carries a **KeyPackage attestation** (§9.7.1) signed by the `#active`/`#agent` verification method named by the member's `ScpCredential.signing_key_id` (ADR-039) — no key signs the credential or leaf itself — binding the leaf's **ephemeral, context-scoped MLS signature key** to the member's DID. The MLS leaf key is a per-context ephemeral key, distinct from the DID's verification methods — the DID binding lives in the attestation, not in any leaf-key-equals-credential-key equality. Signing the attestation with `#active`/`#agent` avoids requiring the hardware-backed `#0` for routine background operations.
 
 ## 23.11 EpochGraceStore Crash Recovery
 
