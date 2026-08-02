@@ -585,7 +585,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-mcp/src/lib.rs",
         "crates/scp-mcp/src/namespace.rs",
@@ -631,7 +631,7 @@
         }
       ],
       "details": {
-        "auditNote": "Downgraded from done (audit): SCP-OUT-007 deliverable absent on main \u2014 crates/scp-mcp/src/translator.rs and the mcp_to_scp/scp_to_mcp functions do not exist (the scp-mcp crate exists but not this lexical translator); dropped by the squashed re-port #2098. Tracked in #2219."
+        "auditNote": "Re-ported from orphaned pre-port f5236ef6a (dropped by squashed re-port #2098) under #2219, reconciled against main's restructured scp-mcp. LANDED + green: translator (crates/scp-mcp/src/translator.rs \u2014 mcp_to_scp/scp_to_mcp + format_mcp_tool_name/parse_mcp_tool_name), lib.rs re-export + doctest examples, server/client/sse/stdio outlet-vocab wiring, and the ContextToolInfo\u2192ContextOutletInfo / ContextProvider::invoke_tool\u2192invoke_outlet rename across all three FFI bridges (PyO3, napi, uniffi). Tests: scp-mcp 246 lib + 11 integration + 5 doctests; scp-ffi PyO3 mcp 42 tests. Gates green: cargo clippy --workspace (CI features) -D warnings, cargo fmt --all, check-error-codes (sample envelope codes corrected from stale SCP-TOOL-* to canonical SCP-OUTLET-6110/6130), check-bridge-symmetry, check-cross-layer, check-pure-helpers, check-protocol-deps, check-handler-no-panic, check-construction-pattern, check-call-invariants. Bridge ContextOutletInfo.kind is sourced from the real registry OutletKind (Query/Action) via a pure projection helper \u2014 never hardcoded. MET: AC0,1,2,5,6,8,9,10 (dot-delimiter + greps: 'query/|call/'=0, '\"query.\"|\"call.\"'\u226512), 11, 12, 13. NOT MET LITERALLY vs main's restructure (flagged for human review, not forced): (1) allowlist AC \u2014 crates/scp-mcp/src/allowlist.rs on main is a stdio SUBPROCESS-COMMAND allowlist (MCP subprocess safety), NOT an outlet/tool-name allowlist; the 'outlet_id vocabulary internal, tool.name at MCP wire' intent is realized in translator.rs + server.rs instead. (2) fixtures round-trip ACs \u2014 the corpus is an in-code fixtures() fn in tests/translator.rs (deterministic) rather than a tests/fixtures/ directory with proptest generators; the round-trip property IS tested over the corpus. UNRELATED pre-existing breakage: scp-ffi-uniffi TEST TARGETS fail to build on base 4e8297b8c (new_in_memory_for_test / make_dht_with_signer / pre_rotation_custody) \u2014 not OUT-007; the uniffi LIBRARY compiles clean."
       }
     },
     {

@@ -420,6 +420,58 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
             provenance,
         })
     }
+
+    // -----------------------------------------------------------------------
+    // SCP-vocabulary surface (SCP-OUT-007)
+    // -----------------------------------------------------------------------
+
+    /// Invoke an external MCP tool using SCP outlet vocabulary.
+    ///
+    /// The `outlet_id` / `kind` pair is projected through the boundary
+    /// translator to an MCP `tool.name` (`query.{id}` or `call.{id}`) before
+    /// being sent to the external server; the response is translated back to
+    /// SCP shape via [`crate::translator::mcp_to_scp`]. The `McpToolResult`
+    /// still carries the raw MCP content for callers that want the verbatim
+    /// external output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpClientError::NotInitialized`] if the handshake has not
+    /// completed, or a transport/server error.
+    pub fn invoke_outlet(
+        &self,
+        outlet_id: &str,
+        kind: crate::translator::OutletKind,
+        input: serde_json::Value,
+        context_id: &str,
+        invoker_did: &str,
+    ) -> Result<McpToolResult, McpClientError> {
+        let mcp_name = crate::translator::format_mcp_tool_name(kind, outlet_id);
+        self.invoke(&mcp_name, input, context_id, invoker_did)
+    }
+
+    /// List available outlets from the external MCP server.
+    ///
+    /// Returns tuples `(kind, outlet_id, ToolDefinition)` so callers that want
+    /// the SCP view can work directly with `outlet_id`s while retaining the
+    /// original MCP `ToolDefinition` for schema inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpClientError::NotInitialized`] if the handshake has not
+    /// completed, or a transport/server error.
+    pub fn list_outlets(
+        &self,
+    ) -> Result<Vec<(crate::translator::OutletKind, String, ToolDefinition)>, McpClientError> {
+        let tools = self.list_tools()?;
+        Ok(tools
+            .into_iter()
+            .map(|t| {
+                let (kind, outlet_id) = crate::translator::parse_mcp_tool_name(&t.name);
+                (kind, outlet_id, t)
+            })
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------

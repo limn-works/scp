@@ -4795,7 +4795,7 @@ const UNIFFI_OUTLET_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOU
 /// - `context_tools()` reads from the per-context `OutletRegistry`
 /// - `agent_role()` reads from `ContextManager::get_role_state()`
 /// - `validate_capability()` runs UCAN validation + role-state capability check
-/// - `invoke_tool()` dispatches to registered handlers with schema validation
+/// - `invoke_outlet()` dispatches to registered handlers with schema validation
 /// - `context_members()` reads from `ContextManager::member_dids()` + `member_role()`
 /// - `context_events()` reads from the per-context event log (UCAN state)
 struct McpUniFfiBridgeProvider {
@@ -4848,6 +4848,19 @@ impl McpUniFfiBridgeProvider {
     }
 }
 
+/// Projects the canonical §5.4.2 [`scp_core::context::outlets::OutletKind`]
+/// onto the scp-mcp boundary sentinel [`scp_mcp::translator::OutletKind`] so
+/// the MCP translator can surface the correct `query.` / `call.` tool-name
+/// prefix. Pure lexical projection at the FFI/MCP seam.
+const fn outlet_kind_to_mcp(
+    kind: scp_core::context::outlets::OutletKind,
+) -> scp_mcp::translator::OutletKind {
+    match kind {
+        scp_core::context::outlets::OutletKind::Query => scp_mcp::translator::OutletKind::Query,
+        scp_core::context::outlets::OutletKind::Action => scp_mcp::translator::OutletKind::Action,
+    }
+}
+
 impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<scp_mcp::namespace::ContextId> {
         self.context_ids.clone()
@@ -4882,7 +4895,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
+    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextOutletInfo> {
         // Look up the ContextHandle from this provider's instance registry
         // and read its outlet_registry.
         // Returns empty if the bridge instance has been dropped (#1549 round-2).
@@ -4896,12 +4909,17 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let outlet_registry = handle.outlet_registry.blocking_lock();
         outlet_registry
             .registrations()
-            .map(|t| scp_mcp::server::ContextToolInfo {
+            .map(|t| scp_mcp::server::ContextOutletInfo {
                 name: t.name.clone(),
                 description: Some(t.description.clone()),
                 input_schema: t.schema.input_schema.clone(),
                 output_schema: Some(t.schema.output_schema.clone()),
                 admin_only: false,
+                // Project the registered §5.4.2 kind to the scp-mcp boundary
+                // sentinel so the translator surfaces the correct `query.` /
+                // `call.` MCP tool-name prefix. The registry carries the real
+                // kind — never hardcode Action here.
+                kind: outlet_kind_to_mcp(t.kind),
             })
             .collect()
     }
@@ -5071,7 +5089,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn invoke_tool(
+    fn invoke_outlet(
         &self,
         context_id: &str,
         outlet_name: &str,
@@ -5081,7 +5099,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.outlet_timeout_ms);
 
-        // Upgrade the bridge instance handle up-front. `invoke_tool` is a
+        // Upgrade the bridge instance handle up-front. `invoke_outlet` is a
         // sync trait method so the Arc is bounded by this function's return
         // and cannot survive across an `await` point (#1549 round-2).
         let bi = self.upgrade_bi()?;

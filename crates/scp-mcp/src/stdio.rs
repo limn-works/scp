@@ -240,7 +240,7 @@ mod tests {
     // -- Integration test with McpServer using mock provider ------------------
 
     // Reuse the mock provider from server.rs tests.
-    use crate::server::{ContextToolInfo, MemberInfo};
+    use crate::server::{ContextOutletInfo, MemberInfo};
 
     struct MockProvider {
         contexts: Vec<String>,
@@ -266,16 +266,16 @@ mod tests {
         fn agent_did(&self) -> &str {
             &self.agent_did
         }
-        fn context_tools(&self, _context_id: &str) -> Vec<ContextToolInfo> {
+        fn context_tools(&self, _context_id: &str) -> Vec<ContextOutletInfo> {
             Vec::new()
         }
         fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
             Ok(())
         }
-        fn invoke_tool(
+        fn invoke_outlet(
             &self,
             _context_id: &str,
-            _tool_name: &str,
+            _outlet_id: &str,
             _arguments: serde_json::Value,
         ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({"status": "ok"}))
