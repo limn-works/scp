@@ -1687,8 +1687,10 @@ impl BroadcastContext {
     /// # Parameters
     ///
     /// - `timestamp_ms`: Unix timestamp in milliseconds to embed in each
-    ///   [`BroadcastKeyEpochAdvance`] (used by the caller for event-log
-    ///   ordering; convert from seconds with `.saturating_mul(1_000)`).
+    ///   [`BroadcastKeyEpochAdvance`]'s `timestamp` field. This field is part
+    ///   of the relay-message wire format (§5.14.10) and is carried for the
+    ///   relay-message consumer; governance callers use `timestamp_secs`
+    ///   directly for event-log ordering, not `advance.timestamp`.
     ///
     /// # Errors
     ///
