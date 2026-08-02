@@ -1971,8 +1971,8 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 ///
 /// This is the single, consolidated implementation used by:
 /// - `DidDht::resolve_did` (DHT resolution path)
-/// - `verify_and_deserialize` in `resolver.rs` (dual-layer resolution path)
-/// - `relay_resolve` in `resolution.rs` (relay resolution path)
+/// - `verify_relay_record` in `resolution.rs` (shared relay/DHT verify path)
+/// - `RealMultiRelayQuerier` in `relay_querier.rs` (relay resolution path)
 ///
 /// # Errors
 ///
@@ -2438,8 +2438,8 @@ fn bind_old_document_to_old_did(
 /// # Caller contract
 ///
 /// Callers MUST supply `old_document` from a verified resolution path
-/// — [`DidDht::resolve_did`], [`crate::resolver::verify_and_deserialize`],
-/// or [`crate::resolution::relay_resolve`] — so the document's BEP44
+/// — [`DidDht::resolve_did`], `resolution::verify_relay_record`,
+/// or [`crate::relay_querier::RealMultiRelayQuerier`] — so the document's BEP44
 /// signature has been validated against the published DHT record (or
 /// an authoritative cache thereof). This function trusts its
 /// `old_document` argument: the Step 0 self-cert binding catches

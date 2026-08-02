@@ -26,7 +26,10 @@ use scp_core::envelope::scpr;
 use scp_dht::{DhtClient, DisabledDhtClient, InMemoryDhtClient, bep44_signable};
 use scp_did::DidDocument;
 use scp_identity::republish::{RELAY_BLOB_TTL_SECS, RelayPublisher};
-use scp_identity::resolver::{DidResolver, DualLayerResolver, ResolutionSource};
+use scp_identity::resolver::{
+    DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, ResolutionSource,
+    StaleLayer,
+};
 use scp_identity::{DidCache, RealMultiRelayQuerier, did_from_ed25519_public_key, did_routing_id};
 use scp_transport::error::TransportError;
 use scp_transport::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter};
@@ -315,4 +318,84 @@ async fn malformed_relay_blob_skipped_valid_still_resolves() {
         resolved.is_some(),
         "valid SCPR record resolves despite a co-located malformed blob"
     );
+}
+
+/// HIGH #1 full-stack regression (§3.10.8 intra-relay shadow / suppression DoS):
+/// a DECODABLE but bad-signature SCPR frame planted FIRST at the DID routing ID,
+/// followed by the valid frame, must NOT shadow the valid record. Unlike
+/// `malformed_relay_blob_skipped_valid_still_resolves` (which injects a
+/// NON-decodable blob), this frame decodes cleanly and only fails BEP44
+/// verification — the exact attack the single-record contract used to enable.
+#[tokio::test]
+async fn decodable_bad_signature_blob_does_not_shadow_valid_record() {
+    let live = live_relay();
+    let id = make_identity(77, 1);
+    let manager = live.current().unwrap();
+    let routing_id = RoutingId::new(did_routing_id(&id.did));
+
+    // FIRST: a well-framed SCPR frame whose signature is corrupted (decodes,
+    // fails BEP44 verify). Raw publish is unauthenticated, so an attacker can
+    // plant this at the DID-derivable routing ID.
+    let mut bad_sig = id.signature;
+    bad_sig[0] ^= 0xFF;
+    let bad_frame = scpr::encode_did_record(&id.value, &bad_sig, id.seq);
+    manager
+        .publish_raw(&routing_id, RELAY_BLOB_TTL_SECS, bad_frame)
+        .await
+        .unwrap();
+
+    // SECOND: the genuine record.
+    publish_to_relay(&live, &id).await;
+
+    let resolver = relay_resolver(&live, Arc::new(DisabledDhtClient));
+    let resolved = resolver
+        .resolve(&id.did)
+        .await
+        .unwrap()
+        .expect("valid record must resolve despite a co-located bad-signature frame");
+    assert!(matches!(resolved.source, ResolutionSource::ScpRelay { .. }));
+    assert_eq!(resolved.document.id, id.did);
+}
+
+/// HIGH #2 regression: the REAL [`DualLayerHealingPublisher`] Relay arm must
+/// publish an SCPR-framed record (not bare document bytes). Drive heal against a
+/// live relay, then resolve — proving the healed blob decodes as a valid SCPR
+/// kind-1 frame AND BEP44-verifies (a bare-bytes heal would decode-fail on read
+/// and silently drop, corrupting the public-record slot).
+#[tokio::test]
+async fn healing_publisher_relay_arm_writes_scpr_frame() {
+    let live = live_relay();
+    let id = make_identity(88, 5);
+
+    let healer = DualLayerHealingPublisher::new(
+        Arc::new(DisabledDhtClient),
+        Arc::new(TransportRelayPublisher::new(live.clone())),
+    );
+
+    // Heal the RELAY layer with the fresher record.
+    healer
+        .heal(
+            &id.did,
+            &StaleLayer::Relay {
+                relay_urls: vec!["mem://relay-1".to_owned()],
+            },
+            &id.value,
+            &id.signature,
+            id.seq,
+            &id.public_key,
+        )
+        .await
+        .expect("relay heal succeeds against a connected transport");
+
+    // The healed record must resolve back via the real relay read path — which
+    // only works if heal wrote a valid SCPR frame carrying the BEP44 triple.
+    let resolver = relay_resolver(&live, Arc::new(DisabledDhtClient));
+    let resolved = resolver
+        .resolve(&id.did)
+        .await
+        .unwrap()
+        .expect("healed record must resolve via the relay");
+    assert!(matches!(resolved.source, ResolutionSource::ScpRelay { .. }));
+    assert_eq!(resolved.seq, 5);
+    assert_eq!(resolved.document.id, id.did);
 }

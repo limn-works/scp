@@ -50,9 +50,7 @@ pub use dht::{
 };
 pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
-pub use resolution::{
-    RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id, relay_resolve,
-};
+pub use resolution::{RelayQuerier, RelayQueryRecord, did_routing_id};
 // Test-harness only: the in-memory single-relay querier double never ships
 // (ADR-062 §Decision 5 / Slice 11). The production querier is
 // `RealMultiRelayQuerier` over `scp-transport`'s `TransportRelayQuerier`.
@@ -236,9 +234,22 @@ pub enum IdentityError {
     #[error("invalid relay URL: {0}")]
     InvalidRelayUrl(String),
 
-    /// Publishing a DID document to an SCP relay failed.
+    /// Publishing a DID document to an SCP relay failed (a connected relay
+    /// rejected the PUBLISH, or the transport erred). Distinct from
+    /// [`RelayNotConnected`](Self::RelayNotConnected): this is an actual failure
+    /// worth surfacing (potential misconfiguration), not the expected
+    /// no-transport interim.
     #[error("relay publish failed: {0}")]
     RelayPublishFailed(String),
+
+    /// No transport is connected, so the relay layer cannot publish/query. This
+    /// is the expected fail-closed interim before `transport_connect` (and after
+    /// disconnect) — an honest absence, NOT an error worth alarming on. Write
+    /// paths treat it as best-effort skipped (the DHT layer remains
+    /// authoritative, §3.10.6); callers SHOULD log it at a lower level than
+    /// [`RelayPublishFailed`](Self::RelayPublishFailed).
+    #[error("relay transport not connected: {0}")]
+    RelayNotConnected(String),
 
     /// Querying an SCP relay for a DID document failed.
     #[error("relay query failed: {0}")]

@@ -24,12 +24,9 @@
 //! live in `scp-transport`; tests use [`InMemoryRelayQuerier`].
 
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
 
 use crate::IdentityError;
-use crate::cache::DidCache;
-use crate::dht::{extract_public_key, verify_self_certification};
-use scp_clock::Clock;
+use crate::dht::verify_self_certification;
 use scp_dht::verify_bep44_signature;
 use scp_did::DidDocument;
 
@@ -87,12 +84,26 @@ pub struct RelayQueryRecord {
 /// Production implementations (in `scp-transport`) send QUERY messages to SCP
 /// relays. Tests use [`InMemoryRelayQuerier`] backed by a `HashMap`.
 ///
-/// This trait is defined in `scp-core` so that the resolution logic does not
+/// This trait is defined in `scp-identity` so that the resolution logic does not
 /// depend on `scp-transport` (§3.10.12 phase integration).
 pub trait RelayQuerier: Send + Sync {
-    /// Queries a relay for a blob with the given routing ID.
+    /// Queries a relay for **all** decodable public-record candidates at a
+    /// routing ID.
     ///
-    /// Sends `QUERY { routing_id, since: null, limit: 1 }` to the relay.
+    /// Returns EVERY SCPR-decodable record stored at `routing_id`, **without**
+    /// verification (framing grants no authority, §9.10.12). The caller (the
+    /// [`RealMultiRelayQuerier`](crate::relay_querier::RealMultiRelayQuerier)
+    /// composer) BEP44-verifies each candidate and selects the first valid one.
+    ///
+    /// Returning a `Vec` — not a single record — is load-bearing: a
+    /// decodable-but-bad-signature blob co-located *before* a valid one at the
+    /// same routing ID must NOT shadow it. Because raw publish is unauthenticated
+    /// and the routing ID is DID-derivable, an attacker can plant a well-framed
+    /// bad-signature frame; returning only the first decodable record would let
+    /// that frame permanently suppress the genuine one (an intra-relay
+    /// suppression denial-of-service, defeating §3.10.6/§3.10.8). The relay
+    /// implementation MUST bound the
+    /// number of candidates it collects (see `TransportRelayQuerier`).
     ///
     /// # Arguments
     ///
@@ -101,139 +112,50 @@ pub trait RelayQuerier: Send + Sync {
     ///
     /// # Returns
     ///
-    /// `Ok(Some(record))` if the relay has a matching blob.
-    /// `Ok(None)` if the relay has no matching blob.
+    /// A (possibly empty) vector of every decodable, **unverified** candidate.
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::RelayQueryFailed`] if the query fails.
+    /// Returns [`IdentityError::RelayQueryFailed`] if the query itself fails.
     fn query(
         &self,
         relay_url: &str,
         routing_id: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<RelayQueryRecord>, IdentityError>> + Send;
+    ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send;
 }
 
-/// Result of a successful relay-based DID resolution.
-#[derive(Debug, Clone)]
-pub struct RelayResolveResult {
-    /// The verified DID document.
-    pub document: DidDocument,
-    /// The BEP44 sequence number.
-    pub seq: u64,
-    /// The relay URL that served this document.
-    pub relay_url: String,
-}
-
-/// Resolves a DID document from SCP relays (§3.10.2, §3.10.4 step 3a).
+/// Verifies a raw relay `(value, signature, seq)` record against a DID and
+/// returns the deserialized [`DidDocument`] (§3.10.4/§9.6.1).
 ///
-/// Queries the provided relay URLs in order (known relays first, then bootstrap
-/// relays per §3.10.4). Returns the first valid response.
-///
-/// # Resolution steps
-///
-/// 1. Compute `did_routing_id`.
-/// 2. Extract `public_key` from DID string (z-base-32 decode).
-/// 3. For each relay URL, send QUERY and on response:
-///    a. Verify BEP44 signature against `public_key`.
-///    b. Check `seq >= last_known_seq` from cache.
-///    c. Deserialize the DID document.
-///    d. Cache the result.
-/// 4. Return the first valid result, or `Ok(None)` if no relay has a valid doc.
-///
-/// # Arguments
-///
-/// * `did_string` — The DID to resolve (e.g., `"did:dht:z6Mk..."`).
-/// * `relay_urls` — Relay URLs to query, in priority order (identity's known
-///   relays first, then bootstrap relays).
-/// * `querier` — The relay QUERY implementation.
-/// * `cache` — The DID resolution cache (for seq checking and result caching).
+/// Performs, in order: BEP44 signature verification against the DID's Ed25519
+/// key, UTF-8 + JSON deserialization, and the self-certification check (the
+/// document's identity key must match the DID suffix). This is the SINGLE shared
+/// verify path used by both the relay composer
+/// ([`RealMultiRelayQuerier`](crate::relay_querier::RealMultiRelayQuerier)) and
+/// the dual-layer resolver ([`crate::resolver::DualLayerResolver`]), so relay
+/// and DHT records are validated identically and the logic is not duplicated.
 ///
 /// # Errors
 ///
-/// Returns `Err` for DID format errors. Relay failures for individual relays
-/// are logged and skipped; the function returns `Ok(None)` only when all relays
-/// fail or return no result.
-pub async fn relay_resolve<Q: RelayQuerier, C: Clock>(
-    did_string: &str,
-    relay_urls: &[&str],
-    querier: &Q,
-    cache: &DidCache<C>,
-) -> Result<Option<RelayResolveResult>, IdentityError> {
-    // Step 1: Compute routing ID.
-    let routing_id = did_routing_id(did_string);
+/// Returns [`IdentityError`] when the signature does not verify, the bytes are
+/// not valid UTF-8/JSON, or self-certification fails.
+pub(crate) fn verify_relay_record(
+    did: &str,
+    public_key: &[u8; 32],
+    value: &[u8],
+    signature: &[u8; 64],
+    seq: u64,
+) -> Result<DidDocument, IdentityError> {
+    verify_bep44_signature(public_key, signature, value, seq)?;
 
-    // Step 2: Extract public key from DID string.
-    let public_key = extract_public_key(did_string)?;
+    let doc_json = String::from_utf8(value.to_vec())
+        .map_err(|e| IdentityError::DocumentDeserializationError(format!("invalid UTF-8: {e}")))?;
+    let document = DidDocument::from_json(&doc_json)
+        .map_err(|e| IdentityError::DocumentDeserializationError(e.to_string()))?;
 
-    // Get last known sequence number from cache for freshness check.
-    let last_known_seq = cache.cached_sequence(did_string).await.unwrap_or(0);
+    verify_self_certification(did, &document)?;
 
-    // Step 3: Query relays in order, return first valid response.
-    for relay_url in relay_urls {
-        let record = match querier.query(relay_url, &routing_id).await {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                debug!(relay_url, did = did_string, "relay has no matching blob");
-                continue;
-            }
-            Err(e) => {
-                warn!(relay_url, did = did_string, error = %e, "relay query failed");
-                continue;
-            }
-        };
-
-        // Step 3a: Verify BEP44 signature.
-        if let Err(e) =
-            verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)
-        {
-            warn!(relay_url, did = did_string, error = %e, "BEP44 signature verification failed");
-            continue;
-        }
-
-        // Step 3b: Check sequence number freshness.
-        if record.seq < last_known_seq {
-            debug!(
-                relay_url,
-                did = did_string,
-                record_seq = record.seq,
-                last_known_seq,
-                "stale document (seq < last known)"
-            );
-            continue;
-        }
-
-        // Step 3c: Deserialize the DID document.
-        let Ok(doc_json) = String::from_utf8(record.value) else {
-            warn!(relay_url, did = did_string, "relay returned non-UTF8 blob");
-            continue;
-        };
-        let Ok(document) = DidDocument::from_json(&doc_json) else {
-            warn!(
-                relay_url,
-                did = did_string,
-                "relay returned invalid DID document JSON"
-            );
-            continue;
-        };
-
-        // Step 3c.1: Verify self-certification — identity key must match DID suffix.
-        if let Err(e) = verify_self_certification(did_string, &document) {
-            warn!(relay_url, did = did_string, error = %e, "self-certification failed");
-            continue;
-        }
-
-        // Step 3d: Cache the result.
-        cache.insert(did_string, document.clone(), record.seq).await;
-
-        return Ok(Some(RelayResolveResult {
-            document,
-            seq: record.seq,
-            relay_url: (*relay_url).to_owned(),
-        }));
-    }
-
-    Ok(None)
+    Ok(document)
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +175,11 @@ pub async fn relay_resolve<Q: RelayQuerier, C: Clock>(
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemoryRelayQuerier {
-    /// Map from (`relay_url`, `routing_id`) to stored record.
-    items: tokio::sync::Mutex<std::collections::HashMap<(String, [u8; 32]), RelayQueryRecord>>,
+    /// Map from (`relay_url`, `routing_id`) to the ordered list of stored
+    /// records. `insert` appends, so a routing ID can hold multiple co-located
+    /// candidates (exercising the shadow-defeating `Vec` query contract).
+    #[allow(clippy::type_complexity)]
+    items: tokio::sync::Mutex<std::collections::HashMap<(String, [u8; 32]), Vec<RelayQueryRecord>>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -267,10 +192,15 @@ impl InMemoryRelayQuerier {
         }
     }
 
-    /// Stores a record for a specific relay and routing ID.
+    /// Appends a record for a specific relay and routing ID. Multiple records
+    /// may be stored at the same key (co-located candidates); they are returned
+    /// by `query` in insertion order.
     pub async fn insert(&self, relay_url: &str, routing_id: &[u8; 32], record: RelayQueryRecord) {
         let mut items = self.items.lock().await;
-        items.insert((relay_url.to_owned(), *routing_id), record);
+        items
+            .entry((relay_url.to_owned(), *routing_id))
+            .or_default()
+            .push(record);
     }
 }
 
@@ -283,15 +213,16 @@ impl RelayQuerier for InMemoryRelayQuerier {
         &self,
         relay_url: &str,
         routing_id: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<RelayQueryRecord>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send {
         async move {
-            let record = self
+            let records = self
                 .items
                 .lock()
                 .await
                 .get(&(relay_url.to_owned(), *routing_id))
-                .cloned();
-            Ok(record)
+                .cloned()
+                .unwrap_or_default();
+            Ok(records)
         }
     }
 }
@@ -299,50 +230,10 @@ impl RelayQuerier for InMemoryRelayQuerier {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use std::sync::Arc;
-
     use sha2::{Digest, Sha256};
 
     use super::DID_ROUTING_DOMAIN_SEPARATOR;
     use crate::*;
-    use scp_clock::TestClock;
-    use scp_dht::bep44_signable;
-    use scp_did::DidDocument;
-
-    /// Helper: create an Ed25519 signing keypair and return (`public_key`, `signing_key`).
-    fn make_ed25519_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-        (verifying_key, signing_key)
-    }
-
-    /// Helper: build a DID string from an Ed25519 public key.
-    fn did_from_public_key(public_key: &ed25519_dalek::VerifyingKey) -> String {
-        format!("did:dht:z{}", zbase32::encode(public_key.as_bytes()))
-    }
-
-    /// Helper: create a BEP44-signed DID document blob for testing.
-    fn make_signed_blob(
-        did: &str,
-        public_key: &[u8; 32],
-        signing_key: &ed25519_dalek::SigningKey,
-        seq: u64,
-    ) -> RelayQueryRecord {
-        let active_key = [2u8; 32];
-        let pre_rotation_key = [3u8; 32];
-        let doc = DidDocument::new(did, public_key, &active_key, &pre_rotation_key);
-        let value = serde_json::to_vec(&doc).unwrap();
-
-        let payload = bep44_signable(&value, seq);
-        let signature: ed25519_dalek::Signature =
-            ed25519_dalek::Signer::sign(signing_key, &payload);
-
-        RelayQueryRecord {
-            value,
-            signature: signature.to_bytes(),
-            seq,
-        }
-    }
 
     // ---- Routing ID tests (preserved from original) ----
 
@@ -406,342 +297,39 @@ mod tests {
         assert_eq!(DID_ROUTING_DOMAIN_SEPARATOR, b"scp:did:");
     }
 
-    // ---- Relay resolution tests (SCP-240) ----
+    // ---- InMemoryRelayQuerier Vec-contract tests ----
 
-    /// Valid BEP44-signed document is accepted and cached.
+    /// The querier returns EVERY co-located record at a routing ID (append
+    /// semantics), so a caller can see a valid record even when a decodable but
+    /// otherwise-bad record was stored first (shadow-defeating `Vec` contract).
     #[tokio::test]
-    async fn relay_resolve_valid_document_accepted_and_cached() {
-        let (verifying_key, signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-        let routing_id = did_routing_id(&did);
-
-        let blob = make_signed_blob(&did, verifying_key.as_bytes(), &signing_key, 1);
-
-        let querier = InMemoryRelayQuerier::new();
-        querier
-            .insert("wss://relay1.example.com/scp/v1", &routing_id, blob)
-            .await;
-
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(Arc::clone(&clock));
-
-        let result = relay_resolve(&did, &["wss://relay1.example.com/scp/v1"], &querier, &cache)
-            .await
-            .unwrap();
-
-        assert!(result.is_some());
-        let resolved = result.unwrap();
-        assert_eq!(resolved.seq, 1);
-        assert_eq!(resolved.relay_url, "wss://relay1.example.com/scp/v1");
-
-        // Verify the document was cached.
-        let cached = cache.get(&did).await;
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().sequence, 1);
-    }
-
-    /// Document with invalid BEP44 signature is rejected.
-    #[tokio::test]
-    async fn relay_resolve_invalid_signature_rejected() {
-        let (verifying_key, signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-        let routing_id = did_routing_id(&did);
-
-        let mut blob = make_signed_blob(&did, verifying_key.as_bytes(), &signing_key, 1);
-        // Corrupt the signature.
-        blob.signature[0] ^= 0xFF;
-
-        let querier = InMemoryRelayQuerier::new();
-        querier
-            .insert("wss://relay1.example.com/scp/v1", &routing_id, blob)
-            .await;
-
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
-
-        let result = relay_resolve(&did, &["wss://relay1.example.com/scp/v1"], &querier, &cache)
-            .await
-            .unwrap();
-
-        // Invalid signature: no valid result returned.
-        assert!(result.is_none());
-
-        // Nothing should be cached.
-        assert!(cache.get(&did).await.is_none());
-    }
-
-    /// Document with lower sequence number than cached is rejected.
-    #[tokio::test]
-    async fn relay_resolve_stale_sequence_rejected() {
-        let (verifying_key, signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-        let routing_id = did_routing_id(&did);
-
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(Arc::clone(&clock));
-
-        // Pre-populate cache with seq=5.
-        let active_key = [2u8; 32];
-        let pre_rotation_key = [3u8; 32];
-        let cached_doc = DidDocument::new(
-            &did,
-            verifying_key.as_bytes(),
-            &active_key,
-            &pre_rotation_key,
-        );
-        cache.insert(&did, cached_doc, 5).await;
-
-        // Relay returns document with seq=3 (stale).
-        let blob = make_signed_blob(&did, verifying_key.as_bytes(), &signing_key, 3);
-
-        let querier = InMemoryRelayQuerier::new();
-        querier
-            .insert("wss://relay1.example.com/scp/v1", &routing_id, blob)
-            .await;
-
-        let result = relay_resolve(&did, &["wss://relay1.example.com/scp/v1"], &querier, &cache)
-            .await
-            .unwrap();
-
-        // Stale sequence: rejected.
-        assert!(result.is_none());
-
-        // Cache still has seq=5, not overwritten.
-        let cached = cache.cached_sequence(&did).await;
-        assert_eq!(cached, Some(5));
-    }
-
-    /// Queries known relays first, then bootstrap relays.
-    #[tokio::test]
-    async fn relay_resolve_queries_in_priority_order() {
-        let (verifying_key, signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-        let routing_id = did_routing_id(&did);
-
-        // Only the second relay (bootstrap) has the document.
-        let blob = make_signed_blob(&did, verifying_key.as_bytes(), &signing_key, 1);
-
-        let querier = InMemoryRelayQuerier::new();
-        // First relay (known) has nothing.
-        // Second relay (bootstrap) has the document.
-        querier
-            .insert("wss://bootstrap.example.com/scp/v1", &routing_id, blob)
-            .await;
-
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
-
-        let result = relay_resolve(
-            &did,
-            &[
-                "wss://known-relay.example.com/scp/v1",
-                "wss://bootstrap.example.com/scp/v1",
-            ],
-            &querier,
-            &cache,
-        )
-        .await
-        .unwrap();
-
-        assert!(result.is_some());
-        let resolved = result.unwrap();
-        assert_eq!(resolved.relay_url, "wss://bootstrap.example.com/scp/v1");
-    }
-
-    /// Returns `None` when no relays have the document.
-    #[tokio::test]
-    async fn relay_resolve_returns_none_when_no_relays_respond() {
-        let (verifying_key, _signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-
-        let querier = InMemoryRelayQuerier::new();
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
-
-        let result = relay_resolve(&did, &["wss://relay1.example.com/scp/v1"], &querier, &cache)
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-    }
-
-    /// Relay returns malformed (non-UTF8) value — skipped gracefully.
-    #[tokio::test]
-    async fn relay_resolve_skips_non_utf8_blob() {
-        let (verifying_key, signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-        let routing_id = did_routing_id(&did);
-
-        // Create a blob with invalid UTF-8 but valid signature.
-        let bad_value = vec![0xFF, 0xFE, 0xFD];
-        let payload = bep44_signable(&bad_value, 1);
-        let signature: ed25519_dalek::Signature =
-            ed25519_dalek::Signer::sign(&signing_key, &payload);
-
-        let blob = RelayQueryRecord {
-            value: bad_value,
-            signature: signature.to_bytes(),
-            seq: 1,
+    async fn in_memory_querier_returns_all_colocated_records_in_order() {
+        let routing_id = did_routing_id("did:dht:zTest");
+        let rec = |seq: u8| RelayQueryRecord {
+            value: vec![seq],
+            signature: [seq; 64],
+            seq: u64::from(seq),
         };
 
         let querier = InMemoryRelayQuerier::new();
-        querier
-            .insert("wss://relay1.example.com/scp/v1", &routing_id, blob)
-            .await;
+        querier.insert("wss://r/scp/v1", &routing_id, rec(1)).await;
+        querier.insert("wss://r/scp/v1", &routing_id, rec(2)).await;
 
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
-
-        let result = relay_resolve(&did, &["wss://relay1.example.com/scp/v1"], &querier, &cache)
+        let out = RelayQuerier::query(&querier, "wss://r/scp/v1", &routing_id)
             .await
             .unwrap();
-
-        assert!(result.is_none());
+        assert_eq!(out.len(), 2, "both co-located records returned");
+        assert_eq!(out[0].seq, 1);
+        assert_eq!(out[1].seq, 2);
     }
 
-    /// Document with equal sequence number to cached is accepted (spec says >=).
+    /// An unknown routing ID yields an empty vector (not an error).
     #[tokio::test]
-    async fn relay_resolve_equal_sequence_accepted() {
-        let (verifying_key, signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-        let routing_id = did_routing_id(&did);
-
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(Arc::clone(&clock));
-
-        // Pre-populate cache with seq=3.
-        let active_key = [2u8; 32];
-        let pre_rotation_key = [3u8; 32];
-        let cached_doc = DidDocument::new(
-            &did,
-            verifying_key.as_bytes(),
-            &active_key,
-            &pre_rotation_key,
-        );
-        cache.insert(&did, cached_doc, 3).await;
-
-        // Relay returns document with seq=3 (equal — accepted per §3.10.7).
-        let blob = make_signed_blob(&did, verifying_key.as_bytes(), &signing_key, 3);
-
+    async fn in_memory_querier_unknown_routing_id_is_empty() {
         let querier = InMemoryRelayQuerier::new();
-        querier
-            .insert("wss://relay1.example.com/scp/v1", &routing_id, blob)
-            .await;
-
-        // Advance clock so the cache insert takes effect (DidCache rejects same seq
-        // unless time advances).
-        clock.advance(1);
-
-        let result = relay_resolve(&did, &["wss://relay1.example.com/scp/v1"], &querier, &cache)
+        let out = RelayQuerier::query(&querier, "wss://r/scp/v1", &[9u8; 32])
             .await
             .unwrap();
-
-        // Equal sequence is >= last_known, so accepted.
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().seq, 3);
-    }
-
-    /// First relay has invalid doc, second has valid — second is returned.
-    #[tokio::test]
-    async fn relay_resolve_falls_through_on_invalid_to_valid() {
-        let (verifying_key, signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-        let routing_id = did_routing_id(&did);
-
-        // First relay: corrupted signature.
-        let mut bad_blob = make_signed_blob(&did, verifying_key.as_bytes(), &signing_key, 1);
-        bad_blob.signature[0] ^= 0xFF;
-
-        // Second relay: valid blob.
-        let good_blob = make_signed_blob(&did, verifying_key.as_bytes(), &signing_key, 1);
-
-        let querier = InMemoryRelayQuerier::new();
-        querier
-            .insert("wss://relay1.example.com/scp/v1", &routing_id, bad_blob)
-            .await;
-        querier
-            .insert("wss://relay2.example.com/scp/v1", &routing_id, good_blob)
-            .await;
-
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
-
-        let result = relay_resolve(
-            &did,
-            &[
-                "wss://relay1.example.com/scp/v1",
-                "wss://relay2.example.com/scp/v1",
-            ],
-            &querier,
-            &cache,
-        )
-        .await
-        .unwrap();
-
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().relay_url, "wss://relay2.example.com/scp/v1");
-    }
-
-    /// Document with mismatched identity key is rejected (self-certification).
-    #[tokio::test]
-    async fn relay_resolve_rejects_wrong_identity_key() {
-        let (verifying_key, signing_key) = make_ed25519_keypair();
-        let did = did_from_public_key(&verifying_key);
-        let routing_id = did_routing_id(&did);
-
-        // Create a document with a WRONG identity key (different from DID suffix).
-        let wrong_identity_key = [0xFFu8; 32];
-        let active_key = [2u8; 32];
-        let pre_rotation_key = [3u8; 32];
-        let doc = DidDocument::new(&did, &wrong_identity_key, &active_key, &pre_rotation_key);
-        let value = serde_json::to_vec(&doc).unwrap();
-
-        // Sign it correctly with the real key (BEP44 sig will verify, but
-        // self-cert will fail because the doc's #0 key doesn't match the DID).
-        let payload = bep44_signable(&value, 1);
-        let signature: ed25519_dalek::Signature =
-            ed25519_dalek::Signer::sign(&signing_key, &payload);
-
-        let blob = RelayQueryRecord {
-            value,
-            signature: signature.to_bytes(),
-            seq: 1,
-        };
-
-        let querier = InMemoryRelayQuerier::new();
-        querier
-            .insert("wss://relay1.example.com/scp/v1", &routing_id, blob)
-            .await;
-
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
-
-        let result = relay_resolve(&did, &["wss://relay1.example.com/scp/v1"], &querier, &cache)
-            .await
-            .unwrap();
-
-        // Self-certification failure: no valid result returned.
-        assert!(result.is_none());
-
-        // Nothing should be cached.
-        assert!(cache.get(&did).await.is_none());
-    }
-
-    /// Invalid DID format returns an error immediately.
-    #[tokio::test]
-    async fn relay_resolve_rejects_invalid_did_format() {
-        let querier = InMemoryRelayQuerier::new();
-        let clock = Arc::new(TestClock::new(1_000_000));
-        let cache = DidCache::with_clock(clock);
-
-        let result = relay_resolve(
-            "not-a-valid-did",
-            &["wss://relay1.example.com/scp/v1"],
-            &querier,
-            &cache,
-        )
-        .await;
-
-        assert!(result.is_err());
+        assert!(out.is_empty());
     }
 }

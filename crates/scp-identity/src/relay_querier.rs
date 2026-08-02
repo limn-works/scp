@@ -28,21 +28,28 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::IdentityError;
-use crate::dht::{extract_public_key, verify_self_certification};
-use crate::resolution::{RelayQuerier, did_routing_id};
+use crate::dht::extract_public_key;
+use crate::resolution::{RelayQuerier, did_routing_id, verify_relay_record};
 use crate::resolver::{MultiRelayQuerier, RelayRecord};
-use scp_dht::verify_bep44_signature;
-use scp_did::DidDocument;
 
 /// The production [`MultiRelayQuerier`] composer over any single-relay
 /// [`RelayQuerier`] (§3.10.2, §3.10.4 step 3a).
 ///
 /// Queries the provided relay URLs in priority order (identity's known relays
-/// first, then bootstrap relays per §3.10.4) and returns the FIRST valid
-/// record: one whose BEP44 signature verifies against the DID's Ed25519 key
-/// (§9.6.1) AND whose embedded identity key self-certifies against the DID
-/// suffix. Invalid records and per-relay errors are logged at WARN and skipped
-/// (fall through to the next relay).
+/// first, then bootstrap relays per §3.10.4). For each relay it fetches **all**
+/// decodable candidates (the `Vec` [`RelayQuerier`] contract) and returns the
+/// FIRST valid one: a record whose BEP44 signature verifies against the DID's
+/// Ed25519 key (§9.6.1) AND whose embedded identity key self-certifies against
+/// the DID suffix. Invalid candidates are logged at WARN and skipped — WITHIN a
+/// relay's candidate list AND across relays.
+///
+/// # Shadow-defeat (intra-relay suppression, §3.10.8)
+///
+/// Iterating *every* candidate at a routing ID — not just the first decodable
+/// one — is load-bearing. A decodable-but-bad-signature frame co-located before
+/// the genuine record must not shadow it; since raw publish is unauthenticated
+/// and the routing ID is DID-derivable, an attacker could otherwise plant one
+/// well-framed bad-signature blob to permanently suppress relay resolution.
 ///
 /// # Layering
 ///
@@ -50,8 +57,8 @@ use scp_did::DidDocument;
 /// freshness check — the [`DualLayerResolver`](crate::resolver::DualLayerResolver)
 /// owns cross-layer sequence arbitration, rollback rejection, and caching
 /// (§3.10.4/§3.10.7). It verifies each record only to select the first VALID
-/// one across the relay set; the resolver independently re-verifies the returned
-/// record (defense in depth).
+/// one; the resolver independently re-verifies the returned record (defense in
+/// depth), via the same shared [`verify_relay_record`] path.
 pub struct RealMultiRelayQuerier<Q: RelayQuerier> {
     /// The single-relay querier (production: `TransportRelayQuerier`).
     inner: Arc<Q>,
@@ -85,49 +92,41 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
             let public_key = extract_public_key(&did)?;
 
             for relay_url in &relay_urls {
-                let record = match inner.query(relay_url, &routing_id).await {
-                    Ok(Some(record)) => record,
-                    Ok(None) => continue,
+                // Fetch EVERY decodable candidate at this routing ID (the `Vec`
+                // contract) so a bad-signature frame co-located before the
+                // genuine record cannot shadow it.
+                let candidates = match inner.query(relay_url, &routing_id).await {
+                    Ok(candidates) => candidates,
                     Err(e) => {
                         warn!(relay_url, did = %did, error = %e, "relay query failed");
                         continue;
                     }
                 };
 
-                // BEP44 signature verification (seq before value, per BEP44).
-                if let Err(e) = verify_bep44_signature(
-                    &public_key,
-                    &record.signature,
-                    &record.value,
-                    record.seq,
-                ) {
-                    warn!(relay_url, did = %did, error = %e, "BEP44 signature verification failed");
-                    continue;
-                }
+                for record in candidates {
+                    // Shared verify: BEP44 signature + UTF-8/JSON + self-cert.
+                    // The embedded identity key must match the DID suffix, so
+                    // record substitution is cryptographically impossible.
+                    if let Err(e) = verify_relay_record(
+                        &did,
+                        &public_key,
+                        &record.value,
+                        &record.signature,
+                        record.seq,
+                    ) {
+                        warn!(relay_url, did = %did, error = %e, "relay candidate failed verification — skipping");
+                        continue;
+                    }
 
-                // Deserialize + self-certify: the embedded identity key must
-                // match the DID suffix (record substitution is impossible).
-                let Ok(doc_json) = String::from_utf8(record.value.clone()) else {
-                    warn!(relay_url, did = %did, "relay returned non-UTF8 blob");
-                    continue;
-                };
-                let Ok(document) = DidDocument::from_json(&doc_json) else {
-                    warn!(relay_url, did = %did, "relay returned invalid DID document JSON");
-                    continue;
-                };
-                if let Err(e) = verify_self_certification(&did, &document) {
-                    warn!(relay_url, did = %did, error = %e, "self-certification failed");
-                    continue;
+                    // First valid record wins. The resolver re-verifies and owns
+                    // sequence arbitration + caching.
+                    return Ok(Some(RelayRecord {
+                        value: record.value,
+                        signature: record.signature,
+                        seq: record.seq,
+                        relay_url: relay_url.clone(),
+                    }));
                 }
-
-                // First valid record wins. The resolver re-verifies and owns
-                // sequence arbitration + caching.
-                return Ok(Some(RelayRecord {
-                    value: record.value,
-                    signature: record.signature,
-                    seq: record.seq,
-                    relay_url: relay_url.clone(),
-                }));
             }
 
             Ok(None)
@@ -141,6 +140,7 @@ mod tests {
     use super::*;
     use crate::resolution::{InMemoryRelayQuerier, RelayQueryRecord};
     use scp_dht::bep44_signable;
+    use scp_did::DidDocument;
 
     fn make_ed25519_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
@@ -233,6 +233,43 @@ mod tests {
             result.expect("relay-b valid").relay_url,
             "wss://relay-b.example.com/scp/v1"
         );
+    }
+
+    /// Intra-relay shadow-defeat (HIGH #1 regression, §3.10.8): a decodable but
+    /// bad-signature frame co-located FIRST at the SAME `routing_id` on the SAME
+    /// relay must NOT shadow the valid frame stored after it. The composer must
+    /// iterate every candidate and still return the valid record — otherwise an
+    /// attacker planting one well-framed bad-signature blob (raw publish is
+    /// unauthenticated, the `routing_id` is DID-derivable) permanently suppresses
+    /// relay resolution.
+    #[tokio::test]
+    async fn skips_bad_candidate_colocated_before_valid_at_same_relay() {
+        let (vk, sk) = make_ed25519_keypair();
+        let did = did_from_public_key(&vk);
+        let routing_id = did_routing_id(&did);
+
+        let mut bad = signed_record(&did, vk.as_bytes(), &sk, 3);
+        bad.signature[0] ^= 0xFF; // decodes, but signature fails to verify
+        let good = signed_record(&did, vk.as_bytes(), &sk, 3);
+
+        let inner = InMemoryRelayQuerier::new();
+        // Bad FIRST, valid SECOND — both at the SAME (relay_url, routing_id).
+        inner
+            .insert("wss://relay-a.example.com/scp/v1", &routing_id, bad)
+            .await;
+        inner
+            .insert("wss://relay-a.example.com/scp/v1", &routing_id, good)
+            .await;
+
+        let composer = RealMultiRelayQuerier::new(Arc::new(inner));
+        let result = composer
+            .query(&did, &["wss://relay-a.example.com/scp/v1".to_owned()])
+            .await
+            .unwrap();
+
+        let record = result.expect("valid co-located record must still resolve");
+        assert_eq!(record.seq, 3);
+        assert_eq!(record.relay_url, "wss://relay-a.example.com/scp/v1");
     }
 
     #[tokio::test]

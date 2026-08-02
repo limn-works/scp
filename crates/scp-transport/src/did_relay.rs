@@ -76,6 +76,15 @@ impl LiveTransport {
     }
 }
 
+/// Upper bound on the number of decodable DID-record candidates the querier
+/// collects per routing ID.
+///
+/// DID resolution needs only enough candidates to find the one valid record;
+/// capping bounds the work an adversary (or a misbehaving/greedy relay) can
+/// impose by planting many well-framed blobs at a DID-derivable routing ID
+/// (defense-in-depth alongside the `query_raw` wire `limit`).
+pub const MAX_RELAY_CANDIDATES: usize = 16;
+
 // ---------------------------------------------------------------------------
 // READ half — TransportRelayQuerier
 // ---------------------------------------------------------------------------
@@ -83,14 +92,21 @@ impl LiveTransport {
 /// Concrete single-relay [`RelayQuerier`] over the live transport (§3.10.4,
 /// §9.10.12).
 ///
-/// Performs the relay QUERY via the public-record `query_raw` path, SCPR-decodes
+/// Performs the relay QUERY via the public-record `query_raw` path.
+///
+/// SCPR-decodes
 /// each returned raw blob as a kind-1 DID-record frame (§9.10.12), and returns
-/// the first decodable record's `(value, signature, seq)` triple. Malformed
-/// (non-decodable) blobs are skipped exactly as an invalid DHT record is
-/// (§3.10.4) — never trusted, never partially parsed. **No BEP44 verification**
-/// happens here: framing grants no authority; the composer / resolver verifies
-/// the triple. When no transport is connected the querier fails closed with
-/// `Ok(None)`.
+/// **all** decodable candidates' `(value, signature, seq)` triples (up to
+/// [`MAX_RELAY_CANDIDATES`]). Malformed (non-decodable) blobs are skipped exactly
+/// as an invalid DHT record is (§3.10.4) — never trusted, never partially
+/// parsed. **No BEP44 verification** happens here: framing grants no authority;
+/// the composer ([`RealMultiRelayQuerier`](scp_identity::RealMultiRelayQuerier))
+/// verifies each candidate and picks the first valid one.
+///
+/// Returning ALL candidates (not just the first decodable one) is what defeats
+/// the intra-relay shadow attack: a decodable-but-bad-signature frame planted
+/// before the genuine record cannot suppress it (§3.10.8). When no transport is
+/// connected the querier fails closed with an empty `Vec`.
 pub struct TransportRelayQuerier {
     live: LiveTransport,
 }
@@ -111,35 +127,46 @@ impl RelayQuerier for TransportRelayQuerier {
         &self,
         relay_url: &str,
         routing_id: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<RelayQueryRecord>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send {
         let live = self.live.clone();
         let relay_url = relay_url.to_owned();
         let routing_id = RoutingId::new(*routing_id);
 
         async move {
-            // Fail closed: no relay connected => honest not-found.
+            // Fail closed: no relay connected => honest empty (no candidates).
             let Some(manager) = live.current() else {
                 debug!(
                     relay_url,
-                    "no transport connected — relay query fails closed (Ok(None))"
+                    "no transport connected — relay query fails closed (empty)"
                 );
-                return Ok(None);
+                return Ok(Vec::new());
             };
 
             let blobs = manager.query_raw(&routing_id).await.map_err(|e| {
                 IdentityError::RelayQueryFailed(format!("relay query_raw failed: {e}"))
             })?;
 
-            // SCPR-decode each raw blob; return the first that decodes. Skip
+            // SCPR-decode each raw blob into a candidate. Return EVERY decodable
+            // candidate (up to MAX_RELAY_CANDIDATES) so the composer can skip a
+            // bad-signature frame co-located before the valid one (§3.10.8). Skip
             // non-decodable blobs (§3.10.4 — malformed framing is discarded).
+            let mut candidates = Vec::new();
             for blob in blobs {
                 match scpr::decode_did_record(&blob) {
                     Ok(record) => {
-                        return Ok(Some(RelayQueryRecord {
+                        candidates.push(RelayQueryRecord {
                             value: record.value,
                             signature: record.signature,
                             seq: record.seq,
-                        }));
+                        });
+                        if candidates.len() >= MAX_RELAY_CANDIDATES {
+                            debug!(
+                                relay_url,
+                                cap = MAX_RELAY_CANDIDATES,
+                                "reached relay candidate cap — stopping collection"
+                            );
+                            break;
+                        }
                     }
                     Err(e) => {
                         warn!(relay_url, error = %e, "relay blob failed SCPR decoding — skipping");
@@ -147,7 +174,7 @@ impl RelayQuerier for TransportRelayQuerier {
                 }
             }
 
-            Ok(None)
+            Ok(candidates)
         }
     }
 }
@@ -163,7 +190,10 @@ impl RelayQuerier for TransportRelayQuerier {
 /// caller (the republish loop / healing publisher) is responsible for wrapping
 /// the `(value, signature, seq)` triple in an SCPR kind-1 frame before calling
 /// `publish`. When no transport is connected the publisher fails closed with a
-/// typed [`IdentityError::RelayPublishFailed`].
+/// typed [`IdentityError::RelayNotConnected`] (distinct from
+/// [`IdentityError::RelayPublishFailed`], which signals an actual failure of a
+/// connected relay — so callers can log the expected no-transport interim
+/// quietly and alarm only on real rejections).
 pub struct TransportRelayPublisher {
     live: LiveTransport,
 }
@@ -191,10 +221,12 @@ impl RelayPublisher for TransportRelayPublisher {
         let blob = blob.to_vec();
 
         async move {
-            // Fail closed: no relay connected => typed publish error, never a
-            // silent success against a nonexistent backend.
+            // Fail closed: no relay connected => typed `RelayNotConnected`, never
+            // a silent success against a nonexistent backend. Distinct from
+            // `RelayPublishFailed` so best-effort callers can log the expected
+            // no-transport interim quietly (the DHT layer stays authoritative).
             let Some(manager) = live.current() else {
-                return Err(IdentityError::RelayPublishFailed(
+                return Err(IdentityError::RelayNotConnected(
                     "no transport connected — cannot publish DID record to relay".to_owned(),
                 ));
             };
@@ -223,7 +255,7 @@ mod tests {
             .query("wss://relay.example.com/scp/v1", &[7u8; 32])
             .await
             .expect("fail-closed query returns Ok, not Err");
-        assert!(result.is_none(), "no transport => honest not-found");
+        assert!(result.is_empty(), "no transport => no candidates");
     }
 
     #[tokio::test]
@@ -232,8 +264,8 @@ mod tests {
         let publisher = TransportRelayPublisher::new(live);
         let result = publisher.publish(&[7u8; 32], 604_800, b"blob").await;
         assert!(
-            matches!(result, Err(IdentityError::RelayPublishFailed(_))),
-            "no transport => typed publish error, never silent success"
+            matches!(result, Err(IdentityError::RelayNotConnected(_))),
+            "no transport => typed RelayNotConnected, never silent success or a generic failure"
         );
     }
 

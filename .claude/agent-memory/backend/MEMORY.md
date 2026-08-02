@@ -1,5 +1,7 @@
 # Backend Agent Memory (scoped)
 
+- [project-adr062-slice11-relay-scpr](project_adr062_slice11_relay_scpr.md) — ADR-062 Slice 11 DID relay READ+WRITE over SCPR frames; FFI DID-publish is all testing-gated (prod create fails closed), write path lives in FFI not scp-node, cross-layer gate is PR-only + needs decode_did_record exemption, scp-relay nextest fails are environmental
+
 - [project-adr057-transport-jssocket](project_adr057_transport_jssocket.md) — ADR-057 JsSocket relay-transport slice; Step-2 finding: MLS SignatureKeyPair ED25519 private = 32-byte seed, recover via serde (private() is test-utils-gated); send_message()→() break analysis
 
 - [project-eventlog-committer-assigned-timestamp](project_eventlog_committer_assigned_timestamp.md) — event-log convergence: committer-assigned leaf timestamps replace per-member now(); per-class sourcing rules + CommitMeta refactor + chokepoints; spec 2ecfa23fb, impl 88c856360

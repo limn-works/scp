@@ -57,7 +57,7 @@ pub async fn publish_did_record_to_relay(
     let routing_id = scp_identity::did_routing_id(did);
     let publisher = scp_transport::TransportRelayPublisher::new(live);
 
-    if let Err(e) = publisher
+    match publisher
         .publish(
             &routing_id,
             scp_identity::republish::RELAY_BLOB_TTL_SECS,
@@ -65,11 +65,26 @@ pub async fn publish_did_record_to_relay(
         )
         .await
     {
-        debug!(
-            did,
-            error = %e,
-            "relay publish of DID record skipped (best-effort; DHT layer remains authoritative)"
-        );
+        Ok(()) => {}
+        // Expected interim: no relay connected yet (identities are typically
+        // minted before `transport_connect`). Not a problem — log quietly.
+        Err(IdentityError::RelayNotConnected(reason)) => {
+            debug!(
+                did,
+                reason,
+                "relay publish of DID record skipped — no transport connected (best-effort; DHT layer remains authoritative)"
+            );
+        }
+        // A CONNECTED relay rejected the publish (or the transport erred). This
+        // may indicate a misconfiguration or a hostile relay — surface it at
+        // WARN so it is not lost among the expected no-transport cases.
+        Err(e) => {
+            warn!(
+                did,
+                error = %e,
+                "relay publish of DID record failed against a connected transport (best-effort; DHT layer remains authoritative)"
+            );
+        }
     }
 }
 
