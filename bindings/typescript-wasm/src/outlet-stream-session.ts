@@ -469,17 +469,17 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
       }
       const chunk = this.#pending.shift() as OutletStreamChunkView;
       if (chunk.sequence !== this.#expectedSequence) {
-        // §5.4.5 "Ordering and gaps" (05-contexts.md:515): a non-contiguous
-        // sequence is a receiver-detected gap. The browser is the REMOTE
-        // invoker-side drain; per ADR-057 + §5.4.5 (Cancel signature,
-        // 05-contexts.md:547) it does NOT sign an OutletCancel here — the
-        // cancel `next_seq` is the runtime's live emission cursor, which a
-        // remote invoker cannot read — so on a gap it surfaces `StreamGap` to
-        // the caller and node-side reclamation (credit-stall / timeout,
-        // §5.4.5 `stream_credit_stall_secs`, 05-contexts.md:485) reclaims the
+        // §5.4.5 "Ordering and gaps" — "Co-located vs. remote receiver": a
+        // non-contiguous sequence is a receiver-detected gap. The browser is
+        // the REMOTE invoker-side drain; per that carve-out + §5.4.5 "Cancel
+        // signature" it does NOT sign an OutletCancel here — the cancel
+        // `next_seq` is the runtime's live emission cursor, which a remote
+        // invoker cannot read — so on a gap it surfaces `StreamGap` to the
+        // caller and node-side reclamation (credit-stall / timeout, §5.4.5
+        // "Credit-based backpressure" `stream_credit_stall_secs`) reclaims the
         // stream. Browser-initiated active cancel is deferred to a future
-        // cross-context-cancel slice. Close and throw WITHOUT yielding the
-        // offending chunk.
+        // cross-context-cancel slice (#2203). Close and throw WITHOUT yielding
+        // the offending chunk.
         const gap = new OutletError(
           `outlet stream sequence gap: expected ${this.#expectedSequence}, got ` +
             `${chunk.sequence} (§5.4.5)`,
