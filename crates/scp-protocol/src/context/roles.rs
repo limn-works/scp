@@ -2025,6 +2025,17 @@ impl ContextRoleState {
         Ok(tokens)
     }
 
+    /// Atomically drops ALL per-DID role state for `did` (spec §5.6.1): removes
+    /// the DID from `members`, `assignments`, `member_capabilities`, AND
+    /// `suspended_capabilities`. The single canonical teardown chokepoint — a
+    /// re-admitted same-DID member never inherits a phantom suspension.
+    pub fn remove_member(&mut self, did: &str) {
+        self.members.remove(did);
+        self.assignments.remove(did);
+        self.member_capabilities.remove(did);
+        self.suspended_capabilities.remove(did);
+    }
+
     /// Destructure `self` into DISJOINT field references for the cross-crate
     /// field-granular role views (ADR-049 §9). The downward-auth `ceiling` is
     /// handed out SHARED `&` (read-only); the suspended-capability map is handed
@@ -5646,5 +5657,139 @@ mod tests {
             state.members.contains("did:dht:creator"),
             "SuspendAll must preserve membership — that's what RemoveMember is for"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_member (spec §5.6.1 clean teardown)
+    // -----------------------------------------------------------------------
+
+    /// Happy path: `remove_member` drops the DID from all four per-DID maps.
+    #[test]
+    fn remove_member_clears_all_four_maps() {
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-rm-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Add alice as a context member and assign the built-in "member" role
+        // (creator has RoleAssign by virtue of the built-in admin role).
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Suspend one capability so she appears in suspended_capabilities.
+        state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
+
+        // Pre-conditions: alice is present in all four collections.
+        assert!(state.members.contains("did:dht:alice"));
+        assert!(state.assignments.contains_key("did:dht:alice"));
+        assert!(state.member_capabilities.contains_key("did:dht:alice"));
+        assert!(state.suspended_capabilities.contains_key("did:dht:alice"));
+
+        // Remove.
+        state.remove_member("did:dht:alice");
+
+        // Post-conditions: alice is absent from all four.
+        assert!(
+            !state.members.contains("did:dht:alice"),
+            "members must be cleared"
+        );
+        assert!(
+            !state.assignments.contains_key("did:dht:alice"),
+            "assignments must be cleared"
+        );
+        assert!(
+            !state.member_capabilities.contains_key("did:dht:alice"),
+            "member_capabilities must be cleared"
+        );
+        assert!(
+            state.suspended_for("did:dht:alice").is_none(),
+            "suspended_capabilities must be cleared"
+        );
+    }
+
+    /// Phantom suspension prevented: a re-admitted member must not inherit a
+    /// suspension from a prior session (spec §5.6.1 re-admission guarantee).
+    #[test]
+    fn remove_member_prevents_phantom_suspension_on_readmission() {
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-rm-2",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Assign alice, suspend a capability, then remove her.
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
+        state.remove_member("did:dht:alice");
+
+        // Re-admit alice: add back to members and re-assign the role.
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // She should have MessagesWrite (no phantom suspension from the previous
+        // session).
+        assert!(
+            state.member_has_capability("did:dht:alice", &Capability::MessagesWrite),
+            "re-admitted member must not inherit a phantom suspension"
+        );
+        assert!(
+            state.suspended_for("did:dht:alice").is_none(),
+            "suspended_capabilities must be absent for freshly re-admitted member"
+        );
+    }
+
+    /// Idempotency: calling `remove_member` on a DID that is not a member must
+    /// not panic or corrupt state.
+    #[test]
+    fn remove_member_is_idempotent_on_non_member() {
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-rm-3",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Calling on a DID that was never a member must be a no-op.
+        state.remove_member("did:dht:nobody");
+
+        // Creator state is untouched.
+        assert!(state.members.contains("did:dht:creator"));
+
+        // Calling again is still a no-op (idempotent).
+        state.remove_member("did:dht:nobody");
     }
 }

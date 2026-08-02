@@ -1307,14 +1307,24 @@ pub fn execute_remove_member(
         }
 
         state.membership.remove_member(did);
-        state.role_state.members.remove(did.as_ref());
-        state.role_state.assignments.remove(did.as_ref());
-        state.role_state.member_capabilities.remove(did.as_ref());
+        // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
+        // assignments, member_capabilities, AND suspended_capabilities. Replaces
+        // the prior strip that left the removed DID's suspension dangling, so a
+        // re-admitted same-DID member no longer inherits a phantom suspension.
+        // Inside `commit_class_s_keep`, so the downward-auth suspension drop
+        // persists fail-closed (ADR-049 §9).
+        state.role_state.remove_member(did.as_ref());
 
         state
             .access
             .access_key_store
             .remove(context_id, did.as_ref());
+
+        // Drop the removed member's CEK-exclusion entry (spec §5.6.1, §9.17) —
+        // per-DID content-access state outside the role state. Mirrors
+        // `execute_restore_access`. Without this, a re-admitted same-DID member
+        // would inherit a phantom read exclusion.
+        state.access.read_exclusion_list.remove(did);
 
         // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
         // broadcast context (which carries no peer registry).

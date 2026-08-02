@@ -202,12 +202,10 @@ fn parse_query_params(query: &str) -> Vec<(String, String)> {
         .split('&')
         .filter(|pair| !pair.is_empty())
         .filter_map(|pair| {
-            let (key, value) = if let Some(eq_pos) = pair.find('=') {
-                (&pair[..eq_pos], &pair[eq_pos + 1..])
-            } else {
-                // Parameters without values are ignored.
-                return None;
-            };
+            // Parameters without `=` are ignored; `?` returns `None` from the
+            // filter_map closure for those.
+            let eq_pos = pair.find('=')?;
+            let (key, value) = (&pair[..eq_pos], &pair[eq_pos + 1..]);
             let decoded_key = percent_decode_str(key).decode_utf8_lossy().into_owned();
             let decoded_value = percent_decode_str(value).decode_utf8_lossy().into_owned();
             Some((decoded_key, decoded_value))

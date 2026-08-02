@@ -666,7 +666,7 @@ fn extract_cost(
 
     let cost_formula: Option<String> = dict
         .get_item("cost_formula")?
-        .and_then(|v| if v.is_none() { None } else { Some(v) })
+        .filter(|v| !v.is_none())
         .map(|v| v.extract())
         .transpose()?;
 
