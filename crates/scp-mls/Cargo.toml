@@ -40,6 +40,10 @@ tls_codec = "0.4"
 
 serde = { workspace = true }
 rmp-serde = { workspace = true }
+# SHA-256 for the §9.5.1 canonical signing hash of the KeyPackage attestation
+# (keypackage_attestation.rs). Workspace-pinned 0.10, wasm32-safe (the same dep
+# scp-protocol uses on the wasm path).
+sha2 = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
