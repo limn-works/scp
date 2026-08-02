@@ -2027,8 +2027,12 @@ impl ContextRoleState {
 
     /// Atomically drops ALL per-DID role state for `did` (spec §5.6.1): removes
     /// the DID from `members`, `assignments`, `member_capabilities`, AND
-    /// `suspended_capabilities`. The single canonical teardown chokepoint — a
-    /// re-admitted same-DID member never inherits a phantom suspension.
+    /// `suspended_capabilities`. The single canonical teardown chokepoint for
+    /// per-DID role state — a re-admitted same-DID member never inherits a
+    /// phantom suspension. Out-of-role per-DID state (sequence tracker,
+    /// reorder buffer, read exclusion, access key store, pseudonym routing) is
+    /// cleared by the runtime-layer callers in `governance_helpers` and
+    /// `lifecycle_helpers`.
     pub fn remove_member(&mut self, did: &str) {
         self.members.remove(did);
         self.assignments.remove(did);

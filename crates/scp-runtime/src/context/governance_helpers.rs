@@ -1332,6 +1332,16 @@ pub fn execute_remove_member(
             reg.remove(did);
         }
 
+        // Drop the removed member's per-sender sequence tracking state
+        // (spec §5.6.1 — "its MLS sequence counter") so a re-admitted same-DID
+        // member's fresh (low-sequence) messages are not rejected as
+        // EnvelopeError::SequenceRegression. Both the anti-replay high-water mark
+        // and any out-of-order buffered envelopes from the removed DID are cleared.
+        state
+            .sequence_tracker
+            .reset_sender(context_id, did.as_ref());
+        state.reorder_buffer.clear_sender(context_id, did.as_ref());
+
         emit(
             state,
             ContextEvent::MemberLeft {
