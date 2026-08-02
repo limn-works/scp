@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::context::ContextError;
 use crate::context::membership::ContextEvent;
 use crate::context::params::ContextMode;
-use crate::crypto::sender_keys::broadcast::seal_broadcast_key_to_subscriber;
+use crate::crypto::sender_keys::broadcast::{
+    BroadcastKeyEpochAdvance, seal_broadcast_key_to_subscriber,
+};
 use crate::crypto::sender_keys::{
     BroadcastEnvelope, BroadcastKey, SealBroadcastParams, SenderKey, generate_sender_key,
     seal_broadcast,
@@ -1677,10 +1679,24 @@ impl BroadcastContext {
     /// `RotateContentKeys` governance action for context-wide key hygiene.
     /// Does not modify block lists or subscriber registry.
     ///
+    /// Returns one [`BroadcastKeyEpochAdvance`] per author so the caller can
+    /// emit `KeyEpochAdvance` event-log leaves per §5.14.10. The rotation is
+    /// all-or-nothing: the pre-validate pass ensures no mid-loop overflow can
+    /// leave some authors rotated and others not.
+    ///
+    /// # Parameters
+    ///
+    /// - `timestamp_ms`: Unix timestamp in milliseconds to embed in each
+    ///   [`BroadcastKeyEpochAdvance`] (used by the caller for event-log
+    ///   ordering; convert from seconds with `.saturating_mul(1_000)`).
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if any author's epoch overflows.
-    pub fn rotate_all_author_keys(&mut self) -> Result<(), ContextError> {
+    pub fn rotate_all_author_keys(
+        &mut self,
+        timestamp_ms: u64,
+    ) -> Result<Vec<BroadcastKeyEpochAdvance>, ContextError> {
         // Pre-validate: ensure ALL authors can increment their epoch before
         // mutating any state. This prevents partial rotation where some
         // authors get new keys but the operation fails mid-loop.
@@ -1690,11 +1706,22 @@ impl BroadcastContext {
             })?;
         }
         // All epochs validated — safe to mutate.
+        let mut advances = Vec::with_capacity(self.authors.len());
         for author in self.authors.values_mut() {
             author.epoch += 1;
             author.broadcast_key = generate_sender_key();
+            advances.push(BroadcastKeyEpochAdvance {
+                author_did: author.author_did.clone(),
+                new_epoch: author.epoch,
+                timestamp: timestamp_ms,
+            });
         }
-        Ok(())
+        // Sort by author_did for deterministic event-log leaf ordering across
+        // replicas and reconstructions. HashMap iteration order is randomized
+        // per process, so the same logical rotation would otherwise produce
+        // a different Merkle root on different nodes or replays.
+        advances.sort_unstable_by(|a, b| a.author_did.cmp(&b.author_did));
+        Ok(advances)
     }
 
     // -----------------------------------------------------------------------
@@ -6170,6 +6197,103 @@ mod tests {
         assert!(
             ctx.is_blocked(author_a, excluded) && ctx.is_blocked(author_b, excluded),
             "reconciliation must block the excluded DID for every author"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // rotate_all_author_keys — §9.17 governance-triggered epoch advance (#1847)
+    // -----------------------------------------------------------------------
+
+    /// `rotate_all_author_keys` must return exactly one [`BroadcastKeyEpochAdvance`]
+    /// per registered author, each with `new_epoch == 1` (initial epoch is 0).
+    #[test]
+    fn rotate_all_author_keys_returns_one_advance_per_author() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        ctx.add_author("did:example:carol").unwrap();
+
+        let advances = ctx.rotate_all_author_keys(1_700_000_000_000).unwrap();
+
+        assert_eq!(
+            advances.len(),
+            3,
+            "expected one advance per author, got {}",
+            advances.len()
+        );
+        for advance in &advances {
+            assert_eq!(
+                advance.new_epoch, 1,
+                "first rotation from epoch 0 must yield new_epoch = 1 for {}",
+                advance.author_did
+            );
+        }
+
+        // The advance set must cover exactly the three registered authors.
+        let mut advance_dids: Vec<&str> = advances.iter().map(|a| a.author_did.as_str()).collect();
+        advance_dids.sort_unstable();
+        assert_eq!(
+            advance_dids,
+            ["did:example:alice", "did:example:bob", "did:example:carol"]
+        );
+    }
+
+    /// Each [`BroadcastKeyEpochAdvance`] carries the `timestamp_ms` passed to
+    /// `rotate_all_author_keys`, so the caller can use it when emitting
+    /// event-log leaves.
+    #[test]
+    fn rotate_all_author_keys_advance_carries_timestamp() {
+        let timestamp_ms: u64 = 1_700_123_456_789;
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let advances = ctx.rotate_all_author_keys(timestamp_ms).unwrap();
+
+        assert_eq!(advances.len(), 1);
+        assert_eq!(
+            advances[0].timestamp, timestamp_ms,
+            "advance.timestamp must match the timestamp_ms argument"
+        );
+        assert_eq!(advances[0].author_did, "did:example:alice");
+        assert_eq!(advances[0].new_epoch, 1);
+    }
+
+    /// Pre-validation must reject the rotation and return
+    /// [`ContextError::CryptoFailed`] when ANY author's epoch is already at
+    /// `u64::MAX` (overflow would otherwise wrap silently).
+    #[test]
+    fn rotate_all_author_keys_epoch_overflow_still_rejected() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:overflow-author").unwrap();
+
+        // Manually set the overflow author's epoch to u64::MAX so the
+        // pre-validate pass detects it before any mutation.
+        ctx.authors
+            .get_mut("did:example:overflow-author")
+            .unwrap()
+            .epoch = u64::MAX;
+
+        let result = ctx.rotate_all_author_keys(1_000);
+        assert!(
+            result.is_err(),
+            "rotate_all_author_keys must fail when any author epoch would overflow"
+        );
+        match result {
+            Err(ContextError::CryptoFailed(msg)) => {
+                assert!(
+                    msg.contains("epoch overflow"),
+                    "error message must mention 'epoch overflow', got: {msg}"
+                );
+            }
+            other => panic!("expected CryptoFailed(epoch overflow), got: {other:?}"),
+        }
+
+        // Alice's epoch must still be 0 — no partial mutation.
+        assert_eq!(
+            ctx.authors.get("did:example:alice").unwrap().epoch,
+            0,
+            "alice's epoch must be unchanged after a failed rotate_all_author_keys"
         );
     }
 

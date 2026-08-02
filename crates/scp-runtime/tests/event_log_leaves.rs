@@ -8,7 +8,7 @@
     clippy::large_futures
 )]
 //! Integration tests asserting that `KeyEpochAdvance` event-log leaves are
-//! appended by the three code paths that emit them (#1847).
+//! appended by the four code paths that emit them (#1847).
 //!
 //! Code paths under test:
 //!
@@ -20,8 +20,10 @@
 //! 3. `execute_revoke` (`governance_helpers.rs`): after a governance ban on a
 //!    broadcast context subscriber, emits one `KeyEpochAdvance` leaf per
 //!    rotated author.
+//! 4. `execute_rotate_content_keys` (`governance_helpers.rs`): `RotateContentKeys`
+//!    on a broadcast context emits one `KeyEpochAdvance` leaf per rotated author.
 //!
-//! All three paths are best-effort (warn on failure, no error propagation), so
+//! All paths are best-effort (warn on failure, no error propagation), so
 //! a regression silently drops the leaves. These tests pin the expected leaf
 //! count to catch silent regressions.
 
@@ -485,5 +487,113 @@ async fn governance_ban_emits_key_epoch_advance_per_author() {
         kea_payload.old_epoch + 1,
         kea_payload.new_epoch,
         "governance_ban_subscriber rotation always increments by exactly 1"
+    );
+}
+
+// ===========================================================================
+// Test 4: RotateContentKeys on a broadcast context emits KeyEpochAdvance per
+//         author (#1847)
+// ===========================================================================
+
+/// A `RotateContentKeys` governance action on a broadcast context must emit:
+///
+/// - Exactly one `ContentKeysRotated` leaf.
+/// - Exactly N `KeyEpochAdvance` leaves, one per registered author, each with
+///   `new_epoch == 1` (starting from 0 at creation) and `old_epoch + 1 ==
+///   new_epoch`.
+///
+/// This pins the fix for the gap where `rotate_all_author_keys` previously
+/// discarded the per-author advance data and emitted no `KeyEpochAdvance`
+/// leaves.
+#[tokio::test]
+async fn rotate_content_keys_broadcast_emits_key_epoch_advance_per_author() {
+    let manager = new_manager();
+    let ctx_id = "kea-rotate-content-keys-broadcast";
+
+    // Create a broadcast context.  Alice is auto-registered as an author at
+    // creation.  The ceiling must include MessagesRead and MessagesWrite.
+    manager
+        .create_context(ctx_id.into(), broadcast_params(), alice(), None)
+        .await
+        .expect("create broadcast context");
+
+    // Subscribe bob so the context has an active subscriber (ensures the
+    // rotation code path touches a non-empty subscriber roster).
+    subscribe_bob(&manager, ctx_id).await;
+
+    // Alice (the single admin) proposes RotateContentKeys.  In SingleAdmin
+    // mode the proposal auto-executes immediately.
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RotateContentKeys { reason: None },
+            &sk_alice,
+        )
+        .await
+        .expect("propose RotateContentKeys");
+
+    use scp_protocol::context::governance::ProposalStatus;
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "SingleAdmin RotateContentKeys must auto-execute"
+    );
+
+    // Read back the durable event-log entries.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .expect("event_log_entries Ok")
+        .expect("event log exists for active context");
+
+    // Assert exactly one ContentKeysRotated leaf.
+    let ckr_leaves: Vec<_> = entries
+        .iter()
+        .filter(|e| e.event_type == EventType::ContentKeysRotated)
+        .collect();
+    assert_eq!(
+        ckr_leaves.len(),
+        1,
+        "expected exactly one ContentKeysRotated leaf after RotateContentKeys, got {}",
+        ckr_leaves.len()
+    );
+
+    // Assert KeyEpochAdvance leaves: one per registered author.  Alice is the
+    // only author (the context creator is auto-registered), so exactly one
+    // leaf is expected.
+    let kea_leaves: Vec<_> = entries
+        .iter()
+        .filter(|e| e.event_type == EventType::KeyEpochAdvance)
+        .collect();
+    assert_eq!(
+        kea_leaves.len(),
+        1,
+        "REGRESSION: expected one KeyEpochAdvance leaf per author after \
+         RotateContentKeys on broadcast context (#1847), got {}",
+        kea_leaves.len()
+    );
+
+    // The leaf's actor_did must be alice (the only registered author).
+    assert_eq!(
+        kea_leaves[0].actor_did.as_ref(),
+        alice().as_ref(),
+        "KeyEpochAdvance actor_did must be the rotated author (alice)"
+    );
+
+    // Validate payload coherence: first rotation from epoch 0 → epoch 1.
+    let kea_payload = scp_event_log::payload::decode_payload::<
+        scp_event_log::payload::KeyEpochAdvancePayload,
+    >(&kea_leaves[0].payload)
+    .expect("KeyEpochAdvancePayload decodes");
+
+    assert_eq!(
+        kea_payload.new_epoch, 1,
+        "first RotateContentKeys must advance broadcast key from epoch 0 to 1"
+    );
+    assert_eq!(
+        kea_payload.old_epoch, 0,
+        "old_epoch must be 0 before the first rotation"
     );
 }
