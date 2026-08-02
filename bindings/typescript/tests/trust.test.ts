@@ -207,15 +207,16 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
     const perm3030 = new Error(
       "[SCP-PERM-3030] permission error: handle belongs to a different SCP instance",
     );
-    native.__stub("ucanValidate", () => Promise.reject(perm3030));
-    native.__stub("eventLogQuery", () => Promise.resolve([]));
+    // scp.evaluateTrust calls this.ucanEvaluate (read-only probe), not ucanValidate.
+    native.__stub("ucanEvaluate", () => Promise.reject(perm3030));
 
     let threw = false;
     try {
       await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
     } catch (err) {
       threw = true;
-      expect(err).toBe(perm3030);
+      // mapBridgeError re-wraps the raw error; check the preserved message.
+      expect((err as Error).message).toContain("[SCP-PERM-3030]");
     }
     expect(threw).toBe(true);
   });
@@ -661,15 +662,14 @@ describe("encodeCapabilityRequirements", () => {
 
   it("Layer 2 — non-context error propagates instead of swallowing to null", async () => {
     const { scp, native, context } = mountWithContext();
-    // ucanValidate resolves (passes Layer 1)
-    native.__stub("ucanValidate", () => Promise.resolve(undefined));
-    // eventLogQuery rejects with a non-[SCP-CTX-] error (e.g. a network failure)
+    // No tokens → Layer 1 skipped. scp.evaluateTrust calls participationRecord for Layer 2.
     const networkError = new Error("Network timeout");
-    native.__stub("eventLogQuery", () => Promise.reject(networkError));
+    native.__stub("participationRecord", () => Promise.reject(networkError));
 
     // The catch block in Layer 2 must re-throw non-context errors — it must NOT
     // swallow them into behavioralRecord: null (which would hide genuine faults).
-    await expect(evaluateTrust(scp, "did:dht:z6MkBob", context)).rejects.toBe(networkError);
+    // mapBridgeError re-wraps the raw error; check the preserved message.
+    await expect(evaluateTrust(scp, "did:dht:z6MkBob", context)).rejects.toThrow("Network timeout");
   });
 });
 
