@@ -585,7 +585,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-mcp/src/lib.rs",
         "crates/scp-mcp/src/namespace.rs",
@@ -630,7 +630,9 @@
           "section": "## 8.5 MCP Compatibility (Model Context Protocol)"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Downgraded from done (audit): SCP-OUT-007 deliverable absent on main \u2014 crates/scp-mcp/src/translator.rs and the mcp_to_scp/scp_to_mcp functions do not exist (the scp-mcp crate exists but not this lexical translator); dropped by the squashed re-port #2098. Tracked in #2219."
+      }
     },
     {
       "id": "SCP-OUT-008",
@@ -713,7 +715,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-testing/src/conformance/mod.rs",
         "crates/scp-testing/tests/integration/conformance.rs",
@@ -752,7 +754,9 @@
           "section": "## 5.4 Outlets"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Downgraded from done (audit): SCP-OUTLET-REGISTRATION-V2 test vectors (outlet_registration_v2.json) are absent on main (dropped by the squashed re-port #2098). Tracked in #2219."
+      }
     },
     {
       "id": "SCP-OUT-010",
@@ -760,7 +764,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         ".docs/prds/main.json"
       ],
@@ -794,7 +798,9 @@
           "section": "## 5.4 Outlets"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Downgraded from done (audit): superseded_by markers in .docs/prds/main.json are absent (0 present). Tracked in #2219."
+      }
     },
     {
       "id": "SCP-OUT-011",
@@ -1009,7 +1015,7 @@
       "gate": "gate-classification",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-runtime/src/context/manager/outlets.rs",
         "crates/scp-runtime/src/context/manager/mod.rs"
@@ -1056,7 +1062,9 @@
           "section": "### 5.4.2 Outlet Classification (Query vs Action)"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Partial (audit): the amplification rule (Query->Action forbidden) is enforced, but the per-kind chain-depth budget is unimplemented \u2014 cross_context_invoke(origin_kind, hop_kind, depth_remaining_query, depth_remaining_action) and the max(1, max_chain_depth/2) Action derivation do not exist, and the ACs cite the nonexistent spec section 6.2.0.4. Known gap tracked in #2221."
+      }
     },
     {
       "id": "SCP-OUT-016",
@@ -1442,7 +1450,7 @@
       "gate": "gate-caveats",
       "priority": "P0",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-ffi/src/ucan.rs",
         "crates/scp-ffi/napi/src/ucan.rs",
@@ -1481,7 +1489,9 @@
           "section": "### 7.3.8 Invocation Caveats"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Downgraded from done (audit): SDK-level InvocationCaveats pass-through on ucan.mint/ucan.narrow is absent across all 4 SDKs (no caveats param, no InvocationCaveats type, no narrow entry point). Spec section 7.3.8 defines the caveat surface; the SDK mint/narrow deferral is tracked in #2221."
+      }
     },
     {
       "id": "SCP-OUT-024",
@@ -1630,7 +1640,7 @@
       "gate": "gate-errors",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-runtime/src/context/manager/outlets.rs",
         "crates/scp-runtime/src/context/outlets/invoke.rs"
@@ -1664,7 +1674,9 @@
           "section": "### 5.4.4 Outlet Error Taxonomy"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Downgraded from done (audit): fix not effective \u2014 the specified manager/outlets.rs no longer exists and no complete From<InvocationError> for OutletError mapping is present. The related stream-open error-masking (permanent failures reported as retryable) is a separate site fixed by #2196. Tracked in #2219."
+      }
     },
     {
       "id": "SCP-OUT-028",
@@ -1773,7 +1785,7 @@
       "gate": "gate-errors",
       "priority": "P0",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "scripts/check-error-codes.sh",
         ".docs/standards/sdk-common.md"
@@ -1806,7 +1818,9 @@
           "section": "## Error Hierarchy"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Downgraded from done (audit): scripts/check-error-codes.sh has no 6100-6199 sub-block gate or OutletErrorClass literal assertion \u2014 the gate is toothless. Tracked in #2219."
+      }
     },
     {
       "id": "SCP-OUT-031",
@@ -1814,7 +1828,7 @@
       "gate": "gate-errors",
       "priority": "P0",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "bindings/python/scp_sdk/errors.py",
         "bindings/typescript/src/errors.ts",
@@ -1870,7 +1884,9 @@
           "section": "### 5.4.4 Outlet Error Taxonomy"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Downgraded from done (audit): the SDK 8-class OutletError hierarchy is inverted/absent (Python has ProtocolError, not OutletProtocolError, and no AuthorizationError/InputError/etc. under OutletError) and outlet_error_fixtures.json is absent. Tracked in #2219."
+      }
     },
     {
       "id": "SCP-OUT-032",
@@ -2457,7 +2473,7 @@
       "gate": "gate-round5-fixes",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-protocol/src/context/outlets/registration.rs",
         "crates/scp-protocol/src/context/outlets/message_catalog.rs",
@@ -2503,7 +2519,9 @@
           "section": "### 5.4.4 Outlet Error Taxonomy"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Downgraded from done (audit): message_catalog is hardcoded empty (Vec::new()) in all FFI bridges (scp-ffi/src/outlets.rs, scp-ffi/src/mcp.rs, scp-ffi/napi/src/outlets.rs, scp-ffi/uniffi/src/bridge.rs) \u2014 AC9 unmet. Tracked in #2221."
+      }
     },
     {
       "id": "SCP-OUT-041a",
@@ -2697,7 +2715,7 @@
       "gate": "gate-round5-fixes",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/context/outlets/interface.rs",
         "crates/scp-event-log/src/lib.rs"
@@ -2725,7 +2743,9 @@
           "section": "#### 6.2.0.1 Bidirectional Consent Protocol"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Upgraded from pending (status-lag, audit): InterfaceEstablished carries all 9 fields (epoch_a/b, ikm_a/b, ikm_a_sig/b_sig, creator_did, admin_set, capability_holder_set) with serde + event-log round-trip tests in interface.rs."
+      }
     },
     {
       "id": "SCP-OUT-042b",
@@ -2901,7 +2921,7 @@
       "gate": "gate-streaming-saga",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/context/outlets/cross_context_saga.rs",
         "crates/scp-protocol/src/context/outlets/mod.rs"
@@ -2945,7 +2965,9 @@
           "section": "#### 9.18.2 Domain Separators"
         }
       ],
-      "details": {}
+      "details": {
+        "auditNote": "Upgraded from pending (status-lag, audit): SCP-XCTX-STREAM-RECEIPT-V1 is fully implemented (CrossContextOutletStreamReceipt sign/verify; domain separator registered in spec section 9.18.2), with sign/verify tests, a KAT fixture, and cross-context streaming-saga wiring. The slice-3 receipt is the full 043."
+      }
     },
     {
       "id": "SCP-OUT-044",

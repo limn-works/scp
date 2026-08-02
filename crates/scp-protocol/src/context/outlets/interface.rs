@@ -103,7 +103,7 @@ pub const MAX_BURST_ALLOWANCE: u32 = 50;
 pub const OFFER_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
-// OutletInterfaceDefaults (§6.2.0.2 classification-aware rate tiers)
+// OutletInterfaceDefaults (SCP-OUT-016 per-kind rate tiers; spec §6.2.0.2 reconciliation tracked in #2222)
 // ---------------------------------------------------------------------------
 
 /// Per-kind cross-context rate-tier defaults (spec §6.2.0.2).
@@ -138,7 +138,8 @@ pub const OFFER_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// the higher tier because reads are amortisable, Action gets the lower
 /// tier because writes have economic and side-effect cost.
 ///
-/// See spec §6.2.0.2 "Classification-aware rate tiers" and §5.4.2.
+/// See SCP-OUT-016 (per-kind rate tiers; spec §6.2.0.2 reconciliation
+/// tracked in #2222) and §5.4.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutletInterfaceDefaults {
     /// The [`OutletKind`] this default tuple is keyed to. Stored so the
@@ -609,11 +610,14 @@ pub struct InterfaceRevoked {
 // ---------------------------------------------------------------------------
 
 /// Domain separator string (UTF-8 bytes) for the
-/// `SCP-OUTLET-IKM-ROTATE-V1:` preimage. Registered in spec §9.18.2.
+/// `SCP-OUTLET-IKM-ROTATE-V1:` preimage.
 ///
-/// The trailing colon is part of the on-wire prefix per the §9.18.2
-/// registration table — every other separator in §9.18.2 ends in a colon
-/// and the §6.2.0.1 byte spec includes the colon literal.
+/// Reserved for SCP-OUT-042b; this separator is not yet present in the
+/// §9.18.2 separator registry and its registration there is tracked in
+/// #2222.
+///
+/// The trailing colon is part of the on-wire prefix, following the §9.18.2
+/// colon convention (every registered separator ends in a colon).
 pub const IKM_ROTATE_DOMAIN_SEPARATOR: &[u8] = b"SCP-OUTLET-IKM-ROTATE-V1:";
 
 /// Rotation event emitted on every active interface a context holds when
