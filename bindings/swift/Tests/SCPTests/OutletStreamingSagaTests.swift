@@ -58,7 +58,7 @@ final class OutletStreamingSagaTests: XCTestCase {
 
     // MARK: - Handle construction helper
 
-    private func makeHandle(_ native: FakeSagaNative) -> StreamingSagaHandle {
+    private func makeHandle(_ native: any StreamingSagaNative) -> StreamingSagaHandle {
         StreamingSagaHandle(
             bridge: native,
             params: StreamingSagaOpenParams(
