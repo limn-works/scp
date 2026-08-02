@@ -54,7 +54,7 @@ import {
 import { IdentityAttestation, RevocationStatus } from "../src/identity";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
-import type { ConsequenceRule as ConsequenceRuleTypeAlias } from "../src/types";
+import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
 /**
@@ -180,7 +180,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
             kind: "SuspendCapability",
             capabilities: [
               "MessagesWrite",
-              { kind: "ToolInvoke", toolId: "calculator" },
+              { kind: "OutletCall", outletId: "calculator" },
               { kind: "Custom", name: "my-custom-cap" },
             ],
           },
@@ -293,7 +293,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     const types = await import("../src/types");
     expect(types.CONSEQUENCE_TRIGGER_VARIANTS).toEqual([
       "MessageVelocity",
-      "ToolRateExceeded",
+      "OutletRateExceeded",
       "WarningCount",
       "Custom",
     ]);
@@ -1219,7 +1219,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const fullCap = token.capabilities[0];
       expect(fullCap).toBeDefined();
       // Must not throw.
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, fullCap as string);
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, fullCap as string, member.did);
     });
 
     it("scp.ucanValidate rejects a capability that was not granted", async () => {
@@ -1231,7 +1231,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       let notGrantedErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, "messages:write");
+        await scp.ucanValidate(ctx._rawHandle, token.encoded, "messages:write", member.did);
       } catch (e) {
         notGrantedErr = e;
       }
@@ -1248,11 +1248,11 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       const cap = token.capabilities[0] as string;
       // First validation succeeds — nonce consumed.
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
       // Second presentation of the same token must be rejected.
       let nonceReplayErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
       } catch (e) {
         nonceReplayErr = e;
       }
@@ -1271,7 +1271,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
       let revokedErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
       } catch (e) {
         revokedErr = e;
       }
@@ -1322,30 +1322,26 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
   });
 
   // -------------------------------------------------------------------
-  // 5.4 Tool lifecycle — register, invoke (with UCAN), verify, sessions
+  // 5.4 Outlet lifecycle — register, invoke (with UCAN), verify
   //
-  // Exercises the real ContextManager tool-execution path with MLS +
+  // Exercises the real ContextManager outlet-execution path with MLS +
   // UCAN capability enforcement. Distinct from `tools.test.ts` which
-  // focuses on the `defineToolDefinition` helper shape.
+  // focuses on the `defineOutletDefinition` helper shape.
   // -------------------------------------------------------------------
 
-  describe("Tool lifecycle (real NAPI)", () => {
-    // scp.toolRegister passes the definition verbatim to the native
-    // bridge — which expects the NAPI field names (`inputSchemaJson`,
-    // `outputSchemaJson`, `operatorDid`) rather than the SDK-facing
-    // camelCase (`inputSchema`, `outputSchema`, `operator`). The
-    // `internal/native.ts` Bridge wrapper is the layer that performs
-    // the rename — callers of the SCP class directly must build the
-    // NAPI shape themselves. These tests exercise the direct surface.
+  describe("Outlet lifecycle (real NAPI)", () => {
+    // scp.outletRegister accepts the SDK-facing OutletDefinition shape
+    // (`inputSchema`, `outputSchema`, `operator`) and converts to the NAPI
+    // wire format internally — callers do not build the NAPI shape themselves.
 
-    function makeNapiToolDef(args: {
+    function makeOutletDef(args: {
       name: string;
       description: string;
       operator: string;
       input?: Record<string, unknown>;
       output?: Record<string, unknown>;
-    }): Record<string, unknown> {
-      // The Rust tool-registration layer enforces a schema-specificity
+    }): OutletDefinition {
+      // The Rust outlet-registration layer enforces a schema-specificity
       // floor (§6.2, §9.2.1): AT LEAST ONE of the input/output schemas
       // must declare ≥ 2 distinct property fields. Using a 2-field input
       // with a permissive output mirrors `real-napi.test.ts` — the
@@ -1354,51 +1350,53 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       return {
         name: args.name,
         description: args.description,
-        inputSchemaJson: JSON.stringify(
-          args.input ?? {
-            type: "object",
-            properties: { x: { type: "number" }, mode: { type: "string" } },
-            required: ["x", "mode"],
-          },
-        ),
-        outputSchemaJson: JSON.stringify(args.output ?? { type: "object" }),
-        operatorDid: args.operator,
+        kind: "action",
+        inputSchema: args.input ?? {
+          type: "object",
+          properties: { x: { type: "number" }, mode: { type: "string" } },
+          required: ["x", "mode"],
+        },
+        outputSchema: args.output ?? { type: "object" },
+        operator: args.operator,
       };
     }
 
-    it("scp.toolRegister returns a tool ID", async () => {
+    it("scp.outletRegister returns an outlet ID", async () => {
       const identity = await scp.identityCreate("in_memory");
-      const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["tool:register"] }));
-      const toolId = await scp.toolRegister(
+      const ctx = await scp.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["outlet:register"] }),
+      );
+      const outletId = await scp.outletRegister(
         ctx._rawHandle,
-        makeNapiToolDef({
+        makeOutletDef({
           name: "scp-class-echo",
           description: "Echoes via SCP class",
           operator: identity.did,
         }),
       );
-      expect(typeof toolId).toBe("string");
-      expect(toolId.length).toBeGreaterThan(0);
+      expect(typeof outletId).toBe("string");
+      expect(outletId.length).toBeGreaterThan(0);
     });
 
-    it("scp.toolInvoke executes a registered tool with a valid UCAN", async () => {
+    it("scp.outletInvoke executes a registered outlet with a valid UCAN", async () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
-      const toolId = await scp.toolRegister(
+      const outletId = await scp.outletRegister(
         ctx._rawHandle,
-        makeNapiToolDef({ name: "scp-class-add", description: "Adds", operator: admin.did }),
+        makeOutletDef({ name: "scp-class-add", description: "Adds", operator: admin.did }),
       );
-      const ucan = (await scp.ucanMint(ctx._rawHandle, member.did, ["tool:invoke:*"])) as {
+      const ucan = (await scp.ucanMint(ctx._rawHandle, member.did, ["outlet:call:*"])) as {
         encoded: string;
       };
-      const result = await scp.toolInvoke(
+      const result = await scp.outletInvoke(
         ctx._rawHandle,
-        toolId,
+        outletId,
         JSON.stringify({ x: 7, mode: "double" }),
         member.did,
         ucan.encoded,
@@ -1408,16 +1406,16 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       JSON.parse(result);
     });
 
-    it("scp.toolInvoke fails without a UCAN for the matching capability", async () => {
+    it("scp.outletInvoke fails without a UCAN for the matching capability", async () => {
       const admin = await scp.identityCreate("in_memory");
       const outsider = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
       );
-      const toolId = await scp.toolRegister(
+      const outletId = await scp.outletRegister(
         ctx._rawHandle,
-        makeNapiToolDef({
+        makeOutletDef({
           name: "scp-class-denied",
           description: "Unreachable",
           operator: admin.did,
@@ -1425,24 +1423,27 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
       let threw = false;
       try {
-        await scp.toolInvoke(ctx._rawHandle, toolId, "{}", outsider.did, "");
+        await scp.outletInvoke(ctx._rawHandle, outletId, "{}", outsider.did, "");
       } catch {
         threw = true;
       }
       expect(threw).toBe(true);
     });
 
-    it("scp.toolVerify returns a verification summary", async () => {
+    it("scp.outletVerify returns a verification summary", async () => {
       const identity = await scp.identityCreate("in_memory");
-      const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["tool:register"] }));
-      const toolId = await scp.toolRegister(
+      const ctx = await scp.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["outlet:register"] }),
+      );
+      const outletId = await scp.outletRegister(
         ctx._rawHandle,
-        makeNapiToolDef({
+        makeOutletDef({
           name: "scp-class-verify-me",
           description: "Verifiable",
           operator: identity.did,
           // 2-field input keeps us over the specificity floor; the
-          // output stays permissive so toolVerify's default payload
+          // output stays permissive so outletVerify's default payload
           // is accepted without a closed schema.
           input: {
             type: "object",
@@ -1451,7 +1452,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           },
         }),
       );
-      const verification = (await scp.toolVerify(ctx._rawHandle, toolId)) as {
+      const verification = (await scp.outletVerify(ctx._rawHandle, outletId)) as {
         passed: boolean;
         failures: unknown[];
       };
@@ -1643,7 +1644,6 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const result = await scp.contextExecuteGovernanceAction(
         ctx._rawHandle,
         JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
-        admin.did,
       );
       expect(typeof result).toBe("string");
       const newRole = await scp.contextMemberRole(ctx._rawHandle, member.did);
@@ -1666,7 +1666,6 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       await scp.contextExecuteGovernanceAction(
         ctx._rawHandle,
         JSON.stringify({ RemoveMember: { did: member.did, reason: null } }),
-        admin.did,
       );
       expect(await scp.contextIsMember(ctx._rawHandle, member.did)).toBe(false);
     });
@@ -1679,7 +1678,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
       let threw = false;
       try {
-        await scp.contextExecuteGovernanceAction(ctx._rawHandle, "{not-json", admin.did);
+        await scp.contextExecuteGovernanceAction(ctx._rawHandle, "{not-json");
       } catch {
         threw = true;
       }
@@ -2072,11 +2071,11 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         capabilities: string[];
       };
       const cap = token.capabilities[0] as string;
-      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
       await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
       let e2eRevokedErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap);
+        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
       } catch (e) {
         e2eRevokedErr = e;
       }

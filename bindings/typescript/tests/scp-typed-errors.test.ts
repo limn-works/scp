@@ -198,7 +198,7 @@ describe("SCP typed-error mapping (trust.ts consumers)", () => {
 
     let thrown: unknown;
     try {
-      await scp.ucanValidate({}, "token", "*");
+      await scp.ucanValidate({}, "token", "*", "did:key:testpresenter");
     } catch (err) {
       thrown = err;
     }

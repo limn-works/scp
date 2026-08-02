@@ -19,6 +19,8 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
+import type { Context } from "../src/context";
+import type { SCP } from "../src/scp";
 import type {
   AttestorInfo,
   CachedAttestation,
@@ -113,6 +115,30 @@ function statefulUcanEvaluate(
     },
     evaluateCountFor: (token: string): number => counts.get(token) ?? 0,
   };
+}
+
+/**
+ * Creates a mock SCP instance paired with a minimal Context handle for tests
+ * that exercise methods requiring a context (e.g. `evaluateTrust` Layer 1+2).
+ */
+function mountWithContext() {
+  const { scp, native } = mountMockScp();
+  const context = { _rawHandle: {} as object, contextId: "ctx-test" } as unknown as Context;
+  return { scp, native, context };
+}
+
+/**
+ * Thin wrapper so tests can call `evaluateTrust(scp, did, ctx, tokens?)` rather
+ * than `scp.evaluateTrust(ctx._rawHandle, did, tokens?)` — mirrors Python's
+ * standalone `evaluate_trust(scp, did, ctx, tokens)` helper convention.
+ */
+function evaluateTrust(
+  scp: SCP,
+  subjectDid: string,
+  context: Context,
+  tokens?: readonly string[],
+): ReturnType<SCP["evaluateTrust"]> {
+  return scp.evaluateTrust(context._rawHandle, subjectDid, tokens);
 }
 
 describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
