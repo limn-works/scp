@@ -84,7 +84,6 @@ def _translate_bridge_error(exc: Exception) -> Exception:
     return sdk_cls(message, code)
 
 
-
 # ---------------------------------------------------------------------------
 # OutletKind — outlet semantic class (Query vs Action), §5.4.2.
 # ---------------------------------------------------------------------------
