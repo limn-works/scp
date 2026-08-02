@@ -14,6 +14,10 @@ categories = ["authentication", "cryptography"]
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
+# SCPR kind-1 DID-record frame codec (§9.10.12). The relay publisher and DID
+# resolver wrap/unwrap the (value, signature, seq) triple in this frame. Acyclic:
+# scp-protocol does not depend on scp-identity (§3.10.12 phase integration).
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 # Crypto primitives ONLY (ADR-062 §Decision 6). `testing` is NO LONGER enabled
 # here: the standalone identity construction front-end (`config.rs`, ADR-052
 # Phase B-P3e) previously minted an `InMemoryPreRotationCustody` (a §17.17.2

@@ -49,7 +49,8 @@ use scp_did::DidDocument;
 // in-memory seam are both encapsulated in the single cfg-gated
 // `scp_ffi_common::dht::build_ffi_dht_client`; this bridge only maps its error.
 use scp_ffi_common::dht::FfiDhtClient;
-use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
+use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, RealMultiRelayQuerier};
+use scp_transport::TransportRelayQuerier;
 // Only the testing-gated `identity_migrate` path constructs a `ScpIdentity`
 // value directly (production migration is unreachable — ADR-062 §Decision 6).
 #[cfg(feature = "testing")]
@@ -113,9 +114,11 @@ pub(crate) fn no_pre_rotation_backend() -> ScpPyError {
 ///
 /// Creates a `DualLayerResolver` backed by the shared [`FfiDhtClient`] (the
 /// real Mainline Pkarr client in a shipped build, or the in-memory test seam
-/// under `testing`) and `NoOpRelayQuerier` (relay resolution will be upgraded
-/// when a production relay querier is available). The resolver is shared across
-/// all UCAN validation and attestation verification calls on the same bridge.
+/// under `testing`) and the real relay querier `RealMultiRelayQuerier` over
+/// `TransportRelayQuerier` (ADR-062 Slice 11), bound to this instance's live
+/// transport handle. The relay layer fails closed (honest not-found) until a
+/// relay is connected. The resolver is shared across all UCAN validation and
+/// attestation verification calls on the same bridge.
 ///
 /// This is idempotent: subsequent calls are no-ops.
 ///
@@ -139,7 +142,13 @@ fn ensure_did_resolver_initialized_on(
     // governance vote verification) fails with "unknown voter". Scoped
     // per-instance to match where the resolver itself is stored.
     let dht_client = Arc::new(build_ffi_dht_client()?);
-    let relay_querier = Arc::new(NoOpRelayQuerier);
+    // Relay layer (READ, ADR-062 Slice 11): the real multi-relay composer over
+    // the transport-backed single-relay querier, bound to this instance's live
+    // transport handle. Fails closed (honest not-found) until a relay is
+    // connected via `transport_connect`.
+    let relay_querier = Arc::new(RealMultiRelayQuerier::new(Arc::new(
+        TransportRelayQuerier::new(bi.core.transport_handle()),
+    )));
     let cache = Arc::new(DidCache::new());
     let bootstrap_relays = Vec::new();
 
@@ -261,6 +270,19 @@ async fn publish_to_resolver_dht_for(
     {
         tracing::warn!("publish_to_resolver_dht: DHT publish failed: {e}");
     }
+
+    // WRITE half (ADR-062 Slice 11): publish the SAME record to the relay layer
+    // via the real `TransportRelayPublisher`, so a peer resolving via the relay
+    // (or a DHT-disabled node) finds it. Best-effort (§3.10.5/§3.10.6): a missing
+    // relay is logged, not fatal — the DHT publish above remains authoritative.
+    scp_ffi_common::publish_did_record_to_relay(
+        bi.core.transport_handle(),
+        &identity.did,
+        value,
+        &signature,
+        seq,
+    )
+    .await;
 }
 
 /// Selects the DHT client that key-rotation / agent-key / migration operations

@@ -71,9 +71,10 @@ use scp_ffi_common::dht::FfiDhtClient;
 #[cfg(all(test, feature = "testing"))]
 use scp_identity::DidMethod;
 use scp_identity::IdentityError;
-use scp_identity::{DidCache, DidDht, DualLayerResolver, NoOpRelayQuerier, ScpIdentity};
+use scp_identity::{DidCache, DidDht, DualLayerResolver, RealMultiRelayQuerier, ScpIdentity};
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
+use scp_transport::TransportRelayQuerier;
 #[cfg(feature = "testing")]
 use std::fmt;
 
@@ -193,7 +194,13 @@ pub(crate) fn ensure_did_resolver_initialized_on(
             .unwrap_or(candidate)
     };
 
-    let relay_querier = Arc::new(NoOpRelayQuerier);
+    // Relay layer (READ, ADR-062 Slice 11): the real multi-relay composer over
+    // the transport-backed single-relay querier, bound to this instance's live
+    // transport handle. Fails closed (honest not-found) until a relay is
+    // connected via `transport_connect`.
+    let relay_querier = Arc::new(RealMultiRelayQuerier::new(Arc::new(
+        TransportRelayQuerier::new(bi.core.transport_handle()),
+    )));
     // Bind the resolver over the CANONICAL per-instance cache (set-if-unset then
     // re-read). Retaining the SAME cache `Arc` the resolver reads from lets
     // post-rotation re-publishes drop the stale cached document (see
@@ -269,6 +276,7 @@ async fn invalidate_resolver_cache(bi: &crate::runtime::NapiBridgeInstance, did:
 /// create fails closed before publishing — ADR-062 §Decision 6).
 #[cfg(feature = "testing")]
 pub(crate) async fn publish_to_shared_dht_for(
+    bi: &crate::runtime::NapiBridgeInstance,
     identity: &ScpIdentity,
     document: &DidDocument,
     custody: &crate::custody::NapiKeyCustody,
@@ -319,6 +327,19 @@ pub(crate) async fn publish_to_shared_dht_for(
     {
         tracing::warn!("publish_to_shared_dht: DHT publish failed: {e}");
     }
+
+    // WRITE half (ADR-062 Slice 11): publish the SAME record to the relay layer
+    // via the real `TransportRelayPublisher`, so a peer resolving via the relay
+    // (or a DHT-disabled node) finds it. Best-effort (§3.10.5/§3.10.6): a missing
+    // relay is logged, not fatal — the DHT publish above remains authoritative.
+    scp_ffi_common::publish_did_record_to_relay(
+        bi.core.transport_handle(),
+        &identity.did,
+        value,
+        &signature,
+        seq,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,7 +1481,7 @@ mod tests {
         // Seed the shared DHT with the freshly minted document, mirroring
         // `identity_create`, so `migrate()`'s `initialize_sequence` reads a
         // real pre-migration record for the old DID.
-        publish_to_shared_dht_for(&scp_identity, &document, &key_custody).await;
+        publish_to_shared_dht_for(&bi, &scp_identity, &document, &key_custody).await;
         let instance_id = bi.instance_id();
         let verifying_key_hex =
             identity_verifying_key_hex(&key_custody, &scp_identity.identity_key).await;

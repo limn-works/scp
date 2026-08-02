@@ -844,6 +844,101 @@ impl NativeRelayClient {
         Ok(envelopes)
     }
 
+    /// Sends a QUERY command and collects RAW blob bytes (Model A, §9.10.12).
+    ///
+    /// The public-record counterpart to [`query`](Self::query): identical wire
+    /// exchange, but each returned `RelayMessage::Blob` is collected as its raw
+    /// `Vec<u8>` bytes WITHOUT the `OuterEnvelope` codec. Used by the DID
+    /// resolver to fetch SCPR frames for decode-and-verify.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the client is not connected.
+    /// Returns [`TransportError::SendFailed`] if the relay responds with an
+    /// error.
+    pub async fn query_raw(&self, routing_id: &[u8; 32]) -> Result<Vec<Vec<u8>>, TransportError> {
+        let rid = crate::traits::RoutingId::new(*routing_id);
+
+        // When there's an active subscription, results arrive through it; a bare
+        // QUERY cannot collect them synchronously here.
+        if self.subscriptions.contains(&rid) {
+            let msg = ClientMessage::Query {
+                ref_id: None,
+                routing_id: *routing_id,
+                since: None,
+                limit: None,
+            };
+            let _response = self.send_request(msg).await?;
+            return Ok(Vec::new());
+        }
+
+        let (tx, mut rx) = mpsc::channel::<SubscriptionMessage>(256);
+
+        // Register a temporary subscription for receiving BLOB messages.
+        self.subscriptions
+            .insert(
+                rid,
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                },
+            )
+            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
+
+        let msg = ClientMessage::Query {
+            ref_id: None,
+            routing_id: *routing_id,
+            since: None,
+            limit: None,
+        };
+
+        let response = self.send_request(msg).await.inspect_err(|_| {
+            self.subscriptions.remove(&rid);
+        })?;
+
+        if let RelayMessage::Err { code, msg, .. } = &response {
+            self.subscriptions.remove(&rid);
+            return Err(TransportError::SendFailed(format!(
+                "relay error {code}: {msg}"
+            )));
+        }
+
+        // Collect RAW BLOB bytes until `query_complete` or timeout.
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        loop {
+            tokio::select! {
+                msg_opt = rx.recv() => {
+                    match msg_opt {
+                        Some(SubscriptionMessage::Relay(
+                            RelayMessage::Blob { blob, .. },
+                        )) => {
+                            // Raw path: collect the blob bytes verbatim (no
+                            // OuterEnvelope decode) for SCPR decoding upstream.
+                            blobs.push(blob);
+                        }
+                        Some(SubscriptionMessage::Relay(
+                            RelayMessage::Event { event_type, .. },
+                        )) if event_type == "query_complete" => {
+                            break;
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    break;
+                }
+            }
+        }
+
+        self.subscriptions.remove(&rid);
+
+        Ok(blobs)
+    }
+
     /// Returns whether the client is currently connected.
     #[allow(dead_code)]
     pub async fn is_connected(&self) -> bool {

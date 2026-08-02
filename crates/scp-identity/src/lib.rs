@@ -36,6 +36,7 @@
 pub mod cache;
 pub mod config;
 pub mod dht;
+pub mod relay_querier;
 pub mod republish;
 pub mod resolution;
 pub mod resolver;
@@ -47,11 +48,16 @@ pub use dht::{
     PostResolveHook, SequenceStore, did_from_ed25519_public_key, extract_public_key,
     verify_migration, verify_self_certification,
 };
+pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
 pub use resolution::{
-    InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id,
-    relay_resolve,
+    RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id, relay_resolve,
 };
+// Test-harness only: the in-memory single-relay querier double never ships
+// (ADR-062 §Decision 5 / Slice 11). The production querier is
+// `RealMultiRelayQuerier` over `scp-transport`'s `TransportRelayQuerier`.
+#[cfg(any(test, feature = "testing"))]
+pub use resolution::InMemoryRelayQuerier;
 pub use resolver::{
     DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
     NoOpHealer, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,

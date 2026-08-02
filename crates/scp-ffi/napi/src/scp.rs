@@ -478,8 +478,13 @@ impl Scp {
                     },
                 );
 
-                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
-                    .await;
+                crate::identity::publish_to_shared_dht_for(
+                    bi,
+                    &scp_identity,
+                    &document,
+                    &key_custody,
+                )
+                .await;
 
                 let handle = crate::identity::NapiIdentity {
                     inner: Arc::new(NapiIdentityInner {
@@ -606,8 +611,13 @@ impl Scp {
                     },
                 );
 
-                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
-                    .await;
+                crate::identity::publish_to_shared_dht_for(
+                    bi,
+                    &scp_identity,
+                    &document,
+                    &key_custody,
+                )
+                .await;
 
                 let handle = crate::identity::NapiIdentity {
                     inner: Arc::new(NapiIdentityInner {
@@ -767,8 +777,13 @@ impl Scp {
                     },
                 );
 
-                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
-                    .await;
+                crate::identity::publish_to_shared_dht_for(
+                    bi,
+                    &scp_identity,
+                    &document,
+                    &key_custody,
+                )
+                .await;
 
                 let handle = crate::identity::NapiIdentity {
                     inner: Arc::new(NapiIdentityInner {

@@ -23,6 +23,57 @@ use scp_identity::IdentityError;
 use scp_identity::resolver::ResolvedDidDocument;
 
 // ---------------------------------------------------------------------------
+// DID relay publish (WRITE half — ADR-062 Slice 11, §3.10.5 / §9.10.12)
+// ---------------------------------------------------------------------------
+
+/// Best-effort one-shot publish of a DID document to the relay layer (§3.10.5).
+///
+/// The WRITE-half counterpart to the bridges' one-shot DHT publish: wherever a
+/// bridge publishes a freshly-minted or rotated DID document to the DHT, it also
+/// calls this to publish the SAME record to the relay layer. It wraps the BEP44
+/// `(value, signature, seq)` triple in an SCPR kind-1 frame (§9.10.12) and
+/// publishes the frame bytes via the real
+/// [`TransportRelayPublisher`](scp_transport::TransportRelayPublisher) over the
+/// instance's live transport handle — the production `RelayPublisher` severed
+/// from the in-memory default in this slice.
+///
+/// **Fail-open (best-effort).** A publish failure — most commonly "no relay
+/// connected yet", since identities are typically minted before
+/// `transport_connect` — is logged, not fatal. The DHT layer remains an
+/// independent resolution path (§3.10.4/§3.10.6); the caller's DHT publish is
+/// authoritative for interim reachability, and once a relay is connected the
+/// record is (re)published there. Matching the bridges' fail-open DHT publish
+/// keeps a missing relay from failing identity creation.
+pub async fn publish_did_record_to_relay(
+    live: scp_transport::LiveTransport,
+    did: &str,
+    value: &[u8],
+    signature: &[u8; 64],
+    seq: u64,
+) {
+    use scp_identity::republish::RelayPublisher as _;
+
+    let blob = scp_protocol::envelope::scpr::encode_did_record(value, signature, seq);
+    let routing_id = scp_identity::did_routing_id(did);
+    let publisher = scp_transport::TransportRelayPublisher::new(live);
+
+    if let Err(e) = publisher
+        .publish(
+            &routing_id,
+            scp_identity::republish::RELAY_BLOB_TTL_SECS,
+            &blob,
+        )
+        .await
+    {
+        debug!(
+            did,
+            error = %e,
+            "relay publish of DID record skipped (best-effort; DHT layer remains authoritative)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BridgeDidResolver
 // ---------------------------------------------------------------------------
 

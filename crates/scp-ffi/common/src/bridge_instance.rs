@@ -63,7 +63,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -261,7 +260,17 @@ pub struct CoreFields {
     /// subscription tasks (which run in spawned async tasks) can hold a
     /// `Send`-compatible reference without keeping the `RwLock` guard alive
     /// across `.await` points.
-    transport: RwLock<Option<Arc<scp_transport::TransportManager>>>,
+    ///
+    /// Held as a [`LiveTransport`](scp_transport::LiveTransport): a
+    /// cheaply-cloneable, late-binding handle over the same
+    /// `Arc<RwLock<Option<Arc<TransportManager>>>>` slot. Clones handed to the
+    /// DID relay querier/publisher ([`transport_handle`](Self::transport_handle))
+    /// observe whatever manager `set_transport` later installs, so relay-layer
+    /// DID resolution and publishing (ADR-062 Slice 11) read the live transport
+    /// without a global or a dependency cycle. `set_transport`/`with_transport`
+    /// and the other slot operations apply this instance's locking policy via
+    /// `self.transport.slot()`.
+    transport: scp_transport::LiveTransport,
 
     /// Instance-scoped transport selector (transparent QUIC↔WebSocket
     /// selection, spec §10.14.3 item 4; ADR-037).
@@ -537,7 +546,7 @@ impl CoreFields {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
-            transport: RwLock::new(None),
+            transport: scp_transport::LiveTransport::new(),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
             known_contexts: DashMap::new(),
             rate_limiters: DashMap::new(),
@@ -621,7 +630,7 @@ impl CoreFields {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
-            transport: RwLock::new(None),
+            transport: scp_transport::LiveTransport::new(),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
             known_contexts: DashMap::new(),
             rate_limiters: DashMap::new(),
@@ -1237,6 +1246,7 @@ impl CoreFields {
         }
         let mut guard = self
             .transport
+            .slot()
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
         *guard = Some(manager);
@@ -1261,6 +1271,7 @@ impl CoreFields {
     pub fn clear_transport(&self) -> Result<(), TransportLockError> {
         let mut guard = self
             .transport
+            .slot()
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
         *guard = None;
@@ -1271,6 +1282,7 @@ impl CoreFields {
     #[must_use]
     pub fn has_transport(&self) -> bool {
         self.transport
+            .slot()
             .read()
             .ok()
             .is_some_and(|guard| guard.is_some())
@@ -1287,6 +1299,20 @@ impl CoreFields {
     #[must_use]
     pub fn transport_selector(&self) -> Arc<scp_transport::TransportSelector> {
         Arc::clone(&self.transport_selector)
+    }
+
+    /// Returns a cheaply-cloneable [`LiveTransport`](scp_transport::LiveTransport)
+    /// handle over this instance's transport slot (ADR-062 Slice 11).
+    ///
+    /// The handle shares the SAME underlying slot as [`Self::set_transport`] /
+    /// [`Self::clear_transport`], so a manager installed later is visible through
+    /// the handle. It is passed to the DID relay querier
+    /// (`TransportRelayQuerier`) and publisher (`TransportRelayPublisher`) so
+    /// relay-layer DID resolution/publishing reads the live transport — falling
+    /// closed (honest not-found / typed error) whenever no relay is connected.
+    #[must_use]
+    pub fn transport_handle(&self) -> scp_transport::LiveTransport {
+        self.transport.clone()
     }
 
     /// Registers `url` as a relay that this bridge intends to stay
@@ -1749,6 +1775,7 @@ impl CoreFields {
     ) -> Result<Option<Arc<scp_transport::TransportManager>>, TransportLockError> {
         let guard = self
             .transport
+            .slot()
             .read()
             .map_err(|_| TransportLockError::Poisoned)?;
         Ok(guard.clone())
@@ -1766,7 +1793,7 @@ impl CoreFields {
         &self,
         f: impl FnOnce(&scp_transport::TransportManager) -> T,
     ) -> Result<T, TransportLockError> {
-        let guard = self.transport.read().map_err(|_| {
+        let guard = self.transport.slot().read().map_err(|_| {
             tracing::debug!("transport RwLock poisoned (a writer panicked)");
             TransportLockError::Poisoned
         })?;
@@ -1793,7 +1820,7 @@ impl CoreFields {
         &self,
         f: impl FnOnce(&mut scp_transport::TransportManager) -> T,
     ) -> Result<T, TransportLockError> {
-        let mut guard = self.transport.write().map_err(|_| {
+        let mut guard = self.transport.slot().write().map_err(|_| {
             tracing::debug!("transport RwLock poisoned (a writer panicked)");
             TransportLockError::Poisoned
         })?;

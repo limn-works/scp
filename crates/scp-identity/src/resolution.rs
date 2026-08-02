@@ -244,12 +244,20 @@ pub async fn relay_resolve<Q: RelayQuerier, C: Clock>(
 ///
 /// Stores blobs in a `HashMap` keyed by routing ID. Supports configuring
 /// per-relay responses for testing relay selection priority.
+///
+/// **Test-harness only.** Gated behind `#[cfg(any(test, feature = "testing"))]`
+/// so it can never ship in a production artifact (ADR-062 §Decision 5 / Slice
+/// 11). The production relay querier is `RealMultiRelayQuerier` composed over
+/// `scp-transport`'s `TransportRelayQuerier`; the honest DHT-only interim is
+/// [`NoOpRelayQuerier`](crate::resolver::NoOpRelayQuerier), which ships.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemoryRelayQuerier {
     /// Map from (`relay_url`, `routing_id`) to stored record.
     items: tokio::sync::Mutex<std::collections::HashMap<(String, [u8; 32]), RelayQueryRecord>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryRelayQuerier {
     /// Creates a new empty in-memory relay querier.
     #[must_use]
@@ -268,6 +276,7 @@ impl InMemoryRelayQuerier {
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
+#[cfg(any(test, feature = "testing"))]
 #[allow(clippy::manual_async_fn)]
 impl RelayQuerier for InMemoryRelayQuerier {
     fn query(

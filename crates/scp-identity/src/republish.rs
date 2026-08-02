@@ -109,9 +109,14 @@ pub trait RelayPublisher: Send + Sync {
     /// PUBLISH {
     ///     routing_id: <32-byte hash>,
     ///     blob_ttl: <seconds>,
-    ///     blob: <BEP44-signed DID document bytes>,
+    ///     blob: <SCPR kind-1 DID-record frame (§9.10.12)>,
     /// }
     /// ```
+    ///
+    /// The blob is published as a RAW relay blob (the SDK public-record
+    /// `publish_raw` path, §9.10.12), NOT wrapped in an `OuterEnvelope`. For DID
+    /// documents the blob is the SCPR kind-1 frame carrying the full BEP44
+    /// `(value, signature, seq)` triple.
     ///
     /// Implementations SHOULD publish to the identity's own relays plus
     /// bootstrap relays from the fallback relay list (§18.5.1).
@@ -120,7 +125,7 @@ pub trait RelayPublisher: Send + Sync {
     ///
     /// * `routing_id` — The 32-byte routing ID derived via [`did_routing_id`].
     /// * `blob_ttl` — TTL in seconds (604800 for DID documents).
-    /// * `blob` — The BEP44-signed DID document bytes.
+    /// * `blob` — The raw relay-blob bytes (SCPR kind-1 frame for DID records).
     ///
     /// # Errors
     ///
@@ -138,6 +143,9 @@ pub trait RelayPublisher: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// A recorded PUBLISH operation for test assertions.
+///
+/// **Test-harness only** — part of [`InMemoryRelayPublisher`].
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone)]
 pub struct RecordedRelayPublish {
     /// The routing ID used in the PUBLISH operation.
@@ -152,12 +160,19 @@ pub struct RecordedRelayPublish {
 ///
 /// Records all PUBLISH operations so tests can inspect routing IDs, TTLs,
 /// and blob contents without network access.
+///
+/// **Test-harness only.** Gated behind `#[cfg(any(test, feature = "testing"))]`
+/// so it can never ship in a production artifact (ADR-062 §Decision 5 / Slice
+/// 11). It is no longer the default `RepublishManager` publisher type parameter;
+/// production wires the real `RelayPublisher` from `scp-transport`.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemoryRelayPublisher {
     /// All recorded PUBLISH operations, in order.
     publishes: Mutex<Vec<RecordedRelayPublish>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryRelayPublisher {
     /// Creates a new empty in-memory relay publisher.
     #[must_use]
@@ -182,6 +197,7 @@ impl InMemoryRelayPublisher {
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait does
 // not guarantee Send futures, so manual impl Future is required.
+#[cfg(any(test, feature = "testing"))]
 #[allow(clippy::manual_async_fn)]
 impl RelayPublisher for InMemoryRelayPublisher {
     fn publish(
@@ -392,9 +408,12 @@ pub type RelayWarningCallback = Arc<dyn Fn(RelayPublishDegraded) + Send + Sync>;
 ///
 /// * `D` — The DHT client implementation. Use `InMemoryDhtClient` for
 ///   testing, or a production pkarr-based client for real DHT access.
-/// * `R` — The relay publisher implementation. Use `InMemoryRelayPublisher`
-///   for testing, or a production relay client for real relay access.
-pub struct RepublishManager<D: DhtClient, R: RelayPublisher = InMemoryRelayPublisher> {
+/// * `R` — The relay publisher implementation. There is **no default**
+///   (ADR-062 §Decision 5 / Slice 11): production MUST wire the real
+///   `RelayPublisher` from `scp-transport` explicitly; the test double
+///   `InMemoryRelayPublisher` is `#[cfg(any(test, feature = "testing"))]` and
+///   can never be selected by construction on a shipped path.
+pub struct RepublishManager<D: DhtClient, R: RelayPublisher> {
     dht_client: Arc<D>,
     relay_publisher: Option<Arc<R>>,
     config: RepublishConfig,
@@ -430,11 +449,16 @@ struct TaskHandle {
     abort_handle: tokio::task::AbortHandle,
 }
 
-impl<D: DhtClient + 'static> RepublishManager<D> {
+impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R> {
     /// Creates a new republish manager with DHT-only publishing.
     ///
     /// Relay publishing is not available until a [`RelayPublisher`] is provided
     /// via [`with_relay_publisher`](RepublishManager::with_relay_publisher).
+    ///
+    /// The relay publisher type `R` must still be named (there is no default —
+    /// ADR-062 §Decision 5), even though the relay slot starts empty. Callers
+    /// that want relay publishing should use
+    /// [`with_relay_publisher`](RepublishManager::with_relay_publisher) instead.
     #[must_use]
     pub fn new(dht_client: Arc<D>) -> Self {
         Self {
@@ -684,7 +708,8 @@ async fn dht_republish_loop<D: DhtClient>(
 /// Publishes immediately using the PUBLISH operation with:
 /// - `routing_id` = `did_routing_id(did_string)` (§3.10.2)
 /// - `blob_ttl` = config-derived TTL (default 604800 = 7 days, §3.10.2)
-/// - `blob` = BEP44-signed DID document bytes
+/// - `blob` = SCPR kind-1 DID-record frame (§9.10.12) carrying the full BEP44
+///   `(value, signature, seq)` triple — NOT the bare document bytes
 ///
 /// Then waits for the derived republish interval before the next publish.
 /// On failure, retries with exponential backoff.
@@ -696,11 +721,24 @@ async fn relay_republish_loop<R: RelayPublisher>(
     republish_interval_secs: u64,
 ) {
     let routing_id = did_routing_id(&entry.did);
+
+    // Wrap the (value, signature, seq) triple in an SCPR kind-1 DID-record frame
+    // (§9.10.12). The relay blob MUST be the SCPR frame carrying the full BEP44
+    // triple — NOT the bare `document_bytes` (which dropped the signature and
+    // sequence, leaving the record unverifiable on the read side). SCPR wraps
+    // `value` for transport only; it never enters the BEP44-signed bytes. The
+    // frame is constant per entry, so it is built once before the loop.
+    let blob = scp_protocol::envelope::scpr::encode_did_record(
+        &entry.document_bytes,
+        &entry.signature,
+        entry.sequence,
+    );
+
     let mut consecutive_failures: u32 = 0;
 
     loop {
         let result = relay_publisher
-            .publish(&routing_id, blob_ttl_secs, &entry.document_bytes)
+            .publish(&routing_id, blob_ttl_secs, &blob)
             .await;
 
         if result.is_ok() {
@@ -860,7 +898,8 @@ mod tests {
     #[tokio::test]
     async fn start_and_stop_republishing() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
+            RepublishManager::new(Arc::clone(&dht));
         let entry = make_entry("did:dht:zTest1");
 
         manager.start_republishing(entry).await;
@@ -881,7 +920,8 @@ mod tests {
     #[tokio::test]
     async fn stop_all_clears_all_tasks() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
+            RepublishManager::new(Arc::clone(&dht));
 
         manager
             .start_republishing(make_entry("did:dht:zTest1"))
@@ -898,7 +938,8 @@ mod tests {
     #[tokio::test]
     async fn replacing_existing_task_aborts_old_one() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
+            RepublishManager::new(Arc::clone(&dht));
 
         manager
             .start_republishing(make_entry("did:dht:zTest1"))
@@ -914,7 +955,8 @@ mod tests {
     #[tokio::test]
     async fn immediate_publish_on_start() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
+            RepublishManager::new(Arc::clone(&dht));
         let entry = make_entry("did:dht:zTest1");
 
         manager.start_republishing(entry).await;
@@ -968,10 +1010,20 @@ mod tests {
             publish.blob_ttl, RELAY_BLOB_TTL_SECS,
             "blob_ttl must be 604800 (7 days)"
         );
+        // The relay blob MUST be the SCPR kind-1 frame carrying the full
+        // (value, signature, seq) triple — not the bare document bytes
+        // (republish.rs no longer drops the signature/sequence, §9.10.12).
+        let decoded = scp_protocol::envelope::scpr::decode_did_record(&publish.blob)
+            .expect("relay blob must decode as a valid SCPR kind-1 frame");
         assert_eq!(
-            publish.blob, b"BEP44-signed DID document",
-            "blob must be the BEP44-signed DID document bytes"
+            decoded.value, b"BEP44-signed DID document",
+            "SCPR value must be the DID document bytes"
         );
+        assert_eq!(
+            decoded.signature, [2u8; 64],
+            "SCPR signature must be carried"
+        );
+        assert_eq!(decoded.seq, 1, "SCPR sequence must be carried");
 
         // Verify DHT publish also happened.
         let dht_record = dht.resolve(&[1u8; 32]).await.unwrap();

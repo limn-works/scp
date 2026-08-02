@@ -122,6 +122,12 @@ scp-core = { path = "../scp-core" }
 ed25519-dalek = { workspace = true }
 scp-platform = { path = "../scp-platform" }
 scp-testing = { path = "../scp-testing" }
+# ADR-062 Slice 11 DID relay round-trip tests need the identity-layer resolver
+# composer + DID doubles: `RealMultiRelayQuerier`, `DualLayerResolver`, the
+# in-memory DHT double (behind `scp-identity/testing` → `scp-dht/testing`).
+scp-identity = { path = "../scp-identity", features = ["testing"] }
+scp-dht = { path = "../scp-dht", features = ["testing"] }
+scp-did = { path = "../scp-did" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"

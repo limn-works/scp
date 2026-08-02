@@ -35,6 +35,7 @@ pub mod backoff;
 pub mod coap;
 pub mod config;
 pub mod cover_traffic;
+pub mod did_relay;
 pub mod discovery;
 #[cfg(all(test, feature = "quic"))]
 mod discovery_test_support;
@@ -72,6 +73,7 @@ pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
 pub use cover_traffic::{
     CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender, pad_to_bucket,
 };
+pub use did_relay::{LiveTransport, TransportRelayPublisher, TransportRelayQuerier};
 pub use discovery::{DiscoveredTransports, RelayTransportDiscovery, well_known_url};
 pub use error::TransportError;
 pub use heartbeat::{

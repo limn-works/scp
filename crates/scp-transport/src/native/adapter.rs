@@ -557,6 +557,67 @@ impl TransportAdapter for NativeRelayAdapter {
         Box::pin(async move { self.client.query(&routing_id_bytes, since).await })
     }
 
+    /// Publishes a raw public-record blob (Model A, §9.10.12).
+    ///
+    /// Sends a PUBLISH command carrying the raw `blob` bytes (an SCPR kind-1
+    /// DID-record frame) directly, WITHOUT wrapping them in an [`OuterEnvelope`]
+    /// or applying the `OuterEnvelope` codec. The relay stores opaque bytes; the
+    /// wire protocol is unchanged. Distinct from [`send`](Self::send), which
+    /// serializes an `OuterEnvelope`.
+    fn publish_raw(
+        &self,
+        routing_id: &RoutingId,
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> BoxFuture<'_, Result<BlobId, TransportError>> {
+        let routing_id_bytes = *routing_id.as_bytes();
+        // The relay wire `blob_ttl` is a `u32`; the public-record API uses `u64`
+        // to match the identity-layer `RelayPublisher` trait. DID blob TTLs
+        // (≤ 604800, the 7-day max) always fit; saturate defensively.
+        let blob_ttl = u32::try_from(blob_ttl).unwrap_or(u32::MAX);
+        Box::pin(async move {
+            let msg = ClientMessage::Publish {
+                ref_id: None,
+                routing_id: routing_id_bytes,
+                // Public records carry no recipient hint — they are public,
+                // self-certifying, and addressed solely by their routing ID.
+                recipient_hint: None,
+                blob_ttl,
+                blob,
+            };
+
+            let response = self.client.send_request(msg).await?;
+
+            match response {
+                RelayMessage::Ok {
+                    blob_id: Some(id), ..
+                } => Ok(BlobId::new(id)),
+                RelayMessage::Ok { blob_id: None, .. } => {
+                    Ok(BlobId::from_sha256(&routing_id_bytes))
+                }
+                RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
+                    "relay error {code}: {msg}"
+                ))),
+                _ => Err(TransportError::ProtocolError(
+                    "unexpected response to PUBLISH (raw)".to_string(),
+                )),
+            }
+        })
+    }
+
+    /// QUERYs raw public-record blobs (Model A, §9.10.12).
+    ///
+    /// Sends a QUERY and collects the raw BLOB bytes stored at `routing_id`,
+    /// WITHOUT deserializing them as [`OuterEnvelope`]s. Returns the raw blobs
+    /// for SCPR decoding at the resolver's single decode-and-verify site.
+    fn query_raw(
+        &self,
+        routing_id: &RoutingId,
+    ) -> BoxFuture<'_, Result<Vec<Vec<u8>>, TransportError>> {
+        let routing_id_bytes = *routing_id.as_bytes();
+        Box::pin(async move { self.client.query_raw(&routing_id_bytes).await })
+    }
+
     /// Requests deletion of a blob via DELETE.
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>> {
         let blob_id_bytes = *blob_id.as_bytes();

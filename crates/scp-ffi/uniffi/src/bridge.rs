@@ -47,14 +47,22 @@ use scp_dht::DhtClient;
 #[cfg(test)]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
-// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` are named only by the
-// testing-gated DID-resolver-init and DHT-signer helpers (production create
-// fails closed before resolver init — ADR-062 §Decision 6).
+// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` / `RealMultiRelayQuerier`
+// are named only by the testing-gated DID-resolver-init and DHT-signer helpers
+// (production create fails closed before resolver init — ADR-062 §Decision 6).
 #[cfg(feature = "testing")]
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
 #[cfg(feature = "testing")]
-use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
+use scp_identity::RealMultiRelayQuerier;
+#[cfg(feature = "testing")]
+use scp_identity::resolver::DualLayerResolver;
+// `NoOpRelayQuerier` is named only by the `#[cfg(test)]` DID-resolver tests that
+// deliberately keep the DHT-only interim relay arm (ADR-062 §Decision 5).
+#[cfg(test)]
+use scp_identity::resolver::NoOpRelayQuerier;
+#[cfg(feature = "testing")]
+use scp_transport::TransportRelayQuerier;
 
 use scp_did::DidDocument as CoreDidDocument;
 use scp_identity::{DidDht, DidMethod, ScpIdentity};
@@ -459,6 +467,19 @@ async fn publish_to_resolver_dht_for<C: KeyCustody + Send + Sync>(
     {
         tracing::warn!("publish_to_resolver_dht: DHT publish failed: {e}");
     }
+
+    // WRITE half (ADR-062 Slice 11): publish the SAME record to the relay layer
+    // via the real `TransportRelayPublisher`, so a peer resolving via the relay
+    // (or a DHT-disabled node) finds it. Best-effort (§3.10.5/§3.10.6): a missing
+    // relay is logged, not fatal — the DHT publish above remains authoritative.
+    scp_ffi_common::publish_did_record_to_relay(
+        bi.core.transport_handle(),
+        &identity.did,
+        value,
+        &signature,
+        seq,
+    )
+    .await;
 }
 
 /// Derives this member's per-context pseudonymous routing ID (§9.10.4).
@@ -9312,8 +9333,14 @@ fn ensure_did_resolver_initialized_on(
         .map(Arc::clone)
         .unwrap_or(candidate_cache);
 
+    // Relay layer (READ, ADR-062 Slice 11): the real multi-relay composer over
+    // the transport-backed single-relay querier, bound to this instance's live
+    // transport handle. Fails closed (honest not-found) until a relay is
+    // connected via `transport_connect`.
     let resolver = Arc::new(DualLayerResolver::new(
-        Arc::new(NoOpRelayQuerier),
+        Arc::new(RealMultiRelayQuerier::new(Arc::new(
+            TransportRelayQuerier::new(bi.core.transport_handle()),
+        ))),
         dht_client,
         cache,
         Vec::new(),

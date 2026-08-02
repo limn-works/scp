@@ -7,12 +7,14 @@ pub mod chunk;
 pub mod inner;
 pub mod outer;
 pub mod padding;
+pub mod scpr;
 pub mod validation;
 
 // Re-exports for backward compatibility.
 pub use inner::{InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance};
 pub use outer::{OuterEnvelope, create_outer_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
+pub use scpr::{DidRecord, ScprError, decode_did_record, encode_did_record};
 pub use validation::{ReorderBuffer, SequenceCheck, SequenceTracker};
 
 /// SCP protocol version for wire structures (§13.2).

@@ -1444,6 +1444,49 @@ mod tests {
         assert_ne!(relay, cache);
     }
 
+    /// AC5 (ADR-062 Slice 11): the shipped `NoOpRelayQuerier` fails CLOSED —
+    /// `query` returns `Ok(None)` (never a fabricated document), and a resolver
+    /// composed over it plus a disabled DHT layer returns honest not-found
+    /// `Ok(None)` when neither layer has the document (§3.10.4 "MUST NOT
+    /// fabricate"). This establishes the READ arm was fail-closed BEFORE the
+    /// relay layer was added — the real querier is defense-in-depth, not a fix
+    /// for a false-answer bug.
+    #[tokio::test]
+    async fn noop_relay_querier_fails_closed_and_resolver_returns_none() {
+        let (_signing_key, did, _doc) = make_test_identity();
+        let public_key = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let routing_id = did_routing_id(&did);
+        let _ = (public_key, routing_id);
+
+        // NoOpRelayQuerier::query returns Ok(None) — never a document.
+        let noop = NoOpRelayQuerier;
+        let record = noop
+            .query(&did, &["wss://relay.example.com/scp/v1".to_owned()])
+            .await
+            .expect("NoOp query is infallible");
+        assert!(
+            record.is_none(),
+            "NoOpRelayQuerier must never fabricate a record"
+        );
+
+        // A resolver over NoOp relay + a DISABLED DHT layer returns honest
+        // not-found when neither layer has the document — never a fabrication.
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(clock));
+        let resolver = DualLayerResolver::new(
+            Arc::new(NoOpRelayQuerier),
+            Arc::new(scp_dht::DisabledDhtClient),
+            cache,
+            vec!["wss://relay.example.com/scp/v1".to_owned()],
+        );
+
+        let result = resolver.resolve(&did).await.expect("resolve is Ok");
+        assert!(
+            result.is_none(),
+            "both layers empty => honest not-found Ok(None), never a fabricated document"
+        );
+    }
+
     #[tokio::test]
     async fn relay_verification_error_logged_dht_still_resolves() {
         // Relay returns a document with a corrupt signature. DHT returns a valid

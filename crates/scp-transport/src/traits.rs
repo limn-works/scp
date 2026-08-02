@@ -238,6 +238,59 @@ pub trait TransportAdapter: Send + Sync {
     /// fails.
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>>;
 
+    /// PUBLISH a raw public-record blob at a routing ID (Model A, §9.10.12).
+    ///
+    /// This is the SDK **public-record raw-blob path**, distinct from the
+    /// [`OuterEnvelope`]-typed [`send`](TransportAdapter::send) message path. It
+    /// Publishes an opaque `Vec<u8>` blob — an SCPR kind-1 DID-record frame
+    /// (§9.10.12) — **without** the `OuterEnvelope` codec. The relay stores the
+    /// bytes opaquely (relay wire protocol unchanged); only the SDK adapter
+    /// distinguishes the two paths. Used by the DID publisher (§3.10.5), never
+    /// for `OuterEnvelope` messages.
+    ///
+    /// The default implementation returns [`TransportError::SendFailed`]:
+    /// adapters that are not relay-backed do not support the public-record path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the adapter has no active
+    /// connection, or [`TransportError::SendFailed`] if the send fails or the
+    /// adapter does not support the raw path.
+    fn publish_raw(
+        &self,
+        _routing_id: &RoutingId,
+        _blob_ttl: u64,
+        _blob: Vec<u8>,
+    ) -> BoxFuture<'_, Result<BlobId, TransportError>> {
+        Box::pin(async {
+            Err(TransportError::SendFailed(
+                "raw public-record path (publish_raw) not supported by this adapter".to_owned(),
+            ))
+        })
+    }
+
+    /// QUERY raw public-record blobs stored at a routing ID (Model A, §9.10.12).
+    ///
+    /// The counterpart to [`publish_raw`](TransportAdapter::publish_raw): returns
+    /// the raw `Vec<u8>` blobs stored at `routing_id`, **without** deserializing
+    /// them as [`OuterEnvelope`]s (a raw SCPR frame is not an `OuterEnvelope` and
+    /// would fail that codec). The DID resolver (§3.10.4) SCPR-decodes each
+    /// returned blob at its single decode-and-verify site.
+    ///
+    /// The default implementation returns an empty vector: an adapter that is
+    /// not relay-backed has no public-record blobs to return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the adapter has no active
+    /// connection, or [`TransportError::Timeout`] if the query times out.
+    fn query_raw(
+        &self,
+        _routing_id: &RoutingId,
+    ) -> BoxFuture<'_, Result<Vec<Vec<u8>>, TransportError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// Records that a suppression-detection heartbeat (§9.9.2) was received
     /// from a peer over this transport.
     ///
@@ -290,6 +343,22 @@ impl TransportAdapter for Box<dyn TransportAdapter> {
 
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>> {
         (**self).delete(blob_id)
+    }
+
+    fn publish_raw(
+        &self,
+        routing_id: &RoutingId,
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> BoxFuture<'_, Result<BlobId, TransportError>> {
+        (**self).publish_raw(routing_id, blob_ttl, blob)
+    }
+
+    fn query_raw(
+        &self,
+        routing_id: &RoutingId,
+    ) -> BoxFuture<'_, Result<Vec<Vec<u8>>, TransportError>> {
+        (**self).query_raw(routing_id)
     }
 
     fn record_heartbeat_received(&self) -> BoxFuture<'_, ()> {

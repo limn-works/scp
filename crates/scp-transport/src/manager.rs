@@ -738,6 +738,47 @@ impl TransportManager {
         adapter.query(routing_id, since).await
     }
 
+    /// PUBLISH a raw public-record blob through the first adapter (Model A,
+    /// §9.10.12).
+    ///
+    /// The public-record counterpart to [`send`](TransportManager::send): it
+    /// Publishes an opaque `Vec<u8>` blob (an SCPR kind-1 DID-record frame) at
+    /// `routing_id` WITHOUT the `OuterEnvelope` codec. Used by the DID publisher
+    /// (§3.10.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if no adapters are registered.
+    /// Propagates errors from the underlying adapter.
+    pub async fn publish_raw(
+        &self,
+        routing_id: &RoutingId,
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> Result<BlobId, TransportError> {
+        let adapter = self.adapters.first().ok_or(TransportError::NotConnected)?;
+        self.touch_adapter(0);
+        adapter.publish_raw(routing_id, blob_ttl, blob).await
+    }
+
+    /// QUERY raw public-record blobs through the first adapter (Model A,
+    /// §9.10.12).
+    ///
+    /// The public-record counterpart to [`query`](TransportManager::query):
+    /// returns the raw `Vec<u8>` blobs stored at `routing_id` WITHOUT
+    /// deserializing them as [`OuterEnvelope`]s. Used by the DID resolver
+    /// (§3.10.4), which SCPR-decodes each returned blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if no adapters are registered.
+    /// Propagates errors from the underlying adapter.
+    pub async fn query_raw(&self, routing_id: &RoutingId) -> Result<Vec<Vec<u8>>, TransportError> {
+        let adapter = self.adapters.first().ok_or(TransportError::NotConnected)?;
+        self.touch_adapter(0);
+        adapter.query_raw(routing_id).await
+    }
+
     /// Request deletion of a blob across all adapters.
     ///
     /// Sends a delete request to every registered adapter. Best-effort:
