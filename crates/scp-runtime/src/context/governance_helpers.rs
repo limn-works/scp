@@ -979,14 +979,11 @@ pub async fn execute_revoke(
             timestamp_secs,
         )
         .await?;
-    // Coalesced Class-C counter bump (rides the next run-loop persist, exactly
-    // as before the combinator migration — NOT covered by the FC persist above).
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
-
     // Spec §2008 / §2015: emit one best-effort KeyEpochAdvance leaf per author
     // whose broadcast key was rotated by the governance ban.  Each rotation
     // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
     // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
+    let mut kea_success_count: u64 = 0;
     for rotation in &rotated_authors {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
         match scp_event_log::payload::encode_payload(
@@ -1013,6 +1010,8 @@ pub async fn execute_revoke(
                         error = %e,
                         "KeyEpochAdvance event-log append failed after governance ban (best-effort)"
                     );
+                } else {
+                    kea_success_count += 1;
                 }
             }
             Err(e) => {
@@ -1025,6 +1024,11 @@ pub async fn execute_revoke(
             }
         }
     }
+    // Coalesced Class-C counter bump: 1 for AccessRevoked + each KeyEpochAdvance
+    // leaf that actually appended. The counter must track the true durable-leaf
+    // count (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position
+    // drift. Best-effort leaves that failed are excluded — they were never durable.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_success_count;
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -3085,23 +3089,19 @@ pub async fn execute_rotate_content_keys(
     // `ContextSnapshot`, so the all-author key-epoch advance persists fail-closed
     // atomically inside the combinator — the prior trailing best-effort
     // `persist_broadcast_snapshot` is gone (§5.14.8).
-    let rotate_commit_bytes = cell
+    let (rotate_commit_bytes, key_advances) = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
             require_active(&state.handle)?;
 
-            let epoch_output = if let Some(ref mut bc) = state.broadcast_context {
-                // NOTE: `rotate_all_author_keys` returns `Ok(())` — no per-author
-                // (author_did, new_epoch) data is surfaced to the caller. Emitting
-                // `KeyEpochAdvance` leaves for each rotated author would require
-                // changing `rotate_all_author_keys` to return that data AND
-                // threading it out of this sync closure, since async event-log
-                // appends cannot happen inside `commit_class_s_keep`. The
-                // `unsubscribe_broadcast` path (which receives per-author
-                // `BlockResult` data from `bc.unsubscribe`) does emit
-                // `KeyEpochAdvance` leaves correctly — see #1847.
-                bc.rotate_all_author_keys()?;
-                None
+            let (epoch_output, advances) = if let Some(ref mut bc) = state.broadcast_context {
+                // `rotate_all_author_keys` now returns per-author advance data so
+                // the caller can emit `KeyEpochAdvance` event-log leaves after the
+                // fail-closed persist (async appends cannot run inside this sync
+                // `commit_class_s_keep` closure — ADR-049 Decision 7). The advance
+                // Vec is threaded out of the closure as the second tuple element.
+                let advances = bc.rotate_all_author_keys(timestamp_secs.saturating_mul(1_000))?;
+                (None, advances)
             } else {
                 // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): advance the MLS epoch on the
                 // actor state (already inside this fail-closed `commit_class_s_keep`
@@ -3134,7 +3134,8 @@ pub async fn execute_rotate_content_keys(
                     let did = new_key.member_did().to_owned();
                     state.access.access_key_store.set(context_id, &did, new_key);
                 }
-                Some(epoch_out)
+                // Non-broadcast: no broadcast-key epoch advances.
+                (Some(epoch_out), vec![])
             };
 
             emit(
@@ -3150,7 +3151,12 @@ pub async fn execute_rotate_content_keys(
             // Commit broadcast runs AFTER the fail-closed persist, outside this sync
             // `_keep` closure (ADR-049 Decision 7 — transport is async). `None` on
             // the broadcast path (no MLS Commit) or when no epoch advance occurred.
-            Ok(epoch_output.map(|epoch_out| epoch_out.commit_bytes))
+            // The `advances` Vec carries per-author BroadcastKeyEpochAdvance data
+            // for KeyEpochAdvance event-log appends AFTER the persist (below).
+            Ok((
+                epoch_output.map(|epoch_out| epoch_out.commit_bytes),
+                advances,
+            ))
         })
         .await?;
 
@@ -3182,7 +3188,65 @@ pub async fn execute_rotate_content_keys(
             timestamp_secs,
         )
         .await?;
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
+    // Emit one `KeyEpochAdvance` leaf per broadcast author whose key was
+    // rotated (§5.14.10, #1847). Best-effort: warn on failure, no error
+    // propagation — same pattern as governance_ban_subscriber in
+    // `execute_revoke`. `key_advances` is empty on the non-broadcast path.
+    //
+    // NOTE: `advance.timestamp` (milliseconds) is not used here — the
+    // event-log append takes `timestamp_secs` directly. The ms field is
+    // carried by `BroadcastKeyEpochAdvance` for the relay-message consumer
+    // on the per-author block path; it is dead data in this governance path.
+    // `old_epoch` is derived as `new_epoch - 1` because `rotate_all_author_keys`
+    // always increments by exactly 1 (pre-validated, sound by construction).
+    let mut kea_success_count: u64 = 0;
+    for advance in &key_advances {
+        let old_epoch = advance.new_epoch.saturating_sub(1);
+        match scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::KeyEpochAdvancePayload {
+                old_epoch,
+                new_epoch: advance.new_epoch,
+            },
+        ) {
+            Ok(payload) => {
+                if let Err(e) = deps
+                    .event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::KeyEpochAdvance,
+                        advance.author_did.as_str(),
+                        payload,
+                        timestamp_secs,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        author_did = %advance.author_did,
+                        error = %e,
+                        "KeyEpochAdvance event-log append failed after RotateContentKeys (best-effort)"
+                    );
+                } else {
+                    kea_success_count += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    author_did = %advance.author_did,
+                    error = %e,
+                    "KeyEpochAdvance payload encode failed after RotateContentKeys (best-effort)"
+                );
+            }
+        }
+    }
+    // Coalesced Class-C counter bump: 1 for ContentKeysRotated + each
+    // KeyEpochAdvance leaf that actually appended. The counter must track the
+    // true durable-leaf count (governance_logic.rs:156-158) to prevent §9.9.3
+    // checkpoint-position drift. Best-effort leaves that failed are excluded —
+    // they were never durable.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_success_count;
     Ok(())
 }
 
