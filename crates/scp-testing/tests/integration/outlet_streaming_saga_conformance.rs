@@ -587,16 +587,14 @@ fn xctx_10_chunk_dual_log_carries_identical_root() {
         .verify(&receipt_vk(&v.target_signing_seed))
         .expect("the streaming receipt verifies under the target key");
 
-    // Dual-log structural identity: both leaves record the SAME root under the
-    // SAME key, exactly as the runtime dual event-log join asserts.
-    let root_hex = to_hex(&root);
-    let target_leaf = serde_json::json!({ "stream_manifest_hash": root_hex });
-    let caller_leaf = serde_json::json!({ "stream_manifest_hash": root_hex });
-    assert_eq!(
-        serde_json::to_vec(&target_leaf).unwrap(),
-        serde_json::to_vec(&caller_leaf).unwrap(),
-        "AC5: target and caller dual-log leaves carry byte-identical stream_manifest_hash"
-    );
+    // The artifact both event logs must carry — the sealed manifest root — is
+    // verified byte-exact above (`root == expected_stream_manifest_hash`, non-zero).
+    // The ATOMIC dual event-log join itself (target `OutletInvoked` + caller
+    // `CrossContextOutletInvoked` recorded over that SAME root in one commit) is a
+    // resident-actor property proven runtime-side by
+    // `xctx_streaming_saga_paid_drive_ac1_ac3_ac5_ac6` (§25.22) — it is not
+    // reconstructible from an external test crate (the Class-S actor-state
+    // isolation boundary), so this harness verifies the shared artifact, not the join.
 }
 
 /// AC3 — `truncated_close`: a mid-stream crash after `crash_after_index` chunks
