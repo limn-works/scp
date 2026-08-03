@@ -296,8 +296,10 @@ impl SupervisorHandle {
     /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command),
     /// which dispatches via the per-context actor mailbox when one is
     /// registered or falls through to the legacy lock-shaped fallback
-    /// otherwise. The reply is awaited inline so the caller observes
-    /// the full per-actor outcome.
+    /// otherwise. The reply is awaited inline — bounded by
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT) — so the
+    /// caller observes the full per-actor outcome without a wedged actor
+    /// pinning it forever.
     ///
     /// # Errors
     ///
@@ -310,6 +312,11 @@ impl SupervisorHandle {
     /// - [`ContextError::TransportFailed`] if the reply channel is
     ///   closed before a response arrives (actor panicked or shut down
     ///   between dispatch and reply).
+    /// - [`ContextError::ActorBusy`] (retryable) if the actor does not
+    ///   reply within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT)
+    ///   — a wedged/deadlocked actor never terminates, so the watchdog never
+    ///   drops the reply sender; this backstop fail-closes instead of
+    ///   hanging the caller.
     pub async fn dispatch_recovery_send_notification(
         &self,
         payload: crate::context::actor::commands::RecoverySendNotificationPayload,
@@ -321,11 +328,24 @@ impl SupervisorHandle {
             reply: reply_tx,
         };
         self.supervisor.dispatch_trust_recovery_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
-            ContextError::TransportFailed(
-                "dispatch_recovery_send_notification: oneshot reply channel closed".to_owned(),
-            )
-        })?
+        // Bounded by REPLY_TIMEOUT: the result is load-bearing (propagated
+        // via `?` into trust-recovery `recovery_notify_contact`, §9.12) and a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender) — without the bound a wedged actor would
+        // pin the caller forever. On elapse, fail-closed with the retryable
+        // `ActorBusy` class; the existing dropped-channel `TransportFailed`
+        // behavior is preserved exactly.
+        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
+            Ok(reply) => reply.map_err(|_| {
+                ContextError::TransportFailed(
+                    "dispatch_recovery_send_notification: oneshot reply channel closed".to_owned(),
+                )
+            })?,
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "context actor did not reply within {} seconds",
+                crate::context::actor::REPLY_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Look up the registered standing-context peer DID for `peer_did`.
