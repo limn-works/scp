@@ -31,7 +31,7 @@
 //! | [`CODE_AUTHORIZATION_DENIED`] (`SCP-OUTLET-6110`) | `Authorization` | `authorization.denied` | `authorization.denied` (oracle-collapse target), `authorization.expired`, `authorization.revoked`, `authorization.missing`, `authorization.attenuation-violation`, `authorization.mint-limit-exceeded`, `authorization.time-box-violation`, `authorization.rate-exceeded`, `authorization.cumulative-exceeded`, `authorization.adapter-not-allowed`, `authorization.revoked-mid-stream`, `authorization.credit-stream-mismatch`, `authorization.ikm-signature-invalid`, `authorization.credit-replay` |
 //! | [`CODE_AUTHORIZATION_ATTENUATION`] (`SCP-OUTLET-6114`) | `Authorization` | `attenuation.mask-width-violation` | `attenuation.caveat-mint-limit-exceeded`, `attenuation.hours-of-day-high-bits-set`, `attenuation.days-of-week-high-bit-set`, `attenuation.origin-kind-stem-mismatch`, `attenuation.origin-kind-mixed-stem-root`, `attenuation.origin-kind-unspecified`, `attenuation.mask-width-violation` |
 //! | [`CODE_AUTHORIZATION_SALT_ROTATION`] (`SCP-OUTLET-6115`) | `Authorization` | `authorization.salt-rotation-unjustified` | `authorization.salt-rotation-unjustified` |
-//! | [`CODE_INPUT_VIOLATION`] (`SCP-OUTLET-6120`) | `Input` | `input.schema-violation` | `input.schema-violation`, `input.too-large`, `input.not-serializable`, `input.estimate-exceeds-bound` |
+//! | [`CODE_INPUT_VIOLATION`] (`SCP-OUTLET-6120`) | `Input` | `input.schema-violation` | `input.schema-violation`, `input.too-large`, `input.not-serializable`, `input.estimate-exceeds-bound`, `input.invalid-grant` |
 //! | [`CODE_EXECUTION_FAULT`] (`SCP-OUTLET-6130`) | `Execution` | `execution.handler-panic` | `execution.handler-panic`, `execution.timeout`, `execution.non-deterministic` |
 //! | [`CODE_EXECUTION_CREDIT`] (`SCP-OUTLET-6131`) | `Execution` | `execution.credit-exhausted` | `execution.credit-exhausted`, `execution.stream-gap` |
 //! | [`CODE_EXECUTION_STREAM_CAP`] (`SCP-OUTLET-6132`) | `Execution` | `execution.stream-cap-exhausted` | `execution.stream-cap-exhausted` |
@@ -131,7 +131,9 @@ pub const CODE_AUTHORIZATION_SALT_ROTATION: &str = "SCP-OUTLET-6115";
 /// Default slug `input.schema-violation`. Slugs: `input.schema-violation`,
 /// `input.too-large`, `input.not-serializable`,
 /// `input.estimate-exceeds-bound` (round-4 stream open
-/// `estimated_chunk_count` cap). See §5.4.4.
+/// `estimated_chunk_count` cap), `input.invalid-grant` (SDK-level credit-grant
+/// range validation — a zero or out-of-`u32`-range `Credit`, rejected before a
+/// grant is signed; SCP-OUT-031). See §5.4.4.
 pub const CODE_INPUT_VIOLATION: &str = "SCP-OUTLET-6120";
 
 /// `SCP-OUTLET-6130` — Execution-class handler-side fault.
@@ -248,6 +250,100 @@ pub const ALL_CODES: [&str; 15] = [
     CODE_ECONOMIC_FAULT,
     CODE_TRANSPORT_FAULT,
     CODE_GOVERNANCE_FAULT,
+];
+
+/// Every §5.4.4 slug the registry defines, in canonical (class, then
+/// declaration) order. The enumerable counterpart to [`slug_to_class`] (a
+/// non-enumerable `match`), analogous to [`ALL_CODES`] for codes.
+///
+/// This is the authoritative slug domain: cross-SDK conformance fixtures
+/// set-equate their slug coverage against this array, so a slug added to the
+/// registry without a matching fixture fails the conformance gate by
+/// construction (rather than passing green against a hand-copied list). The
+/// [`tests::all_slugs_lists_exactly_the_defined_slug_constants`] source-parse
+/// test asserts this array equals the set of `SLUG_*` constant definitions in
+/// this module, so a new `SLUG_*` constant that is not added here fails to
+/// build green. Every entry MUST resolve through [`slug_to_class`]
+/// ([`tests::all_slugs_resolve_through_slug_to_class`]).
+pub const ALL_SLUGS: [&str; 69] = [
+    // Protocol class (6100 + 6101).
+    SLUG_PROTOCOL_VIOLATION,
+    SLUG_QUERY_COST_VIOLATION,
+    SLUG_QUERY_VIOLATION,
+    SLUG_KIND_MISMATCH,
+    SLUG_AMPLIFICATION_VIOLATION,
+    SLUG_STRUCTURAL_FLOOR_VIOLATION,
+    SLUG_SCHEMA_IMMUTABILITY_VIOLATION,
+    SLUG_QUERY_MISDECLARATION,
+    SLUG_PROTOCOL_CATALOG_ROTATION_TOO_FREQUENT,
+    SLUG_PROTOCOL_STREAM_ALREADY_OPEN,
+    SLUG_PROTOCOL_SESSION_ID_CONFLICT,
+    SLUG_PROTOCOL_MALFORMED_SESSION_ID,
+    SLUG_PROTOCOL_UNKNOWN_SESSION,
+    SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+    SLUG_PROTOCOL_STREAM_ALREADY_CLOSED,
+    // Authorization class (6110 general denial + caveat enforcement).
+    SLUG_AUTHORIZATION_DENIED,
+    SLUG_AUTHORIZATION_EXPIRED,
+    SLUG_AUTHORIZATION_REVOKED,
+    SLUG_AUTHORIZATION_MISSING,
+    SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
+    SLUG_AUTHORIZATION_MINT_LIMIT_EXCEEDED,
+    SLUG_AUTHORIZATION_TIME_BOX_VIOLATION,
+    SLUG_AUTHORIZATION_RATE_EXCEEDED,
+    SLUG_AUTHORIZATION_CUMULATIVE_EXCEEDED,
+    SLUG_AUTHORIZATION_ADAPTER_NOT_ALLOWED,
+    SLUG_AUTHORIZATION_REVOKED_MID_STREAM,
+    SLUG_AUTHORIZATION_CREDIT_STREAM_MISMATCH,
+    SLUG_AUTHORIZATION_IKM_SIGNATURE_INVALID,
+    SLUG_AUTHORIZATION_CREDIT_REPLAY,
+    SLUG_AUTHORIZATION_SALT_ROTATION_UNJUSTIFIED,
+    // Authorization attenuation sub-class (6114).
+    SLUG_ATTENUATION_CAVEAT_MINT_LIMIT_EXCEEDED,
+    SLUG_ATTENUATION_HOURS_OF_DAY_HIGH_BITS_SET,
+    SLUG_ATTENUATION_DAYS_OF_WEEK_HIGH_BIT_SET,
+    SLUG_ATTENUATION_ORIGIN_KIND_STEM_MISMATCH,
+    SLUG_ATTENUATION_ORIGIN_KIND_MIXED_STEM_ROOT,
+    SLUG_ATTENUATION_ORIGIN_KIND_UNSPECIFIED,
+    SLUG_ATTENUATION_MASK_WIDTH_VIOLATION,
+    // Input class (6120).
+    SLUG_INPUT_SCHEMA_VIOLATION,
+    SLUG_INPUT_TOO_LARGE,
+    SLUG_INPUT_NOT_SERIALIZABLE,
+    SLUG_INPUT_ESTIMATE_EXCEEDS_BOUND,
+    SLUG_INPUT_INVALID_GRANT,
+    // Execution class (6130 / 6131 / 6132 / 6133 / 6135).
+    SLUG_EXECUTION_HANDLER_PANIC,
+    SLUG_EXECUTION_TIMEOUT,
+    SLUG_EXECUTION_NON_DETERMINISTIC,
+    SLUG_EXECUTION_CREDIT_EXHAUSTED,
+    SLUG_EXECUTION_CREDIT_STALL,
+    SLUG_EXECUTION_STREAM_GAP,
+    SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
+    SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
+    // Output class (6140).
+    SLUG_OUTPUT_SCHEMA_VIOLATION,
+    SLUG_OUTPUT_TOO_LARGE,
+    SLUG_OUTPUT_NOT_SERIALIZABLE,
+    // Economic class (6150, incl. the Protocol-prefixed cross-class slug).
+    SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
+    SLUG_ECONOMIC_ADAPTER_FAILURE,
+    SLUG_ECONOMIC_PRICING_FORMULA_ERROR,
+    SLUG_ECONOMIC_BUDGET_EXCEEDED,
+    SLUG_ECONOMIC_ESCROW_OVERFLOW,
+    SLUG_PROTOCOL_INTERFACE_SPAM_COST,
+    // Transport class (6160).
+    SLUG_TRANSPORT_RELAY_UNAVAILABLE,
+    SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE,
+    SLUG_TRANSPORT_RATE_LIMITED,
+    SLUG_TRANSPORT_CONCURRENT_STREAMS_PER_INVOKER,
+    SLUG_TRANSPORT_CONCURRENT_STREAMS_PER_ORIGIN_INVOKER,
+    SLUG_TRANSPORT_CONCURRENT_STREAMS_PER_OUTLET,
+    // Governance class (6170).
+    SLUG_GOVERNANCE_OUTLET_DEREGISTERED,
+    SLUG_GOVERNANCE_OUTLET_SUSPENDED,
+    SLUG_GOVERNANCE_CEILING_EXCEEDED,
+    SLUG_GOVERNANCE_CONSEQUENCE_ACTIVE,
 ];
 
 // ---------------------------------------------------------------------------
@@ -375,6 +471,20 @@ pub const SLUG_INPUT_TOO_LARGE: &str = "input.too-large";
 pub const SLUG_INPUT_NOT_SERIALIZABLE: &str = "input.not-serializable";
 /// Slug `input.estimate-exceeds-bound` — round-4 `estimated_chunk_count` cap.
 pub const SLUG_INPUT_ESTIMATE_EXCEEDS_BOUND: &str = "input.estimate-exceeds-bound";
+/// Slug `input.invalid-grant` — SDK-level credit-grant range validation.
+///
+/// Emitted by the SDK `Credit` newtype factory (SCP-OUT-031) when a
+/// caller-supplied grant value is zero or exceeds the `u32` range, rejected
+/// before the grant is signed. Rides [`CODE_INPUT_VIOLATION`]
+/// (`SCP-OUTLET-6120`) as an additional slug — the compact §5.4.4 registry
+/// mints new conditions as slugs under an existing code rather than as new
+/// numeric codes. Carries the **Input** class: a bad caller-supplied numeric
+/// scalar is an input range violation, following the §5.4.5 precedent where
+/// an out-of-bound `estimated_chunk_count` surfaces as
+/// [`SLUG_INPUT_ESTIMATE_EXCEEDS_BOUND`] (Input), NOT a Protocol or
+/// Authorization failure. The SDK `InvalidGrant` error class (under
+/// `OutletInputError`) surfaces this `(code, slug)` pair.
+pub const SLUG_INPUT_INVALID_GRANT: &str = "input.invalid-grant";
 
 // --- Execution class ------------------------------------------------------
 
@@ -684,7 +794,8 @@ pub fn slug_to_class(slug: &str) -> Option<OutletErrorClass> {
         SLUG_INPUT_SCHEMA_VIOLATION
         | SLUG_INPUT_TOO_LARGE
         | SLUG_INPUT_NOT_SERIALIZABLE
-        | SLUG_INPUT_ESTIMATE_EXCEEDS_BOUND => Some(OutletErrorClass::Input),
+        | SLUG_INPUT_ESTIMATE_EXCEEDS_BOUND
+        | SLUG_INPUT_INVALID_GRANT => Some(OutletErrorClass::Input),
 
         // Execution class
         SLUG_EXECUTION_HANDLER_PANIC
@@ -1293,6 +1404,134 @@ mod tests {
         // 6132 sits in the canonical 6100-6199 sub-block.
         validate_slug(SLUG_EXECUTION_STREAM_CAP_EXHAUSTED)
             .unwrap_or_else(|e| panic!("stream-cap-exhausted fails regex: {e:?}"));
+    }
+
+    #[test]
+    fn input_invalid_grant_slug_is_input_class_under_6120() {
+        // SCP-OUT-031 (PR-1) — `input.invalid-grant` is the SDK-level
+        // credit-grant range-validation slug (`Credit(0)` / out-of-`u32`-range).
+        // It is registered as an ADDITIONAL slug under the existing Input code
+        // `SCP-OUTLET-6120` (CODE_INPUT_VIOLATION), NOT as a new numeric code —
+        // the §5.4.4 registry is many-slugs-per-code and mints new conditions
+        // as slugs. It carries the INPUT class following the §5.4.5 precedent
+        // where an out-of-bound caller-supplied numeric scalar
+        // (`estimated_chunk_count`) surfaces as Input::EstimateExceedsBound —
+        // a bad `Credit` grant is the same shape. This pins the slug→class
+        // bijection so the SDK `InvalidGrant` class (under `OutletInputError`)
+        // surfaces (6120, input.invalid-grant, Input) uniformly across all four
+        // SDKs (PR-3).
+        assert_eq!(
+            slug_to_class(SLUG_INPUT_INVALID_GRANT),
+            Some(OutletErrorClass::Input),
+            "input.invalid-grant must map to the Input class"
+        );
+        assert_eq!(SLUG_INPUT_INVALID_GRANT, "input.invalid-grant");
+        // The slug passes the §5.4.4 regex.
+        validate_slug(SLUG_INPUT_INVALID_GRANT)
+            .unwrap_or_else(|e| panic!("input.invalid-grant fails the §5.4.4 regex: {e:?}"));
+        // The code it rides under is the Input-class code 6120, whose class
+        // agrees with the slug's class. Adding the slug did NOT change 6120's
+        // default slug or retry policy.
+        assert_eq!(
+            error_code_to_class(CODE_INPUT_VIOLATION),
+            Some(OutletErrorClass::Input)
+        );
+        assert_eq!(
+            error_code_to_default_slug(CODE_INPUT_VIOLATION),
+            Some(SLUG_INPUT_SCHEMA_VIOLATION),
+            "the invalid-grant slug must not displace 6120's default slug"
+        );
+        assert_eq!(
+            error_code_to_retry_policy(CODE_INPUT_VIOLATION),
+            Some(RetryPolicy::Never)
+        );
+        // The reversed Protocol/6100 pairing must NOT exist anywhere in the
+        // registry (the earlier design was reversed to Input/6120): the
+        // `protocol.invalid-grant` spelling is not a registered slug.
+        assert_eq!(
+            slug_to_class("protocol.invalid-grant"),
+            None,
+            "protocol.invalid-grant must NOT be registered (reclassified to input.invalid-grant)"
+        );
+        assert_eq!(
+            error_code_to_default_slug(CODE_PROTOCOL_VIOLATION),
+            Some(SLUG_PROTOCOL_VIOLATION),
+            "6100's default slug is unchanged and does not reference invalid-grant"
+        );
+    }
+
+    #[test]
+    fn all_slugs_resolve_through_slug_to_class() {
+        // Every entry in ALL_SLUGS maps to a class (ALL_SLUGS is the
+        // enumerable domain of the non-enumerable slug_to_class match), passes
+        // the §5.4.4 regex, and is unique.
+        let mut seen = std::collections::BTreeSet::new();
+        for slug in ALL_SLUGS {
+            assert!(
+                slug_to_class(slug).is_some(),
+                "ALL_SLUGS entry {slug} does not resolve through slug_to_class"
+            );
+            validate_slug(slug)
+                .unwrap_or_else(|e| panic!("ALL_SLUGS entry {slug} fails the §5.4.4 regex: {e:?}"));
+            assert!(seen.insert(slug), "ALL_SLUGS contains a duplicate: {slug}");
+        }
+        assert_eq!(seen.len(), ALL_SLUGS.len());
+    }
+
+    #[test]
+    fn all_slugs_lists_exactly_the_defined_slug_constants() {
+        // Source-parse guard (analogous in spirit to an ALL_CODES ⟷ CODE_*
+        // check): ALL_SLUGS must equal the set of values of every `SLUG_*`
+        // constant definition in this module. A new `SLUG_*` constant that is
+        // not added to ALL_SLUGS — the slug-drift hole the hand-copied fixture
+        // list could not catch — fails here by construction.
+        //
+        // The needle is assembled via `concat!` so this test's own source does
+        // NOT contain the contiguous definition prefix it scans for (avoiding a
+        // self-match when the file reads itself).
+        const SRC: &str = include_str!("error_codes.rs");
+        let needle = concat!("pub const ", "SLUG_");
+
+        let mut defined_values = std::collections::BTreeSet::new();
+        let mut rest = SRC;
+        while let Some(pos) = rest.find(needle) {
+            // Advance past the definition head, then take the first string
+            // literal that follows (the constant's value), which may sit on
+            // the next line for wrapped definitions.
+            rest = &rest[pos + needle.len()..];
+            let open = rest
+                .find('"')
+                .expect("SLUG_* definition without a string literal value");
+            let after_open = &rest[open + 1..];
+            let close = after_open
+                .find('"')
+                .expect("SLUG_* string literal without a closing quote");
+            let value = &after_open[..close];
+            assert!(
+                defined_values.insert(value.to_owned()),
+                "duplicate SLUG_* constant value in source: {value}"
+            );
+            rest = &after_open[close + 1..];
+        }
+
+        let listed: std::collections::BTreeSet<String> =
+            ALL_SLUGS.iter().map(|s| (*s).to_owned()).collect();
+
+        let missing_from_all_slugs: Vec<_> = defined_values.difference(&listed).collect();
+        let extra_in_all_slugs: Vec<_> = listed.difference(&defined_values).collect();
+        assert!(
+            missing_from_all_slugs.is_empty(),
+            "SLUG_* constants defined but absent from ALL_SLUGS: {missing_from_all_slugs:?}"
+        );
+        assert!(
+            extra_in_all_slugs.is_empty(),
+            "ALL_SLUGS entries with no matching SLUG_* constant definition: {extra_in_all_slugs:?}"
+        );
+        assert_eq!(
+            defined_values.len(),
+            ALL_SLUGS.len(),
+            "ALL_SLUGS length must equal the number of distinct SLUG_* constants"
+        );
     }
 
     #[test]

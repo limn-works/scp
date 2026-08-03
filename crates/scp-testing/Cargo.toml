@@ -268,5 +268,9 @@ path = "tests/integration/outlet_economy_wiring.rs"
 name = "reconnect_sync"
 path = "tests/integration/reconnect_sync.rs"
 
+[[test]]
+name = "outlet_error_conformance"
+path = "tests/integration/outlet_error_conformance.rs"
+
 [lints]
 workspace = true
