@@ -40,3 +40,32 @@ pub(crate) mod two_party_test_support;
 
 pub use provider::NodeMlsFactory;
 pub use storage::{MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider};
+
+/// Single source of truth for the **testing-only** DID-method carve-out used by
+/// the MLS identity checks.
+///
+/// Returns `true` when `did` uses one of the two mock DID-method prefixes —
+/// `did:test:` or `did:key:` — that the MLS identity-validation paths accept in
+/// place of resolving a real `did:dht:z…` DID. This is a POSITIVE WHITELIST: it
+/// names the exact prefixes the legacy mock-based test suite uses, and nothing
+/// else. Its sole current caller is
+/// [`NodeMlsFactory::validate_creator_identity`](provider::NodeMlsFactory::validate_creator_identity);
+/// it exists as one definition so that any additional MLS identity carve-out
+/// routes through the same predicate rather than re-spelling it and drifting.
+///
+/// # Security — MUST NOT be reachable in shipped artifacts
+///
+/// The whole function is gated behind `#[cfg(any(test, feature = "testing"))]`, so
+/// it is COMPILED OUT of every shipped (no-`testing`) production build. The
+/// `scripts/check-shipped-feature-graph.sh` G1 gate proves the `testing` feature
+/// never enters a shipped artifact's feature graph, so this carve-out cannot exist
+/// on a production path. Production identity validation therefore requires a real,
+/// resolvable `did:dht:z…` DID.
+///
+/// `did:web:` and `did:dht:` are NEVER exempt by this predicate: `did:dht:` is the
+/// real production method (validated on its own path, not via this carve-out), and
+/// `did:web:` has no testing exemption whatsoever.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn is_testing_exempt_did(did: &str) -> bool {
+    did.starts_with("did:test:") || did.starts_with("did:key:")
+}

@@ -637,16 +637,22 @@ impl NodeMlsFactory {
     pub fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         // Validate that the local DID is a valid did:dht:z... format.
         //
-        // Under the `testing` feature gate, also accept `did:test:*` and
-        // `did:key:*` prefixes so the extensive test suite — which used
-        // non-dht test DIDs with the deleted `ContextCryptoProvider`
-        // mocks before ADR-049 §15 — continues to work with
-        // the inherent `NodeMlsFactory` API. Production builds (no
-        // `testing` feature) still require `did:dht:z*`.
-        let accepted = self.local_did.starts_with("did:dht:z")
-            || (cfg!(any(test, feature = "testing"))
-                && (self.local_did.starts_with("did:test:")
-                    || self.local_did.starts_with("did:key:")));
+        // Production builds (no `testing` feature) require `did:dht:z*`.
+        let is_production_did = self.local_did.starts_with("did:dht:z");
+
+        // Under `cfg(test)` / the `testing` feature the check ALSO accepts the
+        // mock `did:test:*` / `did:key:*` prefixes (via the shared
+        // `super::is_testing_exempt_did` single source of truth) so the
+        // extensive test suite — which used non-dht test DIDs with the deleted
+        // `ContextCryptoProvider` mocks before ADR-049 §15 — continues to work
+        // with the inherent `NodeMlsFactory` API. That carve-out is compiled out
+        // of every shipped build (see `super::is_testing_exempt_did`).
+        #[cfg(any(test, feature = "testing"))]
+        let is_testing_exempt = super::is_testing_exempt_did(&self.local_did);
+        #[cfg(not(any(test, feature = "testing")))]
+        let is_testing_exempt = false;
+
+        let accepted = is_production_did || is_testing_exempt;
         if !accepted {
             return Err(ContextCreationError::IdentityValidationFailed(
                 "invalid DID format".to_string(),
