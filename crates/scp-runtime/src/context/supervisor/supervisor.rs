@@ -49,6 +49,7 @@ use crate::context::actor::commands::{
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::WrappingKeyPair;
+use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
 use crate::context::persistence::ContextPersistence;
@@ -3951,7 +3952,7 @@ impl Supervisor {
                     reply: reply_tx,
                 };
                 self.dispatch_trust_recovery_command(cmd).await?;
-                reply_rx.await.map_err(|_| {
+                bounded_reply_await(reply_rx).await.map_err(|_| {
                     ContextError::TransportFailed(
                         "recovery_notify_contact: oneshot reply channel closed".to_owned(),
                     )
@@ -4262,7 +4263,7 @@ impl Supervisor {
                     reply: reply_tx,
                 });
             Self::dispatch_via_mailbox(&actor, cmd).await?;
-            reply_rx.await.map_err(|_| {
+            bounded_reply_await(reply_rx).await.map_err(|_| {
                 ContextError::TransportFailed(
                     "recovery_send_notification_direct: mailbox reply channel closed".to_owned(),
                 )
@@ -5967,7 +5968,7 @@ impl Supervisor {
             reply: reserve_tx,
         };
         Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(reserve_cmd)).await?;
-        let reservation = match reserve_rx.await {
+        let reservation = match bounded_reply_await(reserve_rx).await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(e)) => {
                 // Operation-level error already typed by the handler;
@@ -6012,7 +6013,7 @@ impl Supervisor {
             reply: apply_tx,
         };
         Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(apply_cmd)).await?;
-        match apply_rx.await {
+        match bounded_reply_await(apply_rx).await {
             Ok(Ok(envelope)) => {
                 let _ = reply.send(Ok(envelope));
                 Ok(Outcome::ok_mutated(()))
@@ -6059,7 +6060,7 @@ impl Supervisor {
             .await
             .is_ok()
         {
-            let _ = rx.await;
+            let _ = bounded_reply_await(rx).await;
         }
     }
 
@@ -10360,7 +10361,7 @@ impl Supervisor {
         });
         let cmd = LifecycleCommand::RestoreContext { payload, reply: tx };
         self.dispatch_lifecycle_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::restore_context — actor reply channel closed".to_owned(),
             )
@@ -10408,7 +10409,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_lifecycle_command(cmd).await?;
-        let (snapshot, event_log_data) = rx.await.map_err(|_| {
+        let (snapshot, event_log_data) = bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::export_context — actor reply channel closed".to_owned(),
             )
@@ -10474,7 +10475,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_lifecycle_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::import_context — actor reply channel closed".to_owned(),
             )
@@ -10623,7 +10624,7 @@ impl Supervisor {
         if Self::dispatch_via_mailbox(&actor, cmd).await.is_err() {
             return None;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(state)) => Some(state),
             Ok(Err(_)) | Err(_) => None,
         }
@@ -10966,7 +10967,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return None;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => None,
         }
@@ -10985,7 +10986,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return false;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => false,
         }
@@ -11019,7 +11020,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::build_local_checkpoint — actor reply channel closed".to_owned(),
             )
@@ -11059,7 +11060,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::send_heartbeat — actor reply channel closed".to_owned(),
             )
@@ -11093,7 +11094,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::compare_remote_checkpoint — actor reply channel closed".to_owned(),
             )
@@ -11118,7 +11119,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_lifecycle_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::clear_needs_reconnect — actor reply channel closed".to_owned(),
             )
@@ -11147,7 +11148,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_lifecycle_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::issue_mls_update — actor reply channel closed".to_owned(),
             )
@@ -11190,7 +11191,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        let outcome = rx.await.map_err(|_| {
+        let outcome = bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::deliver_commit_blob — actor reply channel closed".to_owned(),
             )
@@ -11214,7 +11215,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return None;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => None,
         }
@@ -11233,7 +11234,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return false;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => false,
         }
@@ -11270,7 +11271,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return false;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => false,
         }
@@ -11289,7 +11290,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return Vec::new();
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => Vec::new(),
         }
@@ -11318,7 +11319,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return Vec::new();
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => Vec::new(),
         }
@@ -11342,7 +11343,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return None;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => None,
         }
@@ -11364,7 +11365,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return None;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => None,
         }
@@ -11386,7 +11387,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return None;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => None,
         }
@@ -11408,7 +11409,7 @@ impl Supervisor {
         if self.dispatch_command(context_id, cmd).await.is_err() {
             return Vec::new();
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(events)) => events,
             Ok(Err(_)) | Err(_) => Vec::new(),
         }
@@ -11435,7 +11436,7 @@ impl Supervisor {
         if self.dispatch_command(context_id, cmd).await.is_err() {
             return Vec::new();
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(events)) => events,
             Ok(Err(_)) | Err(_) => Vec::new(),
         }
@@ -11588,7 +11589,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_query(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::get_broadcast_key_for_local_author — actor reply channel closed"
                     .to_owned(),
@@ -11605,13 +11606,26 @@ impl Supervisor {
     /// [`PerContextState`](crate::context::actor::state::PerContextState)
     /// hard-rate-limit bucket), and awaits the embedded reply oneshot.
     ///
-    /// Returns `true` if a token was consumed OR if the context is not
-    /// registered. The unknown-context pass-through (`true`) preserves the
-    /// legacy `try_consume_hard_rate_limit_from_any_context` contract: a
-    /// outlet invoked against a context with no live actor is not rate-
-    /// limited here (the absence of a bucket means "no per-context cap to
-    /// enforce"). Returns `false` only when the context IS registered AND
-    /// the sender is over budget.
+    /// Returns `true` (pass-through) when a token was consumed OR when there
+    /// is no live per-context bucket to enforce — the context is not
+    /// registered, the handler replied `Err`, or the actor DROPPED the reply
+    /// channel (terminated). This preserves the legacy
+    /// `try_consume_hard_rate_limit_from_any_context` contract: an outlet
+    /// invoked against a context with no live actor is not rate-limited here
+    /// (absence of a bucket means "no per-context cap to enforce").
+    ///
+    /// Returns `false` (deny) when the context IS registered AND EITHER the
+    /// sender is over budget OR the actor is ALIVE-but-wedged and does not
+    /// reply within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT).
+    /// The wedge case fails CLOSED on purpose: the bucket exists but is
+    /// momentarily unreachable, so folding the timeout into the `true`
+    /// pass-through would silently BYPASS the hard-rate cap for the whole
+    /// reply-timeout window — exploitable in a cross-context topology where
+    /// the caller-context actor is wedged but the target is healthy. Deny is
+    /// the safe default; the caller retries. The `Dropped` (terminated actor,
+    /// no live bucket) and `Elapsed` (wedged actor, unreachable bucket) cases
+    /// are therefore deliberately NOT folded together — see
+    /// [`hard_rate_limit_allow`].
     pub(crate) async fn try_consume_hard_rate_limit(
         &self,
         context_id: &str,
@@ -11632,11 +11646,11 @@ impl Supervisor {
         if self.dispatch_outlets_command(cmd).await.is_err() {
             return true;
         }
-        match reply_rx.await {
-            Ok(Ok(consumed)) => consumed,
-            // Unknown context / channel dropped: legacy pass-through.
-            Ok(Err(_)) | Err(_) => true,
-        }
+        // Fail CLOSED on a wedge (Elapsed): the bucket exists but is
+        // unreachable, so denying is the safe default — never a silent
+        // bypass. Terminated/unregistered (Dropped / handler `Err`) stays
+        // pass-through: no live bucket to enforce. See `hard_rate_limit_allow`.
+        hard_rate_limit_allow(&bounded_reply_await(reply_rx).await)
     }
 
     /// Async hard-rate-limit refund routed through the per-context actor
@@ -11658,7 +11672,7 @@ impl Supervisor {
         if self.dispatch_outlets_command(cmd).await.is_err() {
             return;
         }
-        let _ = reply_rx.await;
+        let _ = bounded_reply_await(reply_rx).await;
     }
 
     /// Runtime-agnostic hard-rate-limit consumption used by FFI
@@ -11846,7 +11860,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx
+        bounded_reply_await(reply_rx)
             .await
             .map_err(|_| {
                 ContextError::TransportFailed(
@@ -11894,7 +11908,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx
+        bounded_reply_await(reply_rx)
             .await
             .map_err(|_| {
                 ContextError::TransportFailed(
@@ -11943,7 +11957,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
+        bounded_reply_await(reply_rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::outlet_stream_reserve_grant — actor reply channel closed".to_owned(),
             )
@@ -11983,7 +11997,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
+        bounded_reply_await(reply_rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::outlet_stream_reverse_grant — actor reply channel closed".to_owned(),
             )
@@ -12044,7 +12058,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
+        bounded_reply_await(reply_rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::settle_outlet_economy_via_actor — actor reply channel closed"
                     .to_owned(),
@@ -12185,7 +12199,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
+        bounded_reply_await(reply_rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::settle_outlet_stream_via_actor — actor reply channel closed"
                     .to_owned(),
@@ -12221,7 +12235,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
+        bounded_reply_await(reply_rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::reconcile_stream_reservations_via_actor — actor reply channel closed"
                     .to_owned(),
@@ -12259,7 +12273,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
+        bounded_reply_await(reply_rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::reverse_stream_escrow_via_actor — actor reply channel closed"
                     .to_owned(),
@@ -12862,7 +12876,7 @@ impl Supervisor {
                 )),
             );
         }
-        rx.await.unwrap_or_else(|_| {
+        bounded_reply_await(rx).await.unwrap_or_else(|_| {
             Err(
                 scp_protocol::context::builder::ContextCreationError::CreationFailed(
                     "Supervisor::create_context — actor reply channel closed".to_owned(),
@@ -14323,7 +14337,7 @@ impl Supervisor {
         });
         let cmd = LifecycleCommand::JoinContext { payload, reply: tx };
         self.dispatch_lifecycle_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::join_context — actor reply channel closed".to_owned(),
             )
@@ -14355,7 +14369,7 @@ impl Supervisor {
         });
         let cmd = LifecycleCommand::LeaveContext { payload, reply: tx };
         self.dispatch_lifecycle_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::leave_context — actor reply channel closed".to_owned(),
             )
@@ -14426,7 +14440,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(handle.context_id(), cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::send_message — actor reply channel closed".to_owned(),
             )
@@ -14462,7 +14476,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::seed_peer_pseudonym — actor reply channel closed".to_owned(),
             )
@@ -14513,7 +14527,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::test_install_access_key — actor reply channel closed".to_owned(),
             )
@@ -14553,7 +14567,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::test_insert_member — actor reply channel closed".to_owned(),
             )
@@ -14594,7 +14608,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::handle_sender_key_request — actor reply channel closed".to_owned(),
             )
@@ -14637,7 +14651,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::land_sender_key_response — actor reply channel closed".to_owned(),
             )
@@ -14692,7 +14706,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::inspect_incoming_inner — actor reply channel closed".to_owned(),
             )
@@ -14736,7 +14750,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::test_grant_member_capability — actor reply channel closed".to_owned(),
             )
@@ -14806,7 +14820,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_governance_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::list_proposals — actor reply channel closed".to_owned(),
             )
@@ -14831,7 +14845,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_governance_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::get_proposal — actor reply channel closed".to_owned(),
             )
@@ -14881,7 +14895,7 @@ impl Supervisor {
         );
         let cmd = GovernanceCommand::ProposeGovernanceAction { payload, reply: tx };
         self.dispatch_governance_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::propose_governance_action — actor reply channel closed".to_owned(),
             )
@@ -14948,7 +14962,7 @@ impl Supervisor {
         );
         let cmd = GovernanceCommand::ProposeGovernanceActionChecked { payload, reply: tx };
         self.dispatch_governance_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::propose_governance_action_checked — actor reply channel closed"
                     .to_owned(),
@@ -14996,7 +15010,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_governance_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::vote_on_proposal — actor reply channel closed".to_owned(),
             )
@@ -15022,7 +15036,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_governance_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::withdraw_governance_vote — actor reply channel closed".to_owned(),
             )
@@ -15051,7 +15065,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_query(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::local_pseudonym — actor reply channel closed".to_owned(),
             )
@@ -15075,7 +15089,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return Vec::new();
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => Vec::new(),
         }
@@ -15097,7 +15111,7 @@ impl Supervisor {
         if self.dispatch_query(cmd).await.is_err() {
             return None;
         }
-        match rx.await {
+        match bounded_reply_await(rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => None,
         }
@@ -15130,7 +15144,7 @@ impl Supervisor {
         if self.dispatch_command(context_id, cmd).await.is_err() {
             return;
         }
-        let _ = rx.await;
+        let _ = bounded_reply_await(rx).await;
     }
 
     // -----------------------------------------------------------------
@@ -15649,6 +15663,29 @@ fn current_timestamp_ms() -> u64 {
     ms
 }
 
+/// Maps a bounded hard-rate-limit reply into an allow (`true`) / deny
+/// (`false`) decision for [`Supervisor::try_consume_hard_rate_limit`].
+///
+/// SECURITY (fail-closed): the `Elapsed` arm — an ALIVE-but-wedged actor
+/// whose per-context bucket exists but is momentarily unreachable — MUST deny
+/// (`false`). Folding it into the `true` pass-through would silently bypass
+/// the hard-rate cap for the full [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT)
+/// window (exploitable when the caller-context actor is wedged but the target
+/// is healthy). Only the "no live bucket to enforce" cases pass through:
+/// - `Ok(Ok(consumed))` — the handler's real verdict.
+/// - `Ok(Err(_))` — handler error (e.g. `ContextNotRegistered`): no bucket.
+/// - `Err(Dropped)` — the actor terminated (reply channel closed): no bucket.
+/// - `Err(Elapsed)` — the actor is alive but wedged: bucket unreachable → DENY.
+const fn hard_rate_limit_allow(
+    reply: &Result<Result<bool, ContextError>, BoundedReplyError>,
+) -> bool {
+    match reply {
+        Ok(Ok(consumed)) => *consumed,
+        Ok(Err(_)) | Err(BoundedReplyError::Dropped) => true,
+        Err(BoundedReplyError::Elapsed) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // No-op SagaJournal — plumbed into the FFI [`Self::with_providers`] factory
 // (and the test-only [`Self::for_query_shim`] constructor) when no production
@@ -15840,6 +15877,46 @@ mod tests {
     use super::*;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
+
+    /// SECURITY regression guard for the hard-rate-limit fail-closed mapping
+    /// ([`hard_rate_limit_allow`]): an ALIVE-but-wedged actor (`Elapsed`) MUST
+    /// deny (`false`), never fold into the `true` pass-through — that fold
+    /// would bypass the per-context hard-rate cap for the reply-timeout window.
+    /// The "no live bucket to enforce" cases (handler `Err`, terminated actor
+    /// `Dropped`) stay pass-through (`true`); a real consume verdict rides
+    /// through unchanged. Directly unit-tests the classifier the live
+    /// actor-mailbox path routes through (wedging a fully-wired Supervisor is
+    /// impractical; the mechanics of producing `Elapsed` are covered by
+    /// `bounded_reply_await`'s own `start_paused` unit test).
+    #[test]
+    fn hard_rate_limit_wedged_actor_fails_closed() {
+        // Wedged/alive actor → deny.
+        assert!(
+            !hard_rate_limit_allow(&Err(BoundedReplyError::Elapsed)),
+            "an Elapsed (wedged actor, unreachable bucket) MUST deny — never bypass the cap"
+        );
+        // Terminated actor (no live bucket) → legacy pass-through.
+        assert!(
+            hard_rate_limit_allow(&Err(BoundedReplyError::Dropped)),
+            "a Dropped reply channel (terminated actor, no bucket) stays pass-through"
+        );
+        // Handler error (e.g. unregistered context, no bucket) → pass-through.
+        assert!(
+            hard_rate_limit_allow(&Ok(Err(ContextError::ContextNotRegistered(
+                "ctx".to_owned()
+            )))),
+            "a handler Err (no live bucket) stays pass-through"
+        );
+        // Real handler verdicts ride through unchanged.
+        assert!(
+            hard_rate_limit_allow(&Ok(Ok(true))),
+            "a real consume (token available) allows"
+        );
+        assert!(
+            !hard_rate_limit_allow(&Ok(Ok(false))),
+            "a real over-budget verdict denies"
+        );
+    }
 
     // -----------------------------------------------------------------
     // DurableProviders same-backend behavioral proof (spec §17.6 / §17.16 /
