@@ -45,6 +45,34 @@ use crate::context::actor::commands::{ContextCommand, LifecycleControlCommand};
 /// value changes, audit the three sibling timers together.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-caller reply-await timeout bounding how long the handle waits on the
+/// actor's oneshot reply AFTER the command was enqueued.
+///
+/// Distinct budget from [`SEND_TIMEOUT`], which bounds only mailbox ADMISSION
+/// (waiting for a free slot on a full mailbox). Once the command is enqueued,
+/// this bounds actor-side PROCESSING — a wedged/deadlocked actor (stuck in an
+/// infinite loop or a never-completing future inside a handler) never
+/// terminates, so the Phase-2B watchdog never fires and the reply sender is
+/// never dropped; without this bound `rx.await` would pin the caller forever.
+///
+/// This is a defense-in-depth BACKSTOP, not a budget any healthy path is
+/// expected to approach: every healthy reply path is already cut off first by
+/// the 30 s send / handler / PHASE budgets, so this only ever fires on a
+/// genuine wedge. On elapse the handle fail-closes with a retryable
+/// [`ContextError::ActorBusy`] (the actor keeps running — we only drop our own
+/// receiver; any committed Class-S state stays committed) rather than awaiting
+/// unbounded.
+///
+/// Set to 2 min — ≥ the key-package actor's 1 min
+/// ([`KP_REPLY_TIMEOUT`](crate::context::supervisor::key_package_actor::KP_REPLY_TIMEOUT),
+/// internal follow-up #129) because context actors have a deeper mailbox
+/// ([`ACTOR_MAILBOX_CAPACITY`](crate::context::supervisor::ACTOR_MAILBOX_CAPACITY)
+/// = 256 vs 32) plus heavier MLS handlers, so a legitimately deep-queued (but
+/// healthy) actor can trail further behind. The exact value is not
+/// load-bearing — it only has to be safely larger than the healthy-path
+/// budgets it backstops.
+pub const REPLY_TIMEOUT: Duration = Duration::from_mins(2);
+
 // ---------------------------------------------------------------------------
 // ContextActorHandle
 // ---------------------------------------------------------------------------
@@ -96,10 +124,14 @@ impl ContextActorHandle {
     ///   (30 s). On timeout, returns
     ///   [`ContextError::ActorBusy`].
     /// - **Reply wait.** After the command enters the mailbox the reply
-    ///   future is awaited unbounded — the actor's per-handler transport
-    ///   and storage timeouts (30 s each per plan §"Transport timeouts
-    ///   inside actor handlers") bound the end-to-end wait; a handler
-    ///   that has entered the dispatch loop is expected to make progress.
+    ///   future is bounded by [`REPLY_TIMEOUT`] (2 min). On the healthy path
+    ///   the actor's per-handler transport and storage timeouts (30 s each
+    ///   per plan §"Transport timeouts inside actor handlers") bound the
+    ///   end-to-end wait long before this fires; [`REPLY_TIMEOUT`] is the
+    ///   defense-in-depth backstop for a wedged/deadlocked actor that never
+    ///   terminates (so the watchdog never drops the reply sender) — on
+    ///   elapse the caller gets a retryable [`ContextError::ActorBusy`]
+    ///   instead of hanging forever.
     ///
     /// # Errors
     ///
@@ -128,11 +160,23 @@ impl ContextActorHandle {
 
         // Bounded-wait mailbox send. Plan §"Mailbox parameters".
         match tokio::time::timeout(SEND_TIMEOUT, self.inbox.send(cmd)).await {
-            Ok(Ok(())) => rx.await.unwrap_or_else(|_| {
-                Err(ContextError::ActorBusy(
+            // Enqueued: bound the reply-await too. A wedged/deadlocked actor
+            // (stuck in an infinite loop or never-completing handler future)
+            // never terminates, so the watchdog never fires and the reply
+            // sender is never dropped — without this bound the caller would
+            // hang forever. On elapse, fail-closed with a retryable
+            // `ActorBusy` (defense-in-depth backstop; every healthy path is
+            // cut off first by the 30 s send/handler/PHASE budgets).
+            Ok(Ok(())) => match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_dropped)) => Err(ContextError::ActorBusy(
                     "actor dropped reply channel before replying".to_owned(),
-                ))
-            }),
+                )),
+                Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                    "context actor did not reply within {} seconds",
+                    REPLY_TIMEOUT.as_secs()
+                ))),
+            },
             Ok(Err(_closed)) => Err(ContextError::ActorBusy(
                 "actor inbox is closed — actor has terminated".to_owned(),
             )),
@@ -163,15 +207,18 @@ impl ContextActorHandle {
     ///   recovery. The command NEVER reached the actor, so no handler-side
     ///   effect occurred.
     /// - `Err((error, None))` — the command WAS delivered but the handler
-    ///   replied with a typed error (or dropped the reply channel). There is no
-    ///   command to recover (the actor owns its outcome); the handler-side
-    ///   effect, if any, is the handler's responsibility.
+    ///   replied with a typed error, dropped the reply channel, or did not
+    ///   reply within [`REPLY_TIMEOUT`] (a wedged actor). There is no command
+    ///   to recover (the actor owns its outcome, including any `#[must_use]`
+    ///   ticket the command carried); the handler-side effect, if any, is the
+    ///   handler's responsibility.
     ///
     /// # Errors
     ///
-    /// Same error classes as [`Self::send`]; the `Option<Box<ContextCommand>>`
-    /// half distinguishes a never-delivered send (recoverable) from a delivered
-    /// handler error (not recoverable).
+    /// Same error classes as [`Self::send`] — including the post-enqueue reply
+    /// bounded by [`REPLY_TIMEOUT`]; the `Option<Box<ContextCommand>>` half
+    /// distinguishes a never-delivered send (recoverable) from a delivered
+    /// handler error / reply timeout (not recoverable).
     pub async fn send_recover_on_failure<T, F>(
         &self,
         cmd_factory: F,
@@ -213,20 +260,28 @@ impl ContextActorHandle {
         let (tx, rx) = oneshot::channel::<Result<T, ContextError>>();
         permit.send(cmd_factory(tx));
 
-        // Delivered: the command reached the actor. A reply error (or a dropped
-        // reply channel) is NOT recoverable — the actor owns the outcome — so
-        // the un-delivered slot is `None`.
-        rx.await.map_or_else(
-            |_| {
-                Err((
-                    ContextError::ActorBusy(
-                        "actor dropped reply channel before replying".to_owned(),
-                    ),
-                    None,
-                ))
-            },
-            |reply| reply.map_err(|e| (e, None)),
-        )
+        // Delivered: the command reached the actor. A reply error, a dropped
+        // reply channel, or a reply-timeout (wedged/deadlocked actor) is NOT
+        // recoverable — the command was enqueued, so the actor owns the
+        // outcome, including any `#[must_use]` ticket the command carried.
+        // The un-delivered slot is therefore `None` (returning `Some` here
+        // would risk a double-balance of the escrow). The reply-await is
+        // bounded by `REPLY_TIMEOUT` so a wedged actor cannot pin the caller
+        // forever — same defense-in-depth backstop as `send`.
+        match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
+            Ok(Ok(reply)) => reply.map_err(|e| (e, None)),
+            Ok(Err(_dropped)) => Err((
+                ContextError::ActorBusy("actor dropped reply channel before replying".to_owned()),
+                None,
+            )),
+            Err(_elapsed) => Err((
+                ContextError::ActorBusy(format!(
+                    "context actor did not reply within {} seconds",
+                    REPLY_TIMEOUT.as_secs()
+                )),
+                None,
+            )),
+        }
     }
 
     /// Submits a pre-built command to the actor's mailbox with a
@@ -348,6 +403,101 @@ mod tests {
     fn send_timeout_is_30_seconds() {
         assert_eq!(SEND_TIMEOUT, Duration::from_secs(30));
     }
+
+    #[test]
+    fn reply_timeout_is_2_minutes() {
+        // Pins the post-enqueue reply-await backstop. Distinct budget from
+        // SEND_TIMEOUT (mailbox admission); ≥ the key-package actor's 1 min
+        // because context actors have a deeper mailbox + heavier MLS handlers.
+        assert_eq!(REPLY_TIMEOUT, Duration::from_mins(2));
+    }
+
+    /// A command that enqueues successfully but is NEVER replied to (no actor
+    /// drains the mailbox / no oneshot ack) must NOT hang the caller forever:
+    /// `send`'s post-enqueue reply-await is bounded by [`REPLY_TIMEOUT`],
+    /// returning a retryable [`ContextError::ActorBusy`] on elapse. Uses
+    /// `start_paused` so tokio auto-advances virtual time to fire the timer —
+    /// the test is deterministic and completes instantly instead of waiting
+    /// the real 2 min.
+    #[tokio::test(start_paused = true)]
+    async fn send_reply_await_is_bounded_when_actor_never_replies() {
+        use crate::context::supervisor::ACTOR_MAILBOX_CAPACITY;
+
+        // Buffered mailbox (capacity > 0) with the receiver held alive but
+        // NEVER drained: `inbox.send` succeeds and buffers the command, so we
+        // exercise the post-enqueue reply-await — the exact wedge — rather
+        // than the enqueue-timeout or closed-inbox branches. `_rx` stays bound
+        // to keep the inbox (and thus the buffered oneshot sender) alive;
+        // dropping it would close the channel and take a different arm.
+        let (tx, _rx) = mpsc::channel::<ContextCommand>(ACTOR_MAILBOX_CAPACITY);
+        let handle = ContextActorHandle::from_sender(tx);
+
+        let start = tokio::time::Instant::now();
+        let result: Result<Option<usize>, ContextError> = handle.send(smoke_query).await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(ContextError::ActorBusy(msg)) => assert!(
+                msg.contains("did not reply"),
+                "expected the reply-timeout ActorBusy variant, got {msg:?}"
+            ),
+            other => panic!("expected ActorBusy reply-timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed >= REPLY_TIMEOUT,
+            "reply-await must span the full REPLY_TIMEOUT budget before failing \
+             closed (elapsed {elapsed:?} < {REPLY_TIMEOUT:?})"
+        );
+    }
+
+    /// Same wedge as [`send_reply_await_is_bounded_when_actor_never_replies`],
+    /// but for [`ContextActorHandle::send_recover_on_failure`]: a command that
+    /// was DELIVERED (enqueued) then never answered must fail closed with a
+    /// bounded reply-timeout `ActorBusy`, and the recovery slot must be `None`
+    /// (the actor owns the enqueued command + any ticket it carried — returning
+    /// `Some` would risk a double-balance of the escrow).
+    #[tokio::test(start_paused = true)]
+    async fn send_recover_on_failure_reply_await_is_bounded() {
+        use crate::context::supervisor::ACTOR_MAILBOX_CAPACITY;
+
+        let (tx, _rx) = mpsc::channel::<ContextCommand>(ACTOR_MAILBOX_CAPACITY);
+        let handle = ContextActorHandle::from_sender(tx);
+
+        let start = tokio::time::Instant::now();
+        let result: Result<Option<usize>, _> = handle.send_recover_on_failure(smoke_query).await;
+        let elapsed = start.elapsed();
+
+        let (err, recovered) = result.expect_err("a never-answered command must error");
+        match err {
+            ContextError::ActorBusy(msg) => assert!(
+                msg.contains("did not reply"),
+                "expected the reply-timeout ActorBusy variant, got {msg:?}"
+            ),
+            other => panic!("expected ActorBusy reply-timeout, got {other:?}"),
+        }
+        assert!(
+            recovered.is_none(),
+            "a DELIVERED-then-wedged command is NOT recoverable — the actor owns \
+             it (and any ticket); the recovery slot must be None to avoid a \
+             double-balance"
+        );
+        assert!(
+            elapsed >= REPLY_TIMEOUT,
+            "reply-await must span the full REPLY_TIMEOUT budget before failing \
+             closed (elapsed {elapsed:?} < {REPLY_TIMEOUT:?})"
+        );
+    }
+
+    // The sibling supervisor-handle reply-awaits
+    // (`SupervisorHandle::dispatch_prepare_for_replace`,
+    // `dispatch_start_ttl_timer`, and `dispatch_recovery_send_notification`)
+    // wrap their `reply_rx.await` in the identical
+    // `tokio::time::timeout(REPLY_TIMEOUT, ..)` pattern over the SAME
+    // [`REPLY_TIMEOUT`] constant pinned above. Constructing a live
+    // `SupervisorHandle` in isolation requires a fully-wired `Supervisor`
+    // (providers, journal, registry), so those seams are covered by this
+    // shared-constant pin plus the two wedge tests here rather than a
+    // standalone supervisor-handle unit test.
 
     #[tokio::test]
     async fn send_to_closed_actor_returns_actor_busy() {

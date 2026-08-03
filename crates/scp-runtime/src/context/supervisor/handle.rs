@@ -296,8 +296,10 @@ impl SupervisorHandle {
     /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command),
     /// which dispatches via the per-context actor mailbox when one is
     /// registered or falls through to the legacy lock-shaped fallback
-    /// otherwise. The reply is awaited inline so the caller observes
-    /// the full per-actor outcome.
+    /// otherwise. The reply is awaited inline — bounded by
+    /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT) — so the
+    /// caller observes the full per-actor outcome without a wedged actor
+    /// pinning it forever.
     ///
     /// # Errors
     ///
@@ -310,6 +312,11 @@ impl SupervisorHandle {
     /// - [`ContextError::TransportFailed`] if the reply channel is
     ///   closed before a response arrives (actor panicked or shut down
     ///   between dispatch and reply).
+    /// - [`ContextError::ActorBusy`] (retryable) if the actor does not
+    ///   reply within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT)
+    ///   — a wedged/deadlocked actor never terminates, so the watchdog never
+    ///   drops the reply sender; this backstop fail-closes instead of
+    ///   hanging the caller.
     pub async fn dispatch_recovery_send_notification(
         &self,
         payload: crate::context::actor::commands::RecoverySendNotificationPayload,
@@ -321,11 +328,24 @@ impl SupervisorHandle {
             reply: reply_tx,
         };
         self.supervisor.dispatch_trust_recovery_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
-            ContextError::TransportFailed(
-                "dispatch_recovery_send_notification: oneshot reply channel closed".to_owned(),
-            )
-        })?
+        // Bounded by REPLY_TIMEOUT: the result is load-bearing (propagated
+        // via `?` into trust-recovery `recovery_notify_contact`, §9.12) and a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender) — without the bound a wedged actor would
+        // pin the caller forever. On elapse, fail-closed with the retryable
+        // `ActorBusy` class; the existing dropped-channel `TransportFailed`
+        // behavior is preserved exactly.
+        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
+            Ok(reply) => reply.map_err(|_| {
+                ContextError::TransportFailed(
+                    "dispatch_recovery_send_notification: oneshot reply channel closed".to_owned(),
+                )
+            })?,
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "context actor did not reply within {} seconds",
+                crate::context::actor::REPLY_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Look up the registered standing-context peer DID for `peer_did`.
@@ -628,10 +648,21 @@ impl SupervisorHandle {
         }
         // The actor dropped the reply sender mid-flight (it exited
         // without answering) → treat as a stale handle; otherwise return
-        // the handler's verdict.
-        reply_rx
-            .await
-            .unwrap_or_else(|_| Err(ContextError::ContextNotRegistered(context_id.to_owned())))
+        // the handler's verdict. The reply-await is bounded by
+        // [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT): a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender), so without the bound this replace path
+        // would hang the caller forever. On elapse, fail-closed with a
+        // retryable `ActorBusy` — the actor keeps running; we only drop our
+        // own receiver.
+        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
+            Ok(reply) => reply
+                .unwrap_or_else(|_| Err(ContextError::ContextNotRegistered(context_id.to_owned()))),
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "context actor did not reply within {} seconds",
+                crate::context::actor::REPLY_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Despawn the actor registered for `context_id`, removing the
@@ -820,13 +851,32 @@ impl SupervisorHandle {
             return;
         }
         // Await the install reply so the timer is registered before the
-        // bootstrap path returns control to the caller.
-        if let Ok(Err(e)) = reply_rx.await {
-            tracing::warn!(
-                context_id,
-                error = %e,
-                "dispatch_start_ttl_timer: actor reported TTL timer install failure"
-            );
+        // bootstrap path returns control to the caller. Bounded by
+        // [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT): a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender), and arming the TTL deadline is a
+        // best-effort background facility — it must never pin the bootstrap
+        // caller forever. On elapse (as on an install failure) we log and
+        // move on; the actor's own `reconcile_timers` re-arms from the
+        // recorded deadline regardless.
+        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "dispatch_start_ttl_timer: actor reported TTL timer install failure"
+                );
+            }
+            // Recv-ok + handler-ok, or the actor dropped the reply channel:
+            // nothing to do (matches the prior best-effort behavior).
+            Ok(_) => {}
+            Err(_elapsed) => {
+                tracing::warn!(
+                    context_id,
+                    "dispatch_start_ttl_timer: actor did not confirm TTL timer install \
+                     within the reply budget — timer install unconfirmed"
+                );
+            }
         }
     }
 
