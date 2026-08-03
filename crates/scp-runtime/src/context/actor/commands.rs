@@ -1895,8 +1895,8 @@ pub enum BroadcastCommand {
     /// and KEA-leaf tests can exercise their real fan-out instead of being
     /// limited to the creator-only case.
     ///
-    /// Mirrors [`SeedPeerPseudonym`](Self::SeedPeerPseudonym) — same rationale,
-    /// same gating. Gated behind the `testing` feature — never compiled into
+    /// Mirrors [`MessagingCommand::SeedPeerPseudonym`] — same rationale, same
+    /// gating. Gated behind the `testing` feature — never compiled into
     /// production builds, never reachable from any FFI bridge.
     #[cfg(feature = "testing")]
     SeedBroadcastAuthor {

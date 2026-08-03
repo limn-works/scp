@@ -14528,7 +14528,7 @@ impl Supervisor {
             reply: tx,
         };
         self.dispatch_broadcast_command(cmd).await?;
-        rx.await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::seed_broadcast_author — actor reply channel closed".to_owned(),
             )

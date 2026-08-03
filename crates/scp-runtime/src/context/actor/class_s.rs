@@ -2662,7 +2662,8 @@ impl<'a> ClassCMut<'a> {
     ///
     /// Returns [`ContextError::MembershipFailed`] if not a broadcast context,
     /// or [`ContextError::PermissionDenied`] if the author is already
-    /// registered (matches [`BroadcastContext::add_author`]).
+    /// registered (matches
+    /// [`BroadcastContext::add_author`](scp_protocol::context::BroadcastContext::add_author)).
     #[cfg(feature = "testing")]
     pub(crate) fn seed_broadcast_author(
         &mut self,
