@@ -364,6 +364,8 @@ pub struct UnsubscribeResult {
     pub subscriber_did: String,
     /// Per-author key rotation results triggered by the unsubscription.
     /// Empty if `rotate_keys` was `false` or there are no authors.
+    /// Sorted ascending by `author_did`. Callers that emit event-log leaves from this output MUST
+    /// preserve this order to maintain §9.9.3 Merkle determinism.
     pub key_rotations: Vec<BlockResult>,
 }
 

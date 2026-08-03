@@ -261,9 +261,8 @@ pub async fn unsubscribe_broadcast(
     // rotation is authorization-UPWARD-safe and is intentionally coalesced).
     // `unsubscribe` always increments by exactly 1, so `old_epoch =
     // new_epoch.saturating_sub(1)` is exact.
-    // Track only successful appends — failed best-effort leaves are never
-    // durable, so they must not inflate the checkpoint counter (§9.9.3).
-    let mut kea_success_count: u64 = 0;
+    // Bump the checkpoint counter inline per durable KEA leaf — failed best-effort
+    // leaves are never durable and must not inflate the counter (§9.9.3).
     for rotation in &result.key_rotations {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
         match scp_event_log::payload::encode_payload(
@@ -291,7 +290,8 @@ pub async fn unsubscribe_broadcast(
                         "KeyEpochAdvance event-log append failed on unsubscribe (best-effort)"
                     );
                 } else {
-                    kea_success_count += 1;
+                    // Leaf is durable — count it immediately.
+                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
                 }
             }
             Err(e) => {
@@ -304,9 +304,6 @@ pub async fn unsubscribe_broadcast(
             }
         }
     }
-    // Bump counter by the number of KEA leaves actually appended (may be 0 if
-    // `rotate_keys` was false, or if all appends failed best-effort).
-    *cell.class_c_view().checkpoint_events_since_mut() += kea_success_count;
 
     Ok(result)
 }
@@ -728,20 +725,27 @@ pub async fn block_broadcast_subscriber(
         )
         .await?;
 
+    // MemberBlocked is fail-closed: bump the checkpoint counter immediately
+    // after the durable append above.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
     // ADR-007 §5: blocking a subscriber rotates the author's sender-key epoch.
     // Append the KeyEpochAdvance leaf immediately after MemberBlocked so the
-    // two leaves are always co-located in the Merkle log. rotate_sender_key_for_block
-    // always increments by exactly 1, so old = new.saturating_sub(1) is exact.
+    // two are intended to be co-located (appended immediately after MemberBlocked
+    // when possible) in the Merkle log. rotate_sender_key_for_block always
+    // increments by exactly 1, so old = new.saturating_sub(1) is exact.
+    //
+    // A per-author unilateral block is **not** a convergent governance trigger
+    // (single-origin, not MLS-commit-ordered). ADR-011: fail-closed applies only
+    // to convergent triggers → convergent leaves. `MemberBlocked` itself is
+    // fail-closed (above) because confidentiality enforcement requires it; the
+    // companion `KeyEpochAdvance` is a trailing audit leaf on a non-convergent
+    // trigger and remains best-effort.
     let old_epoch = result.new_epoch.saturating_sub(1);
-    // Best-effort KEA: 1 if the append succeeded, 0 otherwise. Tracked
-    // separately so the checkpoint counter reflects however many leaves are
-    // actually durable (MemberBlocked is fail-closed; KEA is best-effort).
-    let kea_appended: u64 = match scp_event_log::payload::encode_payload(
-        &scp_event_log::payload::KeyEpochAdvancePayload {
-            old_epoch,
-            new_epoch: result.new_epoch,
-        },
-    ) {
+    match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancePayload {
+        old_epoch,
+        new_epoch: result.new_epoch,
+    }) {
         Ok(payload) => {
             if let Err(e) = deps
                 .event_log
@@ -759,9 +763,9 @@ pub async fn block_broadcast_subscriber(
                     error = %e,
                     "KeyEpochAdvance event-log append failed (best-effort)"
                 );
-                0
             } else {
-                1
+                // KEA leaf is durable — bump the counter for this leaf too.
+                *cell.class_c_view().checkpoint_events_since_mut() += 1;
             }
         }
         Err(e) => {
@@ -770,12 +774,8 @@ pub async fn block_broadcast_subscriber(
                 error = %e,
                 "KeyEpochAdvance payload encode failed (best-effort)"
             );
-            0
         }
-    };
-    // 1 for MemberBlocked (fail-closed) + kea_appended for KeyEpochAdvance
-    // (best-effort). The counter must never exceed the number of durable leaves.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_appended;
+    }
 
     Ok(result)
 }

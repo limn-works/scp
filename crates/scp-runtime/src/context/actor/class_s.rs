@@ -2645,15 +2645,15 @@ impl<'a> ClassCMut<'a> {
         }
     }
 
-    /// Test seam: register an additional DID as a broadcast author, bypassing
-    /// the governance round-trip.
+    /// Test seam: registers `author_did` as a broadcast author with an initial
+    /// epoch, mirroring the author-publish/add path. Bypasses the governance
+    /// round-trip.
     ///
     /// Mirrors the rationale of
     /// [`MessagingCommand::SeedPeerPseudonym`](crate::context::actor::commands::MessagingCommand::SeedPeerPseudonym):
     /// single-node integration tests cannot drive genuine governance to produce
-    /// a second broadcast author; this seam populates the author registry as
-    /// `RotateContentKeys` would, so multi-author KEA-leaf and counter tests
-    /// can exercise the real code path.
+    /// a second broadcast author; this seam populates the author registry so
+    /// multi-author KEA-leaf and counter tests can exercise the real code path.
     ///
     /// Gated behind the `testing` feature — never compiled into production
     /// builds.

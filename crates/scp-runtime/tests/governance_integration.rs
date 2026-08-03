@@ -50,6 +50,9 @@ use scp_protocol::context::params::{
     Capability, ContextMode, ContextParams, GovernanceModel, MemoryScope,
 };
 use scp_protocol::context::{ContextError, ContextState};
+use scp_runtime::context::actor::commands::{
+    BroadcastBlockPayload, BroadcastCommand, SubscribeBroadcastPayload,
+};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
 use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
@@ -3317,5 +3320,236 @@ async fn rotate_content_keys_counter_multi_author() {
         action_specific_delta,
         1 + num_authors,
         "checkpoint_events_since delta must be 1 + num_authors (ContentKeysRotated + KEA per author)"
+    );
+}
+
+// =========================================================================
+// §5.14.8 / §9.9.3: governance ban (execute_revoke) must bump
+// checkpoint_events_since by 1 (AccessRevoked) + N (one KeyEpochAdvance per
+// rotated broadcast author).  Two authors (alice + seeded bob); subscriber
+// carol is banned; expected delta = 1 + 2 = 3.
+// =========================================================================
+
+/// Verify that `execute_revoke` on a broadcast context with N registered
+/// authors bumps `checkpoint_events_since` by exactly 1 (for `AccessRevoked`)
+/// + N (one `KeyEpochAdvance` per rotated author).
+///
+/// Two authors are registered: alice (auto-registered at context creation) and
+/// bob (seeded via `Supervisor::seed_broadcast_author`). Carol is subscribed so
+/// there is a subscriber to ban. Banning carol triggers `governance_ban_subscriber`,
+/// which rotates BOTH authors' broadcast keys and emits 2 `KeyEpochAdvance`
+/// leaves (fail-closed, per ADR-011). The total action-specific leaf delta must
+/// therefore be 1 + 2 = 3.
+#[tokio::test]
+async fn governance_ban_subscriber_bumps_counter_per_kea() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-ban-counter-per-kea";
+    let num_authors: usize = 2;
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Seed bob as a second broadcast author.
+    manager.seed_broadcast_author(ctx_id, bob()).await.unwrap();
+
+    // Subscribe carol so there is a subscriber to ban.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::SubscribeBroadcast {
+        payload: Box::new(SubscribeBroadcastPayload {
+            context_id: ctx_id.to_owned(),
+            subscriber_did: carol(),
+            ucan: None,
+            timestamp: 1_700_000_000,
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch SubscribeBroadcast for carol");
+    rx.await
+        .expect("subscribe carol reply")
+        .expect("subscribe carol succeeds");
+
+    // Baseline: count leaves present before the ban.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    // Alice (SingleAdmin) bans carol with AccessScope::Both.  This auto-executes
+    // execute_revoke, which calls governance_ban_subscriber and emits:
+    //   - 1 AccessRevoked leaf (fail-closed)
+    //   - N KeyEpochAdvance leaves, one per rotated author (fail-closed, ADR-011)
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RevokeAccess {
+                did: carol(),
+                access: AccessScope::Both,
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "SingleAdmin RevokeAccess must auto-execute"
+    );
+
+    // Verify event-log leaf counts.
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after ban");
+
+    let access_revoked_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::AccessRevoked)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+
+    assert_eq!(
+        access_revoked_count, 1,
+        "execute_revoke must emit exactly 1 AccessRevoked leaf"
+    );
+    assert_eq!(
+        kea_count, num_authors,
+        "execute_revoke must emit exactly 1 KeyEpochAdvance per rotated author ({num_authors} authors)"
+    );
+
+    // Total action-specific leaves = 1 (AccessRevoked) + num_authors (KEA).
+    // Subtract GovernanceProposed (always 1) from the delta to isolate execute
+    // leaves — this mirrors the checkpoint_events_since increment.
+    let total_delta = entries.len() - baseline;
+    let governance_proposed = 1_usize;
+    let action_specific_delta = total_delta - governance_proposed;
+    assert_eq!(
+        action_specific_delta,
+        1 + num_authors,
+        "checkpoint_events_since delta must be 1 + num_authors (AccessRevoked + KEA per author)"
+    );
+}
+
+// =========================================================================
+// §5.14.8 / §9.9.3: block_broadcast_subscriber must bump
+// checkpoint_events_since by exactly 2: 1 for the fail-closed MemberBlocked
+// leaf + 1 for the best-effort KeyEpochAdvance leaf (always succeeds on the
+// in-memory event log used in tests).
+// =========================================================================
+
+/// Verify that `block_broadcast_subscriber` bumps `checkpoint_events_since`
+/// by exactly 2 (1 for `MemberBlocked` + 1 for `KeyEpochAdvance`) when the
+/// in-memory event log always succeeds.
+///
+/// Alice (the author) blocks bob (the subscriber).  Both the fail-closed
+/// `MemberBlocked` leaf and the best-effort `KeyEpochAdvance` leaf are
+/// appended on every run (the in-memory log never fails), so the total leaf
+/// delta must be exactly 2.
+#[tokio::test]
+async fn block_broadcast_subscriber_counter() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-block-counter-two";
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Subscribe bob so there is a registered subscriber to block.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::SubscribeBroadcast {
+        payload: Box::new(SubscribeBroadcastPayload {
+            context_id: ctx_id.to_owned(),
+            subscriber_did: bob(),
+            ucan: None,
+            timestamp: 1_700_000_000,
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch SubscribeBroadcast for bob");
+    rx.await
+        .expect("subscribe bob reply")
+        .expect("subscribe bob succeeds");
+
+    // Baseline: count leaves present before the block.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    // Alice blocks bob.  The handler appends MemberBlocked (fail-closed) then
+    // KeyEpochAdvance (best-effort — always succeeds on in-memory log).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::BlockBroadcastSubscriber {
+        payload: Box::new(BroadcastBlockPayload {
+            context_id: ctx_id.to_owned(),
+            author_did: alice(),
+            subscriber_did: bob(),
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch BlockBroadcastSubscriber");
+    rx.await.expect("block reply").expect("block bob succeeds");
+
+    // Verify event-log leaf counts — each leaf corresponds to one
+    // checkpoint_events_since increment.
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after block");
+
+    let total_delta = entries.len() - baseline;
+    assert_eq!(
+        total_delta, 2,
+        "checkpoint_events_since delta must be exactly 2 \
+         (1 MemberBlocked + 1 KeyEpochAdvance) after block_broadcast_subscriber"
+    );
+
+    // Verify the individual leaf types for clarity.
+    let member_blocked_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::MemberBlocked)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+    assert_eq!(member_blocked_count, 1, "exactly 1 MemberBlocked leaf");
+    assert_eq!(
+        kea_count, 1,
+        "exactly 1 KeyEpochAdvance leaf (best-effort KEA, in-memory log always succeeds)"
     );
 }
