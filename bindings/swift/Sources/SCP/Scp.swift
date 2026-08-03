@@ -560,7 +560,7 @@ public extension SCP {
     ///
     /// Validates the capability declaration against the context ceiling and
     /// the actor's role capabilities, then appends a durable `AppBound` event
-    /// (tag 74) to the event log (spec §8.4.1).
+    /// (tag 74) to the event log (spec §8.4.2).
     ///
     /// - Returns: A JSON summary string with `app_did` and `granted_capabilities`.
     func contextAppBind(handle: ContextHandle, declarationJson: String, actorDid: String, timestampSecs: UInt64) async throws -> String {

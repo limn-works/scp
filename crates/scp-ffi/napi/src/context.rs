@@ -5165,8 +5165,24 @@ pub(crate) fn app_bind_on(
         })
         .map_err(NapiError::from)?;
 
+    // Use the supervisor's already-initialised event-log provider.
+    // A fresh provider built from `event_log_provider_from_existing_repo`
+    // has an empty in-memory `logs` map and every `append_event` call
+    // fails with CTX-2057 ("no event log for context"). The supervisor's
+    // provider has its map populated by `init_event_log` during
+    // context_create / context_join / context_restore.
+    let event_log: std::sync::Arc<dyn scp_core::context::builder::ContextEventLogProvider> =
+        crate::runtime::supervisor(bi)?
+            .event_log_provider_arc()
+            .ok_or_else(|| {
+                NapiError::from_reason(format!(
+                    "[{}] event-log provider not initialised — \
+                     call context_create or context_join first",
+                    codes::CTX_2057
+                ))
+            })?;
+
     let handle = ContextHandle::new(context_id.clone(), ContextParams::default());
-    let event_log = crate::runtime::event_log_provider_from_existing_repo(bi);
 
     let scoped = crate::runtime()
         .block_on(async move {
@@ -5236,22 +5252,38 @@ pub(crate) fn app_unbind_on(
     validate_did(&actor_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&app_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
+    // Trim app_did for lookup — bind stores the trimmed key; an untrimmed
+    // lookup always fails even when the app is bound (parity with UniFFI).
+    let app_did_trimmed = app_did.trim().to_owned();
+
     let is_bound = crate::runtime::with_context(bi, &context_id, |st| {
-        Ok(st.bound_apps.contains_key(&app_did))
+        Ok(st.bound_apps.contains_key(&app_did_trimmed))
     })
     .map_err(NapiError::from)?;
     if !is_bound {
         return Err(NapiError::from_reason(format!(
             "[{}] app '{}' is not currently bound to context '{}'",
             codes::CTX_2059,
-            app_did,
+            app_did_trimmed,
             context_id
         )));
     }
 
-    let event_log = crate::runtime::event_log_provider_from_existing_repo(bi);
+    // Use the supervisor's already-initialised event-log provider (same
+    // reason as app_bind_on — a fresh provider has an empty log map).
+    let event_log: std::sync::Arc<dyn scp_core::context::builder::ContextEventLogProvider> =
+        crate::runtime::supervisor(bi)?
+            .event_log_provider_arc()
+            .ok_or_else(|| {
+                NapiError::from_reason(format!(
+                    "[{}] event-log provider not initialised — \
+                     call context_create or context_join first",
+                    codes::CTX_2057
+                ))
+            })?;
+
     let context_id_c = context_id.clone();
-    let app_did_c = app_did.clone();
+    let app_did_c = app_did_trimmed.clone();
 
     crate::runtime()
         .block_on(async move {
@@ -5277,9 +5309,10 @@ pub(crate) fn app_unbind_on(
             }
         })?;
 
-    // Remove the stored scoped handle.
+    // Remove the stored scoped handle (using trimmed key — matches how
+    // bind stored it, fixing parity divergence with UniFFI).
     crate::runtime::with_context(bi, &context_id, |st| {
-        st.bound_apps.remove(&app_did);
+        st.bound_apps.remove(&app_did_trimmed);
         Ok(())
     })
     .map_err(NapiError::from)?;

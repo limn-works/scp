@@ -6238,8 +6238,25 @@ impl crate::scp::PyScp {
             })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
+        // Use the supervisor's already-initialised event-log provider.
+        // A fresh `MerkleEventLogProvider` (from `build_event_log_provider`)
+        // would have an empty in-memory `logs` map and every `append_event`
+        // would fail with CTX-2057 ("no event log for context"). The
+        // supervisor's provider has its map populated by `init_event_log`
+        // during context_create / context_join / context_restore.
+        let event_log: std::sync::Arc<dyn scp_core::context::builder::ContextEventLogProvider> =
+            crate::runtime::supervisor(bi)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .event_log_provider_arc()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "[{}] event-log provider not initialised — \
+                         call context_create or context_join first",
+                        codes::CTX_2057
+                    ))
+                })?;
+
         let handle = ContextHandle::new(context_id.to_owned(), ContextParams::default());
-        let event_log = crate::runtime::build_event_log_provider(bi);
         let actor_did_owned = actor_did.to_owned();
 
         let rt = crate::runtime()?;
@@ -6314,22 +6331,39 @@ impl crate::scp::PyScp {
         validate::validate_did(actor_did).map_err(|e| PyValueError::new_err(e.to_string()))?;
         validate::validate_did(app_did).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
+        // Trim app_did for lookup — bind stores the trimmed key; an untrimmed
+        // lookup always fails even when the app is bound (parity with UniFFI).
+        let app_did_trimmed = app_did.trim();
+
         let is_bound = crate::runtime::with_ffi_state(bi, context_id, |st| {
-            Ok(st.bound_apps.contains_key(app_did))
+            Ok(st.bound_apps.contains_key(app_did_trimmed))
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         if !is_bound {
             return Err(PyRuntimeError::new_err(format!(
                 "[{}] app '{}' is not currently bound to context '{}'",
                 codes::CTX_2059,
-                app_did,
+                app_did_trimmed,
                 context_id
             )));
         }
 
-        let event_log = crate::runtime::build_event_log_provider(bi);
+        // Use the supervisor's already-initialised event-log provider (same
+        // reason as app_bind — a fresh provider has an empty log map).
+        let event_log: std::sync::Arc<dyn scp_core::context::builder::ContextEventLogProvider> =
+            crate::runtime::supervisor(bi)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .event_log_provider_arc()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "[{}] event-log provider not initialised — \
+                         call context_create or context_join first",
+                        codes::CTX_2057
+                    ))
+                })?;
+
         let context_id_owned = context_id.to_owned();
-        let app_did_owned = app_did.to_owned();
+        let app_did_owned = app_did_trimmed.to_owned();
         let actor_did_owned = actor_did.to_owned();
 
         let rt = crate::runtime()?;
@@ -6356,9 +6390,10 @@ impl crate::scp::PyScp {
             }
         })?;
 
-        // Remove the stored scoped handle.
+        // Remove the stored scoped handle (using trimmed key — matches how
+        // bind stored it, fixing parity divergence with UniFFI).
         crate::runtime::with_ffi_state(bi, context_id, |st| {
-            st.bound_apps.remove(app_did);
+            st.bound_apps.remove(app_did_trimmed);
             Ok(())
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

@@ -4621,7 +4621,7 @@ export class SCP {
 
   /**
    * Binds an app to a context and appends a durable `AppBound` event (tag 74)
-   * to the event log (spec §8.4.1).
+   * to the event log (spec §8.4.2).
    *
    * Validates the capability declaration against the context ceiling and the
    * actor's role capabilities before appending.

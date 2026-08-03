@@ -15878,7 +15878,28 @@ impl Scp {
                         .collect()
                 };
 
-                let event_log = bi.protocol_repository.event_log_provider();
+                // Use the supervisor's already-initialised event-log provider.
+                // `bi.protocol_repository.event_log_provider()` creates a NEW
+                // `MerkleEventLogProvider` instance whose in-memory `logs` map
+                // is empty — every `append_event` call fails with CTX-2057
+                // ("no event log for context"). The supervisor's provider has
+                // its map populated by `init_event_log` during context
+                // creation/join/restore.
+                let event_log: std::sync::Arc<
+                    dyn scp_core::context::builder::ContextEventLogProvider,
+                > = bi
+                    .context_manager_expect()
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("Supervisor not initialized: {e}"),
+                        code: codes::CTX_2000.to_owned(),
+                    })?
+                    .event_log_provider_arc()
+                    .ok_or_else(|| ScpError::Context {
+                        msg: "event-log provider not initialised — \
+                              call context_create or context_join first"
+                            .to_owned(),
+                        code: codes::CTX_2057.to_owned(),
+                    })?;
                 let ctx_handle =
                     CoreContextHandle::new(handle.context_id.clone(), ContextParams::default());
 
@@ -15887,7 +15908,7 @@ impl Scp {
                     &ceiling,
                     &role_caps,
                     ctx_handle,
-                    &*event_log,
+                    event_log.as_ref(),
                     trimmed_did,
                     timestamp_secs,
                 )
@@ -15979,12 +16000,29 @@ impl Scp {
                     });
                 }
 
-                let event_log = bi.protocol_repository.event_log_provider();
+                // Use the supervisor's already-initialised event-log provider
+                // (same reason as app_bind — a fresh provider has an empty
+                // log map and every append fails with CTX-2057).
+                let event_log: std::sync::Arc<
+                    dyn scp_core::context::builder::ContextEventLogProvider,
+                > = bi
+                    .context_manager_expect()
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("Supervisor not initialized: {e}"),
+                        code: codes::CTX_2000.to_owned(),
+                    })?
+                    .event_log_provider_arc()
+                    .ok_or_else(|| ScpError::Context {
+                        msg: "event-log provider not initialised — \
+                              call context_create or context_join first"
+                            .to_owned(),
+                        code: codes::CTX_2057.to_owned(),
+                    })?;
 
                 unbind_app(
                     &handle.context_id,
                     trimmed_app,
-                    &*event_log,
+                    event_log.as_ref(),
                     trimmed_actor,
                     timestamp_secs,
                 )

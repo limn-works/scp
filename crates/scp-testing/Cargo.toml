@@ -165,6 +165,10 @@ name = "identity"
 path = "tests/integration/identity.rs"
 
 [[test]]
+name = "app_binding"
+path = "tests/integration/app_binding.rs"
+
+[[test]]
 name = "agent_binding"
 path = "tests/integration/agent_binding.rs"
 

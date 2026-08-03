@@ -381,7 +381,8 @@ pub const CTX_2056: &str = "SCP-CTX-2056";
 pub const CTX_2057: &str = "SCP-CTX-2057";
 /// App sandbox bind-other error (unexpected bind failure).
 pub const CTX_2058: &str = "SCP-CTX-2058";
-/// App sandbox unbind error.
+/// App sandbox not-bound error: the `app_did` is not currently bound to this context.
+/// Returned by `app_unbind` when the was-bound precondition fails.
 pub const CTX_2059: &str = "SCP-CTX-2059";
 /// `UniFFI` relay connection error.
 pub const CTX_2060: &str = "SCP-CTX-2060";

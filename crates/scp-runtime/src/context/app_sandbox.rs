@@ -29,7 +29,6 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::ContextHandle;
 use crate::context::builder::ContextEventLogProvider;
@@ -207,8 +206,15 @@ impl CapabilityEntry {
 /// Maximum length of `app_name` in UTF-8 bytes (spec 8.4.1).
 pub const MAX_APP_NAME_BYTES: usize = 128;
 
+/// Maximum UTF-8 byte length of `app_version` (spec 8.4.1).
+/// Values longer than 64 bytes cannot be valid `SemVer`.
+pub const MAX_APP_VERSION_BYTES: usize = 64;
+
 /// Maximum number of capability entries (spec 8.4.1).
 pub const MAX_CAPABILITY_ENTRIES: usize = 64;
+
+/// Maximum number of actions per capability entry (spec 8.4.1).
+pub const MAX_ACTIONS_PER_CAPABILITY_ENTRY: usize = 32;
 
 /// Current SCP protocol version for declarations.
 pub const CURRENT_SCP_VERSION: &str = "1.0";
@@ -338,10 +344,22 @@ impl CapabilityDeclaration {
     ///
     /// Returns `SandboxError::InvalidDeclaration` with a descriptive message.
     pub fn validate_structure(&self) -> Result<(), SandboxError> {
-        // Check SCP version compatibility (same major version).
-        let decl_major = self.scp_version.split('.').next().unwrap_or("0");
-        let current_major = CURRENT_SCP_VERSION.split('.').next().unwrap_or("0");
-        if decl_major != current_major {
+        // Check SCP version compatibility: same major AND minor <= current.
+        // A declaration targeting a future minor version (e.g. "1.5" when
+        // SDK is "1.0") must be rejected — the SDK cannot honour capabilities
+        // introduced in a spec version it doesn't know about (spec §8.4.1).
+        let decl_parts: Vec<&str> = self.scp_version.splitn(3, '.').collect();
+        let decl_major = *decl_parts.first().unwrap_or(&"0");
+        let decl_minor: u64 = decl_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        let current_parts: Vec<&str> = CURRENT_SCP_VERSION.splitn(3, '.').collect();
+        let current_major = *current_parts.first().unwrap_or(&"0");
+        let current_minor: u64 = current_parts
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        if decl_major != current_major || decl_minor > current_minor {
             return Err(SandboxError::InvalidDeclaration(format!(
                 "incompatible scp_version: declaration targets {}, SDK supports {}",
                 self.scp_version, CURRENT_SCP_VERSION
@@ -363,6 +381,15 @@ impl CapabilityDeclaration {
             ));
         }
 
+        // Check app_version length.
+        if self.app_version.len() > MAX_APP_VERSION_BYTES {
+            return Err(SandboxError::InvalidDeclaration(format!(
+                "app_version exceeds {} UTF-8 bytes (got {})",
+                MAX_APP_VERSION_BYTES,
+                self.app_version.len()
+            )));
+        }
+
         // Check capabilities count.
         if self.capabilities.is_empty() {
             return Err(SandboxError::InvalidDeclaration(
@@ -377,11 +404,18 @@ impl CapabilityDeclaration {
             )));
         }
 
-        // Check each entry has at least one action.
+        // Check each entry has at least one action, and not too many.
         for (i, entry) in self.capabilities.iter().enumerate() {
             if entry.actions.is_empty() {
                 return Err(SandboxError::InvalidDeclaration(format!(
                     "capabilities[{i}] must have at least 1 action"
+                )));
+            }
+            if entry.actions.len() > MAX_ACTIONS_PER_CAPABILITY_ENTRY {
+                return Err(SandboxError::InvalidDeclaration(format!(
+                    "capabilities[{i}] exceeds maximum of {} actions (got {})",
+                    MAX_ACTIONS_PER_CAPABILITY_ENTRY,
+                    entry.actions.len()
                 )));
             }
         }
@@ -1028,25 +1062,6 @@ pub fn sign_declaration(
     declaration.signature = signature.to_bytes().to_vec();
 
     Ok(())
-}
-
-/// Computes the content hash of a capability declaration for integrity checks.
-///
-/// Uses SHA-256 over the canonical JSON bytes (excluding signature).
-///
-/// # Errors
-///
-/// Returns `SandboxError::SerializationFailed` if canonical serialization fails.
-pub fn declaration_content_hash(
-    declaration: &CapabilityDeclaration,
-) -> Result<[u8; 32], SandboxError> {
-    let canonical = declaration.canonical_bytes()?;
-    let mut hasher = Sha256::new();
-    hasher.update(&canonical);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    Ok(hash)
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,33 +1917,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Content Hash
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn declaration_content_hash_deterministic() {
-        let (_, did) = test_keypair();
-        let decl = test_declaration(&did);
-
-        let hash1 = declaration_content_hash(&decl).unwrap();
-        let hash2 = declaration_content_hash(&decl).unwrap();
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn declaration_content_hash_changes_with_content() {
-        let (_, did) = test_keypair();
-        let decl1 = test_declaration(&did);
-
-        let mut decl2 = test_declaration(&did);
-        decl2.app_name = "Different App".to_owned();
-
-        let hash1 = declaration_content_hash(&decl1).unwrap();
-        let hash2 = declaration_content_hash(&decl2).unwrap();
-        assert_ne!(hash1, hash2);
-    }
-
-    // -----------------------------------------------------------------------
     // OutletCallAll covers OutletCall in ceiling/role validation
     // -----------------------------------------------------------------------
 
@@ -2294,10 +2282,75 @@ mod tests {
     }
 
     #[test]
-    fn validate_structure_compatible_minor_version() {
+    fn validate_structure_same_minor_version_passes() {
+        // A declaration that matches the current SDK version exactly is valid.
         let (_, did) = test_keypair();
         let mut decl = test_declaration(&did);
-        decl.scp_version = "1.5".to_owned(); // Same major, different minor.
+        decl.scp_version = CURRENT_SCP_VERSION.to_owned();
+
+        assert!(decl.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn validate_structure_future_minor_version_rejected() {
+        // A declaration targeting a future minor version (1.5 when SDK is 1.0)
+        // must be rejected — spec §8.4.1 requires minor <= current.
+        let (_, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        decl.scp_version = "1.5".to_owned();
+
+        assert!(matches!(
+            decl.validate_structure(),
+            Err(SandboxError::InvalidDeclaration(msg)) if msg.contains("incompatible")
+        ));
+    }
+
+    #[test]
+    fn validate_structure_app_version_too_long() {
+        let (_, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        // 65 bytes exceeds MAX_APP_VERSION_BYTES (64).
+        decl.app_version = "1".repeat(MAX_APP_VERSION_BYTES + 1);
+
+        assert!(matches!(
+            decl.validate_structure(),
+            Err(SandboxError::InvalidDeclaration(msg)) if msg.contains("app_version")
+        ));
+    }
+
+    #[test]
+    fn validate_structure_too_many_actions() {
+        let (_, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        // Exceeds MAX_ACTIONS_PER_CAPABILITY_ENTRY (32).
+        decl.capabilities[0].actions = (0..=MAX_ACTIONS_PER_CAPABILITY_ENTRY)
+            .map(|i| format!("action{i}"))
+            .collect();
+
+        assert!(matches!(
+            decl.validate_structure(),
+            Err(SandboxError::InvalidDeclaration(msg)) if msg.contains("actions")
+        ));
+    }
+
+    #[test]
+    fn validate_structure_exactly_max_actions_passes() {
+        let (_, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        // Exactly MAX_ACTIONS_PER_CAPABILITY_ENTRY actions should be valid.
+        decl.capabilities[0].actions = (0..MAX_ACTIONS_PER_CAPABILITY_ENTRY)
+            .map(|i| format!("action{i}"))
+            .collect();
+
+        assert!(decl.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn validate_structure_exactly_max_app_version_bytes() {
+        let (_, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        // Exactly MAX_APP_VERSION_BYTES bytes is valid.
+        decl.app_version = "1".repeat(MAX_APP_VERSION_BYTES);
 
         assert!(decl.validate_structure().is_ok());
     }

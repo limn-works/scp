@@ -1408,18 +1408,21 @@ class SCP:
 
         Validates the capability declaration against the context ceiling and
         the actor's role capabilities, then appends a durable ``AppBound``
-        event (tag 74) to the event log (spec §8.4.1).
+        event (tag 74) to the event log (spec §8.4.2).
 
         Returns a JSON summary string with ``app_did`` and
         ``granted_capabilities`` on success.
         """
-        return await asyncio.to_thread(
-            self._native.app_bind,
-            context_id,
-            declaration_json,
-            actor_did,
-            timestamp_secs,
-        )
+        try:
+            return await asyncio.to_thread(
+                self._native.app_bind,
+                context_id,
+                declaration_json,
+                actor_did,
+                timestamp_secs,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def context_app_unbind(
         self,
@@ -1433,13 +1436,16 @@ class SCP:
         Removes the app binding and appends a durable ``AppUnbound`` event
         (tag 75) to the event log (spec §8.4.2).
         """
-        return await asyncio.to_thread(
-            self._native.app_unbind,
-            context_id,
-            app_did,
-            actor_did,
-            timestamp_secs,
-        )
+        try:
+            return await asyncio.to_thread(
+                self._native.app_unbind,
+                context_id,
+                app_did,
+                actor_did,
+                timestamp_secs,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def get_economic_policy(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.get_economic_policy``."""
