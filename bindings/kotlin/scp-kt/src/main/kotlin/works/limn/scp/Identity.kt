@@ -358,14 +358,20 @@ class IdentityAdvancedBridge internal constructor(
         }
 
     /**
-     * Executes the compromise recovery protocol for the given DID.
+     * Executes the compromise recovery protocol for the given DID (spec §9.12).
      *
-     * Runs the 6-step recovery protocol from spec section 9.12.
+     * **Fails closed (#2240).** The §9.12 recovery WIRE (a real recovery backend
+     * plus step-1 key rotation) is not yet built — it is tracked as #2240 Part B
+     * and needs human design sign-off. Until it is wired, the underlying bridge
+     * throws a typed `SCP-IDENT-1022` `BridgeException` ("recovery backend not
+     * configured — provide a real backend via SDK layer") rather than
+     * fabricating a success.
      *
      * @param did The DID string to recover.
      * @param tier Compromise tier: "agent", "active_signing", or "identity_key".
      * @param contextIds Context IDs where this DID is a member.
-     * @return JSON string with the recovery result.
+     * @return JSON string with the recovery result (once the backend is wired).
+     * @throws BridgeException `SCP-IDENT-1022` while recovery is not configured.
      */
     suspend fun executeRecovery(
         did: String,

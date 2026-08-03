@@ -804,8 +804,12 @@ class SCP:
     ) -> dict[str, Any]:
         """Delegate to ``_scp_core.SCP.identity_execute_recovery``.
 
-        Returns the recovery outcome dict parsed from the bridge's JSON
-        payload (§9.12).
+        **Fails closed (#2240).** The §9.12 recovery WIRE (a real recovery
+        backend plus step-1 key rotation) is not yet built — it is tracked as
+        #2240 Part B and needs human design sign-off. Until it is wired, this
+        surface raises a typed ``IdentityError`` ("recovery backend not
+        configured — provide a real backend via SDK layer") rather than
+        fabricating a success. It never reports a recovery that did not happen.
 
         :param did: The compromised DID. **Must be owned by this**
             :class:`SCP` **instance** — created or loaded via
@@ -813,10 +817,12 @@ class SCP:
             absent from the instance's identity registry are rejected
             with ``SCP-IDENT-1020``.
         :param context_ids: Contexts to run the recovery protocol
-            against. Capped at **1024** entries per call; over-cap
-            requests return ``SCP-VALID-7120`` before the orchestrator
-            runs. See :meth:`identity_execute_custody_migration` for
-            the shared rate-limiting rationale.
+            against. Accepted for signature symmetry with the wired
+            backend (#2240 Part B); ignored on the current fail-closed
+            path. The NAPI binding additionally enforces a 1024-entry
+            length cap (``SCP-VALID-7120``) and a concurrency permit
+            (``SCP-VALID-7140``); those DoS bounds are runtime-specific
+            and land on this binding when the Part B orchestrator does.
         """
         import json
 

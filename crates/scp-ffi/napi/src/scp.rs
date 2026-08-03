@@ -20,7 +20,6 @@ use std::time::Duration;
 use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_clock::Clock as _;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
@@ -1067,9 +1066,18 @@ impl Scp {
 
     /// Per-instance equivalent of `identity_execute_recovery` (spec §9.12).
     ///
-    /// Executes the compromise recovery protocol and returns the result as
-    /// a JSON string. Bridge-level recovery backend is a placeholder — real
-    /// backends are injected via the SDK wrapper.
+    /// # Fails closed (#2240)
+    ///
+    /// The §9.12 recovery WIRE (a real `RecoveryBackend` plus step-1 key
+    /// rotation) is not yet built (custody / DID-method operations tracked as
+    /// #2240 Part B, pending human sign-off). Until it is wired via the SDK
+    /// layer this method **fails closed** with a typed `SCP-IDENT-1022` error
+    /// ("recovery backend not configured — provide a real backend via SDK
+    /// layer") after the ownership / length / concurrency gates pass — it NEVER
+    /// returns a fabricated success (the former inline always-`Ok` backend
+    /// returned `key_rotation_completed: true` while doing nothing, a nullifier
+    /// forbidden by the builder tenets). Mirrors the sibling
+    /// [`Self::identity_execute_custody_migration`] fail-closed behaviour.
     ///
     /// # Concurrency cap
     ///
@@ -1089,14 +1097,6 @@ impl Scp {
         tier: String,
         context_ids: Vec<String>,
     ) -> napi::Result<String> {
-        use std::collections::HashSet;
-
-        use scp_core::identity::recovery::{
-            CompromiseRecoveryOrchestrator, CompromiseTier, KeyRotationOutcome, PskRotationParams,
-            RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
-            agent_key_rotation_outcome,
-        };
-        use scp_did::DID;
         use scp_ffi_common::validate::validate_did;
 
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -1156,12 +1156,11 @@ impl Scp {
                 })
             })?;
 
-        let did_val = DID::from(did.as_str());
-
-        let compromise_tier = match tier.as_str() {
-            "agent" => CompromiseTier::Agent,
-            "active_signing" => CompromiseTier::ActiveSigning,
-            "identity_key" => CompromiseTier::IdentityKey,
+        // Validate the tier first so callers still get the precise invalid-tier
+        // error rather than the generic fail-closed one. The `_permit` acquired
+        // above is dropped when this method returns.
+        match tier.as_str() {
+            "agent" | "active_signing" | "identity_key" => {}
             other => {
                 return Err(NapiError::from(ScpNapiError::Identity {
                     message: format!(
@@ -1170,89 +1169,23 @@ impl Scp {
                     code: codes::IDENT_1020.to_owned(),
                 }));
             }
-        };
-
-        let now_ms = scp_clock::SystemClock.now_millis();
-        let key_rotation = match compromise_tier {
-            CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
-            CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
-            CompromiseTier::IdentityKey => {
-                scp_core::identity::recovery::identity_key_rotation_outcome(
-                    &did_val,
-                    did_val.clone(),
-                    now_ms,
-                )
-            }
-        };
-
-        struct NapiRecoveryBackend;
-        #[async_trait::async_trait(?Send)]
-        impl RecoveryBackend for NapiRecoveryBackend {
-            async fn mls_update(
-                &self,
-                _context_id: &str,
-                _key_rotation: &KeyRotationOutcome,
-            ) -> Result<(), RecoveryStepError> {
-                Ok(())
-            }
-            async fn revoke_ucans(
-                &self,
-                _context_id: &str,
-                _key_rotation: &KeyRotationOutcome,
-            ) -> Result<(), RecoveryStepError> {
-                Ok(())
-            }
-            async fn rotate_key_packages(
-                &self,
-                _context_id: &str,
-                _key_rotation: &KeyRotationOutcome,
-            ) -> Result<(), RecoveryStepError> {
-                Ok(())
-            }
-            async fn notify_contacts(
-                &self,
-                _did: &DID,
-                _tier: CompromiseTier,
-                _key_rotation: &KeyRotationOutcome,
-                _contacts: &HashSet<DID>,
-            ) -> bool {
-                true
-            }
-            async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
-                true
-            }
         }
 
-        let orchestrator = CompromiseRecoveryOrchestrator::new(did_val, context_ids);
-        let contacts = HashSet::new();
-        let backend = NapiRecoveryBackend;
-
-        // Drive the async orchestrator on the module-local tokio runtime
-        // (crate::runtime()). The prior `Handle::try_current()` path
-        // failed on the napi-rs worker thread because libuv workers
-        // don't carry a tokio context (round-2 bug-catcher finding).
-        let result = crate::runtime()
-            .block_on(orchestrator.execute_recovery(
-                compromise_tier,
-                &key_rotation,
-                &contacts,
-                None,
-                &backend,
-                &scp_clock::SystemClock,
-            ))
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!("recovery failed: {e}"),
-                    code: codes::IDENT_1022.to_owned(),
-                })
-            })?;
-
-        serde_json::to_string(&result).map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("failed to serialize recovery result: {e}"),
-                code: codes::IDENT_1023.to_owned(),
-            })
-        })
+        // FAIL CLOSED (#2240): there is no configured recovery backend at the
+        // FFI layer, and step 1 (real key rotation) cannot be performed here.
+        // Unlike custody migration — whose orchestrator surfaces its
+        // NotConfigured backend's first `Err` as a fatal error —
+        // `CompromiseRecoveryOrchestrator::execute_recovery` isolates
+        // per-context failures (§9.12) and never returns a fatal "backend
+        // absent" error, so recovery must fail closed at the bridge boundary
+        // before any `KeyRotationOutcome` / `RecoveryResult` is fabricated. The
+        // ownership / length / concurrency gates above still run so the DoS and
+        // authorisation guarantees are preserved for the wired backend (Part B).
+        Err(NapiError::from(ScpNapiError::Identity {
+            message: "recovery backend not configured — provide a real backend via SDK layer"
+                .to_owned(),
+            code: codes::IDENT_1022.to_owned(),
+        }))
     }
 
     /// Per-instance equivalent of `identity_execute_custody_migration`
@@ -5025,14 +4958,16 @@ mod concurrency_cap_tests {
         );
 
         // Drop one permit — the next call must proceed past the permit check.
-        // It may still fail downstream (the bridge-level recovery backend is
-        // a placeholder that returns Ok) but it must NOT be a VALID-7140
-        // busy rejection.
+        // Recovery now fails closed (#2240, SCP-IDENT-1022) instead of
+        // fabricating a success, but the point of THIS assertion is that the
+        // permit gate no longer rejects it: whatever it returns, it must NOT be
+        // a VALID-7140 busy rejection.
         drop(permits.pop());
         let result = scp.identity_execute_recovery(did, "agent".to_owned(), Vec::new());
         match result {
             Ok(_) => {
-                // Happy path — orchestrator completed.
+                // Not expected post-#2240, but a non-busy Ok would still satisfy
+                // the "not busy-rejected" invariant this test guards.
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -5042,6 +4977,28 @@ mod concurrency_cap_tests {
                 );
             }
         }
+    }
+
+    /// #2240: recovery must fail closed with the typed `SCP-IDENT-1022`
+    /// "not configured" error — never a fabricated success — once it passes the
+    /// ownership / length / concurrency gates. Mirrors the custody-migration
+    /// `NotConfigured` fail-closed behaviour.
+    #[test]
+    fn recovery_fails_closed_with_not_configured_error() {
+        let (scp, did) = build_scp_with_identity();
+
+        let err = scp
+            .identity_execute_recovery(did, "agent".to_owned(), Vec::new())
+            .expect_err("recovery must fail closed — it has no configured backend (#2240)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-IDENT-1022"),
+            "expected fail-closed SCP-IDENT-1022, got: {msg}"
+        );
+        assert!(
+            msg.contains("not configured"),
+            "expected 'not configured' in fail-closed message, got: {msg}"
+        );
     }
 
     #[test]

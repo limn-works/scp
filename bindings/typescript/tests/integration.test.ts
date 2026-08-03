@@ -848,16 +848,15 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(() => scp.identityExecuteRecovery(identity.did, "nonexistent-tier", [])).toThrow();
     });
 
-    it("scp.identityExecuteRecovery returns a JSON result on the happy path", async () => {
-      // Use a real identity so the DID is well-formed.
+    it("scp.identityExecuteRecovery fails closed with the NotConfigured error", async () => {
+      // #2240: recovery has no configured backend yet (the §9.12 WIRE is
+      // Part B, pending human sign-off). Passing the ownership + tier gates,
+      // the bridge fails closed with SCP-IDENT-1022 instead of fabricating a
+      // success. Mirrors the custody-migration NotConfigured assertion below.
       const identity = await scp.identityCreate("in_memory");
-      const resultJson = scp.identityExecuteRecovery(identity.did, "agent", []);
-      expect(typeof resultJson).toBe("string");
-      // The orchestrator returns a structured result with at least
-      // `did`, `tier`, and `completed_contexts` fields per spec §3.6.
-      const parsed = JSON.parse(resultJson) as Record<string, unknown>;
-      expect(parsed).toHaveProperty("tier");
-      expect(parsed).toHaveProperty("did");
+      expect(() => scp.identityExecuteRecovery(identity.did, "agent", [])).toThrow(
+        /SCP-IDENT-1022|not configured/i,
+      );
     });
 
     it("scp.identityExecuteCustodyMigration surfaces the NotConfigured backend error", async () => {
