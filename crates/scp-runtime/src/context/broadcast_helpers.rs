@@ -733,10 +733,15 @@ pub async fn block_broadcast_subscriber(
     // two leaves are always co-located in the Merkle log. rotate_sender_key_for_block
     // always increments by exactly 1, so old = new.saturating_sub(1) is exact.
     let old_epoch = result.new_epoch.saturating_sub(1);
-    match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancePayload {
-        old_epoch,
-        new_epoch: result.new_epoch,
-    }) {
+    // Best-effort KEA: 1 if the append succeeded, 0 otherwise. Tracked
+    // separately so the checkpoint counter reflects however many leaves are
+    // actually durable (MemberBlocked is fail-closed; KEA is best-effort).
+    let kea_appended: u64 = match scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::KeyEpochAdvancePayload {
+            old_epoch,
+            new_epoch: result.new_epoch,
+        },
+    ) {
         Ok(payload) => {
             if let Err(e) = deps
                 .event_log
@@ -754,6 +759,9 @@ pub async fn block_broadcast_subscriber(
                     error = %e,
                     "KeyEpochAdvance event-log append failed (best-effort)"
                 );
+                0
+            } else {
+                1
             }
         }
         Err(e) => {
@@ -762,9 +770,12 @@ pub async fn block_broadcast_subscriber(
                 error = %e,
                 "KeyEpochAdvance payload encode failed (best-effort)"
             );
+            0
         }
-    }
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    };
+    // 1 for MemberBlocked (fail-closed) + kea_appended for KeyEpochAdvance
+    // (best-effort). The counter must never exceed the number of durable leaves.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_appended;
 
     Ok(result)
 }
