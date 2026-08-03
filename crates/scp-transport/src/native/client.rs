@@ -129,6 +129,19 @@ struct SubscriptionState {
     last_local_receive: Option<Instant>,
     /// Channel for pushing subscription messages to the stream.
     tx: mpsc::Sender<SubscriptionMessage>,
+    /// When `true`, BLOB messages routed to this subscription bypass the
+    /// client-global `seen_blob_ids` dedup LRU — neither checked against it nor
+    /// committed to it.
+    ///
+    /// Set only by the one-shot raw public-record QUERY path
+    /// ([`NativeRelayClient::query_raw`], §3.10.4). The dedup LRU is a
+    /// live-subscription redelivery guard: it suppresses a blob the client has
+    /// already delivered once (e.g. after a reconnect). A one-shot DID-record
+    /// resolution needs every candidate on every call, so applying the dedup
+    /// there would drop the genuine record on the second resolution of an
+    /// unchanged DID — the bug this flag closes. Ordinary `subscribe`/`query`
+    /// leave it `false` and keep the dedup.
+    bypass_dedup: bool,
 }
 
 /// Shared inner state of the WebSocket client.
@@ -207,6 +220,47 @@ type WsSink = futures::stream::SplitSink<
 type WsSource = futures::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
+
+/// RAII cleanup for a one-shot QUERY's temporary subscription and pending
+/// terminator entry.
+///
+/// A one-shot QUERY (`query` / `query_raw`) registers a temporary subscription
+/// keyed by `routing_id` (for BLOB delivery) plus a `pending` oneshot keyed by
+/// `ref_id` (for the terminal `query_complete` / `Err`). There are `.await`
+/// points between registration and cleanup — the sink write and the collect
+/// loop — so an inline `remove` at the end is skipped whenever the future is
+/// dropped mid-flight. The composer wraps each per-relay `query` in a 5s
+/// timeout and drops the future on expiry, so mid-flight drop is the COMMON
+/// case, not a corner case.
+///
+/// A leaked `routing_id` subscription is the dangerous one: the next
+/// `query_raw` for that DID hits the "already subscribed" early-return and
+/// fails permanently until reconnect, and leaks accumulate toward the global
+/// subscription cap (`MAX_TRANSPORT_SUBSCRIPTIONS`). This guard removes it on
+/// EVERY exit — happy path, error, deadline, and external cancellation.
+///
+/// The `pending` entry is removed best-effort via a non-blocking `try_write`
+/// (Drop cannot `.await`). A residual entry is harmless: `ref_id` is monotonic
+/// so it can never collide, and it self-cleans when the relay's terminal
+/// message (which carries this `ref_id`) reaches `dispatch_relay_message`, or on
+/// reconnect.
+struct QueryScopeGuard {
+    subscriptions: Arc<TransportSubscriptionMap<SubscriptionState>>,
+    inner: Arc<RwLock<ClientInner>>,
+    rid: crate::traits::RoutingId,
+    ref_id: String,
+}
+
+impl Drop for QueryScopeGuard {
+    fn drop(&mut self) {
+        // Total, synchronous removal of the collision-causing resource.
+        self.subscriptions.remove(&self.rid);
+        // Best-effort, non-blocking removal of the pending terminator entry.
+        if let Ok(mut state) = self.inner.try_write() {
+            state.pending.remove(&self.ref_id);
+        }
+    }
+}
 
 impl NativeRelayClient {
     /// Creates a new client targeting the given relay URL and immediately
@@ -440,6 +494,16 @@ impl NativeRelayClient {
                 let receive_time = Instant::now();
                 let rid = crate::traits::RoutingId::new(*routing_id);
 
+                // Peek whether this routing_id is a dedup-bypassing (one-shot raw
+                // public-record QUERY) subscription BEFORE the dedup check. This
+                // is a read-only lookup that commits nothing, so it does not
+                // perturb the commit-after-success ordering below. A missing
+                // subscription defaults to `false` (the dedup applies), matching
+                // the ordinary subscribe/query path.
+                let bypass_dedup = subscriptions
+                    .with(&rid, |sub| sub.bypass_dedup)
+                    .unwrap_or(false);
+
                 // 1. Deduplication check (read-only, no commit yet).
                 //    Dedup-cache poisoning defense: check dedup first
                 //    (read-locked, no commit), then check subscription
@@ -451,7 +515,7 @@ impl NativeRelayClient {
                 //    redelivery for those entries. The load-bearing
                 //    invariant is the step ordering (commit-after-success),
                 //    not the lock kind.
-                {
+                if !bypass_dedup {
                     let state = inner.read().await;
                     if state.seen_blob_ids.contains(blob_id) {
                         return;
@@ -510,7 +574,12 @@ impl NativeRelayClient {
                 //    commit dedup -- a future redelivery (e.g. after
                 //    resubscribe) for this `blob_id` must remain deliverable.
                 let blob_id_copy = *blob_id;
-                if tx.send(SubscriptionMessage::Relay(msg)).await.is_ok() {
+                if tx.send(SubscriptionMessage::Relay(msg)).await.is_ok() && !bypass_dedup {
+                    // Commit dedup only for ordinary subscriptions. A raw-query
+                    // (bypass) subscription must never seed the LRU: seeding it
+                    // would suppress the genuine record on a later live
+                    // subscription or repeat resolution (§3.10.4).
+                    //
                     // Double-check guards the static dispatch_relay_message helper when
                     // invoked concurrently from tests; the production reader_loop is single-task.
                     let mut state = inner.write().await;
@@ -680,6 +749,7 @@ impl NativeRelayClient {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx,
+                    bypass_dedup: false,
                 },
             )
             .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
@@ -742,8 +812,12 @@ impl NativeRelayClient {
 
     /// Sends a QUERY command and collects results.
     ///
-    /// Registers a temporary subscription channel, sends QUERY, and collects
-    /// BLOB messages until `query_complete` EVENT or timeout.
+    /// When a live subscription already exists for `routing_id`, the QUERY is
+    /// sent via [`send_request`](Self::send_request) and results flow through
+    /// that subscription (this returns an empty vec). Otherwise it collects over
+    /// a temporary subscription via [`send_query_collect_blobs`](Self::send_query_collect_blobs),
+    /// terminating on the `ref_id`-correlated `query_complete` (not a deadline),
+    /// and decodes each blob as an [`OuterEnvelope`] (undecodable blobs dropped).
     ///
     /// # Errors
     ///
@@ -771,65 +845,278 @@ impl NativeRelayClient {
             return Ok(Vec::new());
         }
 
+        // Temp-subscription path: collect raw blobs — terminated by the
+        // ref_id-correlated `query_complete` (not a deadline) — then decode each
+        // as an `OuterEnvelope`, discarding any that fail to deserialize.
+        let blobs = self
+            .send_query_collect_blobs(routing_id, since, None, false)
+            .await?;
+        Ok(blobs
+            .iter()
+            .filter_map(|blob| OuterEnvelope::from_bytes(blob).ok())
+            .collect())
+    }
+
+    /// Publishes a raw public-record blob at `routing_id` via PUBLISH (§3.10.2).
+    ///
+    /// Unlike [`send`](crate::native::NativeRelayAdapter) via
+    /// [`send_request`](Self::send_request) with an [`OuterEnvelope`], the blob is
+    /// arbitrary already-authenticated bytes (a DID-record frame, §9.10.12). No
+    /// `recipient_hint` is set — a public record has no encrypted recipient.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the client is not connected,
+    /// or [`TransportError::SendFailed`] if the relay responds with an error.
+    pub async fn publish_raw(
+        &self,
+        routing_id: &[u8; 32],
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        // The wire `blob_ttl` is a u32 (seconds); the public API takes u64 to
+        // match the identity-layer RelayPublisher. A DID record's 7-day TTL
+        // (604800) fits comfortably; reject an out-of-range value loudly rather
+        // than silently truncating.
+        let blob_ttl = u32::try_from(blob_ttl).map_err(|_| {
+            TransportError::SendFailed(format!("blob_ttl {blob_ttl} exceeds u32 wire limit"))
+        })?;
+
+        let msg = ClientMessage::Publish {
+            ref_id: None,
+            routing_id: *routing_id,
+            recipient_hint: None,
+            blob_ttl,
+            blob,
+        };
+
+        let response = self.send_request(msg).await?;
+
+        match response {
+            RelayMessage::Ok { .. } => Ok(()),
+            RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
+                "relay error {code}: {msg}"
+            ))),
+            _ => Err(TransportError::ProtocolError(
+                "unexpected response to PUBLISH (raw)".to_string(),
+            )),
+        }
+    }
+
+    /// Sends a QUERY for raw public-record blobs and collects the blob bytes,
+    /// bypassing the `OuterEnvelope` codec AND the `seen_blob_ids` dedup LRU
+    /// (§3.10.2/§3.10.4).
+    ///
+    /// Registers a temporary dedup-bypassing subscription, sends QUERY with the
+    /// given `limit` (§3.10.2 uses N=16), and collects up to `limit` BLOB
+    /// payloads, terminating on the `ref_id`-correlated `query_complete` (or a
+    /// relay `Err`), not a wall-clock deadline. The blobs are returned
+    /// unverified — the caller decodes and BEP44-verifies each one.
+    ///
+    /// A DID `routing_id` is derived as `SHA-256("scp:did:" || did)` (§3.10.2),
+    /// a domain disjoint from context routing IDs, so an existing live
+    /// subscription at this `routing_id` is a collision, not a legitimate
+    /// overlap: this fails loudly rather than silently returning the live
+    /// subscription's dedup-filtered stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the client is not connected,
+    /// [`TransportError::SubscriptionFailed`] if a subscription already exists
+    /// for this routing ID, or [`TransportError::SendFailed`] if the relay
+    /// responds with an error.
+    pub async fn query_raw(
+        &self,
+        routing_id: &[u8; 32],
+        since: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let rid = crate::traits::RoutingId::new(*routing_id);
+
+        if self.subscriptions.contains(&rid) {
+            return Err(TransportError::SubscriptionFailed(
+                "query_raw: routing_id already has an active subscription".to_string(),
+            ));
+        }
+
+        self.send_query_collect_blobs(routing_id, since, Some(limit), true)
+            .await
+    }
+
+    /// Sends a QUERY and collects the returned raw blob payloads over a
+    /// temporary subscription, terminating on the `ref_id`-correlated terminal
+    /// response — the shared core of [`query`](Self::query) and
+    /// [`query_raw`](Self::query_raw).
+    ///
+    /// # Why this does not use [`send_request`](Self::send_request)
+    ///
+    /// A QUERY's ONLY `ref_id`-bearing response is the terminal
+    /// `EVENT { ref_id, "query_complete" }` (BLOB messages carry no `ref_id`).
+    /// `send_request` registers a `pending[ref_id]` oneshot and consumes exactly
+    /// that terminal event — [`dispatch_relay_message`](Self::dispatch_relay_message)
+    /// routes a `ref_id`-matched EVENT to `pending` and returns BEFORE
+    /// broadcasting it to the routing-ID subscription. So if the collect loop
+    /// waited for `query_complete` on the subscription channel it would NEVER see
+    /// it and would run to a deadline (and be cancelled by the composer's 5s
+    /// per-relay timeout, yielding zero candidates). Instead this method
+    /// registers the `pending` oneshot ITSELF and `select!`s the collect loop on
+    /// both the subscription channel (blobs) and that oneshot (the terminator),
+    /// breaking on the terminator.
+    ///
+    /// `bypass_dedup` selects whether delivered blobs pass through the
+    /// `seen_blob_ids` LRU (`false` = normal `query` semantics; `true` = the raw
+    /// one-shot public-record path, which must observe every candidate on every
+    /// call). `limit` caps the collected blobs (defensive against a relay that
+    /// ignores the wire `limit`); `None` collects until the terminator.
+    ///
+    /// A [`QueryScopeGuard`] removes the temporary subscription and the pending
+    /// entry on every exit — including external cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if not connected,
+    /// [`TransportError::SubscriptionFailed`] on a routing-ID collision, or
+    /// [`TransportError::SendFailed`] on a serialize/write failure or a relay
+    /// `Err` response to the QUERY.
+    async fn send_query_collect_blobs(
+        &self,
+        routing_id: &[u8; 32],
+        since: Option<u64>,
+        limit: Option<u32>,
+        bypass_dedup: bool,
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let rid = crate::traits::RoutingId::new(*routing_id);
+
+        // Assign the ref_id and register the terminator oneshot FIRST, under one
+        // write lock, so there is no `.await` between reserving the ref_id and
+        // arming the guard. A disconnected client short-circuits before anything
+        // is inserted.
+        let (term_tx, mut term_rx) = oneshot::channel::<RelayMessage>();
+        let ref_id = {
+            let mut state = self.inner.write().await;
+            if !state.connected {
+                return Err(TransportError::NotConnected);
+            }
+            let id = format!("r-{}", state.next_ref_id);
+            state.next_ref_id += 1;
+            state
+                .pending
+                .insert(id.clone(), PendingRequest { tx: term_tx });
+            id
+        };
+
+        // Register the temporary BLOB-delivery subscription. On a collision, roll
+        // back the pending entry we just reserved (no guard armed yet).
         let (tx, mut rx) = mpsc::channel::<SubscriptionMessage>(256);
+        if let Err(e) = self.subscriptions.insert(
+            rid,
+            SubscriptionState {
+                last_stored_at: None,
+                last_local_receive: None,
+                tx,
+                bypass_dedup,
+            },
+        ) {
+            self.inner.write().await.pending.remove(&ref_id);
+            return Err(TransportError::SubscriptionFailed(e.to_string()));
+        }
 
-        // Register a temporary subscription for receiving BLOB messages.
-        // `Duplicate` may occur under concurrent `subscribe`+`query` for the
-        // same routing_id; the check/insert is intentionally racy because the
-        // cost of a brief misorder is just a `SubscriptionFailed` to the
-        // caller.
-        self.subscriptions
-            .insert(
-                rid,
-                SubscriptionState {
-                    last_stored_at: None,
-                    last_local_receive: None,
-                    tx,
-                },
-            )
-            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
+        // From here every exit (happy, error, deadline, cancellation) cleans up
+        // both the subscription and the pending entry.
+        let _guard = QueryScopeGuard {
+            subscriptions: Arc::clone(&self.subscriptions),
+            inner: Arc::clone(&self.inner),
+            rid,
+            ref_id: ref_id.clone(),
+        };
 
-        // Send the QUERY command.
-        let msg = ClientMessage::Query {
+        // Serialize and send the QUERY frame directly (NOT via send_request,
+        // which would consume the terminal query_complete).
+        let mut msg = ClientMessage::Query {
             ref_id: None,
             routing_id: *routing_id,
             since,
-            limit: None,
+            limit,
         };
+        assign_ref_id(&mut msg, &ref_id);
+        let bytes = msg
+            .to_bytes()
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        self.ws_sink
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(TransportError::NotConnected)?
+            .send(Message::Binary(bytes))
+            .await
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
-        let response = self.send_request(msg).await.inspect_err(|_| {
-            self.subscriptions.remove(&rid);
-        })?;
-
-        if let RelayMessage::Err { code, msg, .. } = &response {
-            self.subscriptions.remove(&rid);
-            return Err(TransportError::SendFailed(format!(
-                "relay error {code}: {msg}"
-            )));
-        }
-
-        // Collect BLOB messages until `query_complete` or timeout.
-        let mut envelopes = Vec::new();
+        // Collect BLOB payloads, terminating on the ref_id-correlated
+        // query_complete/Err. The deadline is a backstop for a relay that never
+        // sends a terminator, not the normal exit.
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        let cap = limit.map(|l| l as usize);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
         loop {
+            if cap.is_some_and(|c| blobs.len() >= c) {
+                break;
+            }
             tokio::select! {
+                // `biased`: drain buffered blobs before observing the terminator,
+                // so a simultaneously-ready terminator never causes us to skip a
+                // blob already in the channel (the post-terminator drain below is
+                // a further belt-and-suspenders).
+                biased;
                 msg_opt = rx.recv() => {
                     match msg_opt {
-                        Some(SubscriptionMessage::Relay(
-                            RelayMessage::Blob { blob, .. },
-                        )) => {
-                            if let Ok(env) = OuterEnvelope::from_bytes(&blob) {
-                                envelopes.push(env);
-                            }
+                        Some(SubscriptionMessage::Relay(RelayMessage::Blob { blob, .. })) => {
+                            blobs.push(blob);
                         }
-                        Some(SubscriptionMessage::Relay(
-                            RelayMessage::Event { event_type, .. },
-                        )) if event_type == "query_complete" => {
+                        // Any other subscription message on the raw path is ignored.
+                        Some(_) => {}
+                        // Channel closed (client shutting down): stop.
+                        None => break,
+                    }
+                }
+                term = &mut term_rx => {
+                    match term {
+                        Ok(RelayMessage::Err { code, msg, .. }) => {
+                            return Err(TransportError::SendFailed(format!(
+                                "relay error {code}: {msg}"
+                            )));
+                        }
+                        // query_complete (or any other terminal response for this
+                        // ref_id): drain blobs already delivered, then stop.
+                        // SAFETY of the drain: this relies on the `biased` select
+                        // above — `rx` is polled first every iteration, so the
+                        // terminator arm is only reached once `rx` is empty, and
+                        // the single-task in-order reader has already enqueued every
+                        // blob before it sends the terminator. The drain is thus a
+                        // belt-and-suspenders sweep of an already-empty channel. If
+                        // `biased` is ever removed, this `try_recv` (which stops at
+                        // the first non-Blob message) could drop a trailing blob —
+                        // keep the two coupled.
+                        Ok(_) => {
+                            while let Ok(SubscriptionMessage::Relay(RelayMessage::Blob {
+                                blob,
+                                ..
+                            })) = rx.try_recv()
+                            {
+                                blobs.push(blob);
+                                if cap.is_some_and(|c| blobs.len() >= c) {
+                                    break;
+                                }
+                            }
                             break;
                         }
-                        None => break,
-                        _ => {}
+                        // The oneshot sender was dropped without delivering a
+                        // terminal response (the pending entry was removed — e.g.
+                        // a `send_request` timeout elsewhere reclaimed it, or the
+                        // reader task ended). Defensive fallback: stop with what we
+                        // have. (`reconnect` re-subscribes but does not bulk-clear
+                        // `pending`, so it is not the trigger here.)
+                        Err(_) => break,
                     }
                 }
                 () = tokio::time::sleep_until(deadline) => {
@@ -838,10 +1125,7 @@ impl NativeRelayClient {
             }
         }
 
-        // Clean up temporary subscription.
-        self.subscriptions.remove(&rid);
-
-        Ok(envelopes)
+        Ok(blobs)
     }
 
     /// Returns whether the client is currently connected.
@@ -1158,10 +1442,95 @@ mod tests {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx,
+                    bypass_dedup: false,
                 },
             )
             .unwrap();
         (inner, subscriptions, rx)
+    }
+
+    /// Helper: like [`setup_inner_with_subscription`] but registers the
+    /// subscription with `bypass_dedup: true` — the one-shot raw public-record
+    /// QUERY shape (§3.10.4).
+    fn setup_inner_with_bypass_subscription(
+        routing_id: [u8; 32],
+    ) -> (
+        Arc<RwLock<ClientInner>>,
+        Arc<TransportSubscriptionMap<SubscriptionState>>,
+        mpsc::Receiver<SubscriptionMessage>,
+    ) {
+        let (tx, rx) = mpsc::channel(16);
+        let inner = Arc::new(RwLock::new(ClientInner {
+            pending: HashMap::new(),
+            next_ref_id: 1,
+            seen_blob_ids: lru::LruCache::new(
+                NonZeroUsize::new(DEDUP_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            ),
+            connected: true,
+        }));
+        let subscriptions = Arc::new(TransportSubscriptionMap::<SubscriptionState>::new());
+        subscriptions
+            .insert(
+                crate::traits::RoutingId::new(routing_id),
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                    bypass_dedup: true,
+                },
+            )
+            .unwrap();
+        (inner, subscriptions, rx)
+    }
+
+    /// A dedup-bypassing (raw-query) subscription receives the SAME blob on a
+    /// repeat dispatch — the genuine record is NOT dropped on the second
+    /// resolution of an unchanged DID — and the `blob_id` is NEVER committed to
+    /// the `seen_blob_ids` LRU (§3.10.2 limit-N shadow-defeat, §3.10.4). This is
+    /// the regression guard for the dedup bug the raw path fixes: an ordinary
+    /// subscription would drop the second delivery (see
+    /// `dispatch_blob_with_correct_hash_accepted`, which asserts the LRU IS
+    /// seeded).
+    #[tokio::test]
+    async fn raw_query_subscription_bypasses_dedup_on_repeat() {
+        let routing_id = [0xDD; 32];
+        let blob_data = vec![0x0A, 0x0B, 0x0C];
+        let blob_id = sha256(&blob_data);
+        let (inner, subscriptions, mut rx) = setup_inner_with_bypass_subscription(routing_id);
+
+        let make_msg = || RelayMessage::Blob {
+            routing_id,
+            blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_data.clone(),
+        };
+
+        // First delivery.
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, make_msg()).await;
+        // Second delivery of the SAME blob_id (a repeat resolution).
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, make_msg()).await;
+
+        // BOTH deliveries arrive — dedup did not suppress the repeat.
+        for attempt in 0..2 {
+            let received = rx.try_recv().unwrap_or_else(|e| {
+                panic!("delivery {attempt} missing (dedup wrongly applied): {e}")
+            });
+            assert!(
+                matches!(
+                    received,
+                    SubscriptionMessage::Relay(RelayMessage::Blob { .. })
+                ),
+                "expected Relay(Blob), got {received:?}"
+            );
+        }
+
+        // The blob_id must NOT have been committed to the dedup LRU.
+        assert!(
+            !inner.read().await.seen_blob_ids.contains(&blob_id),
+            "raw-query path must never seed the dedup LRU"
+        );
     }
 
     /// Computes SHA-256 of the given data, returning a 32-byte array.
@@ -1382,6 +1751,7 @@ mod tests {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx: tx_a2,
+                    bypass_dedup: false,
                 },
             )
             .unwrap();
@@ -1618,6 +1988,383 @@ mod tests {
         assert!(
             matches!(err2, TransportError::SubscriptionFailed(_)),
             "expected SubscriptionFailed on third attempt, got {err2:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Raw-blob path end-to-end tests (SCP-RELAYRES-002)
+    //
+    // These drive the REAL `NativeRelayClient::query_raw` / `publish_raw` over a
+    // WebSocket against an in-process relay — the coverage that the unit-level
+    // `MockRawAdapter` tests (in `native::relay_querier`) cannot provide, because
+    // the mock bypasses `send_request`, the wire, and the collect loop entirely.
+    // The CRITICAL these guard against: a QUERY's only ref_id-bearing response
+    // is the terminal `query_complete`, which must terminate the collect loop.
+    // -----------------------------------------------------------------------
+
+    /// Starts an in-process WebSocket relay that maps each inbound
+    /// [`ClientMessage`] to a scripted sequence of [`RelayMessage`] responses.
+    /// Used to exercise client control-flow that the real relay cannot easily
+    /// drive (a relay that floods more blobs than the QUERY `limit`, or returns
+    /// an unexpected response shape).
+    async fn start_scripted_relay<F>(handler: F) -> String
+    where
+        F: Fn(&ClientMessage) -> Vec<RelayMessage> + Send + Sync + 'static,
+    {
+        use tokio::net::TcpListener;
+
+        let handler = Arc::new(handler);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let (mut sink, mut source) = ws.split();
+                    while let Some(Ok(frame)) = source.next().await {
+                        let bytes = match frame {
+                            Message::Binary(b) => b,
+                            Message::Close(_) => break,
+                            _ => continue,
+                        };
+                        let Ok(msg) = ClientMessage::from_bytes(&bytes) else {
+                            continue;
+                        };
+                        for resp in handler(&msg) {
+                            if let Ok(rb) = resp.to_bytes() {
+                                let _ = sink.send(Message::Binary(rb)).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        url
+    }
+
+    /// Builds a deterministic, decodable DID-record frame's raw bytes.
+    fn did_frame(seq: u64, value: &[u8]) -> Vec<u8> {
+        scp_protocol::envelope::did_record::DidRecordV1::try_new(
+            [0xAB; 32],
+            seq,
+            [0xCD; 64],
+            value.to_vec(),
+        )
+        .unwrap()
+        .encode()
+    }
+
+    /// CRITICAL regression (SCP-RELAYRES-002): `publish_raw` then `query_raw`
+    /// against a REAL in-process relay returns ALL published frames and
+    /// terminates on `query_complete` — promptly, NOT on the 30s deadline (and
+    /// well under the composer's 5s per-relay timeout). Before the fix,
+    /// `send_request` consumed the ref_id-bearing `query_complete` and the
+    /// collect loop ran to its deadline, so the composer cancelled it and every
+    /// normal resolution yielded zero candidates.
+    #[tokio::test]
+    async fn query_raw_e2e_returns_all_frames_and_completes_promptly() {
+        use crate::native::server::{Relay, RelayConfig};
+        use crate::native::storage::BlobStorageBackend;
+        use std::net::SocketAddr;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
+            .await
+            .unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+
+        let routing_id = [0x11; 32];
+        let frames = vec![
+            did_frame(1, b"doc-one"),
+            did_frame(2, b"doc-two"),
+            did_frame(3, b"doc-three"),
+        ];
+        for frame in &frames {
+            client
+                .publish_raw(&routing_id, 3600, frame.clone())
+                .await
+                .expect("publish_raw succeeds");
+        }
+
+        let start = tokio::time::Instant::now();
+        let mut got = client
+            .query_raw(&routing_id, None, 16)
+            .await
+            .expect("query_raw succeeds");
+        let elapsed = start.elapsed();
+
+        assert_eq!(got.len(), 3, "all three published frames returned");
+        let mut want = frames;
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "returned blobs are byte-identical to published");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "query_raw must complete on query_complete, not the deadline; took {elapsed:?}"
+        );
+    }
+
+    /// Dedup-bypass end-to-end (and observability of `bypass_dedup: true` at the
+    /// `query_raw` entry point): querying the SAME unchanged DID twice returns
+    /// the record BOTH times. If `query_raw` registered `bypass_dedup: false`,
+    /// the first query would seed `seen_blob_ids` and the second would return
+    /// empty. This behavioral test fails if the flag is silently flipped.
+    #[tokio::test]
+    async fn query_raw_twice_same_did_returns_record_both_times() {
+        use crate::native::server::{Relay, RelayConfig};
+        use crate::native::storage::BlobStorageBackend;
+        use std::net::SocketAddr;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
+            .await
+            .unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+
+        let routing_id = [0x22; 32];
+        client
+            .publish_raw(&routing_id, 3600, did_frame(7, b"stable-doc"))
+            .await
+            .unwrap();
+
+        let first = client.query_raw(&routing_id, None, 16).await.unwrap();
+        assert_eq!(first.len(), 1, "first resolution returns the record");
+        let second = client.query_raw(&routing_id, None, 16).await.unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "second resolution of the unchanged DID must STILL return it \
+             (dedup bypassed); a bypass_dedup:false regression makes this empty"
+        );
+        assert_eq!(first, second);
+    }
+
+    /// Control-flow: a `routing_id` that already has a live subscription makes
+    /// `query_raw` fail loudly with `SubscriptionFailed` (collision), never
+    /// silently borrow the live subscription's dedup-filtered stream.
+    #[tokio::test]
+    async fn query_raw_collision_returns_subscription_failed() {
+        use crate::native::server::{Relay, RelayConfig};
+        use crate::native::storage::BlobStorageBackend;
+        use std::net::SocketAddr;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
+            .await
+            .unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+
+        let routing_id = [0x33; 32];
+        let _rx = client.subscribe(&routing_id, None).await.unwrap();
+
+        let err = client
+            .query_raw(&routing_id, None, 16)
+            .await
+            .expect_err("query_raw on a subscribed routing_id must fail");
+        assert!(
+            matches!(err, TransportError::SubscriptionFailed(_)),
+            "expected SubscriptionFailed, got {err:?}"
+        );
+    }
+
+    /// Control-flow: the client-side `limit` cap holds even against a relay that
+    /// IGNORES the wire `limit` and floods more blobs (a non-validating/foreign
+    /// transport). The scripted relay returns 5 blobs regardless of the request;
+    /// `query_raw(limit = 2)` must collect exactly 2.
+    #[tokio::test]
+    async fn query_raw_caps_collected_blobs_at_limit() {
+        let url = start_scripted_relay(|msg| match msg {
+            ClientMessage::Publish { ref_id, .. } => vec![RelayMessage::Ok {
+                ref_id: ref_id.clone(),
+                blob_id: None,
+            }],
+            ClientMessage::Query {
+                ref_id, routing_id, ..
+            } => {
+                let mut out: Vec<RelayMessage> = (0..5u8)
+                    .map(|i| {
+                        let blob = vec![i; 8];
+                        let blob_id = *crate::traits::BlobId::from_sha256(&blob).as_bytes();
+                        RelayMessage::Blob {
+                            routing_id: *routing_id,
+                            blob_id,
+                            recipient_hint: None,
+                            blob_ttl: 3600,
+                            stored_at: 1_700_000_000,
+                            blob,
+                        }
+                    })
+                    .collect();
+                out.push(RelayMessage::Event {
+                    ref_id: ref_id.clone(),
+                    event_type: "query_complete".to_string(),
+                });
+                out
+            }
+            _ => Vec::new(),
+        })
+        .await;
+
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+        let got = client.query_raw(&[0x44; 32], None, 2).await.unwrap();
+        assert_eq!(
+            got.len(),
+            2,
+            "client must cap at the requested limit even when the relay floods"
+        );
+    }
+
+    /// RAII cleanup (SCP-RELAYRES-002 HIGH): a `query_raw` future dropped
+    /// mid-flight (the composer cancels each per-relay query at 5s) must NOT leak
+    /// its temporary subscription. The scripted relay sends a blob but NEVER
+    /// `query_complete`, so `query_raw` blocks; we cancel it via a short timeout,
+    /// then issue a SECOND `query_raw` for the SAME `routing_id`. If the first
+    /// leaked its subscription, the second returns `SubscriptionFailed`
+    /// immediately (a fast `Ok(Err(..))`); with the RAII guard it instead gets
+    /// past the collision check and blocks again (a timeout `Err`).
+    #[tokio::test]
+    async fn query_raw_cancellation_cleans_up_subscription() {
+        let url = start_scripted_relay(|msg| match msg {
+            // Return a single blob but deliberately OMIT query_complete, so the
+            // collect loop never terminates on its own.
+            ClientMessage::Query { routing_id, .. } => {
+                let blob = vec![0xEE; 8];
+                let blob_id = *crate::traits::BlobId::from_sha256(&blob).as_bytes();
+                vec![RelayMessage::Blob {
+                    routing_id: *routing_id,
+                    blob_id,
+                    recipient_hint: None,
+                    blob_ttl: 3600,
+                    stored_at: 1_700_000_000,
+                    blob,
+                }]
+            }
+            _ => Vec::new(),
+        })
+        .await;
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+        let routing_id = [0x88; 32];
+
+        // First query_raw: blocks (no query_complete). Cancel it via timeout.
+        let first = tokio::time::timeout(
+            Duration::from_millis(300),
+            client.query_raw(&routing_id, None, 16),
+        )
+        .await;
+        assert!(
+            first.is_err(),
+            "first query_raw should be cancelled (relay never sends query_complete)"
+        );
+
+        // Second query_raw for the SAME routing_id must NOT collide — the
+        // cancelled first must have removed its subscription. If it leaked, this
+        // returns SubscriptionFailed immediately (Ok(Err)), so the timeout would
+        // resolve as Ok, not Err.
+        let second = tokio::time::timeout(
+            Duration::from_millis(300),
+            client.query_raw(&routing_id, None, 16),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "second query_raw must get past the collision check (proving cleanup); \
+             a leaked subscription would make it return SubscriptionFailed immediately"
+        );
+    }
+
+    /// `publish_raw` rejects a `blob_ttl` that overflows the u32 wire field
+    /// before touching the sink (a connected client still fails closed).
+    #[tokio::test]
+    async fn publish_raw_rejects_overflowing_ttl() {
+        let url = start_silent_ws_server().await;
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+
+        let err = client
+            .publish_raw(&[0x55; 32], u64::from(u32::MAX) + 1, vec![1, 2, 3])
+            .await
+            .expect_err("overflowing blob_ttl must be rejected");
+        // Assert the specific overflow message, not merely the SendFailed
+        // variant: the u32 guard fires before any send (the silent server never
+        // responds), so isolating the message proves the overflow branch — a
+        // regression removing the guard would surface a different error, not
+        // this one.
+        assert!(
+            matches!(&err, TransportError::SendFailed(msg) if msg.contains("exceeds u32 wire limit")),
+            "expected SendFailed(\"…exceeds u32 wire limit\") for overflowing ttl, got {err:?}"
+        );
+    }
+
+    /// `publish_raw` maps a relay `ERR` response to `SendFailed`.
+    #[tokio::test]
+    async fn publish_raw_maps_relay_err() {
+        let url = start_scripted_relay(|msg| match msg {
+            ClientMessage::Publish { ref_id, .. } => vec![RelayMessage::Err {
+                ref_id: ref_id.clone(),
+                code: 4001,
+                msg: "rejected".to_string(),
+            }],
+            _ => Vec::new(),
+        })
+        .await;
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+
+        let err = client
+            .publish_raw(&[0x66; 32], 3600, vec![9, 9, 9])
+            .await
+            .expect_err("relay ERR must surface");
+        assert!(
+            matches!(err, TransportError::SendFailed(_)),
+            "expected SendFailed, got {err:?}"
+        );
+    }
+
+    /// `publish_raw` maps an unexpected (non-Ok/non-Err) relay response to
+    /// `ProtocolError`. A ref_id-bearing EVENT is routed to the pending request
+    /// by dispatch, so `send_request` returns it and `publish_raw`'s catch-all
+    /// arm fires.
+    #[tokio::test]
+    async fn publish_raw_maps_unexpected_response() {
+        let url = start_scripted_relay(|msg| match msg {
+            ClientMessage::Publish { ref_id, .. } => vec![RelayMessage::Event {
+                ref_id: ref_id.clone(),
+                event_type: "unexpected".to_string(),
+            }],
+            _ => Vec::new(),
+        })
+        .await;
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+
+        let err = client
+            .publish_raw(&[0x77; 32], 3600, vec![1])
+            .await
+            .expect_err("unexpected response must surface");
+        assert!(
+            matches!(err, TransportError::ProtocolError(_)),
+            "expected ProtocolError, got {err:?}"
         );
     }
 }

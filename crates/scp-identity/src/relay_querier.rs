@@ -34,13 +34,25 @@ use crate::dht::extract_public_key;
 use crate::resolution::{RelayQuerier, did_routing_id, verify_relay_record};
 use crate::resolver::{MultiRelayQuerier, RelayRecord};
 
-/// Maximum number of candidates to verify per relay per resolve call.
+/// The relay QUERY `limit` and the per-relay candidate-verification budget —
+/// one canonical `N = 16` (§3.10.2).
 ///
-/// Bounds the Ed25519 verification budget against a malicious or compromised
-/// relay that returns a huge candidate list. An honest relay in the typical
-/// case stores O(1) co-located frames; this cap provides defense-in-depth
-/// without constraining any realistic honest-relay workload.
-const MAX_CANDIDATES_PER_RELAY: usize = 16;
+/// This is the single source of truth for `N`, serving both roles the spec
+/// pins to the same value so they cannot drift:
+///
+/// - **QUERY `limit: N`** (§3.10.2) — the production single-relay querier
+///   (`TransportRelayQuerier` in `scp-transport`, which reuses this constant)
+///   asks each relay for at most `N` candidates. `limit: N` dominates `limit: 1`
+///   and defeats intra-relay shadowing on a non-validating relay.
+/// - **Verification budget** — this composer verifies at most `N` candidates per
+///   relay, bounding the Ed25519 cost against a malicious relay that returns a
+///   huge candidate list. An honest relay stores O(1) co-located frames, so the
+///   cap never constrains a realistic honest-relay workload.
+///
+/// Reused across the crate boundary (rather than re-declared in `scp-transport`)
+/// so there is exactly one `N`, per SCP-RELAYRES-002 "reuse/converge, don't add
+/// a third constant".
+pub const MAX_CANDIDATES_PER_RELAY: usize = 16;
 
 /// Per-relay wall-clock budget applied to each concurrent relay query.
 ///
@@ -420,6 +432,53 @@ mod tests {
         assert_eq!(
             record.seq, 5,
             "fresh record (seq=5) must win over stale (seq=1) — first-valid would return 1"
+        );
+    }
+
+    /// Combined intra-relay shadow-defeat (§3.10.4 step 5, §3.10.7, §3.10.8):
+    /// the genuine HIGHEST-seq record is co-located with BOTH a stale-but-valid
+    /// record AND a decodable-but-bad-signature record at the SAME relay, in the
+    /// worst insertion order (junk first). The composer must still return the
+    /// genuine highest-seq record — proving the #2226 first-valid selection is
+    /// gone (first-valid would return the stale seq=2 or skip to whatever
+    /// verifies first, never the seq=9 genuine record). This is the composer-side
+    /// half of the raw-query "genuine blob not dropped on repeat/co-located
+    /// query" acceptance criterion; the transport-side half (undecodable
+    /// co-located blobs) lives in `scp-transport`'s `TransportRelayQuerier`
+    /// integration tests, since undecodable blobs are dropped at frame-decode
+    /// before the composer ever sees them.
+    #[tokio::test]
+    async fn highest_seq_wins_over_stale_and_bad_sig_colocated() {
+        let (vk, sk) = make_ed25519_keypair();
+        let did = did_from_public_key(&vk);
+        let routing_id = did_routing_id(&did);
+
+        // Bad-signature record FIRST (a planted shadow), then a stale-but-valid
+        // record, then the genuine current record LAST — the worst order for a
+        // first-valid selector.
+        let mut bad = signed_record(&did, vk.as_bytes(), &sk, 5);
+        bad.signature[0] ^= 0xFF;
+        let stale = signed_record(&did, vk.as_bytes(), &sk, 2);
+        let genuine = signed_record(&did, vk.as_bytes(), &sk, 9);
+
+        let inner = InMemoryRelayQuerier::new();
+        for rec in [bad, stale, genuine] {
+            inner
+                .insert("wss://relay-a.example.com/scp/v1", &routing_id, rec)
+                .await;
+        }
+
+        let composer = RealMultiRelayQuerier::new(Arc::new(inner));
+        let result = composer
+            .query(&did, &["wss://relay-a.example.com/scp/v1".to_owned()])
+            .await
+            .unwrap();
+
+        let record = result.expect("the genuine highest-seq record must resolve");
+        assert_eq!(
+            record.seq, 9,
+            "genuine seq=9 must win over stale seq=2 and the bad-sig shadow — \
+             first-valid selection would not return 9"
         );
     }
 
