@@ -293,7 +293,8 @@ fn sequence_gap_receiver_tracker_cancels_with_6131() {
         );
         if let GapOutcome::Cancelled { code } = tracker.observe(chunk.sequence) {
             assert_eq!(
-                code, "SCP-OUTLET-6131",
+                code,
+                scp_core::context::outlets::error_codes::CODE_EXECUTION_CREDIT,
                 "gap cancels with the consolidated code"
             );
             cancelled_at = Some(chunk.sequence);
@@ -571,7 +572,8 @@ mod live {
                 ChunkPayload::Error { code, terminal, .. } => {
                     assert!(*terminal, "the error chunk is terminal");
                     assert_eq!(
-                        code, "SCP-OUTLET-6130",
+                        code,
+                        scp_core::context::outlets::error_codes::CODE_EXECUTION_FAULT,
                         "handler fault maps to CODE_EXECUTION_FAULT"
                     );
                 }
@@ -625,7 +627,9 @@ mod live {
             if let Err(e) = scp.outlet_stream_cancel(py, &handle_id, &invoker) {
                 let msg = e.to_string();
                 assert!(
-                    !msg.contains("SCP-OUTLET-6110"),
+                    !msg.contains(
+                        scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED
+                    ),
                     "a correctly bridge-signed cancel must not be a signature/auth failure: {msg}"
                 );
             }

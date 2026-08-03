@@ -139,11 +139,12 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
     // framework terminal fires fast; short cancel-ack so the cancellation
     // vector's forced terminal fires fast. Large elsewhere so a well-credited
     // stream never spuriously stalls.
-    let credit_stall_secs = if vec.expected_error_code.as_deref() == Some("SCP-OUTLET-6133") {
-        1
-    } else {
-        3_600
-    };
+    let credit_stall_secs =
+        if vec.expected_error_code.as_deref() == Some(scp_protocol::CODE_EXECUTION_CREDIT_STALL) {
+            1
+        } else {
+            3_600
+        };
     let cancel_ack_secs = if vec.expected_end_status == EndStatus::Cancelled {
         1
     } else {

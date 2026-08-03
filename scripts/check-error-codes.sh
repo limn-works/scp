@@ -7,6 +7,12 @@
 #           used for semantically different errors.
 # Phase 3: Registry in-band uniqueness — each code literal is defined by
 #           exactly one constant in error_codes.rs (one number, one purpose).
+# Phase 4: Outlet 6100-6199 sub-block conformance (SCP-OUT-030, spec §5.4.4).
+#           Validates the compact outlet-error registry
+#           (crates/scp-protocol/src/context/outlets/error_codes.rs): every
+#           live SCP-OUTLET-61NN literal is allocated there, every allocated
+#           code is mapped to a class, and each of the 8 OutletErrorClass
+#           variants has its literal present. Lists all 8 classes each run.
 #
 # Canonical prefixes and ranges:
 #   SCP-IDENT-   1000-1999    SCP-CTX-     2000-2999
@@ -322,6 +328,161 @@ if [[ -f "$REGISTRY_FILE" ]]; then
 else
     echo "VIOLATION: registry file $REGISTRY_FILE not found"
     VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 4: Outlet 6100-6199 sub-block conformance (SCP-OUT-030, spec §5.4.4).
+#
+# The registry crates/scp-protocol/src/context/outlets/error_codes.rs is the
+# single source of truth for the compact §5.4.4 outlet-error code set (the
+# `pub const CODE_* = "SCP-OUTLET-61NN"` definitions, collected in ALL_CODES).
+#
+# This phase is deliberately SOUND-BY-CONSTRUCTION and lexer-free. It splits
+# by language:
+#
+#   (0) ALLOCATE — extract the allocated 6100-6199 codes from the registry's
+#       `CODE_*` const definitions (the authoritative allocated set).
+#
+#   (1a) RUST — forbid raw literals outside the registry. Rust code MUST
+#        reference the `CODE_*` constants, never a raw "SCP-OUTLET-61NN" string
+#        literal. The ONLY .rs file permitted to contain such literals is the
+#        registry itself. Because no raw literal exists anywhere else, a raw
+#        literal in ANY other .rs file — test or not — is a violation. This
+#        needs NO #[cfg(test)] / comment discrimination (no brace-counting, no
+#        lexer): the rule is a trivial grep. The rare legitimate exception (a
+#        code named in a block/doc/trailing comment, or a fixture that
+#        genuinely needs a reserved literal) opts out with an `SCP-CODE-OK:`
+#        marker on the same line.
+#
+#   (1b) SDK BINDINGS (Kotlin/Swift/Python/TypeScript/JS) — the language SDKs
+#        legitimately RESTATE the codes as string literals (they cannot
+#        reference the Rust consts), so this is a genuine cross-language drift
+#        check that `cargo test` cannot provide: every restated literal MUST be
+#        in the allocated set. SDK TEST files are excluded by PATH glob (never
+#        by comment/brace parsing).
+#
+#   (3) CLASS-LIST — print the 8 OutletErrorClass variants each run for
+#       operator legibility. This is a PRINTOUT ONLY. The invariant "every
+#       allocated code maps to a class" is enforced soundly IN RUST — the
+#       exhaustive `error_code_to_class` match plus the
+#       `all_codes_lists_exactly_the_defined_code_constants` and
+#       `every_allocated_code_resolves_*` unit tests in error_codes.rs — and is
+#       NOT re-parsed here (re-checking a compile-time match with awk would be
+#       redundant and can only rot).
+#
+# WHY closed-by-construction (not a denylist). The permitted set is EXACTLY the
+# registry's allocated consts — a positive whitelist that grows only when a new
+# `CODE_*` constant is added to the registry. Reserved codes (6111, 6134,
+# 6180-6199, …) never appear as raw literals in shipped Rust, and the check
+# NEVER enumerates reserved spellings, so it cannot drift into a denylist.
+# ---------------------------------------------------------------------------
+
+OUTLET_REGISTRY="crates/scp-protocol/src/context/outlets/error_codes.rs"
+OUTLET_ERRORS="crates/scp-protocol/src/context/outlets/errors.rs"
+
+if [[ ! -f "$OUTLET_REGISTRY" ]]; then
+    echo "VIOLATION: outlet registry file $OUTLET_REGISTRY not found"
+    VIOLATIONS=$((VIOLATIONS + 1))
+elif [[ ! -f "$OUTLET_ERRORS" ]]; then
+    echo "VIOLATION: outlet errors file $OUTLET_ERRORS not found"
+    VIOLATIONS=$((VIOLATIONS + 1))
+else
+    echo ""
+    echo "Phase 4: outlet 6100-6199 sub-block conformance (§5.4.4)."
+
+    # (0) Allocated codes. The `pub const CODE_* = "SCP-OUTLET-61NN"` definitions
+    #     in the registry are the authoritative allocated set.
+    ALLOCATED_CODES=$(grep -oE 'pub const CODE_[A-Z_]+: &str = "SCP-OUTLET-61[0-9][0-9]"' "$OUTLET_REGISTRY" \
+        | grep -oE 'SCP-OUTLET-61[0-9][0-9]' | sort -u)
+    ALLOCATED_ONELINE=" $(printf '%s' "$ALLOCATED_CODES" | tr '\n' ' ') "
+    allocated_count=$(printf '%s\n' "$ALLOCATED_CODES" | grep -c . || true)
+    echo "  Allocated 6100-6199 codes: $allocated_count"
+
+    # (3) Operator legibility: print the 8 OutletErrorClass variants each run.
+    #     Source of truth is the enum in errors.rs. This is a PRINTOUT ONLY —
+    #     the "every allocated code maps to a class" invariant is enforced in
+    #     Rust (error_codes.rs: exhaustive `error_code_to_class` match +
+    #     `all_codes_lists_exactly_the_defined_code_constants` +
+    #     `every_allocated_code_resolves_*` tests), never re-parsed here.
+    OUTLET_CLASSES=$(awk '
+        /pub enum OutletErrorClass \{/ { f=1; next }
+        f && /^\}/                     { f=0 }
+        f && /^[[:space:]]+[A-Z][A-Za-z0-9]+,[[:space:]]*$/ {
+            name=$1; sub(/,.*/,"",name); print name
+        }' "$OUTLET_ERRORS")
+    echo "  OutletErrorClass variants (§5.4.4):"
+    for cls in $OUTLET_CLASSES; do
+        echo "    - $cls"
+    done
+
+    # (1a) RUST: no raw outlet-code literal outside the registry. Rust MUST
+    #      reference the `CODE_*` constants. The registry file itself is the sole
+    #      exception (it defines the consts; its #[cfg(test)] module exercises
+    #      reserved ranges). A raw double-quoted literal in any other .rs file —
+    #      test or not — is a violation, so no #[cfg(test)]/comment parsing is
+    #      needed. `SCP-CODE-OK:` on the line opts out a rare legitimate case.
+    while IFS=: read -r f ln content; do
+        # Exclude the registry file itself — the sole .rs allowed to hold raw
+        # sub-block literals. Anchor on the PARSED PATH FIELD ($f), not a
+        # `grep -v` over the whole `path:lineno:content` line (which a raw
+        # literal on a line whose *content* mentions the registry path could
+        # otherwise slip past). Exact-path compare — NOT a basename --exclude —
+        # because crates/scp-ffi/common/src/error_codes.rs is a DIFFERENT
+        # error_codes.rs that must still be scanned.
+        case "$f" in ./"$OUTLET_REGISTRY"|"$OUTLET_REGISTRY") continue ;; esac
+        case "$content" in *"SCP-CODE-OK:"*) continue ;; esac
+        code=$(printf '%s' "$content" | grep -oE 'SCP-OUTLET-61[0-9][0-9]' | head -1)
+        echo "VIOLATION: $f:$ln: raw outlet-code literal \"$code\" in Rust outside the registry —"
+        echo "    reference the CODE_* constant from $OUTLET_REGISTRY instead"
+        echo "    (or add an SCP-CODE-OK: marker if this is a comment / reserved-range fixture)."
+        VIOLATIONS=$((VIOLATIONS + 1))
+    done < <(
+        grep -rnE '"SCP-OUTLET-61[0-9][0-9]"' \
+            --include='*.rs' \
+            --exclude-dir='.git' \
+            --exclude-dir='.claude' \
+            --exclude-dir='target' \
+            . 2>/dev/null || true
+    )
+
+    # (1b) SDK bindings (Kotlin/Swift/Python/TypeScript/JS): the SDKs restate the
+    #      codes as string literals (they cannot reference the Rust consts), so
+    #      every restated literal MUST be in the allocated set — a genuine
+    #      cross-language drift check. TEST files are excluded by PATH glob only.
+    #      `SCP-CODE-OK:` opts out a line (e.g. a negative-test fixture).
+    #
+    #      Matches BOTH double- and single-quoted literals (Python/JS/TS allow
+    #      single quotes) so the gate does not depend on ruff/biome quote
+    #      normalization. Explicit quote-matched alternation — not a `["']…["']`
+    #      character class — so a mismatched-quote string cannot over-match.
+    while IFS=: read -r f ln content; do
+        case "$f" in
+            */tests/*|*/Tests/*|*/test/*|*Test.kt|*Tests.swift|test_*.py|*_test.py|*.test.ts|*.test.js|*.spec.ts) continue ;;
+        esac
+        case "$content" in *"SCP-CODE-OK:"*) continue ;; esac
+        for code in $(printf '%s' "$content" | grep -oE 'SCP-OUTLET-61[0-9][0-9]'); do
+            case "$ALLOCATED_ONELINE" in
+                *" $code "*) : ;;  # allocated — ok
+                *)
+                    echo "VIOLATION: $f:$ln: SDK outlet-code literal $code is not allocated in $OUTLET_REGISTRY (§5.4.4 6100-6199 sub-block)"
+                    VIOLATIONS=$((VIOLATIONS + 1))
+                    ;;
+            esac
+        done
+    done < <(
+        grep -rnE '("SCP-OUTLET-61[0-9][0-9]"|'\''SCP-OUTLET-61[0-9][0-9]'\'')' \
+            --include='*.kt' \
+            --include='*.swift' \
+            --include='*.py' \
+            --include='*.ts' \
+            --include='*.js' \
+            --exclude-dir='.git' \
+            --exclude-dir='.claude' \
+            --exclude-dir='node_modules' \
+            --exclude-dir='build' \
+            --exclude-dir='target' \
+            . 2>/dev/null || true
+    )
 fi
 
 if [[ $VIOLATIONS -gt 0 ]]; then

@@ -122,6 +122,86 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13067` | supervisor | Generic saga terminal abort with no specific sub-code (e.g. Prepare-phase 30s timeout, journal I/O failure) — the message string carries the specific cause |
 | `SCP-SAGA-13068` | supervisor | `ParticipantUnavailable` — Prepare-phase abort: participant actor unavailable to complete the Prepare exchange — inbox closed/terminated (transient, retryable) |
 
+### Registered SCP-OUTLET- codes: the 6100-6199 sub-block (outlet error taxonomy, §5.4.4)
+
+Within the `SCP-OUTLET-` band (`6000-6999`) the **`6100-6199` sub-block** is the
+compact outlet-error taxonomy defined by spec §5.4.4. Unlike the free-form
+remainder of the band, this sub-block is a **registry**: the single source of
+truth is `crates/scp-protocol/src/context/outlets/error_codes.rs`, where every
+allocated code is a `pub const CODE_* = "SCP-OUTLET-61NN"` constant (collected in
+the `ALL_CODES` array). The taxonomy is deliberately *compact* — roughly one to
+two codes per class — because fine-grained distinctions are carried by a
+dot-separated **slug**, not by minting new codes. New failure conditions become
+new slugs under an existing code; a new *code* is minted only when a condition
+needs a distinct machine-actionable number.
+
+Every `OutletError` carries exactly one of **eight** root classes
+(`OutletErrorClass`, defined in `outlets/errors.rs`). Each class owns a
+contiguous decimal sub-range inside `6100-6199`:
+
+| Class | Code sub-range | Meaning |
+|-------|----------------|---------|
+| `Protocol` | `6100-6109` | Registration, validation, classification, session-lifecycle violations |
+| `Authorization` | `6110-6119` | UCAN / caveat / capability / attenuation / amplification denials |
+| `Input` | `6120-6129` | Input schema, size, type, range violations |
+| `Execution` | `6130-6139` | Handler panic, timeout, non-determinism, credit / stream exhaustion, cancel-ack timeout |
+| `Output` | `6140-6149` | Output schema, size, serialization violations |
+| `Economic` | `6150-6159` | Budget, insufficient funds, adapter failure, pricing, escrow overflow |
+| `Transport` | `6160-6169` | Relay unavailable, cross-context bridge failure, rate limiting, concurrency caps |
+| `Governance` | `6170-6179` | Deregistration, suspension, ceiling exceeded, active consequence |
+
+The reserved tail `6180-6199` and every intra-class gap (`6111`, `6134`, …) are
+**unallocated**: `error_code_to_class`, `error_code_to_default_slug`, and
+`error_code_to_retry_policy` all return "none" for them. Reserving the gaps lets
+a future condition that genuinely needs its own code take a stable number
+without renumbering. The one cross-class slug is `protocol.interface-spam-cost`,
+which carries a `protocol.` prefix but maps to the **`Economic`** class (code
+`SCP-OUTLET-6150`) — the fee-insufficient rejection is economic, but the rule
+lives at the protocol layer (§6.2.0.1). See spec §5.4.4 for the authoritative
+per-code default-slug and retry-policy table.
+
+**Rust code MUST reference the `CODE_*` constants — never a raw
+`"SCP-OUTLET-61NN"` string literal.** The registry file is the single place a
+raw sub-block literal may appear (it defines the consts, and its `#[cfg(test)]`
+module exercises reserved ranges). Everywhere else in Rust — production or test
+— the code is named via its `CODE_*` constant. This gives one source of truth
+and makes the gate sound-by-construction without any source lexing.
+
+`scripts/check-error-codes.sh` **Phase 4** (SCP-OUT-030) enforces the sub-block.
+It is deliberately split by language so each half is sound and trivial:
+
+- **(0) Allocated set.** Extract the allocated `6100-6199` codes from the
+  registry's `CODE_*` const definitions (a positive, closed-by-construction
+  whitelist).
+- **(1a) Rust — no raw literals outside the registry.** Any raw double-quoted
+  `"SCP-OUTLET-61NN"` literal in *any* `.rs` file except the registry — test or
+  not — is a violation. Because no raw literal exists elsewhere, the check needs
+  **no** `#[cfg(test)]`/comment discrimination (no brace-counting, no lexer): it
+  is a plain grep. A rare legitimate exception (a code named in a block/doc
+  comment, or a fixture that genuinely needs a reserved literal) opts out with
+  an `SCP-CODE-OK:` marker on the line.
+- **(1b) SDK bindings — allocated-set membership.** The language SDKs
+  (Kotlin/Swift/Python/TypeScript) legitimately *restate* the codes as string
+  literals and cannot reference the Rust consts, so every restated literal must
+  be in the allocated set. This is a genuine cross-language drift check that
+  `cargo test` cannot provide. SDK **test** files are excluded by path glob
+  (never by comment/brace parsing).
+- **(3) Class list.** The 8 `OutletErrorClass` variants are printed on every run
+  for operator legibility. This is a printout only.
+
+The "every allocated code maps to a class" invariant is **not** re-checked in
+shell (parsing a compile-time `match` with awk would be redundant and could only
+rot). It is enforced soundly in Rust, in `error_codes.rs`: the exhaustive
+`error_code_to_class` match, plus two unit tests —
+`all_codes_lists_exactly_the_defined_code_constants` (every defined `CODE_*` is
+in `ALL_CODES`) and `every_allocated_code_resolves_class_default_slug_retry_policy`
+(every `ALL_CODES` entry resolves to a class/slug/retry) — together pin it at
+compile/test time.
+
+Adding a code is therefore a single edit: add its `pub const CODE_*` to the
+registry (which, by construction, expands the allowed set) and wire it into
+`error_code_to_class`. No gate edit is required.
+
 ### Registered SCP-CTX- / SCP-CRYPTO- / SCP-TRANS- / SCP-VALID- codes (native registry vs. browser participant)
 
 The native FFI-common registry (`crates/scp-ffi/common/src/error_codes.rs`) is

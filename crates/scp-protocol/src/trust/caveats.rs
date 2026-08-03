@@ -67,8 +67,11 @@ pub const MAX_LIST_ENTRIES: usize = 16;
 pub const MAX_RATE_WINDOW_SECS: u32 = 86_400;
 
 /// Numeric error code for mint-time and mask-width caveat failures (§7.3.8).
-/// Allocated within the SCP-OUTLET-6100..6199 sub-block.
-pub const CAVEAT_MINT_LIMIT_EXCEEDED_CODE: &str = "SCP-OUTLET-6114";
+///
+/// Allocated within the SCP-OUTLET-6100..6199 sub-block; the single source of
+/// truth for the literal is the outlet error-code registry.
+pub const CAVEAT_MINT_LIMIT_EXCEEDED_CODE: &str =
+    crate::context::outlets::error_codes::CODE_AUTHORIZATION_ATTENUATION;
 
 // ---------------------------------------------------------------------------
 // HoursOfDayMask
@@ -2649,7 +2652,6 @@ mod tests {
         nine.input_schema = Some(json!({"type": "string"}));
         let err = InvocationCaveats::try_new(nine).unwrap_err();
         assert_eq!(err.code(), CAVEAT_MINT_LIMIT_EXCEEDED_CODE);
-        assert_eq!(err.code(), "SCP-OUTLET-6114");
         assert_eq!(err.slug(), "caveat-mint-limit-exceeded");
     }
 

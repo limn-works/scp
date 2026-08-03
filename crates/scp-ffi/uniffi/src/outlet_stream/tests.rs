@@ -463,7 +463,8 @@ async fn live_poll_next_drains_to_terminal() {
     // signature/authorization failure (SCP-OUTLET-6110).
     if let Err(e) = outlet_stream_grant_credit_impl(&bi, &handle_id, &invoker, 1).await {
         assert!(
-            !format!("{e}").contains("SCP-OUTLET-6110"),
+            !format!("{e}")
+                .contains(scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED),
             "a correctly bridge-signed grant must not be rejected as a signature/auth failure: {e}"
         );
     }
@@ -696,7 +697,7 @@ mod streaming_vectors_live {
     }
 
     /// `error_terminal` (§5.4.5): a faulting single-shot handler maps to a
-    /// framework terminal `Error{terminal:true, code:"SCP-OUTLET-6130"}`.
+    /// framework terminal `Error{terminal:true, code: SCP-OUTLET-6130}`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn error_terminal_vector_maps_handler_fault_to_6130_live() {
         use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk as Chunk};
@@ -727,7 +728,7 @@ mod streaming_vectors_live {
         }
         assert_eq!(
             terminal_code.as_deref(),
-            Some("SCP-OUTLET-6130"),
+            Some(scp_core::context::outlets::error_codes::CODE_EXECUTION_FAULT),
             "a faulting handler yields a terminal Error with the execution-fault code"
         );
     }
@@ -763,7 +764,8 @@ mod streaming_vectors_live {
 
         if let Err(e) = outlet_stream_cancel_impl(&fx.bi, &fx.handle_id, &fx.invoker).await {
             assert!(
-                !format!("{e}").contains("SCP-OUTLET-6110"),
+                !format!("{e}")
+                    .contains(scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED),
                 "a correctly bridge-signed cancel must not be a signature/auth failure: {e}"
             );
         }
