@@ -39,6 +39,7 @@ use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::crypto::sender_keys::MergePolicy;
 
+use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::supervisor::floors::FloorAdvanceError;
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
@@ -335,13 +336,13 @@ impl SupervisorHandle {
         // pin the caller forever. On elapse, fail-closed with the retryable
         // `ActorBusy` class; the existing dropped-channel `TransportFailed`
         // behavior is preserved exactly.
-        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
-            Ok(reply) => reply.map_err(|_| {
-                ContextError::TransportFailed(
-                    "dispatch_recovery_send_notification: oneshot reply channel closed".to_owned(),
-                )
-            })?,
-            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+        match bounded_reply_await(reply_rx).await {
+            // Handler verdict rides through untouched.
+            Ok(reply) => reply,
+            Err(BoundedReplyError::Dropped) => Err(ContextError::TransportFailed(
+                "dispatch_recovery_send_notification: oneshot reply channel closed".to_owned(),
+            )),
+            Err(BoundedReplyError::Elapsed) => Err(ContextError::ActorBusy(format!(
                 "context actor did not reply within {} seconds",
                 crate::context::actor::REPLY_TIMEOUT.as_secs()
             ))),
@@ -655,10 +656,14 @@ impl SupervisorHandle {
         // would hang the caller forever. On elapse, fail-closed with a
         // retryable `ActorBusy` — the actor keeps running; we only drop our
         // own receiver.
-        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
-            Ok(reply) => reply
-                .unwrap_or_else(|_| Err(ContextError::ContextNotRegistered(context_id.to_owned()))),
-            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+        match bounded_reply_await(reply_rx).await {
+            // Handler verdict rides through untouched.
+            Ok(reply) => reply,
+            // Dropped reply sender → stale handle: signal the caller to re-`lookup`.
+            Err(BoundedReplyError::Dropped) => {
+                Err(ContextError::ContextNotRegistered(context_id.to_owned()))
+            }
+            Err(BoundedReplyError::Elapsed) => Err(ContextError::ActorBusy(format!(
                 "context actor did not reply within {} seconds",
                 crate::context::actor::REPLY_TIMEOUT.as_secs()
             ))),
@@ -859,18 +864,18 @@ impl SupervisorHandle {
         // caller forever. On elapse (as on an install failure) we log and
         // move on; the actor's own `reconcile_timers` re-arms from the
         // recorded deadline regardless.
-        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
-            Ok(Ok(Err(e))) => {
+        match bounded_reply_await(reply_rx).await {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     context_id,
                     error = %e,
                     "dispatch_start_ttl_timer: actor reported TTL timer install failure"
                 );
             }
-            // Recv-ok + handler-ok, or the actor dropped the reply channel:
-            // nothing to do (matches the prior best-effort behavior).
-            Ok(_) => {}
-            Err(_elapsed) => {
+            // Handler confirmed install (Ok), or the actor dropped the reply
+            // channel: nothing to do (matches the prior best-effort behavior).
+            Ok(Ok(())) | Err(BoundedReplyError::Dropped) => {}
+            Err(BoundedReplyError::Elapsed) => {
                 tracing::warn!(
                     context_id,
                     "dispatch_start_ttl_timer: actor did not confirm TTL timer install \

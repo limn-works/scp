@@ -52,6 +52,10 @@ pub use commands::{
 };
 pub use deps::ActorDeps;
 pub use handle::{ContextActorHandle, REPLY_TIMEOUT, SEND_TIMEOUT};
+// Bounded reply-await mechanics — `pub(crate)` so the supervisor reply-await
+// sites AND the `?Send` recovery path (`crate::identity::recovery`, a sibling
+// of `crate::context`) route through the single helper.
+pub(crate) use handle::{BoundedReplyError, bounded_reply_await};
 pub use outcome::Outcome;
 pub use sequence::{SendSequenceTracker, SequenceReservation};
 pub use state::{

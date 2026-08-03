@@ -846,11 +846,14 @@ impl ProductionRecoveryBackend {
         // oneshot. Propagate a dispatch-level error first (e.g. no
         // supervisor attached) before awaiting the reply.
         self.manager.dispatch_trust_recovery_command(cmd).await?;
-        reply_rx.await.map_err(|_| {
-            scp_protocol::context::ContextError::TransportFailed(
-                "trust-recovery reply channel closed before a result was sent".to_owned(),
-            )
-        })?
+        crate::context::actor::bounded_reply_await(reply_rx)
+            .await
+            .map_err(|_| {
+                scp_protocol::context::ContextError::TransportFailed(
+                    "trust-recovery reply channel closed or timed out before a result was sent"
+                        .to_owned(),
+                )
+            })?
     }
 
     /// Dispatches a `RecoverySendNotification` for a named context

@@ -74,6 +74,57 @@ pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 pub const REPLY_TIMEOUT: Duration = Duration::from_mins(2);
 
 // ---------------------------------------------------------------------------
+// Bounded reply-await mechanics
+// ---------------------------------------------------------------------------
+
+/// Classifies why a bounded reply-await did not yield a handler reply.
+///
+/// The two variants let a caller that wants to distinguish the failure modes
+/// do so (e.g. log "wedged actor" vs "dropped reply channel"); callers that
+/// treat any non-reply uniformly match both with `Err(_)` and never inspect
+/// the value. See [`bounded_reply_await`].
+///
+/// Visibility is `pub(crate)` (not `pub(in crate::context)`) because the
+/// `?Send` recovery reply-await in `crate::identity::recovery` — a sibling of
+/// `crate::context`, not nested within it — routes through the same helper.
+#[derive(Debug)]
+pub(crate) enum BoundedReplyError {
+    /// The actor dropped the reply sender before answering (the underlying
+    /// [`oneshot`] channel closed) — typically a terminated/replaced actor.
+    Dropped,
+    /// The actor did not reply within [`REPLY_TIMEOUT`] — a wedged/deadlocked
+    /// actor whose reply sender is still alive (so the channel never closed).
+    Elapsed,
+}
+
+/// Bounds a reply-oneshot await by [`REPLY_TIMEOUT`] and classifies the
+/// outcome, so a wedged/deadlocked actor (whose reply sender is never dropped)
+/// cannot pin the caller forever.
+///
+/// This is **mechanics only**: it centralizes the
+/// `tokio::time::timeout(REPLY_TIMEOUT, rx).await` + outcome-classification
+/// step shared by every `Supervisor::dispatch_*` reply-await, but it does
+/// **not** unify the callers' dispositions. Each caller keeps its own handling
+/// of the [`BoundedReplyError`] inline — return a typed error, soft-default,
+/// discard, warn-and-continue — exactly as it did with a raw `rx.await`.
+///
+/// `T` is generic — it is the oneshot payload type, which the helper never
+/// inspects (the payload is typically the handler's own
+/// `Result<_, ContextError>`, riding through untouched on the `Ok` arm). The
+/// helper imposes no `Send` bound of its own, so it also works in the `?Send`
+/// recovery path (`identity::recovery`, ADR-049 Decision 7). Visibility is
+/// `pub(crate)` because that recovery path is a sibling of `crate::context`.
+pub(crate) async fn bounded_reply_await<T>(
+    rx: oneshot::Receiver<T>,
+) -> Result<T, BoundedReplyError> {
+    match tokio::time::timeout(REPLY_TIMEOUT, rx).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_dropped)) => Err(BoundedReplyError::Dropped),
+        Err(_elapsed) => Err(BoundedReplyError::Elapsed),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ContextActorHandle
 // ---------------------------------------------------------------------------
 
@@ -485,6 +536,63 @@ mod tests {
             elapsed >= REPLY_TIMEOUT,
             "reply-await must span the full REPLY_TIMEOUT budget before failing \
              closed (elapsed {elapsed:?} < {REPLY_TIMEOUT:?})"
+        );
+    }
+
+    /// [`bounded_reply_await`] must fail closed on a wedged actor: a reply
+    /// sender held alive but NEVER answered elapses to
+    /// [`BoundedReplyError::Elapsed`] after the full [`REPLY_TIMEOUT`] budget
+    /// (not before), rather than pinning the caller forever. `start_paused`
+    /// auto-advances virtual time so the test is deterministic and instant.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_reply_await_elapses_when_actor_never_replies() {
+        // `_tx` stays bound so the sender is never dropped — the receiver
+        // therefore never sees a closed channel and can only elapse.
+        let (_tx, rx) = oneshot::channel::<Result<Option<usize>, ContextError>>();
+
+        let start = tokio::time::Instant::now();
+        let result = bounded_reply_await(rx).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(BoundedReplyError::Elapsed)),
+            "a never-answered reply must classify as Elapsed, got {result:?}"
+        );
+        assert!(
+            elapsed >= REPLY_TIMEOUT,
+            "the await must span the full REPLY_TIMEOUT budget before failing \
+             closed (elapsed {elapsed:?} < {REPLY_TIMEOUT:?})"
+        );
+    }
+
+    /// A dropped reply sender (terminated/replaced actor) classifies as
+    /// [`BoundedReplyError::Dropped`] — distinct from the timeout path — and
+    /// returns promptly (no need to wait out [`REPLY_TIMEOUT`]).
+    #[tokio::test(start_paused = true)]
+    async fn bounded_reply_await_reports_dropped_when_sender_dropped() {
+        let (tx, rx) = oneshot::channel::<Result<Option<usize>, ContextError>>();
+        drop(tx);
+
+        let result = bounded_reply_await(rx).await;
+
+        assert!(
+            matches!(result, Err(BoundedReplyError::Dropped)),
+            "a dropped reply sender must classify as Dropped, got {result:?}"
+        );
+    }
+
+    /// A prompt handler reply passes through untouched on the `Ok` arm — the
+    /// helper is mechanics only and never inspects the payload.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_reply_await_passes_prompt_reply_through() {
+        let (tx, rx) = oneshot::channel::<Result<Option<usize>, ContextError>>();
+        tx.send(Ok(Some(7))).expect("receiver is alive");
+
+        let result = bounded_reply_await(rx).await;
+
+        assert!(
+            matches!(result, Ok(Ok(Some(7)))),
+            "a prompt reply must pass through untouched, got {result:?}"
         );
     }
 
