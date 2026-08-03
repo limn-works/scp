@@ -79,7 +79,7 @@
 //! | **establish** (`publish_frame`, `None` arm) | single-slot | **storage** — reconciles co-located blobs, adopts highest-`seq` valid before evicting | a replayed lower-`seq` frame is rejected; the durable higher-`seq` record is adopted, never purged |
 //! | **supersede / refresh** (`publish_frame`) | single highest-`seq` slot | index + storage `get` liveness | a stale index entry is reverted via `generation`-gated checks; a higher valid `seq` always wins |
 //! | **opaque-PUBLISH rule (a)** (`gate_publish` `NotAFrame`) | reject junk at a claimed slot | **index cache** (fast path) | cold-miss may *accept junk into storage*, but it can never *suppress* — QUERY (below) is storage-authoritative and the next establish/sweep evicts. Made storage-authoritative here would put an unbounded scan on the hot path of every encrypted-context PUBLISH (a worse denial-of-service); the read-path authority is the sound closure |
-//! | **QUERY / SUBSCRIBE-backfill rule (c)** (`gate_query`) | return only the slot | **storage** — re-applies over the `storage.query` result, returns only the highest-`seq` valid frame, warms the index | a cold index returns ONLY the genuine record (no leaked junk); no extra hot-path scan for non-DID `routing_id`s (the query already ran; only its results are classified) |
+//! | **QUERY / SUBSCRIBE-backfill rule (c)** (`gate_query`) | return only the slot | **storage** — re-applies over the `storage.query` result, returns only the highest-`seq` valid frame in the returned set; warms the index **only from a complete scan** (`since=None` and untruncated) | a cold index returns ONLY the genuine record (no leaked junk); no extra hot-path scan for non-DID `routing_id`s (the query already ran; only its results are classified). A partial/windowed scan never warms — so a small-`limit` query can't pin an *older* co-located genuine frame |
 //! | **DELETE rule (d)** (`gate_delete`) | only a superseding PUBLISH may replace a slot | **storage** — decodes+verifies the immutable blob; fails *closed* on storage error; rate-limited | a cold index still refuses to delete a genuine record; content-addressing makes the check-then-delete window benign (availability-only) |
 //! | **live delivery** (`deliver_to_subscribers` on opaque fall-through) | — | n/a (delivery, not a slot decision) | any junk delivered live is filtered by the subscriber's own re-verification (RELAYRES-002) |
 //!
@@ -580,8 +580,19 @@ impl DidSlotRegistry {
     /// 1. index fast-path — a live claimed slot returns only that blob;
     /// 2. otherwise the ordinary `storage.query(since, limit)` runs, and if any
     ///    returned blob is a binding-valid DID frame, only the highest-`seq` valid
-    ///    one is returned (and the index is warmed) — so a **cold index cannot leak
+    ///    one **in the returned set** is returned — so a **cold index cannot leak
     ///    co-located junk** alongside a genuine record after a restart.
+    ///
+    /// The index is **warmed only from a COMPLETE view** of the `routing_id` — an
+    /// untruncated (`blobs.len() < limit`) *and* un-narrowed (`since.is_none()`)
+    /// scan. A partial/windowed scan can pick the highest-valid *within the
+    /// window*, which — if two genuine frames coexist (only possible after a
+    /// best-effort `evict_others` delete failed) — may be the *older* frame;
+    /// warming from that would pin the older frame and hide the newer on this
+    /// relay (an attacker could trigger it with a small `limit`). So a partial
+    /// query still returns the correct highest-valid-in-window blob but never
+    /// warms/pins the index. (Returning the in-window best is correct: the client
+    /// re-verifies and takes the highest `seq` across relays and the DHT.)
     ///
     /// Step 2 adds no extra storage round-trip on the hot path: the
     /// `storage.query` is the one a fall-through QUERY does anyway, and the
@@ -612,9 +623,24 @@ impl DidSlotRegistry {
         if validation == DidRecordValidation::Enabled
             && let Some((best_id, best_seq)) = Self::highest_valid_frame(&routing_id, &blobs)
         {
-            // A cold index missed a genuine frame that storage holds. Warm the
-            // index and return ONLY the highest-seq valid frame (rule (c)).
-            self.warm_slot(routing_id, best_id, best_seq).await;
+            // A cold index missed a genuine frame that storage holds. Return ONLY
+            // the highest-seq valid frame *in the returned set* (rule (c)) — this
+            // is correct for THIS query regardless of windowing; the client
+            // re-verifies and takes the highest `seq` across relays/DHT.
+            //
+            // Warm the index ONLY from a COMPLETE view of the routing_id: an
+            // untruncated (`blobs.len() < limit`) AND un-narrowed (`since.is_none()`)
+            // scan. A partial/windowed scan can pick the highest-valid *within the
+            // window*, which — if two genuine frames coexist in storage (only
+            // possible after a best-effort `evict_others` delete failed) — may be
+            // the OLDER frame. Warming from that would PIN the older frame and
+            // hide the newer on this relay (attacker-triggerable via a small
+            // `limit`). Never warm from a partial view; leave the index cold so
+            // the next complete scan (or a re-establish) sets it correctly.
+            let complete_scan = since.is_none() && (blobs.len() as u64) < u64::from(limit);
+            if complete_scan {
+                self.warm_slot(routing_id, best_id, best_seq).await;
+            }
             if let Some(slot) = blobs.into_iter().find(|b| b.blob_id == best_id) {
                 return Ok(vec![slot]);
             }
@@ -1375,6 +1401,82 @@ mod tests {
         assert!(
             !reg.slots.read().await.contains_key(&rid),
             "index not warmed"
+        );
+    }
+
+    /// Warm-only-on-complete-scan guard: a TRUNCATED cold-index QUERY (a `limit`
+    /// smaller than the co-located blob count) must NOT warm/pin the index to the
+    /// highest-valid frame *in that window* — which, when two genuine frames
+    /// coexist (only possible after a best-effort eviction failed) and the older
+    /// one sorts first, would pin the OLDER frame and hide the newer on this
+    /// relay. The truncated query still returns the in-window best (correct for
+    /// that query); a later COMPLETE scan returns the true newest and warms to it.
+    #[tokio::test]
+    async fn partial_cold_index_query_does_not_warm_to_older_frame() {
+        use super::super::storage::{ClockFn, InMemoryBlobStorage};
+
+        let clock_value = Arc::new(AtomicU64::new(1000));
+        let cv = clock_value.clone();
+        let clock: ClockFn = Arc::new(move || cv.load(Ordering::Relaxed));
+        let storage = BlobStorageBackend::from(InMemoryBlobStorage::with_clock(clock));
+        let reg = DidSlotRegistry::new(); // COLD.
+
+        // Two genuine frames from the SAME DID key coexist in storage (only
+        // reachable after a best-effort `evict_others` delete failed). Store the
+        // OLDER (seq 3) first so it sorts before the newer (seq 9) in an
+        // ascending-`stored_at` query window.
+        let (rid, bid3, frame3) = genuine_frame(80, 3, b"old");
+        let (rid9, bid9, frame9) = genuine_frame(80, 9, b"new");
+        assert_eq!(rid, rid9, "same key ⇒ same routing_id");
+        storage.store(rid, bid3, None, 3600, frame3).await.unwrap();
+        clock_value.store(2000, Ordering::Relaxed);
+        storage.store(rid, bid9, None, 3600, frame9).await.unwrap();
+
+        // Truncating query (limit 1 < 2 co-located): returns the in-window best
+        // (older seq-3), but MUST NOT warm the index.
+        let out = reg
+            .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].blob_id, bid3,
+            "in-window highest-valid is the older frame"
+        );
+        assert!(
+            !reg.slots.read().await.contains_key(&rid),
+            "a partial/truncated scan must NOT warm or pin the index",
+        );
+
+        // A `since`-narrowed query likewise must not warm, even if untruncated.
+        let out = reg
+            .gate_query(DidRecordValidation::Enabled, &storage, rid, Some(0), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            out[0].blob_id, bid9,
+            "since-narrowed still returns in-window best (newest here)"
+        );
+        assert!(
+            !reg.slots.read().await.contains_key(&rid),
+            "a since-narrowed scan must NOT warm the index",
+        );
+
+        // A COMPLETE scan (untruncated, since=None) returns the true newest AND
+        // warms to it — never to the older frame.
+        let out = reg
+            .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].blob_id, bid9,
+            "complete scan returns the true highest-seq frame"
+        );
+        assert_eq!(
+            reg.slots.read().await.get(&rid).unwrap().blob_id,
+            bid9,
+            "complete scan warms to the NEWER frame",
         );
     }
 
