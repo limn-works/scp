@@ -809,15 +809,24 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
     // -----------------------------------------------------------------------
 
     /// Handles a DELETE operation: best-effort deletion from storage, EXCEPT a
-    /// claimed DID slot's blob, which is rejected (§3.10.2 rule (a), Fix B).
+    /// protected DID slot's blob, which is rejected (§3.10.2 rule (d), Fix B).
     async fn handle_delete_inner(
         &self,
         ref_id: Option<String>,
         blob_id: [u8; 32],
     ) -> Result<RelayMessage, WebTransportSessionError> {
-        // Slot-exclusivity: reject a DELETE of a claimed DID slot's blob over
-        // WebTransport, identically to WebSocket/QUIC/UDP. Non-slot blobs proceed.
-        if self.did_slots.is_current_slot_blob(&blob_id).await {
+        // Slot-exclusivity (§3.10.2 rule (d)): reject a DELETE of a protected DID
+        // slot blob over WebTransport, identically to WebSocket/QUIC/UDP. The gate
+        // is STORAGE-BACKED (index is a fast-path cache, not the authority) — it
+        // decodes+verifies the immutable, content-addressed blob, so it is immune
+        // to a cold/empty index. The check-then-delete race is benign (immutable
+        // bytes); residual is the availability-only "published just after check"
+        // window. Non-slot blobs proceed.
+        if self
+            .did_slots
+            .delete_would_revert_slot(self.storage.as_ref(), &blob_id)
+            .await
+        {
             return Ok(RelayMessage::Err {
                 ref_id,
                 code: code::DID_RECORD_REJECTED,

@@ -1233,9 +1233,17 @@ async fn handle_delete<S: BlobStorage>(
     storage: &Arc<S>,
     did_slots: &DidSlotRegistry,
 ) -> Result<(), StreamError> {
-    // Slot-exclusivity: reject a DELETE of a claimed DID slot's blob over QUIC,
-    // identically to WebSocket (§3.10.2 rule (a), Fix B). Non-slot blobs proceed.
-    if did_slots.is_current_slot_blob(&blob_id).await {
+    // Slot-exclusivity (§3.10.2 rule (d)): reject a DELETE of a protected DID
+    // slot blob over QUIC, identically to WebSocket. The gate is STORAGE-BACKED
+    // (index is a fast-path cache, not the authority) — it decodes+verifies the
+    // immutable, content-addressed blob, so it is immune to a cold/empty index.
+    // The check-then-delete race is benign (content-addressed bytes are
+    // immutable); residual is the availability-only "published just after check"
+    // window. Non-slot blobs proceed.
+    if did_slots
+        .delete_would_revert_slot(storage.as_ref(), &blob_id)
+        .await
+    {
         let err = RelayMessage::Err {
             ref_id,
             code: code::DID_RECORD_REJECTED,
@@ -2272,6 +2280,44 @@ mod tests {
         )
         .await;
         assert!(matches!(ok.as_slice(), [RelayMessage::Ok { .. }]));
+
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
+    /// Fix B round 3: the QUIC DELETE gate is storage-backed, so it protects a
+    /// genuine DID record even when the slot index is COLD. Pre-seed the shared
+    /// store directly (index never learns of it), then an attacker DELETE of the
+    /// `blob_id` is rejected and the record survives.
+    #[tokio::test]
+    async fn quic_delete_of_cold_index_did_slot_blob_rejected() {
+        let (handle, addr, certs, storage) = start_test_listener_validating();
+
+        // Deposit a genuine frame straight into the shared store (no PUBLISH), so
+        // the listener's slot index stays cold.
+        let (rid, bid, frame) = genuine_frame(43, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+
+        let connection = connect_client(addr, &certs).await;
+        let deleted = send_and_recv(
+            &connection,
+            &ClientMessage::Delete {
+                ref_id: Some("d".into()),
+                blob_id: bid,
+            },
+        )
+        .await;
+        match deleted.as_slice() {
+            [RelayMessage::Err { code, .. }] => assert_eq!(*code, code::DID_RECORD_REJECTED),
+            other => panic!(
+                "expected DID_RECORD_REJECTED (cold-index storage-backed gate), got {other:?}"
+            ),
+        }
+
+        // The genuine record survives.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
 
         connection.close(0u32.into(), b"done");
         handle.shutdown();

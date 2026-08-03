@@ -1671,12 +1671,21 @@ async fn handle_delete(
     storage: &Arc<BlobStorageBackend>,
     did_slots: &DidSlotRegistry,
 ) {
-    // Slot-exclusivity: reject an (unauthenticated) DELETE of a claimed DID
-    // slot's blob. DID records are public, so blob_id is guessable; allowing this
-    // DELETE would revert the slot and reopen the pre-seed window (§3.10.2 rule
-    // (a) — only a superseding PUBLISH may replace a slot). Non-DID / non-slot
-    // blobs are unaffected (the claimed-slot index never lists them).
-    if did_slots.is_current_slot_blob(&blob_id).await {
+    // Slot-exclusivity (§3.10.2 rule (d)): reject an (unauthenticated) DELETE of
+    // a protected DID-record slot blob. DID records are public, so blob_id is
+    // guessable; allowing this DELETE would purge the genuine record and let a
+    // replayed older frame roll the DID back. The gate is STORAGE-BACKED (the
+    // in-memory index is only a fast-path cache, empty after restart) — it
+    // decodes+verifies the immutable, content-addressed blob itself, so it is
+    // immune to a cold index. Content-addressing makes the check-then-delete
+    // race benign: the bytes at a blob_id are immutable, so a valid-DID-frame
+    // blob present at check time cannot become unprotected before the delete;
+    // the only residual is an unforceable "published just after a not-present
+    // check" window, which is availability-only. Non-DID / non-slot blobs proceed.
+    if did_slots
+        .delete_would_revert_slot(storage.as_ref(), &blob_id)
+        .await
+    {
         let _ = tx
             .send(RelayMessage::Err {
                 ref_id,
@@ -1927,13 +1936,20 @@ mod tests {
     /// Helper: create a test server on a random port and return the address.
     /// Delivery jitter is disabled (0ms) for deterministic test behavior.
     async fn start_test_server() -> SocketAddr {
+        start_test_server_with_storage(Arc::new(BlobStorageBackend::in_memory())).await
+    }
+
+    /// Starts a validating relay over a caller-provided (possibly pre-seeded)
+    /// blob store. The relay's DID-slot index is fresh/**cold** — sharing the
+    /// same storage lets a test model a durable store that already holds records
+    /// the (restarted) relay's index knows nothing about.
+    async fn start_test_server_with_storage(storage: Arc<BlobStorageBackend>) -> SocketAddr {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
             ..RelayConfig::default()
         };
-        let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
         let (_handle, addr) = server.start().await.unwrap();
         addr
@@ -2384,6 +2400,46 @@ mod tests {
             recv_msg(&mut stream).await,
             RelayMessage::Ok { .. }
         ));
+    }
+
+    /// Fix B round 3: the DELETE gate is storage-backed, so it protects a genuine
+    /// DID record even when the relay's slot index is COLD (fresh registry over a
+    /// durable store that already holds the record — a restart / store-sharing
+    /// peer). Against the old index-only gate this DELETE would cold-miss and
+    /// purge the record, enabling a seq rollback. It must be rejected and the
+    /// record must survive.
+    #[tokio::test]
+    async fn delete_of_cold_index_did_slot_blob_rejected() {
+        let (rid, bid, frame) = genuine_did_frame(71, 5, b"did-doc");
+
+        // Pre-seed the durable store DIRECTLY (bypassing PUBLISH) so the relay's
+        // index stays cold, then start the relay over that store.
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+        let addr = start_test_server_with_storage(Arc::clone(&storage)).await;
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        // Attacker DELETEs the guessable slot blob_id.
+        send_msg(
+            &mut sink,
+            &ClientMessage::Delete {
+                ref_id: Some("d".into()),
+                blob_id: bid,
+            },
+        )
+        .await;
+        match recv_msg(&mut stream).await {
+            RelayMessage::Err { code: c, .. } => assert_eq!(c, code::DID_RECORD_REJECTED),
+            other => panic!(
+                "cold-index DELETE of a genuine DID record must be rejected by the \
+                 storage-backed gate, got {other:?}"
+            ),
+        }
+
+        // The genuine record survives in the durable store.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
     }
 
     #[tokio::test]

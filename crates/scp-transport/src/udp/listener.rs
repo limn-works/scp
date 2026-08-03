@@ -1122,10 +1122,17 @@ async fn handle_udp_delete<S: BlobStorage>(
     storage: &Arc<S>,
     did_slots: &DidSlotRegistry,
 ) {
-    // Slot-exclusivity: reject a DELETE of a claimed DID slot's blob over UDP,
-    // identically to WebSocket/QUIC (§3.10.2 rule (a), Fix B). Non-slot blobs
-    // proceed.
-    if did_slots.is_current_slot_blob(&blob_id).await {
+    // Slot-exclusivity (§3.10.2 rule (d)): reject a DELETE of a protected DID
+    // slot blob over UDP, identically to WebSocket/QUIC. The gate is
+    // STORAGE-BACKED (index is a fast-path cache, not the authority) — it
+    // decodes+verifies the immutable, content-addressed blob, so it is immune to
+    // a cold/empty index. The check-then-delete race is benign (immutable bytes);
+    // residual is the availability-only "published just after check" window.
+    // Non-slot blobs proceed.
+    if did_slots
+        .delete_would_revert_slot(storage.as_ref(), &blob_id)
+        .await
+    {
         let err = RelayMessage::Err {
             ref_id,
             code: code::DID_RECORD_REJECTED,

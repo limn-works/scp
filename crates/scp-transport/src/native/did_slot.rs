@@ -75,6 +75,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 
+use scp_identity::{did_from_ed25519_public_key, did_routing_id};
+use scp_protocol::envelope::did_record::DidRecordV1;
+
 use super::storage::{BlobStorage, StorageError, StoredBlob};
 use crate::relay::did_record_validation::{DidRecordClass, classify_did_record_frame};
 
@@ -366,27 +369,75 @@ impl DidSlotRegistry {
         }
     }
 
-    /// Returns whether `blob_id` is the current slot blob of some claimed
-    /// DID-domain `routing_id`.
+    /// Returns whether `blob_id` matches the current slot blob of some claimed
+    /// DID-domain `routing_id` **in the in-memory index**.
     ///
-    /// Used to gate DELETE (§3.10.2 rule (a)): DID records are public, so an
-    /// attacker can compute `blob_id = SHA-256(genuine_record)` and DELETE the
-    /// slot blob to force the `routing_id` to revert, then replay an older
-    /// genuine frame to pin a stale slot. Only a *superseding PUBLISH* may replace
-    /// a slot; an unauthenticated DELETE of the current slot blob is rejected on
-    /// every transport (Fix B). A stale index entry (blob already expired) still
-    /// matches here — rejecting a DELETE of an already-absent blob is a harmless
-    /// no-op, and the entry is reconciled by the next publish / consult / sweep.
-    ///
-    /// The scan is over the claimed-slot index only (bounded — a handful of DID
-    /// slots), not the blob store, so it is cheap even on the DELETE hot path for
-    /// ordinary non-DID blobs (empty/absent match → DELETE proceeds).
+    /// This is the cheap *fast path* of the DELETE gate — an in-memory scan over
+    /// the (bounded) claimed-slot index, no storage I/O. It is **not** the
+    /// authority: the index is a cache that is empty after a relay restart and
+    /// cold on a store-sharing peer. The authoritative, index-independent gate is
+    /// [`delete_would_revert_slot`](Self::delete_would_revert_slot); use that on
+    /// the DELETE path.
     pub async fn is_current_slot_blob(&self, blob_id: &[u8; 32]) -> bool {
         self.slots
             .read()
             .await
             .values()
             .any(|s| &s.blob_id == blob_id)
+    }
+
+    /// Storage-backed DELETE gate: returns whether deleting `blob_id` would purge
+    /// a protected DID-record slot (§3.10.2 rule (d)). Used to reject an
+    /// unauthenticated DELETE that would otherwise revert a claimed slot.
+    ///
+    /// DID records are public, so an attacker can compute
+    /// `blob_id = SHA-256(genuine_record)` and DELETE the slot blob to force the
+    /// `routing_id` to revert, then replay an older genuine frame (which the
+    /// cold-index seq-aware establish would then *adopt* from storage) — an
+    /// on-demand **integrity** rollback of the victim's DID document.
+    ///
+    /// The gate is **storage-backed, not index-based**, and therefore immune to a
+    /// cold/empty index (restart, store-sharing peer): a DID-record frame is
+    /// content-addressed (`blob_id = SHA-256(blob)`, so the bytes at a `blob_id`
+    /// are immutable) and self-certifying (embedded `public_key` + BEP44
+    /// signature), so its protected status is reconstructible from the bare
+    /// `blob_id` alone. The in-memory index is only a fast-path cache — the blob
+    /// itself is the authority.
+    ///
+    /// Returns `true` (reject the DELETE) iff the blob is present in storage and
+    /// [`classify_did_record_frame`] rules it a binding-and-signature-**Valid**
+    /// DID frame. The `routing_id` a DELETE-by-`blob_id` binds to is derived from
+    /// the frame's **own** `public_key` — a self-consistent frame binds to exactly
+    /// its own derived `routing_id`, which is what makes it a protected DID
+    /// record. A non-frame blob, an invalid-signature frame, or an absent blob is
+    /// unprotected → the DELETE proceeds.
+    pub async fn delete_would_revert_slot<S: BlobStorage + ?Sized>(
+        &self,
+        storage: &S,
+        blob_id: &[u8; 32],
+    ) -> bool {
+        // Fast path: the in-memory index already knows this is a claimed slot
+        // blob — reject without a storage round-trip.
+        if self.is_current_slot_blob(blob_id).await {
+            return true;
+        }
+
+        // Authoritative path: reconstruct protection from the immutable,
+        // self-describing blob bytes, so a cold/empty index cannot cold-miss.
+        let Ok(Some(stored)) = storage.get(blob_id).await else {
+            return false;
+        };
+        let Ok(frame) = DidRecordV1::decode(&stored.blob) else {
+            return false;
+        };
+        // The frame binds to the routing_id derived from its OWN public_key;
+        // classifying there yields `Valid` iff the BEP44 signature verifies (the
+        // binding holds by construction).
+        let derived_routing_id = did_routing_id(&did_from_ed25519_public_key(frame.public_key()));
+        matches!(
+            classify_did_record_frame(&derived_routing_id, &stored.blob),
+            DidRecordClass::Valid { .. }
+        )
     }
 
     /// Drops a `routing_id` from the index iff it still points at the exact slot
@@ -915,6 +966,43 @@ mod tests {
             .unwrap();
         assert!(!reg.is_current_slot_blob(&bid).await);
         assert!(reg.is_current_slot_blob(&bid2).await);
+    }
+
+    /// Fix B round 3 (cold-index DELETE gate): a genuine binding-valid DID frame
+    /// is present in the durable store but the slot index is COLD (fresh registry
+    /// — models a relay restart or a store-sharing peer). The index-only check
+    /// cold-misses, but the STORAGE-BACKED gate reconstructs protection from the
+    /// self-describing, content-addressed blob and rejects the DELETE. Non-frame
+    /// and absent blobs remain deletable.
+    #[tokio::test]
+    async fn cold_index_delete_gate_is_storage_backed() {
+        let storage = BlobStorageBackend::in_memory();
+        let reg = DidSlotRegistry::new(); // COLD: nothing ever published through it.
+
+        // A genuine seq-5 DID record deposited straight into storage (no publish),
+        // so the in-memory index never learns about it.
+        let (rid, bid, frame) = genuine_frame(71, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+
+        // The index-only fast path cold-misses (this is the bug the round-3 fix
+        // closes); the authoritative storage-backed gate catches it.
+        assert!(
+            !reg.is_current_slot_blob(&bid).await,
+            "index is cold — the index-only check would (wrongly) allow the delete",
+        );
+        assert!(
+            reg.delete_would_revert_slot(&storage, &bid).await,
+            "storage-backed gate must protect the genuine record despite a cold index",
+        );
+
+        // A co-located opaque (non-frame) blob is not protected — DELETE proceeds.
+        let opaque = b"\x80 not-a-did-frame".to_vec();
+        let obid = blob_id_of(&opaque);
+        storage.store(rid, obid, None, 3600, opaque).await.unwrap();
+        assert!(!reg.delete_would_revert_slot(&storage, &obid).await);
+
+        // An absent blob is not protected.
+        assert!(!reg.delete_would_revert_slot(&storage, &[0xAB; 32]).await);
     }
 
     /// The `generation` also protects `sweep_expired` end-to-end: after an
