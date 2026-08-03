@@ -489,8 +489,9 @@ mod tests {
     }
 
     // The sibling supervisor-handle reply-awaits
-    // (`SupervisorHandle::dispatch_prepare_for_replace` and
-    // `dispatch_start_ttl_timer`) wrap their `reply_rx.await` in the identical
+    // (`SupervisorHandle::dispatch_prepare_for_replace`,
+    // `dispatch_start_ttl_timer`, and `dispatch_recovery_send_notification`)
+    // wrap their `reply_rx.await` in the identical
     // `tokio::time::timeout(REPLY_TIMEOUT, ..)` pattern over the SAME
     // [`REPLY_TIMEOUT`] constant pinned above. Constructing a live
     // `SupervisorHandle` in isolation requires a fully-wired `Supervisor`
