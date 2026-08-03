@@ -243,6 +243,15 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // core `scp_core::trust::check_capability_requirements` call and the production
 // `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
+// Raised 55 -> 59 by the app-sandbox (spec §8.4) AppBound/AppUnbound durable
+// event-log wiring: four new structural assertions —
+// `app_bind_wired_through_bind_app_all_bridges`,
+// `app_unbind_wired_through_unbind_app_all_bridges`,
+// `event_log_provider_arc_wired_in_all_bridges`, and
+// `build_event_log_provider_absent_from_all_bridges` — pin each bridge export
+// to the shared `bind_app`/`unbind_app` core functions and to the supervisor's
+// shared `event_log_provider_arc()`. Pure coverage expansion locking the §8.4
+// seams into the ratchet floor.
 const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 59;
 
 // ---------------------------------------------------------------------------

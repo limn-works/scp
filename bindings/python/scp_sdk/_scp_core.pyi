@@ -405,6 +405,14 @@ class SCP:
     def access_key_restore(self, context_id: Any, member_did: Any, caller_did: Any) -> Any: ...
     def access_key_revoke(self, context_id: Any, member_did: Any, caller_did: Any) -> Any: ...
 
+    # -- app sandbox (spec §8.4) --
+    def app_bind(
+        self, context_id: str, declaration_json: str, actor_did: str, timestamp_secs: int
+    ) -> str: ...
+    def app_unbind(
+        self, context_id: str, app_did: str, actor_did: str, timestamp_secs: int
+    ) -> None: ...
+
     # -- governance --
     def add_checkpoint_cosignature(
         self, handle: Any, checkpoint_json: Any, signer_did: Any, signature_hex: Any
