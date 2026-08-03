@@ -6060,14 +6060,22 @@ async fn resolve_uniffi_message_signer(
 ) -> Result<scp_ffi_common::persona::ResolvedMessageSigner, ScpError> {
     let key = match persona {
         scp_did::SigningKeyId::Active => {
-            resolve_uniffi_signing_key(handle)
-                .await
-                .map_err(|_| ScpError::Crypto {
+            resolve_uniffi_signing_key(handle).await.map_err(|e| {
+                // Preserve the underlying custody-export diagnostic before
+                // collapsing to the send-specific SCP-CRYPTO-4001 (the returned
+                // code is intentionally unchanged — only the otherwise-lost
+                // detail is logged).
+                tracing::warn!(
+                    error = %e,
+                    "send #active signing-key resolution failed; returning SCP-CRYPTO-4001"
+                );
+                ScpError::Crypto {
                     msg: "signing key required for send: could not resolve the sender's \
                           #active signing key from retained custody"
                         .to_owned(),
                     code: codes::CRYPTO_4001.to_owned(),
-                })?
+                }
+            })?
         }
         scp_did::SigningKeyId::Agent => {
             let core_id = identity
@@ -20591,6 +20599,99 @@ mod tests {
         assert_eq!(
             signer.message_signer().key().to_bytes(),
             active_key.to_bytes()
+        );
+    }
+
+    /// REGRESSION GUARD (fix 3): the `#agent` arm MUST export the agent key
+    /// through the sender identity's OWN custody, NOT the context handle's
+    /// custody. This test makes those two custodies DIFFER — the `Identity`
+    /// carries `custody_a` (which holds the agent key), while the `ContextHandle`
+    /// carries a DIFFERENT, empty `custody_b` that does NOT hold the agent key
+    /// handle.
+    ///
+    /// Under the fixed code the export sources custody from the identity
+    /// (`custody_a`) and returns the correct agent key. Under a revert to
+    /// context-handle custody sourcing, the export would run against `custody_b`
+    /// — which has no key at the agent handle's index — and return
+    /// `PlatformError::KeyNotFound`, so `resolve_uniffi_message_signer` would
+    /// fail and the `.expect()` below would panic. That is exactly the regression
+    /// this guards.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_persona_uses_identity_custody_not_handle_custody() {
+        let scp = scp_test();
+        let instance_id = scp.instance_id();
+
+        // custody_A: the sender identity's OWN custody — holds the agent key.
+        let custody_a = InMemoryKeyCustody::new();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
+        let (core_id, _document, _prk) = dht
+            .create_with_agent_key(&custody_a, pre_rotation_custody.as_ref())
+            .await
+            .expect("agent-keyed in-memory identity creation succeeds");
+        let did = core_id.did.clone();
+        let active_handle = core_id.active_signing_key;
+        let agent_handle = core_id
+            .agent_signing_key
+            .expect("agent-keyed identity has an agent key handle");
+        let agent_key = custody_a
+            .export_ed25519_signing_key(&agent_handle)
+            .await
+            .expect("export agent key from custody_A");
+
+        let opaque_a = Arc::new(OpaqueInMemoryKeyCustody(custody_a));
+        let identity = Identity {
+            did: did.clone(),
+            custody_type: CustodyMethod::InMemory,
+            core_id: Some(core_id),
+            core_document: None,
+            in_memory_custody: Some(Arc::clone(&opaque_a)),
+            callback_custody: None,
+            verifying_key_hex: None,
+            instance_id,
+            bi: Arc::clone(&scp.inner),
+            rotation_event_json: None,
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            pre_rotation_custody,
+        };
+
+        // custody_B: a DIFFERENT, empty custody on the context handle. It does
+        // NOT hold the agent key handle — so a resolver that (wrongly) sourced
+        // #agent custody from the handle would fail against it.
+        let opaque_b = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let handle = ContextHandle {
+            context_id: format!("persona-regress-{}", uuid::Uuid::new_v4()),
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: did.clone(),
+            in_memory_custody: Some(Arc::clone(&opaque_b)),
+            callback_custody: None,
+            signing_key: Some(active_handle),
+            ceiling_strings: Vec::new(),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
+            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
+            instance_id,
+        };
+
+        let signer =
+            super::resolve_uniffi_message_signer(&handle, &identity, scp_did::SigningKeyId::Agent)
+                .await
+                .expect(
+                    "#agent must resolve via the sender identity's OWN custody (custody_A); a \
+                     resolver sourcing custody from the context handle (custody_B) would fail",
+                );
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            agent_key.to_bytes(),
+            "#agent MUST export the agent key through the sender identity's own custody \
+             (custody_A); sourcing from the context handle's custody_B would export the wrong \
+             key or fail closed"
         );
     }
 

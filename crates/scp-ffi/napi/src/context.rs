@@ -3696,7 +3696,14 @@ async fn resolve_napi_message_signer(
     persona: scp_did::SigningKeyId,
 ) -> napi::Result<scp_ffi_common::persona::ResolvedMessageSigner> {
     let key = match persona {
-        scp_did::SigningKeyId::Active => resolve_napi_signing_key(handle).await.map_err(|_| {
+        scp_did::SigningKeyId::Active => resolve_napi_signing_key(handle).await.map_err(|e| {
+            // Preserve the underlying custody-export diagnostic before collapsing
+            // to the send-specific SCP-CRYPTO-4001 (the returned code is
+            // intentionally unchanged — only the otherwise-lost detail is logged).
+            tracing::warn!(
+                error = %e,
+                "send #active signing-key resolution failed; returning SCP-CRYPTO-4001"
+            );
             NapiError::from(ScpNapiError::Crypto {
                 message: "signing key required for send: could not resolve the sender's \
                               #active signing key from retained custody"
@@ -5774,6 +5781,103 @@ mod tests {
         assert_eq!(
             signer.message_signer().key().to_bytes(),
             active_key.to_bytes()
+        );
+    }
+
+    /// REGRESSION GUARD (fix 3): the `#agent` arm MUST export the agent key
+    /// through the sender identity's OWN custody (the identity-registry entry),
+    /// NOT the context handle's custody. This test makes those two custodies
+    /// DIFFER — the identity is registered with `custody_a` (which holds the
+    /// agent key), while the context handle carries a DIFFERENT, empty
+    /// `custody_b` that does NOT hold the agent key handle.
+    ///
+    /// Under the fixed code the export sources custody from the registry entry
+    /// (`custody_a`) and returns the correct agent key. Under a revert to
+    /// context-handle custody sourcing, the export would run against `custody_b`
+    /// — which has no key at the agent handle's index — and return
+    /// `PlatformError::KeyNotFound`, so `resolve_napi_message_signer` would fail
+    /// and the `.expect()` below would panic. That is exactly the regression this
+    /// guards.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_persona_uses_identity_custody_not_handle_custody() {
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use scp_identity::DidDht;
+        use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
+
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+
+        // custody_A: the sender identity's OWN custody — holds the agent key.
+        let custody_a = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
+        let dht = DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
+        let (identity, document, pre_rotation_handle) = dht
+            .create_with_agent_key(custody_a.as_ref(), pre_rotation_custody.as_ref())
+            .await
+            .expect("agent-keyed in-memory identity creation succeeds");
+        let did = identity.did.clone();
+        let active_handle = identity.active_signing_key;
+        let agent_handle = identity
+            .agent_signing_key
+            .expect("agent-keyed identity has an agent key handle");
+        let agent_key = custody_a
+            .export_ed25519_signing_key(&agent_handle)
+            .await
+            .expect("export agent key from custody_A");
+        crate::runtime::register_identity(
+            &bi,
+            &did,
+            crate::runtime::NapiIdentityEntry {
+                identity,
+                custody: Arc::clone(&custody_a),
+                document,
+                identity_link_attestations: Vec::new(),
+                pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
+
+        // custody_B: a DIFFERENT, empty custody on the context handle. It does
+        // NOT hold the agent key handle — so a resolver that (wrongly) sourced
+        // #agent custody from the handle would fail against it.
+        let custody_b = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
+        let handle = super::NapiContextHandle {
+            context_id: format!("persona-regress-{}", uuid::Uuid::new_v4()),
+            state: std::sync::Mutex::new(super::ContextState::Active),
+            creator_did: did.clone(),
+            mode: "Encrypted".to_owned(),
+            ceiling: vec![],
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            in_memory_custody: Some(Arc::clone(&custody_b)),
+            signing_key: Some(active_handle),
+            core_handle: None,
+            subscription_cancel: std::sync::Mutex::new(super::CancellationToken::new()),
+            subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bi: Arc::clone(&bi),
+            instance_id: bi.instance_id(),
+        };
+
+        let signer =
+            super::resolve_napi_message_signer(&bi, &handle, &did, scp_did::SigningKeyId::Agent)
+                .await
+                .expect(
+                    "#agent must resolve via the sender identity's OWN custody (custody_A); a \
+                     resolver sourcing custody from the context handle (custody_B) would fail",
+                );
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            agent_key.to_bytes(),
+            "#agent MUST export the agent key through the sender identity's own custody \
+             (custody_A); sourcing from the context handle's custody_B would export the wrong \
+             key or fail closed"
         );
     }
 
