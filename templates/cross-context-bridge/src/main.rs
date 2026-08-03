@@ -5,9 +5,9 @@
 //!
 //!   1. Create two contexts with separate identities and role states.
 //!   2. Register a tool in Context A (the provider).
-//!   3. Context A exposes the tool to Context B via `expose_tool`.
+//!   3. Context A exposes the tool to Context B via `expose_outlet`.
 //!   4. Publish an `InterfaceOffer` (governance approval step).
-//!   5. Context B accepts the offer via `accept_tool_interface`.
+//!   5. Context B accepts the offer via `accept_outlet_interface`.
 //!   6. A participant in Context B invokes the tool across contexts via
 //!      `invoke_cross_context` — the bridge routes the call to Context A,
 //!      executes, and returns the result with provenance events for both
@@ -17,7 +17,7 @@
 //!   `cargo run`
 
 use scp_core::context::outlets::interface::{
-    accept_tool_interface, create_interface_offer, expose_tool, invoke_cross_context,
+    accept_outlet_interface, create_interface_offer, expose_outlet, invoke_cross_context,
     InboundPolicy, OutboundPolicy, RateLimit,
 };
 use scp_core::context::outlets::{
@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rate_limit = RateLimit::new(60, Duration::from_secs(60), &scp_clock::SystemClock);
 
-    let mut interface = expose_tool(
+    let mut interface = expose_outlet(
         ctx_a.context_id(),
         &outlet_id,
         &ctx_b.context_id().to_owned(),
@@ -196,7 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         require_spending_ucan: false,
     };
 
-    accept_tool_interface(
+    accept_outlet_interface(
         ctx_b.context_id(),
         &mut interface,
         &role_state_b,
