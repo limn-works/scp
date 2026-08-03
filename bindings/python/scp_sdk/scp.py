@@ -811,11 +811,12 @@ class SCP:
         configured — provide a real backend via SDK layer") rather than
         fabricating a success. It never reports a recovery that did not happen.
 
-        :param did: The compromised DID. **Must be owned by this**
-            :class:`SCP` **instance** — created or loaded via
-            :meth:`identity_create` / :meth:`identity_load`. DIDs
-            absent from the instance's identity registry are rejected
-            with ``SCP-IDENT-1020``.
+        :param did: The compromised DID. **Must be registered on this**
+            :class:`SCP` **instance** — created here via
+            :meth:`identity_create` (or :meth:`identity_migrate`); a DID
+            that was only resolved via :meth:`identity_load` is not
+            registered for recovery. DIDs absent from the instance's
+            registry are rejected with ``SCP-IDENT-1020``.
         :param context_ids: Contexts to run the recovery protocol
             against. Accepted for signature symmetry with the wired
             backend (#2240 Part B); ignored on the current fail-closed
