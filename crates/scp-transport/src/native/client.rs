@@ -2294,9 +2294,14 @@ mod tests {
             .publish_raw(&[0x55; 32], u64::from(u32::MAX) + 1, vec![1, 2, 3])
             .await
             .expect_err("overflowing blob_ttl must be rejected");
+        // Assert the specific overflow message, not merely the SendFailed
+        // variant: the u32 guard fires before any send (the silent server never
+        // responds), so isolating the message proves the overflow branch — a
+        // regression removing the guard would surface a different error, not
+        // this one.
         assert!(
-            matches!(err, TransportError::SendFailed(_)),
-            "expected SendFailed for overflowing ttl, got {err:?}"
+            matches!(&err, TransportError::SendFailed(msg) if msg.contains("exceeds u32 wire limit")),
+            "expected SendFailed(\"…exceeds u32 wire limit\") for overflowing ttl, got {err:?}"
         );
     }
 
