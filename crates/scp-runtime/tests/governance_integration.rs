@@ -51,7 +51,7 @@ use scp_protocol::context::params::{
 };
 use scp_protocol::context::{ContextError, ContextState};
 use scp_runtime::context::actor::commands::{
-    BroadcastBlockPayload, BroadcastCommand, SubscribeBroadcastPayload,
+    BroadcastBlockPayload, BroadcastCommand, SubscribeBroadcastPayload, UnsubscribeBroadcastPayload,
 };
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
@@ -3551,5 +3551,127 @@ async fn block_broadcast_subscriber_counter() {
     assert_eq!(
         kea_count, 1,
         "exactly 1 KeyEpochAdvance leaf (best-effort KEA, in-memory log always succeeds)"
+    );
+}
+
+// =========================================================================
+// §5.14.10 / §9.9.3: unsubscribe_broadcast with rotate_keys=true must bump
+// checkpoint_events_since by 1 (MemberLeft) + N (one KeyEpochAdvance per
+// rotated broadcast author).  Two authors (alice + seeded bob); subscriber
+// carol unsubscribes; expected delta = 1 + 2 = 3.
+// =========================================================================
+
+/// Verify that `unsubscribe_broadcast` with `rotate_keys = true` on a
+/// broadcast context with N registered authors bumps
+/// `checkpoint_events_since` by exactly 1 (for `MemberLeft`) + N (one
+/// `KeyEpochAdvance` per rotated author).
+///
+/// Two authors are registered: alice (auto-registered at context creation)
+/// and bob (seeded via `Supervisor::seed_broadcast_author`). Carol is
+/// subscribed so there is a subscriber to unsubscribe. Carol's voluntary
+/// unsubscribe with `rotate_keys = true` triggers key rotation for BOTH
+/// authors, emitting 2 `KeyEpochAdvance` leaves plus 1 `MemberLeft` leaf.
+/// The total leaf delta must therefore be 1 + 2 = 3.
+#[tokio::test]
+async fn unsubscribe_broadcast_counter_with_kea() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-unsub-counter-kea";
+    let num_authors: usize = 2;
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Seed bob as a second broadcast author.
+    manager.seed_broadcast_author(ctx_id, bob()).await.unwrap();
+
+    // Subscribe carol so there is a subscriber to unsubscribe.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::SubscribeBroadcast {
+        payload: Box::new(SubscribeBroadcastPayload {
+            context_id: ctx_id.to_owned(),
+            subscriber_did: carol(),
+            ucan: None,
+            timestamp: 1_700_000_000,
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch SubscribeBroadcast for carol");
+    rx.await
+        .expect("subscribe carol reply")
+        .expect("subscribe carol succeeds");
+
+    // Baseline: count leaves present before the unsubscribe.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    // Carol unsubscribes with rotate_keys=true.  The handler appends:
+    //   - 1 MemberLeft leaf (fail-closed)
+    //   - N KeyEpochAdvance leaves, one per rotated author (best-effort)
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::UnsubscribeBroadcast {
+        payload: Box::new(UnsubscribeBroadcastPayload {
+            context_id: ctx_id.to_owned(),
+            subscriber_did: carol(),
+            rotate_keys: true,
+        }),
+        reply: tx,
+    };
+    manager
+        .dispatch_broadcast_command(cmd)
+        .await
+        .expect("dispatch UnsubscribeBroadcast for carol");
+    rx.await
+        .expect("unsubscribe carol reply")
+        .expect("unsubscribe carol succeeds");
+
+    // Verify event-log leaf counts — each leaf corresponds to one
+    // checkpoint_events_since increment.
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist after unsubscribe");
+
+    let member_left_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::MemberLeft)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+
+    assert_eq!(
+        member_left_count, 1,
+        "unsubscribe_broadcast must emit exactly 1 MemberLeft leaf"
+    );
+    assert_eq!(
+        kea_count, num_authors,
+        "unsubscribe_broadcast must emit exactly 1 KeyEpochAdvance per rotated author \
+         ({num_authors} authors)"
+    );
+
+    // Total leaf delta = 1 (MemberLeft) + num_authors (KEA).
+    // This mirrors the checkpoint_events_since increment.
+    let total_delta = entries.len() - baseline;
+    assert_eq!(
+        total_delta,
+        1 + num_authors,
+        "checkpoint_events_since delta must be 1 + num_authors \
+         (MemberLeft + KEA per author)"
     );
 }

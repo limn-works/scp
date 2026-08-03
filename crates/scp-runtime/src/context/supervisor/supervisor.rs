@@ -14499,9 +14499,9 @@ impl Supervisor {
     /// Single-node integration tests that need a multi-author broadcast
     /// context cannot drive genuine governance (the bridge key-resolver only
     /// sees one actor's custody). This seam populates the author registry
-    /// the same way a delivered `RotateContentKeys` governance action would,
-    /// so multi-author KEA-leaf and checkpoint-counter tests can exercise
-    /// the real code path instead of being limited to the creator-only case.
+    /// mirroring the author-publish/add path, so multi-author KEA-leaf and
+    /// checkpoint-counter tests can exercise the real code path instead of
+    /// being limited to the creator-only case.
     ///
     /// Mirrors [`Self::seed_peer_pseudonym`] in purpose and gating. Gated
     /// behind `testing` — never compiled into production builds, never

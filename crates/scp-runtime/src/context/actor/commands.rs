@@ -1891,9 +1891,9 @@ pub enum BroadcastCommand {
     /// Single-node integration tests that need a multi-author broadcast context
     /// cannot drive genuine governance (the bridge key-resolver only sees one
     /// actor's custody). This command lets such tests populate the author
-    /// registry the same way a delivered `RotateContentKeys` governance action
-    /// would, so multi-author counter and KEA-leaf tests can exercise their
-    /// real fan-out instead of being limited to the creator-only case.
+    /// registry mirroring the author-publish/add path, so multi-author counter
+    /// and KEA-leaf tests can exercise their real fan-out instead of being
+    /// limited to the creator-only case.
     ///
     /// Mirrors [`SeedPeerPseudonym`](Self::SeedPeerPseudonym) — same rationale,
     /// same gating. Gated behind the `testing` feature — never compiled into

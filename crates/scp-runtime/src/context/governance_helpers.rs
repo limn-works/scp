@@ -3183,9 +3183,9 @@ pub async fn execute_rotate_content_keys(
     //
     // NOTE: `advance.timestamp` (milliseconds) is not used here — the
     // event-log append takes `timestamp_secs` directly. The ms field is
-    // carried by `BroadcastKeyEpochAdvance` for the relay-message consumer
-    // on the per-author block path; it is dead data in this governance path.
-    // `old_epoch` is derived as `new_epoch - 1` because `rotate_all_author_keys`
+    // currently unconsumed: no production wire message or event-log leaf reads
+    // it on any path (governance or block path). `old_epoch` is derived as
+    // `new_epoch - 1` because `rotate_all_author_keys`
     // always increments by exactly 1 (pre-validated, sound by construction).
     // ADR-011: RotateContentKeys is a convergent governance trigger → KeyEpochAdvance
     // leaves are convergent (fail-closed). A failure here is surfaced as an error.
