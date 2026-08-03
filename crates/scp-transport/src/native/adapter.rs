@@ -578,6 +578,31 @@ impl TransportAdapter for NativeRelayAdapter {
         })
     }
 
+    /// Publishes a raw public-record blob (a DID-record frame, §9.10.12) via
+    /// PUBLISH, distinct from the [`OuterEnvelope`] `send` path.
+    fn publish_raw(
+        &self,
+        routing_id: &RoutingId,
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        let routing_id = *routing_id.as_bytes();
+        Box::pin(async move { self.client.publish_raw(&routing_id, blob_ttl, blob).await })
+    }
+
+    /// Queries raw public-record blobs at a routing ID via QUERY, returning the
+    /// blob bytes without the [`OuterEnvelope`] codec and bypassing the
+    /// live-subscription dedup (§3.10.2/§3.10.4).
+    fn query_raw(
+        &self,
+        routing_id: &RoutingId,
+        since: Option<u64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<Vec<u8>>, TransportError>> {
+        let routing_id = *routing_id.as_bytes();
+        Box::pin(async move { self.client.query_raw(&routing_id, since, limit).await })
+    }
+
     /// Trait-object entry point for the relay subscription loop: forwards to
     /// the inherent [`NativeRelayAdapter::record_heartbeat_received`], which
     /// refreshes the [`HeartbeatMonitor`] gap-detection baseline when a

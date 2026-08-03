@@ -36,6 +36,11 @@ startup = ["dep:tracing-subscriber"]
 [dependencies]
 scp-core = { path = "../scp-core", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
+# The wasm-safe leaf that owns the DID-record relay frame (DidRecordV1,
+# §9.10.12). TransportRelayQuerier decodes raw QUERY blobs into it. Depending on
+# the leaf directly (rather than only via scp-core) is acyclic — scp-protocol has
+# no scp-transport edge (SCP-RELAYRES-002).
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 # The relay wire types (ClientMessage/RelayMessage + constants + code) live in
 # the wasm-safe scp-relay-client leaf, shared with the in-browser client
@@ -122,6 +127,11 @@ scp-core = { path = "../scp-core" }
 ed25519-dalek = { workspace = true }
 scp-platform = { path = "../scp-platform" }
 scp-testing = { path = "../scp-testing" }
+# TransportRelayQuerier + RealMultiRelayQuerier integration tests build signed
+# DID-record frames: DID document (scp-did), BEP44 signable payload (scp-dht),
+# and DID-from-key derivation (scp-did). Dev-only (SCP-RELAYRES-002).
+scp-did = { path = "../scp-did" }
+scp-dht = { path = "../scp-dht" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"

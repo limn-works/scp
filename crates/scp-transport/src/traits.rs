@@ -238,6 +238,78 @@ pub trait TransportAdapter: Send + Sync {
     /// fails.
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>>;
 
+    /// Publish a **raw public-record blob** over the existing PUBLISH operation,
+    /// addressed by `routing_id` (§3.10.2).
+    ///
+    /// This is the public-record counterpart to [`send`](TransportAdapter::send):
+    /// the blob is arbitrary, already-authenticated bytes (e.g. a DID-record
+    /// frame, [`DidRecordV1`](scp_protocol::envelope::did_record::DidRecordV1),
+    /// §9.10.12) — **not** a serialized [`OuterEnvelope`]. A DID `routing_id`
+    /// carries DID-record frames, never outer envelopes, so this path never runs
+    /// the envelope codec. `blob_ttl` is the relay storage TTL in seconds
+    /// (§3.10.2 publishes DID records with a 7-day TTL).
+    ///
+    /// # Default
+    ///
+    /// Adapters that cannot carry raw public records (foreign transports, test
+    /// doubles) inherit a default that returns [`TransportError::NotSupported`]
+    /// — a raw publish must fail loudly on a transport that cannot honor it,
+    /// never silently succeed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the adapter has no active
+    /// connection, [`TransportError::SendFailed`] if the publish fails, or
+    /// [`TransportError::NotSupported`] for transports without a raw-blob path.
+    fn publish_raw(
+        &self,
+        routing_id: &RoutingId,
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        // Consume the arguments so the default body has no unused bindings.
+        let _ = (routing_id, blob_ttl, blob);
+        Box::pin(async {
+            Err(TransportError::NotSupported(
+                "publish_raw: this transport has no raw public-record blob path".to_string(),
+            ))
+        })
+    }
+
+    /// One-shot QUERY for **raw public-record blobs** stored at `routing_id`,
+    /// returned as their bytes **without** the [`OuterEnvelope`] codec — a
+    /// DID-record frame is not an outer envelope (§9.10.12). Returns up to
+    /// `limit` blobs (§3.10.2 resolves DID records with `limit = 16`).
+    ///
+    /// Unlike [`query`](TransportAdapter::query) / [`subscribe`], this path
+    /// **bypasses the live-subscription redelivery dedup**: a one-shot public
+    /// record resolution needs every candidate on every call, whereas the dedup
+    /// LRU exists to suppress duplicate live redeliveries and would wrongly drop
+    /// the genuine record on the second resolution of an unchanged DID (§3.10.4).
+    /// The blobs are returned unverified — the caller (the resolver's decode +
+    /// BEP44-verify path) validates each one against the DID-derived key.
+    ///
+    /// # Default
+    ///
+    /// Adapters without a raw-blob path inherit a default that returns an empty
+    /// vector (no public records available over this transport) — an honest
+    /// "nothing here", never a fabricated record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the adapter has no active
+    /// connection, or [`TransportError::Timeout`] if the query times out.
+    fn query_raw(
+        &self,
+        routing_id: &RoutingId,
+        since: Option<u64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<Vec<u8>>, TransportError>> {
+        // Consume the arguments so the default body has no unused bindings.
+        let _ = (routing_id, since, limit);
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// Records that a suppression-detection heartbeat (§9.9.2) was received
     /// from a peer over this transport.
     ///
@@ -290,6 +362,24 @@ impl TransportAdapter for Box<dyn TransportAdapter> {
 
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>> {
         (**self).delete(blob_id)
+    }
+
+    fn publish_raw(
+        &self,
+        routing_id: &RoutingId,
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        (**self).publish_raw(routing_id, blob_ttl, blob)
+    }
+
+    fn query_raw(
+        &self,
+        routing_id: &RoutingId,
+        since: Option<u64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<Vec<u8>>, TransportError>> {
+        (**self).query_raw(routing_id, since, limit)
     }
 
     fn record_heartbeat_received(&self) -> BoxFuture<'_, ()> {

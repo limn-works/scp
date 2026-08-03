@@ -129,6 +129,19 @@ struct SubscriptionState {
     last_local_receive: Option<Instant>,
     /// Channel for pushing subscription messages to the stream.
     tx: mpsc::Sender<SubscriptionMessage>,
+    /// When `true`, BLOB messages routed to this subscription bypass the
+    /// client-global `seen_blob_ids` dedup LRU — neither checked against it nor
+    /// committed to it.
+    ///
+    /// Set only by the one-shot raw public-record QUERY path
+    /// ([`NativeRelayClient::query_raw`], §3.10.4). The dedup LRU is a
+    /// live-subscription redelivery guard: it suppresses a blob the client has
+    /// already delivered once (e.g. after a reconnect). A one-shot DID-record
+    /// resolution needs every candidate on every call, so applying the dedup
+    /// there would drop the genuine record on the second resolution of an
+    /// unchanged DID — the bug this flag closes. Ordinary `subscribe`/`query`
+    /// leave it `false` and keep the dedup.
+    bypass_dedup: bool,
 }
 
 /// Shared inner state of the WebSocket client.
@@ -440,6 +453,16 @@ impl NativeRelayClient {
                 let receive_time = Instant::now();
                 let rid = crate::traits::RoutingId::new(*routing_id);
 
+                // Peek whether this routing_id is a dedup-bypassing (one-shot raw
+                // public-record QUERY) subscription BEFORE the dedup check. This
+                // is a read-only lookup that commits nothing, so it does not
+                // perturb the commit-after-success ordering below. A missing
+                // subscription defaults to `false` (the dedup applies), matching
+                // the ordinary subscribe/query path.
+                let bypass_dedup = subscriptions
+                    .with(&rid, |sub| sub.bypass_dedup)
+                    .unwrap_or(false);
+
                 // 1. Deduplication check (read-only, no commit yet).
                 //    Dedup-cache poisoning defense: check dedup first
                 //    (read-locked, no commit), then check subscription
@@ -451,7 +474,7 @@ impl NativeRelayClient {
                 //    redelivery for those entries. The load-bearing
                 //    invariant is the step ordering (commit-after-success),
                 //    not the lock kind.
-                {
+                if !bypass_dedup {
                     let state = inner.read().await;
                     if state.seen_blob_ids.contains(blob_id) {
                         return;
@@ -510,7 +533,12 @@ impl NativeRelayClient {
                 //    commit dedup -- a future redelivery (e.g. after
                 //    resubscribe) for this `blob_id` must remain deliverable.
                 let blob_id_copy = *blob_id;
-                if tx.send(SubscriptionMessage::Relay(msg)).await.is_ok() {
+                if tx.send(SubscriptionMessage::Relay(msg)).await.is_ok() && !bypass_dedup {
+                    // Commit dedup only for ordinary subscriptions. A raw-query
+                    // (bypass) subscription must never seed the LRU: seeding it
+                    // would suppress the genuine record on a later live
+                    // subscription or repeat resolution (§3.10.4).
+                    //
                     // Double-check guards the static dispatch_relay_message helper when
                     // invoked concurrently from tests; the production reader_loop is single-task.
                     let mut state = inner.write().await;
@@ -680,6 +708,7 @@ impl NativeRelayClient {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx,
+                    bypass_dedup: false,
                 },
             )
             .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
@@ -785,6 +814,7 @@ impl NativeRelayClient {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx,
+                    bypass_dedup: false,
                 },
             )
             .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
@@ -842,6 +872,158 @@ impl NativeRelayClient {
         self.subscriptions.remove(&rid);
 
         Ok(envelopes)
+    }
+
+    /// Publishes a raw public-record blob at `routing_id` via PUBLISH (§3.10.2).
+    ///
+    /// Unlike [`send`](crate::native::NativeRelayAdapter) via
+    /// [`send_request`](Self::send_request) with an [`OuterEnvelope`], the blob is
+    /// arbitrary already-authenticated bytes (a DID-record frame, §9.10.12). No
+    /// `recipient_hint` is set — a public record has no encrypted recipient.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the client is not connected,
+    /// or [`TransportError::SendFailed`] if the relay responds with an error.
+    pub async fn publish_raw(
+        &self,
+        routing_id: &[u8; 32],
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        // The wire `blob_ttl` is a u32 (seconds); the public API takes u64 to
+        // match the identity-layer RelayPublisher. A DID record's 7-day TTL
+        // (604800) fits comfortably; reject an out-of-range value loudly rather
+        // than silently truncating.
+        let blob_ttl = u32::try_from(blob_ttl).map_err(|_| {
+            TransportError::SendFailed(format!("blob_ttl {blob_ttl} exceeds u32 wire limit"))
+        })?;
+
+        let msg = ClientMessage::Publish {
+            ref_id: None,
+            routing_id: *routing_id,
+            recipient_hint: None,
+            blob_ttl,
+            blob,
+        };
+
+        let response = self.send_request(msg).await?;
+
+        match response {
+            RelayMessage::Ok { .. } => Ok(()),
+            RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
+                "relay error {code}: {msg}"
+            ))),
+            _ => Err(TransportError::ProtocolError(
+                "unexpected response to PUBLISH (raw)".to_string(),
+            )),
+        }
+    }
+
+    /// Sends a QUERY for raw public-record blobs and collects the blob bytes,
+    /// bypassing the `OuterEnvelope` codec AND the `seen_blob_ids` dedup LRU
+    /// (§3.10.2/§3.10.4).
+    ///
+    /// Registers a temporary dedup-bypassing subscription, sends QUERY with the
+    /// given `limit` (§3.10.2 uses N=16), and collects up to `limit` BLOB
+    /// payloads until the `query_complete` EVENT or timeout. The blobs are
+    /// returned unverified — the caller decodes and BEP44-verifies each one.
+    ///
+    /// A DID `routing_id` is derived as `SHA-256("scp:did:" || did)` (§3.10.2),
+    /// a domain disjoint from context routing IDs, so an existing live
+    /// subscription at this `routing_id` is a collision, not a legitimate
+    /// overlap: this fails loudly rather than silently returning the live
+    /// subscription's dedup-filtered stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the client is not connected,
+    /// [`TransportError::SubscriptionFailed`] if a subscription already exists
+    /// for this routing ID, or [`TransportError::SendFailed`] if the relay
+    /// responds with an error.
+    pub async fn query_raw(
+        &self,
+        routing_id: &[u8; 32],
+        since: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
+        let rid = crate::traits::RoutingId::new(*routing_id);
+
+        if self.subscriptions.contains(&rid) {
+            return Err(TransportError::SubscriptionFailed(
+                "query_raw: routing_id already has an active subscription".to_string(),
+            ));
+        }
+
+        let (tx, mut rx) = mpsc::channel::<SubscriptionMessage>(256);
+
+        // Register a temporary dedup-bypassing subscription for BLOB delivery.
+        self.subscriptions
+            .insert(
+                rid,
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                    bypass_dedup: true,
+                },
+            )
+            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
+
+        let msg = ClientMessage::Query {
+            ref_id: None,
+            routing_id: *routing_id,
+            since,
+            limit: Some(limit),
+        };
+
+        let response = self.send_request(msg).await.inspect_err(|_| {
+            self.subscriptions.remove(&rid);
+        })?;
+
+        if let RelayMessage::Err { code, msg, .. } = &response {
+            self.subscriptions.remove(&rid);
+            return Err(TransportError::SendFailed(format!(
+                "relay error {code}: {msg}"
+            )));
+        }
+
+        // Collect raw BLOB payloads until `query_complete`, timeout, or the
+        // `limit` is reached (defensive against a relay that ignores `limit`).
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let cap = limit as usize;
+
+        loop {
+            tokio::select! {
+                msg_opt = rx.recv() => {
+                    match msg_opt {
+                        Some(SubscriptionMessage::Relay(
+                            RelayMessage::Blob { blob, .. },
+                        )) => {
+                            blobs.push(blob);
+                            if blobs.len() >= cap {
+                                break;
+                            }
+                        }
+                        Some(SubscriptionMessage::Relay(
+                            RelayMessage::Event { event_type, .. },
+                        )) if event_type == "query_complete" => {
+                            break;
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    break;
+                }
+            }
+        }
+
+        self.subscriptions.remove(&rid);
+
+        Ok(blobs)
     }
 
     /// Returns whether the client is currently connected.
@@ -1158,10 +1340,95 @@ mod tests {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx,
+                    bypass_dedup: false,
                 },
             )
             .unwrap();
         (inner, subscriptions, rx)
+    }
+
+    /// Helper: like [`setup_inner_with_subscription`] but registers the
+    /// subscription with `bypass_dedup: true` — the one-shot raw public-record
+    /// QUERY shape (§3.10.4).
+    fn setup_inner_with_bypass_subscription(
+        routing_id: [u8; 32],
+    ) -> (
+        Arc<RwLock<ClientInner>>,
+        Arc<TransportSubscriptionMap<SubscriptionState>>,
+        mpsc::Receiver<SubscriptionMessage>,
+    ) {
+        let (tx, rx) = mpsc::channel(16);
+        let inner = Arc::new(RwLock::new(ClientInner {
+            pending: HashMap::new(),
+            next_ref_id: 1,
+            seen_blob_ids: lru::LruCache::new(
+                NonZeroUsize::new(DEDUP_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+            ),
+            connected: true,
+        }));
+        let subscriptions = Arc::new(TransportSubscriptionMap::<SubscriptionState>::new());
+        subscriptions
+            .insert(
+                crate::traits::RoutingId::new(routing_id),
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                    bypass_dedup: true,
+                },
+            )
+            .unwrap();
+        (inner, subscriptions, rx)
+    }
+
+    /// A dedup-bypassing (raw-query) subscription receives the SAME blob on a
+    /// repeat dispatch — the genuine record is NOT dropped on the second
+    /// resolution of an unchanged DID — and the `blob_id` is NEVER committed to
+    /// the `seen_blob_ids` LRU (§3.10.2 limit-N shadow-defeat, §3.10.4). This is
+    /// the regression guard for the dedup bug the raw path fixes: an ordinary
+    /// subscription would drop the second delivery (see
+    /// `dispatch_blob_with_correct_hash_accepted`, which asserts the LRU IS
+    /// seeded).
+    #[tokio::test]
+    async fn raw_query_subscription_bypasses_dedup_on_repeat() {
+        let routing_id = [0xDD; 32];
+        let blob_data = vec![0x0A, 0x0B, 0x0C];
+        let blob_id = sha256(&blob_data);
+        let (inner, subscriptions, mut rx) = setup_inner_with_bypass_subscription(routing_id);
+
+        let make_msg = || RelayMessage::Blob {
+            routing_id,
+            blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_data.clone(),
+        };
+
+        // First delivery.
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, make_msg()).await;
+        // Second delivery of the SAME blob_id (a repeat resolution).
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, make_msg()).await;
+
+        // BOTH deliveries arrive — dedup did not suppress the repeat.
+        for attempt in 0..2 {
+            let received = rx.try_recv().unwrap_or_else(|e| {
+                panic!("delivery {attempt} missing (dedup wrongly applied): {e}")
+            });
+            assert!(
+                matches!(
+                    received,
+                    SubscriptionMessage::Relay(RelayMessage::Blob { .. })
+                ),
+                "expected Relay(Blob), got {received:?}"
+            );
+        }
+
+        // The blob_id must NOT have been committed to the dedup LRU.
+        assert!(
+            !inner.read().await.seen_blob_ids.contains(&blob_id),
+            "raw-query path must never seed the dedup LRU"
+        );
     }
 
     /// Computes SHA-256 of the given data, returning a 32-byte array.
@@ -1382,6 +1649,7 @@ mod tests {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx: tx_a2,
+                    bypass_dedup: false,
                 },
             )
             .unwrap();
