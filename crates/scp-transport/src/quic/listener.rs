@@ -47,12 +47,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::native::did_slot::DidSlotRegistry;
+use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
 use crate::native::server::DidRecordValidation;
 use crate::native::storage::BlobStorage;
-use crate::relay::did_record_validation::{
-    DidRecordClass, DidRecordRejection, classify_did_record_frame, slot_publish_error_response,
-};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -687,7 +684,16 @@ async fn handle_stream<S: BlobStorage + 'static>(
             .await
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_delete(send, ref_id, blob_id, &storage, &did_slots).await
+            handle_delete(
+                send,
+                ref_id,
+                blob_id,
+                ip,
+                &storage,
+                &did_slots,
+                &rate_limiter,
+            )
+            .await
         }
         ClientMessage::Ping { ts } => handle_ping(send, ts).await,
         ClientMessage::Unsubscribe { ref_id, routing_id } => {
@@ -867,76 +873,39 @@ async fn handle_publish<S: BlobStorage>(
     // Compute blob_id = SHA-256(blob).
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
 
-    // OPTIONAL validating-relay DID-record path — mirrors the WebSocket relay
-    // EXACTLY over the shared slot registry (§3.10.2). Only engages for a blob
-    // that decodes as a `DidRecordV1` frame; an encrypted context blob is
-    // `NotAFrame` and falls straight through to opaque storage.
-    if config.did_record_validation == DidRecordValidation::Enabled {
-        match classify_did_record_frame(&routing_id, blob) {
-            DidRecordClass::Valid { seq } => {
-                match did_slots
-                    .publish_frame(
-                        storage.as_ref(),
-                        routing_id,
-                        blob_id,
-                        recipient_hint,
-                        blob_ttl,
-                        blob.to_vec(),
-                        seq,
-                    )
-                    .await
-                {
-                    Ok((stored, _outcome)) => {
-                        let _failed_deliveries = subscription::deliver_to_subscribers(
-                            &stored,
-                            subscriptions,
-                            config.delivery_jitter_ms,
-                        )
-                        .await;
-                        let ok = RelayMessage::Ok {
-                            ref_id,
-                            blob_id: Some(blob_id),
-                        };
-                        return write_and_finish(send, &ok).await;
-                    }
-                    Err(e) => {
-                        let (code, msg) = slot_publish_error_response(&e);
-                        let err = RelayMessage::Err { ref_id, code, msg };
-                        return write_and_finish(send, &err).await;
-                    }
-                }
-            }
-            DidRecordClass::Invalid(reason) => {
-                let detail = match reason {
-                    DidRecordRejection::BindingMismatch => {
-                        "DID→routing_id binding mismatch (frame published at the wrong routing_id)"
-                    }
-                    DidRecordRejection::SignatureInvalid => "BEP44 signature verification failed",
-                };
-                let err = RelayMessage::Err {
-                    ref_id,
-                    code: code::DID_RECORD_REJECTED,
-                    msg: format!("DID-record frame rejected: {detail}"),
-                };
-                return write_and_finish(send, &err).await;
-            }
-            DidRecordClass::NotAFrame => {
-                // Slot-exclusivity rule (a): a non-frame blob published at a
-                // claimed DID slot is rejected — it can never co-locate with (or
-                // shadow) the genuine record, even via QUIC.
-                if did_slots.is_claimed(storage.as_ref(), &routing_id).await {
-                    let err = RelayMessage::Err {
-                        ref_id,
-                        code: code::DID_RECORD_REJECTED,
-                        msg: "routing_id has a claimed DID-record slot; \
-                              non-superseding blobs are rejected (slot-exclusive)"
-                            .to_string(),
-                    };
-                    return write_and_finish(send, &err).await;
-                }
-                // Not a claimed DID slot — fall through to ordinary opaque storage.
-            }
+    // OPTIONAL validating-relay DID-record slot gate — the SAME shared chokepoint
+    // the WebSocket/UDP/WebTransport transports route through (§3.10.2). This
+    // handler only emits the wire response and delivers to subscribers on Accepted.
+    match did_slots
+        .gate_publish(
+            config.did_record_validation,
+            storage.as_ref(),
+            routing_id,
+            recipient_hint,
+            blob_ttl,
+            blob,
+            blob_id,
+        )
+        .await
+    {
+        DidPublishGate::Accepted(stored) => {
+            let _failed_deliveries = subscription::deliver_to_subscribers(
+                &stored,
+                subscriptions,
+                config.delivery_jitter_ms,
+            )
+            .await;
+            let ok = RelayMessage::Ok {
+                ref_id,
+                blob_id: Some(blob_id),
+            };
+            return write_and_finish(send, &ok).await;
         }
+        DidPublishGate::Rejected { code, msg } => {
+            let err = RelayMessage::Err { ref_id, code, msg };
+            return write_and_finish(send, &err).await;
+        }
+        DidPublishGate::FallThrough => {}
     }
 
     // Store the blob (opaque path — non-DID blobs, or every blob when
@@ -1059,31 +1028,18 @@ async fn handle_subscribe<S: BlobStorage>(
     };
     write_relay_message(&mut send, &ok).await?;
 
-    // Backfill if `since` is provided.
+    // Backfill if `since` is provided. Slot-exclusivity rule (c) applies via the
+    // shared storage-authoritative QUERY gate: a claimed DID routing_id backfills
+    // ONLY its single genuine record (even on a cold index).
     if let Some(since_ts) = since {
-        // Slot-exclusivity rule (c) applies to backfill too: a routing_id with a
-        // claimed DID slot backfills ONLY that single slot record, never any
-        // co-located opaque junk — the same gate QUERY uses over the shared
-        // registry. Unclaimed routing_ids (all encrypted context blobs) take the
-        // normal windowed backfill.
-        let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
-            did_slots.slot_blob(storage.as_ref(), &routing_id).await
-        } else {
-            None
-        };
-
-        if let Some(slot) = claimed_slot {
-            let blob_msg = RelayMessage::Blob {
-                routing_id: slot.routing_id,
-                blob_id: slot.blob_id,
-                recipient_hint: slot.recipient_hint,
-                blob_ttl: slot.blob_ttl,
-                stored_at: slot.stored_at,
-                blob: slot.blob,
-            };
-            write_relay_message(&mut send, &blob_msg).await?;
-        } else if let Ok(blobs) = storage
-            .query(&routing_id, Some(since_ts), MAX_QUERY_LIMIT)
+        if let Ok(blobs) = did_slots
+            .gate_query(
+                config.did_record_validation,
+                storage.as_ref(),
+                routing_id,
+                Some(since_ts),
+                MAX_QUERY_LIMIT,
+            )
             .await
         {
             for stored in blobs {
@@ -1178,30 +1134,28 @@ async fn handle_query<S: BlobStorage>(
         return write_and_finish(send, &err).await;
     }
 
-    // Slot-exclusivity rule (c): a validating listener returns ONLY the single
-    // slot record at a claimed DID `routing_id`, regardless of `limit`/`since`
-    // and any co-located junk — the same shared-registry gate the WebSocket relay
-    // applies, so a QUIC-reaching resolver cannot be handed a flood.
-    let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
-        did_slots.slot_blob(storage.as_ref(), &routing_id).await
-    } else {
-        None
-    };
-
-    let blobs = if let Some(slot) = claimed_slot {
-        vec![slot]
-    } else {
-        match storage.query(&routing_id, since, effective_limit).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(error = %e, "QUIC: blob query failed");
-                let err = RelayMessage::Err {
-                    ref_id,
-                    code: code::INTERNAL_ERROR,
-                    msg: "internal error".to_owned(),
-                };
-                return write_and_finish(send, &err).await;
-            }
+    // Slot-exclusivity rule (c) via the shared, storage-authoritative QUERY gate:
+    // a claimed DID `routing_id` returns ONLY its single genuine record (even on
+    // a cold index); ordinary routing_ids pass through unchanged.
+    let blobs = match did_slots
+        .gate_query(
+            config.did_record_validation,
+            storage.as_ref(),
+            routing_id,
+            since,
+            effective_limit,
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, "QUIC: blob query failed");
+            let err = RelayMessage::Err {
+                ref_id,
+                code: code::INTERNAL_ERROR,
+                msg: "internal error".to_owned(),
+            };
+            return write_and_finish(send, &err).await;
         }
     };
 
@@ -1230,28 +1184,23 @@ async fn handle_delete<S: BlobStorage>(
     send: SendStream,
     ref_id: Option<String>,
     blob_id: [u8; 32],
+    ip: IpAddr,
     storage: &Arc<S>,
     did_slots: &DidSlotRegistry,
+    rate_limiter: &PublishRateLimiter,
 ) -> Result<(), StreamError> {
-    // Slot-exclusivity (§3.10.2 rule (d)): reject a DELETE of a protected DID
-    // slot blob over QUIC, identically to WebSocket. The gate is STORAGE-BACKED
-    // (index is a fast-path cache, not the authority) — it decodes+verifies the
-    // immutable, content-addressed blob, so it is immune to a cold/empty index.
-    // The check-then-delete race is benign (content-addressed bytes are
-    // immutable); residual is the availability-only "published just after check"
-    // window. Non-slot blobs proceed.
-    if did_slots
-        .delete_would_revert_slot(storage.as_ref(), &blob_id)
+    // Slot-exclusivity (§3.10.2 rule (d)) via the shared, storage-backed,
+    // rate-limited DELETE gate — the SAME chokepoint every transport routes
+    // through. Storage-backed, so immune to a cold index; non-slot blobs proceed.
+    match did_slots
+        .gate_delete(storage.as_ref(), &blob_id, rate_limiter, ip)
         .await
     {
-        let err = RelayMessage::Err {
-            ref_id,
-            code: code::DID_RECORD_REJECTED,
-            msg: "blob_id is a claimed DID-record slot; only a superseding \
-                  PUBLISH may replace it (slot-exclusive)"
-                .to_string(),
-        };
-        return write_and_finish(send, &err).await;
+        DidDeleteGate::Rejected { code, msg } => {
+            let err = RelayMessage::Err { ref_id, code, msg };
+            return write_and_finish(send, &err).await;
+        }
+        DidDeleteGate::Proceed => {}
     }
 
     // Best-effort deletion.

@@ -37,14 +37,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::dtls::AsyncDtlsSession;
-use crate::native::did_slot::DidSlotRegistry;
-use crate::native::server::{DidRecordValidation, RelayConfig};
+use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
+use crate::native::server::RelayConfig;
 use crate::native::storage::BlobStorage;
-use crate::relay::did_record_validation::{
-    DidRecordClass, DidRecordRejection, classify_did_record_frame, slot_publish_error_response,
-};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter};
-use scp_relay_client::{ClientMessage, DEFAULT_QUERY_LIMIT, MIN_BLOB_TTL, RelayMessage, code};
+use scp_relay_client::{ClientMessage, DEFAULT_QUERY_LIMIT, MIN_BLOB_TTL, RelayMessage};
 
 /// Configuration for the UDP/DTLS listener.
 ///
@@ -787,6 +784,7 @@ async fn per_client_recv_loop<S: BlobStorage + 'static>(
             client_msg,
             remote_addr,
             &did_slots,
+            &rate_limiter,
         )
         .await;
     }
@@ -801,6 +799,7 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
     msg: ClientMessage,
     remote_addr: SocketAddr,
     did_slots: &DidSlotRegistry,
+    rate_limiter: &PublishRateLimiter,
 ) {
     match msg {
         ClientMessage::Publish {
@@ -844,7 +843,16 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
             .await;
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_udp_delete(ref_id, blob_id, sessions, &remote_addr, storage, did_slots).await;
+            handle_udp_delete(
+                ref_id,
+                blob_id,
+                sessions,
+                &remote_addr,
+                storage,
+                did_slots,
+                rate_limiter,
+            )
+            .await;
         }
         ClientMessage::Subscribe { ref_id, .. } => {
             let err = RelayMessage::Err {
@@ -941,72 +949,35 @@ async fn handle_udp_publish<S: BlobStorage>(
     // Compute blob_id = SHA-256(blob).
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
 
-    // OPTIONAL validating-relay DID-record path — mirrors the WebSocket/QUIC
-    // handlers EXACTLY over the shared slot registry (§3.10.2). UDP/DTLS has no
-    // subscriptions, so there is no subscriber delivery here.
-    if config.did_record_validation == DidRecordValidation::Enabled {
-        match classify_did_record_frame(&routing_id, blob) {
-            DidRecordClass::Valid { seq } => {
-                match did_slots
-                    .publish_frame(
-                        storage.as_ref(),
-                        routing_id,
-                        blob_id,
-                        recipient_hint,
-                        blob_ttl,
-                        blob.to_vec(),
-                        seq,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        let ok = RelayMessage::Ok {
-                            ref_id,
-                            blob_id: Some(blob_id),
-                        };
-                        send_dtls_response(sessions, remote_addr, &ok).await;
-                    }
-                    Err(e) => {
-                        let (code, msg) = slot_publish_error_response(&e);
-                        let err = RelayMessage::Err { ref_id, code, msg };
-                        send_dtls_response(sessions, remote_addr, &err).await;
-                    }
-                }
-                return;
-            }
-            DidRecordClass::Invalid(reason) => {
-                let detail = match reason {
-                    DidRecordRejection::BindingMismatch => {
-                        "DID→routing_id binding mismatch (frame published at the wrong routing_id)"
-                    }
-                    DidRecordRejection::SignatureInvalid => "BEP44 signature verification failed",
-                };
-                let err = RelayMessage::Err {
-                    ref_id,
-                    code: code::DID_RECORD_REJECTED,
-                    msg: format!("DID-record frame rejected: {detail}"),
-                };
-                send_dtls_response(sessions, remote_addr, &err).await;
-                return;
-            }
-            DidRecordClass::NotAFrame => {
-                // Slot-exclusivity rule (a): a non-frame blob at a claimed DID
-                // slot is rejected — no co-locating junk with the genuine record,
-                // even over UDP.
-                if did_slots.is_claimed(storage.as_ref(), &routing_id).await {
-                    let err = RelayMessage::Err {
-                        ref_id,
-                        code: code::DID_RECORD_REJECTED,
-                        msg: "routing_id has a claimed DID-record slot; \
-                              non-superseding blobs are rejected (slot-exclusive)"
-                            .to_string(),
-                    };
-                    send_dtls_response(sessions, remote_addr, &err).await;
-                    return;
-                }
-                // Not a claimed DID slot — fall through to ordinary opaque storage.
-            }
+    // OPTIONAL validating-relay DID-record slot gate — the SAME shared chokepoint
+    // the WebSocket/QUIC/WebTransport transports route through (§3.10.2). UDP/DTLS
+    // has no subscriptions, so `Accepted` just emits Ok (no subscriber delivery).
+    match did_slots
+        .gate_publish(
+            config.did_record_validation,
+            storage.as_ref(),
+            routing_id,
+            recipient_hint,
+            blob_ttl,
+            blob,
+            blob_id,
+        )
+        .await
+    {
+        DidPublishGate::Accepted(_stored) => {
+            let ok = RelayMessage::Ok {
+                ref_id,
+                blob_id: Some(blob_id),
+            };
+            send_dtls_response(sessions, remote_addr, &ok).await;
+            return;
         }
+        DidPublishGate::Rejected { code, msg } => {
+            let err = RelayMessage::Err { ref_id, code, msg };
+            send_dtls_response(sessions, remote_addr, &err).await;
+            return;
+        }
+        DidPublishGate::FallThrough => {}
     }
 
     match storage
@@ -1063,31 +1034,29 @@ async fn handle_udp_query<S: BlobStorage>(
         return;
     }
 
-    // Slot-exclusivity rule (c): a validating listener returns ONLY the single
-    // slot record at a claimed DID `routing_id`, over the shared registry — the
-    // same gate the WebSocket/QUIC transports apply, so a UDP-reaching resolver
-    // cannot be handed a flood.
-    let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
-        did_slots.slot_blob(storage.as_ref(), &routing_id).await
-    } else {
-        None
-    };
-
-    let blobs = if let Some(slot) = claimed_slot {
-        vec![slot]
-    } else {
-        match storage.query(&routing_id, since, effective_limit).await {
-            Ok(b) => b,
-            Err(e) => {
-                debug!(remote = %remote_addr, error = %e, "UDP: blob query failed");
-                let err = RelayMessage::Err {
-                    ref_id,
-                    code: 500,
-                    msg: "internal error".to_owned(),
-                };
-                send_dtls_response(sessions, remote_addr, &err).await;
-                return;
-            }
+    // Slot-exclusivity rule (c) via the shared, storage-authoritative QUERY gate:
+    // a claimed DID `routing_id` returns ONLY its single genuine record (even on
+    // a cold index); ordinary routing_ids pass through unchanged.
+    let blobs = match did_slots
+        .gate_query(
+            config.did_record_validation,
+            storage.as_ref(),
+            routing_id,
+            since,
+            effective_limit,
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            debug!(remote = %remote_addr, error = %e, "UDP: blob query failed");
+            let err = RelayMessage::Err {
+                ref_id,
+                code: 500,
+                msg: "internal error".to_owned(),
+            };
+            send_dtls_response(sessions, remote_addr, &err).await;
+            return;
         }
     };
 
@@ -1114,6 +1083,7 @@ async fn handle_udp_query<S: BlobStorage>(
 ///
 /// Best-effort deletion -- always returns OK, consistent with the WebSocket
 /// relay behavior — EXCEPT a claimed DID slot's blob, which is rejected.
+#[allow(clippy::too_many_arguments)]
 async fn handle_udp_delete<S: BlobStorage>(
     ref_id: Option<String>,
     blob_id: [u8; 32],
@@ -1121,27 +1091,21 @@ async fn handle_udp_delete<S: BlobStorage>(
     remote_addr: &SocketAddr,
     storage: &Arc<S>,
     did_slots: &DidSlotRegistry,
+    rate_limiter: &PublishRateLimiter,
 ) {
-    // Slot-exclusivity (§3.10.2 rule (d)): reject a DELETE of a protected DID
-    // slot blob over UDP, identically to WebSocket/QUIC. The gate is
-    // STORAGE-BACKED (index is a fast-path cache, not the authority) — it
-    // decodes+verifies the immutable, content-addressed blob, so it is immune to
-    // a cold/empty index. The check-then-delete race is benign (immutable bytes);
-    // residual is the availability-only "published just after check" window.
-    // Non-slot blobs proceed.
-    if did_slots
-        .delete_would_revert_slot(storage.as_ref(), &blob_id)
+    // Slot-exclusivity (§3.10.2 rule (d)) via the shared, storage-backed,
+    // rate-limited DELETE gate — the SAME chokepoint every transport routes
+    // through. Storage-backed, so immune to a cold index; non-slot blobs proceed.
+    match did_slots
+        .gate_delete(storage.as_ref(), &blob_id, rate_limiter, remote_addr.ip())
         .await
     {
-        let err = RelayMessage::Err {
-            ref_id,
-            code: code::DID_RECORD_REJECTED,
-            msg: "blob_id is a claimed DID-record slot; only a superseding \
-                  PUBLISH may replace it (slot-exclusive)"
-                .to_string(),
-        };
-        send_dtls_response(sessions, remote_addr, &err).await;
-        return;
+        DidDeleteGate::Rejected { code, msg } => {
+            let err = RelayMessage::Err { ref_id, code, msg };
+            send_dtls_response(sessions, remote_addr, &err).await;
+            return;
+        }
+        DidDeleteGate::Proceed => {}
     }
 
     let _ = storage.delete(&blob_id).await;
@@ -1336,6 +1300,7 @@ mod tests {
     use crate::native::storage::InMemoryBlobStorage;
     use crate::udp::dtls::AsyncDtlsSession;
     use openssl::ssl::{SslMethod, SslVerifyMode};
+    use scp_relay_client::code;
 
     /// Helper: create a test listener and return the bound address and shutdown handle.
     async fn start_test_listener() -> (UdpDtlsShutdownHandle, SocketAddr, Arc<InMemoryBlobStorage>)

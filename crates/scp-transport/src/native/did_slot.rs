@@ -27,41 +27,61 @@
 //! uniformly to **every** configured backend (in-memory, `SQLite`, redb, `S3`,
 //! `Postgres`) with no per-backend code and no dev/test-only stand-in.
 //!
-//! # Reversion (spec §3.10.2)
+//! # Reversion (spec §3.10.2) — two *different* causes
 //!
-//! The index is in-memory. If a slot's blob TTL expires (owner offline past the
-//! 6-day republish cycle) or the relay restarts, the `routing_id` reverts to an
-//! unclaimed opaque-blob address and the pre-seed window reopens. This is not a
-//! suppression bypass: the genuine record is already absent (owner offline, not
-//! attacker action). The rollback defense here is **not** signature verification
-//! — a replayed *old genuine* record is owner-signed and passes the resolver's
-//! DID-derived-key BEP44 verify — it is the resolver's **client-side
-//! seq-monotonicity** freshness check: a record is accepted only when its BEP44
-//! `seq >= last_known_seq`, and the highest valid `seq` wins across both the
-//! relay and the DHT (§3.10.7; spec §9.6.1 "the BEP44 sequence number is the
-//! sole authority for document freshness"). So during a reversion window a
-//! stale attacker-replayed record cannot roll a resolver back; resolution also
-//! falls through to the DHT, and the owner's next republish re-establishes the
-//! slot and re-fires eviction.
+//! The index is in-memory, so a slot can "revert" for two causes with **very
+//! different** consequences; conflating them (as an earlier revision did) is
+//! wrong:
 //!
-//! Reversion is reconciled two ways. **Lazily** — a slot whose blob is gone is
-//! dropped from the index the next time it is consulted
-//! ([`is_claimed`](DidSlotRegistry::is_claimed) /
-//! [`slot_blob`](DidSlotRegistry::slot_blob)). **Actively** — a periodic
-//! [`sweep_expired`](DidSlotRegistry::sweep_expired) drops entries whose blob
-//! has TTL-expired even if the `routing_id` is never consulted again, so a
-//! slot claimed once and then abandoned cannot pin its index entry forever.
+//! 1. **TTL-expiry** — the slot record's own blob TTL lapsed (owner offline past
+//!    the 6-day republish cycle). Here the genuine record really *is* absent from
+//!    storage; the `routing_id` reverts to an unclaimed opaque address. Not a
+//!    suppression bypass — the record is gone because the owner stopped
+//!    republishing, not because of attacker action.
+//! 2. **Relay-restart / store-sharing cold index** — the in-memory index is
+//!    empty but a **durable backend still holds the genuine blob**. The record is
+//!    *present*; only the relay's cache forgot it. This DOES open a real, bounded,
+//!    availability-only suppression/rollback window **on that one relay** until a
+//!    binding-valid observation re-warms the index — and the storage-authoritative
+//!    gates below are what keep it availability-only rather than integrity-losing.
 //!
-//! # Cold-index reconciliation (never roll a genuine record back)
+//! In **both** cases integrity holds by client re-verification, never by relay
+//! signature checks: a replayed *old-but-genuine* record is owner-signed and
+//! passes the resolver's DID-derived-key BEP44 verify, so the rollback defense is
+//! the resolver's **client-side `seq`-monotonicity** freshness check (accept only
+//! `seq >= last_known_seq`; the highest valid `seq` wins across relay *and* DHT —
+//! §3.10.7, spec §9.6.1 "the BEP44 sequence number is the sole authority for
+//! document freshness"), backed by multi-relay publishing and the DHT.
 //!
-//! The index can be **cold** while storage still holds a genuine record — after
-//! a durable-backend restart (index empty, the genuine blob persisted), or when
-//! a store-sharing transport deposited a frame. Establishing a slot at a cold
-//! `routing_id` therefore reconciles against storage *before* evicting: it
-//! adopts the highest-`seq` binding-valid frame already present, so a replayed
-//! lower-`seq` frame can never delete a higher-`seq` genuine record. This
-//! preserves the invariant that slot-exclusivity affects **availability only,
-//! never integrity**.
+//! For the restart case specifically, the storage-authoritative QUERY gate
+//! ([`gate_query`](DidSlotRegistry::gate_query)) re-derives the slot from the
+//! durable blob on a cold-index read, so a QUERY returns only the genuine record
+//! even before the index re-warms — **largely closing the suppression window on
+//! the read path**, not merely relying on the client to sort out a flood. The
+//! DELETE gate ([`gate_delete`](DidSlotRegistry::gate_delete)) and cold-index
+//! establish are likewise storage-authoritative, so a cold index cannot be used
+//! to *purge* or *roll back* the durable record either.
+//!
+//! Reversion of an expired slot is reclaimed **lazily** (on the next consult) and
+//! **actively** ([`sweep_expired`](DidSlotRegistry::sweep_expired)), so an
+//! abandoned slot cannot pin its index entry forever.
+//!
+//! # Closed-by-construction matrix — every slot-touching operation
+//!
+//! The invariant is that the **index is a pure cache**; every decision that
+//! could otherwise leak/purge/rollback a genuine record is authoritative against
+//! *storage* (the immutable, content-addressed, self-certifying blob), so a cold
+//! or empty index (restart / store-sharing peer) can never break integrity. Each
+//! operation, the rule it enforces, and its cold-index behavior:
+//!
+//! | Operation | Rule | Authority | Cold-index behavior |
+//! |---|---|---|---|
+//! | **establish** (`publish_frame`, `None` arm) | single-slot | **storage** — reconciles co-located blobs, adopts highest-`seq` valid before evicting | a replayed lower-`seq` frame is rejected; the durable higher-`seq` record is adopted, never purged |
+//! | **supersede / refresh** (`publish_frame`) | single highest-`seq` slot | index + storage `get` liveness | a stale index entry is reverted via `generation`-gated checks; a higher valid `seq` always wins |
+//! | **opaque-PUBLISH rule (a)** (`gate_publish` `NotAFrame`) | reject junk at a claimed slot | **index cache** (fast path) | cold-miss may *accept junk into storage*, but it can never *suppress* — QUERY (below) is storage-authoritative and the next establish/sweep evicts. Made storage-authoritative here would put an unbounded scan on the hot path of every encrypted-context PUBLISH (a worse denial-of-service); the read-path authority is the sound closure |
+//! | **QUERY / SUBSCRIBE-backfill rule (c)** (`gate_query`) | return only the slot | **storage** — re-applies over the `storage.query` result, returns only the highest-`seq` valid frame, warms the index | a cold index returns ONLY the genuine record (no leaked junk); no extra hot-path scan for non-DID `routing_id`s (the query already ran; only its results are classified) |
+//! | **DELETE rule (d)** (`gate_delete`) | only a superseding PUBLISH may replace a slot | **storage** — decodes+verifies the immutable blob; fails *closed* on storage error; rate-limited | a cold index still refuses to delete a genuine record; content-addressing makes the check-then-delete window benign (availability-only) |
+//! | **live delivery** (`deliver_to_subscribers` on opaque fall-through) | — | n/a (delivery, not a slot decision) | any junk delivered live is filtered by the subscriber's own re-verification (RELAYRES-002) |
 //!
 //! # Not a trust dependency
 //!
@@ -70,6 +90,7 @@
 //! does not run this bookkeeping degrades availability only, never integrity.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -77,9 +98,14 @@ use tokio::sync::RwLock;
 
 use scp_identity::{did_from_ed25519_public_key, did_routing_id};
 use scp_protocol::envelope::did_record::DidRecordV1;
+use scp_relay_client::code;
 
+use super::server::DidRecordValidation;
 use super::storage::{BlobStorage, StorageError, StoredBlob};
-use crate::relay::did_record_validation::{DidRecordClass, classify_did_record_frame};
+use crate::relay::did_record_validation::{
+    DidRecordClass, DidRecordRejection, classify_did_record_frame, slot_publish_error_response,
+};
+use crate::relay::rate_limit::PublishRateLimiter;
 
 /// A claimed DID-record slot: the single blob currently occupying a DID-domain
 /// `routing_id`, and its BEP44 sequence number (for supersession).
@@ -139,6 +165,48 @@ pub enum SlotPublishError {
     /// An underlying blob-store operation failed.
     #[error("slot storage error: {0}")]
     Storage(#[from] StorageError),
+}
+
+/// Outcome of the shared PUBLISH slot-gate ([`DidSlotRegistry::gate_publish`]).
+///
+/// Each transport matches these arms and emits its own wire response, so the
+/// ~90-line DID-record PUBLISH decision tree (classify → single-slot rule → error
+/// mapping → rule (a)) lives in exactly one place across WebSocket, QUIC,
+/// UDP/DTLS, and WebTransport — a chokepoint, not four copies.
+#[derive(Debug)]
+pub enum DidPublishGate {
+    /// A binding-valid DID-record frame was applied to its slot. The transport
+    /// delivers `stored` to subscribers (where the transport supports live
+    /// delivery) and emits an `Ok { blob_id }`.
+    Accepted(StoredBlob),
+    /// The PUBLISH is rejected — the transport emits `Err { code, msg }`.
+    Rejected {
+        /// The relay wire error code (e.g. `DID_RECORD_REJECTED`).
+        code: u16,
+        /// A human-readable rejection reason.
+        msg: String,
+    },
+    /// Not a DID-record frame at an unclaimed `routing_id` (or validation is
+    /// disabled): the transport takes its ordinary opaque-store path (store +
+    /// deliver + `Ok`).
+    FallThrough,
+}
+
+/// Outcome of the shared DELETE slot-gate
+/// ([`DidSlotRegistry::gate_delete`]).
+#[derive(Debug)]
+pub enum DidDeleteGate {
+    /// The DELETE is allowed — the transport performs its best-effort delete and
+    /// emits `Ok`.
+    Proceed,
+    /// The DELETE is refused — the transport emits `Err { code, msg }` and does
+    /// **not** delete.
+    Rejected {
+        /// The relay wire error code.
+        code: u16,
+        /// A human-readable rejection reason.
+        msg: String,
+    },
 }
 
 /// The validating relay's DID-record slot index over its shared blob store.
@@ -369,75 +437,261 @@ impl DidSlotRegistry {
         }
     }
 
-    /// Returns whether `blob_id` matches the current slot blob of some claimed
-    /// DID-domain `routing_id` **in the in-memory index**.
+    /// Warms the index from an **authoritative storage observation**: records
+    /// that `routing_id` is claimed by the valid frame `(blob_id, seq)` that a
+    /// storage-backed decision just found. This turns a cold-index cold-miss into
+    /// a subsequent fast-path hit (QUERY/opaque-PUBLISH), so the storage-backed
+    /// scan is paid at most once per `routing_id` per cold window.
     ///
-    /// This is the cheap *fast path* of the DELETE gate — an in-memory scan over
-    /// the (bounded) claimed-slot index, no storage I/O. It is **not** the
-    /// authority: the index is a cache that is empty after a relay restart and
-    /// cold on a store-sharing peer. The authoritative, index-independent gate is
-    /// [`delete_would_revert_slot`](Self::delete_would_revert_slot); use that on
-    /// the DELETE path.
-    pub async fn is_current_slot_blob(&self, blob_id: &[u8; 32]) -> bool {
-        self.slots
-            .read()
-            .await
-            .values()
-            .any(|s| &s.blob_id == blob_id)
+    /// Best-effort and race-safe: it does **not** overwrite an index entry that
+    /// already claims an equal-or-higher `seq` (a concurrent establish/supersede
+    /// must win); any staleness it does introduce is reconciled by the ordinary
+    /// lazy revert + sweep. Never establishes a *lower*-seq claim over a higher one.
+    async fn warm_slot(&self, routing_id: [u8; 32], blob_id: [u8; 32], seq: u64) {
+        let mut slots = self.slots.write().await;
+        match slots.get(&routing_id) {
+            Some(existing) if existing.seq >= seq => {}
+            _ => {
+                let slot = self.fresh_slot(blob_id, seq);
+                slots.insert(routing_id, slot);
+            }
+        }
     }
 
-    /// Storage-backed DELETE gate: returns whether deleting `blob_id` would purge
-    /// a protected DID-record slot (§3.10.2 rule (d)). Used to reject an
-    /// unauthenticated DELETE that would otherwise revert a claimed slot.
+    /// The storage-authoritative predicate shared by every slot decision: does
+    /// `blob` (the immutable, content-addressed bytes at some `blob_id`) decode as
+    /// a binding-and-signature-**Valid** DID-record frame? Returns its
+    /// `(derived_routing_id, seq)` if so.
     ///
-    /// DID records are public, so an attacker can compute
-    /// `blob_id = SHA-256(genuine_record)` and DELETE the slot blob to force the
-    /// `routing_id` to revert, then replay an older genuine frame (which the
-    /// cold-index seq-aware establish would then *adopt* from storage) — an
-    /// on-demand **integrity** rollback of the victim's DID document.
+    /// A DID-record frame is content-addressed (`blob_id = SHA-256(blob)`, so its
+    /// bytes are immutable) and self-certifying (embedded `public_key` + BEP44
+    /// signature), so its protected status is reconstructible from the bytes
+    /// alone — independent of any index. The `routing_id` a frame binds to is
+    /// derived from its **own** `public_key`; a self-consistent frame binds to
+    /// exactly that derived `routing_id`, which is what makes it a protected DID
+    /// record. This is the single source of truth behind the DELETE gate and the
+    /// cold-index reconciliation of QUERY / establish.
+    #[must_use]
+    fn classify_stored_frame(blob: &[u8]) -> Option<([u8; 32], u64)> {
+        let frame = DidRecordV1::decode(blob).ok()?;
+        let routing_id = did_routing_id(&did_from_ed25519_public_key(frame.public_key()));
+        match classify_did_record_frame(&routing_id, blob) {
+            DidRecordClass::Valid { seq } => Some((routing_id, seq)),
+            _ => None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared slot gates — the single chokepoint every transport routes through
+    // (§3.10.2). Extracting them here means a change to slot policy (or a new
+    // transport) is made in ONE place, not copy-pasted four times.
+    // -----------------------------------------------------------------------
+
+    /// Shared PUBLISH slot-gate (§3.10.2 rules 1–4 + rule (a)). Given a candidate
+    /// blob at `routing_id`, decides establish/supersede/refresh/reject/opaque and
+    /// returns a transport-agnostic [`DidPublishGate`]; the caller emits the wire
+    /// response (and, on [`Accepted`](DidPublishGate::Accepted), delivers to
+    /// subscribers).
     ///
-    /// The gate is **storage-backed, not index-based**, and therefore immune to a
-    /// cold/empty index (restart, store-sharing peer): a DID-record frame is
-    /// content-addressed (`blob_id = SHA-256(blob)`, so the bytes at a `blob_id`
-    /// are immutable) and self-certifying (embedded `public_key` + BEP44
-    /// signature), so its protected status is reconstructible from the bare
-    /// `blob_id` alone. The in-memory index is only a fast-path cache — the blob
-    /// itself is the authority.
+    /// When `validation` is
+    /// [`Disabled`](crate::native::server::DidRecordValidation::Disabled) the gate
+    /// is a no-op ([`FallThrough`](DidPublishGate::FallThrough)) — the frame is
+    /// stored opaquely like a foreign transport.
     ///
-    /// Returns `true` (reject the DELETE) iff the blob is present in storage and
-    /// [`classify_did_record_frame`] rules it a binding-and-signature-**Valid**
-    /// DID frame. The `routing_id` a DELETE-by-`blob_id` binds to is derived from
-    /// the frame's **own** `public_key` — a self-consistent frame binds to exactly
-    /// its own derived `routing_id`, which is what makes it a protected DID
-    /// record. A non-frame blob, an invalid-signature frame, or an absent blob is
-    /// unprotected → the DELETE proceeds.
-    pub async fn delete_would_revert_slot<S: BlobStorage + ?Sized>(
+    /// Cold-index note: a `Valid` frame goes through
+    /// [`publish_frame`](Self::publish_frame), which is already storage-authoritative
+    /// (it reconciles a cold index against storage before evicting). The
+    /// `NotAFrame` rule-(a) check uses the index fast-path
+    /// ([`is_claimed`](Self::is_claimed)): on a cold index a junk opaque PUBLISH at
+    /// a DID `routing_id` may be *accepted into storage*, but it can never *suppress*
+    /// the genuine record — QUERY ([`gate_query`](Self::gate_query)) is
+    /// storage-authoritative and returns only the genuine frame, and the next
+    /// establish/sweep evicts the stray. Making rule (a) itself storage-authoritative
+    /// would put an unbounded `storage.query` scan on the hot path of *every*
+    /// encrypted-context PUBLISH (which is `NotAFrame` at an unclaimed `routing_id`),
+    /// a far worse denial-of-service than it prevents; the read-path authority is the
+    /// sound closure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn gate_publish<S: BlobStorage + ?Sized>(
+        &self,
+        validation: DidRecordValidation,
+        storage: &S,
+        routing_id: [u8; 32],
+        recipient_hint: Option<[u8; 32]>,
+        blob_ttl: u32,
+        blob: &[u8],
+        blob_id: [u8; 32],
+    ) -> DidPublishGate {
+        if validation != DidRecordValidation::Enabled {
+            return DidPublishGate::FallThrough;
+        }
+        match classify_did_record_frame(&routing_id, blob) {
+            DidRecordClass::Valid { seq } => {
+                match self
+                    .publish_frame(
+                        storage,
+                        routing_id,
+                        blob_id,
+                        recipient_hint,
+                        blob_ttl,
+                        blob.to_vec(),
+                        seq,
+                    )
+                    .await
+                {
+                    Ok((stored, _outcome)) => DidPublishGate::Accepted(stored),
+                    Err(e) => {
+                        let (code, msg) = slot_publish_error_response(&e);
+                        DidPublishGate::Rejected { code, msg }
+                    }
+                }
+            }
+            DidRecordClass::Invalid(reason) => {
+                let detail = match reason {
+                    DidRecordRejection::BindingMismatch => {
+                        "DID→routing_id binding mismatch (frame published at the wrong routing_id)"
+                    }
+                    DidRecordRejection::SignatureInvalid => "BEP44 signature verification failed",
+                };
+                DidPublishGate::Rejected {
+                    code: code::DID_RECORD_REJECTED,
+                    msg: format!("DID-record frame rejected: {detail}"),
+                }
+            }
+            DidRecordClass::NotAFrame => {
+                if self.is_claimed(storage, &routing_id).await {
+                    DidPublishGate::Rejected {
+                        code: code::DID_RECORD_REJECTED,
+                        msg: "routing_id has a claimed DID-record slot; \
+                              non-superseding blobs are rejected (slot-exclusive)"
+                            .to_string(),
+                    }
+                } else {
+                    DidPublishGate::FallThrough
+                }
+            }
+        }
+    }
+
+    /// Shared QUERY / SUBSCRIBE-backfill slot-gate (§3.10.2 rule (c)). Returns the
+    /// exact blob set to return for a QUERY at `routing_id`, applying
+    /// slot-exclusivity **storage-authoritatively**:
+    ///
+    /// 1. index fast-path — a live claimed slot returns only that blob;
+    /// 2. otherwise the ordinary `storage.query(since, limit)` runs, and if any
+    ///    returned blob is a binding-valid DID frame, only the highest-`seq` valid
+    ///    one is returned (and the index is warmed) — so a **cold index cannot leak
+    ///    co-located junk** alongside a genuine record after a restart.
+    ///
+    /// Step 2 adds no extra storage round-trip on the hot path: the
+    /// `storage.query` is the one a fall-through QUERY does anyway, and the
+    /// frame-scan (`highest_valid_frame`) only classifies the returned blobs —
+    /// for an ordinary encrypted-context `routing_id` they are all `NotAFrame`
+    /// (a one-byte decode reject), so no signature work and no slot-only filtering.
+    ///
+    /// When `validation` is `Disabled`, this is a plain `storage.query`.
+    ///
+    /// # Errors
+    /// Propagates a [`StorageError`] from the underlying `storage.query`.
+    pub async fn gate_query<S: BlobStorage + ?Sized>(
+        &self,
+        validation: DidRecordValidation,
+        storage: &S,
+        routing_id: [u8; 32],
+        since: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<StoredBlob>, StorageError> {
+        if validation == DidRecordValidation::Enabled
+            && let Some(slot) = self.slot_blob(storage, &routing_id).await
+        {
+            return Ok(vec![slot]);
+        }
+
+        let blobs = storage.query(&routing_id, since, limit).await?;
+
+        if validation == DidRecordValidation::Enabled
+            && let Some((best_id, best_seq)) = Self::highest_valid_frame(&routing_id, &blobs)
+        {
+            // A cold index missed a genuine frame that storage holds. Warm the
+            // index and return ONLY the highest-seq valid frame (rule (c)).
+            self.warm_slot(routing_id, best_id, best_seq).await;
+            if let Some(slot) = blobs.into_iter().find(|b| b.blob_id == best_id) {
+                return Ok(vec![slot]);
+            }
+            // Unreachable: best_id came from `blobs`. Fall through defensively.
+            return Ok(Vec::new());
+        }
+
+        Ok(blobs)
+    }
+
+    /// Shared DELETE slot-gate (§3.10.2 rule (d)): decides whether a DELETE of
+    /// `blob_id` is allowed or must be refused because it would purge a protected
+    /// DID-record slot.
+    ///
+    /// The gate is **storage-backed** (not index-based) and therefore immune to a
+    /// cold/empty index: it reads the immutable, content-addressed blob and
+    /// reconstructs its protected status via [`classify_stored_frame`](Self::classify_stored_frame)
+    /// — a DID frame is self-certifying, so protection is derivable from the bytes
+    /// alone. Order of operations (defends the CPU-amplifiable classify):
+    ///
+    /// 1. **rate-limit first** (per-IP, shared with PUBLISH) — the storage read +
+    ///    Ed25519 verify below is refused for a client over budget, so an
+    ///    unauthenticated DELETE cannot be used for CPU amplification;
+    /// 2. `storage.get`: `Ok(Some)` → classify; `Ok(None)` → not protected
+    ///    (proceed); **`Err` → fail *closed*** (treat as protected, refuse) — an
+    ///    integrity gate must never let a transient storage error open the delete.
+    ///
+    /// Content-addressing makes the check-then-delete window benign: the bytes at
+    /// a `blob_id` are immutable, so a valid frame present at check time cannot
+    /// become unprotected before the delete; the only residual is an unforceable
+    /// "published just after a not-present check" race, which is availability-only.
+    pub async fn gate_delete<S: BlobStorage + ?Sized>(
         &self,
         storage: &S,
         blob_id: &[u8; 32],
-    ) -> bool {
-        // Fast path: the in-memory index already knows this is a claimed slot
-        // blob — reject without a storage round-trip.
-        if self.is_current_slot_blob(blob_id).await {
-            return true;
+        rate_limiter: &PublishRateLimiter,
+        ip: IpAddr,
+    ) -> DidDeleteGate {
+        // (1) Rate-limit BEFORE the CPU-amplifiable storage-backed classify,
+        // consistent with PUBLISH (DELETE has no dedicated budget; it draws on the
+        // same shared per-IP publish budget).
+        if !rate_limiter.check(ip).await {
+            return DidDeleteGate::Rejected {
+                code: code::RATE_LIMITED,
+                msg: "delete rate limit exceeded".to_string(),
+            };
         }
 
-        // Authoritative path: reconstruct protection from the immutable,
-        // self-describing blob bytes, so a cold/empty index cannot cold-miss.
-        let Ok(Some(stored)) = storage.get(blob_id).await else {
-            return false;
-        };
-        let Ok(frame) = DidRecordV1::decode(&stored.blob) else {
-            return false;
-        };
-        // The frame binds to the routing_id derived from its OWN public_key;
-        // classifying there yields `Valid` iff the BEP44 signature verifies (the
-        // binding holds by construction).
-        let derived_routing_id = did_routing_id(&did_from_ed25519_public_key(frame.public_key()));
-        matches!(
-            classify_did_record_frame(&derived_routing_id, &stored.blob),
-            DidRecordClass::Valid { .. }
-        )
+        // (2) Storage-authoritative protection check, fail-closed on error.
+        match storage.get(blob_id).await {
+            Ok(Some(stored)) => {
+                if Self::classify_stored_frame(&stored.blob).is_some() {
+                    DidDeleteGate::Rejected {
+                        code: code::DID_RECORD_REJECTED,
+                        msg: "blob_id is a claimed DID-record slot; only a superseding \
+                              PUBLISH may replace it (slot-exclusive)"
+                            .to_string(),
+                    }
+                } else {
+                    DidDeleteGate::Proceed
+                }
+            }
+            Ok(None) => DidDeleteGate::Proceed,
+            Err(e) => {
+                // Fail CLOSED: an integrity gate must not let a transient storage
+                // error open the delete of a possibly-protected record. DELETE is
+                // best-effort + client-retryable, so refusing on error is cheap.
+                tracing::warn!(
+                    error = %e,
+                    "DID slot DELETE gate: storage probe failed; refusing delete (fail-closed)",
+                );
+                DidDeleteGate::Rejected {
+                    code: code::INTERNAL_ERROR,
+                    msg: "storage error while verifying delete target; delete refused".to_string(),
+                }
+            }
+        }
     }
 
     /// Drops a `routing_id` from the index iff it still points at the exact slot
@@ -583,6 +837,58 @@ mod tests {
         let mut out = [0u8; 32];
         out.copy_from_slice(&Sha256::digest(blob));
         out
+    }
+
+    /// A [`BlobStorage`] whose `get` always errors — used to prove the DELETE gate
+    /// fails CLOSED on a storage fault (Fix 4).
+    struct FailingGetStorage;
+
+    #[async_trait::async_trait]
+    impl BlobStorage for FailingGetStorage {
+        async fn store(
+            &self,
+            routing_id: [u8; 32],
+            blob_id: [u8; 32],
+            recipient_hint: Option<[u8; 32]>,
+            blob_ttl: u32,
+            blob: Vec<u8>,
+        ) -> Result<StoredBlob, StorageError> {
+            Ok(StoredBlob {
+                routing_id,
+                blob_id,
+                recipient_hint,
+                blob_ttl,
+                stored_at: 0,
+                blob,
+            })
+        }
+
+        async fn get(&self, _blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError> {
+            Err(StorageError::Internal(
+                "simulated storage fault".to_string(),
+            ))
+        }
+
+        async fn query(
+            &self,
+            _routing_id: &[u8; 32],
+            _since: Option<u64>,
+            _limit: u32,
+        ) -> Result<Vec<StoredBlob>, StorageError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _blob_id: &[u8; 32]) -> Result<bool, StorageError> {
+            Ok(false)
+        }
+
+        async fn purge_expired(&self) -> Result<usize, StorageError> {
+            Ok(0)
+        }
+
+        async fn count(&self) -> Result<usize, StorageError> {
+            Ok(0)
+        }
     }
 
     /// Builds a genuine, self-consistent DID-record frame at the signing key's
@@ -934,64 +1240,30 @@ mod tests {
         );
     }
 
-    /// Fix B: the current slot blob is recognized (so DELETE can be gated),
-    /// while non-slot blobs are not — DELETE of ordinary blobs stays unaffected.
-    #[tokio::test]
-    async fn is_current_slot_blob_matches_only_the_claimed_slot() {
-        let storage = BlobStorageBackend::in_memory();
-        let reg = DidSlotRegistry::new();
-        let rid = [0x5A; 32];
-        let v = b"the-slot".to_vec();
-        let bid = blob_id_of(&v);
-        reg.publish_frame(&storage, rid, bid, None, 3600, v, 3)
-            .await
-            .unwrap();
-
-        assert!(
-            reg.is_current_slot_blob(&bid).await,
-            "slot blob is protected"
-        );
-        assert!(
-            !reg.is_current_slot_blob(&blob_id_of(b"some-other-blob"))
-                .await,
-            "a non-slot blob is not protected — DELETE proceeds",
-        );
-
-        // After supersession the OLD slot blob is no longer protected; the new one
-        // is.
-        let v2 = b"the-slot-v9".to_vec();
-        let bid2 = blob_id_of(&v2);
-        reg.publish_frame(&storage, rid, bid2, None, 3600, v2, 9)
-            .await
-            .unwrap();
-        assert!(!reg.is_current_slot_blob(&bid).await);
-        assert!(reg.is_current_slot_blob(&bid2).await);
-    }
-
-    /// Fix B round 3 (cold-index DELETE gate): a genuine binding-valid DID frame
-    /// is present in the durable store but the slot index is COLD (fresh registry
-    /// — models a relay restart or a store-sharing peer). The index-only check
-    /// cold-misses, but the STORAGE-BACKED gate reconstructs protection from the
-    /// self-describing, content-addressed blob and rejects the DELETE. Non-frame
-    /// and absent blobs remain deletable.
+    /// Fix B (cold-index storage-backed DELETE gate): a genuine binding-valid DID
+    /// frame is present in the durable store but the slot index is COLD (fresh
+    /// registry — models a relay restart / store-sharing peer). The gate is
+    /// storage-backed, so it reconstructs protection from the self-describing,
+    /// content-addressed blob and REFUSES the delete despite the cold index.
+    /// Non-frame and absent blobs remain deletable.
     #[tokio::test]
     async fn cold_index_delete_gate_is_storage_backed() {
         let storage = BlobStorageBackend::in_memory();
         let reg = DidSlotRegistry::new(); // COLD: nothing ever published through it.
+        let limiter = PublishRateLimiter::new(1000);
+        let ip = IpAddr::from([127, 0, 0, 1]);
 
         // A genuine seq-5 DID record deposited straight into storage (no publish),
         // so the in-memory index never learns about it.
         let (rid, bid, frame) = genuine_frame(71, 5, b"did-doc");
         storage.store(rid, bid, None, 3600, frame).await.unwrap();
 
-        // The index-only fast path cold-misses (this is the bug the round-3 fix
-        // closes); the authoritative storage-backed gate catches it.
+        // The storage-backed gate REFUSES the delete despite the cold index.
         assert!(
-            !reg.is_current_slot_blob(&bid).await,
-            "index is cold — the index-only check would (wrongly) allow the delete",
-        );
-        assert!(
-            reg.delete_would_revert_slot(&storage, &bid).await,
+            matches!(
+                reg.gate_delete(&storage, &bid, &limiter, ip).await,
+                DidDeleteGate::Rejected { code: c, .. } if c == code::DID_RECORD_REJECTED
+            ),
             "storage-backed gate must protect the genuine record despite a cold index",
         );
 
@@ -999,10 +1271,111 @@ mod tests {
         let opaque = b"\x80 not-a-did-frame".to_vec();
         let obid = blob_id_of(&opaque);
         storage.store(rid, obid, None, 3600, opaque).await.unwrap();
-        assert!(!reg.delete_would_revert_slot(&storage, &obid).await);
+        assert!(matches!(
+            reg.gate_delete(&storage, &obid, &limiter, ip).await,
+            DidDeleteGate::Proceed
+        ));
 
         // An absent blob is not protected.
-        assert!(!reg.delete_would_revert_slot(&storage, &[0xAB; 32]).await);
+        assert!(matches!(
+            reg.gate_delete(&storage, &[0xAB; 32], &limiter, ip).await,
+            DidDeleteGate::Proceed
+        ));
+    }
+
+    /// Fix 3: the DELETE gate is rate-limited (per-IP, shared with PUBLISH) BEFORE
+    /// the CPU-amplifiable storage-backed classify, so an unauthenticated DELETE
+    /// flood cannot be used for CPU amplification.
+    #[tokio::test]
+    async fn delete_gate_is_rate_limited() {
+        let storage = BlobStorageBackend::in_memory();
+        let reg = DidSlotRegistry::new();
+        let limiter = PublishRateLimiter::new(2); // budget of 2
+        let ip = IpAddr::from([127, 0, 0, 2]);
+
+        // Two deletes within budget proceed (blob absent → not protected).
+        for _ in 0..2 {
+            assert!(matches!(
+                reg.gate_delete(&storage, &[0x01; 32], &limiter, ip).await,
+                DidDeleteGate::Proceed
+            ));
+        }
+        // The third is rate-limited.
+        assert!(matches!(
+            reg.gate_delete(&storage, &[0x01; 32], &limiter, ip).await,
+            DidDeleteGate::Rejected { code: c, .. } if c == code::RATE_LIMITED
+        ));
+    }
+
+    /// Fix 4: the DELETE gate fails CLOSED on a storage error — a transient
+    /// `storage.get` failure must never open the delete of a possibly-protected
+    /// record (an integrity gate).
+    #[tokio::test]
+    async fn delete_gate_fails_closed_on_storage_error() {
+        let reg = DidSlotRegistry::new();
+        let limiter = PublishRateLimiter::new(1000);
+        let ip = IpAddr::from([127, 0, 0, 3]);
+        let storage = FailingGetStorage;
+
+        assert!(
+            matches!(
+                reg.gate_delete(&storage, &[0x07; 32], &limiter, ip).await,
+                DidDeleteGate::Rejected { code: c, .. } if c == code::INTERNAL_ERROR
+            ),
+            "a storage error must refuse the delete, not allow it",
+        );
+    }
+
+    /// Fix 1 (storage-authoritative QUERY): a COLD index over a durable store that
+    /// holds a genuine frame co-located with junk must return ONLY the genuine
+    /// frame. The index-only `slot_blob` would cold-miss and leak the junk; the
+    /// storage-authoritative `gate_query` re-applies rule (c) over the storage
+    /// result and warms the index.
+    #[tokio::test]
+    async fn cold_index_query_returns_only_genuine_frame() {
+        let storage = BlobStorageBackend::in_memory();
+        let reg = DidSlotRegistry::new(); // COLD: nothing published through it.
+
+        // Genuine frame + co-located junk, all deposited straight into storage.
+        let (rid, bid, frame) = genuine_frame(72, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+        store_opaque(&storage, rid, b"junk-1").await;
+        store_opaque(&storage, rid, b"junk-2").await;
+        assert_eq!(storage.query(&rid, None, 100).await.unwrap().len(), 3);
+
+        // The storage-authoritative QUERY gate returns ONLY the genuine frame.
+        let out = reg
+            .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "cold-index QUERY must filter co-located junk");
+        assert_eq!(out[0].blob_id, bid);
+
+        // It warmed the index — the fast path now recognizes the claimed slot.
+        assert!(reg.slots.read().await.contains_key(&rid));
+        assert!(reg.is_claimed(&storage, &rid).await);
+    }
+
+    /// A QUERY at an ordinary (non-DID) `routing_id` returns all blobs unchanged —
+    /// the storage-authoritative re-application only engages when storage actually
+    /// holds a binding-valid frame, so it never filters encrypted-context blobs.
+    #[tokio::test]
+    async fn query_at_non_did_routing_id_is_pass_through() {
+        let storage = BlobStorageBackend::in_memory();
+        let reg = DidSlotRegistry::new();
+        let rid = [0xCC; 32];
+        store_opaque(&storage, rid, b"ctx-1").await;
+        store_opaque(&storage, rid, b"ctx-2").await;
+
+        let out = reg
+            .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2, "no frame present → all blobs returned");
+        assert!(
+            !reg.slots.read().await.contains_key(&rid),
+            "index not warmed"
+        );
     }
 
     /// The `generation` also protects `sweep_expired` end-to-end: after an

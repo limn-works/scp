@@ -46,14 +46,11 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::did_slot::DidSlotRegistry;
+use super::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
 use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
 use crate::error::TransportError;
 use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
-use crate::relay::did_record_validation::{
-    DidRecordClass, DidRecordRejection, classify_did_record_frame, slot_publish_error_response,
-};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -1141,7 +1138,16 @@ async fn handle_client_message(
             .await;
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_delete(ref_id.clone(), *blob_id, tx, storage, did_slots).await;
+            handle_delete(
+                ref_id.clone(),
+                *blob_id,
+                ip,
+                tx,
+                storage,
+                did_slots,
+                rate_limiter,
+            )
+            .await;
         }
         ClientMessage::Ack { .. } => {
             // ACK is fire-and-forget. No response.
@@ -1256,94 +1262,45 @@ async fn handle_publish(
     // Compute blob_id = SHA-256(blob).
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
 
-    // OPTIONAL validating-relay DID-record path (§3.10.2 "Relay-side validation",
-    // §9.10.12, ADR-004 "DID-Record Slot-Exclusivity"). Runs cheapest-first and
-    // only engages for a blob that decodes as a `DidRecordV1` frame — an
-    // encrypted context blob (whose first byte is a MessagePack map marker,
-    // never 0x01) is `NotAFrame` and falls straight through to opaque storage.
-    // NEVER a trust dependency: the client re-verifies every record itself, so a
-    // relay with this Disabled just stores the frame opaquely and resolution
-    // stays correct (RELAYRES-002). Behind the per-IP PUBLISH rate limit above.
-    if config.did_record_validation == DidRecordValidation::Enabled {
-        match classify_did_record_frame(&routing_id, blob) {
-            DidRecordClass::Valid { seq } => {
-                // Binding + signature verified. Apply the single-slot / eviction
-                // rule atomically (establish, supersede, or idempotent refresh).
-                match did_slots
-                    .publish_frame(
-                        storage.as_ref(),
-                        routing_id,
-                        blob_id,
-                        recipient_hint,
-                        blob_ttl,
-                        blob.to_vec(),
-                        seq,
-                    )
-                    .await
-                {
-                    Ok((stored, _outcome)) => {
-                        let _failed_deliveries = subscription::deliver_to_subscribers(
-                            &stored,
-                            subscriptions,
-                            config.delivery_jitter_ms,
-                        )
-                        .await;
-                        let _ = tx
-                            .send(RelayMessage::Ok {
-                                ref_id,
-                                blob_id: Some(blob_id),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        // Shared mapping — a full backend → STORAGE_FULL, an
-                        // internal storage fault → INTERNAL_ERROR (not STORAGE_FULL),
-                        // a non-superseding seq → DID_RECORD_REJECTED.
-                        let (code, msg) = slot_publish_error_response(&e);
-                        let _ = tx.send(RelayMessage::Err { ref_id, code, msg }).await;
-                    }
-                }
-                return;
-            }
-            DidRecordClass::Invalid(reason) => {
-                // Decoded as a frame but failed binding or signature — junk at a
-                // DID address. Rejected at validation; never enters a slot
-                // (§3.10.8 "Junk frame … rejected at validation").
-                let detail = match reason {
-                    DidRecordRejection::BindingMismatch => {
-                        "DID→routing_id binding mismatch (frame published at the wrong routing_id)"
-                    }
-                    DidRecordRejection::SignatureInvalid => "BEP44 signature verification failed",
-                };
-                let _ = tx
-                    .send(RelayMessage::Err {
-                        ref_id,
-                        code: code::DID_RECORD_REJECTED,
-                        msg: format!("DID-record frame rejected: {detail}"),
-                    })
-                    .await;
-                return;
-            }
-            DidRecordClass::NotAFrame => {
-                // Opaque blob. Slot-exclusivity rule (a): once a routing_id has a
-                // claimed DID slot, any non-superseding PUBLISH there — including
-                // a non-frame blob — is rejected, so it can never co-locate with
-                // (or shadow) the genuine record.
-                if did_slots.is_claimed(storage.as_ref(), &routing_id).await {
-                    let _ = tx
-                        .send(RelayMessage::Err {
-                            ref_id,
-                            code: code::DID_RECORD_REJECTED,
-                            msg: "routing_id has a claimed DID-record slot; \
-                                  non-superseding blobs are rejected (slot-exclusive)"
-                                .to_string(),
-                        })
-                        .await;
-                    return;
-                }
-                // Not a claimed DID slot — fall through to ordinary opaque storage.
-            }
+    // OPTIONAL validating-relay DID-record slot gate (§3.10.2 "Relay-side
+    // validation", ADR-004 "DID-Record Slot-Exclusivity"). ONE shared chokepoint
+    // (`gate_publish`) decides establish/supersede/refresh/reject/opaque; this
+    // handler only emits the wire response and delivers to subscribers on
+    // Accepted. NEVER a trust dependency: with validation Disabled the gate falls
+    // through and the frame is stored opaquely (RELAYRES-002). Behind the per-IP
+    // PUBLISH rate limit above.
+    match did_slots
+        .gate_publish(
+            config.did_record_validation,
+            storage.as_ref(),
+            routing_id,
+            recipient_hint,
+            blob_ttl,
+            blob,
+            blob_id,
+        )
+        .await
+    {
+        DidPublishGate::Accepted(stored) => {
+            let _failed_deliveries = subscription::deliver_to_subscribers(
+                &stored,
+                subscriptions,
+                config.delivery_jitter_ms,
+            )
+            .await;
+            let _ = tx
+                .send(RelayMessage::Ok {
+                    ref_id,
+                    blob_id: Some(blob_id),
+                })
+                .await;
+            return;
         }
+        DidPublishGate::Rejected { code, msg } => {
+            let _ = tx.send(RelayMessage::Err { ref_id, code, msg }).await;
+            return;
+        }
+        DidPublishGate::FallThrough => {}
     }
 
     // Store the blob (opaque path — non-DID blobs, or every blob when
@@ -1478,32 +1435,19 @@ async fn handle_subscribe(
     };
     let _ = tx.send(ok).await;
 
-    // Backfill if `since` is provided.
+    // Backfill if `since` is provided. Slot-exclusivity rule (c) applies to
+    // backfill too, via the same storage-authoritative QUERY gate: a claimed DID
+    // routing_id backfills ONLY its single genuine record (even on a cold index),
+    // so a subscriber is never handed co-located junk a QUERY would have filtered.
     if let Some(since_ts) = since {
-        // Slot-exclusivity rule (c) applies to backfill too: on a validating
-        // relay a routing_id with a claimed DID slot backfills ONLY that single
-        // slot record, never any co-located opaque junk — the same gate QUERY
-        // uses, so a subscriber cannot be handed suppressed junk that a QUERY
-        // would have filtered. Unclaimed routing_ids (all encrypted context
-        // blobs) fall through to the normal windowed backfill.
-        let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
-            did_slots.slot_blob(storage.as_ref(), &routing_id).await
-        } else {
-            None
-        };
-
-        if let Some(slot) = claimed_slot {
-            let blob_msg = RelayMessage::Blob {
-                routing_id: slot.routing_id,
-                blob_id: slot.blob_id,
-                recipient_hint: slot.recipient_hint,
-                blob_ttl: slot.blob_ttl,
-                stored_at: slot.stored_at,
-                blob: slot.blob,
-            };
-            let _ = tx.send(blob_msg).await;
-        } else if let Ok(blobs) = storage
-            .query(&routing_id, Some(since_ts), MAX_QUERY_LIMIT)
+        if let Ok(blobs) = did_slots
+            .gate_query(
+                config.did_record_validation,
+                storage.as_ref(),
+                routing_id,
+                Some(since_ts),
+                MAX_QUERY_LIMIT,
+            )
             .await
         {
             for stored in blobs {
@@ -1612,34 +1556,29 @@ async fn handle_query(
         return;
     }
 
-    // Slot-exclusivity rule (c): on a validating relay, a routing_id with a
-    // claimed DID slot returns ONLY that single slot record, regardless of
-    // `limit`, `since`, or any co-located opaque junk (§3.10.2). The `since`
-    // filter is intentionally ignored for a claimed slot — the single genuine
-    // record is always returned so a resolver cannot be starved by a narrow
-    // `since` window while junk was stored later. Unclaimed routing_ids (the
-    // common case, incl. all encrypted context blobs) take the fast read-lock
-    // path and fall through to the normal multi-blob query below.
-    let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
-        did_slots.slot_blob(storage.as_ref(), &routing_id).await
-    } else {
-        None
-    };
-
-    let blobs = if let Some(slot) = claimed_slot {
-        vec![slot]
-    } else {
-        match storage.query(&routing_id, since, effective_limit).await {
-            Ok(b) => b,
-            Err(e) => {
-                let err = RelayMessage::Err {
-                    ref_id,
-                    code: code::INTERNAL_ERROR,
-                    msg: e.to_string(),
-                };
-                let _ = tx.send(err).await;
-                return;
-            }
+    // Slot-exclusivity rule (c) via the shared, storage-authoritative QUERY gate:
+    // a claimed DID `routing_id` returns ONLY its single genuine record (even if
+    // the index is cold and junk is co-located in storage). Ordinary routing_ids
+    // pass through unchanged. See `DidSlotRegistry::gate_query`.
+    let blobs = match did_slots
+        .gate_query(
+            config.did_record_validation,
+            storage.as_ref(),
+            routing_id,
+            since,
+            effective_limit,
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            let err = RelayMessage::Err {
+                ref_id,
+                code: code::INTERNAL_ERROR,
+                msg: e.to_string(),
+            };
+            let _ = tx.send(err).await;
+            return;
         }
     };
 
@@ -1664,38 +1603,30 @@ async fn handle_query(
 }
 
 /// Handles a DELETE operation.
+#[allow(clippy::too_many_arguments)]
 async fn handle_delete(
     ref_id: Option<String>,
     blob_id: [u8; 32],
+    ip: IpAddr,
     tx: &mpsc::Sender<RelayMessage>,
     storage: &Arc<BlobStorageBackend>,
     did_slots: &DidSlotRegistry,
+    rate_limiter: &PublishRateLimiter,
 ) {
-    // Slot-exclusivity (§3.10.2 rule (d)): reject an (unauthenticated) DELETE of
-    // a protected DID-record slot blob. DID records are public, so blob_id is
-    // guessable; allowing this DELETE would purge the genuine record and let a
-    // replayed older frame roll the DID back. The gate is STORAGE-BACKED (the
-    // in-memory index is only a fast-path cache, empty after restart) — it
-    // decodes+verifies the immutable, content-addressed blob itself, so it is
-    // immune to a cold index. Content-addressing makes the check-then-delete
-    // race benign: the bytes at a blob_id are immutable, so a valid-DID-frame
-    // blob present at check time cannot become unprotected before the delete;
-    // the only residual is an unforceable "published just after a not-present
-    // check" window, which is availability-only. Non-DID / non-slot blobs proceed.
-    if did_slots
-        .delete_would_revert_slot(storage.as_ref(), &blob_id)
+    // Slot-exclusivity (§3.10.2 rule (d)) via the shared, storage-backed,
+    // rate-limited DELETE gate: reject a DELETE of a protected DID-record slot
+    // blob (immune to a cold index — the blob is self-certifying) and refuse
+    // over-budget or fail-closed on a storage error. Non-DID / non-slot blobs
+    // proceed. See `DidSlotRegistry::gate_delete`.
+    match did_slots
+        .gate_delete(storage.as_ref(), &blob_id, rate_limiter, ip)
         .await
     {
-        let _ = tx
-            .send(RelayMessage::Err {
-                ref_id,
-                code: code::DID_RECORD_REJECTED,
-                msg: "blob_id is a claimed DID-record slot; only a superseding \
-                      PUBLISH may replace it (slot-exclusive)"
-                    .to_string(),
-            })
-            .await;
-        return;
+        DidDeleteGate::Rejected { code, msg } => {
+            let _ = tx.send(RelayMessage::Err { ref_id, code, msg }).await;
+            return;
+        }
+        DidDeleteGate::Proceed => {}
     }
 
     // Best-effort deletion -- always return OK.
@@ -2440,6 +2371,53 @@ mod tests {
         let stored = storage.query(&rid, None, 100).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].blob_id, bid);
+    }
+
+    /// Fix 1 (storage-authoritative QUERY): the WS QUERY gate returns ONLY the
+    /// genuine record even when the index is COLD and junk is co-located in the
+    /// durable store (restart / store-sharing peer). Against the old index-only
+    /// `slot_blob` this QUERY would cold-miss and leak the junk.
+    #[tokio::test]
+    async fn query_of_cold_index_did_slot_returns_only_genuine_record() {
+        let (rid, bid, frame) = genuine_did_frame(73, 5, b"did-doc");
+
+        // Pre-seed a genuine frame + co-located junk straight into the durable
+        // store (bypassing PUBLISH), so the relay's index stays cold.
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+        storage
+            .store(rid, [0x01; 32], None, 3600, vec![0x80u8; 32])
+            .await
+            .unwrap();
+        storage
+            .store(rid, [0x02; 32], None, 3600, vec![0x81u8; 48])
+            .await
+            .unwrap();
+        assert_eq!(storage.query(&rid, None, 100).await.unwrap().len(), 3);
+
+        let addr = start_test_server_with_storage(Arc::clone(&storage)).await;
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        send_msg(
+            &mut sink,
+            &ClientMessage::Query {
+                ref_id: None,
+                routing_id: rid,
+                since: None,
+                limit: Some(100),
+            },
+        )
+        .await;
+
+        // Exactly one BLOB (the genuine record), then query_complete.
+        match recv_msg(&mut stream).await {
+            RelayMessage::Blob { blob_id, .. } => assert_eq!(blob_id, bid),
+            other => panic!("cold-index QUERY must return only the genuine record, got {other:?}"),
+        }
+        assert!(matches!(
+            recv_msg(&mut stream).await,
+            RelayMessage::Event { event_type, .. } if event_type == "query_complete"
+        ));
     }
 
     #[tokio::test]
