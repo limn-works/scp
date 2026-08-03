@@ -41,7 +41,6 @@ use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 
-use crate::context::actor::bounded_reply_await;
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
     MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, QueriesCommand, SagaReject,
@@ -50,6 +49,7 @@ use crate::context::actor::commands::{
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::WrappingKeyPair;
+use crate::context::actor::{BoundedReplyError, bounded_reply_await};
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::outlets::stream::{OriginAdmissionTracker, StreamAdmissionTracker};
 use crate::context::persistence::ContextPersistence;
@@ -11606,13 +11606,26 @@ impl Supervisor {
     /// [`PerContextState`](crate::context::actor::state::PerContextState)
     /// hard-rate-limit bucket), and awaits the embedded reply oneshot.
     ///
-    /// Returns `true` if a token was consumed OR if the context is not
-    /// registered. The unknown-context pass-through (`true`) preserves the
-    /// legacy `try_consume_hard_rate_limit_from_any_context` contract: a
-    /// outlet invoked against a context with no live actor is not rate-
-    /// limited here (the absence of a bucket means "no per-context cap to
-    /// enforce"). Returns `false` only when the context IS registered AND
-    /// the sender is over budget.
+    /// Returns `true` (pass-through) when a token was consumed OR when there
+    /// is no live per-context bucket to enforce — the context is not
+    /// registered, the handler replied `Err`, or the actor DROPPED the reply
+    /// channel (terminated). This preserves the legacy
+    /// `try_consume_hard_rate_limit_from_any_context` contract: an outlet
+    /// invoked against a context with no live actor is not rate-limited here
+    /// (absence of a bucket means "no per-context cap to enforce").
+    ///
+    /// Returns `false` (deny) when the context IS registered AND EITHER the
+    /// sender is over budget OR the actor is ALIVE-but-wedged and does not
+    /// reply within [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT).
+    /// The wedge case fails CLOSED on purpose: the bucket exists but is
+    /// momentarily unreachable, so folding the timeout into the `true`
+    /// pass-through would silently BYPASS the hard-rate cap for the whole
+    /// reply-timeout window — exploitable in a cross-context topology where
+    /// the caller-context actor is wedged but the target is healthy. Deny is
+    /// the safe default; the caller retries. The `Dropped` (terminated actor,
+    /// no live bucket) and `Elapsed` (wedged actor, unreachable bucket) cases
+    /// are therefore deliberately NOT folded together — see
+    /// [`hard_rate_limit_allow`].
     pub(crate) async fn try_consume_hard_rate_limit(
         &self,
         context_id: &str,
@@ -11633,11 +11646,11 @@ impl Supervisor {
         if self.dispatch_outlets_command(cmd).await.is_err() {
             return true;
         }
-        match bounded_reply_await(reply_rx).await {
-            Ok(Ok(consumed)) => consumed,
-            // Unknown context / channel dropped: legacy pass-through.
-            Ok(Err(_)) | Err(_) => true,
-        }
+        // Fail CLOSED on a wedge (Elapsed): the bucket exists but is
+        // unreachable, so denying is the safe default — never a silent
+        // bypass. Terminated/unregistered (Dropped / handler `Err`) stays
+        // pass-through: no live bucket to enforce. See `hard_rate_limit_allow`.
+        hard_rate_limit_allow(&bounded_reply_await(reply_rx).await)
     }
 
     /// Async hard-rate-limit refund routed through the per-context actor
@@ -11847,7 +11860,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx
+        bounded_reply_await(reply_rx)
             .await
             .map_err(|_| {
                 ContextError::TransportFailed(
@@ -11895,7 +11908,7 @@ impl Supervisor {
             reply: reply_tx,
         };
         self.dispatch_outlets_command(cmd).await?;
-        reply_rx
+        bounded_reply_await(reply_rx)
             .await
             .map_err(|_| {
                 ContextError::TransportFailed(
@@ -15650,6 +15663,29 @@ fn current_timestamp_ms() -> u64 {
     ms
 }
 
+/// Maps a bounded hard-rate-limit reply into an allow (`true`) / deny
+/// (`false`) decision for [`Supervisor::try_consume_hard_rate_limit`].
+///
+/// SECURITY (fail-closed): the `Elapsed` arm — an ALIVE-but-wedged actor
+/// whose per-context bucket exists but is momentarily unreachable — MUST deny
+/// (`false`). Folding it into the `true` pass-through would silently bypass
+/// the hard-rate cap for the full [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT)
+/// window (exploitable when the caller-context actor is wedged but the target
+/// is healthy). Only the "no live bucket to enforce" cases pass through:
+/// - `Ok(Ok(consumed))` — the handler's real verdict.
+/// - `Ok(Err(_))` — handler error (e.g. `ContextNotRegistered`): no bucket.
+/// - `Err(Dropped)` — the actor terminated (reply channel closed): no bucket.
+/// - `Err(Elapsed)` — the actor is alive but wedged: bucket unreachable → DENY.
+const fn hard_rate_limit_allow(
+    reply: &Result<Result<bool, ContextError>, BoundedReplyError>,
+) -> bool {
+    match reply {
+        Ok(Ok(consumed)) => *consumed,
+        Ok(Err(_)) | Err(BoundedReplyError::Dropped) => true,
+        Err(BoundedReplyError::Elapsed) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // No-op SagaJournal — plumbed into the FFI [`Self::with_providers`] factory
 // (and the test-only [`Self::for_query_shim`] constructor) when no production
@@ -15841,6 +15877,46 @@ mod tests {
     use super::*;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
+
+    /// SECURITY regression guard for the hard-rate-limit fail-closed mapping
+    /// ([`hard_rate_limit_allow`]): an ALIVE-but-wedged actor (`Elapsed`) MUST
+    /// deny (`false`), never fold into the `true` pass-through — that fold
+    /// would bypass the per-context hard-rate cap for the reply-timeout window.
+    /// The "no live bucket to enforce" cases (handler `Err`, terminated actor
+    /// `Dropped`) stay pass-through (`true`); a real consume verdict rides
+    /// through unchanged. Directly unit-tests the classifier the live
+    /// actor-mailbox path routes through (wedging a fully-wired Supervisor is
+    /// impractical; the mechanics of producing `Elapsed` are covered by
+    /// `bounded_reply_await`'s own `start_paused` unit test).
+    #[test]
+    fn hard_rate_limit_wedged_actor_fails_closed() {
+        // Wedged/alive actor → deny.
+        assert!(
+            !hard_rate_limit_allow(&Err(BoundedReplyError::Elapsed)),
+            "an Elapsed (wedged actor, unreachable bucket) MUST deny — never bypass the cap"
+        );
+        // Terminated actor (no live bucket) → legacy pass-through.
+        assert!(
+            hard_rate_limit_allow(&Err(BoundedReplyError::Dropped)),
+            "a Dropped reply channel (terminated actor, no bucket) stays pass-through"
+        );
+        // Handler error (e.g. unregistered context, no bucket) → pass-through.
+        assert!(
+            hard_rate_limit_allow(&Ok(Err(ContextError::ContextNotRegistered(
+                "ctx".to_owned()
+            )))),
+            "a handler Err (no live bucket) stays pass-through"
+        );
+        // Real handler verdicts ride through unchanged.
+        assert!(
+            hard_rate_limit_allow(&Ok(Ok(true))),
+            "a real consume (token available) allows"
+        );
+        assert!(
+            !hard_rate_limit_allow(&Ok(Ok(false))),
+            "a real over-budget verdict denies"
+        );
+    }
 
     // -----------------------------------------------------------------
     // DurableProviders same-backend behavioral proof (spec §17.6 / §17.16 /
