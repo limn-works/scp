@@ -1046,6 +1046,21 @@ export class SCP {
     }
   }
 
+  /**
+   * Execute §9.12 compromise recovery for `did`.
+   *
+   * **Fails closed (#2240).** The recovery WIRE (a real backend plus step-1
+   * key rotation) is not yet built — it is tracked as #2240 Part B and needs
+   * human design sign-off. Until then this call **always throws** a
+   * `SCP-IDENT-1022` "recovery backend not configured" error rather than
+   * fabricating a success; it never reports a recovery that did not happen.
+   * A `did` this SCP instance does not host is rejected with `SCP-IDENT-1020`,
+   * and an unknown `tier` with `SCP-IDENT-1020`, before the fail-closed return.
+   * Because this wrapper delegates to the native (NAPI) binding, a `contextIds`
+   * list over 1024 entries is rejected with `SCP-VALID-7120` and a concurrent
+   * recovery flood with `SCP-VALID-7140` (runtime DoS bounds absent from the
+   * other bindings until #2240 Part B wires them uniformly).
+   */
   identityExecuteRecovery(did: string, tier: string, contextIds: readonly string[]): string {
     try {
       return (

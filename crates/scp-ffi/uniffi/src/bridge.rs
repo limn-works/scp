@@ -17327,31 +17327,53 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `identity_execute_recovery`.
     ///
-    /// Pure orchestration — takes no handles. Routes through `&self.inner`
-    /// only to preserve API uniformity; the underlying recovery backend is
-    /// a local stub pending SDK-layer wiring.
+    /// # Fails closed (#2240)
+    ///
+    /// The §9.12 recovery WIRE (a real `RecoveryBackend` plus step-1 key
+    /// rotation) is not yet built (custody / DID-method operations tracked as
+    /// #2240 Part B, pending human sign-off). Until it is wired via the SDK
+    /// layer this method **fails closed** with a typed `SCP-IDENT-1022` error
+    /// ("recovery backend not configured — provide a real backend via SDK
+    /// layer") — it NEVER returns a fabricated success (the former inline
+    /// always-`Ok` backend returned `key_rotation_completed: true` while doing
+    /// nothing, a nullifier forbidden by the builder tenets). Mirrors the
+    /// sibling [`Self::identity_execute_custody_migration`] fail-closed
+    /// behaviour.
     pub fn identity_execute_recovery(
         &self,
         did: String,
         tier: String,
         context_ids: Vec<String>,
     ) -> Result<String, ScpError> {
-        use std::collections::HashSet;
-
-        use scp_core::identity::recovery::{
-            CompromiseRecoveryOrchestrator, CompromiseTier, KeyRotationOutcome, PskRotationParams,
-            RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
-            agent_key_rotation_outcome,
-        };
-        use scp_did::DID;
-
         validate_did(&did)?;
-        let did_val = DID::from(did.as_str());
 
-        let compromise_tier = match tier.as_str() {
-            "agent" => CompromiseTier::Agent,
-            "active_signing" => CompromiseTier::ActiveSigning,
-            "identity_key" => CompromiseTier::IdentityKey,
+        // Ownership gate (parity with the NAPI bridge's RED-PR5-003 check):
+        // recovery is restricted to identities THIS bridge instance hosts in
+        // its per-instance identity custody registry (populated by
+        // `identity_create*`). A DID this instance does not own is rejected
+        // here so a co-resident caller cannot drive recovery against arbitrary
+        // DIDs. `SCP-IDENT-1020` matches NAPI/PyO3.
+        if !identity_custody_registry(&self.inner).contains_key(&did) {
+            return Err(ScpError::Identity {
+                msg: format!(
+                    "identity_execute_recovery: DID '{did}' is not owned by this SCP instance — \
+                     recovery is restricted to identities created or loaded via this SCP"
+                ),
+                code: codes::IDENT_1020.to_owned(),
+            });
+        }
+
+        // `context_ids` is accepted for FFI/SDK signature symmetry with the
+        // eventual wired backend (#2240 Part B); unused on the fail-closed path.
+        // NAPI's length-cap + libuv concurrency gates bound orchestrator work
+        // that only runs once that backend lands (Part B), so they are not
+        // replicated on this fail-closed path.
+        let _ = context_ids;
+
+        // Validate the tier first so callers still get the precise invalid-tier
+        // error rather than the generic fail-closed one.
+        match tier.as_str() {
+            "agent" | "active_signing" | "identity_key" => {}
             other => {
                 return Err(ScpError::Identity {
                     msg: format!(
@@ -17360,83 +17382,20 @@ impl Scp {
                     code: codes::IDENT_1020.to_owned(),
                 });
             }
-        };
-
-        let now_ms = scp_clock::SystemClock.now_millis();
-
-        let key_rotation = match compromise_tier {
-            CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
-            CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
-            CompromiseTier::IdentityKey => {
-                scp_core::identity::recovery::identity_key_rotation_outcome(
-                    &did_val,
-                    did_val.clone(),
-                    now_ms,
-                )
-            }
-        };
-
-        struct UniffiRecoveryBackend;
-        #[async_trait::async_trait(?Send)]
-        impl RecoveryBackend for UniffiRecoveryBackend {
-            async fn mls_update(
-                &self,
-                _context_id: &str,
-                _key_rotation: &KeyRotationOutcome,
-            ) -> Result<(), RecoveryStepError> {
-                Ok(())
-            }
-            async fn revoke_ucans(
-                &self,
-                _context_id: &str,
-                _key_rotation: &KeyRotationOutcome,
-            ) -> Result<(), RecoveryStepError> {
-                Ok(())
-            }
-            async fn rotate_key_packages(
-                &self,
-                _context_id: &str,
-                _key_rotation: &KeyRotationOutcome,
-            ) -> Result<(), RecoveryStepError> {
-                Ok(())
-            }
-            async fn notify_contacts(
-                &self,
-                _did: &DID,
-                _tier: CompromiseTier,
-                _key_rotation: &KeyRotationOutcome,
-                _contacts: &HashSet<DID>,
-            ) -> bool {
-                true
-            }
-            async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
-                true
-            }
         }
 
-        let orchestrator = CompromiseRecoveryOrchestrator::new(did_val, context_ids);
-        let contacts = HashSet::new();
-        let backend = UniffiRecoveryBackend;
-
-        let rt = crate::runtime();
-
-        let result = rt
-            .block_on(orchestrator.execute_recovery(
-                compromise_tier,
-                &key_rotation,
-                &contacts,
-                None,
-                &backend,
-                &scp_clock::SystemClock,
-            ))
-            .map_err(|e| ScpError::Identity {
-                msg: format!("recovery failed: {e}"),
-                code: codes::IDENT_1022.to_owned(),
-            })?;
-
-        serde_json::to_string(&result).map_err(|e| ScpError::Identity {
-            msg: format!("failed to serialize recovery result: {e}"),
-            code: codes::IDENT_1023.to_owned(),
+        // FAIL CLOSED (#2240): there is no configured recovery backend at the
+        // FFI layer, and step 1 (real key rotation) cannot be performed here.
+        // Unlike custody migration — whose orchestrator surfaces its
+        // NotConfigured backend's first `Err` as a fatal error —
+        // `CompromiseRecoveryOrchestrator::execute_recovery` isolates
+        // per-context failures (§9.12) and never returns a fatal "backend
+        // absent" error, so recovery must fail closed at the bridge boundary
+        // before any `KeyRotationOutcome` / `RecoveryResult` is fabricated.
+        Err(ScpError::Identity {
+            msg: "recovery backend not configured — provide a real backend via SDK layer"
+                .to_owned(),
+            code: codes::IDENT_1022.to_owned(),
         })
     }
 
@@ -19070,6 +19029,90 @@ mod tests {
             !reserved.key_package_public.is_empty(),
             "public KeyPackage bytes must be non-empty"
         );
+    }
+
+    /// #2240: recovery must fail closed with the typed `SCP-IDENT-1022`
+    /// "not configured" error — never a fabricated success. Mirrors the
+    /// custody-migration `NotConfigured` fail-closed behaviour.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn recovery_fails_closed_with_not_configured_error() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let err = scp
+            .identity_execute_recovery(identity.did(), "agent".to_owned(), Vec::new())
+            .expect_err("recovery must fail closed — it has no configured backend (#2240)");
+        match err {
+            ScpError::Identity { msg, code } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1022,
+                    "expected fail-closed SCP-IDENT-1022"
+                );
+                assert!(
+                    msg.contains("not configured"),
+                    "expected 'not configured' in fail-closed message, got: {msg}"
+                );
+            }
+            other => panic!("expected ScpError::Identity, got: {other:?}"),
+        }
+    }
+
+    /// Recovery rejects a DID this bridge instance does not host with the
+    /// canonical ownership code (`SCP-IDENT-1020`) — before the tier check or
+    /// the fail-closed return — matching the NAPI/PyO3 ownership gate.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn recovery_rejects_unowned_did() {
+        let scp = scp_test();
+        let err = scp
+            .identity_execute_recovery(
+                "did:dht:unowned-attacker-did".to_owned(),
+                "agent".to_owned(),
+                Vec::new(),
+            )
+            .expect_err("recovery against an unowned DID must be rejected");
+        match err {
+            ScpError::Identity { msg, code } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1020,
+                    "expected ownership-check rejection SCP-IDENT-1020, got: {msg}"
+                );
+                assert!(
+                    msg.contains("is not owned by this SCP instance"),
+                    "expected ownership-rejection message, got: {msg}"
+                );
+            }
+            other => panic!("expected ScpError::Identity, got: {other:?}"),
+        }
+    }
+
+    /// Recovery still rejects an unknown tier with the precise invalid-tier
+    /// error before reaching the fail-closed return.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn recovery_rejects_unknown_tier() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let err = scp
+            .identity_execute_recovery(identity.did(), "bogus-tier".to_owned(), Vec::new())
+            .expect_err("unknown tier must be rejected");
+        match err {
+            ScpError::Identity { msg, .. } => assert!(
+                msg.contains("invalid compromise tier"),
+                "expected invalid-tier message, got: {msg}"
+            ),
+            other => panic!("expected ScpError::Identity, got: {other:?}"),
+        }
     }
 
     /// `reserve_key_package` rejects a non-custodied (DID-only, `identity_load`)

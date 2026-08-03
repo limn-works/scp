@@ -271,18 +271,34 @@ class TestIdentity:
         with pytest.raises(Exception, match="invalid custody migration target"):
             await scp.identity_execute_custody_migration(identity.did, "nonexistent_target", [])
 
-    async def test_execute_recovery(self, scp: SCP):
+    async def test_execute_recovery_fails_closed(self, scp: SCP):
+        # #2240: recovery has no configured backend yet (the §9.12 WIRE is
+        # Part B, pending human sign-off), so the surface fails closed with a
+        # typed error instead of fabricating a success. Mirrors
+        # test_execute_custody_migration.
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
-        result = await scp.identity_execute_recovery(identity.did, "agent", [])
-        assert isinstance(result, dict)
-        assert "key_rotation_completed" in result
-        assert result["tier"] == "Agent"
-        assert result["did"] == identity.did
+        # Pin the canonical code (SCP-IDENT-1022) so the fail-closed path stays
+        # cross-bridge symmetric with NAPI/UniFFI, not just the generic
+        # IDENT_1001 bucket (#2240 review).
+        with pytest.raises(Exception, match="SCP-IDENT-1022"):
+            await scp.identity_execute_recovery(identity.did, "agent", [])
 
     async def test_execute_recovery_invalid_tier(self, scp: SCP):
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
-        with pytest.raises(Exception):
+        # Invalid-tier rejection carries the canonical SCP-IDENT-1020 code on
+        # every bridge (parity with NAPI/UniFFI). Match the distinctive message
+        # too — 1020 is shared with the ownership-rejection path, so the message
+        # is what pins THIS path (the identity is owned, so ownership passes).
+        with pytest.raises(Exception, match="invalid compromise tier"):
             await scp.identity_execute_recovery(identity.did, "invalid_tier", [])
+
+    async def test_execute_recovery_rejects_unowned_did(self, scp: SCP):
+        # Ownership gate (parity with NAPI/UniFFI): recovery against a DID this
+        # SCP instance does not host is rejected with SCP-IDENT-1020 before any
+        # recovery bookkeeping — a realm-local caller cannot drive recovery
+        # against arbitrary DIDs.
+        with pytest.raises(Exception, match="SCP-IDENT-1020"):
+            await scp.identity_execute_recovery("did:dht:unowned-attacker-did", "agent", [])
 
     async def test_migrate(self, scp: SCP):
         import json

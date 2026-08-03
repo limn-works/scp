@@ -2505,15 +2505,27 @@ impl crate::scp::PyScp {
     }
 
     // -----------------------------------------------------------------------
-    // Compromise recovery — FFI exposure for CompromiseRecoveryOrchestrator
+    // Compromise recovery (§9.12) — fails closed pending the WIRE (#2240 Part B)
     // -----------------------------------------------------------------------
 
-    /// Executes the compromise recovery protocol for the given DID.
+    /// Executes the compromise recovery protocol for the given DID (§9.12).
     ///
-    /// This method creates a `CompromiseRecoveryOrchestrator` and a mock
-    /// `RecoveryBackend` and runs the 6-step recovery protocol. Step 1 (key
-    /// rotation) is represented by the caller-provided `tier` and
-    /// `rotated_key_scopes`.
+    /// # Fails closed (#2240)
+    ///
+    /// The §9.12 compromise-recovery WIRE (a real `RecoveryBackend` that rotates
+    /// keys, revokes UCANs, rotates `KeyPackages`, notifies contacts, and
+    /// rotates the PSK, plus step-1 key rotation) is not yet built — it needs
+    /// custody / DID-method operations that are tracked as #2240 Part B and
+    /// require human design sign-off. Until that backend is wired via the SDK
+    /// layer, this surface **fails closed** with a typed `IdentityError`
+    /// ("recovery backend not configured — provide a real backend via SDK
+    /// layer"). It NEVER returns a fabricated success. The former inline
+    /// always-`Ok` backend returned `key_rotation_completed: true` while
+    /// rotating no key and revoking no token — a nullifier shipping a false
+    /// guarantee on a security-critical operation, forbidden by the builder
+    /// tenets. This mirrors the sibling
+    /// [`Self::identity_execute_custody_migration`], which likewise fails closed
+    /// via a `NotConfigured*Backend`.
     ///
     /// # Arguments
     ///
@@ -2522,129 +2534,71 @@ impl crate::scp::PyScp {
     ///   `"identity_key"`.
     /// * `context_ids` — List of context IDs where the DID is a member.
     ///
-    /// # Returns
-    ///
-    /// A JSON string with recovery outcome fields.
-    ///
     /// # Errors
     ///
-    /// Raises `IdentityError` if recovery fails.
+    /// Raises `IdentityError` — an invalid `tier`, or (on any valid input) the
+    /// fail-closed "recovery backend not configured" error.
     ///
-    /// See spec §9.12 and PR #1080.
+    /// See spec §9.12 and issue #2240.
     #[pyo3(name = "identity_execute_recovery")]
     pub fn identity_execute_recovery(
         &self,
-        py: Python<'_>,
         did: &str,
         tier: &str,
         context_ids: Vec<String>,
     ) -> PyResult<String> {
-        use std::collections::HashSet;
-
-        use scp_core::identity::recovery::{
-            CompromiseRecoveryOrchestrator, CompromiseTier, KeyRotationOutcome, PskRotationParams,
-            RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
-            agent_key_rotation_outcome,
-        };
-        use scp_did::DID;
-
         validate::validate_did(did)?;
-        let did_owned = did.to_owned();
-        let tier_owned = tier.to_owned();
-        let rt = crate::runtime()?;
 
-        py.allow_threads(move || -> Result<String, ScpPyError> {
-            let did_val = DID::from(did_owned.as_str());
+        // Ownership gate (parity with the NAPI bridge's RED-PR5-003 check):
+        // recovery is restricted to identities THIS SCP instance hosts in its
+        // identity registry (populated by `identity_create*` / `identity_load`).
+        // A DID this instance does not own is rejected here — before any
+        // recovery bookkeeping — so a realm-local caller cannot drive recovery
+        // against arbitrary DIDs. `SCP-IDENT-1020` matches NAPI/UniFFI.
+        if !crate::runtime::identity_registry_contains(&self.inner, did) {
+            return Err(PyErr::from(ScpPyError::identity_with_code(
+                format!(
+                    "identity_execute_recovery: DID '{did}' is not owned by this SCP instance — \
+                     recovery is restricted to identities created or loaded via this SCP"
+                ),
+                scp_ffi_common::error_codes::IDENT_1020,
+            )));
+        }
 
-            let compromise_tier = match tier_owned.as_str() {
-                "agent" => CompromiseTier::Agent,
-                "active_signing" => CompromiseTier::ActiveSigning,
-                "identity_key" => CompromiseTier::IdentityKey,
-                other => {
-                    return Err(ScpPyError::identity(format!(
+        // `context_ids` is accepted for FFI/SDK signature symmetry with the
+        // eventual wired backend (#2240 Part B); it is unused on the
+        // fail-closed path (cf. `let _ = old_did;` in recovery.rs). NAPI's
+        // length-cap + libuv-worker concurrency gates bound the orchestrator
+        // work that only runs once that backend lands, so they belong with the
+        // Part B WIRE, not this fail-closed path.
+        let _ = context_ids;
+
+        // Validate the tier first so callers still get the precise invalid-tier
+        // error rather than the generic fail-closed one.
+        match tier {
+            "agent" | "active_signing" | "identity_key" => {}
+            other => {
+                return Err(PyErr::from(ScpPyError::identity_with_code(
+                    format!(
                         "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
-                    )));
-                }
-            };
-
-            // Build key rotation outcome (step 1 is pre-completed by caller).
-            let now_ms = scp_clock::SystemClock.now_millis();
-            let key_rotation = match compromise_tier {
-                CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
-                CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
-                CompromiseTier::IdentityKey => {
-                    // Identity key migration creates a new DID; for FFI exposure
-                    // we use the same DID as a placeholder since the caller
-                    // manages the actual DID migration externally.
-                    scp_core::identity::recovery::identity_key_rotation_outcome(
-                        &did_val,
-                        did_val.clone(),
-                        now_ms,
-                    )
-                }
-            };
-
-            // Use a simple backend that succeeds for all operations.
-            struct FfiRecoveryBackend;
-            #[async_trait::async_trait(?Send)]
-            impl RecoveryBackend for FfiRecoveryBackend {
-                async fn mls_update(
-                    &self,
-                    _context_id: &str,
-                    _key_rotation: &KeyRotationOutcome,
-                ) -> Result<(), RecoveryStepError> {
-                    Ok(())
-                }
-                async fn revoke_ucans(
-                    &self,
-                    _context_id: &str,
-                    _key_rotation: &KeyRotationOutcome,
-                ) -> Result<(), RecoveryStepError> {
-                    Ok(())
-                }
-                async fn rotate_key_packages(
-                    &self,
-                    _context_id: &str,
-                    _key_rotation: &KeyRotationOutcome,
-                ) -> Result<(), RecoveryStepError> {
-                    Ok(())
-                }
-                async fn notify_contacts(
-                    &self,
-                    _did: &DID,
-                    _tier: CompromiseTier,
-                    _key_rotation: &KeyRotationOutcome,
-                    _contacts: &HashSet<DID>,
-                ) -> bool {
-                    true
-                }
-                async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
-                    true
-                }
+                    ),
+                    scp_ffi_common::error_codes::IDENT_1020,
+                )));
             }
+        }
 
-            let orchestrator = CompromiseRecoveryOrchestrator::new(did_val, context_ids);
-            let contacts = HashSet::new();
-            let backend = FfiRecoveryBackend;
-
-            let result = rt
-                .block_on(orchestrator.execute_recovery(
-                    compromise_tier,
-                    &key_rotation,
-                    &contacts,
-                    None,
-                    &backend,
-                    &scp_clock::SystemClock,
-                ))
-                .map_err(|e| ScpPyError::identity(format!("recovery failed: {e}")))?;
-
-            // Serialize to JSON and return — the Python layer converts to dict.
-            let json = serde_json::to_string(&result).map_err(|e| {
-                ScpPyError::identity(format!("failed to serialize recovery result: {e}"))
-            })?;
-            Ok(json)
-        })
-        .map_err(PyErr::from)
+        // FAIL CLOSED (#2240): there is no configured recovery backend at the
+        // FFI layer, and step 1 (real key rotation) cannot be performed here.
+        // Unlike custody migration — whose orchestrator surfaces its
+        // NotConfigured backend's first `Err` as a fatal error —
+        // `CompromiseRecoveryOrchestrator::execute_recovery` isolates
+        // per-context failures (§9.12) and never returns a fatal "backend
+        // absent" error, so recovery must fail closed at the bridge boundary
+        // before any `KeyRotationOutcome` / `RecoveryResult` is fabricated.
+        Err(PyErr::from(ScpPyError::identity_with_code(
+            "recovery backend not configured — provide a real backend via SDK layer",
+            scp_ffi_common::error_codes::IDENT_1022,
+        )))
     }
 
     // -----------------------------------------------------------------------
