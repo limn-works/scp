@@ -3069,6 +3069,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
     #[cfg(feature = "quic")]
     publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
+    #[cfg(feature = "quic")] did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry,
     acme_challenges: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
@@ -3166,6 +3167,8 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         bridge_lookup: Some(bridge_lookup),
         #[cfg(feature = "quic")]
         publish_rate_limiter,
+        #[cfg(feature = "quic")]
+        did_slot_registry,
         #[cfg(feature = "quic")]
         quic_server_config,
         // Set to `true` by `serve()` once the QUIC listener binds (§10.14.3).
@@ -3276,7 +3279,7 @@ async fn publish_did_document_for_mode<D: DidMethod + 'static>(
 }
 
 // Node builder internal: all parameters are required for server construction.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
@@ -3299,6 +3302,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
     #[cfg(feature = "quic")]
     publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
+    #[cfg(feature = "quic")] did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError> {
     // NAT strategy needs the public HTTP port, not the internal relay port (#641).
@@ -3401,6 +3405,8 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         // No-domain mode is plaintext `ws://` (no cert), so QUIC is not served (§10.14.3).
         #[cfg(feature = "quic")]
         publish_rate_limiter,
+        #[cfg(feature = "quic")]
+        did_slot_registry,
         #[cfg(feature = "quic")]
         quic_server_config: None,
         // No QUIC config means `serve()` never sets this; stays `false`.

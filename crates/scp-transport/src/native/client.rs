@@ -2072,13 +2072,20 @@ mod tests {
     /// normal resolution yielded zero candidates.
     #[tokio::test]
     async fn query_raw_e2e_returns_all_frames_and_completes_promptly() {
-        use crate::native::server::{Relay, RelayConfig};
+        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
         use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
 
+        // This test exercises the CLIENT's multi-candidate collection over
+        // NON-validating storage (the frames use dummy key/signature bytes —
+        // exactly what a validating relay would reject). A validating relay
+        // collapses a DID routing_id to a single slot (SCP-RELAYRES-003), which
+        // is a separate, relay-side property; here we want the relay to keep and
+        // return every published blob so the client's sift path is exercised.
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
+            did_record_validation: DidRecordValidation::Disabled,
             ..RelayConfig::default()
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
@@ -2125,13 +2132,16 @@ mod tests {
     /// empty. This behavioral test fails if the flag is silently flipped.
     #[tokio::test]
     async fn query_raw_twice_same_did_returns_record_both_times() {
-        use crate::native::server::{Relay, RelayConfig};
+        use crate::native::server::{DidRecordValidation, Relay, RelayConfig};
         use crate::native::storage::BlobStorageBackend;
         use std::net::SocketAddr;
 
+        // Client-side dedup-bypass behavior over NON-validating storage (the
+        // dummy-signature frame is not relay-valid). See the sibling test above.
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
+            did_record_validation: DidRecordValidation::Disabled,
             ..RelayConfig::default()
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())

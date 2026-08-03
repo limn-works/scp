@@ -36,6 +36,7 @@ pub mod cert_pin;
 pub(crate) mod client;
 #[cfg(feature = "combined")]
 pub mod combined;
+pub mod did_slot;
 #[cfg(feature = "local-cache")]
 pub mod local_cache;
 #[cfg(feature = "postgres-blob")]

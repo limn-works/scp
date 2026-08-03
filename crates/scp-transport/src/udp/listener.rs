@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::dtls::AsyncDtlsSession;
+use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
 use crate::native::server::RelayConfig;
 use crate::native::storage::BlobStorage;
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter};
@@ -139,14 +140,17 @@ struct DtlsSession {
 /// use scp_transport::native::server::RelayConfig;
 /// use scp_transport::native::storage::InMemoryBlobStorage;
 /// use scp_transport::relay::rate_limit::{self, PublishRateLimiter};
+/// use scp_transport::native::did_slot::DidSlotRegistry;
 ///
 /// let config = UdpDtlsListenerConfig::default();
 /// let relay_config = RelayConfig::default();
 /// let storage = Arc::new(InMemoryBlobStorage::new());
 /// let rate_limiter = PublishRateLimiter::new(100);
 /// let conn_tracker = rate_limit::new_connection_tracker();
+/// // Share the validating relay's slot index via `RelayServer::did_slot_registry()`.
+/// let did_slots = DidSlotRegistry::new();
 /// let listener = UdpDtlsListener::new(
-///     config, relay_config, storage, rate_limiter, conn_tracker,
+///     config, relay_config, storage, rate_limiter, conn_tracker, did_slots,
 /// );
 ///
 /// let (handle, addr) = listener.start().await?;
@@ -171,6 +175,13 @@ pub struct UdpDtlsListener<S: BlobStorage> {
 
     /// Shared connection tracker (same instance as WebSocket/QUIC handlers).
     connection_tracker: ConnectionTracker,
+
+    /// Shared DID-record slot index (same instance as the WebSocket/QUIC
+    /// handlers). When `relay_config.did_record_validation` is `Enabled`, a
+    /// PUBLISH/QUERY over UDP/DTLS honors the same slot-exclusivity as the other
+    /// transports over the shared blob store (§3.10.2, SCP-RELAYRES-003) — so an
+    /// attacker cannot use UDP to co-locate junk with the genuine slot.
+    did_slots: DidSlotRegistry,
 }
 
 /// Handle for gracefully shutting down the UDP/DTLS listener.
@@ -213,6 +224,7 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
         storage: Arc<S>,
         publish_rate_limiter: PublishRateLimiter,
         connection_tracker: ConnectionTracker,
+        did_slots: DidSlotRegistry,
     ) -> Result<Self, String> {
         let ssl_ctx = build_dtls_server_context()
             .map_err(|e| format!("failed to build DTLS server context: {e}"))?;
@@ -224,6 +236,7 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
             ssl_ctx,
             publish_rate_limiter,
             connection_tracker,
+            did_slots,
         })
     }
 
@@ -290,6 +303,7 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
             let conn_tracker = Arc::clone(&self.connection_tracker);
             let recv_token = token.clone();
             let ssl_ctx = self.ssl_ctx.clone();
+            let did_slots = self.did_slots.clone();
 
             tokio::spawn(async move {
                 datagram_recv_loop(
@@ -302,6 +316,7 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
                     conn_tracker,
                     recv_token,
                     ssl_ctx,
+                    did_slots,
                 )
                 .await;
             });
@@ -330,6 +345,10 @@ struct DispatchCtx<S: BlobStorage> {
     /// inserted into `sessions`. Prevents TOCTOU on the global session limit:
     /// we increment before the handshake and decrement on failure.
     pending_sessions: Arc<AtomicUsize>,
+    /// Shared DID-record slot index (§3.10.2). Threaded to the per-client recv
+    /// loop so PUBLISH/QUERY over UDP honor slot-exclusivity over the shared
+    /// store, identically to WebSocket/QUIC.
+    did_slots: DidSlotRegistry,
 }
 
 /// Main datagram receive loop.
@@ -353,6 +372,7 @@ async fn datagram_recv_loop<S: BlobStorage + 'static>(
     conn_tracker: ConnectionTracker,
     token: CancellationToken,
     ssl_ctx: SslContext,
+    did_slots: DidSlotRegistry,
 ) {
     let ctx = DispatchCtx {
         socket,
@@ -364,6 +384,7 @@ async fn datagram_recv_loop<S: BlobStorage + 'static>(
         conn_tracker,
         ssl_ctx,
         pending_sessions: Arc::new(AtomicUsize::new(0)),
+        did_slots,
     };
 
     let mut buf = vec![0u8; ctx.listener_config.recv_buffer_size];
@@ -556,6 +577,7 @@ async fn handle_new_client<S: BlobStorage + 'static>(
     let relay_config = ctx.relay_config.clone();
     let rate_limiter = ctx.rate_limiter.clone();
     let conn_tracker = Arc::clone(&ctx.conn_tracker);
+    let did_slots = ctx.did_slots.clone();
     tokio::spawn(async move {
         per_client_recv_loop(
             remote_addr,
@@ -564,6 +586,7 @@ async fn handle_new_client<S: BlobStorage + 'static>(
             relay_config,
             rate_limiter,
             conn_tracker,
+            did_slots,
         )
         .await;
     });
@@ -671,6 +694,7 @@ fn create_reuse_port_socket(
 /// The DTLS session `Arc` is extracted from the session map under a brief read
 /// lock, then the lock is dropped before the blocking `recv()` call. This
 /// prevents read-lock starvation of write operations (session insert, cleanup).
+#[allow(clippy::too_many_arguments)]
 async fn per_client_recv_loop<S: BlobStorage + 'static>(
     remote_addr: SocketAddr,
     sessions: Arc<RwLock<HashMap<SocketAddr, DtlsSession>>>,
@@ -678,6 +702,7 @@ async fn per_client_recv_loop<S: BlobStorage + 'static>(
     relay_config: RelayConfig,
     rate_limiter: PublishRateLimiter,
     conn_tracker: ConnectionTracker,
+    did_slots: DidSlotRegistry,
 ) {
     // Extract the DTLS session Arc once — it remains valid for the session's
     // lifetime. The session map read lock is released immediately.
@@ -752,17 +777,29 @@ async fn per_client_recv_loop<S: BlobStorage + 'static>(
         }
 
         // Dispatch to the appropriate handler.
-        dispatch_client_message(&sessions, &storage, &relay_config, client_msg, remote_addr).await;
+        dispatch_client_message(
+            &sessions,
+            &storage,
+            &relay_config,
+            client_msg,
+            remote_addr,
+            &did_slots,
+            &rate_limiter,
+        )
+        .await;
     }
 }
 
 /// Routes a validated `ClientMessage` to the appropriate handler.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_client_message<S: BlobStorage + 'static>(
     sessions: &Arc<RwLock<HashMap<SocketAddr, DtlsSession>>>,
     storage: &Arc<S>,
     relay_config: &RelayConfig,
     msg: ClientMessage,
     remote_addr: SocketAddr,
+    did_slots: &DidSlotRegistry,
+    rate_limiter: &PublishRateLimiter,
 ) {
     match msg {
         ClientMessage::Publish {
@@ -782,6 +819,7 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
                 &remote_addr,
                 storage,
                 relay_config,
+                did_slots,
             )
             .await;
         }
@@ -800,11 +838,21 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
                 &remote_addr,
                 storage,
                 relay_config,
+                did_slots,
             )
             .await;
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_udp_delete(ref_id, blob_id, sessions, &remote_addr, storage).await;
+            handle_udp_delete(
+                ref_id,
+                blob_id,
+                sessions,
+                &remote_addr,
+                storage,
+                did_slots,
+                rate_limiter,
+            )
+            .await;
         }
         ClientMessage::Subscribe { ref_id, .. } => {
             let err = RelayMessage::Err {
@@ -848,9 +896,15 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
 
 /// Handles a PUBLISH operation over UDP/DTLS.
 ///
-/// Validates blob size and TTL, computes `blob_id` as SHA-256(blob), stores
-/// the blob, and sends an OK response with the `blob_id`.
-#[allow(clippy::too_many_arguments)]
+/// Validates blob size and TTL, computes `blob_id` as SHA-256(blob), then — when
+/// `config.did_record_validation` is
+/// [`Enabled`](crate::native::server::DidRecordValidation::Enabled) — runs the
+/// **same** DID-record frame validation / slot-exclusivity over the **same
+/// shared** [`DidSlotRegistry`] the WebSocket and QUIC transports use (§3.10.2,
+/// SCP-RELAYRES-003), so a DID slot is enforced identically regardless of
+/// transport. Otherwise (or for a non-frame blob) it stores opaquely. Never a
+/// trust dependency: the client re-verifies every record (RELAYRES-002).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_udp_publish<S: BlobStorage>(
     ref_id: Option<String>,
     routing_id: [u8; 32],
@@ -861,6 +915,7 @@ async fn handle_udp_publish<S: BlobStorage>(
     remote_addr: &SocketAddr,
     storage: &Arc<S>,
     config: &RelayConfig,
+    did_slots: &DidSlotRegistry,
 ) {
     // Validate blob size.
     if blob.is_empty() || blob.len() > config.max_blob_size {
@@ -893,6 +948,37 @@ async fn handle_udp_publish<S: BlobStorage>(
 
     // Compute blob_id = SHA-256(blob).
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
+
+    // OPTIONAL validating-relay DID-record slot gate — the SAME shared chokepoint
+    // the WebSocket/QUIC/WebTransport transports route through (§3.10.2). UDP/DTLS
+    // has no subscriptions, so `Accepted` just emits Ok (no subscriber delivery).
+    match did_slots
+        .gate_publish(
+            config.did_record_validation,
+            storage.as_ref(),
+            routing_id,
+            recipient_hint,
+            blob_ttl,
+            blob,
+            blob_id,
+        )
+        .await
+    {
+        DidPublishGate::Accepted(_stored) => {
+            let ok = RelayMessage::Ok {
+                ref_id,
+                blob_id: Some(blob_id),
+            };
+            send_dtls_response(sessions, remote_addr, &ok).await;
+            return;
+        }
+        DidPublishGate::Rejected { code, msg } => {
+            let err = RelayMessage::Err { ref_id, code, msg };
+            send_dtls_response(sessions, remote_addr, &err).await;
+            return;
+        }
+        DidPublishGate::FallThrough => {}
+    }
 
     match storage
         .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
@@ -931,6 +1017,7 @@ async fn handle_udp_query<S: BlobStorage>(
     remote_addr: &SocketAddr,
     storage: &Arc<S>,
     config: &RelayConfig,
+    did_slots: &DidSlotRegistry,
 ) {
     let effective_limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
 
@@ -947,7 +1034,19 @@ async fn handle_udp_query<S: BlobStorage>(
         return;
     }
 
-    let blobs = match storage.query(&routing_id, since, effective_limit).await {
+    // Slot-exclusivity rule (c) via the shared, storage-authoritative QUERY gate:
+    // a claimed DID `routing_id` returns ONLY its single genuine record (even on
+    // a cold index); ordinary routing_ids pass through unchanged.
+    let blobs = match did_slots
+        .gate_query(
+            config.did_record_validation,
+            storage.as_ref(),
+            routing_id,
+            since,
+            effective_limit,
+        )
+        .await
+    {
         Ok(b) => b,
         Err(e) => {
             debug!(remote = %remote_addr, error = %e, "UDP: blob query failed");
@@ -983,14 +1082,32 @@ async fn handle_udp_query<S: BlobStorage>(
 /// Handles a DELETE operation over UDP/DTLS.
 ///
 /// Best-effort deletion -- always returns OK, consistent with the WebSocket
-/// relay behavior.
+/// relay behavior — EXCEPT a claimed DID slot's blob, which is rejected.
+#[allow(clippy::too_many_arguments)]
 async fn handle_udp_delete<S: BlobStorage>(
     ref_id: Option<String>,
     blob_id: [u8; 32],
     sessions: &Arc<RwLock<HashMap<SocketAddr, DtlsSession>>>,
     remote_addr: &SocketAddr,
     storage: &Arc<S>,
+    did_slots: &DidSlotRegistry,
+    rate_limiter: &PublishRateLimiter,
 ) {
+    // Slot-exclusivity (§3.10.2 rule (d)) via the shared, storage-backed,
+    // rate-limited DELETE gate — the SAME chokepoint every transport routes
+    // through. Storage-backed, so immune to a cold index; non-slot blobs proceed.
+    match did_slots
+        .gate_delete(storage.as_ref(), &blob_id, rate_limiter, remote_addr.ip())
+        .await
+    {
+        DidDeleteGate::Rejected { code, msg } => {
+            let err = RelayMessage::Err { ref_id, code, msg };
+            send_dtls_response(sessions, remote_addr, &err).await;
+            return;
+        }
+        DidDeleteGate::Proceed => {}
+    }
+
     let _ = storage.delete(&blob_id).await;
 
     let ok = RelayMessage::Ok {
@@ -1183,6 +1300,7 @@ mod tests {
     use crate::native::storage::InMemoryBlobStorage;
     use crate::udp::dtls::AsyncDtlsSession;
     use openssl::ssl::{SslMethod, SslVerifyMode};
+    use scp_relay_client::code;
 
     /// Helper: create a test listener and return the bound address and shutdown handle.
     async fn start_test_listener() -> (UdpDtlsShutdownHandle, SocketAddr, Arc<InMemoryBlobStorage>)
@@ -1209,6 +1327,7 @@ mod tests {
             Arc::clone(&storage),
             PublishRateLimiter::new(100),
             rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
         )
         .unwrap();
         let (handle, addr) = listener.start().await.unwrap();
@@ -1359,6 +1478,7 @@ mod tests {
             storage,
             PublishRateLimiter::new(100),
             rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
         );
         assert!(listener.is_ok());
     }
@@ -1426,6 +1546,260 @@ mod tests {
             }
             other => panic!("expected query_complete Event, got: {other:?}"),
         }
+
+        handle.shutdown();
+    }
+
+    /// Builds a genuine, self-consistent DID-record frame at the signing key's
+    /// own DID-domain `routing_id`, returning `(routing_id, blob_id, bytes)`.
+    fn genuine_frame(seed: u8, seq: u64, value: &[u8]) -> ([u8; 32], [u8; 32], Vec<u8>) {
+        use ed25519_dalek::{Signer, SigningKey};
+        use scp_dht::bep44_signable;
+        use scp_identity::{did_from_ed25519_public_key, did_routing_id};
+        use scp_protocol::envelope::did_record::DidRecordV1;
+        use sha2::{Digest, Sha256};
+
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        let did = did_from_ed25519_public_key(&vk.to_bytes());
+        let rid = did_routing_id(&did);
+        let signature: ed25519_dalek::Signature = sk.sign(&bep44_signable(value, seq));
+        let bytes = DidRecordV1::try_new(vk.to_bytes(), seq, signature.to_bytes(), value.to_vec())
+            .unwrap()
+            .encode();
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(&Sha256::digest(&bytes));
+        (rid, bid, bytes)
+    }
+
+    /// A validating UDP/DTLS listener enforces DID-record slot-exclusivity over
+    /// the shared registry exactly like WebSocket/QUIC: a genuine frame claims
+    /// the slot, later junk at the same `routing_id` is rejected, and QUERY returns
+    /// only the slot — closing the Fix 1 gap where UDP bypassed the registry.
+    #[tokio::test]
+    async fn udp_did_record_slot_exclusivity_enforced() {
+        let (handle, addr, storage) = start_test_listener().await;
+        let client = create_dtls_client(addr).await;
+
+        // Publish a genuine DID-record frame over UDP → claims the slot.
+        let (rid, bid, frame) = genuine_frame(21, 5, b"did-doc");
+        let ok = send_and_recv(
+            &client,
+            &ClientMessage::Publish {
+                ref_id: Some("p".into()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: frame,
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                ok,
+                RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "genuine frame should be accepted, got {ok:?}",
+        );
+
+        // Opaque junk at the claimed routing_id over UDP → rejected (rule a).
+        let rejected = send_and_recv(
+            &client,
+            &ClientMessage::Publish {
+                ref_id: Some("j".into()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![0x80u8; 64],
+            },
+        )
+        .await;
+        match rejected {
+            RelayMessage::Err { code: c, .. } => assert_eq!(c, code::DID_RECORD_REJECTED),
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
+
+        // The junk never reached storage: exactly the slot blob is present.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+
+        // QUERY over UDP returns ONLY the slot (rule c): one Blob + complete.
+        let query = ClientMessage::Query {
+            ref_id: Some("q".into()),
+            routing_id: rid,
+            since: None,
+            limit: Some(100),
+        };
+        let data = rmp_serde::to_vec_named(&query).unwrap();
+        client.send(data).await.unwrap();
+        let blob_response = recv_msg(&client).await;
+        match &blob_response {
+            RelayMessage::Blob { blob_id, .. } => assert_eq!(blob_id, &bid),
+            other => panic!("expected the slot Blob, got {other:?}"),
+        }
+        let complete = recv_msg(&client).await;
+        assert!(matches!(complete, RelayMessage::Event { .. }));
+
+        handle.shutdown();
+    }
+
+    /// Fix B: an unauthenticated DELETE of a claimed DID slot's blob over
+    /// UDP/DTLS is rejected and the slot survives; DELETE of a non-slot blob
+    /// still succeeds.
+    #[tokio::test]
+    async fn udp_delete_of_claimed_slot_blob_rejected() {
+        let (handle, addr, storage) = start_test_listener().await;
+        let client = create_dtls_client(addr).await;
+
+        let (rid, bid, frame) = genuine_frame(42, 5, b"did-doc");
+        let ok = send_and_recv(
+            &client,
+            &ClientMessage::Publish {
+                ref_id: None,
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: frame,
+            },
+        )
+        .await;
+        assert!(matches!(
+            ok,
+            RelayMessage::Ok {
+                blob_id: Some(_),
+                ..
+            }
+        ));
+
+        // Attacker DELETEs the guessable slot blob_id.
+        let deleted = send_and_recv(
+            &client,
+            &ClientMessage::Delete {
+                ref_id: Some("d".into()),
+                blob_id: bid,
+            },
+        )
+        .await;
+        match deleted {
+            RelayMessage::Err { code: c, .. } => assert_eq!(c, code::DID_RECORD_REJECTED),
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
+
+        // Slot survives.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+
+        // A DELETE of an unrelated blob still returns OK.
+        let ok = send_and_recv(
+            &client,
+            &ClientMessage::Delete {
+                ref_id: None,
+                blob_id: [0xEE; 32],
+            },
+        )
+        .await;
+        assert!(matches!(ok, RelayMessage::Ok { .. }));
+
+        handle.shutdown();
+    }
+
+    /// Fix B / cold-index (UDP): the storage-backed DELETE gate protects a genuine
+    /// DID record even when the listener's slot index is COLD (fresh registry over a
+    /// durable store that already holds the record — a restart / store-sharing
+    /// peer). The genuine frame is pre-seeded straight into the shared store
+    /// (bypassing PUBLISH) so the index never learns of it; an attacker DELETE of the
+    /// guessable `blob_id` must be rejected by the storage-backed gate and the record
+    /// must survive. Mirrors `delete_of_cold_index_did_slot_blob_rejected` (WS) and
+    /// `quic_delete_of_cold_index_did_slot_blob_rejected` (QUIC).
+    #[tokio::test]
+    async fn udp_delete_of_cold_index_did_slot_blob_rejected() {
+        let (handle, addr, storage) = start_test_listener().await;
+
+        // Deposit a genuine frame straight into the shared store (no PUBLISH), so the
+        // listener's slot index stays cold.
+        let (rid, bid, frame) = genuine_frame(43, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+
+        let client = create_dtls_client(addr).await;
+
+        // Attacker DELETEs the guessable slot blob_id.
+        let deleted = send_and_recv(
+            &client,
+            &ClientMessage::Delete {
+                ref_id: Some("d".into()),
+                blob_id: bid,
+            },
+        )
+        .await;
+        match deleted {
+            RelayMessage::Err { code: c, .. } => assert_eq!(c, code::DID_RECORD_REJECTED),
+            other => panic!(
+                "cold-index DELETE of a genuine DID record must be rejected by the \
+                 storage-backed gate, got {other:?}"
+            ),
+        }
+
+        // The genuine record survives in the durable store.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+
+        handle.shutdown();
+    }
+
+    /// Fix 1 / cold-index (UDP): the storage-authoritative QUERY gate returns ONLY
+    /// the genuine record even when the index is COLD and junk is co-located in the
+    /// durable store (restart / store-sharing peer). The genuine frame + junk are
+    /// pre-seeded straight into the shared store (bypassing PUBLISH) so the index
+    /// stays cold; a QUERY over UDP must return exactly one Blob (the genuine record)
+    /// followed by `query_complete`, never leaking the co-located junk. Mirrors
+    /// `query_of_cold_index_did_slot_returns_only_genuine_record` (WS). UDP has no
+    /// SUBSCRIBE, so this polls via QUERY.
+    #[tokio::test]
+    async fn udp_query_of_cold_index_did_slot_returns_only_genuine_record() {
+        let (handle, addr, storage) = start_test_listener().await;
+
+        // Pre-seed a genuine frame + co-located junk straight into the durable store
+        // (bypassing PUBLISH), so the listener's index stays cold.
+        let (rid, bid, frame) = genuine_frame(44, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+        storage
+            .store(rid, [0x01; 32], None, 3600, vec![0x80u8; 32])
+            .await
+            .unwrap();
+        storage
+            .store(rid, [0x02; 32], None, 3600, vec![0x81u8; 48])
+            .await
+            .unwrap();
+        assert_eq!(storage.query(&rid, None, 100).await.unwrap().len(), 3);
+
+        let client = create_dtls_client(addr).await;
+
+        // QUERY over UDP: expect exactly one Blob (the genuine record) + complete.
+        let query = ClientMessage::Query {
+            ref_id: Some("q".into()),
+            routing_id: rid,
+            since: None,
+            limit: Some(100),
+        };
+        let data = rmp_serde::to_vec_named(&query).unwrap();
+        client.send(data).await.unwrap();
+
+        let blob_response = recv_msg(&client).await;
+        match &blob_response {
+            RelayMessage::Blob { blob_id, .. } => assert_eq!(blob_id, &bid),
+            other => panic!("cold-index QUERY must return only the genuine record, got {other:?}"),
+        }
+        let complete = recv_msg(&client).await;
+        assert!(
+            matches!(&complete, RelayMessage::Event { event_type, .. } if event_type == "query_complete"),
+            "expected query_complete after the single genuine Blob, got {complete:?}",
+        );
 
         handle.shutdown();
     }

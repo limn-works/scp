@@ -23,6 +23,8 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
+use crate::native::server::DidRecordValidation;
 use crate::native::storage::BlobStorage;
 use crate::relay::rate_limit::{PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
@@ -109,6 +111,18 @@ pub struct WebTransportSessionConfig {
 
     /// Subscribe rate limit: maximum subscribes per minute per session (default: 20).
     pub subscribe_rate_limit: u32,
+
+    /// Whether this session validates public DID-record frames and enforces the
+    /// single slot-exclusive slot per DID-domain `routing_id` (§3.10.2, ADR-004),
+    /// exactly like the WebSocket/QUIC/UDP transports. When a WebTransport
+    /// listener shares a validating relay's blob store and slot registry, this
+    /// MUST match the relay's
+    /// [`RelayConfig::did_record_validation`](crate::native::server::RelayConfig::did_record_validation)
+    /// so co-deployed transports enforce one consistent set of claimed slots.
+    /// Defaults to
+    /// [`DidRecordValidation::Enabled`](crate::native::server::DidRecordValidation::Enabled),
+    /// the canonical SCP-native behavior. Never a trust dependency (RELAYRES-002).
+    pub did_record_validation: DidRecordValidation,
 }
 
 impl Default for WebTransportSessionConfig {
@@ -121,6 +135,7 @@ impl Default for WebTransportSessionConfig {
             max_query_limit: MAX_QUERY_LIMIT,
             delivery_jitter_ms: 50,
             subscribe_rate_limit: 20,
+            did_record_validation: DidRecordValidation::Enabled,
         }
     }
 }
@@ -166,6 +181,12 @@ pub struct WebTransportSessionHandler<S: BlobStorage> {
     remote_ip: IpAddr,
     /// Routing IDs subscribed by this session (for cleanup).
     my_subscriptions: Arc<RwLock<HashSet<[u8; 32]>>>,
+    /// Shared DID-record slot index (same instance as WebSocket/QUIC/UDP). When
+    /// `config.did_record_validation` is `Enabled` and the session shares a
+    /// validating relay's blob store, PUBLISH/QUERY/DELETE honor slot-exclusivity
+    /// over this registry — so WebTransport cannot be used to bypass a claimed DID
+    /// slot in the shared store (§3.10.2, SCP-RELAYRES-003).
+    did_slots: DidSlotRegistry,
 }
 
 impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
@@ -180,7 +201,11 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
     /// * `shutdown_token` - Cancellation token for coordinated shutdown.
     /// * `publish_rate_limiter` - Shared per-IP publish rate limiter.
     /// * `remote_ip` - Client's remote IP address for rate limiting.
+    /// * `did_slots` - Shared DID-record slot index (obtain via
+    ///   [`RelayServer::did_slot_registry`](crate::native::server::RelayServer::did_slot_registry));
+    ///   pass `config.did_record_validation` equal to the relay's mode.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         config: WebTransportSessionConfig,
@@ -189,6 +214,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
         shutdown_token: CancellationToken,
         publish_rate_limiter: PublishRateLimiter,
         remote_ip: IpAddr,
+        did_slots: DidSlotRegistry,
     ) -> Self {
         let subscribe_rate_limit = config.subscribe_rate_limit;
         Self {
@@ -204,6 +230,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             publish_rate_limiter,
             remote_ip,
             my_subscriptions: Arc::new(RwLock::new(HashSet::new())),
+            did_slots,
         }
     }
 
@@ -363,6 +390,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
     /// Validates blob size and TTL, computes `blob_id = SHA-256(blob)`, stores
     /// the blob, fans out to active subscribers, and returns an OK with the
     /// `blob_id`.
+    #[allow(clippy::too_many_lines)]
     async fn handle_publish_inner(
         &self,
         ref_id: Option<String>,
@@ -413,7 +441,41 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
         // Compute blob_id = SHA-256(blob) using the canonical BlobId helper.
         let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
 
-        // Store the blob.
+        // OPTIONAL validating-relay DID-record slot gate — the SAME shared
+        // chokepoint the WebSocket/QUIC/UDP transports route through (§3.10.2).
+        match self
+            .did_slots
+            .gate_publish(
+                self.config.did_record_validation,
+                self.storage.as_ref(),
+                routing_id,
+                recipient_hint,
+                blob_ttl,
+                blob,
+                blob_id,
+            )
+            .await
+        {
+            DidPublishGate::Accepted(stored) => {
+                let _failed_deliveries = subscription::deliver_to_subscribers(
+                    &stored,
+                    &self.subscriptions,
+                    self.config.delivery_jitter_ms,
+                )
+                .await;
+                return Ok(RelayMessage::Ok {
+                    ref_id,
+                    blob_id: Some(blob_id),
+                });
+            }
+            DidPublishGate::Rejected { code, msg } => {
+                return Ok(RelayMessage::Err { ref_id, code, msg });
+            }
+            DidPublishGate::FallThrough => {}
+        }
+
+        // Store the blob (opaque path — non-DID blobs, or every blob when
+        // did_record_validation is Disabled).
         let stored = match self
             .storage
             .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
@@ -531,11 +593,19 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             blob_id: None,
         }];
 
-        // Backfill if `since` is provided.
+        // Backfill if `since` is provided. Slot-exclusivity rule (c) applies via
+        // the shared storage-authoritative QUERY gate: a claimed DID routing_id
+        // backfills ONLY its single genuine record (even on a cold index).
         if let Some(since_ts) = since {
             if let Ok(blobs) = self
-                .storage
-                .query(&routing_id, Some(since_ts), MAX_QUERY_LIMIT)
+                .did_slots
+                .gate_query(
+                    self.config.did_record_validation,
+                    self.storage.as_ref(),
+                    routing_id,
+                    Some(since_ts),
+                    MAX_QUERY_LIMIT,
+                )
                 .await
             {
                 for stored in blobs {
@@ -622,9 +692,18 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             }]);
         }
 
+        // Slot-exclusivity rule (c) via the shared, storage-authoritative QUERY
+        // gate: a claimed DID `routing_id` returns ONLY its single genuine record
+        // (even on a cold index); ordinary routing_ids pass through unchanged.
         let blobs = match self
-            .storage
-            .query(&routing_id, since, effective_limit)
+            .did_slots
+            .gate_query(
+                self.config.did_record_validation,
+                self.storage.as_ref(),
+                routing_id,
+                since,
+                effective_limit,
+            )
             .await
         {
             Ok(b) => b,
@@ -667,12 +746,33 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
     // DELETE handler
     // -----------------------------------------------------------------------
 
-    /// Handles a DELETE operation: best-effort deletion from storage.
+    /// Handles a DELETE operation: best-effort deletion from storage, EXCEPT a
+    /// protected DID slot's blob, which is rejected (§3.10.2 rule (d), Fix B).
     async fn handle_delete_inner(
         &self,
         ref_id: Option<String>,
         blob_id: [u8; 32],
     ) -> Result<RelayMessage, WebTransportSessionError> {
+        // Slot-exclusivity (§3.10.2 rule (d)) via the shared, storage-backed,
+        // rate-limited DELETE gate — the SAME chokepoint every transport routes
+        // through. Storage-backed, so immune to a cold index; non-slot blobs
+        // proceed.
+        match self
+            .did_slots
+            .gate_delete(
+                self.storage.as_ref(),
+                &blob_id,
+                &self.publish_rate_limiter,
+                self.remote_ip,
+            )
+            .await
+        {
+            DidDeleteGate::Rejected { code, msg } => {
+                return Ok(RelayMessage::Err { ref_id, code, msg });
+            }
+            DidDeleteGate::Proceed => {}
+        }
+
         // Best-effort deletion.
         let _ = self.storage.delete(&blob_id).await;
 
@@ -741,6 +841,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
 /// QUERY and SUBSCRIBE produce multiple relay messages (blobs + completion
 /// event), while other operations produce a single response.
 #[must_use]
+#[derive(Debug)]
 pub enum DispatchResult {
     /// A single relay message response (PUBLISH OK, DELETE OK, PING PONG, etc.).
     Single(RelayMessage),
@@ -832,7 +933,17 @@ mod tests {
 
     /// Helper: creates a session handler with default config and in-memory storage.
     fn make_handler() -> WebTransportSessionHandler<InMemoryBlobStorage> {
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        make_handler_with_storage(Arc::new(InMemoryBlobStorage::new()))
+    }
+
+    /// Helper: creates a session handler with default config over a caller-provided
+    /// (possibly pre-seeded) blob store. The handler's `DidSlotRegistry` is fresh /
+    /// **cold**, so pre-seeding the shared store directly models a durable backend
+    /// that already holds records the (restarted) relay's index knows nothing about
+    /// — the cold-index scenario the storage-authoritative gates defend.
+    fn make_handler_with_storage(
+        storage: Arc<InMemoryBlobStorage>,
+    ) -> WebTransportSessionHandler<InMemoryBlobStorage> {
         let subscriptions = crate::relay::subscription::new_registry();
         let token = CancellationToken::new();
         let rate_limiter = PublishRateLimiter::new(100);
@@ -844,6 +955,7 @@ mod tests {
             token,
             rate_limiter,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DidSlotRegistry::new(),
         )
     }
 
@@ -887,6 +999,220 @@ mod tests {
         assert_eq!(config.max_subscriptions_per_session, 100);
         assert_eq!(config.max_query_limit, MAX_QUERY_LIMIT);
         assert_eq!(config.delivery_jitter_ms, 50);
+        assert_eq!(
+            config.did_record_validation,
+            DidRecordValidation::Enabled,
+            "WebTransport validates DID records by default, like the other transports",
+        );
+    }
+
+    /// Builds a genuine, self-consistent DID-record frame at the signing key's
+    /// own DID-domain `routing_id`, returning `(routing_id, blob_id, bytes)`.
+    fn genuine_frame(seed: u8, seq: u64, value: &[u8]) -> ([u8; 32], [u8; 32], Vec<u8>) {
+        use ed25519_dalek::{Signer, SigningKey};
+        use scp_dht::bep44_signable;
+        use scp_identity::{did_from_ed25519_public_key, did_routing_id};
+        use scp_protocol::envelope::did_record::DidRecordV1;
+        use sha2::{Digest, Sha256};
+
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        let did = did_from_ed25519_public_key(&vk.to_bytes());
+        let rid = did_routing_id(&did);
+        let signature: ed25519_dalek::Signature = sk.sign(&bep44_signable(value, seq));
+        let bytes = DidRecordV1::try_new(vk.to_bytes(), seq, signature.to_bytes(), value.to_vec())
+            .unwrap()
+            .encode();
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(&Sha256::digest(&bytes));
+        (rid, bid, bytes)
+    }
+
+    fn slot_blob_ids(result: &DispatchResult) -> Vec<[u8; 32]> {
+        let DispatchResult::Multi(msgs) = result else {
+            panic!("expected Multi (QUERY), got a different DispatchResult");
+        };
+        msgs.iter()
+            .filter_map(|m| match m {
+                RelayMessage::Blob { blob_id, .. } => Some(*blob_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Fix C: a validating WebTransport session enforces DID-record
+    /// slot-exclusivity over the shared registry — a genuine frame claims the
+    /// slot, later junk is rejected, QUERY returns only the slot, and an
+    /// unauthenticated DELETE of the slot blob is rejected while the slot
+    /// survives. Mirrors the QUIC/UDP handler behavior exactly.
+    #[tokio::test]
+    async fn webtransport_did_record_slot_exclusivity_and_delete_gate() {
+        let mut h = make_handler();
+        let (rid, bid, frame) = genuine_frame(61, 5, b"did-doc");
+
+        // PUBLISH genuine frame → claims the slot.
+        let ok = h
+            .dispatch_message_multi(&ClientMessage::Publish {
+                ref_id: None,
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: frame,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(ok, DispatchResult::Single(RelayMessage::Ok { .. })),
+            "genuine frame should be accepted, got {ok:?}",
+        );
+
+        // Opaque junk at the claimed routing_id → rejected (rule a).
+        let rejected = h
+            .dispatch_message_multi(&ClientMessage::Publish {
+                ref_id: None,
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![0x80u8; 64],
+            })
+            .await
+            .unwrap();
+        match rejected {
+            DispatchResult::Single(RelayMessage::Err { code: c, .. }) => {
+                assert_eq!(c, code::DID_RECORD_REJECTED);
+            }
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
+
+        // QUERY returns ONLY the slot (rule c).
+        let query = ClientMessage::Query {
+            ref_id: None,
+            routing_id: rid,
+            since: None,
+            limit: Some(100),
+        };
+        let q = h.dispatch_message_multi(&query).await.unwrap();
+        assert_eq!(slot_blob_ids(&q), vec![bid]);
+
+        // DELETE of the slot blob → rejected (Fix B).
+        let deleted = h
+            .dispatch_message_multi(&ClientMessage::Delete {
+                ref_id: None,
+                blob_id: bid,
+            })
+            .await
+            .unwrap();
+        match deleted {
+            DispatchResult::Single(RelayMessage::Err { code: c, .. }) => {
+                assert_eq!(c, code::DID_RECORD_REJECTED);
+            }
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
+
+        // Slot survives: QUERY still returns it.
+        let q = h.dispatch_message_multi(&query).await.unwrap();
+        assert_eq!(slot_blob_ids(&q), vec![bid]);
+
+        // DELETE of a non-slot blob still succeeds.
+        let ok = h
+            .dispatch_message_multi(&ClientMessage::Delete {
+                ref_id: None,
+                blob_id: [0xEE; 32],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            ok,
+            DispatchResult::Single(RelayMessage::Ok { .. })
+        ));
+    }
+
+    /// Fix B / cold-index (WebTransport): the storage-backed DELETE gate protects a
+    /// genuine DID record even when the session's slot index is COLD (fresh registry
+    /// over a durable store that already holds the record — a restart / store-sharing
+    /// peer). The genuine frame is pre-seeded straight into the shared store
+    /// (bypassing PUBLISH, so the index never learns of it); an attacker DELETE of the
+    /// guessable `blob_id` — driven via `dispatch_message_multi` on the real handler —
+    /// must be rejected and the record must survive. Mirrors
+    /// `delete_of_cold_index_did_slot_blob_rejected` (WS) and
+    /// `quic_delete_of_cold_index_did_slot_blob_rejected` (QUIC).
+    #[tokio::test]
+    async fn webtransport_delete_of_cold_index_did_slot_blob_rejected() {
+        let storage = Arc::new(InMemoryBlobStorage::new());
+
+        // Deposit a genuine frame straight into the shared store (no PUBLISH), so the
+        // handler's slot index stays cold.
+        let (rid, bid, frame) = genuine_frame(62, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+
+        let mut h = make_handler_with_storage(Arc::clone(&storage));
+
+        // Attacker DELETEs the guessable slot blob_id.
+        let deleted = h
+            .dispatch_message_multi(&ClientMessage::Delete {
+                ref_id: None,
+                blob_id: bid,
+            })
+            .await
+            .unwrap();
+        match deleted {
+            DispatchResult::Single(RelayMessage::Err { code: c, .. }) => {
+                assert_eq!(c, code::DID_RECORD_REJECTED);
+            }
+            other => panic!(
+                "cold-index DELETE of a genuine DID record must be rejected by the \
+                 storage-backed gate, got {other:?}"
+            ),
+        }
+
+        // The genuine record survives in the durable store.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+    }
+
+    /// Fix 1 / cold-index (WebTransport): the storage-authoritative QUERY gate returns
+    /// ONLY the genuine record even when the index is COLD and junk is co-located in
+    /// the durable store (restart / store-sharing peer). The genuine frame + junk are
+    /// pre-seeded straight into the shared store (bypassing PUBLISH) so the index
+    /// stays cold; a QUERY driven via `dispatch_message_multi` must return exactly the
+    /// genuine record, never leaking the co-located junk. Mirrors
+    /// `query_of_cold_index_did_slot_returns_only_genuine_record` (WS).
+    #[tokio::test]
+    async fn webtransport_query_of_cold_index_did_slot_returns_only_genuine_record() {
+        let storage = Arc::new(InMemoryBlobStorage::new());
+
+        // Pre-seed a genuine frame + co-located junk straight into the durable store
+        // (bypassing PUBLISH), so the handler's index stays cold.
+        let (rid, bid, frame) = genuine_frame(63, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+        storage
+            .store(rid, [0x01; 32], None, 3600, vec![0x80u8; 32])
+            .await
+            .unwrap();
+        storage
+            .store(rid, [0x02; 32], None, 3600, vec![0x81u8; 48])
+            .await
+            .unwrap();
+        assert_eq!(storage.query(&rid, None, 100).await.unwrap().len(), 3);
+
+        let mut h = make_handler_with_storage(Arc::clone(&storage));
+
+        // QUERY returns ONLY the genuine record (rule c), not the co-located junk.
+        let q = h
+            .dispatch_message_multi(&ClientMessage::Query {
+                ref_id: None,
+                routing_id: rid,
+                since: None,
+                limit: Some(100),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            slot_blob_ids(&q),
+            vec![bid],
+            "cold-index QUERY must return only the genuine record",
+        );
     }
 
     #[tokio::test]
@@ -904,6 +1230,7 @@ mod tests {
             token.clone(),
             rate_limiter,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DidSlotRegistry::new(),
         );
 
         // Cancel immediately so the run loop exits.
@@ -941,6 +1268,7 @@ mod tests {
             token,
             rate_limiter,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DidSlotRegistry::new(),
         );
 
         // Track the subscription in the handler's local list.
@@ -991,6 +1319,7 @@ mod tests {
             token,
             rate_limiter,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DidSlotRegistry::new(),
         );
 
         handler.active_subscriptions.push(StreamSubscription {
@@ -1353,6 +1682,7 @@ mod tests {
             token,
             rate_limiter,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DidSlotRegistry::new(),
         );
         handler.mark_active();
 
