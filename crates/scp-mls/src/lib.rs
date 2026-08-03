@@ -67,9 +67,11 @@ pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};
 pub use error::MlsError;
 pub use keypackage_attestation::{
-    AttestationTrigger, KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
+    AttestationLeafGroundTruth, AttestationResolutionVerifyError, AttestationTrigger,
+    AttestationVerifyError, KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
     MAX_KEYPACKAGE_ATTESTATION_LIFETIME, SCP_KEYPACKAGE_ATTESTATION_DOMAIN,
     SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE, scp_capabilities_with_keypackage_attestation,
+    verify_attestation_with_resolution,
 };
 
 // The MLS signing key pair appears in this crate's public op signatures

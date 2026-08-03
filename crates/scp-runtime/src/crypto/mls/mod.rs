@@ -25,6 +25,13 @@
 #[cfg(test)]
 mod wrapping_extension_runtime_tests;
 
+// Async, native `DidResolver`-backed KeyPackage-attestation verification —
+// §9.7.1 verifier checks 1–2 (CRYPTO-22 S4, Layer B). The pure, wasm-safe
+// checks-1–2 seam lives in `scp_mls::verify_attestation_with_resolution`
+// (Layer A); this module resolves the signer DID and supplies the resolved
+// document + honest clock-stamped `resolved_at`.
+pub mod attestation_verification;
+
 // Async durable-storage bridge — stays in scp-runtime (tokio-coupled, node-only).
 pub mod backend;
 pub mod production_backend;
