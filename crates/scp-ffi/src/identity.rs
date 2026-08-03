@@ -2551,7 +2551,9 @@ impl crate::scp::PyScp {
 
         // Ownership gate (parity with the NAPI bridge's RED-PR5-003 check):
         // recovery is restricted to identities THIS SCP instance hosts in its
-        // identity registry (populated by `identity_create*` / `identity_load`).
+        // identity registry (populated by `identity_create*` / migrate, never by
+        // `identity_load`, which only reads the registry and fails
+        // `SCP-IDENT-1010` if the DID is absent).
         // A DID this instance does not own is rejected here — before any
         // recovery bookkeeping — so a realm-local caller cannot drive recovery
         // against arbitrary DIDs. `SCP-IDENT-1020` matches NAPI/UniFFI.
@@ -2559,7 +2561,11 @@ impl crate::scp::PyScp {
             return Err(PyErr::from(ScpPyError::identity_with_code(
                 format!(
                     "identity_execute_recovery: DID '{did}' is not owned by this SCP instance — \
-                     recovery is restricted to identities created or loaded via this SCP"
+                     recovery is restricted to identities registered on this instance (populated \
+                     only by identity_create* / migrate, never by identity_load, on every \
+                     binding). The ownership-registry keying mechanism differs across bindings \
+                     (UniFFI custody registry vs PyO3/NAPI identity registry) and is unified in \
+                     #2240 Part B."
                 ),
                 scp_ffi_common::error_codes::IDENT_1020,
             )));

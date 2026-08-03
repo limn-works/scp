@@ -59,7 +59,11 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
         """{"old_did":"did:dht:zOld","new_did":"did:dht:zNew","rotated_at":1700000000}"""
     var attestDeviceResult = "dGVzdC1hdHRlc3RhdGlvbg=="
     var verifyDeviceAttestationResult = true
-    var executeRecoveryResult = """{"key_rotation_completed":true}"""
+    // Neutral delegation fixture. The real recovery surface fails closed
+    // (#2240 Part A) and never returns a success payload — this value only
+    // exercises the wrapper's param-forwarding / pass-through plumbing, so it
+    // deliberately does NOT encode the removed `key_rotation_completed` shape.
+    var executeRecoveryResult = """{"status":"delegated"}"""
     var executeCustodyMigrationResult = """{"key_generated":true,"authorized":true}"""
 
     // Configurable errors
@@ -332,16 +336,22 @@ class IdentityAdvancedBridgeTest {
                 assertEquals("did:dht:z6MkTest", stubAdvanced.lastDid)
                 assertEquals("agent", stubAdvanced.lastTier)
                 assertEquals(listOf("ctx-1"), stubAdvanced.lastContextIds)
-                assertTrue(result.contains("key_rotation_completed"))
+                assertEquals("""{"status":"delegated"}""", result)
             }
 
         @Test
-        fun `executeRecovery propagates bridge error`() =
+        fun `executeRecovery propagates the fail-closed SCP-IDENT-1022 error`() =
             runTest(testDispatcher) {
-                stubAdvanced.executeRecoveryError = BridgeException("recovery failed", "SCP-IDENT-1030")
-                assertFailsWith<BridgeException> {
+                // #2240 Part A: the recovery surface fails closed with the typed
+                // SCP-IDENT-1022 "backend not configured" error on every bridge;
+                // assert the Kotlin wrapper propagates that exact code, not just
+                // that it throws.
+                stubAdvanced.executeRecoveryError =
+                    BridgeException("recovery backend not configured", "SCP-IDENT-1022")
+                val ex = assertFailsWith<BridgeException> {
                     advancedBridge.executeRecovery("did:dht:z6MkFail", "identity_key")
                 }
+                assertEquals("SCP-IDENT-1022", ex.code)
             }
     }
 

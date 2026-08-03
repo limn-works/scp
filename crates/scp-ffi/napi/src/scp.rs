@@ -1113,7 +1113,11 @@ impl Scp {
             return Err(NapiError::from(ScpNapiError::Identity {
                 message: format!(
                     "identity_execute_recovery: DID '{did}' is not owned by this SCP instance — \
-                     recovery is restricted to identities created or loaded via this SCP"
+                     recovery is restricted to identities registered on this instance (populated \
+                     only by identity_create* / migrate, never by identity_load, on every \
+                     binding). The ownership-registry keying mechanism differs across bindings \
+                     (UniFFI custody registry vs PyO3/NAPI identity registry) and is unified in \
+                     #2240 Part B."
                 ),
                 code: codes::IDENT_1020.to_owned(),
             }));
