@@ -68,7 +68,7 @@ pub use encrypt::{DecryptedContent, InboundChange};
 pub use error::MlsError;
 pub use keypackage_attestation::{
     AttestationLeafGroundTruth, AttestationResolutionVerifyError, AttestationTrigger,
-    KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
+    AttestationVerifyError, KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
     MAX_KEYPACKAGE_ATTESTATION_LIFETIME, SCP_KEYPACKAGE_ATTESTATION_DOMAIN,
     SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE, scp_capabilities_with_keypackage_attestation,
     verify_attestation_with_resolution,
