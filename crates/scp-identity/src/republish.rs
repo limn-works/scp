@@ -96,8 +96,9 @@ const LAYER_DISABLED_WARNING: &str =
 /// Abstraction over SCP relay PUBLISH operations for DID documents (§3.10.2).
 ///
 /// Production implementations wrap the relay client from `scp-transport`.
-/// The [`InMemoryRelayPublisher`] provides a test implementation that records
-/// all PUBLISH operations for assertion.
+/// `InMemoryRelayPublisher` (test-harness-only, gated behind
+/// `#[cfg(any(test, feature = "testing"))]`) provides a test implementation
+/// that records all PUBLISH operations for assertion.
 ///
 /// `scp-core` defines the trait; `scp-transport` implements it. This avoids
 /// a direct dependency from `scp-core` to `scp-transport`.
@@ -138,6 +139,11 @@ pub trait RelayPublisher: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// A recorded PUBLISH operation for test assertions.
+///
+/// Produced exclusively by [`InMemoryRelayPublisher`]; gated to the same
+/// test-harness cfg so no dead test-double support type ships (ADR-062
+/// §Decision 5, E4).
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone)]
 pub struct RecordedRelayPublish {
     /// The routing ID used in the PUBLISH operation.
@@ -152,12 +158,19 @@ pub struct RecordedRelayPublish {
 ///
 /// Records all PUBLISH operations so tests can inspect routing IDs, TTLs,
 /// and blob contents without network access.
+///
+/// Test-harness-only: gated behind `#[cfg(any(test, feature = "testing"))]` so
+/// it is ABSENT from every shipped (non-testing) build — it can never be bound
+/// on a production `RepublishManager` path (ADR-062 §Decision 5, E4; mirrors
+/// E1's `InMemoryDhtClient` and E2's `InMemoryCredentialStore` demotions).
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemoryRelayPublisher {
     /// All recorded PUBLISH operations, in order.
     publishes: Mutex<Vec<RecordedRelayPublish>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryRelayPublisher {
     /// Creates a new empty in-memory relay publisher.
     #[must_use]
@@ -182,6 +195,7 @@ impl InMemoryRelayPublisher {
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait does
 // not guarantee Send futures, so manual impl Future is required.
+#[cfg(any(test, feature = "testing"))]
 #[allow(clippy::manual_async_fn)]
 impl RelayPublisher for InMemoryRelayPublisher {
     fn publish(
@@ -392,9 +406,13 @@ pub type RelayWarningCallback = Arc<dyn Fn(RelayPublishDegraded) + Send + Sync>;
 ///
 /// * `D` — The DHT client implementation. Use `InMemoryDhtClient` for
 ///   testing, or a production pkarr-based client for real DHT access.
-/// * `R` — The relay publisher implementation. Use `InMemoryRelayPublisher`
-///   for testing, or a production relay client for real relay access.
-pub struct RepublishManager<D: DhtClient, R: RelayPublisher = InMemoryRelayPublisher> {
+/// * `R` — The relay publisher implementation. A production relay client for
+///   real relay access, or `InMemoryRelayPublisher` (test-harness-only, gated
+///   behind `#[cfg(any(test, feature = "testing"))]`) for tests. There is no
+///   default: every caller MUST name a publisher explicitly, so no shipped
+///   `RepublishManager` can silently bind the in-memory dev double (ADR-062
+///   §Decision 5, E4 — mirrors E1's `DidDht<D>` default severance).
+pub struct RepublishManager<D: DhtClient, R: RelayPublisher> {
     dht_client: Arc<D>,
     relay_publisher: Option<Arc<R>>,
     config: RepublishConfig,
@@ -430,11 +448,14 @@ struct TaskHandle {
     abort_handle: tokio::task::AbortHandle,
 }
 
-impl<D: DhtClient + 'static> RepublishManager<D> {
+impl<D: DhtClient + 'static, R: RelayPublisher> RepublishManager<D, R> {
     /// Creates a new republish manager with DHT-only publishing.
     ///
-    /// Relay publishing is not available until a [`RelayPublisher`] is provided
-    /// via [`with_relay_publisher`](RepublishManager::with_relay_publisher).
+    /// The relay publisher type `R` must still be named by the caller (there is
+    /// no default type parameter — ADR-062 §Decision 5, E4), even though this
+    /// constructor leaves it unset (`relay_publisher: None`). Relay publishing
+    /// is not available until a [`RelayPublisher`] is provided via
+    /// [`with_relay_publisher`](RepublishManager::with_relay_publisher).
     #[must_use]
     pub fn new(dht_client: Arc<D>) -> Self {
         Self {
@@ -860,7 +881,8 @@ mod tests {
     #[tokio::test]
     async fn start_and_stop_republishing() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
+            RepublishManager::new(Arc::clone(&dht));
         let entry = make_entry("did:dht:zTest1");
 
         manager.start_republishing(entry).await;
@@ -881,7 +903,8 @@ mod tests {
     #[tokio::test]
     async fn stop_all_clears_all_tasks() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
+            RepublishManager::new(Arc::clone(&dht));
 
         manager
             .start_republishing(make_entry("did:dht:zTest1"))
@@ -898,7 +921,8 @@ mod tests {
     #[tokio::test]
     async fn replacing_existing_task_aborts_old_one() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
+            RepublishManager::new(Arc::clone(&dht));
 
         manager
             .start_republishing(make_entry("did:dht:zTest1"))
@@ -914,7 +938,8 @@ mod tests {
     #[tokio::test]
     async fn immediate_publish_on_start() {
         let dht = Arc::new(InMemoryDhtClient::new());
-        let manager: RepublishManager<InMemoryDhtClient> = RepublishManager::new(Arc::clone(&dht));
+        let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
+            RepublishManager::new(Arc::clone(&dht));
         let entry = make_entry("did:dht:zTest1");
 
         manager.start_republishing(entry).await;
