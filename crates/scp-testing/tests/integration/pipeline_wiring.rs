@@ -3538,16 +3538,16 @@ fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
 // App Sandboxing (spec §8.4) — AppBound / AppUnbound event log wiring
 // ===========================================================================
 
-/// Verifies that `sandbox_app_bind` (PyO3), `app_bind_on` (NAPI), and
-/// `sandbox_app_bind` (UniFFI) all route through the shared `bind_app`
+/// Verifies that `app_bind` (PyO3), `app_bind_on` (NAPI), and
+/// `app_bind` (UniFFI) all route through the shared `bind_app`
 /// function from `app_sandbox`, which appends the durable `AppBound` (tag 74)
 /// event to the event log (spec §8.4.1 — silent app attachment is not
 /// possible).
 #[test]
 fn app_bind_wired_through_bind_app_all_bridges() {
     assert!(
-        fn_body_contains(PYO3_CONTEXT_SRC, "sandbox_app_bind", "bind_app("),
-        "PyO3 sandbox_app_bind must route through bind_app (spec §8.4.1 — \
+        fn_body_contains(PYO3_CONTEXT_SRC, "app_bind", "bind_app("),
+        "PyO3 app_bind must route through bind_app (spec §8.4.1 — \
          AppBound event log wiring)"
     );
     assert!(
@@ -3556,22 +3556,22 @@ fn app_bind_wired_through_bind_app_all_bridges() {
          AppBound event log wiring)"
     );
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "sandbox_app_bind", "bind_app("),
-        "UniFFI sandbox_app_bind must route through bind_app (spec §8.4.1 — \
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "app_bind", "bind_app("),
+        "UniFFI app_bind must route through bind_app (spec §8.4.1 — \
          AppBound event log wiring)"
     );
 }
 
-/// Verifies that `sandbox_app_unbind` (PyO3), `app_unbind_on` (NAPI), and
-/// `sandbox_app_unbind` (UniFFI) all route through the shared `unbind_app`
+/// Verifies that `app_unbind` (PyO3), `app_unbind_on` (NAPI), and
+/// `app_unbind` (UniFFI) all route through the shared `unbind_app`
 /// function from `app_sandbox`, which appends the durable `AppUnbound`
 /// (tag 75) event to the event log (spec §8.4.2 — silent app detachment is
 /// not possible).
 #[test]
 fn app_unbind_wired_through_unbind_app_all_bridges() {
     assert!(
-        fn_body_contains(PYO3_CONTEXT_SRC, "sandbox_app_unbind", "unbind_app("),
-        "PyO3 sandbox_app_unbind must route through unbind_app (spec §8.4.2 — \
+        fn_body_contains(PYO3_CONTEXT_SRC, "app_unbind", "unbind_app("),
+        "PyO3 app_unbind must route through unbind_app (spec §8.4.2 — \
          AppUnbound event log wiring)"
     );
     assert!(
@@ -3580,8 +3580,8 @@ fn app_unbind_wired_through_unbind_app_all_bridges() {
          AppUnbound event log wiring)"
     );
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "sandbox_app_unbind", "unbind_app("),
-        "UniFFI sandbox_app_unbind must route through unbind_app (spec §8.4.2 — \
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "app_unbind", "unbind_app("),
+        "UniFFI app_unbind must route through unbind_app (spec §8.4.2 — \
          AppUnbound event log wiring)"
     );
 }

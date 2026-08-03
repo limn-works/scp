@@ -2768,29 +2768,29 @@
       ]
     },
     {
-      "canonical": "sandbox_app_bind",
+      "canonical": "app_bind",
       "category": "context",
       "pyo3": [
-        "sandbox_app_bind"
+        "app_bind"
       ],
       "uniffi": [
-        "sandbox_app_bind"
+        "app_bind"
       ],
       "napi": [
-        "sandbox_app_bind"
+        "app_bind"
       ]
     },
     {
-      "canonical": "sandbox_app_unbind",
+      "canonical": "app_unbind",
       "category": "context",
       "pyo3": [
-        "sandbox_app_unbind"
+        "app_unbind"
       ],
       "uniffi": [
-        "sandbox_app_unbind"
+        "app_unbind"
       ],
       "napi": [
-        "sandbox_app_unbind"
+        "app_unbind"
       ]
     },
     {

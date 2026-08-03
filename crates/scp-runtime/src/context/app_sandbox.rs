@@ -2686,7 +2686,12 @@ mod tests {
         assert_eq!(payload.app_name, decl.app_name);
         assert_eq!(payload.app_version, decl.app_version);
 
-        // Capabilities must be sorted (deterministic Merkle leaf convergence).
+        // Verify capabilities are sorted (deterministic Merkle leaves).
+        assert!(
+            payload.capabilities.windows(2).all(|w| w[0] <= w[1]),
+            "AppBoundPayload.capabilities must be sorted for Merkle convergence"
+        );
+        // Verify the content matches what was granted.
         let mut expected: Vec<String> = scoped
             .allowed_capabilities()
             .iter()

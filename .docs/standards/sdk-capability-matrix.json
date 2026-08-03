@@ -320,7 +320,7 @@
           }
         },
         {
-          "name": "sandbox_app_bind",
+          "name": "app_bind",
           "python": true,
           "typescript": true,
           "kotlin": true,
@@ -328,7 +328,7 @@
           "notes": "Binds an app to a context (spec §8.4.1), appending a durable AppBound event (tag 74). Returns JSON with app_did and granted_capabilities."
         },
         {
-          "name": "sandbox_app_unbind",
+          "name": "app_unbind",
           "python": true,
           "typescript": true,
           "kotlin": true,

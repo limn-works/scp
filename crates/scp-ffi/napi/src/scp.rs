@@ -2771,8 +2771,8 @@ impl Scp {
     /// durable event log (spec §8.4).
     ///
     /// Returns a camelCase JSON summary on success.
-    #[napi(js_name = "sandboxAppBind")]
-    pub fn sandbox_app_bind(
+    #[napi(js_name = "appBind")]
+    pub fn app_bind(
         &self,
         context_id: String,
         declaration_json: String,
@@ -2788,8 +2788,8 @@ impl Scp {
 
     /// Unbinds an app from a context and appends an `AppUnbound` event to
     /// the durable event log (spec §8.4).
-    #[napi(js_name = "sandboxAppUnbind")]
-    pub fn sandbox_app_unbind(
+    #[napi(js_name = "appUnbind")]
+    pub fn app_unbind(
         &self,
         context_id: String,
         app_did: String,

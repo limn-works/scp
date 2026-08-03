@@ -5099,16 +5099,16 @@ pub(crate) fn validate_capability_declaration_on(
                 .collect();
             serde_json::json!({
                 "valid": true,
-                "grantedCapabilities": granted,
+                "granted_capabilities": granted,
                 "error": null,
-                "appDid": decl.app_id.to_string()
+                "app_did": decl.app_id.to_string()
             })
         }
         Err(e) => serde_json::json!({
             "valid": false,
-            "grantedCapabilities": [],
+            "granted_capabilities": [],
             "error": e.to_string(),
-            "appDid": decl.app_id.to_string()
+            "app_did": decl.app_id.to_string()
         }),
     };
 
@@ -5121,8 +5121,8 @@ pub(crate) fn validate_capability_declaration_on(
 ///
 /// Validates the declaration against the context ceiling (looked up from
 /// `UcanContextState`) and the actor's effective (suspension-aware) role
-/// capabilities, then appends a typed `AppBound` leaf. Returns a camelCase
-/// JSON summary: `{"appDid": "...", "grantedCapabilities": [...]}`.
+/// capabilities, then appends a typed `AppBound` leaf. Returns a `snake_case`
+/// JSON summary: `{"app_did": "...", "granted_capabilities": [...]}`.
 ///
 /// # Errors
 ///
@@ -5139,6 +5139,8 @@ pub(crate) fn app_bind_on(
     use scp_core::context::roles::Capability;
     use scp_core::context::{ContextHandle, ContextParams};
 
+    scp_ffi_common::validate::validate_context_id(&context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&actor_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
@@ -5192,7 +5194,7 @@ pub(crate) fn app_bind_on(
             _ => NapiError::from_reason(format!("[{}] bind_app failed: {e}", codes::CTX_2058)),
         })?;
 
-    let app_did = scoped.app_did().to_string();
+    let app_did = scoped.app_did().trim().to_string();
     let granted: Vec<String> = scoped
         .allowed_capabilities()
         .iter()
@@ -5207,8 +5209,8 @@ pub(crate) fn app_bind_on(
     .map_err(NapiError::from)?;
 
     serde_json::to_string(&serde_json::json!({
-        "appDid": app_did,
-        "grantedCapabilities": granted,
+        "app_did": app_did,
+        "granted_capabilities": granted,
     }))
     .map_err(|e| NapiError::from_reason(format!("serialization failed: {e}")))
 }
@@ -5229,6 +5231,8 @@ pub(crate) fn app_unbind_on(
 ) -> napi::Result<()> {
     use scp_core::context::app_sandbox::unbind_app;
 
+    scp_ffi_common::validate::validate_context_id(&context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&actor_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&app_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -5261,7 +5265,16 @@ pub(crate) fn app_unbind_on(
             .await
         })
         .map_err(|e| {
-            NapiError::from_reason(format!("[{}] unbind_app failed: {e}", codes::CTX_2059))
+            use scp_core::context::app_sandbox::SandboxError;
+            match &e {
+                SandboxError::EventLogFailed(_) => NapiError::from_reason(format!(
+                    "[{}] event log append failed: {e}",
+                    codes::CTX_2057
+                )),
+                _ => {
+                    NapiError::from_reason(format!("[{}] unbind_app failed: {e}", codes::CTX_2059))
+                }
+            }
         })?;
 
     // Remove the stored scoped handle.

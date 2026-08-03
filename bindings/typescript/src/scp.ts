@@ -4628,7 +4628,7 @@ export class SCP {
    *
    * @returns A JSON summary string with `app_did` and `granted_capabilities`.
    */
-  async contextSandboxAppBind(
+  async contextAppBind(
     contextId: string,
     declarationJson: string,
     actorDid: string,
@@ -4636,7 +4636,7 @@ export class SCP {
   ): Promise<string> {
     try {
       return await (
-        this.#native.sandboxAppBind as (
+        this.#native.appBind as (
           id: string,
           decl: string,
           did: string,
@@ -4652,7 +4652,7 @@ export class SCP {
    * Unbinds an app from a context and appends a durable `AppUnbound` event
    * (tag 75) to the event log (spec §8.4.2).
    */
-  async contextSandboxAppUnbind(
+  async contextAppUnbind(
     contextId: string,
     appDid: string,
     actorDid: string,
@@ -4660,7 +4660,7 @@ export class SCP {
   ): Promise<void> {
     try {
       await (
-        this.#native.sandboxAppUnbind as (
+        this.#native.appUnbind as (
           id: string,
           app: string,
           did: string,

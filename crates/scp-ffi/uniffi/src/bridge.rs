@@ -15798,7 +15798,7 @@ impl Scp {
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn sandbox_app_bind(
+    pub async fn app_bind(
         &self,
         handle: Arc<ContextHandle>,
         declaration_json: String,
@@ -15906,7 +15906,7 @@ impl Scp {
                     }
                 })?;
 
-                let app_did = scoped.app_did().to_string();
+                let app_did = scoped.app_did().trim().to_string();
                 let granted: Vec<String> = scoped
                     .allowed_capabilities()
                     .iter()
@@ -15939,12 +15939,12 @@ impl Scp {
     /// a durable `AppUnbound` event (tag 75) to the context event log.
     ///
     /// Removes the binding from the bridge instance's `bound_apps_registry`.
-    /// Returns `ScpError::Context` (SCP-CTX-2030) when the event log append
+    /// Returns `ScpError::Context` (`SCP-CTX-2057`) when the event log append
     /// fails — silent app detachment is not possible (spec §8.4).
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn sandbox_app_unbind(
+    pub async fn app_unbind(
         &self,
         handle: Arc<ContextHandle>,
         app_did: String,
@@ -15989,9 +15989,16 @@ impl Scp {
                     timestamp_secs,
                 )
                 .await
-                .map_err(|e| ScpError::Context {
-                    msg: e.to_string(),
-                    code: codes::CTX_2059.to_owned(),
+                .map_err(|e| {
+                    use scp_core::context::app_sandbox::SandboxError;
+                    let code = match &e {
+                        SandboxError::EventLogFailed(_) => codes::CTX_2057,
+                        _ => codes::CTX_2059,
+                    };
+                    ScpError::Context {
+                        msg: e.to_string(),
+                        code: code.to_owned(),
+                    }
                 })?;
 
                 // Remove the binding from the per-context registry.

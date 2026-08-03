@@ -6198,7 +6198,7 @@ impl crate::scp::PyScp {
     /// `RuntimeError` if validation fails (ceiling exceeded, signature invalid)
     /// or if the durable event log append fails.
     #[pyo3(signature = (context_id, declaration_json, actor_did, timestamp_secs))]
-    pub fn sandbox_app_bind(
+    pub fn app_bind(
         &self,
         context_id: &str,
         declaration_json: &str,
@@ -6211,6 +6211,8 @@ impl crate::scp::PyScp {
 
         let bi = &*self.inner;
 
+        validate::validate_context_id(context_id)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         validate::validate_did(actor_did).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         let decl: CapabilityDeclaration = serde_json::from_str(declaration_json)
@@ -6267,7 +6269,7 @@ impl crate::scp::PyScp {
                 _ => PyRuntimeError::new_err(format!("[{}] bind_app failed: {e}", codes::CTX_2058)),
             })?;
 
-        let app_did = scoped.app_did().to_string();
+        let app_did = scoped.app_did().trim().to_string();
         let granted: Vec<String> = scoped
             .allowed_capabilities()
             .iter()
@@ -6296,7 +6298,7 @@ impl crate::scp::PyScp {
     /// Returns `RuntimeError` if the context is not found or if the durable
     /// event log append fails.
     #[pyo3(signature = (context_id, app_did, actor_did, timestamp_secs))]
-    pub fn sandbox_app_unbind(
+    pub fn app_unbind(
         &self,
         context_id: &str,
         app_did: &str,
@@ -6307,6 +6309,8 @@ impl crate::scp::PyScp {
 
         let bi = &*self.inner;
 
+        validate::validate_context_id(context_id)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         validate::validate_did(actor_did).map_err(|e| PyValueError::new_err(e.to_string()))?;
         validate::validate_did(app_did).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
@@ -6340,7 +6344,16 @@ impl crate::scp::PyScp {
             .await
         })
         .map_err(|e| {
-            PyRuntimeError::new_err(format!("[{}] unbind_app failed: {e}", codes::CTX_2059))
+            use scp_core::context::app_sandbox::SandboxError;
+            match &e {
+                SandboxError::EventLogFailed(_) => PyRuntimeError::new_err(format!(
+                    "[{}] event log append failed: {e}",
+                    codes::CTX_2057
+                )),
+                _ => {
+                    PyRuntimeError::new_err(format!("[{}] unbind_app failed: {e}", codes::CTX_2059))
+                }
+            }
         })?;
 
         // Remove the stored scoped handle.

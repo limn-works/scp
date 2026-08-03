@@ -1397,14 +1397,14 @@ class SCP:
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
 
-    async def context_sandbox_app_bind(
+    async def context_app_bind(
         self,
         context_id: str,
         declaration_json: str,
         actor_did: str,
         timestamp_secs: int,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.sandbox_app_bind``.
+        """Delegate to ``_scp_core.SCP.app_bind``.
 
         Validates the capability declaration against the context ceiling and
         the actor's role capabilities, then appends a durable ``AppBound``
@@ -1414,27 +1414,27 @@ class SCP:
         ``granted_capabilities`` on success.
         """
         return await asyncio.to_thread(
-            self._native.sandbox_app_bind,
+            self._native.app_bind,
             context_id,
             declaration_json,
             actor_did,
             timestamp_secs,
         )
 
-    async def context_sandbox_app_unbind(
+    async def context_app_unbind(
         self,
         context_id: str,
         app_did: str,
         actor_did: str,
         timestamp_secs: int,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.sandbox_app_unbind``.
+        """Delegate to ``_scp_core.SCP.app_unbind``.
 
         Removes the app binding and appends a durable ``AppUnbound`` event
         (tag 75) to the event log (spec §8.4.2).
         """
         return await asyncio.to_thread(
-            self._native.sandbox_app_unbind,
+            self._native.app_unbind,
             context_id,
             app_did,
             actor_did,
