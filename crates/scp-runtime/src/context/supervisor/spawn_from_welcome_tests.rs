@@ -690,6 +690,92 @@ async fn spawn_from_welcome_yields_a_live_send_capable_actor() {
 }
 
 // ---------------------------------------------------------------------------
+// Test A1b — the joiner INSTALLS the genesis-declared outlets (GitHub #2020).
+// ---------------------------------------------------------------------------
+
+/// Builds a minimal valid genesis [`OutletRegistration`] fixture (GitHub #2020),
+/// operated by the creator (`ALICE_DID`) — the genesis declarant.
+fn genesis_outlet(outlet_id: &str) -> scp_protocol::context::outlets::OutletRegistration {
+    use scp_protocol::context::outlets::{OutletKind, OutletRegistration, OutletSchema};
+    OutletRegistration {
+        outlet_id: outlet_id.to_owned(),
+        kind: OutletKind::Action,
+        name: outlet_id.to_owned(),
+        description: "genesis outlet fixture".to_owned(),
+        schema: OutletSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "object"}),
+            aggregate_schema: None,
+        },
+        implementation_hash: [0u8; 32],
+        test_vectors: vec![],
+        message_catalog: Vec::new(),
+        operator_did: ALICE_DID.into(),
+        cost: None,
+        registered_at: 0,
+        signature: Vec::new(),
+    }
+}
+
+/// §5.1/§5.12 (GitHub #2020): a Welcome-joiner INSTALLS the genesis-declared
+/// `params.outlets` into its live registry (via the shared
+/// `state::fresh_governance_state`), so the joiner sees the SAME initial outlet
+/// set the creator declared at genesis. Before the fix the join path dropped
+/// `params.outlets`, so a joiner's registry came up empty.
+///
+/// The joiner appends NO local `OutletRegistered` leaf — those are
+/// creator-authoritative and converge via event-log leaf replication, exactly
+/// like `ContextCreated`/`MemberJoined` (Test A). The installed set is asserted
+/// on the joiner's persisted Class-S snapshot, which the spawn writes fail-closed
+/// BEFORE registering the actor, so it is a faithful read of the joiner's live
+/// `governance.registered_outlets`.
+#[tokio::test]
+async fn welcome_joiner_installs_genesis_outlets() {
+    let params = ContextParams {
+        outlets: vec![genesis_outlet("alpha"), genesis_outlet("beta")],
+        ..joiner_params()
+    };
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0x2c,
+        Some(Box::new(rec.clone())),
+        Some(params.clone()),
+        params.clone(),
+        None,
+    )
+    .await;
+    result.expect("welcome join succeeds with genesis outlets");
+
+    let snapshot = rec
+        .store
+        .get(&j.ctx_id)
+        .map(|e| e.value().clone())
+        .expect("the joiner persisted a Class-S snapshot before spawning");
+    let ids: Vec<&str> = snapshot
+        .registered_outlets
+        .iter()
+        .map(|o| o.outlet_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["alpha", "beta"],
+        "the joiner installs the creator's genesis-declared outlets into its live registry"
+    );
+
+    // No joiner-local OutletRegistered leaf: the joiner reconstructs its registry
+    // from `params` and converges the authenticated leaves via replication.
+    assert!(
+        j.sup
+            .event_log_entries(&j.ctx_bytes)
+            .expect("event-log provider is wired")
+            .is_none_or(|v| v
+                .iter()
+                .all(|e| e.event_type != scp_event_log::EventType::OutletRegistered)),
+        "joiner emits no local OutletRegistered leaf; genesis leaves converge via replication"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test A2 — the joiner seeds its ABSOLUTE MLS epoch from the joined group.
 // ---------------------------------------------------------------------------
 

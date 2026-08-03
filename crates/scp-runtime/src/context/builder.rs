@@ -823,6 +823,20 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // policy is Governed, that is technically valid (no capabilities to
     // narrow). No structural constraint to enforce here.
 
+    // §5.1/§5.12: outlets are declared at creation and installed into the live
+    // registry (GitHub #2020). Reject a genesis outlet set that would exceed the
+    // per-context registry cap here, at creation, so the genesis-seeding path
+    // (`state::fresh_governance_state`) and the runtime governance-registration
+    // path (`governance_helpers::execute_register_outlet`) enforce the SAME
+    // `MAX_REGISTERED_OUTLETS` bound — no genesis bypass of the cap.
+    if params.outlets.len() > crate::context::state::MAX_REGISTERED_OUTLETS {
+        return Err(ContextCreationError::CreationFailed(format!(
+            "genesis outlet count {} exceeds the per-context limit of {}",
+            params.outlets.len(),
+            crate::context::state::MAX_REGISTERED_OUTLETS,
+        )));
+    }
+
     // Validate memory scope is permitted for the context mode (§5.11).
     // Broadcast contexts only support MemoryScope::Full — Ephemeral and
     // Summary require MLS group state destruction which broadcast mode lacks.
@@ -1108,6 +1122,59 @@ pub async fn create_context(
         return Err(e.into());
     }
 
+    // Step 8.5: Append one `OutletRegistered` leaf per genesis-declared outlet
+    // (§5.1/§5.12 "declared at creation"; GitHub #2020). The creator is the
+    // authoritative event-log writer, so these leaves are appended HERE — the
+    // same append boundary that just wrote `ContextCreated`/`MemberJoined` —
+    // reusing the exact `EventType::OutletRegistered` leaf that
+    // `governance_helpers::execute_register_outlet` emits for the runtime
+    // governance-registration path, so genesis-seeded and governance-registered
+    // outlets are UNIFORM authenticated log leaves (§5.4: "silent outlet
+    // modification is not possible — any change is visible to all context
+    // members"). The corresponding live-registry seed happens in
+    // `state::fresh_governance_state`; a Welcome-joiner receives these leaves via
+    // log replication (dormant today, exactly like the `ContextCreated` leaf) and
+    // seeds its own registry from the same `params.outlets`. `actor_did` is the
+    // creator (the genesis declarant), and every leaf carries the convergent
+    // creator-assigned `creation_timestamp_secs` (§7.3.1, §9.9.3). A failure
+    // rolls back the whole creation, exactly like the leaves above.
+    //
+    // NOTE (uniformity finding, GitHub #2020 requirement 3): neither this genesis
+    // path NOR `execute_register_outlet` verifies an `OutletRegistration`'s
+    // §5.4.1 operator signature today — `verify_outlet_registration_signature`
+    // exists but has no production caller. The two paths are therefore uniform
+    // (both unverified); this genesis path introduces no bypass. Wiring signature
+    // verification into BOTH paths is a separate, pre-existing gap.
+    //
+    // The leaf is unparameterized (`EventPayload::default()`) — byte-for-byte the
+    // same append `execute_register_outlet` makes via `append_context_event`, so
+    // one leaf is emitted per genesis outlet without embedding the registration
+    // body (which is seeded into live state by `state::fresh_governance_state`).
+    for _outlet in &params.outlets {
+        if let Err(e) = event_log_provider
+            .append_event(
+                &id_bytes,
+                scp_event_log::EventType::OutletRegistered,
+                creator_did,
+                scp_event_log::EventPayload::default(),
+                creation_timestamp_secs,
+            )
+            .await
+        {
+            // #2148 F6: eagerly free the born-but-never-seeded crypto (signer
+            // freed, NOT zeroized — #82) before it drops on this rollback.
+            // `owned_crypto` is still live (returned to the caller on success at
+            // step 9), so it is the live owner here.
+            if let Some(mut owned) = owned_crypto {
+                owned.dispose_secrets();
+            }
+            receipt
+                .rollback(&id_bytes, transport, event_log_provider)
+                .await;
+            return Err(e);
+        }
+    }
+
     // Step 9: Return the handle plus the owned crypto material (Encrypted
     // mode) for the caller to seed onto the spawning actor. Broadcast contexts
     // return `None` — their broadcast key lives on the actor's `BroadcastState`.
@@ -1383,6 +1450,130 @@ mod tests {
         assert!(
             record.participation_duration_seconds > 0,
             "a founder who participated must have non-zero participation duration"
+        );
+    }
+
+    /// Builds a minimal valid [`OutletRegistration`] fixture for genesis-outlet
+    /// tests (GitHub #2020).
+    fn outlet_fixture(outlet_id: &str) -> scp_protocol::context::outlets::OutletRegistration {
+        use scp_protocol::context::outlets::{OutletKind, OutletRegistration, OutletSchema};
+        OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
+            kind: OutletKind::Action,
+            name: outlet_id.to_owned(),
+            description: "genesis outlet fixture".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            message_catalog: Vec::new(),
+            operator_did: TEST_DID.into(),
+            cost: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// §5.1/§5.12 (GitHub #2020): outlets declared in `ContextParams.outlets` at
+    /// genesis are INSTALLED — the creator's authoritative event log carries one
+    /// `OutletRegistered` leaf per genesis outlet (the same leaf
+    /// `execute_register_outlet` emits for the runtime governance path), attributed
+    /// to the creator at the convergent creation timestamp. Before the fix the
+    /// genesis path dropped `params.outlets` entirely, so NO leaves were emitted.
+    #[tokio::test]
+    async fn genesis_outlets_emit_outlet_registered_leaves_on_create() {
+        use crate::context::providers::MerkleEventLogProvider;
+
+        const CREATION_TS: u64 = 1_000;
+        let id = hex::encode([0x3bu8; 32]);
+        let id_bytes = context_id_bytes(&id);
+        let crypto = NodeMlsFactory::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
+        let provider = MerkleEventLogProvider::new();
+
+        let params = ContextParams {
+            outlets: vec![outlet_fixture("alpha"), outlet_fixture("beta")],
+            ..Default::default()
+        };
+
+        create_context(
+            id.clone(),
+            params,
+            &crypto,
+            &TestTransport,
+            &provider,
+            TEST_DID,
+            CREATION_TS,
+        )
+        .await
+        .expect("create_context should succeed with genesis outlets");
+
+        let entries = provider
+            .event_log_entries(&id_bytes)
+            .expect("entries readable")
+            .expect("log exists");
+
+        let outlet_leaves: Vec<_> = entries
+            .iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::OutletRegistered)
+            .collect();
+        assert_eq!(
+            outlet_leaves.len(),
+            2,
+            "one OutletRegistered leaf per genesis outlet must be emitted on create"
+        );
+        for leaf in &outlet_leaves {
+            assert_eq!(
+                leaf.actor_did.0.as_str(),
+                TEST_DID,
+                "genesis outlet leaf is attributed to the creator (the genesis declarant)"
+            );
+            assert_eq!(
+                leaf.timestamp, CREATION_TS,
+                "genesis outlet leaf carries the convergent creation timestamp"
+            );
+        }
+    }
+
+    /// The genesis path enforces the SAME `MAX_REGISTERED_OUTLETS` bound as the
+    /// runtime governance-registration path (`execute_register_outlet`): a
+    /// `params.outlets` set larger than the cap is rejected at creation, so genesis
+    /// cannot bypass the per-context registry limit (GitHub #2020).
+    #[test]
+    fn validate_params_rejects_genesis_outlets_over_the_cap() {
+        let params = ContextParams {
+            outlets: (0..=crate::context::state::MAX_REGISTERED_OUTLETS)
+                .map(|i| outlet_fixture(&format!("outlet-{i}")))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(
+            params.outlets.len() > crate::context::state::MAX_REGISTERED_OUTLETS,
+            "fixture must exceed the cap"
+        );
+        assert!(
+            validate_params(&params).is_err(),
+            "a genesis outlet set exceeding MAX_REGISTERED_OUTLETS must be rejected at creation"
+        );
+    }
+
+    /// A genesis outlet set at exactly the cap is accepted (boundary check).
+    #[test]
+    fn validate_params_accepts_genesis_outlets_at_the_cap() {
+        let params = ContextParams {
+            outlets: (0..crate::context::state::MAX_REGISTERED_OUTLETS)
+                .map(|i| outlet_fixture(&format!("outlet-{i}")))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(
+            validate_params(&params).is_ok(),
+            "a genesis outlet set at exactly MAX_REGISTERED_OUTLETS must be accepted"
         );
     }
 }
