@@ -48,7 +48,7 @@ use pyo3::types::PyDict;
 use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport, SystemTimestamp};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
-use scp_mcp::server::{ContextProvider, ContextToolInfo, McpServer, MemberInfo};
+use scp_mcp::server::{ContextOutletInfo, ContextProvider, McpServer, MemberInfo};
 use scp_platform::traits::Storage;
 
 use crate::error::ScpPyError;
@@ -679,7 +679,7 @@ impl ContextProvider for FfiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, context_id: &str) -> Vec<ContextToolInfo> {
+    fn context_tools(&self, context_id: &str) -> Vec<ContextOutletInfo> {
         // Returns empty if the bridge has been dropped — matches the
         // "unknown context" fallback semantics of this trait method.
         let Ok(bi) = self.upgrade_bi() else {
@@ -689,12 +689,18 @@ impl ContextProvider for FfiBridgeProvider {
             let outlets = rt
                 .outlet_registry
                 .registrations()
-                .map(|t| ContextToolInfo {
+                .map(|t| ContextOutletInfo {
                     name: t.name.clone(),
                     description: Some(t.description.clone()),
                     input_schema: t.schema.input_schema.clone(),
                     output_schema: Some(t.schema.output_schema.clone()),
                     admin_only: false,
+                    // Carry the registry's authoritative §5.4.2 kind so the
+                    // translator surfaces the correct `query.` / `call.` MCP
+                    // tool-name prefix. `ContextOutletInfo.kind` is the canonical
+                    // `scp_core::context::outlets::OutletKind` (re-exported by
+                    // scp-mcp), so this is a direct move — never hardcode Action.
+                    kind: t.kind,
                 })
                 .collect();
             Ok(outlets)
@@ -832,7 +838,7 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
-    fn invoke_tool(
+    fn invoke_outlet(
         &self,
         context_id: &str,
         outlet_name: &str,
@@ -845,9 +851,9 @@ impl ContextProvider for FfiBridgeProvider {
         // After successful invocation, appends a OutletInvokedEvent to the
         // context's event log per ADR-010 acceptance criterion 3.
         //
-        // The handler dispatch is sync because ContextProvider::invoke_tool is
+        // The handler dispatch is sync because ContextProvider::invoke_outlet is
         // sync and Python handlers are GIL-bound (inherently sync). The async
-        // invoke_tool in scp-core is for contexts where Rust itself executes
+        // invoke_outlet in scp-core is for contexts where Rust itself executes
         // outlets. See SCP-212, ADR-010, ADR-015.
         //
         // IMPORTANT: The handler Arc and output schema are extracted inside the
@@ -859,7 +865,7 @@ impl ContextProvider for FfiBridgeProvider {
         // Handler execution is bounded by `outlet_timeout_ms` to prevent a
         // misbehaving handler from blocking the tokio runtime indefinitely.
         // Uses std::thread::spawn + mpsc::recv_timeout (sync timeout) because
-        // ContextProvider::invoke_tool is a sync trait method. See issue #123.
+        // ContextProvider::invoke_outlet is a sync trait method. See issue #123.
         //
         // KNOWN LIMITATION — thread leak on timeout: When `recv_timeout`
         // expires, the spawned `std::thread` continues running in the
@@ -889,7 +895,7 @@ impl ContextProvider for FfiBridgeProvider {
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.outlet_timeout_ms);
 
-        // Upgrade the bridge instance handle up-front. `invoke_tool` is a
+        // Upgrade the bridge instance handle up-front. `invoke_outlet` is a
         // sync trait method, so the `Arc` we hold here has a well-defined
         // lifetime bounded by this function's return — it cannot survive
         // across an `await` and pin the instance alive (#1549 round-2).
@@ -2273,7 +2279,7 @@ impl crate::scp::PyScp {
 /// Registers a Python callable as the handler for an outlet in a context.
 ///
 /// The handler is called when the outlet is invoked via MCP
-/// (`FfiBridgeProvider::invoke_tool`). It receives the outlet's validated
+/// (`FfiBridgeProvider::invoke_outlet`). It receives the outlet's validated
 /// JSON input as a Python dict and must return a Python dict representing
 /// the JSON output.
 ///
@@ -2900,7 +2906,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_tool — echo fallback when no handler
+    // FfiBridgeProvider::invoke_outlet — echo fallback when no handler
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2920,8 +2926,8 @@ mod tests {
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
-        let result = provider.invoke_tool(&ctx_id, "calculator", input.clone());
-        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+        let result = provider.invoke_outlet(&ctx_id, "calculator", input.clone());
+        assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         let output = result.unwrap();
         assert_eq!(
@@ -2937,7 +2943,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_tool — appends OutletInvokedEvent to event log
+    // FfiBridgeProvider::invoke_outlet — appends OutletInvokedEvent to event log
     // (ADR-010 acceptance criterion 3, issue #120)
     // -----------------------------------------------------------------------
 
@@ -2966,8 +2972,8 @@ mod tests {
 
         // Invoke in echo mode (no handler registered).
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
-        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+        assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         // Verify the event log now has one event.
         let after_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
@@ -2981,7 +2987,7 @@ mod tests {
 
         // Invoke again to verify sequential appending.
         let result2 =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
         assert!(result2.is_ok());
 
         let final_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
@@ -3022,8 +3028,8 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 10, "b": 20}));
-        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 10, "b": 20}));
+        assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
         assert_eq!(result.unwrap(), serde_json::json!({"result": 30.0}));
 
         // Verify event was logged.
@@ -3064,7 +3070,7 @@ mod tests {
 
         // Invoke with invalid input (schema validation fails).
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!("not an object"));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!("not an object"));
         assert!(result.is_err(), "invalid input should be rejected");
 
         // Event log should still be empty (no event appended on error).
@@ -3081,7 +3087,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_tool — rejects invalid schema input
+    // FfiBridgeProvider::invoke_outlet — rejects invalid schema input
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3103,7 +3109,7 @@ mod tests {
         // Input schema requires an object with "a" and "b" as required fields.
         // Pass a string instead.
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!("not an object"));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!("not an object"));
         assert!(result.is_err(), "invalid input should be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -3112,7 +3118,7 @@ mod tests {
         );
 
         // Pass an object missing required fields.
-        let result = provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1}));
+        let result = provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1}));
         assert!(
             result.is_err(),
             "input missing required field 'b' should be rejected"
@@ -3120,14 +3126,14 @@ mod tests {
 
         // Pass valid input — should succeed.
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_ok(), "valid input should succeed: {result:?}");
 
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_tool — outlet not found
+    // FfiBridgeProvider::invoke_outlet — outlet not found
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3146,7 +3152,7 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
+        let result = provider.invoke_outlet(&ctx_id, "nonexistent", serde_json::json!({}));
         assert!(result.is_err(), "unknown outlet should be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -3311,8 +3317,8 @@ mod tests {
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
-        let result = provider.invoke_tool(&ctx_id, "calculator", input);
-        assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
+        let result = provider.invoke_outlet(&ctx_id, "calculator", input);
+        assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         let output = result.unwrap();
         // Handler returns computed output, not echoed input.
@@ -3377,7 +3383,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(
             result.is_err(),
             "handler returning invalid output should be rejected"
@@ -3415,7 +3421,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_err(), "failing handler should propagate error");
         let err = result.unwrap_err();
         assert!(
@@ -3456,7 +3462,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_err(), "blocking handler should be timed out");
         let err = result.unwrap_err();
         assert!(
@@ -3504,7 +3510,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 3, "b": 4}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 3, "b": 4}));
         assert!(
             result.is_ok(),
             "fast handler should complete within timeout: {result:?}"

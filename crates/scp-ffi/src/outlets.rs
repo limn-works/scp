@@ -422,7 +422,7 @@ pub(crate) fn validate_outlet_ucan(
 /// input/output schemas and computes the input/output hashes for the
 /// `OutletInvokedEvent`. If no handler is registered, falls back to
 /// returning validated input with metadata (schema-only mode), identical
-/// to `FfiBridgeProvider::invoke_tool` in `mcp.rs`.
+/// to `FfiBridgeProvider::invoke_outlet` in `mcp.rs`.
 ///
 /// # Arguments
 ///

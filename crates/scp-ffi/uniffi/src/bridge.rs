@@ -4795,7 +4795,7 @@ const UNIFFI_OUTLET_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOU
 /// - `context_tools()` reads from the per-context `OutletRegistry`
 /// - `agent_role()` reads from `ContextManager::get_role_state()`
 /// - `validate_capability()` runs UCAN validation + role-state capability check
-/// - `invoke_tool()` dispatches to registered handlers with schema validation
+/// - `invoke_outlet()` dispatches to registered handlers with schema validation
 /// - `context_members()` reads from `ContextManager::member_dids()` + `member_role()`
 /// - `context_events()` reads from the per-context event log (UCAN state)
 struct McpUniFfiBridgeProvider {
@@ -4882,7 +4882,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
+    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextOutletInfo> {
         // Look up the ContextHandle from this provider's instance registry
         // and read its outlet_registry.
         // Returns empty if the bridge instance has been dropped (#1549 round-2).
@@ -4896,12 +4896,18 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let outlet_registry = handle.outlet_registry.blocking_lock();
         outlet_registry
             .registrations()
-            .map(|t| scp_mcp::server::ContextToolInfo {
+            .map(|t| scp_mcp::server::ContextOutletInfo {
                 name: t.name.clone(),
                 description: Some(t.description.clone()),
                 input_schema: t.schema.input_schema.clone(),
                 output_schema: Some(t.schema.output_schema.clone()),
                 admin_only: false,
+                // Carry the registry's authoritative §5.4.2 kind so the
+                // translator surfaces the correct `query.` / `call.` MCP
+                // tool-name prefix. `ContextOutletInfo.kind` is the canonical
+                // `scp_core::context::outlets::OutletKind` (re-exported by
+                // scp-mcp), so this is a direct move — never hardcode Action.
+                kind: t.kind,
             })
             .collect()
     }
@@ -5071,7 +5077,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn invoke_tool(
+    fn invoke_outlet(
         &self,
         context_id: &str,
         outlet_name: &str,
@@ -5081,7 +5087,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.outlet_timeout_ms);
 
-        // Upgrade the bridge instance handle up-front. `invoke_tool` is a
+        // Upgrade the bridge instance handle up-front. `invoke_outlet` is a
         // sync trait method so the Arc is bounded by this function's return
         // and cannot survive across an `await` point (#1549 round-2).
         let bi = self.upgrade_bi()?;

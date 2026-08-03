@@ -149,6 +149,25 @@ pub struct McpToolResult {
     pub provenance: ExternalToolProvenance,
 }
 
+/// One entry from [`McpClient::list_outlets`] — an external MCP tool surfaced in
+/// SCP vocabulary.
+///
+/// The authoritative wire name is [`ToolDefinition::name`] on `definition`; pass
+/// it straight back to [`McpClient::invoke_outlet`]. `advisory_kind` is derived
+/// from any `query.` / `call.` prefix the external server used and is
+/// classification metadata ONLY — it is deliberately NOT combined with the name
+/// to reconstruct a wire identifier (the field name makes the
+/// advisory-vs-authoritative distinction explicit and avoids the double-prefix
+/// footgun on [`crate::translator::format_mcp_tool_name`]).
+#[derive(Debug, Clone)]
+pub struct OutletListing {
+    /// Advisory outlet classification parsed from the tool-name prefix
+    /// (defaults to [`crate::translator::OutletKind::Action`] when unprefixed).
+    pub advisory_kind: crate::translator::OutletKind,
+    /// The external MCP tool definition, carrying the verbatim wire `name`.
+    pub definition: ToolDefinition,
+}
+
 // ---------------------------------------------------------------------------
 // Timestamp provider
 // ---------------------------------------------------------------------------
@@ -188,8 +207,17 @@ const CLIENT_VERSION: &str = "0.1.0";
 ///
 /// 1. Create a client with a transport and timestamp provider.
 /// 2. Call [`initialize`](Self::initialize) to complete the MCP handshake.
-/// 3. Call [`list_tools`](Self::list_tools) to discover available tools.
-/// 4. Call [`invoke`](Self::invoke) to invoke a tool with SCP provenance wrapping.
+/// 3. Discover tools, then invoke one. Two equivalent surfaces are provided:
+///    - **SCP vocabulary (canonical):** [`list_outlets`](Self::list_outlets)
+///      returns [`OutletListing`]s; pass an entry's verbatim
+///      `definition.name` to [`invoke_outlet`](Self::invoke_outlet).
+///    - **Raw MCP vocabulary:** [`list_tools`](Self::list_tools) +
+///      [`invoke`](Self::invoke) work directly in `tool`/`tool.name` terms.
+///
+///    Both send identical bytes on the wire; the SCP-vocabulary pair only adds
+///    an advisory outlet `kind` in the listing. Names from either surface are
+///    verbatim external wire names — never pass them through
+///    [`crate::translator::format_mcp_tool_name`] (server-side projection only).
 ///
 /// See ADR-015 in `.docs/adrs/phase-3.md` for the full design.
 pub struct McpClient<T: McpTransport, C: TimestampProvider = SystemTimestamp> {
@@ -419,6 +447,71 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
             is_error: call_result.is_error,
             provenance,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-vocabulary surface (SCP-OUT-007)
+    // -----------------------------------------------------------------------
+
+    /// Invoke an external MCP tool from an SCP-aware caller (the canonical
+    /// SCP-vocabulary counterpart to the raw-MCP [`Self::invoke`]).
+    ///
+    /// `tool_name` MUST be the verbatim MCP `tool.name` as returned by
+    /// [`Self::list_outlets`] (i.e. `OutletListing::definition.name`). It is sent
+    /// to the external server **unchanged**: SCP does not reconstruct the wire
+    /// name from an outlet `kind` here. The `query.` / `call.` kind-prefix
+    /// projection is a SERVER-side concern — it applies only when SCP exposes its
+    /// own outlets over MCP (see [`crate::server`] / [`crate::translator`]). When
+    /// SCP is the *client* of a foreign MCP server, that server owns its tool
+    /// naming, so re-prefixing a generic name like `get_weather` to
+    /// `call.get_weather` would produce a tool-not-found error.
+    ///
+    /// The returned [`McpToolResult`] carries the verbatim external MCP content
+    /// and SCP provenance; no envelope translation is applied to the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpClientError::NotInitialized`] if the handshake has not
+    /// completed, or a transport/server error.
+    pub fn invoke_outlet(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        context_id: &str,
+        invoker_did: &str,
+    ) -> Result<McpToolResult, McpClientError> {
+        // Verbatim name — no kind reconstruction (see doc comment for why).
+        self.invoke(tool_name, input, context_id, invoker_did)
+    }
+
+    /// List available outlets from the external MCP server (the canonical
+    /// SCP-vocabulary counterpart to the raw-MCP [`Self::list_tools`]).
+    ///
+    /// Returns [`OutletListing`] entries: `definition.name` is the **verbatim**
+    /// MCP `tool.name` to pass back to [`Self::invoke_outlet`], and
+    /// `advisory_kind` is **advisory** classification metadata parsed from any
+    /// `query.` / `call.` prefix the server used (defaulting to
+    /// [`crate::translator::OutletKind::Action`] for unprefixed names) — it is
+    /// informational only and is never used to rebuild the wire name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpClientError::NotInitialized`] if the handshake has not
+    /// completed, or a transport/server error.
+    pub fn list_outlets(&self) -> Result<Vec<OutletListing>, McpClientError> {
+        let tools = self.list_tools()?;
+        Ok(tools
+            .into_iter()
+            .map(|t| {
+                // Advisory kind only; the verbatim `tool.name` stays on the
+                // definition for invoke.
+                let (advisory_kind, _outlet_id) = crate::translator::parse_mcp_tool_name(&t.name);
+                OutletListing {
+                    advisory_kind,
+                    definition: t,
+                }
+            })
+            .collect())
     }
 }
 
@@ -729,6 +822,90 @@ mod tests {
         let client = initialized_client(vec![tools_response]);
         let tools = client.list_tools().unwrap();
         assert!(tools.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-vocabulary surface (SCP-OUT-007): verbatim external tool naming
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_outlets_preserves_verbatim_tool_name_with_advisory_kind() {
+        let tools_response = {
+            let result = ToolsListResult {
+                tools: vec![
+                    // Generic external tool — no SCP kind prefix.
+                    ToolDefinition {
+                        name: "get_weather".to_owned(),
+                        description: Some("Weather".to_owned()),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    // Foreign server that happens to project a kind prefix.
+                    ToolDefinition {
+                        name: "query.lookup_users".to_owned(),
+                        description: None,
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                ],
+                next_cursor: None,
+            };
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
+        };
+
+        let client = initialized_client(vec![tools_response]);
+        let outlets = client.list_outlets().unwrap();
+
+        assert_eq!(outlets.len(), 2);
+        // Unprefixed external tool: advisory kind Action, and the definition
+        // carries the VERBATIM wire name (not stripped or rewritten).
+        assert_eq!(
+            outlets[0].advisory_kind,
+            crate::translator::OutletKind::Action
+        );
+        assert_eq!(outlets[0].definition.name, "get_weather");
+        // Prefixed foreign tool: advisory kind Query, but the verbatim wire name
+        // RETAINS the prefix so invoke_outlet can send it back unchanged.
+        assert_eq!(
+            outlets[1].advisory_kind,
+            crate::translator::OutletKind::Query
+        );
+        assert_eq!(outlets[1].definition.name, "query.lookup_users");
+    }
+
+    #[test]
+    fn invoke_outlet_sends_external_tool_name_verbatim() {
+        // Regression for the MED finding: an unprefixed external tool name must
+        // NOT be re-prefixed with `call.` / `query.`. Re-prefixing would send
+        // `call.get_weather` to a foreign MCP server that owns its own naming,
+        // producing a tool-not-found error. SCP-as-MCP-client sends verbatim.
+        let call_response = {
+            let result = ToolsCallResult {
+                content: vec![ContentItem::Text {
+                    text: "ok".to_owned(),
+                }],
+                is_error: false,
+            };
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::to_value(&result).unwrap())
+        };
+
+        let client = initialized_client(vec![call_response]);
+        client
+            .invoke_outlet(
+                "get_weather",
+                serde_json::json!({"city": "SF"}),
+                "ctx-1",
+                "did:dht:z6MkAlice",
+            )
+            .unwrap();
+
+        let requests = client.transport.sent_requests();
+        // [0] initialize, [1] tools/call.
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method, "tools/call");
+        let params = requests[1].params.as_ref().unwrap();
+        assert_eq!(
+            params["name"], "get_weather",
+            "external tool name must be sent verbatim, never re-prefixed"
+        );
     }
 
     // -----------------------------------------------------------------------

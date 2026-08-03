@@ -361,7 +361,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, _context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
+    fn context_tools(&self, _context_id: &str) -> Vec<scp_mcp::server::ContextOutletInfo> {
         Vec::new()
     }
 
@@ -377,7 +377,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         Err("capability validation not implemented — wire a production ContextProvider".to_owned())
     }
 
-    fn invoke_tool(
+    fn invoke_outlet(
         &self,
         _context_id: &str,
         _outlet_name: &str,
