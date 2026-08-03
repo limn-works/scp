@@ -51,7 +51,7 @@ pub use commands::{
     StandingCommand, TrustRecoveryCommand, TtlCloseCommand,
 };
 pub use deps::ActorDeps;
-pub use handle::{ContextActorHandle, SEND_TIMEOUT};
+pub use handle::{ContextActorHandle, REPLY_TIMEOUT, SEND_TIMEOUT};
 pub use outcome::Outcome;
 pub use sequence::{SendSequenceTracker, SequenceReservation};
 pub use state::{

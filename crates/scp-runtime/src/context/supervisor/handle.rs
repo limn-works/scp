@@ -628,10 +628,21 @@ impl SupervisorHandle {
         }
         // The actor dropped the reply sender mid-flight (it exited
         // without answering) → treat as a stale handle; otherwise return
-        // the handler's verdict.
-        reply_rx
-            .await
-            .unwrap_or_else(|_| Err(ContextError::ContextNotRegistered(context_id.to_owned())))
+        // the handler's verdict. The reply-await is bounded by
+        // [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT): a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender), so without the bound this replace path
+        // would hang the caller forever. On elapse, fail-closed with a
+        // retryable `ActorBusy` — the actor keeps running; we only drop our
+        // own receiver.
+        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
+            Ok(reply) => reply
+                .unwrap_or_else(|_| Err(ContextError::ContextNotRegistered(context_id.to_owned()))),
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "context actor did not reply within {} seconds",
+                crate::context::actor::REPLY_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Despawn the actor registered for `context_id`, removing the
@@ -820,13 +831,32 @@ impl SupervisorHandle {
             return;
         }
         // Await the install reply so the timer is registered before the
-        // bootstrap path returns control to the caller.
-        if let Ok(Err(e)) = reply_rx.await {
-            tracing::warn!(
-                context_id,
-                error = %e,
-                "dispatch_start_ttl_timer: actor reported TTL timer install failure"
-            );
+        // bootstrap path returns control to the caller. Bounded by
+        // [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT): a
+        // wedged/deadlocked actor never terminates (so the watchdog never
+        // drops the reply sender), and arming the TTL deadline is a
+        // best-effort background facility — it must never pin the bootstrap
+        // caller forever. On elapse (as on an install failure) we log and
+        // move on; the actor's own `reconcile_timers` re-arms from the
+        // recorded deadline regardless.
+        match tokio::time::timeout(crate::context::actor::REPLY_TIMEOUT, reply_rx).await {
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "dispatch_start_ttl_timer: actor reported TTL timer install failure"
+                );
+            }
+            // Recv-ok + handler-ok, or the actor dropped the reply channel:
+            // nothing to do (matches the prior best-effort behavior).
+            Ok(_) => {}
+            Err(_elapsed) => {
+                tracing::warn!(
+                    context_id,
+                    "dispatch_start_ttl_timer: actor did not confirm TTL timer install \
+                     within the reply budget — timer install unconfirmed"
+                );
+            }
         }
     }
 
