@@ -3672,14 +3672,23 @@ async fn resolve_napi_signing_key(
 ///   retained active signing key (byte-identical to [`resolve_napi_signing_key`],
 ///   so the default send path is unchanged).
 /// - [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) → the sender
-///   identity's agent signing key (from the identity registry), exported via the
-///   handle's retained custody. **Fail-closed** with `SCP-IDENT-1023` if the
-///   identity has no agent key — NEVER falls back to `#active`.
+///   identity's agent signing key, resolved together with the sender identity's
+///   OWN retained custody from the SAME identity-registry entry. **Fail-closed**
+///   with `SCP-IDENT-1023` if the identity has no agent key — NEVER falls back
+///   to `#active`.
 ///
-/// The `#agent` key handle comes from the identity registry (the handle only
-/// caches the active key), while the custody comes from the handle so
-/// callback/keychain-backed identities are supported and the active path is
-/// untouched.
+/// Both the `#agent` key handle and the custody it is exported through come from
+/// the same registry entry (mirroring the `PyO3` reference `resolve_message_signer`,
+/// which reads `entry.custody` + `entry.identity.agent_signing_key` from one
+/// lookup). Sourcing the custody from the sender identity — not the context
+/// handle — guarantees the exported key belongs to the identity that stamps the
+/// `#agent` persona; the two could differ, and the handle's custody could export
+/// the wrong identity's key (fail-closed at the receiver, but a latent
+/// correctness bug that bites when RFC #2242 activates the agent path). The
+/// `#active` arm still resolves through the handle's retained active key, so the
+/// default send path is untouched; a failure there is remapped to a
+/// send-specific `SCP-CRYPTO-4001` rather than propagating the governance-worded
+/// `SCP-CTX-2040` from [`resolve_napi_signing_key`].
 async fn resolve_napi_message_signer(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -3687,27 +3696,32 @@ async fn resolve_napi_message_signer(
     persona: scp_did::SigningKeyId,
 ) -> napi::Result<scp_ffi_common::persona::ResolvedMessageSigner> {
     let key = match persona {
-        scp_did::SigningKeyId::Active => resolve_napi_signing_key(handle).await?,
+        scp_did::SigningKeyId::Active => resolve_napi_signing_key(handle).await.map_err(|_| {
+            NapiError::from(ScpNapiError::Crypto {
+                message: "signing key required for send: could not resolve the sender's \
+                              #active signing key from retained custody"
+                    .to_owned(),
+                code: codes::CRYPTO_4001.to_owned(),
+            })
+        })?,
         scp_did::SigningKeyId::Agent => {
-            let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-                NapiError::from(ScpNapiError::Context {
-                    message: "no custody provider on context handle — sending under #agent \
-                              requires an identity created with custody"
-                        .to_owned(),
-                    code: codes::CTX_2040.to_owned(),
-                })
-            })?;
-            let agent_handle = crate::runtime::with_identity(bi, sender_did, |entry| {
-                entry
-                    .identity
-                    .agent_signing_key
-                    .ok_or_else(|| ScpNapiError::Identity {
-                        message: format!(
-                            "identity '{sender_did}' has no agent signing key — cannot send \
-                             under #agent; add one with identityAddAgentKey first"
-                        ),
-                        code: codes::IDENT_1023.to_owned(),
-                    })
+            // Resolve the agent key handle AND the sender identity's own custody
+            // from the SAME registry entry. Clone the custody `Arc` and copy the
+            // `KeyHandle` OUT of the `with_identity` closure before the async
+            // export so no DashMap shard guard is held across the await (#1940).
+            let (custody, agent_handle) = crate::runtime::with_identity(bi, sender_did, |entry| {
+                let handle =
+                    entry
+                        .identity
+                        .agent_signing_key
+                        .ok_or_else(|| ScpNapiError::Identity {
+                            message: format!(
+                                "identity '{sender_did}' has no agent signing key — cannot \
+                                 send under #agent; add one with identityAddAgentKey first"
+                            ),
+                            code: codes::IDENT_1023.to_owned(),
+                        })?;
+                Ok((entry.custody.clone(), handle))
             })
             .map_err(NapiError::from)?;
             custody
@@ -5589,6 +5603,178 @@ mod tests {
             },
         );
         did
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-039 Enforcement-Stack Layer 2 — message-send persona-source seam.
+    //
+    // Mirrors the PyO3 reference persona resolver tests
+    // (`resolve_message_signer_binds_stamp_and_key_atomically` +
+    // `..._fails_closed`) against the NAPI bridge, whose custody sourcing is
+    // materially different (context-handle custody for `#active`; SAME
+    // identity-registry entry for `#agent`). These exercise the REAL
+    // `resolve_napi_message_signer`, which binds the VM stamp and the key handle
+    // from ONE persona (fail-closed on `#agent` with no agent key).
+    // -----------------------------------------------------------------------
+
+    /// Registers a fresh in-memory identity (optionally carrying an `#agent`
+    /// signing key) and returns `(did, active_key, agent_key, handle)` with the
+    /// two keys exported for byte-comparison and a context handle carrying the
+    /// identity's custody + active key so the `#active` resolution path works.
+    #[cfg(feature = "testing")]
+    async fn register_persona_test_identity(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        with_agent_key: bool,
+    ) -> (
+        String,
+        ed25519_dalek::SigningKey,
+        Option<ed25519_dalek::SigningKey>,
+        super::NapiContextHandle,
+    ) {
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use scp_identity::{DidDht, DidMethod};
+        use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
+
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
+        let dht = DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
+        let (identity, document, pre_rotation_handle) = if with_agent_key {
+            dht.create_with_agent_key(custody.as_ref(), pre_rotation_custody.as_ref())
+                .await
+                .expect("agent-keyed in-memory identity creation succeeds")
+        } else {
+            DidMethod::create(&dht, custody.as_ref(), pre_rotation_custody.as_ref())
+                .await
+                .expect("in-memory identity creation succeeds")
+        };
+        let did = identity.did.clone();
+        // `KeyHandle` is `Copy` — read the handles before moving `identity`.
+        let active_handle = identity.active_signing_key;
+        let active_key = custody
+            .export_ed25519_signing_key(&active_handle)
+            .await
+            .expect("export active key");
+        let agent_key = match identity.agent_signing_key {
+            Some(h) => Some(
+                custody
+                    .export_ed25519_signing_key(&h)
+                    .await
+                    .expect("export agent key"),
+            ),
+            None => None,
+        };
+        crate::runtime::register_identity(
+            bi,
+            &did,
+            crate::runtime::NapiIdentityEntry {
+                identity,
+                custody: Arc::clone(&custody),
+                document,
+                identity_link_attestations: Vec::new(),
+                pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
+        let handle = super::NapiContextHandle {
+            context_id: format!("persona-test-{}", uuid::Uuid::new_v4()),
+            state: std::sync::Mutex::new(super::ContextState::Active),
+            creator_did: did.clone(),
+            mode: "Encrypted".to_owned(),
+            ceiling: vec![],
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            in_memory_custody: Some(Arc::clone(&custody)),
+            signing_key: Some(active_handle),
+            core_handle: None,
+            subscription_cancel: std::sync::Mutex::new(super::CancellationToken::new()),
+            subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bi: Arc::clone(bi),
+            instance_id: bi.instance_id(),
+        };
+        (did, active_key, agent_key, handle)
+    }
+
+    /// `resolve_napi_message_signer` binds the `#agent` VM stamp to the
+    /// identity's AGENT key (never the active key), and `#active` to the active
+    /// key — atomically. This is the property that makes an `#agent`-stamped-
+    /// but-`#active`-signed message unrepresentable at the FFI send boundary.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_message_signer_binds_stamp_and_key_atomically() {
+        use scp_core::context::supervisor::MessageSigner;
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let (did, active_key, agent_key, handle) = register_persona_test_identity(&bi, true).await;
+        let agent_key = agent_key.expect("agent-keyed identity has an agent key");
+        assert_ne!(
+            active_key.to_bytes(),
+            agent_key.to_bytes(),
+            "test identity must have distinct active and agent keys"
+        );
+
+        // #agent persona → agent key + #agent stamp.
+        let signer =
+            super::resolve_napi_message_signer(&bi, &handle, &did, scp_did::SigningKeyId::Agent)
+                .await
+                .unwrap();
+        assert_eq!(signer.persona(), scp_did::SigningKeyId::Agent);
+        assert!(matches!(signer.message_signer(), MessageSigner::Agent(_)));
+        assert_eq!(
+            signer.message_signer().signing_key_id(),
+            scp_did::SigningKeyId::Agent
+        );
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            agent_key.to_bytes(),
+            "#agent persona MUST resolve the agent key, never the active key"
+        );
+
+        // #active persona → active key + #active stamp (default path unchanged).
+        let signer =
+            super::resolve_napi_message_signer(&bi, &handle, &did, scp_did::SigningKeyId::Active)
+                .await
+                .unwrap();
+        assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
+        assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            active_key.to_bytes()
+        );
+    }
+
+    /// Fail-closed: `#agent` requested for an identity with NO agent key returns
+    /// a typed error (SCP-IDENT-1023) and NEVER falls back to the active key.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_message_signer_agent_without_agent_key_fails_closed() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let (did, active_key, agent_key, handle) = register_persona_test_identity(&bi, false).await;
+        assert!(agent_key.is_none(), "active-only identity has no agent key");
+
+        let err =
+            super::resolve_napi_message_signer(&bi, &handle, &did, scp_did::SigningKeyId::Agent)
+                .await
+                .expect_err("#agent send without an agent key must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1023),
+            "expected fail-closed no-agent-key code SCP-IDENT-1023, got: {msg}"
+        );
+
+        // The active path still resolves — the failure is specific to #agent,
+        // not a broken identity.
+        let signer =
+            super::resolve_napi_message_signer(&bi, &handle, &did, scp_did::SigningKeyId::Active)
+                .await
+                .unwrap();
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            active_key.to_bytes()
+        );
     }
 
     /// ADR-049 Phase 2J: `reserve_key_package` enforces local custody of the

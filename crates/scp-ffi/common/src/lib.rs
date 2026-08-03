@@ -172,7 +172,11 @@ pub mod export_verify;
 // The `PersonaSource` callable + `ResolvedMessageSigner` atomic (key, persona)
 // pair, injected per bridge instance and consulted at each native bridge's
 // send site. Requires scp-core (MessageSigner) + ed25519-dalek (behind
-// `resolvers`). WASM has no send/signing path and does not use it.
+// `resolvers`). There is no `scp-ffi` WASM bridge (`crates/scp-ffi/wasm` does
+// not exist); the separate browser WASM client (`scp-client` / `scp-client-wasm`)
+// provisions no agent key and does not route sends through scp-core's
+// `MessageSigner`/`CoreFields`, so this seam is inapplicable there until
+// `scp-client` gains agent-key custody (a real gap to revisit under RFC #2242).
 #[cfg(feature = "resolvers")]
 pub mod persona;
 

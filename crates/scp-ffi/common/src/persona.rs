@@ -6,7 +6,12 @@
 //! boundary — every native bridge's message-send site pinned
 //! `MessageSigner::Active`. This module supplies the shared pieces that
 //! de-hardcode it, identically across the three native bridges (`PyO3`, NAPI,
-//! `UniFFI`). WASM has no send/signing path, so it does not use this module.
+//! `UniFFI`). There is no `scp-ffi` WASM bridge (`crates/scp-ffi/wasm` does not
+//! exist); the separate browser WASM client (`scp-client` / `scp-client-wasm`)
+//! provisions no agent key and does not route sends through scp-core's
+//! [`MessageSigner`] / `CoreFields`, so this persona seam is inapplicable there
+//! until `scp-client` gains agent-key custody — a real gap to revisit under RFC
+//! #2242 at that point, not an intrinsic absence.
 //!
 //! Two pieces:
 //! 1. [`PersonaSource`] — a per-send callable returning the [`SigningKeyId`]
@@ -111,15 +116,6 @@ impl ResolvedMessageSigner {
     pub const fn persona(&self) -> SigningKeyId {
         self.persona
     }
-
-    /// The resolved signing key, regardless of persona. Exposed for the NAPI
-    /// bridge, which decomposes the signer into `(bytes, signing_key_id)` across
-    /// the actor mailbox — both fields taken from the same
-    /// [`Self::message_signer`] so they cannot diverge.
-    #[must_use]
-    pub const fn key(&self) -> &ed25519_dalek::SigningKey {
-        &self.key
-    }
 }
 
 #[cfg(test)]
@@ -153,14 +149,15 @@ mod tests {
     #[test]
     fn message_signer_and_key_share_one_key() {
         // The NAPI decomposition path takes `.key()` and `.signing_key_id()`
-        // from the same signer; assert they reference the same key bytes.
+        // from the same `message_signer()`; assert repeated derivations of it
+        // reference the same key bytes.
         let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let resolved = ResolvedMessageSigner::new(key.clone(), SigningKeyId::Agent);
         let signer = resolved.message_signer();
         assert_eq!(
             signer.key().to_bytes(),
-            resolved.key().to_bytes(),
-            "message_signer() and key() must expose the same key"
+            resolved.message_signer().key().to_bytes(),
+            "repeated message_signer() derivations must expose the same key"
         );
         assert_eq!(signer.key().to_bytes(), key.to_bytes());
     }

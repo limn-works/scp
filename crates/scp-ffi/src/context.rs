@@ -8614,7 +8614,7 @@ class SignOnlyCustody:
             scp_did::SigningKeyId::Agent
         );
         assert_eq!(
-            signer.key().to_bytes(),
+            signer.message_signer().key().to_bytes(),
             agent_key.to_bytes(),
             "#agent persona MUST resolve the agent key, never the active key"
         );
@@ -8623,7 +8623,10 @@ class SignOnlyCustody:
         let signer = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Active).unwrap();
         assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
         assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
-        assert_eq!(signer.key().to_bytes(), active_key.to_bytes());
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            active_key.to_bytes()
+        );
     }
 
     /// Fail-closed: `#agent` requested for an identity with NO agent key returns
@@ -8646,6 +8649,9 @@ class SignOnlyCustody:
         // The active path still resolves — the failure is specific to #agent,
         // not a broken identity.
         let signer = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Active).unwrap();
-        assert_eq!(signer.key().to_bytes(), active_key.to_bytes());
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            active_key.to_bytes()
+        );
     }
 }
