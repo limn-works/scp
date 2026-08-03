@@ -1312,6 +1312,18 @@ mod tests {
     /// Fix 3: the DELETE gate is rate-limited (per-IP, shared with PUBLISH) BEFORE
     /// the CPU-amplifiable storage-backed classify, so an unauthenticated DELETE
     /// flood cannot be used for CPU amplification.
+    ///
+    /// The target is a **genuine, binding-valid, signed** DID-record frame that IS
+    /// present in storage — so the gate's expensive path (`storage.get` →
+    /// `classify_stored_frame`, an Ed25519 verify) is fully reachable and, when the
+    /// limiter permits, actually runs (each within-budget DELETE returns
+    /// `DID_RECORD_REJECTED`, proving the classify fired). The over-budget DELETE of
+    /// the SAME protected blob must return `RATE_LIMITED`, NOT `DID_RECORD_REJECTED`:
+    /// the only way the code emits `RATE_LIMITED` is the limiter short-circuiting
+    /// **before** the classify. Getting `DID_RECORD_REJECTED` on the over-budget call
+    /// would prove the classify ran first — exactly the CPU-amplification bug this
+    /// ordering defends against. Same blob, two different codes selected purely by
+    /// remaining budget: that is the short-circuit, proven.
     #[tokio::test]
     async fn delete_gate_is_rate_limited() {
         let storage = BlobStorageBackend::in_memory();
@@ -1319,18 +1331,36 @@ mod tests {
         let limiter = PublishRateLimiter::new(2); // budget of 2
         let ip = IpAddr::from([127, 0, 0, 2]);
 
-        // Two deletes within budget proceed (blob absent → not protected).
+        // A genuine seq-5 DID record deposited straight into storage: `storage.get`
+        // returns `Some` and the blob classifies as a protected slot, so the gate
+        // WOULD reach + run the Ed25519-verifying classify absent the rate limit.
+        let (rid, bid, frame) = genuine_frame(74, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+
+        // Within budget, the classify runs and refuses the protected blob — proving
+        // the expensive path is live (not short-circuited) while budget remains.
         for _ in 0..2 {
-            assert!(matches!(
-                reg.gate_delete(&storage, &[0x01; 32], &limiter, ip).await,
-                DidDeleteGate::Proceed
-            ));
+            assert!(
+                matches!(
+                    reg.gate_delete(&storage, &bid, &limiter, ip).await,
+                    DidDeleteGate::Rejected { code: c, .. } if c == code::DID_RECORD_REJECTED
+                ),
+                "within-budget DELETE of a protected slot must run the classify and \
+                 reject it as DID_RECORD_REJECTED",
+            );
         }
-        // The third is rate-limited.
-        assert!(matches!(
-            reg.gate_delete(&storage, &[0x01; 32], &limiter, ip).await,
-            DidDeleteGate::Rejected { code: c, .. } if c == code::RATE_LIMITED
-        ));
+
+        // Over budget, the SAME protected blob yields RATE_LIMITED — the limiter
+        // short-circuited BEFORE the classify. DID_RECORD_REJECTED here would mean
+        // the classify ran first (the CPU-amplification bug).
+        assert!(
+            matches!(
+                reg.gate_delete(&storage, &bid, &limiter, ip).await,
+                DidDeleteGate::Rejected { code: c, .. } if c == code::RATE_LIMITED
+            ),
+            "over-budget DELETE must short-circuit to RATE_LIMITED before the \
+             CPU-amplifiable classify, not fall through to DID_RECORD_REJECTED",
+        );
     }
 
     /// Fix 4: the DELETE gate fails CLOSED on a storage error — a transient
@@ -1434,6 +1464,16 @@ mod tests {
 
         // Truncating query (limit 1 < 2 co-located): returns the in-window best
         // (older seq-3), but MUST NOT warm the index.
+        //
+        // Assumption pinned: this asserts the WINDOW contains only the older frame,
+        // which relies on the `BlobStorage::query` contract (storage.rs, trait doc:
+        // "Results are ordered oldest-first (ascending stored_at timestamp)") plus
+        // `limit`-truncation keeping the earliest — so with stored_at(bid3)=1000 <
+        // stored_at(bid9)=2000, `limit=1` yields exactly [bid3]. If a backend's
+        // query returned newest-first (or truncated differently), the window would
+        // hold bid9 and this exact-blob assertion would need revisiting; the
+        // no-warm invariant below (index stays cold on ANY partial scan) would still
+        // hold regardless of which in-window frame is returned.
         let out = reg
             .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 1)
             .await

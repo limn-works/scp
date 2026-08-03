@@ -1708,6 +1708,102 @@ mod tests {
         handle.shutdown();
     }
 
+    /// Fix B / cold-index (UDP): the storage-backed DELETE gate protects a genuine
+    /// DID record even when the listener's slot index is COLD (fresh registry over a
+    /// durable store that already holds the record — a restart / store-sharing
+    /// peer). The genuine frame is pre-seeded straight into the shared store
+    /// (bypassing PUBLISH) so the index never learns of it; an attacker DELETE of the
+    /// guessable `blob_id` must be rejected by the storage-backed gate and the record
+    /// must survive. Mirrors `delete_of_cold_index_did_slot_blob_rejected` (WS) and
+    /// `quic_delete_of_cold_index_did_slot_blob_rejected` (QUIC).
+    #[tokio::test]
+    async fn udp_delete_of_cold_index_did_slot_blob_rejected() {
+        let (handle, addr, storage) = start_test_listener().await;
+
+        // Deposit a genuine frame straight into the shared store (no PUBLISH), so the
+        // listener's slot index stays cold.
+        let (rid, bid, frame) = genuine_frame(43, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+
+        let client = create_dtls_client(addr).await;
+
+        // Attacker DELETEs the guessable slot blob_id.
+        let deleted = send_and_recv(
+            &client,
+            &ClientMessage::Delete {
+                ref_id: Some("d".into()),
+                blob_id: bid,
+            },
+        )
+        .await;
+        match deleted {
+            RelayMessage::Err { code: c, .. } => assert_eq!(c, code::DID_RECORD_REJECTED),
+            other => panic!(
+                "cold-index DELETE of a genuine DID record must be rejected by the \
+                 storage-backed gate, got {other:?}"
+            ),
+        }
+
+        // The genuine record survives in the durable store.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+
+        handle.shutdown();
+    }
+
+    /// Fix 1 / cold-index (UDP): the storage-authoritative QUERY gate returns ONLY
+    /// the genuine record even when the index is COLD and junk is co-located in the
+    /// durable store (restart / store-sharing peer). The genuine frame + junk are
+    /// pre-seeded straight into the shared store (bypassing PUBLISH) so the index
+    /// stays cold; a QUERY over UDP must return exactly one Blob (the genuine record)
+    /// followed by `query_complete`, never leaking the co-located junk. Mirrors
+    /// `query_of_cold_index_did_slot_returns_only_genuine_record` (WS). UDP has no
+    /// SUBSCRIBE, so this polls via QUERY.
+    #[tokio::test]
+    async fn udp_query_of_cold_index_did_slot_returns_only_genuine_record() {
+        let (handle, addr, storage) = start_test_listener().await;
+
+        // Pre-seed a genuine frame + co-located junk straight into the durable store
+        // (bypassing PUBLISH), so the listener's index stays cold.
+        let (rid, bid, frame) = genuine_frame(44, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+        storage
+            .store(rid, [0x01; 32], None, 3600, vec![0x80u8; 32])
+            .await
+            .unwrap();
+        storage
+            .store(rid, [0x02; 32], None, 3600, vec![0x81u8; 48])
+            .await
+            .unwrap();
+        assert_eq!(storage.query(&rid, None, 100).await.unwrap().len(), 3);
+
+        let client = create_dtls_client(addr).await;
+
+        // QUERY over UDP: expect exactly one Blob (the genuine record) + complete.
+        let query = ClientMessage::Query {
+            ref_id: Some("q".into()),
+            routing_id: rid,
+            since: None,
+            limit: Some(100),
+        };
+        let data = rmp_serde::to_vec_named(&query).unwrap();
+        client.send(data).await.unwrap();
+
+        let blob_response = recv_msg(&client).await;
+        match &blob_response {
+            RelayMessage::Blob { blob_id, .. } => assert_eq!(blob_id, &bid),
+            other => panic!("cold-index QUERY must return only the genuine record, got {other:?}"),
+        }
+        let complete = recv_msg(&client).await;
+        assert!(
+            matches!(&complete, RelayMessage::Event { event_type, .. } if event_type == "query_complete"),
+            "expected query_complete after the single genuine Blob, got {complete:?}",
+        );
+
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn delete_returns_ok() {
         let (handle, addr, _storage) = start_test_listener().await;

@@ -933,7 +933,17 @@ mod tests {
 
     /// Helper: creates a session handler with default config and in-memory storage.
     fn make_handler() -> WebTransportSessionHandler<InMemoryBlobStorage> {
-        let storage = Arc::new(InMemoryBlobStorage::new());
+        make_handler_with_storage(Arc::new(InMemoryBlobStorage::new()))
+    }
+
+    /// Helper: creates a session handler with default config over a caller-provided
+    /// (possibly pre-seeded) blob store. The handler's `DidSlotRegistry` is fresh /
+    /// **cold**, so pre-seeding the shared store directly models a durable backend
+    /// that already holds records the (restarted) relay's index knows nothing about
+    /// — the cold-index scenario the storage-authoritative gates defend.
+    fn make_handler_with_storage(
+        storage: Arc<InMemoryBlobStorage>,
+    ) -> WebTransportSessionHandler<InMemoryBlobStorage> {
         let subscriptions = crate::relay::subscription::new_registry();
         let token = CancellationToken::new();
         let rate_limiter = PublishRateLimiter::new(100);
@@ -1115,6 +1125,94 @@ mod tests {
             ok,
             DispatchResult::Single(RelayMessage::Ok { .. })
         ));
+    }
+
+    /// Fix B / cold-index (WebTransport): the storage-backed DELETE gate protects a
+    /// genuine DID record even when the session's slot index is COLD (fresh registry
+    /// over a durable store that already holds the record — a restart / store-sharing
+    /// peer). The genuine frame is pre-seeded straight into the shared store
+    /// (bypassing PUBLISH, so the index never learns of it); an attacker DELETE of the
+    /// guessable `blob_id` — driven via `dispatch_message_multi` on the real handler —
+    /// must be rejected and the record must survive. Mirrors
+    /// `delete_of_cold_index_did_slot_blob_rejected` (WS) and
+    /// `quic_delete_of_cold_index_did_slot_blob_rejected` (QUIC).
+    #[tokio::test]
+    async fn webtransport_delete_of_cold_index_did_slot_blob_rejected() {
+        let storage = Arc::new(InMemoryBlobStorage::new());
+
+        // Deposit a genuine frame straight into the shared store (no PUBLISH), so the
+        // handler's slot index stays cold.
+        let (rid, bid, frame) = genuine_frame(62, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+
+        let mut h = make_handler_with_storage(Arc::clone(&storage));
+
+        // Attacker DELETEs the guessable slot blob_id.
+        let deleted = h
+            .dispatch_message_multi(&ClientMessage::Delete {
+                ref_id: None,
+                blob_id: bid,
+            })
+            .await
+            .unwrap();
+        match deleted {
+            DispatchResult::Single(RelayMessage::Err { code: c, .. }) => {
+                assert_eq!(c, code::DID_RECORD_REJECTED);
+            }
+            other => panic!(
+                "cold-index DELETE of a genuine DID record must be rejected by the \
+                 storage-backed gate, got {other:?}"
+            ),
+        }
+
+        // The genuine record survives in the durable store.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+    }
+
+    /// Fix 1 / cold-index (WebTransport): the storage-authoritative QUERY gate returns
+    /// ONLY the genuine record even when the index is COLD and junk is co-located in
+    /// the durable store (restart / store-sharing peer). The genuine frame + junk are
+    /// pre-seeded straight into the shared store (bypassing PUBLISH) so the index
+    /// stays cold; a QUERY driven via `dispatch_message_multi` must return exactly the
+    /// genuine record, never leaking the co-located junk. Mirrors
+    /// `query_of_cold_index_did_slot_returns_only_genuine_record` (WS).
+    #[tokio::test]
+    async fn webtransport_query_of_cold_index_did_slot_returns_only_genuine_record() {
+        let storage = Arc::new(InMemoryBlobStorage::new());
+
+        // Pre-seed a genuine frame + co-located junk straight into the durable store
+        // (bypassing PUBLISH), so the handler's index stays cold.
+        let (rid, bid, frame) = genuine_frame(63, 5, b"did-doc");
+        storage.store(rid, bid, None, 3600, frame).await.unwrap();
+        storage
+            .store(rid, [0x01; 32], None, 3600, vec![0x80u8; 32])
+            .await
+            .unwrap();
+        storage
+            .store(rid, [0x02; 32], None, 3600, vec![0x81u8; 48])
+            .await
+            .unwrap();
+        assert_eq!(storage.query(&rid, None, 100).await.unwrap().len(), 3);
+
+        let mut h = make_handler_with_storage(Arc::clone(&storage));
+
+        // QUERY returns ONLY the genuine record (rule c), not the co-located junk.
+        let q = h
+            .dispatch_message_multi(&ClientMessage::Query {
+                ref_id: None,
+                routing_id: rid,
+                since: None,
+                limit: Some(100),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            slot_blob_ids(&q),
+            vec![bid],
+            "cold-index QUERY must return only the genuine record",
+        );
     }
 
     #[tokio::test]
