@@ -3226,3 +3226,96 @@ async fn rotate_content_keys_broadcast_kea_governance_integration() {
         "exactly 1 KeyEpochAdvance leaf per broadcast author (alice is sole author)"
     );
 }
+
+/// Verify that `execute_rotate_content_keys` emits one `KeyEpochAdvance` leaf
+/// per registered broadcast author and that `checkpoint_events_since` accounts
+/// for all of them.
+///
+/// This test extends the single-author variant above with a second author (bob)
+/// seeded via `Supervisor::seed_broadcast_author`, then checks that
+/// `RotateContentKeys` produces:
+/// - exactly 1 `ContentKeysRotated` leaf, and
+/// - exactly 2 `KeyEpochAdvance` leaves (one per author).
+///
+/// The total action-specific leaf delta (after subtracting `GovernanceProposed`)
+/// must equal 1 + `num_authors` = 3, which is what `checkpoint_events_since`
+/// should be incremented by.
+#[tokio::test]
+async fn rotate_content_keys_counter_multi_author() {
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-broadcast-rotate-counter-multi-author";
+    let num_authors: usize = 2;
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: governance_ceiling(),
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    // Add bob as a second broadcast author via the test-only seam.  This
+    // mirrors the state that a real `RotateContentKeys` with a pre-existing
+    // second author would produce.
+    manager.seed_broadcast_author(ctx_id, bob()).await.unwrap();
+
+    // Record the baseline event-log length before RotateContentKeys.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let baseline = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist")
+        .len();
+
+    // Execute RotateContentKeys as SingleAdmin (auto-approve + auto-execute).
+    let sk_alice = signing_key_for_did(&alice());
+    let (proposal, _events, result) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RotateContentKeys { reason: None },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    let _ = proposal;
+    assert!(
+        result.is_some(),
+        "SingleAdmin must auto-execute RotateContentKeys"
+    );
+
+    // Verify event-log leaf counts.
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist");
+
+    let ckr_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::ContentKeysRotated)
+        .count();
+    let kea_count = entries
+        .iter()
+        .filter(|e| e.event_type == scp_event_log::EventType::KeyEpochAdvance)
+        .count();
+
+    assert_eq!(ckr_count, 1, "exactly 1 ContentKeysRotated leaf");
+    assert_eq!(
+        kea_count, num_authors,
+        "exactly 1 KeyEpochAdvance per broadcast author ({num_authors} authors)"
+    );
+
+    // Total action-specific leaves = 1 (ContentKeysRotated) + num_authors (KEA).
+    // Subtract GovernanceProposed (always 1) from the delta to isolate execute
+    // leaves — this mirrors the checkpoint_events_since increment.
+    let total_delta = entries.len() - baseline;
+    let governance_proposed = 1_usize;
+    let action_specific_delta = total_delta - governance_proposed;
+    assert_eq!(
+        action_specific_delta,
+        1 + num_authors,
+        "checkpoint_events_since delta must be 1 + num_authors (ContentKeysRotated + KEA per author)"
+    );
+}

@@ -1884,6 +1884,30 @@ pub enum BroadcastCommand {
         /// Oneshot reply channel. See [`BroadcastAdmissionReply`].
         reply: BroadcastAdmissionReply,
     },
+
+    /// Register a DID as a broadcast author on an existing broadcast context,
+    /// bypassing the normal governance round-trip.
+    ///
+    /// Single-node integration tests that need a multi-author broadcast context
+    /// cannot drive genuine governance (the bridge key-resolver only sees one
+    /// actor's custody). This command lets such tests populate the author
+    /// registry the same way a delivered `RotateContentKeys` governance action
+    /// would, so multi-author counter and KEA-leaf tests can exercise their
+    /// real fan-out instead of being limited to the creator-only case.
+    ///
+    /// Mirrors [`SeedPeerPseudonym`](Self::SeedPeerPseudonym) — same rationale,
+    /// same gating. Gated behind the `testing` feature — never compiled into
+    /// production builds, never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    SeedBroadcastAuthor {
+        /// Context identifier string.
+        context_id: String,
+        /// The DID to register as an additional broadcast author.
+        author_did: scp_did::DID,
+        /// Oneshot reply channel. Replies `Ok(())` once the author is
+        /// registered, or `Err` if the context is unknown or not broadcast.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 /// Reply-channel type alias for
