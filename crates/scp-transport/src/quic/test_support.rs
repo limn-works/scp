@@ -104,6 +104,7 @@ pub fn start_test_listener() -> (
         Arc::clone(&subscriptions),
         publish_rate_limiter,
         connection_tracker,
+        crate::native::did_slot::DidSlotRegistry::new(),
     );
     let (handle, addr) = listener.start(server_config).unwrap();
 

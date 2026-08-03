@@ -93,10 +93,21 @@ pub enum DidRecordClass {
 ///    `public_key` — only reached once the binding holds.
 ///
 /// Ordering the binding (a hash) ahead of the signature (an Ed25519 verify) is
-/// deliberate and load-bearing: a mis-addressed or non-frame blob never costs an
-/// Ed25519 verify, so flooding a DID `routing_id` with junk cannot force the
-/// relay into expensive per-blob signature work (the whole path also sits behind
-/// the per-IP PUBLISH rate limit, ADR-004).
+/// deliberate: a **mis-addressed** or non-frame blob never costs an Ed25519
+/// verify, so binding-first saves the signature work for junk that isn't even
+/// aimed at the victim's `routing_id`. It does **not** make flooding free — a
+/// *targeted* attacker who embeds the victim's real `public_key` and publishes
+/// at the victim's `routing_id` satisfies the binding and DOES incur one Ed25519
+/// verify per blob. Both cases are bounded by the per-IP PUBLISH rate limit
+/// (ADR-004), which is the actual cost ceiling; binding-first is a constant-
+/// factor saving on mis-addressed junk, not a flooding defense on its own.
+///
+/// Separately, the *first* binding-valid establish at a `routing_id` that was
+/// pre-seeded with a flood pays a one-time O(N) eviction scan over the co-located
+/// blobs (and, on a cold index, an O(N) classify scan to reconcile against
+/// storage). N is bounded — only pre-seed junk accumulates at a DID address, and
+/// the whole path sits behind the same per-IP rate limit — so the scan is cheap
+/// and one-time (see [`DidSlotRegistry`](crate::native::did_slot::DidSlotRegistry)).
 ///
 /// This function is pure: it neither reads nor writes storage and holds no
 /// state. The single-slot and slot-exclusivity decisions that consume a
@@ -134,6 +145,44 @@ pub fn classify_did_record_frame(routing_id: &[u8; 32], blob: &[u8]) -> DidRecor
     }
 
     DidRecordClass::Valid { seq: frame.seq() }
+}
+
+/// Maps a slot-publish failure to the relay wire error `(code, message)`.
+///
+/// Shared by every validating transport (WebSocket, QUIC, UDP/DTLS) — via
+/// [`SlotPublishError`](crate::native::did_slot::SlotPublishError) — so the
+/// PUBLISH-rejection code mapping never diverges across them:
+///
+/// - a non-superseding `seq` (or a genuine higher/equal frame adopted from
+///   storage instead) → [`DID_RECORD_REJECTED`](scp_relay_client::code::DID_RECORD_REJECTED);
+/// - a full backend → [`STORAGE_FULL`](scp_relay_client::code::STORAGE_FULL);
+/// - any other backend failure → [`INTERNAL_ERROR`](scp_relay_client::code::INTERNAL_ERROR)
+///   (an internal storage fault is not "storage full").
+#[must_use]
+pub fn slot_publish_error_response(
+    err: &crate::native::did_slot::SlotPublishError,
+) -> (u16, String) {
+    use crate::native::did_slot::SlotPublishError;
+    use crate::native::storage::StorageError;
+    use scp_relay_client::code;
+
+    match err {
+        SlotPublishError::NonSuperseding {
+            stored_seq,
+            got_seq,
+        } => (
+            code::DID_RECORD_REJECTED,
+            format!(
+                "DID-record seq {got_seq} does not supersede the stored slot (seq {stored_seq})"
+            ),
+        ),
+        SlotPublishError::Storage(StorageError::StorageFull) => {
+            (code::STORAGE_FULL, err.to_string())
+        }
+        SlotPublishError::Storage(StorageError::Internal(_)) => {
+            (code::INTERNAL_ERROR, err.to_string())
+        }
+    }
 }
 
 #[cfg(test)]

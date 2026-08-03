@@ -47,7 +47,12 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::native::did_slot::DidSlotRegistry;
+use crate::native::server::DidRecordValidation;
 use crate::native::storage::BlobStorage;
+use crate::relay::did_record_validation::{
+    DidRecordClass, DidRecordRejection, classify_did_record_frame, slot_publish_error_response,
+};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -115,6 +120,21 @@ pub struct QuicListenerConfig {
     /// forwarding each stored blob to subscribers (BLACK-001 mitigation).
     /// Set to 0 to disable jitter (useful for tests).
     pub delivery_jitter_ms: u64,
+    /// Whether this QUIC listener validates public DID-record frames and enforces
+    /// the single slot-exclusive slot per DID-domain `routing_id` (§3.10.2,
+    /// ADR-004 "DID-Record Slot-Exclusivity"), exactly like the WebSocket relay.
+    ///
+    /// When a QUIC listener shares a validating relay's blob store and slot
+    /// registry, this MUST match the relay's
+    /// [`RelayConfig::did_record_validation`](crate::native::server::RelayConfig::did_record_validation)
+    /// so co-deployed transports enforce one consistent set of claimed slots —
+    /// otherwise a QUIC-reaching attacker could co-locate junk with the genuine
+    /// slot in the shared store. Defaults to
+    /// [`DidRecordValidation::Enabled`](crate::native::server::DidRecordValidation::Enabled),
+    /// the canonical SCP-native behavior; set `Disabled` to store DID frames
+    /// opaquely like a foreign transport. Never a trust dependency (the client
+    /// always re-verifies, RELAYRES-002).
+    pub did_record_validation: DidRecordValidation,
 }
 
 impl Default for QuicListenerConfig {
@@ -130,6 +150,10 @@ impl Default for QuicListenerConfig {
             rate_limit_publishes_per_second: DEFAULT_RATE_LIMIT_PUBLISHES_PER_SECOND,
             rate_limit_subscribes_per_minute: DEFAULT_RATE_LIMIT_SUBSCRIBES_PER_MINUTE,
             delivery_jitter_ms: DEFAULT_DELIVERY_JITTER_MS,
+            // Mirror RelayConfig's default: an SCP-native transport validates by
+            // default. The node wiring overrides this to match the co-deployed
+            // WebSocket relay's configured mode.
+            did_record_validation: DidRecordValidation::Enabled,
         }
     }
 }
@@ -197,15 +221,21 @@ pub struct QuicListener<S: BlobStorage> {
     subscriptions: SubscriptionRegistry,
     connection_tracker: ConnectionTracker,
     publish_rate_limiter: PublishRateLimiter,
+    did_slots: DidSlotRegistry,
 }
 
 impl<S: BlobStorage + 'static> QuicListener<S> {
     /// Creates a new QUIC listener with the given configuration and shared state.
     ///
-    /// The `storage`, `subscriptions`, `publish_rate_limiter`, and
-    /// `connection_tracker` are shared with the WebSocket relay server and
-    /// UDP/DTLS listener, enabling cross-transport message delivery and
-    /// unified rate limiting (ADR-037 AC3, spec §10.14.3).
+    /// The `storage`, `subscriptions`, `publish_rate_limiter`,
+    /// `connection_tracker`, and `did_slots` are shared with the WebSocket relay
+    /// server (and any UDP/DTLS listener), enabling cross-transport message
+    /// delivery, unified rate limiting, and — crucially — a **single shared
+    /// DID-record slot index** so slot-exclusivity holds across every transport
+    /// that reaches the same blob store, not just WebSocket (ADR-037 AC3, spec
+    /// §10.14.3, §3.10.2). Obtain the shared registry via
+    /// [`RelayServer::did_slot_registry`](crate::native::server::RelayServer::did_slot_registry)
+    /// and pass `config.did_record_validation` equal to the relay's mode.
     #[must_use]
     pub const fn new(
         config: QuicListenerConfig,
@@ -213,6 +243,7 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
         subscriptions: SubscriptionRegistry,
         publish_rate_limiter: PublishRateLimiter,
         connection_tracker: ConnectionTracker,
+        did_slots: DidSlotRegistry,
     ) -> Self {
         Self {
             config,
@@ -220,6 +251,7 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
             subscriptions,
             connection_tracker,
             publish_rate_limiter,
+            did_slots,
         }
     }
 
@@ -258,6 +290,7 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
         let config = self.config.clone();
         let conn_tracker = Arc::clone(&self.connection_tracker);
         let rate_limiter = self.publish_rate_limiter.clone();
+        let did_slots = self.did_slots.clone();
 
         tokio::spawn(async move {
             accept_loop(
@@ -268,6 +301,7 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
                 config,
                 conn_tracker,
                 rate_limiter,
+                did_slots,
             )
             .await;
         });
@@ -367,6 +401,7 @@ async fn accept_loop<S: BlobStorage + 'static>(
     config: QuicListenerConfig,
     conn_tracker: ConnectionTracker,
     rate_limiter: PublishRateLimiter,
+    did_slots: DidSlotRegistry,
 ) {
     loop {
         let incoming = tokio::select! {
@@ -430,6 +465,7 @@ async fn accept_loop<S: BlobStorage + 'static>(
         let config = config.clone();
         let conn_tracker = Arc::clone(&conn_tracker);
         let rate_limiter = rate_limiter.clone();
+        let did_slots = did_slots.clone();
 
         tokio::spawn(async move {
             match incoming.await {
@@ -442,6 +478,7 @@ async fn accept_loop<S: BlobStorage + 'static>(
                         subscriptions,
                         config,
                         rate_limiter,
+                        did_slots,
                     )
                     .await;
                 }
@@ -477,6 +514,7 @@ async fn handle_connection<S: BlobStorage + 'static>(
     subscriptions: SubscriptionRegistry,
     config: QuicListenerConfig,
     rate_limiter: PublishRateLimiter,
+    did_slots: DidSlotRegistry,
 ) {
     // Track this connection's subscriptions for cleanup on disconnect.
     let my_subscriptions: Arc<RwLock<HashSet<[u8; 32]>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -507,6 +545,7 @@ async fn handle_connection<S: BlobStorage + 'static>(
         let rate_limiter = rate_limiter.clone();
         let my_subs = Arc::clone(&my_subscriptions);
         let sub_rate_limiter = Arc::clone(&subscribe_rate_limiter);
+        let did_slots = did_slots.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_stream(
@@ -519,6 +558,7 @@ async fn handle_connection<S: BlobStorage + 'static>(
                 config,
                 rate_limiter,
                 sub_rate_limiter,
+                did_slots,
             )
             .await
             {
@@ -586,6 +626,7 @@ async fn handle_stream<S: BlobStorage + 'static>(
     config: QuicListenerConfig,
     rate_limiter: PublishRateLimiter,
     subscribe_rate_limiter: Arc<tokio::sync::Mutex<SubscribeRateLimiter>>,
+    did_slots: DidSlotRegistry,
 ) -> Result<(), StreamError> {
     // Read the initial client message from the stream.
     let client_msg = read_client_message(recv).await?;
@@ -610,6 +651,7 @@ async fn handle_stream<S: BlobStorage + 'static>(
                 &subscriptions,
                 &config,
                 &rate_limiter,
+                &did_slots,
             )
             .await
         }
@@ -629,6 +671,7 @@ async fn handle_stream<S: BlobStorage + 'static>(
                 &my_subscriptions,
                 &config,
                 &subscribe_rate_limiter,
+                &did_slots,
             )
             .await
         }
@@ -637,7 +680,12 @@ async fn handle_stream<S: BlobStorage + 'static>(
             routing_id,
             since,
             limit,
-        } => handle_query(send, ref_id, routing_id, since, limit, &storage, &config).await,
+        } => {
+            handle_query(
+                send, ref_id, routing_id, since, limit, &storage, &config, &did_slots,
+            )
+            .await
+        }
         ClientMessage::Delete { ref_id, blob_id } => {
             handle_delete(send, ref_id, blob_id, &storage).await
         }
@@ -752,20 +800,18 @@ async fn write_and_finish(mut send: SendStream, msg: &RelayMessage) -> Result<()
 
 /// Handles a PUBLISH operation on a QUIC stream.
 ///
-/// This QUIC listener is a **non-validating** SCP transport: it stores every
-/// blob opaquely and does NOT run the OPTIONAL DID-record frame validation /
-/// slot-exclusivity that the WebSocket native relay applies (§3.10.2, ADR-004
-/// "DID-Record Slot-Exclusivity", SCP-RELAYRES-003). This is spec-permitted —
-/// relay-side validation is optional and never a trust dependency, and the
-/// resolver re-verifies every record independently (RELAYRES-002). When this
-/// listener shares a blob store with a validating WebSocket relay, that relay's
-/// registry-gated QUERY still returns only the genuine slot; a DID resolver
-/// reaching a DID record over this non-validating transport gets best-effort
-/// (availability-only) suppression resistance and relies on client re-verify,
-/// the DHT, and multi-relay publishing (§3.10.8). Validating this transport too
-/// (sharing the WS relay's slot index via `RelayServer::did_slot_registry`) is a
-/// clean future extension, not a correctness gap here.
-#[allow(clippy::too_many_arguments)]
+/// When `config.did_record_validation` is
+/// [`Enabled`](crate::native::server::DidRecordValidation::Enabled) this runs the
+/// **same** OPTIONAL DID-record frame validation / slot-exclusivity the
+/// WebSocket native relay applies, over the **same shared** [`DidSlotRegistry`]
+/// (§3.10.2, ADR-004 "DID-Record Slot-Exclusivity", SCP-RELAYRES-003) — so a
+/// DID `routing_id`'s single slot is enforced identically whether a PUBLISH
+/// arrives over WebSocket or QUIC; an attacker cannot use QUIC to co-locate junk
+/// with the genuine slot in a shared store. When `Disabled` (a foreign /
+/// non-validating deployment) it stores every blob opaquely. Never a trust
+/// dependency either way: the resolver re-verifies every record independently
+/// (RELAYRES-002).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_publish<S: BlobStorage>(
     send: SendStream,
     ref_id: Option<String>,
@@ -778,6 +824,7 @@ async fn handle_publish<S: BlobStorage>(
     subscriptions: &SubscriptionRegistry,
     config: &QuicListenerConfig,
     rate_limiter: &PublishRateLimiter,
+    did_slots: &DidSlotRegistry,
 ) -> Result<(), StreamError> {
     // Check rate limit.
     if !rate_limiter.check(ip).await {
@@ -820,7 +867,80 @@ async fn handle_publish<S: BlobStorage>(
     // Compute blob_id = SHA-256(blob).
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
 
-    // Store the blob.
+    // OPTIONAL validating-relay DID-record path — mirrors the WebSocket relay
+    // EXACTLY over the shared slot registry (§3.10.2). Only engages for a blob
+    // that decodes as a `DidRecordV1` frame; an encrypted context blob is
+    // `NotAFrame` and falls straight through to opaque storage.
+    if config.did_record_validation == DidRecordValidation::Enabled {
+        match classify_did_record_frame(&routing_id, blob) {
+            DidRecordClass::Valid { seq } => {
+                match did_slots
+                    .publish_frame(
+                        storage.as_ref(),
+                        routing_id,
+                        blob_id,
+                        recipient_hint,
+                        blob_ttl,
+                        blob.to_vec(),
+                        seq,
+                    )
+                    .await
+                {
+                    Ok((stored, _outcome)) => {
+                        let _failed_deliveries = subscription::deliver_to_subscribers(
+                            &stored,
+                            subscriptions,
+                            config.delivery_jitter_ms,
+                        )
+                        .await;
+                        let ok = RelayMessage::Ok {
+                            ref_id,
+                            blob_id: Some(blob_id),
+                        };
+                        return write_and_finish(send, &ok).await;
+                    }
+                    Err(e) => {
+                        let (code, msg) = slot_publish_error_response(&e);
+                        let err = RelayMessage::Err { ref_id, code, msg };
+                        return write_and_finish(send, &err).await;
+                    }
+                }
+            }
+            DidRecordClass::Invalid(reason) => {
+                let detail = match reason {
+                    DidRecordRejection::BindingMismatch => {
+                        "DID→routing_id binding mismatch (frame published at the wrong routing_id)"
+                    }
+                    DidRecordRejection::SignatureInvalid => "BEP44 signature verification failed",
+                };
+                let err = RelayMessage::Err {
+                    ref_id,
+                    code: code::DID_RECORD_REJECTED,
+                    msg: format!("DID-record frame rejected: {detail}"),
+                };
+                return write_and_finish(send, &err).await;
+            }
+            DidRecordClass::NotAFrame => {
+                // Slot-exclusivity rule (a): a non-frame blob published at a
+                // claimed DID slot is rejected — it can never co-locate with (or
+                // shadow) the genuine record, even via QUIC.
+                if did_slots.is_claimed(storage.as_ref(), &routing_id).await {
+                    let err = RelayMessage::Err {
+                        ref_id,
+                        code: code::DID_RECORD_REJECTED,
+                        msg: "routing_id has a claimed DID-record slot; \
+                              non-superseding blobs are rejected (slot-exclusive)"
+                            .to_string(),
+                    };
+                    return write_and_finish(send, &err).await;
+                }
+                // Not a claimed DID slot — fall through to ordinary opaque storage.
+            }
+        }
+    }
+
+    // Store the blob (opaque path — non-DID blobs, or every blob when
+    // did_record_validation is Disabled).
     let stored = match storage
         .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
         .await
@@ -855,7 +975,7 @@ async fn handle_publish<S: BlobStorage>(
 /// The stream remains open for long-lived blob delivery. BLOBs are pushed
 /// to the subscriber via the stream until the stream is closed or the
 /// connection is dropped.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_subscribe<S: BlobStorage>(
     mut send: SendStream,
     ref_id: Option<String>,
@@ -867,6 +987,7 @@ async fn handle_subscribe<S: BlobStorage>(
     my_subscriptions: &Arc<RwLock<HashSet<[u8; 32]>>>,
     config: &QuicListenerConfig,
     subscribe_rate_limiter: &Arc<tokio::sync::Mutex<SubscribeRateLimiter>>,
+    did_slots: &DidSlotRegistry,
 ) -> Result<(), StreamError> {
     // Check subscribe rate limit.
     {
@@ -940,11 +1061,31 @@ async fn handle_subscribe<S: BlobStorage>(
 
     // Backfill if `since` is provided.
     if let Some(since_ts) = since {
-        let blobs = storage
-            .query(&routing_id, Some(since_ts), MAX_QUERY_LIMIT)
-            .await;
+        // Slot-exclusivity rule (c) applies to backfill too: a routing_id with a
+        // claimed DID slot backfills ONLY that single slot record, never any
+        // co-located opaque junk — the same gate QUERY uses over the shared
+        // registry. Unclaimed routing_ids (all encrypted context blobs) take the
+        // normal windowed backfill.
+        let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
+            did_slots.slot_blob(storage.as_ref(), &routing_id).await
+        } else {
+            None
+        };
 
-        if let Ok(blobs) = blobs {
+        if let Some(slot) = claimed_slot {
+            let blob_msg = RelayMessage::Blob {
+                routing_id: slot.routing_id,
+                blob_id: slot.blob_id,
+                recipient_hint: slot.recipient_hint,
+                blob_ttl: slot.blob_ttl,
+                stored_at: slot.stored_at,
+                blob: slot.blob,
+            };
+            write_relay_message(&mut send, &blob_msg).await?;
+        } else if let Ok(blobs) = storage
+            .query(&routing_id, Some(since_ts), MAX_QUERY_LIMIT)
+            .await
+        {
             for stored in blobs {
                 let blob_msg = RelayMessage::Blob {
                     routing_id: stored.routing_id,
@@ -1011,6 +1152,7 @@ async fn handle_unsubscribe(
 }
 
 /// Handles a QUERY operation on a QUIC stream.
+#[allow(clippy::too_many_arguments)]
 async fn handle_query<S: BlobStorage>(
     mut send: SendStream,
     ref_id: Option<String>,
@@ -1019,6 +1161,7 @@ async fn handle_query<S: BlobStorage>(
     limit: Option<u32>,
     storage: &Arc<S>,
     config: &QuicListenerConfig,
+    did_slots: &DidSlotRegistry,
 ) -> Result<(), StreamError> {
     let effective_limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
 
@@ -1035,16 +1178,30 @@ async fn handle_query<S: BlobStorage>(
         return write_and_finish(send, &err).await;
     }
 
-    let blobs = match storage.query(&routing_id, since, effective_limit).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, "QUIC: blob query failed");
-            let err = RelayMessage::Err {
-                ref_id,
-                code: code::INTERNAL_ERROR,
-                msg: "internal error".to_owned(),
-            };
-            return write_and_finish(send, &err).await;
+    // Slot-exclusivity rule (c): a validating listener returns ONLY the single
+    // slot record at a claimed DID `routing_id`, regardless of `limit`/`since`
+    // and any co-located junk — the same shared-registry gate the WebSocket relay
+    // applies, so a QUIC-reaching resolver cannot be handed a flood.
+    let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
+        did_slots.slot_blob(storage.as_ref(), &routing_id).await
+    } else {
+        None
+    };
+
+    let blobs = if let Some(slot) = claimed_slot {
+        vec![slot]
+    } else {
+        match storage.query(&routing_id, since, effective_limit).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, "QUIC: blob query failed");
+                let err = RelayMessage::Err {
+                    ref_id,
+                    code: code::INTERNAL_ERROR,
+                    msg: "internal error".to_owned(),
+                };
+                return write_and_finish(send, &err).await;
+            }
         }
     };
 
@@ -1166,10 +1323,67 @@ mod tests {
             Arc::clone(&subscriptions),
             publish_rate_limiter,
             connection_tracker,
+            DidSlotRegistry::new(),
         );
         let (handle, addr) = listener.start(server_config).unwrap();
 
         (handle, addr, certs, storage, subscriptions)
+    }
+
+    /// Helper: start a test QUIC listener that shares an explicit
+    /// [`DidSlotRegistry`] with its blob store, and return it alongside the
+    /// storage so a test can assert slot-exclusivity end-to-end over QUIC.
+    fn start_test_listener_validating() -> (
+        QuicShutdownHandle,
+        SocketAddr,
+        Vec<CertificateDer<'static>>,
+        Arc<InMemoryBlobStorage>,
+    ) {
+        let (server_config, certs) = test_server_config();
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let subscriptions = subscription::new_registry();
+        let publish_rate_limiter = PublishRateLimiter::new(100);
+        let connection_tracker = rate_limit::new_connection_tracker();
+
+        let config = QuicListenerConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            did_record_validation: DidRecordValidation::Enabled,
+            ..QuicListenerConfig::default()
+        };
+
+        let listener = QuicListener::new(
+            config,
+            Arc::clone(&storage),
+            Arc::clone(&subscriptions),
+            publish_rate_limiter,
+            connection_tracker,
+            DidSlotRegistry::new(),
+        );
+        let (handle, addr) = listener.start(server_config).unwrap();
+
+        (handle, addr, certs, storage)
+    }
+
+    /// Builds a genuine, self-consistent DID-record frame at the signing key's
+    /// own DID-domain `routing_id`, returning `(routing_id, blob_id, bytes)`.
+    fn genuine_frame(seed: u8, seq: u64, value: &[u8]) -> ([u8; 32], [u8; 32], Vec<u8>) {
+        use ed25519_dalek::{Signer, SigningKey};
+        use scp_dht::bep44_signable;
+        use scp_identity::{did_from_ed25519_public_key, did_routing_id};
+        use scp_protocol::envelope::did_record::DidRecordV1;
+
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        let did = did_from_ed25519_public_key(&vk.to_bytes());
+        let rid = did_routing_id(&did);
+        let signature: ed25519_dalek::Signature = sk.sign(&bep44_signable(value, seq));
+        let bytes = DidRecordV1::try_new(vk.to_bytes(), seq, signature.to_bytes(), value.to_vec())
+            .unwrap()
+            .encode();
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(&Sha256::digest(&bytes));
+        (rid, bid, bytes)
     }
 
     /// Helper: connect a QUIC client to the test listener.
@@ -1880,6 +2094,115 @@ mod tests {
         let blobs = storage.query(&routing_id, None, 100).await.unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0].blob, blob_data);
+
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
+    /// A validating QUIC listener enforces DID-record slot-exclusivity exactly
+    /// like the WebSocket relay: a genuine frame claims the slot, later junk at
+    /// the same `routing_id` is rejected, and QUERY returns only the slot — closing
+    /// the Fix 1 gap where QUIC bypassed the registry entirely.
+    #[tokio::test]
+    async fn quic_did_record_slot_exclusivity_enforced() {
+        let (handle, addr, certs, storage) = start_test_listener_validating();
+        let connection = connect_client(addr, &certs).await;
+
+        // Publish a genuine DID-record frame over QUIC → claims the slot.
+        let (rid, bid, frame) = genuine_frame(7, 5, b"did-doc");
+        let publish = ClientMessage::Publish {
+            ref_id: Some("p".into()),
+            routing_id: rid,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: frame,
+        };
+        let responses = send_and_recv(&connection, &publish).await;
+        assert!(
+            matches!(responses.as_slice(), [RelayMessage::Ok { .. }]),
+            "genuine frame should be accepted, got {responses:?}",
+        );
+
+        // Opaque junk at the claimed routing_id over QUIC → rejected (rule a).
+        let junk = ClientMessage::Publish {
+            ref_id: Some("j".into()),
+            routing_id: rid,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![0x80u8; 64],
+        };
+        let responses = send_and_recv(&connection, &junk).await;
+        match responses.as_slice() {
+            [RelayMessage::Err { code, .. }] => {
+                assert_eq!(*code, code::DID_RECORD_REJECTED);
+            }
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
+
+        // The junk never reached storage: exactly the slot blob is present.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+
+        // QUERY over QUIC returns ONLY the slot (rule c).
+        let query = ClientMessage::Query {
+            ref_id: Some("q".into()),
+            routing_id: rid,
+            since: None,
+            limit: Some(100),
+        };
+        let responses = send_and_recv(&connection, &query).await;
+        let blobs: Vec<_> = responses
+            .iter()
+            .filter_map(|m| match m {
+                RelayMessage::Blob { blob_id, .. } => Some(*blob_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blobs, vec![bid], "QUERY must return only the slot");
+
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
+    /// A lower-seq genuine frame published over QUIC after a higher-seq slot is
+    /// established is rejected as non-superseding (single highest-seq slot).
+    #[tokio::test]
+    async fn quic_lower_seq_frame_rejected() {
+        let (handle, addr, certs, _storage) = start_test_listener_validating();
+        let connection = connect_client(addr, &certs).await;
+
+        let (rid, _bid9, frame9) = genuine_frame(8, 9, b"v9");
+        let (_rid, _bid3, frame3) = genuine_frame(8, 3, b"v3");
+
+        let ok = send_and_recv(
+            &connection,
+            &ClientMessage::Publish {
+                ref_id: None,
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: frame9,
+            },
+        )
+        .await;
+        assert!(matches!(ok.as_slice(), [RelayMessage::Ok { .. }]));
+
+        let rejected = send_and_recv(
+            &connection,
+            &ClientMessage::Publish {
+                ref_id: None,
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: frame3,
+            },
+        )
+        .await;
+        match rejected.as_slice() {
+            [RelayMessage::Err { code, .. }] => assert_eq!(*code, code::DID_RECORD_REJECTED),
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
 
         connection.close(0u32.into(), b"done");
         handle.shutdown();

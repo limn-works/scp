@@ -46,13 +46,13 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::did_slot::{DidSlotRegistry, SlotPublishError};
+use super::did_slot::DidSlotRegistry;
 use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
 use crate::error::TransportError;
 use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
 use crate::relay::did_record_validation::{
-    DidRecordClass, DidRecordRejection, classify_did_record_frame,
+    DidRecordClass, DidRecordRejection, classify_did_record_frame, slot_publish_error_response,
 };
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
@@ -452,9 +452,10 @@ impl RelayServer {
 
         // Spawn the TTL expiry background task.
         let storage_for_ttl = Arc::clone(&self.storage);
+        let did_slots_for_ttl = self.did_slots.clone();
         let ttl_interval = self.config.ttl_check_interval;
         tokio::spawn(async move {
-            ttl_expiry_task(storage_for_ttl, ttl_interval).await;
+            ttl_expiry_task(storage_for_ttl, did_slots_for_ttl, ttl_interval).await;
         });
 
         loop {
@@ -526,13 +527,14 @@ impl RelayServer {
     /// Spawns background maintenance tasks (TTL expiry + rate limiter cleanup).
     fn spawn_background_tasks(&self, token: &CancellationToken) {
         let storage_for_ttl = Arc::clone(&self.storage);
+        let did_slots_for_ttl = self.did_slots.clone();
         let ttl_interval = self.config.ttl_check_interval;
         let ttl_token = token.clone();
         tokio::spawn(async move {
             tokio::select! {
                 biased;
                 () = ttl_token.cancelled() => {}
-                () = ttl_expiry_task(storage_for_ttl, ttl_interval) => {}
+                () = ttl_expiry_task(storage_for_ttl, did_slots_for_ttl, ttl_interval) => {}
             }
         });
 
@@ -691,12 +693,27 @@ pub enum RelayError {
     AcceptFailed(String),
 }
 
-/// Background task that periodically purges expired blobs.
-async fn ttl_expiry_task(storage: Arc<BlobStorageBackend>, interval: Duration) {
+/// Background task that periodically purges expired blobs and reclaims stale
+/// DID-slot index entries.
+///
+/// Purging storage alone is not enough for the DID-slot index: a `routing_id`
+/// claimed once and then never re-queried keeps its index entry forever after
+/// its blob TTL-expires, because reversion is otherwise only *lazy* (on-consult).
+/// Sweeping the index here is the active backstop that bounds index growth (Fix
+/// 3): without it an attacker could mint unlimited keypairs and pin unbounded
+/// permanent slots. The sweep is a no-op when validation is disabled (the index
+/// is never populated) and cheap otherwise (bounded by the number of claimed
+/// slots, behind the slow TTL interval).
+async fn ttl_expiry_task(
+    storage: Arc<BlobStorageBackend>,
+    did_slots: DidSlotRegistry,
+    interval: Duration,
+) {
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
         let _ = storage.purge_expired().await;
+        did_slots.sweep_expired(storage.as_ref()).await;
     }
 }
 
@@ -1089,6 +1106,7 @@ async fn handle_client_message(
                 config,
                 subscribe_rate_limiter,
                 persistence,
+                did_slots,
             )
             .await;
         }
@@ -1253,7 +1271,7 @@ async fn handle_publish(
                 // rule atomically (establish, supersede, or idempotent refresh).
                 match did_slots
                     .publish_frame(
-                        storage,
+                        storage.as_ref(),
                         routing_id,
                         blob_id,
                         recipient_hint,
@@ -1277,28 +1295,12 @@ async fn handle_publish(
                             })
                             .await;
                     }
-                    Err(SlotPublishError::NonSuperseding {
-                        stored_seq,
-                        got_seq,
-                    }) => {
-                        let _ = tx
-                            .send(RelayMessage::Err {
-                                ref_id,
-                                code: code::DID_RECORD_REJECTED,
-                                msg: format!(
-                                    "DID-record seq {got_seq} does not supersede the stored slot (seq {stored_seq})"
-                                ),
-                            })
-                            .await;
-                    }
-                    Err(SlotPublishError::Storage(e)) => {
-                        let _ = tx
-                            .send(RelayMessage::Err {
-                                ref_id,
-                                code: code::STORAGE_FULL,
-                                msg: e.to_string(),
-                            })
-                            .await;
+                    Err(e) => {
+                        // Shared mapping — a full backend → STORAGE_FULL, an
+                        // internal storage fault → INTERNAL_ERROR (not STORAGE_FULL),
+                        // a non-superseding seq → DID_RECORD_REJECTED.
+                        let (code, msg) = slot_publish_error_response(&e);
+                        let _ = tx.send(RelayMessage::Err { ref_id, code, msg }).await;
                     }
                 }
                 return;
@@ -1327,7 +1329,7 @@ async fn handle_publish(
                 // claimed DID slot, any non-superseding PUBLISH there — including
                 // a non-frame blob — is rejected, so it can never co-locate with
                 // (or shadow) the genuine record.
-                if did_slots.is_claimed(storage, &routing_id).await {
+                if did_slots.is_claimed(storage.as_ref(), &routing_id).await {
                     let _ = tx
                         .send(RelayMessage::Err {
                             ref_id,
@@ -1382,7 +1384,11 @@ async fn handle_publish(
 /// Handles a SUBSCRIBE operation.
 // SUBSCRIBE handler receives protocol-defined fields plus connection state;
 // grouping would obscure the protocol-level parameters.
-#[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines
+)]
 async fn handle_subscribe(
     ref_id: Option<String>,
     routing_id: [u8; 32],
@@ -1395,6 +1401,7 @@ async fn handle_subscribe(
     config: &RelayConfig,
     subscribe_rate_limiter: &mut SubscribeRateLimiter,
     persistence: Option<&Arc<dyn RelayPersistence>>,
+    did_slots: &DidSlotRegistry,
 ) {
     // Check subscribe rate limit (ADR-004: 20/min per connection).
     if !subscribe_rate_limiter.check() {
@@ -1473,11 +1480,32 @@ async fn handle_subscribe(
 
     // Backfill if `since` is provided.
     if let Some(since_ts) = since {
-        let blobs = storage
-            .query(&routing_id, Some(since_ts), MAX_QUERY_LIMIT)
-            .await;
+        // Slot-exclusivity rule (c) applies to backfill too: on a validating
+        // relay a routing_id with a claimed DID slot backfills ONLY that single
+        // slot record, never any co-located opaque junk — the same gate QUERY
+        // uses, so a subscriber cannot be handed suppressed junk that a QUERY
+        // would have filtered. Unclaimed routing_ids (all encrypted context
+        // blobs) fall through to the normal windowed backfill.
+        let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
+            did_slots.slot_blob(storage.as_ref(), &routing_id).await
+        } else {
+            None
+        };
 
-        if let Ok(blobs) = blobs {
+        if let Some(slot) = claimed_slot {
+            let blob_msg = RelayMessage::Blob {
+                routing_id: slot.routing_id,
+                blob_id: slot.blob_id,
+                recipient_hint: slot.recipient_hint,
+                blob_ttl: slot.blob_ttl,
+                stored_at: slot.stored_at,
+                blob: slot.blob,
+            };
+            let _ = tx.send(blob_msg).await;
+        } else if let Ok(blobs) = storage
+            .query(&routing_id, Some(since_ts), MAX_QUERY_LIMIT)
+            .await
+        {
             for stored in blobs {
                 let blob_msg = RelayMessage::Blob {
                     routing_id: stored.routing_id,
@@ -1593,7 +1621,7 @@ async fn handle_query(
     // common case, incl. all encrypted context blobs) take the fast read-lock
     // path and fall through to the normal multi-blob query below.
     let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
-        did_slots.slot_blob(storage, &routing_id).await
+        did_slots.slot_blob(storage.as_ref(), &routing_id).await
     } else {
         None
     };

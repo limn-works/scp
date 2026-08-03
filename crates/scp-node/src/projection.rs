@@ -2829,6 +2829,8 @@ mod tests {
             #[cfg(feature = "quic")]
             publish_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(100),
             #[cfg(feature = "quic")]
+            did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry::new(),
+            #[cfg(feature = "quic")]
             quic_server_config: None,
             #[cfg(feature = "quic")]
             quic_listening: std::sync::atomic::AtomicBool::new(false),

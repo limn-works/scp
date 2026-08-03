@@ -956,6 +956,11 @@ where
     // budgets are enforced uniformly across WebSocket and QUIC (ADR-037 AC3).
     #[cfg(feature = "quic")]
     let publish_rate_limiter = relay_server.publish_rate_limiter();
+    // Shared DID-record slot index — the QUIC listener reuses it so
+    // slot-exclusivity holds across WebSocket and QUIC over the shared store
+    // (§3.10.2, SCP-RELAYRES-003).
+    #[cfg(feature = "quic")]
+    let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start().await?;
     let dev_token = local_api.map(generate_dev_token);
     let http_bind_addr = http_bind_addr_opt.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
@@ -1000,6 +1005,8 @@ where
                 subscription_registry.clone(),
                 #[cfg(feature = "quic")]
                 publish_rate_limiter.clone(),
+                #[cfg(feature = "quic")]
+                did_slot_registry.clone(),
                 acme_challenges,
                 #[cfg(feature = "http3")]
                 http3,
@@ -1037,6 +1044,8 @@ where
                 subscription_registry,
                 #[cfg(feature = "quic")]
                 publish_rate_limiter,
+                #[cfg(feature = "quic")]
+                did_slot_registry,
                 // The domain reach's TLS-failure fall-through always probes NAT
                 // (it is the §10.12.8 zero-config path), so it never skips the
                 // probe — matching the legacy `self.skip_nat_probe` which was
@@ -1092,6 +1101,10 @@ where
     // not served without TLS, but kept on NodeState for a uniform struct).
     #[cfg(feature = "quic")]
     let publish_rate_limiter = relay_server.publish_rate_limiter();
+    // Shared DID-record slot index (same rationale as publish_rate_limiter:
+    // unused in no-domain mode, kept for a uniform NodeState).
+    #[cfg(feature = "quic")]
+    let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
     // 4. Generate dev API token if local_api was configured.
@@ -1122,6 +1135,8 @@ where
         subscription_registry,
         #[cfg(feature = "quic")]
         publish_rate_limiter,
+        #[cfg(feature = "quic")]
+        did_slot_registry,
         skip_nat_probe,
     )
     .await
