@@ -112,9 +112,10 @@ pub struct ContextOutletInfo {
     /// Whether this outlet requires admin privileges.
     pub admin_only: bool,
     /// Outlet classification (§5.4.2). `Query` surfaces to MCP as
-    /// `query.{outlet_id}`; `Action` surfaces as `call.{outlet_id}`. Until
-    /// SCP-OUT-017 provides the canonical enum, bridges that cannot yet
-    /// distinguish Query from Action default to `Action`.
+    /// `query.{outlet_id}`; `Action` surfaces as `call.{outlet_id}`. This is the
+    /// canonical [`OutletKind`] enum (SCP-OUT-011); bridges populate it directly
+    /// from the outlet registry's `kind`. Absence defaults to `Action`
+    /// (fail-safe per §5.4.2).
     pub kind: OutletKind,
 }
 
@@ -436,10 +437,12 @@ impl<P: ContextProvider> McpServer<P> {
         // prefix before validation and invocation. An unrecognized prefix
         // falls back to using the full name as the outlet_id with kind =
         // Action (fail-safe default per AC14).
-        // The recovered kind is intentionally unused here: the invocation
-        // handler is kind-agnostic until SCP-OUT-017 wires the Query / Action
-        // dispatch difference. It is NOT currently recorded in provenance. Note
-        // an inbound (caller-derived) kind is advisory only; authoritative kind
+        // The recovered kind is intentionally unused here: this MCP handler is
+        // kind-agnostic and defers the Query/Action enforcement difference to
+        // the runtime authorization gate — the ReadOnlyInvocation guard
+        // (SCP-OUT-013) plus the split UCAN stems (SCP-OUT-014), which resolve
+        // kind from the registry. It is NOT recorded in provenance. Note an
+        // inbound (caller-derived) kind is advisory only; the authoritative kind
         // is the registry's — see the SECURITY note in translator.rs.
         let (_outlet_kind, owned_outlet_id) = parse_mcp_tool_name(mcp_tool_name);
         let tool_name: &str = owned_outlet_id.as_str();

@@ -55,17 +55,19 @@
 //! forward slash and a name, which a non-conforming MCP client might
 //! send — default to [`OutletKind::Action`]
 //! (fail-safe: an undeclared kind cannot accidentally be treated as
-//! read-only, per §5.4.2 and SCP-OUT-017). The optional `x-scp-kind` JSON
-//! Schema extension on an MCP `inputSchema` overrides the default.
+//! read-only, per §5.4.2). The optional `x-scp-kind` JSON Schema extension on
+//! an MCP `inputSchema` overrides the default.
 //!
 //! # `OutletKind`
 //!
-//! [`OutletKind`] is the canonical `scp_core::context::outlets::OutletKind`,
-//! re-exported here so this module, the `scp-mcp` server, and the FFI bridges
-//! share one type and one (lowercase, `"query"` / `"action"`) wire spelling.
-//! This translator only *projects* an already-classified kind across the MCP
-//! boundary; authoritative classification is owned by SCP-OUT-017 and, at
-//! runtime, by the registry (`ContextOutletInfo.kind`).
+//! [`OutletKind`] is the canonical `scp_core::context::outlets::OutletKind`
+//! (the enum defined by SCP-OUT-011), re-exported here so this module, the
+//! `scp-mcp` server, and the FFI bridges share one type and one (lowercase,
+//! `"query"` / `"action"`) wire spelling. This translator only *projects* an
+//! already-classified kind across the MCP boundary; the authoritative kind
+//! lives in the outlet registry (`ContextOutletInfo.kind`) and is enforced at
+//! runtime by the `ReadOnlyInvocation` authorization gate (SCP-OUT-013, with
+//! the split UCAN stems of SCP-OUT-014).
 //!
 //! # Round-trip semantics
 //!
@@ -152,11 +154,13 @@ const ERROR_META_FIELDS: [(&str, &str); 6] = [
 /// SCP-side `kind` field and the `x-scp-kind` JSON Schema extension both use
 /// that canonical spelling.
 ///
-/// Authoritative classification of an outlet's kind is owned by SCP-OUT-017 (the
-/// classification gate) and, at runtime, by the registry
-/// (`ContextOutletInfo.kind`). This translator only projects an
-/// already-classified kind across the MCP boundary; it never authoritatively
-/// assigns one (see the `SECURITY` note at the inbound `kind` write site).
+/// The enum itself is defined by SCP-OUT-011. The authoritative kind of an
+/// outlet lives in the outlet registry (`ContextOutletInfo.kind`) and is
+/// enforced at runtime by the `ReadOnlyInvocation` authorization gate
+/// (SCP-OUT-013, with the split UCAN stems of SCP-OUT-014). This translator only
+/// projects an already-classified kind across the MCP boundary; it never
+/// authoritatively assigns one (see the `SECURITY` note at the inbound `kind`
+/// write site).
 pub use scp_core::context::outlets::OutletKind;
 
 /// The MCP-facing dot-delimited tool-name prefix for a kind
@@ -331,12 +335,12 @@ fn translate_tools_call_params_to_invoke(mut map: Map<String, Value>) -> Map<Str
     out.insert("outlet_id".to_owned(), Value::String(outlet_id));
     // SECURITY: this `kind` is caller-derived (inferred from the inbound MCP
     // tool.name prefix). It is advisory ONLY. The authoritative kind is always
-    // the registry's `ContextOutletInfo.kind`; the SCP-OUT-017 classification /
-    // authorization gate MUST resolve kind from the registry and MUST NEVER
-    // trust this translator-emitted inbound value — otherwise an external MCP
-    // caller could label an Action outlet `query.*` and slip a mutating call
-    // past a Query-only (read-only) authorization path (Action-as-Query
-    // bypass).
+    // the registry's `ContextOutletInfo.kind`; the runtime authorization gate —
+    // the `ReadOnlyInvocation` guard (SCP-OUT-013) and the split UCAN stems
+    // (SCP-OUT-014) — MUST resolve kind from the registry and MUST NEVER trust
+    // this translator-emitted inbound value — otherwise an external MCP caller
+    // could label an Action outlet `query.*` and slip a mutating call past a
+    // Query-only (read-only) authorization path (Action-as-Query bypass).
     out.insert(
         "kind".to_owned(),
         Value::String(kind_scp_tag(kind).to_owned()),
@@ -551,8 +555,15 @@ fn translate_scp_to_mcp_object(mut map: Map<String, Value>) -> Map<String, Value
         && let Some(Value::Object(err)) = map.remove("error")
     {
         let mut result = translate_outlet_error_to_call_tool_result(err);
-        // Preserve any sibling keys of the error envelope (translated).
+        // Preserve any sibling keys of the error envelope (translated), but
+        // NEVER let a sibling clobber the structural fields the error
+        // translation owns — otherwise a crafted `{"error":{...},
+        // "isError":false}` would overwrite the `isError:true` we just set and
+        // re-open the fail-open hole this branch exists to close.
         for (k, v) in map {
+            if matches!(k.as_str(), "isError" | "content" | "_meta") {
+                continue;
+            }
             result.insert(k, translate_scp_to_mcp_value(v));
         }
         return result;

@@ -291,6 +291,29 @@ fn error_envelope_with_sibling_keys_still_marks_iserror() {
 }
 
 #[test]
+fn error_envelope_colliding_sibling_cannot_clobber_iserror() {
+    // A3 (round-3): a crafted sibling that collides with a structural field the
+    // error translation owns (`isError` / `content` / `_meta`) must NOT
+    // overwrite it — otherwise `{"error":{...}, "isError":false}` would flip a
+    // real error back to success (fail-open). The colliding siblings are dropped
+    // for these owned keys, not applied.
+    let scp = json!({
+        "error": { "code": "SCP-OUTLET-6130", "message": "boom" },
+        "isError": false,
+        "content": [ { "type": "text", "text": "not the real content" } ],
+        "_meta": { "scp_error_code": "SPOOFED" }
+    });
+    let mcp = scp_to_mcp(scp);
+    assert_eq!(
+        mcp["isError"], true,
+        "a colliding isError:false sibling must not re-open the fail-open hole"
+    );
+    // The error translation's own content/_meta win over the crafted siblings.
+    assert_eq!(mcp["content"][0]["text"], "boom");
+    assert_eq!(mcp["_meta"]["scp_error_code"], "SCP-OUTLET-6130");
+}
+
+#[test]
 fn iserror_non_bool_true_is_treated_as_error() {
     // A4: a malicious/lenient server sending a non-`false` isError (here the
     // string "true") must be treated as an error, not silently as success.
