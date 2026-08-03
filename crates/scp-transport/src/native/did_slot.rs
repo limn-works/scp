@@ -71,6 +71,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 
@@ -87,6 +88,17 @@ struct DidSlot {
     blob_id: [u8; 32],
     /// The slot's BEP44 sequence number (§3.10.7).
     seq: u64,
+    /// A monotonically-increasing token bumped on **every** (re-)insert of this
+    /// slot (establish, supersede, adopt, refresh). Unlike `blob_id` — which is
+    /// *stable* across an expiry→same-record-refresh (the 6-day BEP44 republish
+    /// re-stores the identical `value`+`seq`, hence the same `blob_id`) — the
+    /// generation changes on each write. The reversion paths
+    /// ([`revert_if_stale`](DidSlotRegistry::revert_if_stale),
+    /// [`sweep_expired`](DidSlotRegistry::sweep_expired)) gate removal on the
+    /// generation, not just `blob_id`, so a slot that a concurrent refresh
+    /// re-established between the caller's probe and the write lock is never
+    /// clobbered (Fix A).
+    generation: u64,
 }
 
 /// What a successful validated-frame PUBLISH did to the slot.
@@ -138,6 +150,11 @@ pub enum SlotPublishError {
 #[derive(Clone, Default)]
 pub struct DidSlotRegistry {
     slots: Arc<RwLock<HashMap<[u8; 32], DidSlot>>>,
+    /// Source of the monotonic [`DidSlot::generation`] token. Shared across every
+    /// clone of the registry (all clones enforce one store's slots), so the
+    /// counter is globally monotonic. An `AtomicU64` — independent of the `slots`
+    /// lock — so bumping it never widens the critical section.
+    next_generation: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for DidSlotRegistry {
@@ -151,6 +168,17 @@ impl DidSlotRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Builds a [`DidSlot`] carrying a fresh, globally-unique generation token.
+    /// Every insert into the index MUST go through this so the reversion paths
+    /// can distinguish a re-established slot from the one they observed (Fix A).
+    fn fresh_slot(&self, blob_id: [u8; 32], seq: u64) -> DidSlot {
+        DidSlot {
+            blob_id,
+            seq,
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+        }
     }
 
     /// Applies a **validated** DID-record frame to its `routing_id`'s slot.
@@ -241,13 +269,7 @@ impl DidSlotRegistry {
                     // it as the slot, evict every other co-located blob, and REJECT
                     // the newcomer. Never let a lower-or-equal-seq frame delete a
                     // higher/equal genuine record.
-                    slots.insert(
-                        routing_id,
-                        DidSlot {
-                            blob_id: best_id,
-                            seq: best_seq,
-                        },
-                    );
+                    slots.insert(routing_id, self.fresh_slot(best_id, best_seq));
                     Self::evict_others(storage, &routing_id, best_id).await;
                     return Err(SlotPublishError::NonSuperseding {
                         stored_seq: best_seq,
@@ -261,7 +283,7 @@ impl DidSlotRegistry {
                 let stored = storage
                     .store(routing_id, blob_id, recipient_hint, blob_ttl, blob)
                     .await?;
-                slots.insert(routing_id, DidSlot { blob_id, seq });
+                slots.insert(routing_id, self.fresh_slot(blob_id, seq));
                 Self::evict_others(storage, &routing_id, blob_id).await;
                 Ok((stored, SlotPublishOutcome::Established))
             }
@@ -269,17 +291,21 @@ impl DidSlotRegistry {
                 let stored = storage
                     .store(routing_id, blob_id, recipient_hint, blob_ttl, blob)
                     .await?;
-                slots.insert(routing_id, DidSlot { blob_id, seq });
+                slots.insert(routing_id, self.fresh_slot(blob_id, seq));
                 Self::evict_others(storage, &routing_id, blob_id).await;
                 Ok((stored, SlotPublishOutcome::Superseded))
             }
             Some(slot) if seq == slot.seq && blob_id == slot.blob_id => {
                 // Byte-identical equal-seq republish: refresh storage lifetime
                 // (re-store overwrites stored_at + blob_ttl) and re-assert
-                // sole-slot. The slot entry (blob_id, seq) is unchanged.
+                // sole-slot. The (blob_id, seq) is unchanged, but re-insert with a
+                // fresh generation so a concurrent sweep/revert that snapshotted
+                // the pre-refresh generation cannot drop this now-refreshed slot
+                // (Fix A).
                 let stored = storage
                     .store(routing_id, blob_id, recipient_hint, blob_ttl, blob)
                     .await?;
+                slots.insert(routing_id, self.fresh_slot(blob_id, seq));
                 Self::evict_others(storage, &routing_id, blob_id).await;
                 Ok((stored, SlotPublishOutcome::IdempotentRefresh))
             }
@@ -310,7 +336,8 @@ impl DidSlotRegistry {
         if let Ok(Some(_)) = storage.get(&slot.blob_id).await {
             true
         } else {
-            self.revert_if_stale(routing_id, slot.blob_id).await;
+            self.revert_if_stale(routing_id, slot.blob_id, slot.generation)
+                .await;
             false
         }
     }
@@ -333,16 +360,43 @@ impl DidSlotRegistry {
         if let Ok(Some(stored)) = storage.get(&slot.blob_id).await {
             Some(stored)
         } else {
-            self.revert_if_stale(routing_id, slot.blob_id).await;
+            self.revert_if_stale(routing_id, slot.blob_id, slot.generation)
+                .await;
             None
         }
     }
 
-    /// Drops a `routing_id` from the index iff it still points at `blob_id`
-    /// (i.e. no concurrent establish replaced it since the caller observed it).
-    async fn revert_if_stale(&self, routing_id: &[u8; 32], blob_id: [u8; 32]) {
+    /// Returns whether `blob_id` is the current slot blob of some claimed
+    /// DID-domain `routing_id`.
+    ///
+    /// Used to gate DELETE (§3.10.2 rule (a)): DID records are public, so an
+    /// attacker can compute `blob_id = SHA-256(genuine_record)` and DELETE the
+    /// slot blob to force the `routing_id` to revert, then replay an older
+    /// genuine frame to pin a stale slot. Only a *superseding PUBLISH* may replace
+    /// a slot; an unauthenticated DELETE of the current slot blob is rejected on
+    /// every transport (Fix B). A stale index entry (blob already expired) still
+    /// matches here — rejecting a DELETE of an already-absent blob is a harmless
+    /// no-op, and the entry is reconciled by the next publish / consult / sweep.
+    ///
+    /// The scan is over the claimed-slot index only (bounded — a handful of DID
+    /// slots), not the blob store, so it is cheap even on the DELETE hot path for
+    /// ordinary non-DID blobs (empty/absent match → DELETE proceeds).
+    pub async fn is_current_slot_blob(&self, blob_id: &[u8; 32]) -> bool {
+        self.slots
+            .read()
+            .await
+            .values()
+            .any(|s| &s.blob_id == blob_id)
+    }
+
+    /// Drops a `routing_id` from the index iff it still points at the exact slot
+    /// the caller observed — same `blob_id` **and** same `generation`. Gating on
+    /// generation (not just `blob_id`) is load-bearing: an expiry→same-record
+    /// refresh re-establishes the identical `blob_id`, so a `blob_id`-only guard
+    /// would drop a slot that a concurrent refresh made live again (Fix A).
+    async fn revert_if_stale(&self, routing_id: &[u8; 32], blob_id: [u8; 32], generation: u64) {
         let mut slots = self.slots.write().await;
-        if slots.get(routing_id).map(|s| s.blob_id) == Some(blob_id) {
+        if slots.get(routing_id).map(|s| (s.blob_id, s.generation)) == Some((blob_id, generation)) {
             slots.remove(routing_id);
         }
     }
@@ -357,27 +411,30 @@ impl DidSlotRegistry {
     /// calls this periodically; the lazy path stays the fast path for live
     /// traffic.
     ///
-    /// Snapshots the `(routing_id, blob_id)` pairs under a read lock, probes
-    /// storage without holding the lock, then drops only the entries confirmed
-    /// absent — and only if the index still points at the same (now-gone) blob,
-    /// so a concurrent re-establish is never clobbered.
+    /// Snapshots the `(routing_id, blob_id, generation)` triples under a read
+    /// lock, probes storage without holding the lock, then drops only the entries
+    /// confirmed absent — and only if the index still points at the exact same
+    /// slot (same `blob_id` **and** `generation`). Gating on generation is
+    /// load-bearing: a slot whose blob TTL-expires and is then re-established by a
+    /// concurrent same-record refresh keeps the identical `blob_id`, so a
+    /// `blob_id`-only guard would clobber a now-live slot (Fix A).
     pub async fn sweep_expired<S: BlobStorage + ?Sized>(&self, storage: &S) {
-        let entries: Vec<([u8; 32], [u8; 32])> = {
+        let entries: Vec<([u8; 32], [u8; 32], u64)> = {
             let slots = self.slots.read().await;
             slots
                 .iter()
-                .map(|(rid, slot)| (*rid, slot.blob_id))
+                .map(|(rid, slot)| (*rid, slot.blob_id, slot.generation))
                 .collect()
         };
         if entries.is_empty() {
             return;
         }
 
-        let mut stale: Vec<([u8; 32], [u8; 32])> = Vec::new();
-        for (rid, blob_id) in entries {
+        let mut stale: Vec<([u8; 32], [u8; 32], u64)> = Vec::new();
+        for (rid, blob_id, generation) in entries {
             match storage.get(&blob_id).await {
                 Ok(Some(_)) => {}
-                Ok(None) => stale.push((rid, blob_id)),
+                Ok(None) => stale.push((rid, blob_id, generation)),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -392,8 +449,8 @@ impl DidSlotRegistry {
         }
 
         let mut slots = self.slots.write().await;
-        for (rid, blob_id) in stale {
-            if slots.get(&rid).map(|s| s.blob_id) == Some(blob_id) {
+        for (rid, blob_id, generation) in stale {
+            if slots.get(&rid).map(|s| (s.blob_id, s.generation)) == Some((blob_id, generation)) {
                 slots.remove(&rid);
             }
         }
@@ -772,6 +829,129 @@ mod tests {
             .await
             .unwrap();
 
+        reg.sweep_expired(&storage).await;
+        assert!(reg.slots.read().await.contains_key(&rid));
+        assert!(reg.is_claimed(&storage, &rid).await);
+    }
+
+    /// Fix A (same-`blob_id` refresh race): the 6-day BEP44 refresh republishes
+    /// the identical record (same `value`+`seq` → same `blob_id`), so a reversion
+    /// guard that compares only `blob_id` would drop a slot that a concurrent
+    /// refresh re-established between the reverter's probe and its write lock.
+    /// The `generation` gate must reject a removal keyed to the pre-refresh slot.
+    #[tokio::test]
+    async fn refresh_bumps_generation_so_stale_generation_revert_is_ignored() {
+        let storage = BlobStorageBackend::in_memory();
+        let reg = DidSlotRegistry::new();
+        let rid = [0x99; 32];
+        let v = b"genuine-record".to_vec();
+        let bid = blob_id_of(&v);
+
+        // Establish, then capture the slot's generation.
+        reg.publish_frame(&storage, rid, bid, None, 3600, v.clone(), 5)
+            .await
+            .unwrap();
+        let gen1 = reg.slots.read().await.get(&rid).unwrap().generation;
+
+        // Byte-identical equal-seq republish (the TTL refresh): same blob_id, but
+        // the generation must advance.
+        let (_s, outcome) = reg
+            .publish_frame(&storage, rid, bid, None, 3600, v, 5)
+            .await
+            .unwrap();
+        assert_eq!(outcome, SlotPublishOutcome::IdempotentRefresh);
+        let gen2 = reg.slots.read().await.get(&rid).unwrap().generation;
+        assert!(gen2 > gen1, "a refresh must bump the generation");
+
+        // A reverter that snapshotted the PRE-refresh slot (same blob_id, old
+        // generation) — the exact interleave `sweep_expired`/`revert_if_stale`
+        // guard against — must NOT drop the now-refreshed live slot.
+        reg.revert_if_stale(&rid, bid, gen1).await;
+        assert!(
+            reg.slots.read().await.contains_key(&rid),
+            "stale-generation revert must be a no-op on a refreshed slot",
+        );
+        assert!(reg.is_claimed(&storage, &rid).await);
+
+        // The gate still removes a truly-current stale entry (matching generation
+        // when the blob is genuinely gone).
+        storage.delete(&bid).await.unwrap();
+        reg.revert_if_stale(&rid, bid, gen2).await;
+        assert!(
+            !reg.slots.read().await.contains_key(&rid),
+            "matching-generation revert of an absent blob must remove the entry",
+        );
+    }
+
+    /// Fix B: the current slot blob is recognized (so DELETE can be gated),
+    /// while non-slot blobs are not — DELETE of ordinary blobs stays unaffected.
+    #[tokio::test]
+    async fn is_current_slot_blob_matches_only_the_claimed_slot() {
+        let storage = BlobStorageBackend::in_memory();
+        let reg = DidSlotRegistry::new();
+        let rid = [0x5A; 32];
+        let v = b"the-slot".to_vec();
+        let bid = blob_id_of(&v);
+        reg.publish_frame(&storage, rid, bid, None, 3600, v, 3)
+            .await
+            .unwrap();
+
+        assert!(
+            reg.is_current_slot_blob(&bid).await,
+            "slot blob is protected"
+        );
+        assert!(
+            !reg.is_current_slot_blob(&blob_id_of(b"some-other-blob"))
+                .await,
+            "a non-slot blob is not protected — DELETE proceeds",
+        );
+
+        // After supersession the OLD slot blob is no longer protected; the new one
+        // is.
+        let v2 = b"the-slot-v9".to_vec();
+        let bid2 = blob_id_of(&v2);
+        reg.publish_frame(&storage, rid, bid2, None, 3600, v2, 9)
+            .await
+            .unwrap();
+        assert!(!reg.is_current_slot_blob(&bid).await);
+        assert!(reg.is_current_slot_blob(&bid2).await);
+    }
+
+    /// The `generation` also protects `sweep_expired` end-to-end: after an
+    /// expiry→same-record refresh re-establishes the slot (new generation, blob
+    /// live again), a subsequent sweep must keep it.
+    #[tokio::test]
+    async fn sweep_keeps_slot_after_expiry_then_refresh() {
+        use super::super::storage::{ClockFn, InMemoryBlobStorage};
+        use std::sync::atomic::AtomicU64 as ClockU64;
+
+        let clock_value = Arc::new(ClockU64::new(1_000_000));
+        let cv = clock_value.clone();
+        let clock: ClockFn = Arc::new(move || cv.load(Ordering::Relaxed));
+        let storage = BlobStorageBackend::from(InMemoryBlobStorage::with_clock(clock));
+        let reg = DidSlotRegistry::new();
+        let rid = [0xAA; 32];
+        let v = b"refreshable".to_vec();
+        let bid = blob_id_of(&v);
+
+        reg.publish_frame(&storage, rid, bid, None, 10, v.clone(), 1)
+            .await
+            .unwrap();
+        let gen1 = reg.slots.read().await.get(&rid).unwrap().generation;
+
+        // Blob TTL-expires.
+        clock_value.store(1_000_011, Ordering::Relaxed);
+
+        // Owner republishes the identical record (same blob_id) with a fresh TTL:
+        // the live-slot probe finds the blob gone and re-establishes → new
+        // generation, blob live again.
+        reg.publish_frame(&storage, rid, bid, None, 3600, v, 1)
+            .await
+            .unwrap();
+        let gen2 = reg.slots.read().await.get(&rid).unwrap().generation;
+        assert!(gen2 > gen1);
+
+        // The sweep must keep the refreshed live slot.
         reg.sweep_expired(&storage).await;
         assert!(reg.slots.read().await.contains_key(&rid));
         assert!(reg.is_claimed(&storage, &rid).await);

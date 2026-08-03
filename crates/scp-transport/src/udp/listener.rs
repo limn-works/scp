@@ -844,7 +844,7 @@ async fn dispatch_client_message<S: BlobStorage + 'static>(
             .await;
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_udp_delete(ref_id, blob_id, sessions, &remote_addr, storage).await;
+            handle_udp_delete(ref_id, blob_id, sessions, &remote_addr, storage, did_slots).await;
         }
         ClientMessage::Subscribe { ref_id, .. } => {
             let err = RelayMessage::Err {
@@ -1113,14 +1113,30 @@ async fn handle_udp_query<S: BlobStorage>(
 /// Handles a DELETE operation over UDP/DTLS.
 ///
 /// Best-effort deletion -- always returns OK, consistent with the WebSocket
-/// relay behavior.
+/// relay behavior — EXCEPT a claimed DID slot's blob, which is rejected.
 async fn handle_udp_delete<S: BlobStorage>(
     ref_id: Option<String>,
     blob_id: [u8; 32],
     sessions: &Arc<RwLock<HashMap<SocketAddr, DtlsSession>>>,
     remote_addr: &SocketAddr,
     storage: &Arc<S>,
+    did_slots: &DidSlotRegistry,
 ) {
+    // Slot-exclusivity: reject a DELETE of a claimed DID slot's blob over UDP,
+    // identically to WebSocket/QUIC (§3.10.2 rule (a), Fix B). Non-slot blobs
+    // proceed.
+    if did_slots.is_current_slot_blob(&blob_id).await {
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::DID_RECORD_REJECTED,
+            msg: "blob_id is a claimed DID-record slot; only a superseding \
+                  PUBLISH may replace it (slot-exclusive)"
+                .to_string(),
+        };
+        send_dtls_response(sessions, remote_addr, &err).await;
+        return;
+    }
+
     let _ = storage.delete(&blob_id).await;
 
     let ok = RelayMessage::Ok {
@@ -1655,6 +1671,67 @@ mod tests {
         }
         let complete = recv_msg(&client).await;
         assert!(matches!(complete, RelayMessage::Event { .. }));
+
+        handle.shutdown();
+    }
+
+    /// Fix B: an unauthenticated DELETE of a claimed DID slot's blob over
+    /// UDP/DTLS is rejected and the slot survives; DELETE of a non-slot blob
+    /// still succeeds.
+    #[tokio::test]
+    async fn udp_delete_of_claimed_slot_blob_rejected() {
+        let (handle, addr, storage) = start_test_listener().await;
+        let client = create_dtls_client(addr).await;
+
+        let (rid, bid, frame) = genuine_frame(42, 5, b"did-doc");
+        let ok = send_and_recv(
+            &client,
+            &ClientMessage::Publish {
+                ref_id: None,
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: frame,
+            },
+        )
+        .await;
+        assert!(matches!(
+            ok,
+            RelayMessage::Ok {
+                blob_id: Some(_),
+                ..
+            }
+        ));
+
+        // Attacker DELETEs the guessable slot blob_id.
+        let deleted = send_and_recv(
+            &client,
+            &ClientMessage::Delete {
+                ref_id: Some("d".into()),
+                blob_id: bid,
+            },
+        )
+        .await;
+        match deleted {
+            RelayMessage::Err { code: c, .. } => assert_eq!(c, code::DID_RECORD_REJECTED),
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
+
+        // Slot survives.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+
+        // A DELETE of an unrelated blob still returns OK.
+        let ok = send_and_recv(
+            &client,
+            &ClientMessage::Delete {
+                ref_id: None,
+                blob_id: [0xEE; 32],
+            },
+        )
+        .await;
+        assert!(matches!(ok, RelayMessage::Ok { .. }));
 
         handle.shutdown();
     }

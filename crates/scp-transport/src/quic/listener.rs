@@ -687,7 +687,7 @@ async fn handle_stream<S: BlobStorage + 'static>(
             .await
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_delete(send, ref_id, blob_id, &storage).await
+            handle_delete(send, ref_id, blob_id, &storage, &did_slots).await
         }
         ClientMessage::Ping { ts } => handle_ping(send, ts).await,
         ClientMessage::Unsubscribe { ref_id, routing_id } => {
@@ -1231,7 +1231,21 @@ async fn handle_delete<S: BlobStorage>(
     ref_id: Option<String>,
     blob_id: [u8; 32],
     storage: &Arc<S>,
+    did_slots: &DidSlotRegistry,
 ) -> Result<(), StreamError> {
+    // Slot-exclusivity: reject a DELETE of a claimed DID slot's blob over QUIC,
+    // identically to WebSocket (§3.10.2 rule (a), Fix B). Non-slot blobs proceed.
+    if did_slots.is_current_slot_blob(&blob_id).await {
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::DID_RECORD_REJECTED,
+            msg: "blob_id is a claimed DID-record slot; only a superseding \
+                  PUBLISH may replace it (slot-exclusive)"
+                .to_string(),
+        };
+        return write_and_finish(send, &err).await;
+    }
+
     // Best-effort deletion.
     let _ = storage.delete(&blob_id).await;
 
@@ -2203,6 +2217,61 @@ mod tests {
             [RelayMessage::Err { code, .. }] => assert_eq!(*code, code::DID_RECORD_REJECTED),
             other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
         }
+
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
+    /// Fix B: an unauthenticated DELETE of a claimed DID slot's blob over QUIC is
+    /// rejected and the slot survives; DELETE of a non-slot blob still succeeds.
+    #[tokio::test]
+    async fn quic_delete_of_claimed_slot_blob_rejected() {
+        let (handle, addr, certs, storage) = start_test_listener_validating();
+        let connection = connect_client(addr, &certs).await;
+
+        let (rid, bid, frame) = genuine_frame(41, 5, b"did-doc");
+        let ok = send_and_recv(
+            &connection,
+            &ClientMessage::Publish {
+                ref_id: None,
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: frame,
+            },
+        )
+        .await;
+        assert!(matches!(ok.as_slice(), [RelayMessage::Ok { .. }]));
+
+        // Attacker computes blob_id = SHA-256(genuine record) and DELETEs it.
+        let deleted = send_and_recv(
+            &connection,
+            &ClientMessage::Delete {
+                ref_id: Some("d".into()),
+                blob_id: bid,
+            },
+        )
+        .await;
+        match deleted.as_slice() {
+            [RelayMessage::Err { code, .. }] => assert_eq!(*code, code::DID_RECORD_REJECTED),
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
+
+        // Slot survives in storage and remains claimed.
+        let stored = storage.query(&rid, None, 100).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].blob_id, bid);
+
+        // A DELETE of an unrelated (non-slot) blob still succeeds.
+        let ok = send_and_recv(
+            &connection,
+            &ClientMessage::Delete {
+                ref_id: None,
+                blob_id: [0xEE; 32],
+            },
+        )
+        .await;
+        assert!(matches!(ok.as_slice(), [RelayMessage::Ok { .. }]));
 
         connection.close(0u32.into(), b"done");
         handle.shutdown();

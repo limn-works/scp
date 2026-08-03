@@ -1141,7 +1141,7 @@ async fn handle_client_message(
             .await;
         }
         ClientMessage::Delete { ref_id, blob_id } => {
-            handle_delete(ref_id.clone(), *blob_id, tx, storage).await;
+            handle_delete(ref_id.clone(), *blob_id, tx, storage, did_slots).await;
         }
         ClientMessage::Ack { .. } => {
             // ACK is fire-and-forget. No response.
@@ -1669,7 +1669,26 @@ async fn handle_delete(
     blob_id: [u8; 32],
     tx: &mpsc::Sender<RelayMessage>,
     storage: &Arc<BlobStorageBackend>,
+    did_slots: &DidSlotRegistry,
 ) {
+    // Slot-exclusivity: reject an (unauthenticated) DELETE of a claimed DID
+    // slot's blob. DID records are public, so blob_id is guessable; allowing this
+    // DELETE would revert the slot and reopen the pre-seed window (§3.10.2 rule
+    // (a) — only a superseding PUBLISH may replace a slot). Non-DID / non-slot
+    // blobs are unaffected (the claimed-slot index never lists them).
+    if did_slots.is_current_slot_blob(&blob_id).await {
+        let _ = tx
+            .send(RelayMessage::Err {
+                ref_id,
+                code: code::DID_RECORD_REJECTED,
+                msg: "blob_id is a claimed DID-record slot; only a superseding \
+                      PUBLISH may replace it (slot-exclusive)"
+                    .to_string(),
+            })
+            .await;
+        return;
+    }
+
     // Best-effort deletion -- always return OK.
     let _ = storage.delete(&blob_id).await;
 
@@ -2267,6 +2286,103 @@ mod tests {
                 event_type,
                 ..
             } if event_type == "query_complete"
+        ));
+    }
+
+    /// Builds a genuine, self-consistent DID-record frame at the signing key's
+    /// own DID-domain `routing_id`, returning `(routing_id, blob_id, bytes)`.
+    fn genuine_did_frame(seed: u8, seq: u64, value: &[u8]) -> ([u8; 32], [u8; 32], Vec<u8>) {
+        use ed25519_dalek::Signer;
+        use scp_dht::bep44_signable;
+        use scp_identity::{did_from_ed25519_public_key, resolution::did_routing_id};
+        use scp_protocol::envelope::did_record::DidRecordV1;
+        use sha2::{Digest, Sha256};
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        let did = did_from_ed25519_public_key(&vk.to_bytes());
+        let rid = did_routing_id(&did);
+        let signature: ed25519_dalek::Signature = sk.sign(&bep44_signable(value, seq));
+        let bytes = DidRecordV1::try_new(vk.to_bytes(), seq, signature.to_bytes(), value.to_vec())
+            .unwrap()
+            .encode();
+        let mut bid = [0u8; 32];
+        bid.copy_from_slice(&Sha256::digest(&bytes));
+        (rid, bid, bytes)
+    }
+
+    /// Fix B: an unauthenticated DELETE of a claimed DID slot's blob over the
+    /// WebSocket relay is rejected and the slot survives; a DELETE of a non-slot
+    /// blob is unaffected.
+    #[tokio::test]
+    async fn delete_of_claimed_did_slot_blob_rejected() {
+        let addr = start_test_server().await;
+        let (mut sink, mut stream) = connect_client(addr).await;
+
+        // Publish a genuine DID-record frame → claims the slot.
+        let (rid, bid, frame) = genuine_did_frame(51, 5, b"did-doc");
+        send_msg(
+            &mut sink,
+            &ClientMessage::Publish {
+                ref_id: None,
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: frame,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_msg(&mut stream).await,
+            RelayMessage::Ok { .. }
+        ));
+
+        // Attacker computes blob_id = SHA-256(genuine record) and DELETEs it.
+        send_msg(
+            &mut sink,
+            &ClientMessage::Delete {
+                ref_id: Some("d".into()),
+                blob_id: bid,
+            },
+        )
+        .await;
+        match recv_msg(&mut stream).await {
+            RelayMessage::Err { code: c, .. } => assert_eq!(c, code::DID_RECORD_REJECTED),
+            other => panic!("expected DID_RECORD_REJECTED, got {other:?}"),
+        }
+
+        // The slot survives: QUERY still returns exactly the slot record.
+        send_msg(
+            &mut sink,
+            &ClientMessage::Query {
+                ref_id: None,
+                routing_id: rid,
+                since: None,
+                limit: Some(100),
+            },
+        )
+        .await;
+        match recv_msg(&mut stream).await {
+            RelayMessage::Blob { blob_id, .. } => assert_eq!(blob_id, bid),
+            other => panic!("expected the slot Blob, got {other:?}"),
+        }
+        assert!(matches!(
+            recv_msg(&mut stream).await,
+            RelayMessage::Event { event_type, .. } if event_type == "query_complete"
+        ));
+
+        // A DELETE of an unrelated (non-slot) blob still succeeds.
+        send_msg(
+            &mut sink,
+            &ClientMessage::Delete {
+                ref_id: None,
+                blob_id: [0xEE; 32],
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_msg(&mut stream).await,
+            RelayMessage::Ok { .. }
         ));
     }
 

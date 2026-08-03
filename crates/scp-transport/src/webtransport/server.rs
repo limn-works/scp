@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::native::did_slot::DidSlotRegistry;
 use crate::native::storage::BlobStorage;
 use crate::relay::rate_limit::{ConnectionTracker, PublishRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
@@ -128,16 +129,21 @@ pub struct WebTransportListener<S: BlobStorage> {
     subscriptions: SubscriptionRegistry,
     connection_tracker: ConnectionTracker,
     publish_rate_limiter: PublishRateLimiter,
+    did_slots: DidSlotRegistry,
 }
 
 impl<S: BlobStorage + 'static> WebTransportListener<S> {
     /// Creates a new WebTransport listener with the given configuration
     /// and shared state.
     ///
-    /// The `storage`, `subscriptions`, `publish_rate_limiter`, and
-    /// `connection_tracker` are shared with the WebSocket relay server,
-    /// QUIC listener, and UDP/DTLS listener, enabling cross-transport
-    /// message delivery and unified rate limiting (ADR-037 AC3).
+    /// The `storage`, `subscriptions`, `publish_rate_limiter`,
+    /// `connection_tracker`, and `did_slots` are shared with the WebSocket relay
+    /// server, QUIC listener, and UDP/DTLS listener, enabling cross-transport
+    /// message delivery, unified rate limiting, and one shared DID-record slot
+    /// index so slot-exclusivity holds across every transport on the shared blob
+    /// store (ADR-037 AC3, §3.10.2). Obtain the shared registry via
+    /// [`RelayServer::did_slot_registry`](crate::native::server::RelayServer::did_slot_registry)
+    /// and set `config.session_config.did_record_validation` to the relay's mode.
     #[must_use]
     pub const fn new(
         config: WebTransportListenerConfig,
@@ -145,6 +151,7 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
         subscriptions: SubscriptionRegistry,
         publish_rate_limiter: PublishRateLimiter,
         connection_tracker: ConnectionTracker,
+        did_slots: DidSlotRegistry,
     ) -> Self {
         Self {
             config,
@@ -152,6 +159,7 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
             subscriptions,
             connection_tracker,
             publish_rate_limiter,
+            did_slots,
         }
     }
 
@@ -187,6 +195,7 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
             shutdown_token,
             self.publish_rate_limiter.clone(),
             remote_ip,
+            self.did_slots.clone(),
         )
     }
 
@@ -246,6 +255,7 @@ mod tests {
             subscriptions,
             rate_limiter,
             conn_tracker,
+            DidSlotRegistry::new(),
         )
     }
 
