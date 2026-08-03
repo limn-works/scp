@@ -1785,25 +1785,29 @@
       "gate": "gate-errors",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "scripts/check-error-codes.sh",
+        "crates/scp-protocol/src/context/outlets/error_codes.rs",
         ".docs/standards/sdk-common.md"
       ],
-      "description": "Extend `scripts/check-error-codes.sh` so it validates the new 6100-6199 sub-block: every SCP-OUTLET-61NN code must appear in the crates/scp-protocol/src/context/outlets/error_codes.rs registry AND the associated OutletErrorClass variant must appear as a Rust literal in the same file. The script also grep-asserts that every SCP-OUTLET-61NN code found across the tree is registered. Update `.docs/standards/sdk-common.md` stub policy section with the 6100-6199 allocation.",
+      "description": "Extend `scripts/check-error-codes.sh` (Phase 4) to validate the \u00a75.4.4 6100-6199 outlet-error sub-block against the `crates/scp-protocol/src/context/outlets/error_codes.rs` registry, using a sound-by-construction (lexer-free) design. Rust code MUST reference the `CODE_*` constants, never a raw \"SCP-OUTLET-61NN\" literal, so the Rust half is a plain grep: any raw sub-block literal in any .rs file other than the registry is a violation (SCP-CODE-OK: marks the rare exception). The SDK half is a genuine cross-language drift check: Kotlin/Swift/Python/TypeScript restated literals must be in the allocated set, with test files excluded by path glob. The 'every allocated code maps to a class' invariant is enforced in Rust unit tests in the registry (not re-parsed by the shell). Document the sub-block and enforcement in `.docs/standards/sdk-common.md`.",
       "acceptanceCriteria": [
-        "check-error-codes.sh reads crates/scp-protocol/src/context/outlets/error_codes.rs and extracts all allocated codes in the 6100-6199 range",
-        "Script fails if any SCP-OUTLET-61NN in the tree is NOT in the allocated set",
-        "Script fails if any allocated code in the registry is missing its OutletErrorClass variant literal in the same file",
-        "Script output lists all 8 classes at every run",
-        "Running bash scripts/check-error-codes.sh exits 0 once the registry from SCP-OUT-036 is in place",
-        ".docs/standards/sdk-common.md \u00a7Error Code Registry (or the equivalent \u00a7) documents the 6100-6199 sub-block and the outlet class allocation",
+        "check-error-codes.sh extracts the allocated 6100-6199 set from the `pub const CODE_* = \"SCP-OUTLET-61NN\"` definitions in crates/scp-protocol/src/context/outlets/error_codes.rs",
+        "check-error-codes.sh (Phase 4, Rust half) fails if any raw double-quoted \"SCP-OUTLET-61NN\" literal appears in any .rs file other than crates/scp-protocol/src/context/outlets/error_codes.rs; the SCP-CODE-OK: marker on the line opts out a comment/reserved-range fixture",
+        "check-error-codes.sh (Phase 4, SDK half) fails if any SCP-OUTLET-61NN literal restated in a non-test Kotlin/Swift/Python/TypeScript/JS binding file is not in the allocated set; SDK test files are excluded by path glob",
+        "error_codes.rs unit test all_codes_lists_exactly_the_defined_code_constants asserts ALL_CODES equals the set of `pub const CODE_* = \"SCP-OUTLET-61NN\"` definitions, and every_allocated_code_resolves_class_default_slug_retry_policy asserts every ALL_CODES entry resolves to a class via the exhaustive error_code_to_class match (together enforcing 'every allocated code maps to a class')",
+        "check-error-codes.sh prints all 8 OutletErrorClass variants (Protocol, Authorization, Input, Execution, Output, Economic, Transport, Governance) on every run",
+        "Running bash scripts/check-error-codes.sh exits 0 against the current registry",
+        ".docs/standards/sdk-common.md \u00a7Error Code Registry documents the 6100-6199 sub-block, the 8-class allocation, and the split Rust/SDK enforcement",
         "CI job that runs check-error-codes.sh remains green"
       ],
       "actionItems": [
-        "Extend check-error-codes.sh with outlet-sub-block logic",
+        "Add Phase 4 to check-error-codes.sh: allocated-set extraction, Rust no-raw-literal-outside-registry check, SDK allocated-set membership with path-based test exclusion, and the 8-class printout",
+        "Convert every raw SCP-OUTLET-61NN literal in Rust outside error_codes.rs to the appropriate CODE_* constant (single source of truth)",
+        "Add the all_codes_lists_exactly_the_defined_code_constants unit test to error_codes.rs",
         "Update sdk-common.md documentation",
-        "Run the script and confirm pass"
+        "Run the script and confirm it exits 0"
       ],
       "blockedBy": [
         "SCP-OUT-025"
@@ -1819,7 +1823,7 @@
         }
       ],
       "details": {
-        "auditNote": "Downgraded from done (audit): scripts/check-error-codes.sh has no 6100-6199 sub-block gate or OutletErrorClass literal assertion \u2014 the gate is toothless. Tracked in #2219."
+        "auditNote": "Downgraded from done (audit): scripts/check-error-codes.sh has no 6100-6199 sub-block gate or OutletErrorClass literal assertion \u2014 the gate is toothless. Tracked in #2219. RECOVERED (#2219, sound-by-construction redesign): the gate now enforces the sub-block, but the MECHANISM was deliberately changed from the original AC wording, which is STRENGTHENED not weakened. Two independent reviewers (simplifier + bug-catcher) flagged the first recovery attempt's awk-based live-vs-test discrimination (brace-counting the #[cfg(test)] skip + comment parsing) as fragile and UNSOUND: bug-catcher reproduced a HIGH false-negative (an unbalanced '{' inside a cfg(test) string kept the skip active past the module close, so a later production unallocated \"SCP-OUTLET-6199\" literal was never scanned and the gate PASSED when it must FAIL) plus MEDIUM false-positives (feature-gated tests, block/trailing comments). Rather than reimplement a Rust lexer in bash (the non-convergent denylist rabbit hole CLAUDE.md forbids), the design was reframed: (1a) Rust MUST reference the CODE_* constants \u2014 a raw \"SCP-OUTLET-61NN\" literal in ANY .rs file except the registry (test or not) is a violation, so NO cfg(test)/comment discrimination is needed (plain grep, sound and trivial); every prior raw literal in Rust (scp-protocol errors.rs/stream.rs/caveats.rs, scp-runtime outlets_helpers.rs, scp-mcp translator.rs + tests, scp-ffi napi/uniffi/pyo3 test files, scp-testing integration tests) was converted to the CODE_* const (one source of truth); (1b) the SDK bindings, which legitimately restate the literals and cannot reference the Rust consts, keep the allocated-set membership check with PATH-based test exclusion (no comment/brace parsing) \u2014 this is the gate's genuinely additive cross-language drift value that cargo test cannot provide; (3) the class-mapping invariant moved OUT of shell awk (which redundantly re-checked a compile-time match and could only rot) INTO Rust: the exhaustive error_code_to_class match plus the new all_codes_lists_exactly_the_defined_code_constants test (closing the real residual gap \u2014 a CODE_* const omitted from ALL_CODES previously escaped the resolve-coverage test) plus every_allocated_code_resolves_* enforce it soundly at compile/test time; the shell keeps only the 8-class printout for operator legibility. HIGH-closed proof: the Case-H reproduction (unbalanced brace in a cfg(test) string + a later production unallocated 6199) now FAILS the gate. MEDIUM-fp proof: a reserved code referenced via a CODE_* const in a feature-gated test PASSES, and an SDK reserved literal in a path-excluded test file PASSES. Verified green: bash scripts/check-error-codes.sh exit 0; cargo test -p scp-protocol error_codes (incl. the new test) + caveats + scp-mcp translator pass; cargo fmt --all; full-workspace cargo test --no-run compiles clean under the CI feature set. (The workspace clippy --all-targets full-feature invocation is pre-existingly red on origin/main at scp-transport/relay_querier from the tip relay-res commit \u2014 unrelated to this story; proven identical with changes stashed.)"
       }
     },
     {

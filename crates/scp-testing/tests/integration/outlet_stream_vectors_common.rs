@@ -346,7 +346,7 @@ impl OutletExecutor for ScriptedExecutor {
 /// excess and the credit-stall timer fires (the vector's terminal `Error` chunk
 /// is framework-emitted, not executor-emitted).
 pub fn build_script(vec: &Vector) -> (Vec<ChunkPayload>, TerminalAction) {
-    if vec.expected_error_code.as_deref() == Some("SCP-OUTLET-6133") {
+    if vec.expected_error_code.as_deref() == Some(scp_protocol::CODE_EXECUTION_CREDIT_STALL) {
         // credit_stall: send credit_window + 1 Data chunks so the (window+1)th
         // parks with credit at zero; never terminate — the framework drives the
         // credit-stall terminal.
@@ -813,7 +813,11 @@ fn sequence_gap_receiver_tracker_cancels_with_6131() {
                     .expect("gap has an error code"),
                 "gap cancel code is execution.stream-gap / SCP-OUTLET-6131"
             );
-            assert_eq!(code, "SCP-OUTLET-6131", "gap code is 6131");
+            assert_eq!(
+                code,
+                scp_protocol::CODE_EXECUTION_CREDIT,
+                "gap code is 6131"
+            );
             fired_at = Some(i);
             break;
         }

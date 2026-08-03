@@ -3738,7 +3738,7 @@ mod tests {
             .expect_err("second exceeds cap");
             let msg = format!("{err}");
             assert!(
-                msg.contains("SCP-OUTLET-6110") && msg.contains("maxCalls"),
+                msg.contains(scp_protocol::CODE_AUTHORIZATION_DENIED) && msg.contains("maxCalls"),
                 "exhaustion must map to the Authorization code + kind slug: {msg}"
             );
         }
@@ -4168,7 +4168,7 @@ mod tests {
             .await
             .expect_err("populated allowed_target_dids must reject a same-context call");
             assert!(
-                format!("{err}").contains("SCP-OUTLET-6110"),
+                format!("{err}").contains(scp_protocol::CODE_AUTHORIZATION_DENIED),
                 "target-DID reject must surface a caveat violation: {err}"
             );
             assert!(
@@ -4197,7 +4197,7 @@ mod tests {
             .await
             .expect_err("populated allowed_adapters must reject when no adapter is negotiated");
             assert!(
-                format!("{err}").contains("SCP-OUTLET-6110"),
+                format!("{err}").contains(scp_protocol::CODE_AUTHORIZATION_DENIED),
                 "adapter reject must surface a caveat violation: {err}"
             );
         }

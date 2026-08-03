@@ -1208,11 +1208,14 @@ mod tests {
         let mcp = json!({
             "content": [ { "type": "text", "text": "permission denied" } ],
             "isError": true,
-            "_meta": { "scp_error_code": "SCP-OUTLET-6110", "scp_slug": "authorization.denied" }
+            "_meta": { "scp_error_code": scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED, "scp_slug": "authorization.denied" }
         });
         let scp = mcp_to_scp(mcp);
         let err = &scp["error"];
-        assert_eq!(err["code"], "SCP-OUTLET-6110");
+        assert_eq!(
+            err["code"],
+            scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED
+        );
         assert_eq!(err["slug"], "authorization.denied");
         assert_eq!(err["message"], "permission denied");
     }
@@ -1221,7 +1224,7 @@ mod tests {
     fn outlet_error_becomes_call_tool_result() {
         let scp = json!({
             "error": {
-                "code": "SCP-OUTLET-6110",
+                "code": scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
                 "slug": "authorization.denied",
                 "class": "Authorization",
                 "message": "permission denied",
@@ -1230,7 +1233,10 @@ mod tests {
         });
         let mcp = scp_to_mcp(scp);
         assert_eq!(mcp["isError"], true);
-        assert_eq!(mcp["_meta"]["scp_error_code"], "SCP-OUTLET-6110");
+        assert_eq!(
+            mcp["_meta"]["scp_error_code"],
+            scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED
+        );
         assert_eq!(mcp["_meta"]["scp_slug"], "authorization.denied");
         assert_eq!(mcp["_meta"]["scp_class"], "Authorization");
         let text = mcp["content"][0]["text"].as_str().unwrap();
@@ -1241,7 +1247,7 @@ mod tests {
     fn outlet_error_without_content_synthesizes_text_from_message() {
         let scp = json!({
             "error": {
-                "code": "SCP-OUTLET-6130",
+                "code": scp_core::context::outlets::error_codes::CODE_EXECUTION_FAULT,
                 "message": "handler panicked"
             }
         });

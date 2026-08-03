@@ -1677,9 +1677,10 @@ pub fn fully_populated_open_fixture() -> OutletStreamOpen {
 mod tests {
     use super::*;
     use crate::context::outlets::error_codes::{
-        CODE_AUTHORIZATION_DENIED, CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION,
-        SLUG_AUTHORIZATION_ATTENUATION_VIOLATION, SLUG_AUTHORIZATION_REVOKED_MID_STREAM,
-        SLUG_PROTOCOL_STREAM_ALREADY_OPEN, SLUG_PROTOCOL_UNKNOWN_SESSION,
+        CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_FAULT,
+        CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
+        SLUG_AUTHORIZATION_REVOKED_MID_STREAM, SLUG_PROTOCOL_STREAM_ALREADY_OPEN,
+        SLUG_PROTOCOL_UNKNOWN_SESSION,
     };
     use crate::context::outlets::errors::OutletErrorClass;
     use crate::context::params::MemoryScope;
@@ -1813,7 +1814,7 @@ mod tests {
     fn chunk_payload_is_terminal_error_terminal_only() {
         assert!(
             ChunkPayload::Error {
-                code: "SCP-OUTLET-6130".into(),
+                code: CODE_EXECUTION_FAULT.into(),
                 message: "panic".into(),
                 terminal: true,
             }
@@ -1821,7 +1822,7 @@ mod tests {
         );
         assert!(
             !ChunkPayload::Error {
-                code: "SCP-OUTLET-6130".into(),
+                code: CODE_EXECUTION_FAULT.into(),
                 message: "warn".into(),
                 terminal: false,
             }
@@ -1836,7 +1837,7 @@ mod tests {
     #[test]
     fn stream_terminal_status_three_variants() {
         let _ = StreamTerminalStatus::Ok;
-        let _ = StreamTerminalStatus::Error("SCP-OUTLET-6130".into());
+        let _ = StreamTerminalStatus::Error(CODE_EXECUTION_FAULT.into());
         let _ = StreamTerminalStatus::Cancelled;
     }
 
@@ -1844,7 +1845,7 @@ mod tests {
     fn stream_terminal_status_serde_roundtrip() {
         let cases = [
             StreamTerminalStatus::Ok,
-            StreamTerminalStatus::Error("SCP-OUTLET-6135".into()),
+            StreamTerminalStatus::Error(CODE_EXECUTION_CANCEL_ACK_TIMEOUT.into()),
             StreamTerminalStatus::Cancelled,
         ];
         for status in cases {
@@ -2463,7 +2464,7 @@ mod tests {
     #[test]
     fn chunk_payload_type_first_error() {
         let p = ChunkPayload::Error {
-            code: "SCP-OUTLET-6130".into(),
+            code: CODE_EXECUTION_FAULT.into(),
             message: "x".into(),
             terminal: true,
         };
@@ -2518,7 +2519,7 @@ mod tests {
         // Error with body keys 'code', 'message', 'terminal' — 'c' is
         // close to 'a'.
         let p_e = ChunkPayload::Error {
-            code: "SCP-OUTLET-6130".into(),
+            code: CODE_EXECUTION_FAULT.into(),
             message: "x".into(),
             terminal: false,
         };
@@ -2943,7 +2944,7 @@ mod tests {
                 execution_time_ms: sequence,
             },
             _ => ChunkPayload::Error {
-                code: "SCP-OUTLET-6130".to_owned(),
+                code: CODE_EXECUTION_FAULT.to_owned(),
                 message: "err".to_owned(),
                 terminal: true,
             },

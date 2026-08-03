@@ -72,7 +72,7 @@ const EXPECTED_OPERATOR_PK: [u8; 32] = [
 ];
 /// §5.4.5 stream-gap code (shared `CODE_EXECUTION_CREDIT`, slug
 /// `execution.stream-gap`).
-const CODE_STREAM_GAP: &str = "SCP-OUTLET-6131";
+const CODE_STREAM_GAP: &str = scp_core::context::outlets::error_codes::CODE_EXECUTION_CREDIT;
 
 fn vectors() -> serde_json::Value {
     let raw = include_str!("../../../../tests/conformance/vectors/outlet_stream_vectors.json");

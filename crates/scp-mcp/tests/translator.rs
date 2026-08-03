@@ -202,20 +202,23 @@ fn round_trip_mcp_to_scp_to_mcp_modulo_kind_annotation() {
 fn outlet_error_envelope_round_trip() {
     let scp_err = json!({
         "error": {
-            "code": "SCP-OUTLET-6110",
+            "code": scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
             "slug": "authorization.denied",
             "class": "Authorization",
             "message": "permission denied",
             "retry": "Never",
             "source_chain": [
-                { "context_id": "hmac_abc", "wrapped_code": "SCP-OUTLET-6110" }
+                { "context_id": "hmac_abc", "wrapped_code": scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED }
             ],
             "content": [ { "type": "text", "text": "permission denied" } ]
         }
     });
     let mcp = scp_to_mcp(scp_err);
     assert_eq!(mcp["isError"], true);
-    assert_eq!(mcp["_meta"]["scp_error_code"], "SCP-OUTLET-6110");
+    assert_eq!(
+        mcp["_meta"]["scp_error_code"],
+        scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED
+    );
     assert_eq!(mcp["_meta"]["scp_slug"], "authorization.denied");
     assert_eq!(mcp["_meta"]["scp_class"], "Authorization");
     assert_eq!(mcp["_meta"]["scp_retry"], "Never");
@@ -224,7 +227,10 @@ fn outlet_error_envelope_round_trip() {
     // Round-trip back — structured fields must reappear in the SCP envelope.
     let back = mcp_to_scp(mcp);
     let err = &back["error"];
-    assert_eq!(err["code"], "SCP-OUTLET-6110");
+    assert_eq!(
+        err["code"],
+        scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED
+    );
     assert_eq!(err["slug"], "authorization.denied");
     assert_eq!(err["class"], "Authorization");
     assert_eq!(err["retry"], "Never");
@@ -240,7 +246,7 @@ fn error_message_richer_than_content_survives_round_trip() {
     let rich = "detailed authorization failure: token nb caveat exceeded at edge 3";
     let scp_err = json!({
         "error": {
-            "code": "SCP-OUTLET-6110",
+            "code": scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
             "message": rich,
             "content": [ { "type": "text", "text": "denied" } ]
         }
@@ -277,7 +283,7 @@ fn error_envelope_with_sibling_keys_still_marks_iserror() {
     // recognized as an error (object-typed `error` detection is not gated on
     // len==1) — a sibling must not suppress the MCP isError marker.
     let scp = json!({
-        "error": { "code": "SCP-OUTLET-6130", "message": "boom" },
+        "error": { "code": scp_core::context::outlets::error_codes::CODE_EXECUTION_FAULT, "message": "boom" },
         "trace_id": "tr-9"
     });
     let mcp = scp_to_mcp(scp);
@@ -285,7 +291,10 @@ fn error_envelope_with_sibling_keys_still_marks_iserror() {
         mcp["isError"], true,
         "sibling key must not suppress isError"
     );
-    assert_eq!(mcp["_meta"]["scp_error_code"], "SCP-OUTLET-6130");
+    assert_eq!(
+        mcp["_meta"]["scp_error_code"],
+        scp_core::context::outlets::error_codes::CODE_EXECUTION_FAULT
+    );
     // The sibling is preserved (translated) on the MCP side.
     assert_eq!(mcp["trace_id"], "tr-9");
 }
@@ -298,7 +307,7 @@ fn error_envelope_colliding_sibling_cannot_clobber_iserror() {
     // real error back to success (fail-open). The colliding siblings are dropped
     // for these owned keys, not applied.
     let scp = json!({
-        "error": { "code": "SCP-OUTLET-6130", "message": "boom" },
+        "error": { "code": scp_core::context::outlets::error_codes::CODE_EXECUTION_FAULT, "message": "boom" },
         "isError": false,
         "content": [ { "type": "text", "text": "not the real content" } ],
         "_meta": { "scp_error_code": "SPOOFED" }
@@ -310,7 +319,10 @@ fn error_envelope_colliding_sibling_cannot_clobber_iserror() {
     );
     // The error translation's own content/_meta win over the crafted siblings.
     assert_eq!(mcp["content"][0]["text"], "boom");
-    assert_eq!(mcp["_meta"]["scp_error_code"], "SCP-OUTLET-6130");
+    assert_eq!(
+        mcp["_meta"]["scp_error_code"],
+        scp_core::context::outlets::error_codes::CODE_EXECUTION_FAULT
+    );
 }
 
 #[test]

@@ -1253,6 +1253,10 @@ mod serde_pad_nonce {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::context::outlets::error_codes::{
+        CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_FAULT, CODE_PROTOCOL_VIOLATION,
+        CODE_TRANSPORT_FAULT,
+    };
 
     fn fixed_outlet_message_key() -> [u8; OUTLET_MESSAGE_KEY_LEN] {
         [0x42; OUTLET_MESSAGE_KEY_LEN]
@@ -1287,7 +1291,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-OUTLET-6110",
+            code: CODE_AUTHORIZATION_DENIED,
             slug: "authorization.denied",
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::Authorization {
@@ -1377,7 +1381,7 @@ mod tests {
         let hop = ContextHop {
             context_id: "ctx-a".to_owned(),
             hop_index: 0,
-            wrapped_code: "SCP-OUTLET-6110".to_owned(),
+            wrapped_code: CODE_AUTHORIZATION_DENIED.to_owned(),
         };
         let json = serde_json::to_string(&hop).unwrap();
         assert!(json.contains("\"context_id\""));
@@ -1390,7 +1394,7 @@ mod tests {
         let hop = ContextHop {
             context_id: "ctx-b".to_owned(),
             hop_index: 7,
-            wrapped_code: "SCP-OUTLET-6130".to_owned(),
+            wrapped_code: CODE_EXECUTION_FAULT.to_owned(),
         };
         let bytes = rmp_serde::to_vec_named(&hop).unwrap();
         let back: ContextHop = rmp_serde::from_slice(&bytes).unwrap();
@@ -1522,7 +1526,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-OUTLET-6110",
+            code: CODE_AUTHORIZATION_DENIED,
             slug: "Authorization.Denied", // uppercase — invalid
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::Authorization {
@@ -1563,7 +1567,7 @@ mod tests {
             // Mismatch: 6110 is the Authorization-class code per the registry,
             // but the caller-supplied class is Input.
             class: OutletErrorClass::Input,
-            code: "SCP-OUTLET-6110",
+            code: CODE_AUTHORIZATION_DENIED,
             slug: "authorization.denied",
             retry: RetryPolicy::Never,
             detail: None,
@@ -1576,7 +1580,7 @@ mod tests {
                 expected,
                 actual,
             }) => {
-                assert_eq!(code_or_slug, "SCP-OUTLET-6110");
+                assert_eq!(code_or_slug, CODE_AUTHORIZATION_DENIED);
                 assert_eq!(expected, OutletErrorClass::Authorization);
                 assert_eq!(actual, OutletErrorClass::Input);
             }
@@ -1607,7 +1611,7 @@ mod tests {
             // (6160) but a mismatched Authorization class. The slug check
             // (which runs after the code check) surfaces the diagnostic.
             class: OutletErrorClass::Authorization,
-            code: "SCP-OUTLET-6160",
+            code: CODE_TRANSPORT_FAULT,
             slug: "transport.relay-unavailable",
             retry: RetryPolicy::WithBackoff {
                 min: Duration::from_secs(1),
@@ -1624,7 +1628,7 @@ mod tests {
                 actual,
             }) => {
                 // Code 6160 is Transport — the code check rejects first.
-                assert_eq!(code_or_slug, "SCP-OUTLET-6160");
+                assert_eq!(code_or_slug, CODE_TRANSPORT_FAULT);
                 assert_eq!(expected, OutletErrorClass::Transport);
                 assert_eq!(actual, OutletErrorClass::Authorization);
             }
@@ -1649,8 +1653,9 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            // 6180 is reserved per §5.4.4 — no registry class.
-            code: "SCP-OUTLET-6180",
+            // 6180 is reserved per §5.4.4 — no registry class, so no CODE_*
+            // constant exists to reference here.
+            code: "SCP-OUTLET-6180", // SCP-CODE-OK: reserved-range envelope fixture (§5.4.4)
             slug: "execution.handler-panic",
             retry: RetryPolicy::Never,
             detail: None,
@@ -1687,7 +1692,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Execution,
-            code: "SCP-OUTLET-6130",
+            code: CODE_EXECUTION_FAULT,
             slug: "execution.handler-panic",
             retry: RetryPolicy::Never,
             detail: None,
@@ -1696,7 +1701,7 @@ mod tests {
         })
         .expect("registry-aligned construction must succeed");
         assert_eq!(env.class, OutletErrorClass::Execution);
-        assert_eq!(env.code, "SCP-OUTLET-6130");
+        assert_eq!(env.code, CODE_EXECUTION_FAULT);
         assert_eq!(env.slug, "execution.handler-panic");
     }
 
@@ -1716,7 +1721,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-OUTLET-6110",
+            code: CODE_AUTHORIZATION_DENIED,
             slug: "AUTHORIZATION.DENIED", // uppercase — fails §5.4.4 regex
             retry: RetryPolicy::Never,
             detail: None,
@@ -1750,7 +1755,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-OUTLET-6100",
+            code: CODE_PROTOCOL_VIOLATION,
             slug: "query-cost-violation", // Protocol-class per registry
             retry: RetryPolicy::Never,
             detail: None,
@@ -1771,9 +1776,13 @@ mod tests {
     #[test]
     fn constructor_accepts_valid_canonical_code_range() {
         // Positive-test fixture for the range validator. 6199 is a §5.4.4
-        // reserved-gap that the range validator must accept even though no
-        // CODE_* constant is allocated for it.
-        let valid_codes: [&str; 3] = ["SCP-OUTLET-6100", "SCP-OUTLET-6110", "SCP-OUTLET-6199"];
+        // reserved-gap with no allocated CODE_* constant that the range
+        // validator must still accept, so it stays a raw literal here.
+        let valid_codes: [&str; 3] = [
+            CODE_PROTOCOL_VIOLATION,
+            CODE_AUTHORIZATION_DENIED,
+            "SCP-OUTLET-6199", // SCP-CODE-OK: reserved-gap 6199 (no const) for range validator
+        ];
         for code in valid_codes {
             assert!(validate_outlet_error_code(code), "expected valid: {code}");
         }
@@ -1816,7 +1825,7 @@ mod tests {
             catalog_key: &unknown,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-OUTLET-6110",
+            code: CODE_AUTHORIZATION_DENIED,
             slug: "authorization.denied",
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::Authorization {
@@ -1869,7 +1878,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Protocol,
-            code: "SCP-OUTLET-6100",
+            code: CODE_PROTOCOL_VIOLATION,
             slug: "protocol.query-cost-violation",
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::FieldViolation {
@@ -1903,7 +1912,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Execution,
-            code: "SCP-OUTLET-6130",
+            code: CODE_EXECUTION_FAULT,
             slug: "execution.handler-panic",
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::ExecutionPanic {
@@ -2067,7 +2076,7 @@ mod tests {
         err.source_chain = vec![ContextHop {
             context_id: "ctx-x".to_owned(),
             hop_index: 0,
-            wrapped_code: "SCP-OUTLET-6110".to_owned(),
+            wrapped_code: CODE_AUTHORIZATION_DENIED.to_owned(),
         }];
         let bytes = rmp_serde::to_vec_named(&err).unwrap();
         let back: OutletError = rmp_serde::from_slice(&bytes).unwrap();
@@ -2081,7 +2090,7 @@ mod tests {
         err.source_chain = vec![ContextHop {
             context_id: "ctx-y".to_owned(),
             hop_index: 1,
-            wrapped_code: "SCP-OUTLET-6130".to_owned(),
+            wrapped_code: CODE_EXECUTION_FAULT.to_owned(),
         }];
         let bytes = serde_json::to_vec(&err).unwrap();
         let back: OutletError = serde_json::from_slice(&bytes).unwrap();
@@ -2220,12 +2229,12 @@ mod tests {
             ContextHop {
                 context_id: "ctx-0".to_owned(),
                 hop_index: 0,
-                wrapped_code: "SCP-OUTLET-6110".to_owned(),
+                wrapped_code: CODE_AUTHORIZATION_DENIED.to_owned(),
             },
             ContextHop {
                 context_id: "ctx-1".to_owned(),
                 hop_index: 1,
-                wrapped_code: "SCP-OUTLET-6130".to_owned(),
+                wrapped_code: CODE_EXECUTION_FAULT.to_owned(),
             },
         ];
         let bytes = rmp_serde::to_vec_named(&err).unwrap();
@@ -2304,7 +2313,7 @@ mod tests {
         let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = vec![
             (
                 rmpv::Value::String("1".into()),
-                rmpv::Value::String("SCP-OUTLET-6110".into()),
+                rmpv::Value::String(CODE_AUTHORIZATION_DENIED.into()),
             ),
             (
                 rmpv::Value::String("2".into()),

@@ -2913,7 +2913,7 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
             .expect_err("a non-member invoker is rejected at the runtime membership gate");
         let msg = open_err.to_string();
         assert!(
-            msg.contains("SCP-OUTLET-6110"),
+            msg.contains(scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED),
             "the open reached the runtime and mapped its rejection to the canonical \
              NON-RETRYABLE authorization-denied code (#2196: a non-member membership \
              denial is SCP-OUTLET-6110 authorization.denied, NOT the old wrongly-retryable \
@@ -3141,7 +3141,7 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
         if let Err(e) = scp.outlet_stream_grant_credit(py, &handle_id, &invoker, 1) {
             let msg = e.to_string();
             assert!(
-                !msg.contains("SCP-OUTLET-6110"),
+                !msg.contains(scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED),
                 "a correctly bridge-signed grant must not be rejected as a signature/auth \
                  failure: {msg}"
             );

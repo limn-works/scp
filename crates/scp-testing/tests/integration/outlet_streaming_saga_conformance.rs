@@ -689,7 +689,7 @@ fn receive_side_drain_lossy_fires_stream_gap_6131() {
     let file = load();
     let v: LossySpec = spec(&file, "receive_side_drain_lossy");
     assert_eq!(v.expected_end_status, "Cancelled");
-    assert_eq!(v.expected_error_code, "SCP-OUTLET-6131");
+    assert_eq!(v.expected_error_code, scp_protocol::CODE_EXECUTION_CREDIT);
     assert_eq!(
         v.expected_error_code, CODE_STREAM_GAP,
         "the vector's gap code is the consolidated execution.stream-gap code"
@@ -757,5 +757,9 @@ fn aggregate_schema_violation_maps_to_6140() {
         code, v.expected_error_code,
         "an aggregate-schema violation maps to SCP-OUTLET-6140"
     );
-    assert_eq!(code, "SCP-OUTLET-6140", "the Output-class code is 6140");
+    assert_eq!(
+        code,
+        scp_protocol::CODE_OUTPUT_VIOLATION,
+        "the Output-class code is 6140"
+    );
 }

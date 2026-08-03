@@ -737,6 +737,67 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// `ALL_CODES` must list EXACTLY the set of `pub const CODE_* =
+    /// "SCP-OUTLET-NNNN"` definitions in this file.
+    ///
+    /// This closes the one residual completeness gap that the resolve-coverage
+    /// tests below cannot: those iterate `ALL_CODES`, so a code const that is
+    /// *defined* but accidentally omitted from `ALL_CODES` would never be
+    /// exercised — it could lack a class/slug/retry mapping and no test would
+    /// notice. We source-parse our own file for the const definitions (the
+    /// authoritative allocation) and assert the two sets are equal. Combined
+    /// with `every_allocated_code_resolves_class_default_slug_retry_policy`
+    /// (every `ALL_CODES` entry resolves to a class via the exhaustive
+    /// `error_code_to_class` match), this pins "every defined outlet code maps
+    /// to a class" at compile/test time — the invariant the `check-error-codes.sh`
+    /// gate used to re-check by parsing this file with awk (SCP-OUT-030).
+    #[test]
+    fn all_codes_lists_exactly_the_defined_code_constants() {
+        let src = include_str!("error_codes.rs");
+        let mut defined: Vec<&str> = Vec::new();
+        for line in src.lines() {
+            // Match a top-level `pub const CODE_<NAME>: &str = "SCP-OUTLET-NNNN";`
+            // definition and extract the quoted literal. Only *definitions* start
+            // with this prefix; references (`CODE_FOO`) and docs (`///`) do not.
+            // The prefix compared below is intentionally digit-free so this line
+            // is not itself scanned as an error-code literal by check-error-codes.sh.
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("pub const CODE_") else {
+                continue;
+            };
+            let Some(open) = rest.find('"') else { continue };
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else {
+                continue;
+            };
+            let literal = &after[..close];
+            if let Some(tail) = literal.strip_prefix("SCP-OUTLET-") {
+                // Guard: a 4-digit `61NN` tail keeps us inside the 6100..6199
+                // sub-block (compared as "61" — no `SCP-` prefix — so this stays
+                // invisible to the error-code range scanner).
+                if tail.len() == 4
+                    && tail.starts_with("61")
+                    && tail.bytes().all(|b| b.is_ascii_digit())
+                {
+                    defined.push(literal);
+                }
+            }
+        }
+        defined.sort_unstable();
+        defined.dedup();
+
+        let mut allocated: Vec<&str> = ALL_CODES.to_vec();
+        allocated.sort_unstable();
+        allocated.dedup();
+
+        assert_eq!(
+            defined, allocated,
+            "ALL_CODES must list exactly the `pub const CODE_* = \"SCP-OUTLET-NNNN\"` \
+             definitions in error_codes.rs — a defined const missing from ALL_CODES \
+             escapes the resolve-coverage tests"
+        );
+    }
+
     /// Every code in `ALL_CODES` resolves through every lookup function.
     /// Drives AC: "every allocated code has a class, default slug, retry
     /// policy entry."
