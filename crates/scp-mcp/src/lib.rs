@@ -11,7 +11,7 @@
 //!   splitting) and built-in tool definitions (`send_message`, `read_messages`,
 //!   `list_members`).
 //! - [`translator`] -- Purely lexical `outlet` ↔ `tool` boundary translation
-//!   per §8.5 / ADR-049. MCP messages inbound are rewritten to SCP outlet
+//!   per §8.5 / ADR-015. MCP messages inbound are rewritten to SCP outlet
 //!   vocabulary; SCP messages outbound are rewritten to MCP tool vocabulary.
 //!   Only ENVELOPE identifiers and field names are translated (method names,
 //!   `tool.name` ↔ `outlet_id`, schema field names, the error envelope); opaque
@@ -68,11 +68,12 @@
 //! });
 //! let scp = mcp_to_scp(mcp);
 //! assert_eq!(scp["params"]["outlet_id"], "lookup_users");
-//! assert_eq!(scp["params"]["kind"], "Query");
+//! // The SCP-side `kind` uses the canonical lowercase serde spelling.
+//! assert_eq!(scp["params"]["kind"], "query");
 //! # let _ = OutletKind::Query;
 //! ```
 //!
-//! See ADR-015 in `.docs/adrs/phase-3.md` and ADR-049 §8.5 for the full
+//! See ADR-015 in `.docs/adrs/phase-3.md` and spec §8.5 for the full
 //! design.
 
 #![forbid(unsafe_code)]

@@ -9,7 +9,7 @@
 //! - `scp_to_mcp(mcp_to_scp(mcp))` reconstructs the original MCP value up to
 //!   the expected `x-scp-kind` annotation the translator injects to keep the
 //!   kind recoverable. A normalization pass strips that annotation for
-//!   comparison — the ADR-049 §8.5 round-trip contract permits the
+//!   comparison — the §8.5 / ADR-015 round-trip contract permits the
 //!   annotation because the alternative (silently dropping the kind) would
 //!   make MCP→SCP→MCP round-trips lossy for Query outlets.
 //!
@@ -55,7 +55,7 @@ fn fixtures() -> Vec<(&'static str, Value, Value)> {
             json!({
                 "jsonrpc": "2.0",
                 "method": "outlet invoke",
-                "params": { "outlet_id": "send_payment", "kind": "Action", "arguments": { "amount": 10 } },
+                "params": { "outlet_id": "send_payment", "kind": "action", "arguments": { "amount": 10 } },
                 "id": 2
             }),
         ),
@@ -70,7 +70,7 @@ fn fixtures() -> Vec<(&'static str, Value, Value)> {
             json!({
                 "jsonrpc": "2.0",
                 "method": "outlet invoke",
-                "params": { "outlet_id": "lookup_users", "kind": "Query", "arguments": { "q": "alice" } },
+                "params": { "outlet_id": "lookup_users", "kind": "query", "arguments": { "q": "alice" } },
                 "id": 3
             }),
         ),
@@ -108,7 +108,7 @@ fn fixtures() -> Vec<(&'static str, Value, Value)> {
                 "outlets": [
                     {
                         "outlet_id": "send_payment",
-                        "kind": "Action",
+                        "kind": "action",
                         "description": "Send a payment",
                         "schema": {
                             "input": { "type": "object", "required": ["amount"] }
@@ -116,7 +116,7 @@ fn fixtures() -> Vec<(&'static str, Value, Value)> {
                     },
                     {
                         "outlet_id": "lookup_users",
-                        "kind": "Query",
+                        "kind": "query",
                         "description": "Find users",
                         "schema": {
                             "input": { "type": "object" },
@@ -231,6 +231,103 @@ fn outlet_error_envelope_round_trip() {
     assert!(err["source_chain"].is_array());
 }
 
+#[test]
+fn error_message_richer_than_content_survives_round_trip() {
+    // D3 / A2: the SCP error `message` is richer than the MCP text content. The
+    // reverse path must recover the ORIGINAL message from `_meta.scp_message`
+    // (the A2 read-back), not recompute it from the shorter content text. Fails
+    // against the pre-fix write-only channel.
+    let rich = "detailed authorization failure: token nb caveat exceeded at edge 3";
+    let scp_err = json!({
+        "error": {
+            "code": "SCP-OUTLET-6110",
+            "message": rich,
+            "content": [ { "type": "text", "text": "denied" } ]
+        }
+    });
+    let mcp = scp_to_mcp(scp_err);
+    // The human message is preserved under _meta; content stays the short text.
+    assert_eq!(mcp["_meta"]["scp_message"], rich);
+    assert_eq!(mcp["content"][0]["text"], "denied");
+
+    let back = mcp_to_scp(mcp);
+    assert_eq!(
+        back["error"]["message"], rich,
+        "the richer scp_message must survive, not be replaced by the content text"
+    );
+}
+
+#[test]
+fn non_object_error_value_is_not_treated_as_error_envelope() {
+    // D1 / A3: a message whose `error` field is a non-object (here a string) is
+    // NOT an OutletError envelope. It must fall through to verbatim recursion —
+    // the value is preserved, not dropped, and no `isError` marker is invented.
+    let scp = json!({ "error": "some string" });
+    let mcp = scp_to_mcp(scp);
+    assert_eq!(mcp["error"], "some string", "non-object error must survive");
+    assert!(
+        mcp.get("isError").is_none(),
+        "a non-object error is not an error envelope; no isError marker"
+    );
+}
+
+#[test]
+fn error_envelope_with_sibling_keys_still_marks_iserror() {
+    // A3: an OutletError body carrying an extra sibling key must STILL be
+    // recognized as an error (object-typed `error` detection is not gated on
+    // len==1) — a sibling must not suppress the MCP isError marker.
+    let scp = json!({
+        "error": { "code": "SCP-OUTLET-6130", "message": "boom" },
+        "trace_id": "tr-9"
+    });
+    let mcp = scp_to_mcp(scp);
+    assert_eq!(
+        mcp["isError"], true,
+        "sibling key must not suppress isError"
+    );
+    assert_eq!(mcp["_meta"]["scp_error_code"], "SCP-OUTLET-6130");
+    // The sibling is preserved (translated) on the MCP side.
+    assert_eq!(mcp["trace_id"], "tr-9");
+}
+
+#[test]
+fn iserror_non_bool_true_is_treated_as_error() {
+    // A4: a malicious/lenient server sending a non-`false` isError (here the
+    // string "true") must be treated as an error, not silently as success.
+    let mcp = json!({
+        "content": [ { "type": "text", "text": "boom" } ],
+        "isError": "true"
+    });
+    let scp = mcp_to_scp(mcp);
+    assert!(
+        scp.get("error").is_some(),
+        "non-bool isError must map to an SCP error envelope"
+    );
+    // A literal `false` remains success.
+    let ok = mcp_to_scp(json!({
+        "content": [ { "type": "text", "text": "ok" } ],
+        "isError": false
+    }));
+    assert!(ok.get("error").is_none(), "isError:false is success");
+}
+
+#[test]
+fn name_prefix_wins_over_disagreeing_x_scp_kind() {
+    // D2: when the tool name prefix and the `x-scp-kind` extension disagree, the
+    // NAME PREFIX wins (translate_tool_definition_to_outlet). Here `query.` name
+    // vs `x-scp-kind: action` → kind resolves to query.
+    let mcp = json!({
+        "name": "query.forecast",
+        "inputSchema": { "type": "object", "x-scp-kind": "action" }
+    });
+    let scp = mcp_to_scp(mcp);
+    assert_eq!(scp["outlet_id"], "forecast");
+    assert_eq!(
+        scp["kind"], "query",
+        "the dot-prefix on the name takes precedence over x-scp-kind"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Streaming projection (AC7)
 // ---------------------------------------------------------------------------
@@ -300,7 +397,7 @@ fn ac12_inbound_dot_prefix_recovers_kind_and_strips_prefix() {
     });
     let scp = mcp_to_scp(mcp);
     assert_eq!(scp["params"]["outlet_id"], "current_weather");
-    assert_eq!(scp["params"]["kind"], "Query");
+    assert_eq!(scp["params"]["kind"], "query");
 }
 
 #[test]
@@ -395,7 +492,7 @@ fn arguments_with_envelope_colliding_keys_survive_verbatim_both_directions() {
         json!({
             "jsonrpc": "2.0",
             "method": "outlet invoke",
-            "params": { "outlet_id": "echo", "kind": "Action", "arguments": payload() },
+            "params": { "outlet_id": "echo", "kind": "action", "arguments": payload() },
             "id": 7
         })
     };

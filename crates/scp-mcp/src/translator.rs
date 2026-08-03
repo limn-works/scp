@@ -55,14 +55,17 @@
 //! forward slash and a name, which a non-conforming MCP client might
 //! send — default to [`OutletKind::Action`]
 //! (fail-safe: an undeclared kind cannot accidentally be treated as
-//! read-only, per ADR-049 §2). The optional `x-scp-kind` JSON Schema extension
-//! on an MCP `inputSchema` overrides the default.
+//! read-only, per §5.4.2 and SCP-OUT-017). The optional `x-scp-kind` JSON
+//! Schema extension on an MCP `inputSchema` overrides the default.
 //!
-//! # `OutletKind` sentinel
+//! # `OutletKind`
 //!
-//! The real `OutletKind` enum lands in SCP-OUT-017 (classification gate). Until
-//! then this module defines a local sentinel with the same `Query` / `Action`
-//! shape so the translator's behavior is frozen at the wire level now.
+//! [`OutletKind`] is the canonical `scp_core::context::outlets::OutletKind`,
+//! re-exported here so this module, the `scp-mcp` server, and the FFI bridges
+//! share one type and one (lowercase, `"query"` / `"action"`) wire spelling.
+//! This translator only *projects* an already-classified kind across the MCP
+//! boundary; authoritative classification is owned by SCP-OUT-017 and, at
+//! runtime, by the registry (`ContextOutletInfo.kind`).
 //!
 //! # Round-trip semantics
 //!
@@ -119,56 +122,74 @@ pub const MCP_CALL_PREFIX: &str = "call.";
 /// kind for inbound translation. Per §8.5.
 pub const X_SCP_KIND_EXT: &str = "x-scp-kind";
 
+/// Bidirectional mapping between SCP `OutletError` field names and the
+/// `_meta.scp_*` keys that carry them across the MCP boundary, as
+/// `(meta_key, error_key)` pairs.
+///
+/// These are NAMED envelope fields, not opaque payloads: the table only renames
+/// a fixed set of known keys and never touches the verbatim-passthrough of
+/// `arguments` / `_meta`. `message` <-> `scp_message` is special-cased (the
+/// message is also surfaced as MCP text `content`), so it is handled outside
+/// this table in both directions.
+const ERROR_META_FIELDS: [(&str, &str); 6] = [
+    ("scp_error_code", "code"),
+    ("scp_slug", "slug"),
+    ("scp_class", "class"),
+    ("scp_retry", "retry"),
+    ("scp_detail", "detail"),
+    ("scp_source_chain", "source_chain"),
+];
+
 // ---------------------------------------------------------------------------
-// OutletKind sentinel (until SCP-OUT-017)
+// OutletKind (canonical, re-exported from scp-core)
 // ---------------------------------------------------------------------------
 
-/// Local sentinel for the outlet classification (§5.4.2 / ADR-049 §2).
+/// Outlet classification (§5.4.2): `Query` (read-only, idempotent, cacheable)
+/// vs `Action` (may mutate context state; the fail-safe default). Re-exported
+/// from the canonical [`scp_core::context::outlets::OutletKind`] so the
+/// translator, `scp-mcp` server, and the FFI bridges all share one type and one
+/// wire spelling. Its serde form is lowercase (`"query"` / `"action"`); the
+/// SCP-side `kind` field and the `x-scp-kind` JSON Schema extension both use
+/// that canonical spelling.
 ///
-/// The authoritative `OutletKind` enum lands in SCP-OUT-017 (classification
-/// gate). Until then this module defines the same `Query` / `Action` shape so
-/// the translator's observable behavior is frozen now. When the canonical enum
-/// arrives, this sentinel is replaced with a re-export with no wire impact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutletKind {
-    /// Read-only, idempotent, semantically cacheable outlet.
-    Query,
-    /// Mutating outlet. The fail-safe default per ADR-049 §2.
-    Action,
+/// Authoritative classification of an outlet's kind is owned by SCP-OUT-017 (the
+/// classification gate) and, at runtime, by the registry
+/// (`ContextOutletInfo.kind`). This translator only projects an
+/// already-classified kind across the MCP boundary; it never authoritatively
+/// assigns one (see the `SECURITY` note at the inbound `kind` write site).
+pub use scp_core::context::outlets::OutletKind;
+
+/// The MCP-facing dot-delimited tool-name prefix for a kind
+/// (`Query` → `"query."`, `Action` → `"call."`).
+#[must_use]
+const fn kind_mcp_prefix(kind: OutletKind) -> &'static str {
+    match kind {
+        OutletKind::Query => MCP_QUERY_PREFIX,
+        OutletKind::Action => MCP_CALL_PREFIX,
+    }
 }
 
-impl OutletKind {
-    /// The MCP-facing dot-delimited prefix for this kind.
-    ///
-    /// Query → `"query."`, Action → `"call."`.
-    #[must_use]
-    pub const fn mcp_prefix(self) -> &'static str {
-        match self {
-            Self::Query => MCP_QUERY_PREFIX,
-            Self::Action => MCP_CALL_PREFIX,
-        }
+/// The canonical lowercase serde tag for a kind, used as the SCP-side `kind`
+/// field value and the `x-scp-kind` JSON Schema extension value. Matches the
+/// `#[serde(rename_all = "lowercase")]` on
+/// [`scp_core::context::outlets::OutletKind`]
+/// (a round-trip test pins this alignment).
+#[must_use]
+const fn kind_scp_tag(kind: OutletKind) -> &'static str {
+    match kind {
+        OutletKind::Query => "query",
+        OutletKind::Action => "action",
     }
+}
 
-    /// The serde-style tag value used in the `x-scp-kind` JSON Schema extension
-    /// and in the SCP-side `kind` field.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Query => "Query",
-            Self::Action => "Action",
-        }
-    }
-
-    /// Parses the serde-style tag value. Accepts `"Query"` and `"Action"`.
-    /// Returns `None` for any other input (including case variations). The
-    /// caller is responsible for applying the Action default.
-    #[must_use]
-    pub fn from_tag(tag: &str) -> Option<Self> {
-        match tag {
-            "Query" => Some(Self::Query),
-            "Action" => Some(Self::Action),
-            _ => None,
-        }
+/// Parse the canonical lowercase serde tag back into an [`OutletKind`]. Returns
+/// `None` for any other input; the caller applies the Action fail-safe default.
+#[must_use]
+fn kind_from_scp_tag(tag: &str) -> Option<OutletKind> {
+    match tag {
+        "query" => Some(OutletKind::Query),
+        "action" => Some(OutletKind::Action),
+        _ => None,
     }
 }
 
@@ -308,7 +329,18 @@ fn translate_tools_call_params_to_invoke(mut map: Map<String, Value>) -> Map<Str
 
     let mut out = Map::new();
     out.insert("outlet_id".to_owned(), Value::String(outlet_id));
-    out.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+    // SECURITY: this `kind` is caller-derived (inferred from the inbound MCP
+    // tool.name prefix). It is advisory ONLY. The authoritative kind is always
+    // the registry's `ContextOutletInfo.kind`; the SCP-OUT-017 classification /
+    // authorization gate MUST resolve kind from the registry and MUST NEVER
+    // trust this translator-emitted inbound value — otherwise an external MCP
+    // caller could label an Action outlet `query.*` and slip a mutating call
+    // past a Query-only (read-only) authorization path (Action-as-Query
+    // bypass).
+    out.insert(
+        "kind".to_owned(),
+        Value::String(kind_scp_tag(kind).to_owned()),
+    );
     // Opaque payload: move `arguments` VERBATIM. It is caller-owned tool input
     // whose keys are arbitrary; recursing would re-run envelope shape-detection
     // and could destroy or invent keys (e.g. an `arguments.name` string misread
@@ -348,7 +380,11 @@ fn translate_tools_list_result_to_outlet_list(mut map: Map<String, Value>) -> Ma
 }
 
 fn translate_call_tool_result_to_outlet_result(mut map: Map<String, Value>) -> Map<String, Value> {
-    let is_error = map.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    // A4/security: any present `isError` that is not literally `false` marks an
+    // error. A malicious/lenient external server sending `"isError":"true"`
+    // (string), `1`, or `null` MUST NOT be silently treated as success — only a
+    // literal `false` (or an absent field) is success.
+    let is_error = map.get("isError").is_some_and(|v| *v != Value::Bool(false));
     let content = map
         .remove("content")
         .unwrap_or_else(|| Value::Array(Vec::new()));
@@ -357,30 +393,25 @@ fn translate_call_tool_result_to_outlet_result(mut map: Map<String, Value>) -> M
     if is_error {
         // CallToolResult { isError: true, ... } → SCP OutletError envelope.
         let mut err = Map::new();
-        // Extract `meta.scp_error_code` / `meta.scp_source_chain` if present
-        // (the structured round-trip path); otherwise the message is the
-        // concatenated text content.
+        // Extract the structured `_meta.scp_*` fields if present (the structured
+        // round-trip path).
         if let Some(Value::Object(meta_obj)) = &meta {
-            if let Some(code) = meta_obj.get("scp_error_code").cloned() {
-                err.insert("code".to_owned(), code);
-            }
-            if let Some(slug) = meta_obj.get("scp_slug").cloned() {
-                err.insert("slug".to_owned(), slug);
-            }
-            if let Some(class) = meta_obj.get("scp_class").cloned() {
-                err.insert("class".to_owned(), class);
-            }
-            if let Some(retry) = meta_obj.get("scp_retry").cloned() {
-                err.insert("retry".to_owned(), retry);
-            }
-            if let Some(detail) = meta_obj.get("scp_detail").cloned() {
-                err.insert("detail".to_owned(), detail);
-            }
-            if let Some(chain) = meta_obj.get("scp_source_chain").cloned() {
-                err.insert("source_chain".to_owned(), chain);
+            for (meta_key, err_key) in ERROR_META_FIELDS {
+                if let Some(v) = meta_obj.get(meta_key).cloned() {
+                    err.insert(err_key.to_owned(), v);
+                }
             }
         }
-        let message = concat_text_content(&content);
+        // A2: prefer the round-tripped `_meta.scp_message` (the authoritative
+        // SCP message, which may be richer than the MCP text content); fall back
+        // to the concatenated content text only when it is absent. Without this
+        // read-back the write-only `scp_message` channel silently loses any
+        // message not reflected in the content text.
+        let message = meta
+            .as_ref()
+            .and_then(|m| m.get("scp_message"))
+            .and_then(Value::as_str)
+            .map_or_else(|| concat_text_content(&content), str::to_owned);
         err.insert("message".to_owned(), Value::String(message));
         err.insert("content".to_owned(), content);
         // Keep any trailing unknown keys.
@@ -453,7 +484,10 @@ fn translate_tool_definition_to_outlet(mut map: Map<String, Value>) -> Map<Strin
 
     let mut out = Map::new();
     out.insert("outlet_id".to_owned(), Value::String(outlet_id));
-    out.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+    out.insert(
+        "kind".to_owned(),
+        Value::String(kind_scp_tag(kind).to_owned()),
+    );
     if let Some(desc) = map.remove("description") {
         out.insert("description".to_owned(), desc);
     }
@@ -504,16 +538,24 @@ fn translate_scp_to_mcp_object(mut map: Map<String, Value>) -> Map<String, Value
         return map;
     }
 
-    // OutletError envelope: { "error": { ... } }. Peek with `matches!` before
-    // the `map.remove` — the peek short-circuits the `&&`, so the removing side
-    // effect only runs once we know the value is an object. Without the peek, a
-    // let-chain `remove` would drop a non-object `error` value even when the
-    // `Value::Object` pattern fails, silently discarding it.
-    if map.len() == 1
-        && matches!(map.get("error"), Some(Value::Object(_)))
+    // OutletError envelope: any object carrying an object-typed `error` field.
+    //
+    // A3/security: detection is by the presence of an object `error`, REGARDLESS
+    // of sibling keys — a lenient or malicious producer must not be able to
+    // suppress the MCP `isError` marker (fail-open error signaling) simply by
+    // adding a sibling key. The `matches!` peek short-circuits the `&&`, so the
+    // removing side effect only runs once we know the value is an object; a
+    // NON-object `error` value is therefore left intact and falls through to
+    // verbatim recursion (a non-error message that merely has an `error` key).
+    if matches!(map.get("error"), Some(Value::Object(_)))
         && let Some(Value::Object(err)) = map.remove("error")
     {
-        return translate_outlet_error_to_call_tool_result(err);
+        let mut result = translate_outlet_error_to_call_tool_result(err);
+        // Preserve any sibling keys of the error envelope (translated).
+        for (k, v) in map {
+            result.insert(k, translate_scp_to_mcp_value(v));
+        }
+        return result;
     }
 
     // InvokeParams body: { "outlet_id": ..., "kind"?, "arguments"? }.
@@ -567,7 +609,7 @@ fn translate_invoke_params_to_tools_call(mut map: Map<String, Value>) -> Map<Str
     let kind = map
         .remove("kind")
         .and_then(|v| match v {
-            Value::String(s) => OutletKind::from_tag(&s),
+            Value::String(s) => kind_from_scp_tag(&s),
             _ => None,
         })
         .unwrap_or(OutletKind::Action);
@@ -623,7 +665,7 @@ fn translate_outlet_definition_to_tool(mut map: Map<String, Value>) -> Map<Strin
     let kind = map
         .remove("kind")
         .and_then(|v| match v {
-            Value::String(s) => OutletKind::from_tag(&s),
+            Value::String(s) => kind_from_scp_tag(&s),
             _ => None,
         })
         .unwrap_or(OutletKind::Action);
@@ -670,27 +712,16 @@ fn translate_outlet_error_to_call_tool_result(mut err: Map<String, Value>) -> Ma
 
     // Meta reconstruction with scp_ prefixed keys (round-trip-safe).
     let mut meta = Map::new();
-    if let Some(code) = err.remove("code") {
-        meta.insert("scp_error_code".to_owned(), code);
-    }
-    if let Some(slug) = err.remove("slug") {
-        meta.insert("scp_slug".to_owned(), slug);
-    }
-    if let Some(class) = err.remove("class") {
-        meta.insert("scp_class".to_owned(), class);
-    }
-    if let Some(retry) = err.remove("retry") {
-        meta.insert("scp_retry".to_owned(), retry);
-    }
-    if let Some(detail) = err.remove("detail") {
-        meta.insert("scp_detail".to_owned(), detail);
-    }
-    if let Some(chain) = err.remove("source_chain") {
-        meta.insert("scp_source_chain".to_owned(), chain);
+    for (meta_key, err_key) in ERROR_META_FIELDS {
+        if let Some(v) = err.remove(err_key) {
+            meta.insert(meta_key.to_owned(), v);
+        }
     }
     if let Some(msg) = message.clone() {
-        // Preserve `message` under _meta for lossless round-trip; MCP
-        // clients read the text content for the human message.
+        // Preserve `message` under _meta for a lossless round-trip; the A2
+        // read-back on the inverse path prefers this over the text content. MCP
+        // clients that ignore `_meta` still read the human message from
+        // `content` (synthesized below when content is empty).
         meta.insert("scp_message".to_owned(), msg);
     }
 
@@ -788,10 +819,20 @@ pub fn parse_mcp_tool_name(name: &str) -> (OutletKind, String) {
 
 /// Format an SCP `(OutletKind, outlet_id)` pair as an MCP `tool.name` with the
 /// dot-delimited prefix.
+///
+/// # Warning
+///
+/// This is SERVER-side projection ONLY — for use when SCP exposes its own
+/// outlets over MCP. Never apply it to a name obtained from the client path
+/// ([`crate::client::McpClient::list_outlets`] /
+/// [`crate::client::McpClient::invoke_outlet`]): those names are already
+/// verbatim external wire names, and re-prefixing them produces a double-prefix
+/// (e.g. `call.call.foo`) and a tool-not-found error.
 #[must_use]
 pub fn format_mcp_tool_name(kind: OutletKind, outlet_id: &str) -> String {
-    let mut s = String::with_capacity(kind.mcp_prefix().len() + outlet_id.len());
-    s.push_str(kind.mcp_prefix());
+    let prefix = kind_mcp_prefix(kind);
+    let mut s = String::with_capacity(prefix.len() + outlet_id.len());
+    s.push_str(prefix);
     s.push_str(outlet_id);
     s
 }
@@ -809,7 +850,7 @@ fn extract_x_scp_kind(schema: &Value) -> Option<OutletKind> {
         Value::Object(obj) => obj
             .get(X_SCP_KIND_EXT)
             .and_then(Value::as_str)
-            .and_then(OutletKind::from_tag),
+            .and_then(kind_from_scp_tag),
         _ => None,
     }
 }
@@ -829,7 +870,7 @@ fn inject_x_scp_kind(schema: Value, kind: OutletKind) -> Value {
         Value::Object(mut obj) => {
             obj.insert(
                 X_SCP_KIND_EXT.to_owned(),
-                Value::String(kind.as_str().to_owned()),
+                Value::String(kind_scp_tag(kind).to_owned()),
             );
             Value::Object(obj)
         }
@@ -843,7 +884,7 @@ fn inject_x_scp_kind(schema: Value, kind: OutletKind) -> Value {
             obj.insert("schema".to_owned(), other);
             obj.insert(
                 X_SCP_KIND_EXT.to_owned(),
-                Value::String(kind.as_str().to_owned()),
+                Value::String(kind_scp_tag(kind).to_owned()),
             );
             Value::Object(obj)
         }
@@ -876,8 +917,9 @@ fn collect_content_as_chunks(content: &Value) -> Vec<Value> {
     // Project an MCP content array to the SCP degenerate two-chunk stream:
     // one Data chunk per content item, then a terminal End chunk whose
     // `aggregate` is the concatenated content (matching §5.4.5). The payload
-    // tag `@type` is chosen per ADR-049 §5 so canonical JCS sort places it
-    // first.
+    // tag key is `@type` so a canonical JCS (RFC 8785) sort — which orders
+    // object members by UTF-16 code unit — places it ahead of `aggregate` /
+    // `payload` / `sequence`.
     let mut chunks = Vec::new();
     if let Value::Array(items) = content {
         for (idx, item) in items.iter().enumerate() {
@@ -1073,7 +1115,7 @@ mod tests {
         assert_eq!(scp["next_cursor"], "page2");
         let o0 = &scp["outlets"][0];
         assert_eq!(o0["outlet_id"], "send_payment");
-        assert_eq!(o0["kind"], "Action");
+        assert_eq!(o0["kind"], "action");
         assert_eq!(o0["description"], "Send a payment");
         assert!(o0["schema"]["input"].is_object());
     }
@@ -1084,7 +1126,7 @@ mod tests {
             "outlets": [
                 {
                     "outlet_id": "send_payment",
-                    "kind": "Action",
+                    "kind": "action",
                     "description": "Send a payment",
                     "schema": { "input": { "type": "object" } }
                 }
@@ -1098,7 +1140,7 @@ mod tests {
         assert_eq!(t0["name"], "call.send_payment");
         assert_eq!(t0["description"], "Send a payment");
         assert_eq!(t0["inputSchema"]["type"], "object");
-        assert_eq!(t0["inputSchema"][X_SCP_KIND_EXT], "Action");
+        assert_eq!(t0["inputSchema"][X_SCP_KIND_EXT], "action");
     }
 
     // --- tools/call ↔ outlet invoke --------------------------------------
@@ -1114,7 +1156,7 @@ mod tests {
         let scp = mcp_to_scp(mcp);
         assert_eq!(scp["method"], "outlet invoke");
         assert_eq!(scp["params"]["outlet_id"], "lookup_users");
-        assert_eq!(scp["params"]["kind"], "Query");
+        assert_eq!(scp["params"]["kind"], "query");
         assert_eq!(scp["params"]["arguments"]["q"], "alice");
     }
 
@@ -1123,7 +1165,7 @@ mod tests {
         let scp = json!({
             "jsonrpc": "2.0",
             "method": "outlet invoke",
-            "params": { "outlet_id": "lookup_users", "kind": "Query", "arguments": { "q": "alice" } },
+            "params": { "outlet_id": "lookup_users", "kind": "query", "arguments": { "q": "alice" } },
             "id": 42
         });
         let mcp = scp_to_mcp(scp);
@@ -1236,12 +1278,12 @@ mod tests {
             "description": "Find users",
             "inputSchema": {
                 "type": "object",
-                "x-scp-kind": "Query"
+                "x-scp-kind": "query"
             }
         });
         let scp = mcp_to_scp(mcp);
         assert_eq!(scp["outlet_id"], "lookup_users");
-        assert_eq!(scp["kind"], "Query");
+        assert_eq!(scp["kind"], "query");
         assert_eq!(scp["description"], "Find users");
         assert!(scp["schema"]["input"].is_object());
         // The x-scp-kind extension is stripped from the lifted schema.
@@ -1255,7 +1297,7 @@ mod tests {
             "inputSchema": { "type": "object" }
         });
         let scp = mcp_to_scp(mcp);
-        assert_eq!(scp["kind"], "Action");
+        assert_eq!(scp["kind"], "action");
         assert_eq!(scp["outlet_id"], "lookup_users");
     }
 
@@ -1263,7 +1305,7 @@ mod tests {
     fn outlet_definition_round_trips_kind_via_schema_extension() {
         let scp = json!({
             "outlet_id": "lookup_users",
-            "kind": "Query",
+            "kind": "query",
             "description": "Find users",
             "schema": {
                 "input": { "type": "object" },
@@ -1272,7 +1314,7 @@ mod tests {
         });
         let mcp = scp_to_mcp(scp);
         assert_eq!(mcp["name"], "query.lookup_users");
-        assert_eq!(mcp["inputSchema"][X_SCP_KIND_EXT], "Query");
+        assert_eq!(mcp["inputSchema"][X_SCP_KIND_EXT], "query");
         assert_eq!(mcp["outputSchema"]["type"], "array");
     }
 
@@ -1320,13 +1362,13 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "method": "outlet invoke",
-                "params": { "outlet_id": "send_payment", "kind": "Action", "arguments": { "amount": 10 } },
+                "params": { "outlet_id": "send_payment", "kind": "action", "arguments": { "amount": 10 } },
                 "id": 2
             }),
             json!({
                 "jsonrpc": "2.0",
                 "method": "outlet invoke",
-                "params": { "outlet_id": "lookup_users", "kind": "Query", "arguments": { "q": "alice" } },
+                "params": { "outlet_id": "lookup_users", "kind": "query", "arguments": { "q": "alice" } },
                 "id": 3
             }),
             json!({
@@ -1335,8 +1377,8 @@ mod tests {
             }),
             json!({
                 "outlets": [
-                    { "outlet_id": "send_payment", "kind": "Action", "description": "pay", "schema": { "input": { "type": "object" } } },
-                    { "outlet_id": "lookup_users", "kind": "Query", "description": "find", "schema": { "input": { "type": "object" }, "output": { "type": "array" } } }
+                    { "outlet_id": "send_payment", "kind": "action", "description": "pay", "schema": { "input": { "type": "object" } } },
+                    { "outlet_id": "lookup_users", "kind": "query", "description": "find", "schema": { "input": { "type": "object" }, "output": { "type": "array" } } }
                 ]
             }),
         ]
@@ -1450,13 +1492,27 @@ mod tests {
         assert!(!MCP_CALL_PREFIX.contains('/'));
     }
 
-    // --- OutletKind::from_tag --------------------------------------------
+    // --- kind_from_scp_tag (canonical lowercase) -------------------------
 
     #[test]
-    fn outlet_kind_from_tag_accepts_exact_strings() {
-        assert_eq!(OutletKind::from_tag("Query"), Some(OutletKind::Query));
-        assert_eq!(OutletKind::from_tag("Action"), Some(OutletKind::Action));
-        assert_eq!(OutletKind::from_tag("query"), None);
-        assert_eq!(OutletKind::from_tag(""), None);
+    fn kind_from_scp_tag_accepts_canonical_lowercase() {
+        assert_eq!(kind_from_scp_tag("query"), Some(OutletKind::Query));
+        assert_eq!(kind_from_scp_tag("action"), Some(OutletKind::Action));
+        // Capitalized / unknown spellings are rejected (caller applies the
+        // Action fail-safe default).
+        assert_eq!(kind_from_scp_tag("Query"), None);
+        assert_eq!(kind_from_scp_tag(""), None);
+    }
+
+    #[test]
+    fn kind_scp_tag_matches_canonical_serde_spelling() {
+        // Guards against wire-spelling drift: the SCP-side `kind` value the
+        // translator emits MUST equal the canonical enum's serde form.
+        for kind in [OutletKind::Query, OutletKind::Action] {
+            assert_eq!(
+                Value::String(kind_scp_tag(kind).to_owned()),
+                serde_json::to_value(kind).unwrap()
+            );
+        }
     }
 }

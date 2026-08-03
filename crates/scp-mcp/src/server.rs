@@ -436,11 +436,12 @@ impl<P: ContextProvider> McpServer<P> {
         // prefix before validation and invocation. An unrecognized prefix
         // falls back to using the full name as the outlet_id with kind =
         // Action (fail-safe default per AC14).
-        let (outlet_kind, owned_outlet_id) = parse_mcp_tool_name(mcp_tool_name);
         // The recovered kind is intentionally unused here: the invocation
         // handler is kind-agnostic until SCP-OUT-017 wires the Query / Action
-        // dispatch difference. It is NOT currently recorded in provenance.
-        let _ = outlet_kind;
+        // dispatch difference. It is NOT currently recorded in provenance. Note
+        // an inbound (caller-derived) kind is advisory only; authoritative kind
+        // is the registry's — see the SECURITY note in translator.rs.
+        let (_outlet_kind, owned_outlet_id) = parse_mcp_tool_name(mcp_tool_name);
         let tool_name: &str = owned_outlet_id.as_str();
 
         // Verify caller is a member of the target context.

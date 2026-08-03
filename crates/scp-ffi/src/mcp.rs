@@ -653,19 +653,6 @@ impl FfiBridgeProvider {
     }
 }
 
-/// Projects the canonical §5.4.2 [`scp_core::context::outlets::OutletKind`]
-/// onto the scp-mcp boundary sentinel [`scp_mcp::translator::OutletKind`] so
-/// the MCP translator can surface the correct `query.` / `call.` tool-name
-/// prefix. This is a pure lexical projection at the FFI/MCP seam.
-const fn outlet_kind_to_mcp(
-    kind: scp_core::context::outlets::OutletKind,
-) -> scp_mcp::translator::OutletKind {
-    match kind {
-        scp_core::context::outlets::OutletKind::Query => scp_mcp::translator::OutletKind::Query,
-        scp_core::context::outlets::OutletKind::Action => scp_mcp::translator::OutletKind::Action,
-    }
-}
-
 impl ContextProvider for FfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<String> {
         self.context_ids.clone()
@@ -708,11 +695,12 @@ impl ContextProvider for FfiBridgeProvider {
                     input_schema: t.schema.input_schema.clone(),
                     output_schema: Some(t.schema.output_schema.clone()),
                     admin_only: false,
-                    // Project the registered §5.4.2 kind to the scp-mcp
-                    // boundary sentinel so the translator surfaces the correct
-                    // `query.` / `call.` MCP tool-name prefix. Never hardcode
-                    // Action here — the registry carries the real kind.
-                    kind: outlet_kind_to_mcp(t.kind),
+                    // Carry the registry's authoritative §5.4.2 kind so the
+                    // translator surfaces the correct `query.` / `call.` MCP
+                    // tool-name prefix. `ContextOutletInfo.kind` is the canonical
+                    // `scp_core::context::outlets::OutletKind` (re-exported by
+                    // scp-mcp), so this is a direct move — never hardcode Action.
+                    kind: t.kind,
                 })
                 .collect();
             Ok(outlets)
