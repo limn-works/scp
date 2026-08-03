@@ -2036,14 +2036,14 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
 
-**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `RevokeAccess { did, access: Read }` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `RevokeAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
+**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `RevokeAccess { did, access: Read }` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`, fail-closed per ADR-011: convergent governance trigger → convergent leaf). This mirrors `RevokeAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
 
 Governance ban lifecycle:
 
 1. Governance proposal: `RevokeAccess { did, access: Read }` — proposed via the standard governance flow (§5.9).
 2. Context manager verifies `member:ban` capability in ceiling — rejects with `PermissionDenied` if absent.
 3. On approval: subscriber removed from registry, added to all authors' block lists.
-4. All authors rotate keys — mandatory `KeyEpochAdvance` per author.
+4. All authors rotate keys — mandatory `KeyEpochAdvance` per author, fail-closed per ADR-011 (convergent governance trigger → convergent leaf).
 5. `ReadAccessRevoked` event emitted to event log.
 6. Future `handle_key_request` from banned subscriber returns `Deny` for all authors.
 
