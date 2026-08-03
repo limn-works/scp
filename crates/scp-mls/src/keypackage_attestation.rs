@@ -114,12 +114,26 @@ const LEN_PREFIX_SIZE: usize = 4;
 /// an Update / Commit-with-`UpdatePath`). A Commit/Proposal that does not change
 /// the committer's leaf carries no new attestation and MUST NOT be re-verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AttestationTrigger {
+pub enum AttestationTrigger<'a> {
     /// A new leaf is being **added** via a `KeyPackage` (the cross-group
     /// fail-closed path; the only trigger at which the `init_key` checks apply).
-    Add,
+    ///
+    /// Carries the `KeyPackage`'s `init_key` (checks 7–8) **inside** the variant:
+    /// an `Add` structurally *always* has a `KeyPackage`, and a `KeyPackage`
+    /// always has an `init_key` (RFC 9420 §7.1). Folding it here makes the
+    /// Add-requires-`init_key` / Update-has-none coupling a **type-system**
+    /// guarantee — an `Add` with no `init_key` is unrepresentable — rather than a
+    /// runtime fail-closed check (per the SCP "encode required choices as required
+    /// fields" tenet).
+    Add {
+        /// The `KeyPackage`'s `init_key`: a raw 32-byte X25519 public key. Check 7
+        /// binds `attestation.init_key` to it; check 8 (RFC 9420 §10.1) rejects a
+        /// `KeyPackage` whose `init_key` equals its `encryption_key`.
+        kp_init_key: &'a [u8; PUBLIC_KEY_SIZE],
+    },
     /// An already-admitted member is **replacing its own leaf** (Update /
-    /// Commit-with-`UpdatePath`).
+    /// Commit-with-`UpdatePath`). A ratchet-tree leaf has no `init_key`, so checks
+    /// 7–8 do not run.
     Update,
 }
 
@@ -376,13 +390,6 @@ pub const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
 /// [`verify_attestation`] for the exact caller contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AttestationVerifyError {
-    /// The caller declared an [`AttestationTrigger::Add`] but supplied no
-    /// `KeyPackage` `init_key` in the context — checks 7–8 cannot run, so the
-    /// join fails closed. This is a caller-contract violation (an Add MUST carry
-    /// a `KeyPackage`, RFC 9420 §7.1), not a numbered §9.7.1 check.
-    #[error("Add trigger requires the KeyPackage init_key, but none was supplied")]
-    MissingKeyPackageInitKey,
-
     /// Check 3: the Ed25519 signature does not verify against the resolved
     /// current verification method. This is also what makes **rotation =
     /// revocation** (§9.12): an attestation signed by a rotated-away key fails
@@ -495,11 +502,6 @@ pub struct AttestationVerificationContext<'a> {
     pub leaf_encryption_key: &'a [u8; PUBLIC_KEY_SIZE],
     /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension (check 6).
     pub leaf_wrapping_key: &'a [u8; PUBLIC_KEY_SIZE],
-    /// The `KeyPackage`'s `init_key` — `Some` on an [`AttestationTrigger::Add`]
-    /// (checks 7–8), `None` on an [`AttestationTrigger::Update`] (a ratchet-tree
-    /// leaf has no `init_key`). Consistency with `trigger` is enforced by
-    /// [`verify_attestation`].
-    pub kp_init_key: Option<&'a [u8; PUBLIC_KEY_SIZE]>,
     /// The DID carried in the leaf's `ScpCredential` (check 9).
     pub leaf_credential_did: &'a str,
     /// The `signing_key_id` carried in the leaf's `ScpCredential` (check 10).
@@ -511,9 +513,12 @@ pub struct AttestationVerificationContext<'a> {
     /// The verifier's current Unix time in seconds (check 13).
     pub now: u64,
     /// Which handshake event is being verified — the **structural** gate for the
-    /// Add-only `init_key` checks (7–8). Per §9.7.1 this gate is on the trigger,
-    /// **never** on `attestation.init_key == leaf_encryption_key` field equality.
-    pub trigger: AttestationTrigger,
+    /// Add-only `init_key` checks (7–8), and the carrier of the `KeyPackage`
+    /// `init_key` itself on [`AttestationTrigger::Add`] (a ratchet-tree leaf on an
+    /// [`AttestationTrigger::Update`] has none). Per §9.7.1 this gate is on the
+    /// trigger, **never** on `attestation.init_key == leaf_encryption_key` field
+    /// equality.
+    pub trigger: AttestationTrigger<'a>,
 }
 
 /// Verifies a [`KeyPackageAttestation`] against already-resolved ground-truth
@@ -543,13 +548,15 @@ pub struct AttestationVerificationContext<'a> {
 ///
 /// # The `init_key` structural gate (anti-trap)
 ///
-/// Checks 7–8 run **iff `ctx.trigger == AttestationTrigger::Add`** — the
+/// Checks 7–8 run **iff `ctx.trigger` is [`AttestationTrigger::Add`]** — the
 /// handshake structure — **never** because `attestation.init_key` happens to
 /// equal `leaf_encryption_key`. A bare creator/PCS-Update leaf legitimately
 /// carries `init_key == encryption_key`; keying the carve-out on that equality
-/// would reopen the read-as-victim vector (§9.5.2 field 4, §9.7.1). On an `Add`,
-/// `ctx.kp_init_key` MUST be `Some` (else [`AttestationVerifyError::MissingKeyPackageInitKey`]);
-/// on an `Update` it is ignored.
+/// would reopen the read-as-victim vector (§9.5.2 field 4, §9.7.1). The
+/// `KeyPackage` `init_key` those checks need lives **inside** the
+/// `Add { kp_init_key }` variant, so an `Add` with no `init_key` is
+/// unrepresentable — the coupling is a type-system guarantee, not a runtime
+/// fail-closed check. An `Update` carries no `init_key` and skips 7–8.
 ///
 /// # Errors
 ///
@@ -590,8 +597,10 @@ pub fn verify_attestation(
     // (structure), NEVER on field-value equality (§9.7.1 anti-trap). An Update
     // replaces a ratchet-tree leaf that has no init_key, so these do not run.
     match ctx.trigger {
-        AttestationTrigger::Add => {
-            let kp_init_key = ctx.kp_init_key.ok_or(E::MissingKeyPackageInitKey)?;
+        AttestationTrigger::Add { kp_init_key } => {
+            // The KeyPackage's init_key rides inside the Add variant, so an Add
+            // with no init_key is unrepresentable — no runtime fail-closed check
+            // is needed (or possible) here.
             // Check 7: the attestation binds the KeyPackage's init_key.
             if attestation.init_key != *kp_init_key {
                 return Err(E::InitKeyMismatch);
@@ -1122,6 +1131,17 @@ mod tests {
         att.signature = signer.sign(&att.signing_hash()).to_bytes();
     }
 
+    /// Which handshake event a fixture is built for. A test-only selector: the
+    /// real [`AttestationTrigger::Add`] carries a borrow of the `KeyPackage`
+    /// `init_key`, which would make [`Truth`] self-referential, so [`Truth`]
+    /// stores this plain discriminant and [`Truth::ctx`] constructs the real
+    /// (borrowing) trigger on demand from `self.kp_init`.
+    #[derive(Clone, Copy)]
+    enum TriggerKind {
+        Add,
+        Update,
+    }
+
     /// Owned ground-truth values a test can mutate, then borrow into a context
     /// via [`Truth::ctx`]. Fields that are ALSO signed (`did`, `signing_key_id`,
     /// `issued_at`, `expires_at`, `init_key` on Add) must be changed on the
@@ -1140,7 +1160,7 @@ mod tests {
         not_before: u64,
         not_after: u64,
         now: u64,
-        trigger: AttestationTrigger,
+        kind: TriggerKind,
     }
 
     impl Truth {
@@ -1150,16 +1170,17 @@ mod tests {
                 leaf_signature_key: &self.leaf_sig,
                 leaf_encryption_key: &self.leaf_enc,
                 leaf_wrapping_key: &self.leaf_wrap,
-                kp_init_key: match self.trigger {
-                    AttestationTrigger::Add => Some(&self.kp_init),
-                    AttestationTrigger::Update => None,
-                },
                 leaf_credential_did: &self.did,
                 leaf_credential_signing_key_id: self.skid,
                 leaf_lifetime_not_before: self.not_before,
                 leaf_lifetime_not_after: self.not_after,
                 now: self.now,
-                trigger: self.trigger,
+                trigger: match self.kind {
+                    TriggerKind::Add => AttestationTrigger::Add {
+                        kp_init_key: &self.kp_init,
+                    },
+                    TriggerKind::Update => AttestationTrigger::Update,
+                },
             }
         }
     }
@@ -1169,15 +1190,15 @@ mod tests {
     /// `init_key` field carries `leaf_encryption_key` (a bare leaf) — this
     /// exercises the anti-trap path where `init_key == encryption_key` is
     /// legitimate.
-    fn valid_fixture(trigger: AttestationTrigger) -> (KeyPackageAttestation, Truth, SigningKey) {
+    fn valid_fixture(kind: TriggerKind) -> (KeyPackageAttestation, Truth, SigningKey) {
         let signer = SigningKey::generate(&mut OsRng);
         let leaf_sig = rand_key();
         let leaf_enc = rand_key();
         let leaf_wrap = rand_key();
         let kp_init = rand_key();
-        let att_init = match trigger {
-            AttestationTrigger::Add => kp_init,
-            AttestationTrigger::Update => leaf_enc,
+        let att_init = match kind {
+            TriggerKind::Add => kp_init,
+            TriggerKind::Update => leaf_enc,
         };
         let did = "did:dht:z6MkVerifyTest".to_owned();
         let skid = SigningKeyId::Active;
@@ -1204,7 +1225,7 @@ mod tests {
             not_before: ISSUED,
             not_after: EXPIRES,
             now: NOW,
-            trigger,
+            kind,
         };
         (att, truth, signer)
     }
@@ -1213,13 +1234,13 @@ mod tests {
 
     #[test]
     fn valid_add_passes() {
-        let (att, truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, truth, _s) = valid_fixture(TriggerKind::Add);
         assert_eq!(verify_attestation(&att, &truth.ctx()), Ok(()));
     }
 
     #[test]
     fn valid_update_passes() {
-        let (att, truth, _s) = valid_fixture(AttestationTrigger::Update);
+        let (att, truth, _s) = valid_fixture(TriggerKind::Update);
         assert_eq!(verify_attestation(&att, &truth.ctx()), Ok(()));
     }
 
@@ -1229,7 +1250,7 @@ mod tests {
     fn add_wrong_resolved_key_is_signature_error() {
         // A rotated-away #active key: the caller resolves a DIFFERENT current
         // key than the one that signed. Signature must fail (rotation revokes).
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.signer_pubkey = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1241,7 +1262,7 @@ mod tests {
     fn update_wrong_resolved_key_is_signature_error() {
         // Rotation revokes on an Update's resolution SUCCESS too, exactly as on
         // an Add (§9.7.1 check 1: a rotated key still rejects).
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Update);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Update);
         truth.signer_pubkey = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1251,7 +1272,7 @@ mod tests {
 
     #[test]
     fn tampered_signature_is_signature_error() {
-        let (mut att, truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (mut att, truth, _s) = valid_fixture(TriggerKind::Add);
         att.signature[0] ^= 0x01;
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1263,7 +1284,7 @@ mod tests {
 
     #[test]
     fn leaf_signature_key_mismatch() {
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.leaf_sig = rand_key();
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1273,7 +1294,7 @@ mod tests {
 
     #[test]
     fn leaf_encryption_key_mismatch() {
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.leaf_enc = rand_key();
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1283,7 +1304,7 @@ mod tests {
 
     #[test]
     fn wrapping_key_mismatch() {
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.leaf_wrap = rand_key();
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1297,7 +1318,7 @@ mod tests {
     fn add_init_key_mismatch() {
         // The KeyPackage's init_key (context input, unsigned) differs from the
         // attested init_key — the read-as-victim-at-join substitution.
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.kp_init = rand_key();
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1310,7 +1331,7 @@ mod tests {
         // Malformed KeyPackage (RFC 9420 §10.1): init_key == encryption_key.
         // Set the attested init_key to leaf_enc AND the KeyPackage init_key to
         // leaf_enc so check 7 passes and check 8 fires; re-sign the changed field.
-        let (mut att, mut truth, signer) = valid_fixture(AttestationTrigger::Add);
+        let (mut att, mut truth, signer) = valid_fixture(TriggerKind::Add);
         att.init_key = truth.leaf_enc;
         sign_in_place(&mut att, &signer);
         truth.kp_init = truth.leaf_enc;
@@ -1320,24 +1341,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn add_missing_kp_init_key_fails_closed() {
-        // Caller declares Add but supplies no KeyPackage init_key: fail closed.
-        let (att, truth, _s) = valid_fixture(AttestationTrigger::Add);
-        let mut ctx = truth.ctx();
-        ctx.kp_init_key = None;
-        assert_eq!(
-            verify_attestation(&att, &ctx),
-            Err(AttestationVerifyError::MissingKeyPackageInitKey)
-        );
-    }
+    // NOTE: there is no "Add without a KeyPackage init_key" test, because that
+    // state is now UNREPRESENTABLE. The `KeyPackage` `init_key` rides inside the
+    // `AttestationTrigger::Add { kp_init_key }` variant, so an `Add` with no
+    // `init_key` is a compile error — the coupling is enforced by the type system,
+    // not by a runtime fail-closed check. Concretely,
+    // `AttestationTrigger::Add {}` (or `AttestationTrigger::Add` with no field)
+    // does not compile, so the former `MissingKeyPackageInitKey` runtime error was
+    // removed. This comment stands in for the deleted
+    // `add_missing_kp_init_key_fails_closed` runtime test.
 
     /// ANTI-TRAP: an Update leaf with `init_key == encryption_key` is legitimate
     /// (a bare ratchet-tree leaf) and MUST be accepted — the Add-only checks
     /// (7–8) are gated on the TRIGGER, never on that field equality (§9.7.1).
     #[test]
     fn update_with_init_key_equal_to_encryption_key_is_accepted() {
-        let (att, truth, _s) = valid_fixture(AttestationTrigger::Update);
+        let (att, truth, _s) = valid_fixture(TriggerKind::Update);
         assert_eq!(
             att.init_key, att.leaf_encryption_key,
             "the Update fixture must exhibit init_key == encryption_key to guard the trap"
@@ -1349,7 +1368,7 @@ mod tests {
 
     #[test]
     fn did_mismatch() {
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.did = "did:dht:z6MkDifferent".to_owned();
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1360,7 +1379,7 @@ mod tests {
     #[test]
     fn signing_key_id_mismatch() {
         // Attestation signed under #active; credential claims #agent.
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         assert_eq!(att.signing_key_id, SigningKeyId::Active);
         truth.skid = SigningKeyId::Agent;
         assert_eq!(
@@ -1375,7 +1394,7 @@ mod tests {
     fn lifetime_window_mismatch() {
         // Flip the leaf Lifetime (context input) so it no longer equals the
         // attested window; signature stays valid.
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.not_after = EXPIRES + 1;
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1388,7 +1407,7 @@ mod tests {
     #[test]
     fn lifetime_too_long() {
         // Window one second past the cap; leaf Lifetime matches (check 11 OK).
-        let (mut att, mut truth, signer) = valid_fixture(AttestationTrigger::Add);
+        let (mut att, mut truth, signer) = valid_fixture(TriggerKind::Add);
         att.expires_at = att.issued_at + MAX_KEYPACKAGE_ATTESTATION_LIFETIME + 1;
         sign_in_place(&mut att, &signer);
         truth.not_after = att.expires_at;
@@ -1401,7 +1420,7 @@ mod tests {
     #[test]
     fn lifetime_exactly_max_passes() {
         // Boundary: a window of exactly the cap is accepted (`>` rejects).
-        let (mut att, mut truth, signer) = valid_fixture(AttestationTrigger::Add);
+        let (mut att, mut truth, signer) = valid_fixture(TriggerKind::Add);
         att.expires_at = att.issued_at + MAX_KEYPACKAGE_ATTESTATION_LIFETIME;
         sign_in_place(&mut att, &signer);
         truth.not_after = att.expires_at;
@@ -1411,7 +1430,7 @@ mod tests {
     #[test]
     fn expires_not_after_issued() {
         // Degenerate window (expires == issued); leaf Lifetime matches.
-        let (mut att, mut truth, signer) = valid_fixture(AttestationTrigger::Add);
+        let (mut att, mut truth, signer) = valid_fixture(TriggerKind::Add);
         att.expires_at = att.issued_at;
         sign_in_place(&mut att, &signer);
         truth.not_after = att.expires_at;
@@ -1427,7 +1446,7 @@ mod tests {
     #[test]
     fn expired() {
         // `now` past expiry (context input, unsigned).
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.now = EXPIRES + 1;
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1438,7 +1457,7 @@ mod tests {
     #[test]
     fn issued_in_future_beyond_skew() {
         // issued_at leads `now` by more than the §9.14 skew tolerance.
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.now = ISSUED - (CLOCK_SKEW_TOLERANCE_SECS + 1);
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
@@ -1449,7 +1468,7 @@ mod tests {
     #[test]
     fn issued_at_skew_boundary_is_inclusive() {
         // Exactly at the skew boundary (issued_at == now + skew): accepted.
-        let (att, mut truth, _s) = valid_fixture(AttestationTrigger::Add);
+        let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         truth.now = ISSUED - CLOCK_SKEW_TOLERANCE_SECS;
         assert_eq!(verify_attestation(&att, &truth.ctx()), Ok(()));
         // One second tighter: rejected.
