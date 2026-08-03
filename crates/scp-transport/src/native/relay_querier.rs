@@ -298,20 +298,63 @@ mod tests {
         let did = did_of(&vk);
         let rid = routing_id_of(&did);
 
-        // Two decodable frames (seq 1 and 2) and one undecodable blob between
-        // them (first byte 0xFF != version 0x01 -> UnknownVersion).
+        // Two decodable frames (seq 1 and 2) plus two undecodable blobs that
+        // exercise BOTH discard paths (§3.10.4 "never partially parsed"):
+        //   - `wrong_version`: first byte 0x00 != version 0x01 -> UnknownVersion
+        //     (rejected at the version gate).
+        //   - `truncated`: correct version 0x01 but shorter than the 105-byte
+        //     fixed prefix -> Truncated (rejected in the body, the path a
+        //     version-only-wrong fixture never reaches).
         let f1 = frame_bytes(&did, vk.as_bytes(), &sk, *vk.as_bytes(), 1);
-        let garbage = vec![0xFF, 0x00, 0x01, 0x02, 0x03];
+        let wrong_version = vec![0x00, 0x01, 0x02, 0x03];
+        let truncated = vec![0x01, 0xDE, 0xAD, 0xBE, 0xEF];
         let f2 = frame_bytes(&did, vk.as_bytes(), &sk, *vk.as_bytes(), 2);
 
         let querier = TransportRelayQuerier::new();
-        querier.bind(RELAY, Arc::new(MockRawAdapter::new(vec![f1, garbage, f2])));
+        querier.bind(
+            RELAY,
+            Arc::new(MockRawAdapter::new(vec![f1, wrong_version, truncated, f2])),
+        );
 
         let records = RelayQuerier::query(&querier, RELAY, &rid).await.unwrap();
 
-        assert_eq!(records.len(), 2, "only the two decodable frames survive");
+        assert_eq!(
+            records.len(),
+            2,
+            "only the two decodable frames survive; both the wrong-version and \
+             the correct-version-but-truncated blobs are discarded"
+        );
         let seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
         assert!(seqs.contains(&1) && seqs.contains(&2));
+    }
+
+    /// The QUERY is bounded to `MAX_CANDIDATES_PER_RELAY` (N = 16, §3.10.2): the
+    /// querier passes `limit = 16` to `query_raw`, so even when a relay holds far
+    /// more co-located candidates, at most 16 are retrieved and decoded. This is
+    /// the bound the composer docstrings call load-bearing against an
+    /// unbounded-verification `DoS`.
+    #[tokio::test]
+    async fn caps_candidates_at_max_per_relay() {
+        let (vk, sk) = keypair(13);
+        let did = did_of(&vk);
+        let rid = routing_id_of(&did);
+
+        // 20 decodable frames co-located at one routing_id (> N = 16). The mock
+        // honors the `limit` the querier passes (as a real relay's QUERY does),
+        // so the querier must request exactly N.
+        let frames: Vec<Vec<u8>> = (0..20u64)
+            .map(|seq| frame_bytes(&did, vk.as_bytes(), &sk, *vk.as_bytes(), seq + 1))
+            .collect();
+
+        let querier = TransportRelayQuerier::new();
+        querier.bind(RELAY, Arc::new(MockRawAdapter::new(frames)));
+
+        let records = RelayQuerier::query(&querier, RELAY, &rid).await.unwrap();
+        assert_eq!(
+            records.len(),
+            MAX_CANDIDATES_PER_RELAY,
+            "querier must bound the QUERY to N = {MAX_CANDIDATES_PER_RELAY} candidates"
+        );
     }
 
     #[tokio::test]
@@ -327,13 +370,22 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // AC 5: genuine highest-seq record co-located with stale + undecodable
-    // blobs is NOT dropped — and a repeat query still returns it (dedup-bypass
-    // end-to-end through the composer).
+    // AC 5 (querier/composer selection half): a genuine highest-seq record
+    // co-located with a stale-valid record AND an undecodable blob resolves to
+    // the genuine one — every time it is queried.
+    //
+    // NOTE: this proves the querier + composer are STATELESS across calls (the
+    // decode/discard + highest-seq-valid selection is recomputed each call), NOT
+    // the client-side dedup-bypass property. `MockRawAdapter` is stateless and
+    // the real `NativeRelayClient` (which owns the `seen_blob_ids` LRU) is never
+    // in this path. The actual dedup-bypass is proven by the client-level
+    // `raw_query_subscription_bypasses_dedup_on_repeat` (dispatch) and the
+    // end-to-end `query_raw_twice_same_did_returns_record_both_times` (real
+    // relay) tests in `native::client`.
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn genuine_not_dropped_among_stale_and_junk_on_repeat_query() {
+    async fn genuine_selected_among_stale_and_junk_on_every_query() {
         let (vk, sk) = keypair(11);
         let did = did_of(&vk);
 
@@ -360,14 +412,15 @@ mod tests {
             "genuine highest-seq must win over stale seq=2"
         );
 
-        // Repeat resolution of the same unchanged DID: still returns it (the
-        // raw path never dedups the one-shot QUERY).
+        // A second resolution of the same unchanged DID recomputes selection
+        // from scratch and returns the same genuine record — the querier and
+        // composer hold no cross-call state that could drop it.
         let second = composer
             .query(&did, &[RELAY.to_owned()])
             .await
             .unwrap()
-            .expect("genuine record still resolves on repeat query");
-        assert_eq!(second.seq, 9, "repeat query must still return the record");
+            .expect("genuine record still resolves on the second query");
+        assert_eq!(second.seq, 9, "second query must still return the record");
     }
 
     // ------------------------------------------------------------------
