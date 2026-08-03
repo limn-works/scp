@@ -4,12 +4,17 @@
 //! Async modules (pseudonym, inner/sign, outer/ops) stay in scp-runtime.
 
 pub mod chunk;
+pub mod did_record;
 pub mod inner;
 pub mod outer;
 pub mod padding;
 pub mod validation;
 
 // Re-exports for backward compatibility.
+pub use did_record::{
+    DID_RECORD_FIXED_PREFIX_LEN, DID_RECORD_VERSION, DidRecordBuildError, DidRecordDecodeError,
+    DidRecordV1, MAX_DID_RECORD_VALUE_LEN,
+};
 pub use inner::{InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance};
 pub use outer::{OuterEnvelope, create_outer_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
