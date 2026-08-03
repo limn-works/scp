@@ -1,0 +1,1404 @@
+{
+  "$comment": "SCP-OUT-031 \u00a75.4.4 OutletError cross-SDK conformance fixtures. Generated from the current 15-code registry (crates/scp-protocol/src/context/outlets/error_codes.rs). The Rust conformance gate set-equates fixture coverage against the registry's ALL_SLUGS array (and pins each pair to the pub CODE_*/SLUG_* constants), so a slug added to the registry without a fixture here FAILS the gate by construction. `fixtures` holds one VALID descriptor per (code, slug) pair covering every \u00a75.4.4 slug and all 15 allocated codes; each carries a valid per-class DetailBody shape. These fixtures establish the STRUCTURAL / field-level contract (class, code, slug, retry, detail shape, field widths) \u2014 NOT golden serialized wire bytes: `message` is a TEST-ONLY plaintext stand-in for the SDK's reconstructed developer-facing catalog message; the real on-wire tag-4 field is HMAC-SHA-256(outlet_message_key, catalog_key)[..32], never prose. Golden serialized-envelope bytes + the expected HMAC value per fixture are a PR-2 deliverable (once the bridge wire format is settled); until then SDK round-trip means reconstructing the typed envelope from the descriptor, not deserializing a wire blob. One fixture embeds an email + DID to exercise the AC9/AC10 redactor. `pad_nonce` (16-byte hex) and `registration_event_id` (32-byte hex) are emitted unconditionally per \u00a75.4.4 round-5/6. `malformed` holds one detail-shape mismatch per class (detail.kind() != class.expected_detail()) for the per-SDK AC10 rejection tests. `supplementary` holds the top cross-SDK round-trip hazards (a 32-byte ExecutionPanic hash; a >2^53 u64). Neither `malformed` nor `supplementary` counts toward the per-(code,slug) coverage. The Rust gate is crates/scp-testing/tests/integration/outlet_error_conformance.rs.",
+  "fixtures": [
+    {
+      "name": "scp-outlet-6100--protocol.violation",
+      "code": "SCP-OUTLET-6100",
+      "slug": "protocol.violation",
+      "class": "protocol",
+      "message": "protocol.violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "00000000000000000000000000000000",
+      "registration_event_id": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "scp-outlet-6100--query-cost-violation",
+      "code": "SCP-OUTLET-6100",
+      "slug": "query-cost-violation",
+      "class": "protocol",
+      "message": "query-cost-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "01010101010101010101010101010101",
+      "registration_event_id": "0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "name": "scp-outlet-6100--query-violation",
+      "code": "SCP-OUTLET-6100",
+      "slug": "query-violation",
+      "class": "protocol",
+      "message": "query-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "02020202020202020202020202020202",
+      "registration_event_id": "0202020202020202020202020202020202020202020202020202020202020202"
+    },
+    {
+      "name": "scp-outlet-6100--kind-mismatch",
+      "code": "SCP-OUTLET-6100",
+      "slug": "kind-mismatch",
+      "class": "protocol",
+      "message": "kind-mismatch",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "03030303030303030303030303030303",
+      "registration_event_id": "0303030303030303030303030303030303030303030303030303030303030303"
+    },
+    {
+      "name": "scp-outlet-6100--amplification-violation",
+      "code": "SCP-OUTLET-6100",
+      "slug": "amplification-violation",
+      "class": "protocol",
+      "message": "amplification-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "04040404040404040404040404040404",
+      "registration_event_id": "0404040404040404040404040404040404040404040404040404040404040404"
+    },
+    {
+      "name": "scp-outlet-6100--structural-floor-violation",
+      "code": "SCP-OUTLET-6100",
+      "slug": "structural-floor-violation",
+      "class": "protocol",
+      "message": "structural-floor-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "05050505050505050505050505050505",
+      "registration_event_id": "0505050505050505050505050505050505050505050505050505050505050505"
+    },
+    {
+      "name": "scp-outlet-6100--schema-immutability-violation",
+      "code": "SCP-OUTLET-6100",
+      "slug": "schema-immutability-violation",
+      "class": "protocol",
+      "message": "schema-immutability-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "06060606060606060606060606060606",
+      "registration_event_id": "0606060606060606060606060606060606060606060606060606060606060606"
+    },
+    {
+      "name": "scp-outlet-6100--query-misdeclaration",
+      "code": "SCP-OUTLET-6100",
+      "slug": "query-misdeclaration",
+      "class": "protocol",
+      "message": "query-misdeclaration",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "07070707070707070707070707070707",
+      "registration_event_id": "0707070707070707070707070707070707070707070707070707070707070707"
+    },
+    {
+      "name": "scp-outlet-6100--protocol.catalog-rotation-too-frequent",
+      "code": "SCP-OUTLET-6100",
+      "slug": "protocol.catalog-rotation-too-frequent",
+      "class": "protocol",
+      "message": "protocol.catalog-rotation-too-frequent",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "08080808080808080808080808080808",
+      "registration_event_id": "0808080808080808080808080808080808080808080808080808080808080808"
+    },
+    {
+      "name": "scp-outlet-6100--protocol.stream-already-open",
+      "code": "SCP-OUTLET-6100",
+      "slug": "protocol.stream-already-open",
+      "class": "protocol",
+      "message": "protocol.stream-already-open",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "09090909090909090909090909090909",
+      "registration_event_id": "0909090909090909090909090909090909090909090909090909090909090909"
+    },
+    {
+      "name": "scp-outlet-6101--protocol.session-id-conflict",
+      "code": "SCP-OUTLET-6101",
+      "slug": "protocol.session-id-conflict",
+      "class": "protocol",
+      "message": "protocol.session-id-conflict",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "registration_event_id": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+    },
+    {
+      "name": "scp-outlet-6101--protocol.malformed-session-id",
+      "code": "SCP-OUTLET-6101",
+      "slug": "protocol.malformed-session-id",
+      "class": "protocol",
+      "message": "protocol.malformed-session-id",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "registration_event_id": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+    },
+    {
+      "name": "scp-outlet-6101--protocol.unknown-session",
+      "code": "SCP-OUTLET-6101",
+      "slug": "protocol.unknown-session",
+      "class": "protocol",
+      "message": "protocol.unknown-session",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+      "registration_event_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+    },
+    {
+      "name": "scp-outlet-6101--protocol.context-closed-mid-stream",
+      "code": "SCP-OUTLET-6101",
+      "slug": "protocol.context-closed-mid-stream",
+      "class": "protocol",
+      "message": "protocol.context-closed-mid-stream",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+      "registration_event_id": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+    },
+    {
+      "name": "scp-outlet-6101--protocol.stream-already-closed",
+      "code": "SCP-OUTLET-6101",
+      "slug": "protocol.stream-already-closed",
+      "class": "protocol",
+      "message": "protocol.stream-already-closed",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "query-cost-floor"
+      },
+      "pad_nonce": "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e",
+      "registration_event_id": "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.denied",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.denied",
+      "class": "authorization",
+      "message": "Access denied for alice@example.com acting as did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH on this outlet.",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+      "registration_event_id": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.expired",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.expired",
+      "class": "authorization",
+      "message": "authorization.expired",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "10101010101010101010101010101010",
+      "registration_event_id": "1010101010101010101010101010101010101010101010101010101010101010"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.revoked",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.revoked",
+      "class": "authorization",
+      "message": "authorization.revoked",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "11111111111111111111111111111111",
+      "registration_event_id": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.missing",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.missing",
+      "class": "authorization",
+      "message": "authorization.missing",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "12121212121212121212121212121212",
+      "registration_event_id": "1212121212121212121212121212121212121212121212121212121212121212"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.attenuation-violation",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.attenuation-violation",
+      "class": "authorization",
+      "message": "authorization.attenuation-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "13131313131313131313131313131313",
+      "registration_event_id": "1313131313131313131313131313131313131313131313131313131313131313"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.mint-limit-exceeded",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.mint-limit-exceeded",
+      "class": "authorization",
+      "message": "authorization.mint-limit-exceeded",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "14141414141414141414141414141414",
+      "registration_event_id": "1414141414141414141414141414141414141414141414141414141414141414"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.time-box-violation",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.time-box-violation",
+      "class": "authorization",
+      "message": "authorization.time-box-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "15151515151515151515151515151515",
+      "registration_event_id": "1515151515151515151515151515151515151515151515151515151515151515"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.rate-exceeded",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.rate-exceeded",
+      "class": "authorization",
+      "message": "authorization.rate-exceeded",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "16161616161616161616161616161616",
+      "registration_event_id": "1616161616161616161616161616161616161616161616161616161616161616"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.cumulative-exceeded",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.cumulative-exceeded",
+      "class": "authorization",
+      "message": "authorization.cumulative-exceeded",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "17171717171717171717171717171717",
+      "registration_event_id": "1717171717171717171717171717171717171717171717171717171717171717"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.adapter-not-allowed",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.adapter-not-allowed",
+      "class": "authorization",
+      "message": "authorization.adapter-not-allowed",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "18181818181818181818181818181818",
+      "registration_event_id": "1818181818181818181818181818181818181818181818181818181818181818"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.revoked-mid-stream",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.revoked-mid-stream",
+      "class": "authorization",
+      "message": "authorization.revoked-mid-stream",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "19191919191919191919191919191919",
+      "registration_event_id": "1919191919191919191919191919191919191919191919191919191919191919"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.credit-stream-mismatch",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.credit-stream-mismatch",
+      "class": "authorization",
+      "message": "authorization.credit-stream-mismatch",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+      "registration_event_id": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.ikm-signature-invalid",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.ikm-signature-invalid",
+      "class": "authorization",
+      "message": "authorization.ikm-signature-invalid",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b",
+      "registration_event_id": "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b"
+    },
+    {
+      "name": "scp-outlet-6110--authorization.credit-replay",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.credit-replay",
+      "class": "authorization",
+      "message": "authorization.credit-replay",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
+      "registration_event_id": "1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c"
+    },
+    {
+      "name": "scp-outlet-6114--attenuation.mask-width-violation",
+      "code": "SCP-OUTLET-6114",
+      "slug": "attenuation.mask-width-violation",
+      "class": "authorization",
+      "message": "attenuation.mask-width-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d",
+      "registration_event_id": "1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d"
+    },
+    {
+      "name": "scp-outlet-6114--attenuation.caveat-mint-limit-exceeded",
+      "code": "SCP-OUTLET-6114",
+      "slug": "attenuation.caveat-mint-limit-exceeded",
+      "class": "authorization",
+      "message": "attenuation.caveat-mint-limit-exceeded",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e",
+      "registration_event_id": "1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e"
+    },
+    {
+      "name": "scp-outlet-6114--attenuation.hours-of-day-high-bits-set",
+      "code": "SCP-OUTLET-6114",
+      "slug": "attenuation.hours-of-day-high-bits-set",
+      "class": "authorization",
+      "message": "attenuation.hours-of-day-high-bits-set",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+      "registration_event_id": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f"
+    },
+    {
+      "name": "scp-outlet-6114--attenuation.days-of-week-high-bit-set",
+      "code": "SCP-OUTLET-6114",
+      "slug": "attenuation.days-of-week-high-bit-set",
+      "class": "authorization",
+      "message": "attenuation.days-of-week-high-bit-set",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "20202020202020202020202020202020",
+      "registration_event_id": "2020202020202020202020202020202020202020202020202020202020202020"
+    },
+    {
+      "name": "scp-outlet-6114--attenuation.origin-kind-stem-mismatch",
+      "code": "SCP-OUTLET-6114",
+      "slug": "attenuation.origin-kind-stem-mismatch",
+      "class": "authorization",
+      "message": "attenuation.origin-kind-stem-mismatch",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "21212121212121212121212121212121",
+      "registration_event_id": "2121212121212121212121212121212121212121212121212121212121212121"
+    },
+    {
+      "name": "scp-outlet-6114--attenuation.origin-kind-mixed-stem-root",
+      "code": "SCP-OUTLET-6114",
+      "slug": "attenuation.origin-kind-mixed-stem-root",
+      "class": "authorization",
+      "message": "attenuation.origin-kind-mixed-stem-root",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "22222222222222222222222222222222",
+      "registration_event_id": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    {
+      "name": "scp-outlet-6114--attenuation.origin-kind-unspecified",
+      "code": "SCP-OUTLET-6114",
+      "slug": "attenuation.origin-kind-unspecified",
+      "class": "authorization",
+      "message": "attenuation.origin-kind-unspecified",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "23232323232323232323232323232323",
+      "registration_event_id": "2323232323232323232323232323232323232323232323232323232323232323"
+    },
+    {
+      "name": "scp-outlet-6115--authorization.salt-rotation-unjustified",
+      "code": "SCP-OUTLET-6115",
+      "slug": "authorization.salt-rotation-unjustified",
+      "class": "authorization",
+      "message": "authorization.salt-rotation-unjustified",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:example"
+      },
+      "pad_nonce": "24242424242424242424242424242424",
+      "registration_event_id": "2424242424242424242424242424242424242424242424242424242424242424"
+    },
+    {
+      "name": "scp-outlet-6120--input.schema-violation",
+      "code": "SCP-OUTLET-6120",
+      "slug": "input.schema-violation",
+      "class": "input",
+      "message": "input.schema-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/items/0",
+        "violation": "type"
+      },
+      "pad_nonce": "25252525252525252525252525252525",
+      "registration_event_id": "2525252525252525252525252525252525252525252525252525252525252525"
+    },
+    {
+      "name": "scp-outlet-6120--input.too-large",
+      "code": "SCP-OUTLET-6120",
+      "slug": "input.too-large",
+      "class": "input",
+      "message": "input.too-large",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/items/0",
+        "violation": "type"
+      },
+      "pad_nonce": "26262626262626262626262626262626",
+      "registration_event_id": "2626262626262626262626262626262626262626262626262626262626262626"
+    },
+    {
+      "name": "scp-outlet-6120--input.not-serializable",
+      "code": "SCP-OUTLET-6120",
+      "slug": "input.not-serializable",
+      "class": "input",
+      "message": "input.not-serializable",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/items/0",
+        "violation": "type"
+      },
+      "pad_nonce": "27272727272727272727272727272727",
+      "registration_event_id": "2727272727272727272727272727272727272727272727272727272727272727"
+    },
+    {
+      "name": "scp-outlet-6120--input.estimate-exceeds-bound",
+      "code": "SCP-OUTLET-6120",
+      "slug": "input.estimate-exceeds-bound",
+      "class": "input",
+      "message": "input.estimate-exceeds-bound",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/items/0",
+        "violation": "type"
+      },
+      "pad_nonce": "28282828282828282828282828282828",
+      "registration_event_id": "2828282828282828282828282828282828282828282828282828282828282828"
+    },
+    {
+      "name": "scp-outlet-6120--input.invalid-grant",
+      "code": "SCP-OUTLET-6120",
+      "slug": "input.invalid-grant",
+      "class": "input",
+      "message": "input.invalid-grant",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/grant",
+        "violation": "range"
+      },
+      "pad_nonce": "29292929292929292929292929292929",
+      "registration_event_id": "2929292929292929292929292929292929292929292929292929292929292929"
+    },
+    {
+      "name": "scp-outlet-6130--execution.handler-panic",
+      "code": "SCP-OUTLET-6130",
+      "slug": "execution.handler-panic",
+      "class": "execution",
+      "message": "execution.handler-panic",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+      "registration_event_id": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+    },
+    {
+      "name": "scp-outlet-6130--execution.timeout",
+      "code": "SCP-OUTLET-6130",
+      "slug": "execution.timeout",
+      "class": "execution",
+      "message": "execution.timeout",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+      "registration_event_id": "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
+    },
+    {
+      "name": "scp-outlet-6130--execution.non-deterministic",
+      "code": "SCP-OUTLET-6130",
+      "slug": "execution.non-deterministic",
+      "class": "execution",
+      "message": "execution.non-deterministic",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c",
+      "registration_event_id": "2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c"
+    },
+    {
+      "name": "scp-outlet-6131--execution.credit-exhausted",
+      "code": "SCP-OUTLET-6131",
+      "slug": "execution.credit-exhausted",
+      "class": "execution",
+      "message": "execution.credit-exhausted",
+      "retry": {
+        "policy": "immediate"
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d",
+      "registration_event_id": "2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d"
+    },
+    {
+      "name": "scp-outlet-6131--execution.stream-gap",
+      "code": "SCP-OUTLET-6131",
+      "slug": "execution.stream-gap",
+      "class": "execution",
+      "message": "execution.stream-gap",
+      "retry": {
+        "policy": "immediate"
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e",
+      "registration_event_id": "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e"
+    },
+    {
+      "name": "scp-outlet-6132--execution.stream-cap-exhausted",
+      "code": "SCP-OUTLET-6132",
+      "slug": "execution.stream-cap-exhausted",
+      "class": "execution",
+      "message": "execution.stream-cap-exhausted",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f",
+      "registration_event_id": "2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f"
+    },
+    {
+      "name": "scp-outlet-6133--execution.credit-stall",
+      "code": "SCP-OUTLET-6133",
+      "slug": "execution.credit-stall",
+      "class": "execution",
+      "message": "execution.credit-stall",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "30303030303030303030303030303030",
+      "registration_event_id": "3030303030303030303030303030303030303030303030303030303030303030"
+    },
+    {
+      "name": "scp-outlet-6135--execution.cancel-ack-timeout",
+      "code": "SCP-OUTLET-6135",
+      "slug": "execution.cancel-ack-timeout",
+      "class": "execution",
+      "message": "execution.cancel-ack-timeout",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "31313131313131313131313131313131",
+      "registration_event_id": "3131313131313131313131313131313131313131313131313131313131313131"
+    },
+    {
+      "name": "scp-outlet-6140--output.schema-violation",
+      "code": "SCP-OUTLET-6140",
+      "slug": "output.schema-violation",
+      "class": "output",
+      "message": "output.schema-violation",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/result/0",
+        "violation": "type"
+      },
+      "pad_nonce": "32323232323232323232323232323232",
+      "registration_event_id": "3232323232323232323232323232323232323232323232323232323232323232"
+    },
+    {
+      "name": "scp-outlet-6140--output.too-large",
+      "code": "SCP-OUTLET-6140",
+      "slug": "output.too-large",
+      "class": "output",
+      "message": "output.too-large",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/result/0",
+        "violation": "type"
+      },
+      "pad_nonce": "33333333333333333333333333333333",
+      "registration_event_id": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "name": "scp-outlet-6140--output.not-serializable",
+      "code": "SCP-OUTLET-6140",
+      "slug": "output.not-serializable",
+      "class": "output",
+      "message": "output.not-serializable",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/result/0",
+        "violation": "type"
+      },
+      "pad_nonce": "34343434343434343434343434343434",
+      "registration_event_id": "3434343434343434343434343434343434343434343434343434343434343434"
+    },
+    {
+      "name": "scp-outlet-6150--economic.insufficient-funds",
+      "code": "SCP-OUTLET-6150",
+      "slug": "economic.insufficient-funds",
+      "class": "economic",
+      "message": "economic.insufficient-funds",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "economic-insufficient",
+        "needed": 500,
+        "currency": "USD"
+      },
+      "pad_nonce": "35353535353535353535353535353535",
+      "registration_event_id": "3535353535353535353535353535353535353535353535353535353535353535"
+    },
+    {
+      "name": "scp-outlet-6150--economic.adapter-failure",
+      "code": "SCP-OUTLET-6150",
+      "slug": "economic.adapter-failure",
+      "class": "economic",
+      "message": "economic.adapter-failure",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "economic-adapter",
+        "adapter_id": "adapter-x"
+      },
+      "pad_nonce": "36363636363636363636363636363636",
+      "registration_event_id": "3636363636363636363636363636363636363636363636363636363636363636"
+    },
+    {
+      "name": "scp-outlet-6150--economic.pricing-formula-error",
+      "code": "SCP-OUTLET-6150",
+      "slug": "economic.pricing-formula-error",
+      "class": "economic",
+      "message": "economic.pricing-formula-error",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "economic-insufficient",
+        "needed": 500,
+        "currency": "USD"
+      },
+      "pad_nonce": "37373737373737373737373737373737",
+      "registration_event_id": "3737373737373737373737373737373737373737373737373737373737373737"
+    },
+    {
+      "name": "scp-outlet-6150--economic.budget-exceeded",
+      "code": "SCP-OUTLET-6150",
+      "slug": "economic.budget-exceeded",
+      "class": "economic",
+      "message": "economic.budget-exceeded",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "economic-insufficient",
+        "needed": 500,
+        "currency": "USD"
+      },
+      "pad_nonce": "38383838383838383838383838383838",
+      "registration_event_id": "3838383838383838383838383838383838383838383838383838383838383838"
+    },
+    {
+      "name": "scp-outlet-6150--economic.escrow-overflow",
+      "code": "SCP-OUTLET-6150",
+      "slug": "economic.escrow-overflow",
+      "class": "economic",
+      "message": "economic.escrow-overflow",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "economic-insufficient",
+        "needed": 500,
+        "currency": "USD"
+      },
+      "pad_nonce": "39393939393939393939393939393939",
+      "registration_event_id": "3939393939393939393939393939393939393939393939393939393939393939"
+    },
+    {
+      "name": "scp-outlet-6150--protocol.interface-spam-cost",
+      "code": "SCP-OUTLET-6150",
+      "slug": "protocol.interface-spam-cost",
+      "class": "economic",
+      "message": "protocol.interface-spam-cost",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "economic-insufficient",
+        "needed": 500,
+        "currency": "USD"
+      },
+      "pad_nonce": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "registration_event_id": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a"
+    },
+    {
+      "name": "scp-outlet-6160--transport.relay-unavailable",
+      "code": "SCP-OUTLET-6160",
+      "slug": "transport.relay-unavailable",
+      "class": "transport",
+      "message": "transport.relay-unavailable",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "transport-relay",
+        "relay_url_kind": "wss"
+      },
+      "pad_nonce": "3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "registration_event_id": "3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b"
+    },
+    {
+      "name": "scp-outlet-6160--transport.cross-context-bridge-failure",
+      "code": "SCP-OUTLET-6160",
+      "slug": "transport.cross-context-bridge-failure",
+      "class": "transport",
+      "message": "transport.cross-context-bridge-failure",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "transport-rate-limit",
+        "retry_after_secs": 30
+      },
+      "pad_nonce": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+      "registration_event_id": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c"
+    },
+    {
+      "name": "scp-outlet-6160--transport.rate-limited",
+      "code": "SCP-OUTLET-6160",
+      "slug": "transport.rate-limited",
+      "class": "transport",
+      "message": "transport.rate-limited",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "transport-rate-limit",
+        "retry_after_secs": 30
+      },
+      "pad_nonce": "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d",
+      "registration_event_id": "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d"
+    },
+    {
+      "name": "scp-outlet-6160--transport.concurrent-streams-per-invoker",
+      "code": "SCP-OUTLET-6160",
+      "slug": "transport.concurrent-streams-per-invoker",
+      "class": "transport",
+      "message": "transport.concurrent-streams-per-invoker",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "transport-rate-limit",
+        "retry_after_secs": 30
+      },
+      "pad_nonce": "3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
+      "registration_event_id": "3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e"
+    },
+    {
+      "name": "scp-outlet-6160--transport.concurrent-streams-per-origin-invoker",
+      "code": "SCP-OUTLET-6160",
+      "slug": "transport.concurrent-streams-per-origin-invoker",
+      "class": "transport",
+      "message": "transport.concurrent-streams-per-origin-invoker",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "transport-rate-limit",
+        "retry_after_secs": 30
+      },
+      "pad_nonce": "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f",
+      "registration_event_id": "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f"
+    },
+    {
+      "name": "scp-outlet-6160--transport.concurrent-streams-per-outlet",
+      "code": "SCP-OUTLET-6160",
+      "slug": "transport.concurrent-streams-per-outlet",
+      "class": "transport",
+      "message": "transport.concurrent-streams-per-outlet",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "transport-rate-limit",
+        "retry_after_secs": 30
+      },
+      "pad_nonce": "40404040404040404040404040404040",
+      "registration_event_id": "4040404040404040404040404040404040404040404040404040404040404040"
+    },
+    {
+      "name": "scp-outlet-6170--governance.outlet-deregistered",
+      "code": "SCP-OUTLET-6170",
+      "slug": "governance.outlet-deregistered",
+      "class": "governance",
+      "message": "governance.outlet-deregistered",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "governance",
+        "action": "outlet-deregistered"
+      },
+      "pad_nonce": "41414141414141414141414141414141",
+      "registration_event_id": "4141414141414141414141414141414141414141414141414141414141414141"
+    },
+    {
+      "name": "scp-outlet-6170--governance.outlet-suspended",
+      "code": "SCP-OUTLET-6170",
+      "slug": "governance.outlet-suspended",
+      "class": "governance",
+      "message": "governance.outlet-suspended",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "governance",
+        "action": "outlet-deregistered"
+      },
+      "pad_nonce": "42424242424242424242424242424242",
+      "registration_event_id": "4242424242424242424242424242424242424242424242424242424242424242"
+    },
+    {
+      "name": "scp-outlet-6170--governance.ceiling-exceeded",
+      "code": "SCP-OUTLET-6170",
+      "slug": "governance.ceiling-exceeded",
+      "class": "governance",
+      "message": "governance.ceiling-exceeded",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "governance",
+        "action": "outlet-deregistered"
+      },
+      "pad_nonce": "43434343434343434343434343434343",
+      "registration_event_id": "4343434343434343434343434343434343434343434343434343434343434343"
+    },
+    {
+      "name": "scp-outlet-6170--governance.consequence-active",
+      "code": "SCP-OUTLET-6170",
+      "slug": "governance.consequence-active",
+      "class": "governance",
+      "message": "governance.consequence-active",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "governance",
+        "action": "outlet-deregistered"
+      },
+      "pad_nonce": "44444444444444444444444444444444",
+      "registration_event_id": "4444444444444444444444444444444444444444444444444444444444444444"
+    }
+  ],
+  "malformed": [
+    {
+      "name": "malformed--protocol--detail-shape-mismatch",
+      "code": "SCP-OUTLET-6100",
+      "slug": "protocol.violation",
+      "class": "protocol",
+      "message": "malformed detail for protocol",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/x",
+        "violation": "type"
+      },
+      "malformed": true,
+      "pad_nonce": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+      "registration_event_id": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+    },
+    {
+      "name": "malformed--authorization--detail-shape-mismatch",
+      "code": "SCP-OUTLET-6110",
+      "slug": "authorization.denied",
+      "class": "authorization",
+      "message": "malformed detail for authorization",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "protocol",
+        "rule": "wrong-shape"
+      },
+      "malformed": true,
+      "pad_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "registration_event_id": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+    },
+    {
+      "name": "malformed--input--detail-shape-mismatch",
+      "code": "SCP-OUTLET-6120",
+      "slug": "input.schema-violation",
+      "class": "input",
+      "message": "malformed detail for input",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "authorization",
+        "capability": "outlet_query:x"
+      },
+      "malformed": true,
+      "pad_nonce": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "registration_event_id": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+    },
+    {
+      "name": "malformed--execution--detail-shape-mismatch",
+      "code": "SCP-OUTLET-6130",
+      "slug": "execution.handler-panic",
+      "class": "execution",
+      "message": "malformed detail for execution",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "governance",
+        "action": "wrong-shape"
+      },
+      "malformed": true,
+      "pad_nonce": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+      "registration_event_id": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
+    },
+    {
+      "name": "malformed--output--detail-shape-mismatch",
+      "code": "SCP-OUTLET-6140",
+      "slug": "output.schema-violation",
+      "class": "output",
+      "message": "malformed detail for output",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "economic-insufficient",
+        "needed": 1,
+        "currency": "USD"
+      },
+      "malformed": true,
+      "pad_nonce": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+      "registration_event_id": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"
+    },
+    {
+      "name": "malformed--economic--detail-shape-mismatch",
+      "code": "SCP-OUTLET-6150",
+      "slug": "economic.insufficient-funds",
+      "class": "economic",
+      "message": "malformed detail for economic",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "field-violation",
+        "field_path": "/x",
+        "violation": "type"
+      },
+      "malformed": true,
+      "pad_nonce": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "registration_event_id": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+    },
+    {
+      "name": "malformed--transport--detail-shape-mismatch",
+      "code": "SCP-OUTLET-6160",
+      "slug": "transport.relay-unavailable",
+      "class": "transport",
+      "message": "malformed detail for transport",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "governance",
+        "action": "wrong-shape"
+      },
+      "malformed": true,
+      "pad_nonce": "a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6",
+      "registration_event_id": "a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6"
+    },
+    {
+      "name": "malformed--governance--detail-shape-mismatch",
+      "code": "SCP-OUTLET-6170",
+      "slug": "governance.outlet-deregistered",
+      "class": "governance",
+      "message": "malformed detail for governance",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "transport-rate-limit",
+        "retry_after_secs": 5
+      },
+      "malformed": true,
+      "pad_nonce": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+      "registration_event_id": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+    }
+  ],
+  "supplementary": [
+    {
+      "name": "supp--execution-panic-hash-bytes",
+      "code": "SCP-OUTLET-6130",
+      "slug": "execution.handler-panic",
+      "class": "execution",
+      "message": "handler panicked",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "execution-panic",
+        "panic_location_hash": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ]
+      },
+      "supplementary": true,
+      "pad_nonce": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+      "registration_event_id": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0"
+    },
+    {
+      "name": "supp--execution-timeout-large-u64",
+      "code": "SCP-OUTLET-6130",
+      "slug": "execution.timeout",
+      "class": "execution",
+      "message": "handler timed out",
+      "retry": {
+        "policy": "never"
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 9007199254740993
+      },
+      "supplementary": true,
+      "pad_nonce": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+      "registration_event_id": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+    }
+  ]
+}
