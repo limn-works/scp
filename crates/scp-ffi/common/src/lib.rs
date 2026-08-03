@@ -168,6 +168,18 @@ pub mod broadcast;
 #[cfg(feature = "resolvers")]
 pub mod export_verify;
 
+// Shared message-send persona-source seam (ADR-039 Enforcement-Stack Layer 2).
+// The `PersonaSource` callable + `ResolvedMessageSigner` atomic (key, persona)
+// pair, injected per bridge instance and consulted at each native bridge's
+// send site. Requires scp-core (MessageSigner) + ed25519-dalek (behind
+// `resolvers`). There is no `scp-ffi` WASM bridge (`crates/scp-ffi/wasm` does
+// not exist); the separate browser WASM client (`scp-client` / `scp-client-wasm`)
+// provisions no agent key and does not route sends through scp-core's
+// `MessageSigner`/`CoreFields`, so this seam is inapplicable there until
+// `scp-client` gains agent-key custody (a real gap to revisit under RFC #2242).
+#[cfg(feature = "resolvers")]
+pub mod persona;
+
 // All resolver types below require the `resolvers` feature (scp-core, scp-identity, tokio).
 #[cfg(feature = "resolvers")]
 mod resolvers;

@@ -5994,6 +5994,124 @@ pub(crate) async fn resolve_uniffi_signing_key(
     })
 }
 
+/// Exports the raw Ed25519 signing key for a key handle via the SENDER
+/// IDENTITY's OWN retained custody (platform/callback custody first, then —
+/// only under `testing` — the in-memory dev custody), mirroring the resolution
+/// order of [`resolve_uniffi_signing_key`] but sourcing custody from the
+/// identity that owns the key rather than the context handle.
+///
+/// The `#agent` send path uses this so the agent key handle and the custody it
+/// is exported through come from the SAME identity — mirroring the `PyO3`
+/// reference `resolve_message_signer`, which reads both from one registry entry.
+/// Exporting through the context handle's custody could export the wrong
+/// identity's key when the two differ (fail-closed at the receiver, but a latent
+/// correctness bug that bites when RFC #2242 activates the agent path).
+async fn export_uniffi_key_via_identity_custody(
+    identity: &Identity,
+    key_handle: &KeyHandle,
+) -> Result<ed25519_dalek::SigningKey, ScpError> {
+    if let Some(ref cb) = identity.callback_custody {
+        return cb
+            .export_ed25519_signing_key(key_handle)
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("failed to export agent signing key from platform custody: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            });
+    }
+
+    #[cfg(feature = "testing")]
+    if let Some(ref imc) = identity.in_memory_custody {
+        return imc
+            .0
+            .export_ed25519_signing_key(key_handle)
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("failed to export agent signing key from in-memory custody: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            });
+    }
+
+    Err(ScpError::Identity {
+        msg: format!(
+            "identity '{}' has an agent key but no usable custody backend to export it — \
+             cannot send under #agent",
+            identity.did
+        ),
+        code: codes::IDENT_1023.to_owned(),
+    })
+}
+
+/// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
+/// for a **message send** under the requested persona (ADR-039 Enforcement-Stack
+/// Layer 2).
+///
+/// Selects BOTH the key handle and the persona so the `#active`/`#agent` stamp
+/// and the signing key are chosen together and cannot diverge:
+/// - [`SigningKeyId::Active`](scp_did::SigningKeyId::Active) → the handle's
+///   retained active signing key (byte-identical to [`resolve_uniffi_signing_key`],
+///   so the default send path is unchanged). A failure there is remapped to a
+///   send-specific `SCP-CRYPTO-4001` rather than propagating the
+///   governance-worded `SCP-CTX-2040` from [`resolve_uniffi_signing_key`].
+/// - [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) → the sender
+///   identity's agent signing key (from its retained [`ScpIdentity`]), exported
+///   via the sender identity's OWN retained custody (same source as the key
+///   handle — see [`export_uniffi_key_via_identity_custody`]). **Fail-closed**
+///   with `SCP-IDENT-1023` when the identity has no retained key material or no
+///   agent key — NEVER falls back to `#active`.
+async fn resolve_uniffi_message_signer(
+    handle: &ContextHandle,
+    identity: &Identity,
+    persona: scp_did::SigningKeyId,
+) -> Result<scp_ffi_common::persona::ResolvedMessageSigner, ScpError> {
+    let key = match persona {
+        scp_did::SigningKeyId::Active => {
+            resolve_uniffi_signing_key(handle).await.map_err(|e| {
+                // Preserve the underlying custody-export diagnostic before
+                // collapsing to the send-specific SCP-CRYPTO-4001 (the returned
+                // code is intentionally unchanged — only the otherwise-lost
+                // detail is logged).
+                tracing::warn!(
+                    error = %e,
+                    "send #active signing-key resolution failed; returning SCP-CRYPTO-4001"
+                );
+                ScpError::Crypto {
+                    msg: "signing key required for send: could not resolve the sender's \
+                          #active signing key from retained custody"
+                        .to_owned(),
+                    code: codes::CRYPTO_4001.to_owned(),
+                }
+            })?
+        }
+        scp_did::SigningKeyId::Agent => {
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: format!(
+                        "identity '{}' has no retained key material — cannot send under #agent",
+                        identity.did
+                    ),
+                    code: codes::IDENT_1023.to_owned(),
+                })?;
+            let agent_handle = core_id
+                .agent_signing_key
+                .ok_or_else(|| ScpError::Identity {
+                    msg: format!(
+                        "identity '{}' has no agent signing key — cannot send under #agent; \
+                     add one with add_agent_key first",
+                        identity.did
+                    ),
+                    code: codes::IDENT_1023.to_owned(),
+                })?;
+            export_uniffi_key_via_identity_custody(identity, &agent_handle).await?
+        }
+    };
+    Ok(scp_ffi_common::persona::ResolvedMessageSigner::new(
+        key, persona,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a) — bridge helpers
 // ---------------------------------------------------------------------------
@@ -11016,9 +11134,15 @@ impl Scp {
                 drop(state);
 
                 // Validate inner envelope signing via the retained KeyCustody
-                // (SCP-214 criterion 6). This ensures the identity's active signing
-                // key can produce a valid Ed25519 signature before delegating to
-                // the ContextManager for message delivery.
+                // (SCP-214 criterion 6). This ensures the identity's mandatory
+                // `#active` signing key can produce a valid Ed25519 signature
+                // before delegating to the ContextManager. This is a discarded
+                // custody smoke-test on the baseline operational key (identity
+                // plumbing), NOT the wire persona — the persona actually stamped
+                // on the message is chosen below via the ADR-039 persona-source
+                // seam and validated for the chosen persona by
+                // `resolve_uniffi_message_signer` (fail-closed on `#agent` with
+                // no agent key).
                 if let Some(core_id) = identity.core_id.as_ref() {
                     let context_id = handle.context_id.clone();
                     let sender_did_str = identity.did.clone();
@@ -11066,11 +11190,16 @@ impl Scp {
                     }
                 }
 
-                // Resolve the signing key from the handle's retained custody so the
-                // ContextManager can produce a valid inner envelope signature. Passing
-                // None would cause the encrypted send path to fail with "signing key
-                // required".
-                let resolved_signing_key = resolve_uniffi_signing_key(&handle).await.ok();
+                // ADR-039 Enforcement-Stack Layer 2: consult the per-instance
+                // persona-source seam to choose the send persona (default
+                // `#active`; a future determiner — RFC #2242 — overrides it),
+                // then resolve BOTH the VM stamp and the matching key handle
+                // from that one persona (fail-closed on `#agent` with no agent
+                // key). Passing no signer would cause the encrypted send path to
+                // fail with "signing key required".
+                let persona = (bi.core.persona_source())();
+                let resolved_signer =
+                    resolve_uniffi_message_signer(&handle, &identity, persona).await?;
 
                 // Delegate to the shared ContextManager for message delivery
                 // through the transport provider.
@@ -11092,27 +11221,17 @@ impl Scp {
                     })?;
 
                 let sender_did: scp_did::DID = identity.did.clone().into();
-                // Every send path requires a signing key; `MessageSigner` is
-                // non-optional. Fail closed with a descriptive error when the
-                // key cannot be resolved rather than handing the send path a
-                // `None` it would only reject downstream.
-                let signing_key = resolved_signing_key.ok_or_else(|| ScpError::Crypto {
-                    msg: "signing key required for send: could not resolve the sender's signing \
-                          key from retained custody"
-                        .to_owned(),
-                    code: codes::CRYPTO_4001.to_owned(),
-                })?;
                 manager
                     .send_message(
                         &core_handle,
                         &sender_did,
                         &payload,
-                        // ADR-039: UniFFI bridge sends under the human `#active`
-                        // key today; per-message persona selection is out of
-                        // scope for this runtime-pipeline wiring (FFI is
-                        // mechanically widened only). `MessageSigner` pairs key +
-                        // persona so they cannot diverge.
-                        scp_core::context::supervisor::MessageSigner::Active(&signing_key),
+                        // The `MessageSigner` is derived from the same persona
+                        // that selected the key handle (see
+                        // `resolve_uniffi_message_signer`), so the persona
+                        // stamped on the wire and the key that signs are one
+                        // source of truth (ADR-039).
+                        resolved_signer.message_signer(),
                         None,
                         spending_ucan.as_ref(),
                     )
@@ -20352,6 +20471,277 @@ mod tests {
             pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
             pre_rotation_custody,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-039 Enforcement-Stack Layer 2 — message-send persona-source seam.
+    //
+    // Mirrors the PyO3 reference persona resolver tests
+    // (`resolve_message_signer_binds_stamp_and_key_atomically` +
+    // `..._fails_closed`) against the UniFFI bridge, whose custody sourcing is
+    // materially different (context-handle custody for `#active`; the SENDER
+    // identity's OWN custody for `#agent`). These exercise the REAL
+    // `resolve_uniffi_message_signer`, which binds the VM stamp and the key
+    // handle from ONE persona (fail-closed on `#agent` with no agent key).
+    // -----------------------------------------------------------------------
+
+    /// Builds a fresh in-memory `Identity` (optionally carrying an `#agent`
+    /// signing key) plus a `ContextHandle` that shares the identity's custody +
+    /// active key handle, returning `(identity, handle, active_key, agent_key)`
+    /// with the two keys exported for byte-comparison. The `#active` resolution
+    /// path exports through the handle's custody; the `#agent` path exports
+    /// through the identity's OWN custody — both wrap the SAME in-memory custody
+    /// instance here so the resolved keys can be compared against the exports.
+    #[cfg(feature = "testing")]
+    async fn build_persona_test_identity(
+        scp: &Arc<crate::scp::Scp>,
+        with_agent_key: bool,
+    ) -> (
+        Identity,
+        ContextHandle,
+        ed25519_dalek::SigningKey,
+        Option<ed25519_dalek::SigningKey>,
+    ) {
+        let instance_id = scp.instance_id();
+        let custody = InMemoryKeyCustody::new();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
+        let (core_id, _document, _prk) = if with_agent_key {
+            dht.create_with_agent_key(&custody, pre_rotation_custody.as_ref())
+                .await
+                .expect("agent-keyed in-memory identity creation succeeds")
+        } else {
+            DidMethod::create(&dht, &custody, pre_rotation_custody.as_ref())
+                .await
+                .expect("in-memory identity creation succeeds")
+        };
+        let did = core_id.did.clone();
+        // `KeyHandle` is `Copy` — read handles before moving `core_id`/`custody`.
+        let active_handle = core_id.active_signing_key;
+        let active_key = custody
+            .export_ed25519_signing_key(&active_handle)
+            .await
+            .expect("export active key");
+        let agent_key = match core_id.agent_signing_key {
+            Some(h) => Some(
+                custody
+                    .export_ed25519_signing_key(&h)
+                    .await
+                    .expect("export agent key"),
+            ),
+            None => None,
+        };
+        // Wrap the SAME custody instance so identity + handle share key material.
+        let opaque = Arc::new(OpaqueInMemoryKeyCustody(custody));
+        let identity = Identity {
+            did: did.clone(),
+            custody_type: CustodyMethod::InMemory,
+            core_id: Some(core_id),
+            core_document: None,
+            in_memory_custody: Some(Arc::clone(&opaque)),
+            callback_custody: None,
+            verifying_key_hex: None,
+            instance_id,
+            bi: Arc::clone(&scp.inner),
+            rotation_event_json: None,
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            pre_rotation_custody,
+        };
+        let handle = ContextHandle {
+            context_id: format!("persona-test-{}", uuid::Uuid::new_v4()),
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: did,
+            in_memory_custody: Some(Arc::clone(&opaque)),
+            callback_custody: None,
+            signing_key: Some(active_handle),
+            ceiling_strings: Vec::new(),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
+            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
+            instance_id,
+        };
+        (identity, handle, active_key, agent_key)
+    }
+
+    /// `resolve_uniffi_message_signer` binds the `#agent` VM stamp to the
+    /// identity's AGENT key (never the active key), and `#active` to the active
+    /// key — atomically. This is the property that makes an `#agent`-stamped-
+    /// but-`#active`-signed message unrepresentable at the FFI send boundary.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_message_signer_binds_stamp_and_key_atomically() {
+        use scp_core::context::supervisor::MessageSigner;
+        let scp = scp_test();
+        let (identity, handle, active_key, agent_key) =
+            build_persona_test_identity(&scp, true).await;
+        let agent_key = agent_key.expect("agent-keyed identity has an agent key");
+        assert_ne!(
+            active_key.to_bytes(),
+            agent_key.to_bytes(),
+            "test identity must have distinct active and agent keys"
+        );
+
+        // #agent persona → agent key + #agent stamp.
+        let signer =
+            super::resolve_uniffi_message_signer(&handle, &identity, scp_did::SigningKeyId::Agent)
+                .await
+                .unwrap();
+        assert_eq!(signer.persona(), scp_did::SigningKeyId::Agent);
+        assert!(matches!(signer.message_signer(), MessageSigner::Agent(_)));
+        assert_eq!(
+            signer.message_signer().signing_key_id(),
+            scp_did::SigningKeyId::Agent
+        );
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            agent_key.to_bytes(),
+            "#agent persona MUST resolve the agent key, never the active key"
+        );
+
+        // #active persona → active key + #active stamp (default path unchanged).
+        let signer =
+            super::resolve_uniffi_message_signer(&handle, &identity, scp_did::SigningKeyId::Active)
+                .await
+                .unwrap();
+        assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
+        assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            active_key.to_bytes()
+        );
+    }
+
+    /// Fail-closed: `#agent` requested for an identity with NO agent key returns
+    /// a typed error (SCP-IDENT-1023) and NEVER falls back to the active key.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_message_signer_agent_without_agent_key_fails_closed() {
+        let scp = scp_test();
+        let (identity, handle, active_key, agent_key) =
+            build_persona_test_identity(&scp, false).await;
+        assert!(agent_key.is_none(), "active-only identity has no agent key");
+
+        let err =
+            super::resolve_uniffi_message_signer(&handle, &identity, scp_did::SigningKeyId::Agent)
+                .await
+                .expect_err("#agent send without an agent key must fail closed");
+        match err {
+            ScpError::Identity { ref code, .. } => assert_eq!(
+                code,
+                codes::IDENT_1023,
+                "expected fail-closed no-agent-key code SCP-IDENT-1023"
+            ),
+            other => panic!("expected ScpError::Identity SCP-IDENT-1023, got: {other:?}"),
+        }
+
+        // The active path still resolves — the failure is specific to #agent,
+        // not a broken identity.
+        let signer =
+            super::resolve_uniffi_message_signer(&handle, &identity, scp_did::SigningKeyId::Active)
+                .await
+                .unwrap();
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            active_key.to_bytes()
+        );
+    }
+
+    /// REGRESSION GUARD (fix 3): the `#agent` arm MUST export the agent key
+    /// through the sender identity's OWN custody, NOT the context handle's
+    /// custody. This test makes those two custodies DIFFER — the `Identity`
+    /// carries `custody_a` (which holds the agent key), while the `ContextHandle`
+    /// carries a DIFFERENT, empty `custody_b` that does NOT hold the agent key
+    /// handle.
+    ///
+    /// Under the fixed code the export sources custody from the identity
+    /// (`custody_a`) and returns the correct agent key. Under a revert to
+    /// context-handle custody sourcing, the export would run against `custody_b`
+    /// — which has no key at the agent handle's index — and return
+    /// `PlatformError::KeyNotFound`, so `resolve_uniffi_message_signer` would
+    /// fail and the `.expect()` below would panic. That is exactly the regression
+    /// this guards.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_persona_uses_identity_custody_not_handle_custody() {
+        let scp = scp_test();
+        let instance_id = scp.instance_id();
+
+        // custody_A: the sender identity's OWN custody — holds the agent key.
+        let custody_a = InMemoryKeyCustody::new();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
+        let (core_id, _document, _prk) = dht
+            .create_with_agent_key(&custody_a, pre_rotation_custody.as_ref())
+            .await
+            .expect("agent-keyed in-memory identity creation succeeds");
+        let did = core_id.did.clone();
+        let active_handle = core_id.active_signing_key;
+        let agent_handle = core_id
+            .agent_signing_key
+            .expect("agent-keyed identity has an agent key handle");
+        let agent_key = custody_a
+            .export_ed25519_signing_key(&agent_handle)
+            .await
+            .expect("export agent key from custody_A");
+
+        let opaque_a = Arc::new(OpaqueInMemoryKeyCustody(custody_a));
+        let identity = Identity {
+            did: did.clone(),
+            custody_type: CustodyMethod::InMemory,
+            core_id: Some(core_id),
+            core_document: None,
+            in_memory_custody: Some(Arc::clone(&opaque_a)),
+            callback_custody: None,
+            verifying_key_hex: None,
+            instance_id,
+            bi: Arc::clone(&scp.inner),
+            rotation_event_json: None,
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            pre_rotation_custody,
+        };
+
+        // custody_B: a DIFFERENT, empty custody on the context handle. It does
+        // NOT hold the agent key handle — so a resolver that (wrongly) sourced
+        // #agent custody from the handle would fail against it.
+        let opaque_b = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let handle = ContextHandle {
+            context_id: format!("persona-regress-{}", uuid::Uuid::new_v4()),
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: did.clone(),
+            in_memory_custody: Some(Arc::clone(&opaque_b)),
+            callback_custody: None,
+            signing_key: Some(active_handle),
+            ceiling_strings: Vec::new(),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
+            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
+            instance_id,
+        };
+
+        let signer =
+            super::resolve_uniffi_message_signer(&handle, &identity, scp_did::SigningKeyId::Agent)
+                .await
+                .expect(
+                    "#agent must resolve via the sender identity's OWN custody (custody_A); a \
+                     resolver sourcing custody from the context handle (custody_B) would fail",
+                );
+        assert_eq!(
+            signer.message_signer().key().to_bytes(),
+            agent_key.to_bytes(),
+            "#agent MUST export the agent key through the sender identity's own custody \
+             (custody_A); sourcing from the context handle's custody_B would export the wrong \
+             key or fail closed"
+        );
     }
 
     /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an empty/whitespace
