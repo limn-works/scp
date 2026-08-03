@@ -148,7 +148,7 @@ crates/
 
 - **Contexts, not channels.** A context is a governed, encrypted, auditable space with its own key material, Merkle log, and outlet surface. It's the security boundary, lifecycle boundary, and governance
 boundary all in one.
-- **Encryption IS access control.** No relay or server enforces membership — the math does. Relays are untrusted dumb pipes.
+- **Encryption IS access control.** No relay or server enforces membership — the math does. Relays are untrusted: clients verify everything cryptographically and never rely on a relay for access control or correctness. A relay may validate *public, self-certifying* records (e.g. DID documents) to resist suppression, but is never trusted to — and never reads encrypted content.
 - **No operator required.** If Limn disappears tomorrow, SCP works exactly as designed. DID resolution via DHT, relays are commodity storage, governance is per-context.
 - **Provenance everywhere.** Not a feature — a core protocol property. Every message, outlet output, attestation, and cross-context transfer is traceable.
 - **Human accountability.** Every agent chains back to a human DID. The protocol provides the mechanism; contexts decide the requirement.

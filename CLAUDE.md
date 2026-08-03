@@ -9,7 +9,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 - **Provenance everywhere.** All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal.
 - **Human accountability.** Every agent traces to a human DID through attestation chains. Behavioral records are durable.
 - **Context isolation.** All interaction within bounded contexts. Cross-context data flow is explicit and governed. The security boundary.
-- **Encryption-as-access-control.** MLS group keys enforce membership. Relays are untrusted dumb pipes.
+- **Encryption-as-access-control.** MLS group keys enforce membership. Relays are untrusted: access control is cryptographic (never relay-enforced) and clients verify every record independently, so correctness never depends on a relay. A relay MAY validate *public, self-certifying* records it stores (e.g. verify a DID document's BEP44 signature and keep the highest-seq copy) for availability/anti-suppression — defense-in-depth, never a trust dependency, and never applies to encrypted content. 'Untrusted,' not 'does zero validation,' is the invariant.
 - **Legibility before opt-in.** Context parameters visible before joining. Informed consent is mechanical.
 - **Protocol requires no operator.** Must work if Limn disappears tomorrow.
 - **Transport independence.** No structural coupling to any single transport.

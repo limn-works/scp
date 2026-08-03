@@ -1,0 +1,307 @@
+{
+  "project": "Relay-Based DID Resolution (Model B) — issue #482",
+  "description": "Build the SCP relay-based DID resolution layer (Layer 1, §3.10.2), the primary layer of the dual-layer resolution architecture (§3.10) alongside the existing Mainline DHT fallback (Layer 2). This is issue #482 — a FEATURE, NOT ADR-062 dev-backend cleanup. ADR-062's Slice 11 (SCP-CAPINJECT-011) only severs the InMemoryRelayPublisher default type param; this PRD builds the actual capability. Model B (spec commit aa0722f2b): DID documents ride in a minimal fixed-layout DID-record relay frame (§9.10.12 `DidRecordV1`: version‖public_key‖seq‖signature‖value) carried as a RAW relay blob over the EXISTING PUBLISH/QUERY operations (ADR-004) — no new wire types. Trust is client-side: the resolver re-verifies every record's BEP44 signature against the key derived from the DID string itself (§9.6.1), never the frame-supplied public_key or the relay's acceptance. An SCP-native relay MAY OPTIONALLY validate each frame it stores (decode → DID→routing_id binding → BEP44 signature, cheapest-first) and keep a single highest-sequence slot per routing_id (slot-exclusivity), which delivers the §3.10.8 suppression resistance; foreign/non-validating transports store the frame opaquely and stay correct via client-side verification, the DHT, and multi-relay publishing. Five stories: 001 the DidRecordV1 frame primitive (scp-protocol, wasm-safe, byte-deterministic); 002 the READ path (transport publish_raw/query_raw + TransportRelayQuerier + completing/correcting the #2226 RealMultiRelayQuerier composer to highest-seq-valid selection without dropping the genuine blob); 003 relay-side validation + slot-exclusivity (with the companion ADR-004 storage-semantics update the spec mandates); 004 the WRITE path (real RelayPublisher + production RepublishManager wiring + the republish-loop signature/sequence-drop fix, republish.rs:703); 005 the publish→resolve round-trip + slot-exclusivity/flood regression tests. #2226 (RealMultiRelayQuerier composer) is already merged on main and RETAINED — #482 completes and corrects it, it does not delete it. Pre-rotation/create-ceremony production activation is a SEPARATE dependency (RFC #2130 / #1729) and is NOT required here. Forward-only DAG.",
+  "gates": [
+    {
+      "id": "gate-relayres-1",
+      "name": "DID-record frame primitive (DidRecordV1, scp-protocol)",
+      "stories": [
+        "SCP-RELAYRES-001"
+      ]
+    },
+    {
+      "id": "gate-relayres-2",
+      "name": "Relay READ path (transport raw-blob + TransportRelayQuerier + composer correction)",
+      "stories": [
+        "SCP-RELAYRES-002"
+      ]
+    },
+    {
+      "id": "gate-relayres-3",
+      "name": "Relay-side validation + slot-exclusivity (+ companion ADR-004 update)",
+      "stories": [
+        "SCP-RELAYRES-003"
+      ]
+    },
+    {
+      "id": "gate-relayres-4",
+      "name": "Relay WRITE path (RelayPublisher + production RepublishManager wiring + loop fix)",
+      "stories": [
+        "SCP-RELAYRES-004"
+      ]
+    },
+    {
+      "id": "gate-relayres-5",
+      "name": "Publish->resolve round-trip + suppression/flood regression",
+      "stories": [
+        "SCP-RELAYRES-005"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-RELAYRES-001",
+      "title": "Implement the DidRecordV1 DID-record relay frame (version‖public_key‖seq‖signature‖value) in scp-protocol — wasm-safe, byte-deterministic encode/decode with the §9.10.12 decoder-determinism rules",
+      "gate": "gate-relayres-1",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/envelope/did_record.rs",
+        "crates/scp-protocol/src/envelope/mod.rs"
+      ],
+      "description": "Foundational shared primitive for the whole relay-resolution feature (#482). Implement the minimal, fixed-layout DID-record relay frame `DidRecordV1` as a pure sync wasm-compatible type in scp-protocol (§3.10.12 places it in scp-protocol as a Phase-2 type; §9.10.12 is the authoritative frame spec). Layout (§9.10.12): `version: u8 = 1` ‖ `public_key: [u8;32]` (Ed25519, carried for the RELAY's verify; the client ignores it for trust) ‖ `seq: u64` (8 bytes big-endian, BEP44 sequence) ‖ `signature: [u8;64]` (raw fixed-width BEP44 signature, NO length prefix) ‖ `value: [u8]` (the sole variable-length field, the trailing remainder — the BEP44-signed DID-document payload; NO value_len prefix). Fixed prefix = 1+32+8+64 = 105 bytes; total frame length = 105 + len(value). Raw fixed-layout binary encoding under §9.5.1 length-prefix discipline — NOT MessagePack/CBOR/bencode — so the bytes are byte-reproducible across every binding and the exact `value` bytes handed to BEP44 verification are preserved octet-for-octet (§9.10.12 'Why raw binary'). There is deliberately no magic tag and no record-kind byte (the routing-ID domain is the type discriminant, §3.10.2). The frame carries ONLY the (public_key, seq, signature, value) tuple; BEP44 verification is a SEPARATE concern performed by the resolver against the DID-derived key (decode is not verify — §9.10.12 'decode-and-verify at exactly one site' means downstream consumers pair this decode with the single verify site; this type provides the decode). Provides `encode(&self) -> Vec<u8>` and `decode(bytes: &[u8]) -> Result<DidRecordV1, _>`.",
+      "acceptanceCriteria": [
+        "The DidRecordV1 type exists in scp-protocol's envelope module with encode + decode: `grep -rn 'struct DidRecordV1' crates/scp-protocol/src/envelope` matches, and the type exposes an `encode` (-> `Vec<u8>`) and a `decode` (`&[u8]` -> `Result`) function (grep both fn signatures); it is re-exported from `crates/scp-protocol/src/envelope/mod.rs`.",
+        "Byte-exact layout: a test asserts `encode` of a fixed (public_key, seq, signature, value) tuple yields exactly `105 + value.len()` bytes, with byte[0] == 0x01 (version), public_key at bytes[1..33], `seq` big-endian at bytes[33..41], signature at bytes[41..105], and value at bytes[105..].",
+        "Round-trip determinism: a test encodes a (public_key, seq, signature, value) tuple, decodes the bytes, and asserts the decoded tuple is byte-identical to the input; encoding the decoded value again yields identical bytes (idempotent).",
+        "Decoder rule 1 — version gated first: `decode` rejects (returns Err, no partial parse) any frame whose first byte is not 0x01 (an unimplemented version), asserted before any subsequent byte is interpreted; a test feeds a buffer whose first byte is a MessagePack map marker (0x80) and asserts Err (an OuterEnvelope is never mistaken for a frame, §9.10.12).",
+        "Decoder rule 2 — full fixed prefix required: `decode` rejects any frame shorter than the 105-byte fixed prefix (a test feeds buffers of length 0, 1, and 104 and asserts Err with no panic in a debug build — proving no `len - 105` underflow, §9.10.12 rule 3).",
+        "Decoder rule 3 — value bounds after prefix check: `decode` rejects an empty value (total length exactly 105) and rejects `len(value) > 262144 - 105` (Max blob size 262144, §9.18.11); a test asserts both boundaries (105 rejected; 262039-byte value accepted; 262040-byte value rejected).",
+        "wasm-safe / pure sync: the frame type introduces no async or tokio dependency — `grep -n 'tokio\\|async ' crates/scp-protocol/src/envelope/did_record.rs` returns 0 (scp-protocol is the wasm32-compatible pure-sync crate, §3.10.12).",
+        "Full CI green: `cargo fmt --all -- --check`; `cargo clippy -p scp-protocol --all-targets -- -D warnings`; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test -p scp-protocol` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Create crates/scp-protocol/src/envelope/did_record.rs with the DidRecordV1 struct (public_key, seq, signature, value) + encode/decode; register `pub mod did_record` and re-export DidRecordV1 in crates/scp-protocol/src/envelope/mod.rs.",
+        "Implement encode as fixed-width big-endian writes (version, public_key, seq, signature) followed by the value remainder — no length prefixes on fixed fields, no value_len prefix.",
+        "Implement decode enforcing the four §9.10.12 decoder-determinism rules in order: read+check version first; require the full 105-byte prefix; bound-check value length only after the prefix check (reject empty, reject > 262144-105); return the (public_key, seq, signature, value) tuple with no verification.",
+        "Write the layout, round-trip, and decoder-determinism (version/prefix/value-bounds/OuterEnvelope-marker) tests; run full CI + review roster."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay DID-Record Frame"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.12 Phase Integration"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "model": "Model B (spec commit aa0722f2b)"
+      }
+    },
+    {
+      "id": "SCP-RELAYRES-002",
+      "title": "Relay READ path: add the transport raw-blob path (publish_raw/query_raw), implement the concrete TransportRelayQuerier (query_raw + DidRecordV1 decode) in scp-transport, and complete+correct the #2226 RealMultiRelayQuerier composer to highest-seq-valid selection that never drops the genuine blob on repeat query",
+      "gate": "gate-relayres-2",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/traits.rs",
+        "crates/scp-transport/src/native/adapter.rs",
+        "crates/scp-transport/src/native/relay_querier.rs",
+        "crates/scp-transport/src/native/mod.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-identity/src/relay_querier.rs"
+      ],
+      "description": "The READ half of relay resolution (§3.10.2/§3.10.4). Model B carries DID records as RAW relay blobs over the EXISTING PUBLISH/QUERY operations (§9.10.12: no new wire types), so the SDK transport adapter needs a public-record RAW-BLOB path — `publish_raw(routing_id, blob_ttl, blob: Vec<u8>)` and `query_raw(routing_id, since, limit) -> Vec<Vec<u8>>` — DISTINCT from the adapter's `OuterEnvelope` message send/query path (a DID routing ID carries DidRecordV1 frames, never OuterEnvelopes, §9.10.12). Implement the concrete `TransportRelayQuerier` in scp-transport (the production querier belongs here: scp-transport depends on scp-identity, so scp-identity cannot host a relay-talking impl without a circular dep — resolution.rs module doc): it performs the relay QUERY via `query_raw` with `limit: N` (N=16, §3.10.2), decodes each returned blob via `DidRecordV1::decode` (SCP-RELAYRES-001) into a `RelayQueryRecord` (value, signature, seq), discards blobs that fail to decode (§3.10.4 'relay blob fails frame decoding' — falls through, never partially parsed), and returns the surviving candidates; it implements the scp-identity `RelayQuerier` trait. COMPLETE and CORRECT the already-merged #2226 `RealMultiRelayQuerier<Q>` composer (crates/scp-identity/src/relay_querier.rs, RETAINED under Model B — its per-relay multi-candidate `Vec` collection is exactly the non-validating/foreign-relay best-effort sift the resolver needs): ensure the composer selects the HIGHEST-seq VALID record across all relays and all co-located candidates (§3.10.4 step 5, §3.10.7), NOT first-valid, and that a genuine record co-located with junk/stale/duplicate blobs (repeat query, non-validating relay) is NOT dropped — the highest-seq valid blob is always returned. Client-side re-verification (BEP44 signature over bencode(seq,value) against the DID-derived key) stays in the composer/resolver verify path (§9.10.12 'framing is outside the signed authority'; the frame's public_key is NEVER trusted). Add a `scp-protocol` dependency to scp-transport (acyclic: scp-protocol is a leaf) so TransportRelayQuerier can consume DidRecordV1.",
+      "acceptanceCriteria": [
+        "Transport raw-blob path exists, distinct from the OuterEnvelope path: `grep -rn 'fn publish_raw' crates/scp-transport/src` and `grep -rn 'fn query_raw' crates/scp-transport/src` each match a raw-blob method whose blob type is `Vec<u8>` (NOT `OuterEnvelope`) on the transport adapter trait (traits.rs) and its native impl (native/adapter.rs).",
+        "Concrete TransportRelayQuerier in scp-transport: `grep -rn 'impl RelayQuerier for' crates/scp-transport/src` matches a real, non-InMemory `TransportRelayQuerier` that calls `query_raw` and decodes each returned blob via `DidRecordV1::decode` (grep the decode call); scp-transport gains a `scp-protocol` dependency (`grep -n 'scp-protocol' crates/scp-transport/Cargo.toml` matches a non-comment dependency line).",
+        "Malformed frames are discarded, not partially parsed: a test feeds the TransportRelayQuerier a routing_id whose query_raw returns a mix of valid DidRecordV1 frames and undecodable blobs, and asserts only the decodable records survive (undecodable blobs dropped, §3.10.4).",
+        "Composer selects highest-seq valid (not first-valid): a test where multiple relays (and co-located candidates within one relay) return valid records with DIFFERENT seq values asserts `RealMultiRelayQuerier::query` returns the record with the HIGHEST seq (§3.10.4 step 5 / §3.10.7), independent of arrival/insertion order.",
+        "Genuine blob not dropped on repeat query / co-located junk: a test where a routing_id holds the genuine highest-seq record alongside stale-seq and undecodable co-located blobs (a repeated/non-validating-relay query) asserts the genuine record is still returned — the composer's dedup/selection never discards the highest-seq valid candidate (§3.10.2 limit-N shadow-defeat, §3.10.8 residual).",
+        "Client-side re-verification retained: a test asserts a candidate whose BEP44 signature does not verify against the DID-derived key is rejected (never returned), and that the frame-supplied public_key is not trusted (a frame carrying a mismatched public_key whose triple still verifies against the DID key is accepted; a frame whose triple only verifies against its own embedded key is rejected) — §9.10.12 'framing is outside the signed authority'.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Add `publish_raw`/`query_raw` (Vec<u8> blobs over the existing PUBLISH/QUERY ops) to the transport adapter trait (crates/scp-transport/src/traits.rs) and its native impl (native/adapter.rs), distinct from the OuterEnvelope send/query path.",
+        "Add a `scp-protocol` dependency to crates/scp-transport/Cargo.toml (acyclic).",
+        "Create crates/scp-transport/src/native/relay_querier.rs implementing `TransportRelayQuerier` (impl scp-identity `RelayQuerier`): query_raw with limit N=16, DidRecordV1::decode each blob, drop undecodable blobs, return the candidate Vec; register the module in native/mod.rs.",
+        "In crates/scp-identity/src/relay_querier.rs, complete+correct the #2226 RealMultiRelayQuerier composer: guarantee highest-seq-valid selection across relays and co-located candidates and that the genuine blob is never dropped on repeat/co-located queries; add the highest-seq + repeat-query regression tests.",
+        "Write the raw-blob-path, TransportRelayQuerier decode/discard, and client-re-verify tests; run full CI + review roster."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay DID-Record Frame"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "builds_on": "#2226 RealMultiRelayQuerier composer (merged on main, RETAINED + corrected — not deleted)"
+      }
+    },
+    {
+      "id": "SCP-RELAYRES-003",
+      "title": "Relay-side validation + slot-exclusivity for DID-record frames (SCP-native relay, OPTIONAL capability): decode → DID→routing_id binding → BEP44 signature (cheapest-first) → single highest-seq slot; slot-exclusive routing_id once claimed — with the companion ADR-004 storage-semantics update the spec mandates",
+      "gate": "gate-relayres-3",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/did_record_validation.rs",
+        "crates/scp-transport/src/relay/mod.rs",
+        "crates/scp-node/src/projection.rs",
+        ".docs/adrs/phase-1.md"
+      ],
+      "description": "The relay-side anti-suppression behavior that makes the relay layer suppression-resistant (§3.10.2 'Relay-side validation', §3.10.8, §9.10.12). This is an OPTIONAL capability of SCP-native relays — the protocol MUST NOT require a validating relay; foreign/non-validating transports store the frame opaquely and stay correct via client-side verification (§3.10.2). On PUBLISH of a blob at a routing_id, a validating SCP-native relay runs, CHEAPEST-FIRST (so junk is rejected before any Ed25519 verify, all behind the existing per-IP PUBLISH rate limit, ADR-004): (1) structural decode as a DidRecordV1 frame (SCP-RELAYRES-001); (2) DID→routing_id binding: confirm `SHA-256(\"scp:did:\" || did(public_key)) == routing_id` where `did(public_key)` is the did:dht string derived from the frame's public_key (§9.6.1) — a plain hash, cheaper than a signature verify, so it runs BEFORE step 3; this mirrors the exact check BRIDGE_REGISTER already performs on the control plane (§10.12.4); (3) BEP44 signature verify over bencode(seq, value) against the frame's public_key, only for a blob that passed 1-2; (4) single highest-sequence slot per routing_id: reject a frame whose seq <= the stored slot's seq UNLESS an equal-seq frame is byte-identical (idempotent TTL refresh), replace only on strictly-higher valid seq. SLOT-EXCLUSIVITY: once a binding-valid, signature-valid frame first establishes a slot at a routing_id, that routing_id becomes slot-exclusive — (a) reject any later PUBLISH there that is not a binding-valid, seq-advancing frame; (b) evict any pre-existing opaque blobs at that routing_id when the slot is first established; (c) QUERY there returns only the single slot. Before the first valid frame the relay cannot recognize the routing_id as DID-domain (SHA-256 is one-way), so pre-seeded junk sits as ordinary opaque blobs until the first valid publish evicts it (§3.10.2/§9.10.12). This is an availability/anti-suppression measure, NEVER a trust dependency — the client re-verifies every record independently, so a relay that skips/botches/lies about validation degrades availability only, never integrity (§3.10.2 'Client always re-verifies'). COMPANION ADR-004 UPDATE (upstream dependency the spec mandates): slot-exclusivity is a relay STORAGE behavior — the base relay stores multiple opaque blobs per routing_id with no per-routing_id cap (ADR-004) — so ADR-004 (§ADR-004: SCP Native Relay Protocol, .docs/adrs/phase-1.md) MUST be updated to specify that DID-domain routing_ids are slot-exclusive once claimed. Per the artifact flow (specs govern ADRs; §3.10.2 is authoritative for the behavior and says 'ADR-004 must be updated to match before the relay implements it'), the ADR-004 update is the FIRST step of this story, before the relay code.",
+      "acceptanceCriteria": [
+        "Companion ADR-004 update landed FIRST: `.docs/adrs/phase-1.md` ADR-004 section documents that DID-domain routing_ids (`SHA-256(\"scp:did:\" || did_string)`) are slot-exclusive once a binding-valid frame establishes a slot — `grep -n 'slot-exclusive\\|slot exclusiv' .docs/adrs/phase-1.md` matches within the ADR-004 section (per §3.10.2 mandate).",
+        "Validation runs cheapest-first (decode → binding → signature → slot): the validating-relay path decodes the DidRecordV1 frame, then checks the `SHA-256(\"scp:did:\" || did(public_key)) == routing_id` binding, then verifies the BEP44 signature over bencode(seq, value) against the frame's public_key, in that order — a test asserts a wrong-binding frame is rejected WITHOUT an Ed25519 verify being performed (binding check precedes signature, §3.10.2 step 2/3).",
+        "Single highest-seq slot: a test asserts a frame with seq <= the stored slot's seq is rejected (unless byte-identical at equal seq = idempotent refresh) and the slot is replaced only on a strictly-higher valid seq (§3.10.2 step 4).",
+        "Slot-exclusivity rule (a): once a slot exists at a routing_id, a subsequent PUBLISH that is a non-frame blob, a wrong-binding frame, an invalid signature, or a non-superseding seq is rejected — a test asserts each of the four is rejected once the slot is established (§3.10.2/§3.10.8 flood variants).",
+        "Slot-exclusivity rule (b) — pre-seeded eviction: a test pre-seeds opaque junk blobs at a routing_id BEFORE any valid frame, then PUBLISHes the first binding-valid frame, and asserts the pre-existing opaque blobs are evicted when the slot is established (§3.10.2, closing the pre-seeding gap).",
+        "Slot-exclusivity rule (c) — QUERY returns only the slot: after a slot is established, a test asserts QUERY at that routing_id returns exactly the single slot record regardless of `limit`, and never any co-located junk.",
+        "Validation is OPTIONAL and never a trust dependency: a test asserts a non-validating storage path (foreign/opaque) still accepts and returns the frame as an opaque blob (resolution stays correct via client re-verification), and that relay acceptance is never consumed as a client trust input (the resolver re-verifies) — §3.10.2 'Relay-side validation is an OPTIONAL capability'.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "FIRST: update ADR-004 (.docs/adrs/phase-1.md, `## ADR-004: SCP Native Relay Protocol`) to specify DID-domain routing_ids are slot-exclusive once claimed (relay storage semantics), per the §3.10.2 mandate — artifact flow requires the ADR update before the relay code.",
+        "Implement the validating-relay DID-record path (crates/scp-transport/src/relay/did_record_validation.rs): cheapest-first decode → binding (SHA-256(\"scp:did:\"||did(public_key))==routing_id) → BEP44 signature → single highest-seq slot; register in relay/mod.rs.",
+        "Wire slot-exclusivity into the relay blob store (crates/scp-node/src/projection.rs): reject non-advancing/non-frame/wrong-binding/invalid-sig PUBLISHes once a slot exists; evict pre-existing opaque blobs on first slot establishment; QUERY returns only the slot.",
+        "Keep validation OPTIONAL — non-validating/foreign storage stores the frame opaquely; the client re-verifies. Write the cheapest-first-order, single-slot, slot-exclusivity (a/b/c), and optional-validation tests; run full CI + review roster."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.8 Security Analysis"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay DID-Record Frame"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.4 Relay Architecture"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "companion": "ADR-004 storage-semantics update (slot-exclusive DID-domain routing_ids) — spec-mandated upstream dependency, done as step 1 of this story"
+      }
+    },
+    {
+      "id": "SCP-RELAYRES-004",
+      "title": "Relay WRITE path: implement a real production RelayPublisher (DidRecordV1-wrap + publish_raw) in scp-transport, wire a production RepublishManager with the real publisher + the 6-day relay republish cycle, and fix the republish loop's signature/sequence drop (republish.rs:703 — publish the full DidRecordV1 frame, not bare document_bytes)",
+      "gate": "gate-relayres-4",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/relay_publisher.rs",
+        "crates/scp-transport/src/native/mod.rs",
+        "crates/scp-identity/src/republish.rs",
+        "crates/scp-node/src/self_host.rs"
+      ],
+      "description": "The WRITE half of relay resolution (§3.10.5). No production RelayPublisher exists today — only the (now test-harness-only, per SCP-CAPINJECT-011) InMemoryRelayPublisher — and the relay-republish loop DROPS the signature and sequence: at republish.rs:703 it publishes bare `entry.document_bytes` rather than the DID-record frame, even though `RepublishEntry` already carries `public_key`, `signature`, and `sequence` (republish.rs:340). This story: (a) implement a real production `RelayPublisher` in scp-transport that wraps `(public_key, seq, signature, value=document_bytes)` into a `DidRecordV1` frame (SCP-RELAYRES-001) and PUBLISHes the frame bytes at the DID routing_id via the `publish_raw` transport path (SCP-RELAYRES-002) — the DID relay blob MUST be the DidRecordV1 frame, not the bare document bytes and not an OuterEnvelope (§9.10.12 publish contract); (b) FIX the relay-republish loop (republish.rs:703) to build and publish the full DidRecordV1 frame from the RepublishEntry's (public_key, signature, sequence, document_bytes), so signature and sequence are no longer dropped; (c) wire a PRODUCTION `RepublishManager` with the real RelayPublisher at the node/self-host construction site (crates/scp-node/src/self_host.rs), adding the relay republishing cycle (every 6 days, blob_ttl 7 days with a 1-day margin, §3.10.2/§3.10.5) alongside the existing 2-hour DHT cycle — so a node actually publishes its own DID document to relays. This is the story that makes DID records reach relays at all. The InMemoryRelayPublisher default was already severed + demoted to test-harness-only by SCP-CAPINJECT-011 (cross-PRD dependency); this story supplies the real R the severed API now requires. Publishing to both layers stays a MUST (§3.10.6 anti-segmentation) — the relay cycle is additive to the DHT cycle, not a replacement.",
+      "acceptanceCriteria": [
+        "Real production RelayPublisher in scp-transport: `grep -rn 'impl RelayPublisher for' crates/scp-transport/src` matches a real (non-InMemory, non-test) publisher that DidRecordV1-encodes `(public_key, seq, signature, value)` and calls `publish_raw` (grep both the DidRecordV1 encode and the publish_raw call); module registered in native/mod.rs.",
+        "Republish loop publishes the full frame (signature/sequence no longer dropped): a test drives the relay-republish path with a recording publisher and asserts the published blob decodes via `DidRecordV1::decode` into the SAME (public_key, signature, seq) and value=document_bytes as the source `RepublishEntry` — proving republish.rs:703 no longer publishes bare `document_bytes`; `grep -n 'document_bytes' crates/scp-identity/src/republish.rs` shows the loop wraps it in a frame (the publish call no longer passes bare document_bytes as the blob).",
+        "Production RepublishManager wired with the real publisher + 6-day relay cycle: crates/scp-node/src/self_host.rs constructs a `RepublishManager` with the real scp-transport `RelayPublisher` (grep the construction naming the real publisher type as `R`), and the relay republish interval is the 6-day cycle (§3.10.2/§3.10.5) — a test asserts a node schedules relay republishing alongside the existing DHT cycle.",
+        "DID record reaches the relay as a frame: an integration test has a node publish its own DID document and asserts the blob stored at `did_routing_id` decodes as a valid DidRecordV1 whose (value, signature, seq) verifies against the node's DID-derived key (§9.10.12 publish contract; the blob is the frame, never bare bytes or an OuterEnvelope).",
+        "Both-layer publish preserved (§3.10.6): a test asserts the production RepublishManager publishes to BOTH the DHT (existing 2-hour cycle) and the relay (new 6-day cycle) — the relay cycle is additive, not a replacement (anti-segmentation invariant).",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Create crates/scp-transport/src/native/relay_publisher.rs implementing a real `RelayPublisher` (impl the scp-identity `RelayPublisher` trait): DidRecordV1-wrap (public_key, seq, signature, value) and PUBLISH via publish_raw at the DID routing_id; register in native/mod.rs.",
+        "Fix crates/scp-identity/src/republish.rs relay-republish loop (:703) to build a DidRecordV1 frame from the RepublishEntry (public_key, signature, sequence, document_bytes) and publish the frame bytes — stop publishing bare document_bytes.",
+        "Wire a production RepublishManager<Dht, TransportRelayPublisher> at crates/scp-node/src/self_host.rs with the real relay publisher and the 6-day relay republish cycle alongside the 2-hour DHT cycle.",
+        "Write the real-publisher frame-encode, republish-loop full-frame, production-wiring, and both-layer-publish tests; run full CI + review roster."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-002",
+        "SCP-CAPINJECT-011"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.5 Publishing Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.6 Anti-Segmentation Invariant"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay DID-Record Frame"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "cross_prd_dep": "SCP-CAPINJECT-011 severs+demotes the InMemoryRelayPublisher default; this story supplies the real publisher the severed API requires",
+        "pre_rotation_note": "pre-rotation / create-ceremony production activation (RFC #2130 / #1729) is a SEPARATE dependency, NOT required here"
+      }
+    },
+    {
+      "id": "SCP-RELAYRES-005",
+      "title": "End-to-end relay-only publish→resolve round-trip + dual-layer suppression-resilience and slot-exclusivity/flood regression tests, including a DhtMode::Disabled node resolving its own and a peer's DID via the relay",
+      "gate": "gate-relayres-5",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/tests/integration/relay_did_resolution.rs",
+        "crates/scp-testing/tests/integration/mod.rs"
+      ],
+      "description": "Integration coverage proving the READ + WRITE halves interoperate and the relay layer delivers the §3.10.8 suppression resilience it claims. Only both halves together restore that resilience (a real querier reading relays a real publisher actually populates), so this story exercises the full loop across a validating SCP-native relay. Tests: (1) RELAY-ONLY publish→resolve round-trip — publish a DID document ONLY to a relay (not the DHT) via the real RelayPublisher (SCP-RELAYRES-004) and resolve it back via the real TransportRelayQuerier + RealMultiRelayQuerier composer through the DualLayerResolver (SCP-RELAYRES-002), asserting the resolved document is byte-identical and verifies (§3.10.4/§3.10.5); (2) DUAL-LAYER suppression resilience — suppression on one layer is defeated by the other; with the record on a relay and the DHT, dropping either still resolves (§3.10.8); (3) FLOOD inert on a validating relay — junk frame (malformed/wrong-binding/bad-sig), valid-looking frame with stale/equal seq, non-frame opaque junk, and pre-seeded junk are ALL inert against the single highest-seq slot (SCP-RELAYRES-003), and the genuine record still resolves (§3.10.8 four flood variants); (4) DhtMode::Disabled node — a Disabled node (DHT arm off) publishes its OWN DID to a relay and resolves its own DID back via the relay, AND resolves a PEER's DID published to a relay (this completes the A2 self-DID + peer resolution path noted in SCP-CAPINJECT-001 / ADR-062 A2↔A4 sequencing, which relay resolution — this feature — brings online).",
+      "acceptanceCriteria": [
+        "Relay-only publish→resolve round-trip: a test publishes a DID document to a relay ONLY (DHT not used) via the real RelayPublisher and resolves it back through the real querier + DualLayerResolver, asserting the resolved document + (value, signature, seq) is byte-identical to the published one and verifies against the DID-derived key (§3.10.4/§3.10.5).",
+        "Dual-layer suppression resilience: a test with the record present on both a relay and the DHT asserts resolution still succeeds when the relay layer is suppressed (DHT serves it) and when the DHT layer is suppressed (relay serves it) — §3.10.8; and asserts that when BOTH layers hold nothing the resolver returns honest not-found Ok(None), never a fabricated document (§3.10.4).",
+        "Flood inert on a validating relay (four variants): a test asserts that against a validating relay holding the genuine slot, each of a junk frame, a stale/equal-seq frame, a non-frame opaque blob, and pre-seeded junk fails to displace the genuine record, and the genuine record still resolves (§3.10.8).",
+        "DhtMode::Disabled self-DID via relay: a test constructs a DhtMode::Disabled node (DHT-layer-off), publishes its OWN DID to a relay via the real RelayPublisher, and asserts it resolves its own DID back via the real querier (self-DID resolution requires the write half — completing SCP-CAPINJECT-001 A2).",
+        "DhtMode::Disabled peer-DID via relay: the same test (or a sibling) asserts the Disabled node resolves a PEER's DID that was published to a relay — confirming the ADR-062 A2↔A4 sequencing note that a Disabled node's peer resolution comes online with relay resolution (§3.10.2/§3.10.4).",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Create crates/scp-testing/tests/integration/relay_did_resolution.rs (registered in integration/mod.rs) with the relay-only round-trip, dual-layer suppression, four-variant flood-inert, and DhtMode::Disabled self-DID + peer tests.",
+        "Exercise the full stack: real RelayPublisher (004) -> validating relay + slot-exclusivity (003) -> TransportRelayQuerier + composer (002) -> DualLayerResolver, using DidRecordV1 (001) end to end.",
+        "Run full CI + review roster."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-003",
+        "SCP-RELAYRES-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.8 Security Analysis"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.6 Anti-Segmentation Invariant"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "completes": "SCP-CAPINJECT-001 A2 (DhtMode::Disabled self-DID + peer resolution via relay)"
+      }
+    }
+  ]
+}

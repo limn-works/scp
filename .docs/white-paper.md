@@ -53,7 +53,7 @@ SCP is governed by nine design principles. Each has a load-bearing consequence f
 
 3. **Context isolation.** All interaction occurs within bounded contexts. Cross-context data flow is explicit and governed. *Consequence:* agents in different contexts are separate instances at the protocol level, even when operated by the same human (Section 5).
 
-4. **Encryption-as-access-control.** MLS group keys enforce membership. No relay or intermediary enforces access — the cryptography does. *Consequence:* relays are untrusted; a compromised relay cannot breach confidentiality (Section 6).
+4. **Encryption-as-access-control.** MLS group keys enforce membership. No relay or intermediary enforces access — the cryptography does. *Consequence:* relays are untrusted; a compromised relay cannot breach confidentiality (Section 6). The untrust is what is load-bearing, not literal content-blindness: a relay MAY validate *public, self-certifying* records it stores (e.g. verify a DID document's BEP44 signature and keep the highest-sequence copy) as an availability and anti-suppression measure. This is never a trust dependency — clients verify every record independently, so a relay that skips, botches, or lies about such validation degrades availability only, never integrity — and it never applies to encrypted content, which relays can neither read nor validate.
 
 5. **Legibility before opt-in.** Every context's parameters are visible before joining. *Consequence:* informed consent is mechanical, not social.
 

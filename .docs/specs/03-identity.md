@@ -777,10 +777,10 @@ DID resolution is the trust root for identity verification (§3.8). The current 
 
 SCP introduces a dual-layer resolution architecture:
 
-- **Primary: SCP relay-based resolution.** DID documents stored on SCP relays as standard blobs, resolved via existing relay operations. Grows with the SCP network. Requires no protocol changes — DID documents are just another blob type routed by a deterministic `routing_id`.
+- **Primary: SCP relay-based resolution.** DID documents published to SCP relays via the existing PUBLISH/QUERY operations (ADR-004), addressed by a deterministic `routing_id`. An SCP-native relay validates each DID-record blob it stores and keeps a single highest-sequence slot per `routing_id` (§3.10.2), which is what makes the relay layer suppression-resistant (§3.10.8); foreign transports that cannot validate store the record opaquely and stay correct via client-side verification. Grows with the SCP network.
 - **Fallback: Mainline DHT.** Existing did:dht resolution via BEP44. Works from day one. Transitions from "only path" to "fallback path" as the relay network matures.
 
-Both layers are self-certifying: the BEP44 signature on a DID document is verified against the public key encoded in the DID string itself (§9.6.1). The storage backend — whether an SCP relay or a DHT node — is untrusted. Trust derives from the cryptographic binding between the DID and its document, not from the infrastructure serving it.
+Both layers are self-certifying: the BEP44 signature on a DID document is verified against the public key encoded in the DID string itself (§9.6.1). The storage backend — whether an SCP relay or a DHT node — is untrusted. Trust derives from the cryptographic binding between the DID and its document, not from the infrastructure serving it. An SCP-native relay MAY additionally validate the records it stores (§3.10.2) — a validating relay keeps a single highest-sequence slot, which resists suppression — but this is an availability property layered on top, never a trust dependency: the resolver re-verifies every record independently and accepts nothing on the relay's word (§3.10.4).
 
 ### 3.10.1 Resolution Priority
 
@@ -795,7 +795,7 @@ Parallel query means resolution latency is `min(relay_latency, dht_latency)`. Th
 
 ### 3.10.2 Layer 1: SCP Relay-Based Resolution
 
-DID documents are published to SCP relays using the existing relay operations defined in ADR-004. No new wire types, no special relay behavior — a DID document is a blob addressed by a deterministic `routing_id`.
+DID documents are published to SCP relays using the existing PUBLISH/QUERY operations (ADR-004) — no new wire types. A DID document rides in a minimal, fixed-layout **DID-record relay frame** (§9.10.12), addressed by a deterministic `routing_id`. What is new versus a plain opaque blob is a relay *behavior*: an SCP-native relay validates the frame and keeps a single highest-sequence slot per `routing_id`. This is issue #482.
 
 **Routing ID derivation:**
 
@@ -803,7 +803,7 @@ DID documents are published to SCP relays using the existing relay operations de
 did_routing_id = SHA-256("scp:did:" || did_string)
 ```
 
-The `"scp:did:"` domain separator prevents collision with other routing ID derivation schemes in the protocol: encrypted context routing IDs use HKDF from identity key material (§9.10.4), broadcast context routing IDs use `SHA-256(context_id)` (§5.14), and context metadata routing IDs use `HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` (§9.10.4.B). The domain separator ensures that a DID string can never produce a routing ID that collides with a context ID or metadata address.
+The `"scp:did:"` domain separator prevents collision with other routing ID derivation schemes in the protocol: encrypted context routing IDs use HKDF from identity key material (§9.10.4), broadcast context routing IDs use `SHA-256(context_id)` (§5.14), and context metadata routing IDs use `HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` (§9.10.4.B). The domain separator ensures that a DID string can never produce a routing ID that collides with a context ID or metadata address. Because DID records live at their own `routing_id` domain, the address is the type discriminant — the frame carries no magic tag or record-kind byte (§9.10.12).
 
 **Publication** uses the existing PUBLISH operation (ADR-004):
 
@@ -811,7 +811,7 @@ The `"scp:did:"` domain separator prevents collision with other routing ID deriv
 PUBLISH {
     routing_id: did_routing_id,
     blob_ttl: 604800,
-    blob: <SCPR kind-1 DID-record frame (§9.10.12), carrying (value, signature, seq)>
+    blob: <DID-record relay frame (§9.10.12), carrying (public_key, seq, signature, value)>
 }
 ```
 
@@ -821,26 +821,39 @@ PUBLISH {
 QUERY {
     routing_id: did_routing_id,
     since: null,
-    limit: N   (bounded; see below)
+    limit: N          // N = 16 (implementation constant)
 }
 ```
 
-The `limit` is a small bounded constant (implementation: 16) rather than 1. This
-multi-candidate QUERY is required for intra-relay shadow-defeat (§3.10.8): a relay
-stores blobs keyed by content hash, so multiple distinct blobs can co-exist at one
-`routing_id`. An attacker with knowledge of `did_routing_id` (derivable from any
-DID string) and access to unauthenticated PUBLISH can co-locate a
-decodable-but-invalid frame before the genuine record. A `limit: 1` response would
-return only that planted frame; a bounded multi-candidate response lets the resolver
-skip the bad frame and find the genuine one. The resolver selects the highest-seq
-valid candidate (§3.10.7) so neither bad-signature nor stale-but-valid shadows
-suppress the current record.
+`limit: N` (N = 16) **dominates `limit: 1`** and costs nothing where it does not help. Against a **validating** SCP-native relay the routing ID is slot-exclusive (below), so exactly one record is returned regardless of `N`. Against a **non-validating or foreign** transport that accumulates multiple blobs per `routing_id`, `limit: N` lets the resolver retrieve up to N candidates and sift them to the highest-sequence *valid* one (§3.10.4 step 5) — defeating an intra-relay shadowing attempt that a single-record fetch would miss, and giving a `DhtMode::Disabled` node (relay-only resolution, which the spec permits) a fighting chance against a non-validating relay. Under an *active* flood on a non-validating relay this remains best-effort (§3.10.8 residual): N candidates may all be junk. The resolver's highest-sequence-valid selection across relays and the DHT (§3.10.4) still returns the freshest genuine record whenever any queried source holds it.
+
+**Relay-side validation (SCP-native relays).** The whole path sits behind the existing per-IP PUBLISH rate limit (ADR-004). On PUBLISH of a blob at a `routing_id`, an SCP-native relay performs the checks **cheapest-first**, so junk is rejected before any expensive work:
+
+1. **Structural decode.** Attempt to decode the blob as a DID-record frame (§9.10.12). A blob that does not decode is not a candidate DID record (it is governed by the slot-exclusivity rule below).
+2. **DID→routing_id binding.** Confirm `SHA-256("scp:did:" || did(public_key)) == routing_id`, where `did(public_key)` is the `did:dht` string derived from the frame's `public_key` (z-base-32, §9.6.1). A frame whose embedded `public_key` does not hash to the `routing_id` it is published at is rejected. This binding is the discriminant that lets a validating relay recognize a DID record without any new wire type or knowledge of `routing_id` semantics — and it is a plain hash, cheaper than a signature verify, so it runs **before** step 3.
+3. **BEP44 signature.** Only for a blob that passed steps 1–2, verify the BEP44 signature over `bencode(seq, value)` against the frame's `public_key`. Ordering the binding check ahead of the signature verify means a mis-addressed or non-frame blob never costs an Ed25519 verify.
+4. **Single highest-sequence slot.** For a frame that passed steps 1–3, keep a **single highest-sequence slot** per `routing_id`: reject a frame whose `seq` is lower than or equal to the stored slot's `seq` **unless** an equal-`seq` frame is byte-identical to the stored record (idempotent TTL refresh), and replace the slot only on a strictly-higher valid `seq`.
+
+**Slot-exclusivity.** A validating relay does not store DID records alongside arbitrary blobs. The moment a binding-valid, signature-valid frame first **establishes a slot** at a `routing_id`, that `routing_id` becomes **slot-exclusive**:
+
+- **(a)** the relay rejects any subsequent PUBLISH at that `routing_id` that is not a binding-valid, `seq`-advancing frame (a non-frame blob, a wrong-binding frame, an invalid signature, or a non-superseding `seq` — all rejected), the sole exception being a byte-identical equal-`seq` republish, which is an idempotent TTL refresh (per single-slot rule 4 above);
+- **(b)** when the slot is first established, the relay **evicts any pre-existing opaque blobs** stored at that `routing_id`;
+- **(c)** QUERY at that `routing_id` returns **only the single slot**.
+
+**Before** the first valid frame, the relay cannot recognize the `routing_id` as DID-domain — `SHA-256` is one-way, so it cannot distinguish a not-yet-claimed DID `routing_id` from any other opaque-blob address. Pre-seeded junk (published *before* the victim's first DID publish) therefore simply sits as ordinary opaque blobs until the first binding-valid frame establishes the slot, at which point rule (b) evicts it. This closes the pre-seeding / non-frame-junk gap: on a validating relay, once the DID owner has published even once, QUERY cannot be made to return anything but the single genuine slot. Slot-exclusivity is a property of a *claimed* slot: if the slot record's own blob TTL (§9.10.2) expires while the owner is offline past the 6-day republish cycle, the `routing_id` reverts to an unclaimed opaque-blob address and the pre-seed window reopens. This is not a suppression bypass — during that window the genuine record is already absent (owner offline, not attacker action), any attacker blob still fails the resolver's DID-derived-key BEP44 verification, resolution falls through to the DHT, and the owner's next republish re-establishes the slot and re-fires rule (b).
+
+Slot-exclusivity is a relay **storage** behavior (the base relay stores multiple opaque blobs per `routing_id` with no per-`routing_id` cap, ADR-004), so it requires a **companion ADR-004 update** — relay storage semantics: DID-domain `routing_id`s are slot-exclusive once claimed — tracked as the integration follow-up under #482. This spec section is authoritative for the behavior; ADR-004 must be updated to match before the relay implements it. (Not edited in this pass.)
+
+This mirrors, and extends to a stored public record, the exact check `BRIDGE_REGISTER` already performs on the control plane — Ed25519 signature + the same `SHA-256("scp:did:" || did_string) == routing_id` binding (§10.12.4). It is what Mainline DHT BEP44 nodes already do for mutable items. It is an **availability and anti-suppression measure, never a trust dependency** (see the client-verify property below).
+
+**Relay-side validation is an OPTIONAL capability of SCP-native relays.** The protocol MUST NOT require a validating relay. Foreign transports and adapters (Nostr, Matrix, etc.) that cannot validate treat the frame as an opaque blob; resolution stays correct over them via client-side verification, the DHT, and multi-relay publishing. The suppression-resistance property of the relay layer (§3.10.8) is delivered by validating SCP-native relays; non-validating storage contributes availability only.
 
 **Properties:**
 
-- **No relay protocol changes; one SDK-side addition.** PUBLISH and QUERY are existing relay operations, and the relay stores and retrieves a DID document like any other opaque blob — it needs no awareness that a blob contains a DID document. What Model A adds is entirely client-side: the SDK transport adapter gains a **public-record raw-blob path** (`publish_raw` / `query_raw`, §9.10.12) distinct from its `OuterEnvelope` message path, because a raw SCPR blob is not an `OuterEnvelope` and cannot ride the `OuterEnvelope`-typed `send` / `query` path. SCPR framing (§9.10.12) is a client-side payload convention, not a relay behavior — the relay stores the frame bytes opaquely.
-- **Self-verifying blob payload.** The DID relay blob is an SCPR kind-1 frame (§9.10.12) carrying the BEP44 `(value, signature, seq)` triple, not the bare document bytes. Because the signature and sequence travel inside the blob, a resolver verifies the record from the blob alone — no DHT round-trip is required to obtain the signature.
-- **Relay-agnostic.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for suppression resistance.
+- **Client always re-verifies (relay untrusted).** The resolver ALWAYS verifies the BEP44 signature against the key it derives from the DID string ITSELF (§9.6.1), and never trusts the frame-supplied `public_key` or the relay's acceptance. Relay validation is defense-in-depth for availability; it is never a trust input. A relay that skips, botches, or lies about validation degrades availability only, never integrity.
+- **Why the frame carries `public_key`.** The relay holds only the one-way `routing_id` hash and cannot recover the DID or its key from it — so, exactly as `BRIDGE_REGISTER` carries `public_key` for the relay to verify against (§10.12.4), the DID-record frame carries `public_key` for the relay's binding + signature check. The client ignores this field and verifies with its own DID-derived key.
+- **Self-verifying blob payload.** The frame carries the BEP44 `(value, signature, seq)` triple, not the bare document bytes. Because the signature and sequence travel inside the blob, a resolver verifies the record from the blob alone — no DHT round-trip is required to obtain the signature.
+- **Multi-relay.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for availability and suppression resistance.
 - **Size budget.** DID documents range from 2-30KB depending on attestation count and service endpoint list. The relay blob size limit is 256KB (ADR-004). Well within bounds.
 - **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager already handles periodic DHT republishing on a 2-hour cycle; relay republishing adds a separate 6-day cycle for relay-stored DID documents.
 
@@ -863,21 +876,27 @@ The full resolution sequence:
 1. Compute did_routing_id = SHA-256("scp:did:" || did_string)
 2. Extract public_key from DID string (z-base-32 decode per did:dht spec)
 3. In parallel:
-   a. QUERY did_routing_id on known SCP relays via the SDK public-record
-      raw-blob path (query_raw, §9.10.12 — the relay returns raw SCPR
-      blobs, not OuterEnvelopes)
+   a. QUERY did_routing_id on known SCP relays (existing QUERY operation,
+      ADR-004; the stored blob is a DID-record frame, §9.10.12)
       (identity's published relays if known, else bootstrap relays from §18.5.1)
    b. DhtClient.resolve(public_key) on Mainline DHT
 4. For each response, obtain the (value, signature, seq) triple:
-   a. Relay response: decode the SCPR kind-1 frame (§9.10.12) into
+   a. Relay response: decode the DID-record frame (§9.10.12) into
       (value, signature, seq). DHT response: the triple is native.
-      Framing bytes are unsigned and MUST NOT be trusted — only the
-      triple is used.
+      Framing bytes — including the frame's own public_key — are unsigned
+      and MUST NOT be trusted; only the (value, signature, seq) triple is
+      used, and it is verified against the DID-derived key (step 4b), never
+      the frame-supplied key.
    b. Verify the BEP44 signature over the BEP44-canonical bencoded buffer
       bencode(salt?, seq, value) — seq before value, per BEP44 (BitTorrent
       BEP 44 is authoritative for this ordering) — against public_key
+      (the key derived from the DID string in step 2)
    c. Verify seq >= last_known_seq for this DID
-5. Accept the valid response with highest sequence number
+5. Accept the valid response with highest sequence number. Within the relay
+   layer, if more than one valid record is returned (a non-validating or
+   foreign relay that accumulated multiple blobs), the resolver takes the
+   highest-seq valid record; across layers, the overall highest-seq valid
+   record wins.
 6. Cache result per §9.10.7 caching policy
    (24h refresh for active contacts, 7d for inactive)
 ```
@@ -894,7 +913,7 @@ The parallel query model (step 3) requires clear rules for when queries are canc
 - **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
 - **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
 - **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
-- **Relay blob fails SCPR decoding.** A relay blob that does not decode as a valid SCPR kind-1 frame (§9.10.12) — truncated, carrying trailing bytes, wrong magic, unrecognized version, wrong/unrecognized kind, or a `value_len` that fails the exact-length check (`total_frame_len == 82 + value_len`) — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other layer exactly as for an invalid signature.
+- **Relay blob fails frame decoding.** A relay blob that does not decode as a valid DID-record frame (§9.10.12) — shorter than the 105-byte fixed prefix, carrying an empty `value`, exceeding the bounded `value` length, or an unrecognized `version` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other layer exactly as for an invalid signature.
 - **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
 
 ### 3.10.5 Publishing Protocol
@@ -909,11 +928,10 @@ On DID document create or update:
    `3:seqi<seq>e1:v<value>`, per the BEP44 spec, which is authoritative for
    this ordering; did:dht uses no salt)
 3. In parallel:
-   a. Wrap (value, signature, seq) in an SCPR kind-1 frame (§9.10.12) and
-      PUBLISH the frame bytes to SCP relays (own relays + bootstrap relays)
-      via the SDK public-record raw-blob path (publish_raw, §9.10.12 — a raw
-      blob, NOT wrapped in an OuterEnvelope), blob_ttl: 604800. The SCPR
-      wrapper is around `value` for transport only — it is NEVER part of the
+   a. Wrap (public_key, seq, signature, value) in a DID-record frame
+      (§9.10.12) and PUBLISH the frame bytes to SCP relays (own relays +
+      bootstrap relays) via the existing PUBLISH operation, blob_ttl: 604800.
+      The frame is transport framing around `value` — it is NEVER part of the
       bencoded signed bytes.
    b. DhtClient.publish(public_key, signature, doc_bytes, seq) to Mainline DHT
 4. RepublishManager schedules:
@@ -921,7 +939,7 @@ On DID document create or update:
    - DHT republishing: every 2 hours (existing cycle, unchanged)
 ```
 
-Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically. SCPR wraps `value` for transport but does not enter the signed bytes; the `(value, signature, seq)` triple carried to both layers is byte-identical (§9.10.12).
+Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically. The DID-record frame wraps `value` for transport but does not enter the signed bytes; the `(value, signature, seq)` triple carried to both layers is byte-identical (§9.10.12).
 
 ### 3.10.6 Anti-Segmentation Invariant
 
@@ -945,12 +963,19 @@ When both layers return valid documents with different sequence numbers, the hig
 
 The dual-layer architecture preserves all security properties of §9.6.1 (self-certification) while adding relay-layer resilience:
 
-- **Self-certification preserved.** The BEP44 signature is verified against the public key encoded in the DID string. The storage backend (relay or DHT) is untrusted. §9.6.1 properties are unchanged.
+- **Self-certification preserved.** The BEP44 signature is verified against the public key encoded in the DID string. The storage backend (relay or DHT) is untrusted; the resolver never trusts a relay's acceptance or a frame-supplied key. §9.6.1 properties are unchanged.
 - **Relay serves stale document.** Detected by sequence number comparison. The resolver falls through to other relays or DHT. Stale documents do not compromise security — they delay propagation of key rotations, which is bounded by the republish cycle (6 days for relays, 2 hours for DHT).
-- **Relay suppresses document.** Concurrent query across all relay URLs plus DHT, each relay guarded by an independent per-relay timeout. A single slow or hung relay cannot suppress results obtained from faster relays. Suppression by one source does not prevent resolution. Multi-relay publishing (§9.9.2) applies to DID documents as it does to context blobs.
-- **Intra-relay co-located shadow (honest relay, planted blob).** An attacker who knows a DID's `routing_id` (derivable from the DID string) and can send unauthenticated PUBLISH commands can co-locate a well-framed but bad-signature (or stale-but-valid) blob at the same `routing_id` ahead of the genuine record on an otherwise honest relay. Defeated by the bounded multi-candidate QUERY (§3.10.2): the resolver fetches all candidates within the bounded candidate window (bounded by `MAX_CANDIDATES_PER_RELAY = 16` per relay) and selects the **highest-seq valid** one. A bad-signature candidate fails BEP44 verification and is skipped. A stale-but-valid candidate has a lower seq than the genuine record; since `seq` is inside the BEP44 signed payload, an attacker cannot forge a higher seq without the identity owner's private key (§3.10.7). Both attacks are closed by the same "iterate the bounded candidate window, pick highest-seq-valid" selection rule. (A relay returning >16 candidates can defeat this selection, but a malicious relay can equally suppress resolution by returning an empty set — the cap is a DoS budget bound, not the primary shadow-defeat control; the relay QUERY contract (§3.10.2) specifies the bounded `limit: N` (implementation: 16) response within which the resolver selects the highest-seq valid record. Shadow-defeat therefore holds for honest relays; active suppression by a malicious relay is covered by cross-relay + DHT fan-out, below.)
+- **Relay unresponsive, slow, or withholding.** Resolution queries all of an identity's relay URLs plus the DHT concurrently, each relay guarded by an independent per-relay timeout (§3.10.4). A single slow, hung, or withholding relay cannot block a result obtained from a faster relay or the DHT, and suppression by any one source does not prevent resolution — multi-relay publishing (§9.9.2) applies to DID documents as it does to context blobs.
 - **Relay serves wrong DID's document.** The BEP44 signature does not verify against the target DID's public key. Rejected immediately. The routing ID is derived from the DID string, but verification is against the DID's key — substitution is cryptographically impossible.
-- **Dual-layer resilience.** An attacker must suppress a DID document on ALL of an identity's relays AND ALL reachable DHT nodes to prevent resolution. This is a strictly harder attack than suppressing on either layer alone.
+- **Attacker floods junk at the DID routing ID.** The `routing_id = SHA-256("scp:did:" || did_string)` is publicly derivable, so any party can PUBLISH to it. On a **validating SCP-native relay every flood variant is inert**, because the relay keeps a single highest-sequence slot and makes the `routing_id` slot-exclusive once claimed (§3.10.2):
+  - **Junk frame** (malformed, wrong binding, or bad signature) — rejected at validation; never enters the slot.
+  - **Valid-looking frame with a stale or equal `seq`** — rejected by the single-slot rule; displacing the genuine record requires a higher-`seq` frame signed by the DID's private key, which the attacker does not hold.
+  - **Non-frame opaque junk blob** — rejected once the slot exists (slot-exclusivity rule (a)); QUERY returns only the slot (rule (c)).
+  - **Pre-seeded junk** (published *before* the victim's first DID publish, while the relay cannot yet recognize the `routing_id` as DID-domain since `SHA-256` is one-way) — evicted the moment the first binding-valid frame establishes the slot (rule (b)).
+
+  This is precisely why the relay layer is suppression-resistant: presence-in-the-QUERY-window is controlled by the validating relay's write rule, not by the attacker's PUBLISH volume or timing.
+- **Suppression resilience (validating SCP-native relays).** With single-slot validation, an attacker cannot evict the genuine record by flooding, and cannot reorder it out of a bounded QUERY window (there is at most one record to return). To prevent resolution, an attacker must suppress the DID document on ALL of an identity's validating relays AND all reachable DHT nodes — the DHT being independently suppression-resistant for the same structural reason (BEP44 nodes validate on write and keep one highest-`seq` slot per key). This "all relays AND the DHT" claim holds for validating relays.
+- **Residual: foreign / non-validating relays are best-effort.** A foreign transport or a non-validating relay that accumulates multiple blobs per `routing_id` can be flooded, and its bounded QUERY window can be made to omit the genuine record. Resolution over such storage alone is therefore best-effort for suppression; the resolver still recovers the genuine record via any validating relay, via multi-relay publishing (§9.9.2), or via the DHT, and its highest-seq-valid selection (§3.10.4) discards the junk. What foreign/non-validating storage contributes is availability, not anti-suppression.
 
 ### 3.10.9 Privacy Properties
 
@@ -1016,7 +1041,7 @@ The dual-layer architecture is designed to be self-reinforcing as the SCP networ
 | DID document QUERY from relays | Phase 2 | `scp-core` | Extends existing DID resolution path with relay QUERY before/parallel to DHT. |
 | `DidResolver` trait | Phase 2 | `scp-core` | Unified interface composing relay + DHT resolution. |
 | Parallel dual-layer resolution | Phase 2 | `scp-core` | Orchestration of parallel queries with first-valid-wins semantics. |
-| SCPR DID-record frame (§9.10.12) | Phase 2 | `scp-protocol` | Deterministic binary encode/decode of the relay public-record frame kind 1. Pure sync wasm-compatible type; consumed by the relay publisher + DID resolver in `scp-identity`. |
+| DID-record relay frame (§9.10.12) | Phase 2 (#482) | `scp-protocol` | Deterministic binary encode/decode of the minimal fixed-layout DID-record frame (`DidRecordV1`). Pure sync wasm-compatible type; consumed by the relay publisher + DID resolver in `scp-identity` and by the relay-side validation path. |
 
 ## 3.11 DID Authentication for External Services (SCPID)
 
