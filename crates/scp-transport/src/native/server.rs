@@ -46,10 +46,14 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::did_slot::{DidSlotRegistry, SlotPublishError};
 use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
 use crate::error::TransportError;
 use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
+use crate::relay::did_record_validation::{
+    DidRecordClass, DidRecordRejection, classify_did_record_frame,
+};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -81,6 +85,39 @@ pub enum BridgeRole {
     /// The relay accepts `BRIDGE_REGISTER` operations (each Ed25519-authenticated
     /// per SCP-247) and proxies traffic for registered routing IDs.
     Enabled,
+}
+
+/// Whether this SCP-native relay validates public DID-record frames on PUBLISH.
+///
+/// A validating relay keeps a single, slot-exclusive highest-`seq` slot per
+/// DID-domain `routing_id` (§3.10.2 "Relay-side validation", §9.10.12, ADR-004
+/// "DID-Record Slot-Exclusivity").
+///
+/// This is an **OPTIONAL** capability. Relay-side validation is defense-in-depth
+/// for **availability / anti-suppression** and is **never a trust dependency**:
+/// the resolver re-verifies every record independently (RELAYRES-002), so a
+/// non-validating relay stores the frame as an ordinary opaque blob and
+/// resolution stays correct via client-side re-verification, the DHT, and
+/// multi-relay publishing (§3.10.8). An enum, not a bool, per
+/// `construction.md` M1.
+///
+/// The default is [`Enabled`](DidRecordValidation::Enabled): an SCP-native relay
+/// delivers the relay-layer suppression-resistance property by default. It never
+/// affects encrypted context blobs — those never decode as `DidRecordV1` frames
+/// (an `OuterEnvelope`'s first byte is a `MessagePack` map marker, never `0x01`,
+/// §9.10.12) — so enabling it changes behavior only for public DID-record
+/// frames published at their own `routing_id` domain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DidRecordValidation {
+    /// The relay validates DID-record frames (decode → `DID→routing_id` binding →
+    /// BEP44 signature, cheapest-first) and enforces the single-slot /
+    /// slot-exclusivity rules. The canonical SCP-native-relay behavior.
+    #[default]
+    Enabled,
+    /// The relay treats DID-record frames as opaque blobs (no validation, no
+    /// slot-exclusivity) — the behavior of a foreign / non-validating transport.
+    /// Resolution stays correct via client-side re-verification.
+    Disabled,
 }
 
 /// Configuration for the relay server.
@@ -139,6 +176,14 @@ pub struct RelayConfig {
     /// behind NAT and proxies traffic for registered routing IDs. Defaults
     /// to [`BridgeRole::Disabled`] (the fail-safe — brokers nothing).
     pub bridge: BridgeRole,
+    /// Whether the relay validates public DID-record frames and keeps a single
+    /// slot-exclusive slot per DID-domain `routing_id` (§3.10.2, ADR-004
+    /// "DID-Record Slot-Exclusivity"). Defaults to
+    /// [`DidRecordValidation::Enabled`] — the anti-suppression property an
+    /// SCP-native relay delivers. OPTIONAL: never a trust dependency (the client
+    /// always re-verifies); set [`DidRecordValidation::Disabled`] to store DID
+    /// frames opaquely like a foreign transport.
+    pub did_record_validation: DidRecordValidation,
 }
 
 impl Default for RelayConfig {
@@ -162,6 +207,11 @@ impl Default for RelayConfig {
             // `BridgeRole::Disabled` — a relay that brokers nothing until
             // explicitly enabled.
             bridge: BridgeRole::Disabled,
+            // Validating SCP-native relay by default: delivers the relay-layer
+            // suppression-resistance property (§3.10.8). Never a trust
+            // dependency (client always re-verifies), and inert for encrypted
+            // context blobs (they never decode as DID-record frames).
+            did_record_validation: DidRecordValidation::Enabled,
         }
     }
 }
@@ -229,6 +279,14 @@ pub struct RelayServer {
     /// (empty registry is zero-cost) so the handler can check it without
     /// `Option` wrapping.
     bridge_registry: Arc<BridgeRegistry>,
+    /// DID-record slot index for the OPTIONAL validating-relay path (§3.10.2,
+    /// ADR-004 "DID-Record Slot-Exclusivity"). Tracks which DID-domain
+    /// `routing_id`s have a claimed single slot. Consulted only when
+    /// `config.did_record_validation` is [`DidRecordValidation::Enabled`];
+    /// initialized unconditionally (an empty index is zero-cost). Cheaply
+    /// clonable and exposed via [`did_slot_registry`](Self::did_slot_registry)
+    /// so co-deployed transports can share one index over the same blob store.
+    did_slots: DidSlotRegistry,
 }
 
 impl RelayServer {
@@ -254,6 +312,7 @@ impl RelayServer {
             publish_rate_limiter,
             persistence: None,
             bridge_registry: Arc::new(BridgeRegistry::new()),
+            did_slots: DidSlotRegistry::new(),
         }
     }
 
@@ -279,6 +338,7 @@ impl RelayServer {
             publish_rate_limiter,
             persistence: Some(persistence),
             bridge_registry: Arc::new(BridgeRegistry::new()),
+            did_slots: DidSlotRegistry::new(),
         }
     }
 
@@ -332,7 +392,21 @@ impl RelayServer {
             publish_rate_limiter,
             persistence: None,
             bridge_registry: Arc::new(BridgeRegistry::new()),
+            did_slots: DidSlotRegistry::new(),
         }
+    }
+
+    /// Returns a clone of this relay's DID-record slot index (§3.10.2, ADR-004
+    /// "DID-Record Slot-Exclusivity").
+    ///
+    /// The returned handle shares the same underlying index, so a co-deployed
+    /// SCP-native transport that also validates DID-record frames over the
+    /// *same* blob store can enforce one consistent set of claimed slots. The
+    /// index is a validating-relay concern; a non-validating transport ignores
+    /// it and stores frames opaquely (§3.10.2 "OPTIONAL capability").
+    #[must_use]
+    pub fn did_slot_registry(&self) -> DidSlotRegistry {
+        self.did_slots.clone()
     }
 
     /// Returns a clone of the subscription registry for sharing with other
@@ -418,6 +492,7 @@ impl RelayServer {
             let rate_limiter = self.publish_rate_limiter.clone();
             let persistence = self.persistence.clone();
             let bridge_registry = Arc::clone(&self.bridge_registry);
+            let did_slots = self.did_slots.clone();
 
             tokio::spawn(async move {
                 if let Err(_e) = handle_connection(
@@ -430,6 +505,7 @@ impl RelayServer {
                     rate_limiter,
                     persistence,
                     bridge_registry,
+                    did_slots,
                 )
                 .await
                 {
@@ -500,6 +576,7 @@ impl RelayServer {
         let rate_limiter = self.publish_rate_limiter.clone();
         let persistence = self.persistence.clone();
         let bridge_registry = Arc::clone(&self.bridge_registry);
+        let did_slots = self.did_slots.clone();
         let accept_token = token.clone();
 
         tokio::spawn(async move {
@@ -543,6 +620,7 @@ impl RelayServer {
                 let rate_limiter = rate_limiter.clone();
                 let persistence = persistence.clone();
                 let bridge_registry = Arc::clone(&bridge_registry);
+                let did_slots = did_slots.clone();
 
                 tokio::spawn(async move {
                     let _ = handle_connection(
@@ -555,6 +633,7 @@ impl RelayServer {
                         rate_limiter,
                         persistence,
                         bridge_registry,
+                        did_slots,
                     )
                     .await;
                     // Decrement connection count on disconnect.
@@ -775,6 +854,7 @@ async fn handle_connection(
     rate_limiter: PublishRateLimiter,
     persistence: Option<Arc<dyn RelayPersistence>>,
     bridge_registry: Arc<BridgeRegistry>,
+    did_slots: DidSlotRegistry,
 ) -> Result<(), ConnectionError> {
     let ws_stream = accept_websocket(stream, config.bridge_secret).await?;
     let (mut ws_sink, mut ws_source) = ws_stream.split();
@@ -863,6 +943,7 @@ async fn handle_connection(
                     persistence.as_ref(),
                     &bridge_registry,
                     &bridge_forward_tx,
+                    &did_slots,
                 )
                 .await;
             }
@@ -965,6 +1046,7 @@ async fn handle_client_message(
     persistence: Option<&Arc<dyn RelayPersistence>>,
     bridge_registry: &Arc<BridgeRegistry>,
     bridge_forward_tx: &mpsc::Sender<Vec<u8>>,
+    did_slots: &DidSlotRegistry,
 ) {
     match msg {
         ClientMessage::Publish {
@@ -986,6 +1068,7 @@ async fn handle_client_message(
                 subscriptions,
                 config,
                 rate_limiter,
+                did_slots,
             )
             .await;
         }
@@ -1035,6 +1118,7 @@ async fn handle_client_message(
                 tx,
                 storage,
                 config,
+                did_slots,
             )
             .await;
         }
@@ -1092,8 +1176,10 @@ async fn handle_client_message(
 
 /// Handles a PUBLISH operation.
 // PUBLISH handler receives protocol-defined fields plus connection state;
-// grouping would obscure the protocol-level parameters.
-#[allow(clippy::too_many_arguments)]
+// grouping would obscure the protocol-level parameters. The DID-record
+// validating-relay branch (§3.10.2) adds the cheapest-first classify + slot
+// handling inline, hence too_many_lines.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_publish(
     ref_id: Option<String>,
     routing_id: [u8; 32],
@@ -1106,6 +1192,7 @@ async fn handle_publish(
     subscriptions: &SubscriptionRegistry,
     config: &RelayConfig,
     rate_limiter: &PublishRateLimiter,
+    did_slots: &DidSlotRegistry,
 ) {
     // Check rate limit.
     if !rate_limiter.check(ip).await {
@@ -1151,7 +1238,114 @@ async fn handle_publish(
     // Compute blob_id = SHA-256(blob).
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
 
-    // Store the blob.
+    // OPTIONAL validating-relay DID-record path (§3.10.2 "Relay-side validation",
+    // §9.10.12, ADR-004 "DID-Record Slot-Exclusivity"). Runs cheapest-first and
+    // only engages for a blob that decodes as a `DidRecordV1` frame — an
+    // encrypted context blob (whose first byte is a MessagePack map marker,
+    // never 0x01) is `NotAFrame` and falls straight through to opaque storage.
+    // NEVER a trust dependency: the client re-verifies every record itself, so a
+    // relay with this Disabled just stores the frame opaquely and resolution
+    // stays correct (RELAYRES-002). Behind the per-IP PUBLISH rate limit above.
+    if config.did_record_validation == DidRecordValidation::Enabled {
+        match classify_did_record_frame(&routing_id, blob) {
+            DidRecordClass::Valid { seq } => {
+                // Binding + signature verified. Apply the single-slot / eviction
+                // rule atomically (establish, supersede, or idempotent refresh).
+                match did_slots
+                    .publish_frame(
+                        storage,
+                        routing_id,
+                        blob_id,
+                        recipient_hint,
+                        blob_ttl,
+                        blob.to_vec(),
+                        seq,
+                    )
+                    .await
+                {
+                    Ok((stored, _outcome)) => {
+                        let _failed_deliveries = subscription::deliver_to_subscribers(
+                            &stored,
+                            subscriptions,
+                            config.delivery_jitter_ms,
+                        )
+                        .await;
+                        let _ = tx
+                            .send(RelayMessage::Ok {
+                                ref_id,
+                                blob_id: Some(blob_id),
+                            })
+                            .await;
+                    }
+                    Err(SlotPublishError::NonSuperseding {
+                        stored_seq,
+                        got_seq,
+                    }) => {
+                        let _ = tx
+                            .send(RelayMessage::Err {
+                                ref_id,
+                                code: code::DID_RECORD_REJECTED,
+                                msg: format!(
+                                    "DID-record seq {got_seq} does not supersede the stored slot (seq {stored_seq})"
+                                ),
+                            })
+                            .await;
+                    }
+                    Err(SlotPublishError::Storage(e)) => {
+                        let _ = tx
+                            .send(RelayMessage::Err {
+                                ref_id,
+                                code: code::STORAGE_FULL,
+                                msg: e.to_string(),
+                            })
+                            .await;
+                    }
+                }
+                return;
+            }
+            DidRecordClass::Invalid(reason) => {
+                // Decoded as a frame but failed binding or signature — junk at a
+                // DID address. Rejected at validation; never enters a slot
+                // (§3.10.8 "Junk frame … rejected at validation").
+                let detail = match reason {
+                    DidRecordRejection::BindingMismatch => {
+                        "DID→routing_id binding mismatch (frame published at the wrong routing_id)"
+                    }
+                    DidRecordRejection::SignatureInvalid => "BEP44 signature verification failed",
+                };
+                let _ = tx
+                    .send(RelayMessage::Err {
+                        ref_id,
+                        code: code::DID_RECORD_REJECTED,
+                        msg: format!("DID-record frame rejected: {detail}"),
+                    })
+                    .await;
+                return;
+            }
+            DidRecordClass::NotAFrame => {
+                // Opaque blob. Slot-exclusivity rule (a): once a routing_id has a
+                // claimed DID slot, any non-superseding PUBLISH there — including
+                // a non-frame blob — is rejected, so it can never co-locate with
+                // (or shadow) the genuine record.
+                if did_slots.is_claimed(storage, &routing_id).await {
+                    let _ = tx
+                        .send(RelayMessage::Err {
+                            ref_id,
+                            code: code::DID_RECORD_REJECTED,
+                            msg: "routing_id has a claimed DID-record slot; \
+                                  non-superseding blobs are rejected (slot-exclusive)"
+                                .to_string(),
+                        })
+                        .await;
+                    return;
+                }
+                // Not a claimed DID slot — fall through to ordinary opaque storage.
+            }
+        }
+    }
+
+    // Store the blob (opaque path — non-DID blobs, or every blob when
+    // did_record_validation is Disabled).
     let stored = match storage
         .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
         .await
@@ -1361,6 +1555,9 @@ async fn handle_unsubscribe(
 }
 
 /// Handles a QUERY operation.
+// QUERY handler carries protocol fields plus the storage, config, and DID slot
+// index; grouping them would obscure the protocol-level parameters.
+#[allow(clippy::too_many_arguments)]
 async fn handle_query(
     ref_id: Option<String>,
     routing_id: [u8; 32],
@@ -1369,6 +1566,7 @@ async fn handle_query(
     tx: &mpsc::Sender<RelayMessage>,
     storage: &Arc<BlobStorageBackend>,
     config: &RelayConfig,
+    did_slots: &DidSlotRegistry,
 ) {
     let effective_limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
 
@@ -1386,16 +1584,34 @@ async fn handle_query(
         return;
     }
 
-    let blobs = match storage.query(&routing_id, since, effective_limit).await {
-        Ok(b) => b,
-        Err(e) => {
-            let err = RelayMessage::Err {
-                ref_id,
-                code: code::INTERNAL_ERROR,
-                msg: e.to_string(),
-            };
-            let _ = tx.send(err).await;
-            return;
+    // Slot-exclusivity rule (c): on a validating relay, a routing_id with a
+    // claimed DID slot returns ONLY that single slot record, regardless of
+    // `limit`, `since`, or any co-located opaque junk (§3.10.2). The `since`
+    // filter is intentionally ignored for a claimed slot — the single genuine
+    // record is always returned so a resolver cannot be starved by a narrow
+    // `since` window while junk was stored later. Unclaimed routing_ids (the
+    // common case, incl. all encrypted context blobs) take the fast read-lock
+    // path and fall through to the normal multi-blob query below.
+    let claimed_slot = if config.did_record_validation == DidRecordValidation::Enabled {
+        did_slots.slot_blob(storage, &routing_id).await
+    } else {
+        None
+    };
+
+    let blobs = if let Some(slot) = claimed_slot {
+        vec![slot]
+    } else {
+        match storage.query(&routing_id, since, effective_limit).await {
+            Ok(b) => b,
+            Err(e) => {
+                let err = RelayMessage::Err {
+                    ref_id,
+                    code: code::INTERNAL_ERROR,
+                    msg: e.to_string(),
+                };
+                let _ = tx.send(err).await;
+                return;
+            }
         }
     };
 
@@ -3334,6 +3550,346 @@ mod tests {
                 assert_eq!(c, code::BRIDGE_AUTH_FAILED);
             }
             other => panic!("expected ERR(BRIDGE_AUTH_FAILED), got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // DID-record relay-side validation + slot-exclusivity (SCP-RELAYRES-003)
+    //
+    // These tests drive the REAL RelayServer + real BlobStorageBackend
+    // in-process over a WebSocket, exercising the validating-relay PUBLISH/QUERY
+    // path end-to-end (never a mock that bypasses validation). They prove the
+    // four §3.10.8 flood variants are inert on a validating relay, plus the
+    // single-slot, slot-exclusivity, and optional-validation properties
+    // (§3.10.2, §9.10.12, ADR-004 "DID-Record Slot-Exclusivity").
+    // -----------------------------------------------------------------------
+
+    mod did_record {
+        use super::*;
+        use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+        use scp_protocol::envelope::did_record::DidRecordV1;
+
+        /// A deterministic Ed25519 keypair for a test identity.
+        fn keypair(seed: u8) -> (VerifyingKey, SigningKey) {
+            let sk = SigningKey::from_bytes(&[seed; 32]);
+            let vk = sk.verifying_key();
+            (vk, sk)
+        }
+
+        /// The DID-domain `routing_id` `SHA-256("scp:did:" || did(vk))` a frame
+        /// carrying `vk` must be published at to bind.
+        fn routing_id_of(vk: &VerifyingKey) -> [u8; 32] {
+            let did = scp_identity::did_from_ed25519_public_key(&vk.to_bytes());
+            scp_identity::did_routing_id(&did)
+        }
+
+        /// Builds DID-record frame bytes. `embed_vk` is what the frame carries
+        /// (the relay checks against it); `signer` actually signs the BEP44
+        /// payload — pass a different signer than `embed_vk`'s to forge a bad
+        /// signature. `value` is opaque to the relay (a stand-in DID document).
+        fn frame(embed_vk: &VerifyingKey, signer: &SigningKey, seq: u64, value: &[u8]) -> Vec<u8> {
+            let payload = scp_dht::bep44_signable(value, seq);
+            let sig: ed25519_dalek::Signature = signer.sign(&payload);
+            DidRecordV1::try_new(embed_vk.to_bytes(), seq, sig.to_bytes(), value.to_vec())
+                .unwrap()
+                .encode()
+        }
+
+        /// A well-formed, self-consistent frame (embedded key signs the payload).
+        fn valid_frame(vk: &VerifyingKey, sk: &SigningKey, seq: u64, value: &[u8]) -> Vec<u8> {
+            frame(vk, sk, seq, value)
+        }
+
+        async fn start_validating_server() -> SocketAddr {
+            start_test_server().await // default RelayConfig => validation Enabled
+        }
+
+        async fn start_non_validating_server() -> SocketAddr {
+            let config = RelayConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                ttl_check_interval: Duration::from_millis(100),
+                delivery_jitter_ms: 0,
+                did_record_validation: DidRecordValidation::Disabled,
+                ..RelayConfig::default()
+            };
+            let storage = Arc::new(BlobStorageBackend::in_memory());
+            let (_handle, addr) = RelayServer::new(config, storage).start().await.unwrap();
+            addr
+        }
+
+        type Sink = futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >;
+        type Stream = futures::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >;
+
+        /// PUBLISH `blob` at `routing_id` and return the single reply (OK or ERR).
+        async fn publish(
+            sink: &mut Sink,
+            stream: &mut Stream,
+            routing_id: [u8; 32],
+            blob: Vec<u8>,
+        ) -> RelayMessage {
+            let msg = ClientMessage::Publish {
+                ref_id: Some("p".to_string()),
+                routing_id,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob,
+            };
+            send_msg(sink, &msg).await;
+            recv_msg(stream).await
+        }
+
+        /// QUERY `routing_id` and collect the returned blob byte-vectors (drains
+        /// BLOBs up to the terminating `query_complete` EVENT).
+        async fn query(
+            sink: &mut Sink,
+            stream: &mut Stream,
+            routing_id: [u8; 32],
+            limit: u32,
+        ) -> Vec<Vec<u8>> {
+            let msg = ClientMessage::Query {
+                ref_id: Some("q".to_string()),
+                routing_id,
+                since: None,
+                limit: Some(limit),
+            };
+            send_msg(sink, &msg).await;
+            let mut blobs = Vec::new();
+            loop {
+                match recv_msg(stream).await {
+                    RelayMessage::Blob { blob, .. } => blobs.push(blob),
+                    RelayMessage::Event { event_type, .. } if event_type == "query_complete" => {
+                        break;
+                    }
+                    other => panic!("unexpected QUERY reply: {other:?}"),
+                }
+            }
+            blobs
+        }
+
+        fn assert_ok(reply: &RelayMessage) {
+            assert!(
+                matches!(reply, RelayMessage::Ok { .. }),
+                "expected OK, got {reply:?}"
+            );
+        }
+
+        fn assert_rejected(reply: &RelayMessage) {
+            match reply {
+                RelayMessage::Err { code: c, .. } => {
+                    assert_eq!(
+                        *c,
+                        code::DID_RECORD_REJECTED,
+                        "expected DID_RECORD_REJECTED"
+                    );
+                }
+                other => panic!("expected ERR(DID_RECORD_REJECTED), got {other:?}"),
+            }
+        }
+
+        /// A valid frame at the correct `routing_id` establishes a slot, and QUERY
+        /// returns exactly that frame's bytes.
+        #[tokio::test]
+        async fn valid_frame_establishes_slot_and_is_queryable() {
+            let addr = start_validating_server().await;
+            let (mut sink, mut stream) = connect_client(addr).await;
+            let (vk, sk) = keypair(1);
+            let rid = routing_id_of(&vk);
+            let f = valid_frame(&vk, &sk, 7, b"did-document-v7");
+
+            assert_ok(&publish(&mut sink, &mut stream, rid, f.clone()).await);
+
+            let got = query(&mut sink, &mut stream, rid, 16).await;
+            assert_eq!(got, vec![f]);
+        }
+
+        /// Flood variant (a): a junk frame — wrong binding OR bad signature — is
+        /// rejected at validation and never enters the slot (§3.10.8).
+        #[tokio::test]
+        async fn flood_variant_a_junk_frame_rejected() {
+            let addr = start_validating_server().await;
+            let (mut sink, mut stream) = connect_client(addr).await;
+            let (vk, sk) = keypair(2);
+            let rid = routing_id_of(&vk);
+
+            // Establish the genuine slot.
+            let genuine = valid_frame(&vk, &sk, 5, b"genuine");
+            assert_ok(&publish(&mut sink, &mut stream, rid, genuine.clone()).await);
+
+            // Junk frame 1: valid signature but WRONG binding (a different key's
+            // frame parked at this routing_id).
+            let (vk_other, sk_other) = keypair(99);
+            let wrong_binding = valid_frame(&vk_other, &sk_other, 6, b"attacker");
+            assert_rejected(&publish(&mut sink, &mut stream, rid, wrong_binding).await);
+
+            // Junk frame 2: correct binding but BAD signature (embeds vk, signed
+            // by someone else), higher seq — still rejected.
+            let bad_sig = frame(&vk, &sk_other, 6, b"forged");
+            assert_rejected(&publish(&mut sink, &mut stream, rid, bad_sig).await);
+
+            // The genuine record is untouched.
+            assert_eq!(query(&mut sink, &mut stream, rid, 16).await, vec![genuine]);
+        }
+
+        /// Flood variant (b): a stale or equal-seq frame is rejected by the
+        /// single-slot rule — EXCEPT a byte-identical equal-seq republish, which
+        /// is an idempotent TTL refresh (no error). Highest-seq wins (§3.10.2 step
+        /// 4, §3.10.8). Covers the single-highest-seq-slot acceptance criterion.
+        #[tokio::test]
+        async fn flood_variant_b_stale_and_equal_seq() {
+            let addr = start_validating_server().await;
+            let (mut sink, mut stream) = connect_client(addr).await;
+            let (vk, sk) = keypair(3);
+            let rid = routing_id_of(&vk);
+
+            let f5 = valid_frame(&vk, &sk, 5, b"rec-seq5");
+            assert_ok(&publish(&mut sink, &mut stream, rid, f5.clone()).await);
+
+            // Stale seq (3 <= 5) → rejected.
+            let f3 = valid_frame(&vk, &sk, 3, b"rec-seq3");
+            assert_rejected(&publish(&mut sink, &mut stream, rid, f3).await);
+
+            // Equal seq, byte-identical → idempotent refresh (OK, no error).
+            assert_ok(&publish(&mut sink, &mut stream, rid, f5.clone()).await);
+
+            // Equal seq, DIFFERENT bytes → rejected (§3.10.4 same-seq conflict).
+            let f5b = valid_frame(&vk, &sk, 5, b"rec-seq5-DIFFERENT");
+            assert_rejected(&publish(&mut sink, &mut stream, rid, f5b).await);
+
+            // Slot still holds the original seq-5 record.
+            assert_eq!(query(&mut sink, &mut stream, rid, 16).await, vec![f5]);
+
+            // Strictly-higher valid seq → supersede.
+            let f9 = valid_frame(&vk, &sk, 9, b"rec-seq9");
+            assert_ok(&publish(&mut sink, &mut stream, rid, f9.clone()).await);
+            assert_eq!(query(&mut sink, &mut stream, rid, 16).await, vec![f9]);
+        }
+
+        /// Flood variant (c): once the slot exists, a non-frame opaque junk blob
+        /// is rejected (slot-exclusivity rule (a)) and QUERY returns only the slot
+        /// (rule (c)).
+        #[tokio::test]
+        async fn flood_variant_c_non_frame_junk_rejected_query_returns_only_slot() {
+            let addr = start_validating_server().await;
+            let (mut sink, mut stream) = connect_client(addr).await;
+            let (vk, sk) = keypair(4);
+            let rid = routing_id_of(&vk);
+
+            let f = valid_frame(&vk, &sk, 5, b"genuine-record");
+            assert_ok(&publish(&mut sink, &mut stream, rid, f.clone()).await);
+
+            // Non-frame opaque junk at the claimed routing_id → rejected.
+            assert_rejected(&publish(&mut sink, &mut stream, rid, vec![0xAA; 256]).await);
+            assert_rejected(&publish(&mut sink, &mut stream, rid, vec![0x00; 40]).await);
+
+            // QUERY returns exactly one record — the slot — even at a large limit.
+            assert_eq!(query(&mut sink, &mut stream, rid, 1000).await, vec![f]);
+        }
+
+        /// Flood variant (d): junk pre-seeded BEFORE the first valid frame (while
+        /// the relay cannot yet recognize the `routing_id` as DID-domain) sits as
+        /// opaque storage, then is EVICTED when the first binding-valid frame
+        /// establishes the slot (rule (b)).
+        #[tokio::test]
+        async fn flood_variant_d_preseeded_junk_evicted_on_establish() {
+            let addr = start_validating_server().await;
+            let (mut sink, mut stream) = connect_client(addr).await;
+            let (vk, sk) = keypair(5);
+            let rid = routing_id_of(&vk);
+
+            // Pre-seed opaque junk BEFORE any valid frame — accepted as opaque.
+            assert_ok(&publish(&mut sink, &mut stream, rid, vec![0xAA; 100]).await);
+            assert_ok(&publish(&mut sink, &mut stream, rid, vec![0xBB; 120]).await);
+            // Both are visible as ordinary opaque blobs (not yet DID-domain).
+            assert_eq!(query(&mut sink, &mut stream, rid, 16).await.len(), 2);
+
+            // First binding-valid frame establishes the slot AND evicts the junk.
+            let f = valid_frame(&vk, &sk, 1, b"first-genuine");
+            assert_ok(&publish(&mut sink, &mut stream, rid, f.clone()).await);
+
+            assert_eq!(query(&mut sink, &mut stream, rid, 16).await, vec![f]);
+        }
+
+        /// A validly-signed frame published at the WRONG `routing_id` (binding
+        /// mismatch) is rejected — you cannot park a valid frame at someone
+        /// else's DID address.
+        #[tokio::test]
+        async fn valid_frame_at_wrong_routing_id_rejected() {
+            let addr = start_validating_server().await;
+            let (mut sink, mut stream) = connect_client(addr).await;
+            let (vk, sk) = keypair(6);
+            let (vk_victim, _sk_victim) = keypair(7);
+            let victim_rid = routing_id_of(&vk_victim);
+
+            // Self-consistent frame for vk, published at vk_victim's routing_id.
+            let f = valid_frame(&vk, &sk, 3, b"doc");
+            assert_rejected(&publish(&mut sink, &mut stream, victim_rid, f).await);
+
+            // Nothing was stored at the victim's routing_id.
+            assert!(
+                query(&mut sink, &mut stream, victim_rid, 16)
+                    .await
+                    .is_empty()
+            );
+        }
+
+        /// After a slot is claimed, QUERY returns exactly one record even under a
+        /// sustained non-frame junk flood (all rejected), regardless of `limit`.
+        #[tokio::test]
+        async fn query_returns_one_slot_after_junk_flood() {
+            let addr = start_validating_server().await;
+            let (mut sink, mut stream) = connect_client(addr).await;
+            let (vk, sk) = keypair(8);
+            let rid = routing_id_of(&vk);
+
+            let f = valid_frame(&vk, &sk, 2, b"the-record");
+            assert_ok(&publish(&mut sink, &mut stream, rid, f.clone()).await);
+
+            for i in 0u8..25 {
+                assert_rejected(&publish(&mut sink, &mut stream, rid, vec![i; 300]).await);
+            }
+
+            assert_eq!(query(&mut sink, &mut stream, rid, 1000).await, vec![f]);
+        }
+
+        /// Optional validation: a NON-validating relay stores a DID-record frame
+        /// (and co-located junk) opaquely and returns them all — resolution stays
+        /// correct via client-side re-verification, and relay acceptance is never
+        /// a trust input (§3.10.2 "OPTIONAL capability").
+        #[tokio::test]
+        async fn non_validating_relay_stores_frame_opaquely() {
+            let addr = start_non_validating_server().await;
+            let (mut sink, mut stream) = connect_client(addr).await;
+            let (vk, sk) = keypair(9);
+            let rid = routing_id_of(&vk);
+
+            // A genuine frame is accepted — but as an opaque blob (no slot).
+            let f = valid_frame(&vk, &sk, 5, b"genuine");
+            assert_ok(&publish(&mut sink, &mut stream, rid, f.clone()).await);
+
+            // Co-located opaque junk is ALSO accepted (no slot-exclusivity).
+            assert_ok(&publish(&mut sink, &mut stream, rid, vec![0xAA; 80]).await);
+
+            // Even a wrong-binding frame is accepted opaquely (no validation).
+            let (vk_other, sk_other) = keypair(10);
+            let wrong = valid_frame(&vk_other, &sk_other, 6, b"other");
+            assert_ok(&publish(&mut sink, &mut stream, rid, wrong.clone()).await);
+
+            // QUERY returns everything stored — the non-validating path does not
+            // collapse to a single slot. The resolver sifts to the highest-seq
+            // *valid* record client-side (RELAYRES-002) and re-verifies.
+            let got = query(&mut sink, &mut stream, rid, 16).await;
+            assert_eq!(got.len(), 3, "non-validating relay keeps all blobs");
+            assert!(got.contains(&f));
+            assert!(got.contains(&wrong));
         }
     }
 }

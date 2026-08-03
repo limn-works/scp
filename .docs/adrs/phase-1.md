@@ -598,7 +598,7 @@ Implement a WebSocket-based store-and-forward relay server and its corresponding
 **Relay server requirements:**
 
 - TTL enforcement: a background task deletes expired blobs.
-- No blob inspection: the relay never parses, validates, or inspects blob contents.
+- No blob inspection of encrypted content: the relay never parses, validates, or inspects the contents of *encrypted, opaque* blobs (`OuterEnvelope`s and any other ciphertext). It routes by `routing_id`, stores for `blob_ttl`, and delivers — it learns nothing about who sent a message, what context it belongs to, or what it contains. The **sole, narrow exception** is the OPTIONAL DID-record validation below: a validating SCP-native relay MAY validate *public, self-certifying* DID-record frames (which carry no confidential content — they are signed, plaintext identity records) for availability / anti-suppression. This exception never applies to encrypted content and is never a trust dependency (the client always re-verifies, §3.10.2). "Untrusted dumb pipe," not "does zero validation," is the invariant.
 - No client authentication: any WebSocket client can connect, publish, subscribe, query.
 - Connection multiplexing: one WebSocket connection supports multiple subscriptions.
 - Bind address is configurable (supports deployment behind reverse proxies, VPNs, or other network configurations).
@@ -676,7 +676,7 @@ Every message is a MessagePack map with a required `op` field (string) plus oper
 
 #### Error Codes
 
-**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS.
+**Client errors (4xxx):** `4000` INVALID_MESSAGE, `4001` UNKNOWN_OP, `4002` MISSING_FIELD, `4003` INVALID_FIELD, `4010` BLOB_TOO_LARGE, `4011` TTL_TOO_LONG, `4012` LIMIT_EXCEEDED, `4020` RATE_LIMITED, `4021` TOO_MANY_SUBSCRIPTIONS, `4040` DID_RECORD_REJECTED (a validating SCP-native relay rejected a PUBLISH at a DID-domain `routing_id`: a frame that failed the DID→routing_id binding or BEP44 signature, a non-superseding `seq`, or any non-frame / wrong-binding / invalid-signature blob published to a slot-claimed `routing_id` — see the DID-Record Slot-Exclusivity subsection).
 
 **Server errors (5xxx):** `5000` INTERNAL_ERROR, `5001` STORAGE_FULL, `5002` SHUTTING_DOWN.
 
@@ -729,6 +729,31 @@ pub enum RelayMessage {
 ```
 
 Serialized via `serde` with `rmp-serde`. The `op` field is handled by tagged enum representation. All binary fields use MessagePack's native `bin` type.
+
+#### DID-Record Slot-Exclusivity (validating SCP-native relays, OPTIONAL)
+
+This subsection is the companion ADR-004 storage-semantics update mandated by spec §3.10.2 ("Relay-side validation") and §9.10.12: **DID-domain `routing_id`s are slot-exclusive once a binding-valid frame claims them.** The spec sections are authoritative for the behavior; this subsection records the relay **storage** semantics that follow from them. It is delivered by issue #482 (story SCP-RELAYRES-003).
+
+**Motivation.** The base relay stores *multiple opaque blobs per `routing_id` with no per-`routing_id` cap* (a dumb store-and-forward pipe, above). For encrypted context blobs that is correct — the relay cannot and must not distinguish them. But a DID document rides in a public, self-certifying **DID-record frame** (`DidRecordV1`, §9.10.12) published at a deterministic DID-domain `routing_id = SHA-256("scp:did:" || did_string)` (§3.10.2). Because that address is publicly derivable, any party can PUBLISH junk there. Left as unbounded opaque storage, a flood could push the genuine record out of a bounded QUERY window (a suppression vector). A validating relay closes this by keeping a **single highest-sequence slot** per DID-domain `routing_id` and making the address slot-exclusive once claimed.
+
+**Optional, never a trust dependency.** Relay-side validation is an **OPTIONAL capability** of SCP-native relays. The protocol MUST NOT require it: foreign transports, adapters, and non-validating SCP transports (e.g. a node's alternate QUIC listener, ADR-037) store the frame as an ordinary opaque blob, and resolution stays correct via **client-side re-verification** (RELAYRES-002), the DHT, and multi-relay publishing (§3.10.8). A relay that skips, botches, or lies about validation degrades **availability only, never integrity** — the resolver ALWAYS re-verifies each record's BEP44 signature against the key it derives from the DID string itself and never trusts the relay's acceptance or the frame-supplied `public_key` (§9.10.12 "Framing is outside the signed authority"). The canonical validating relay is the WebSocket native relay of this ADR.
+
+**Validation on PUBLISH (cheapest-first).** When a validating relay receives a PUBLISH whose blob **decodes as a `DidRecordV1` frame**, it runs, in order — the whole path behind the existing per-IP PUBLISH rate limit:
+
+1. **Structural decode** (`DidRecordV1::decode`, §9.10.12). A blob that does not decode is *not a candidate DID record* — it is an opaque blob governed only by the slot-exclusivity rule below.
+2. **DID→routing_id binding.** Confirm `SHA-256("scp:did:" || did(public_key)) == routing_id`, where `did(public_key)` is the `did:dht` string derived from the frame's `public_key` (§9.6.1). A plain hash — **cheaper than a signature verify, so it runs before step 3.** A frame whose `public_key` does not hash to its `routing_id` is rejected (`DID_RECORD_REJECTED`), and — because the binding precedes the signature — a mis-addressed frame **never costs an Ed25519 verify**. This mirrors, on the data plane, the exact check `BRIDGE_REGISTER` already performs on the control plane (§10.12.4).
+3. **BEP44 signature.** Only for a blob that passed 1–2, verify the BEP44 signature over `bencode(seq, value)` against the frame's `public_key` (§9.10.12). Failure → rejected.
+4. **Single highest-sequence slot.** For a frame that passed 1–3, keep a single slot per `routing_id`: reject a frame whose `seq` is `≤` the stored slot's `seq` **unless** an equal-`seq` frame is byte-identical to the stored record (an idempotent TTL refresh — permitted, no error, refreshes storage lifetime), and replace the slot only on a strictly-higher valid `seq`. Two records at equal `seq` that are *not* byte-identical is a conflict and is rejected (§3.10.4).
+
+**Slot-exclusivity.** The moment a binding-valid, signature-valid frame first **establishes a slot** at a `routing_id`, that `routing_id` becomes slot-exclusive:
+
+- **(a)** the relay rejects any later PUBLISH there that is not a binding-valid, `seq`-advancing frame — a non-frame blob, a wrong-binding frame, an invalid signature, or a non-superseding `seq` are all rejected (`DID_RECORD_REJECTED`); the sole exception is the byte-identical equal-`seq` refresh of rule 4;
+- **(b)** when the slot is first established, the relay **evicts any pre-existing opaque blobs** stored at that `routing_id` (closing the pre-seeding gap: junk published *before* the first valid frame — while `SHA-256` one-wayness prevents the relay from recognizing the address as DID-domain — sits as ordinary opaque storage until the first valid publish evicts it);
+- **(c)** QUERY at that `routing_id` returns **only the single slot**, regardless of the `limit`.
+
+**Reversion.** Slot-exclusivity is a property of a *claimed* slot. If the slot record's own blob TTL (§9.10.2) expires while the owner is offline past the 6-day republish cycle (§3.10.2) — or, for an in-memory slot index, on relay restart — the `routing_id` reverts to an unclaimed opaque-blob address and the pre-seed window reopens. This is **not a suppression bypass**: during that window the genuine record is already absent (owner offline, not attacker action), any attacker blob still fails the resolver's DID-derived-key BEP44 verification, resolution falls through to the DHT, and the owner's next republish re-establishes the slot and re-fires rule (b).
+
+**Storage-model note.** Slot state (which DID-domain `routing_id`s are claimed, and at what `seq`) is tracked by the validating relay as an index over its blob store; enforcement is backend-agnostic and therefore applies uniformly across every configured blob-storage backend (in-memory, SQLite, redb, S3, Postgres) without per-backend code. The index is a validating-relay concern, not a change to the opaque store's `(routing_id, blob_id)` keying or its multi-blob-per-`routing_id` contract for non-DID addresses.
 
 ---
 

@@ -751,6 +751,20 @@ async fn write_and_finish(mut send: SendStream, msg: &RelayMessage) -> Result<()
 // ---------------------------------------------------------------------------
 
 /// Handles a PUBLISH operation on a QUIC stream.
+///
+/// This QUIC listener is a **non-validating** SCP transport: it stores every
+/// blob opaquely and does NOT run the OPTIONAL DID-record frame validation /
+/// slot-exclusivity that the WebSocket native relay applies (§3.10.2, ADR-004
+/// "DID-Record Slot-Exclusivity", SCP-RELAYRES-003). This is spec-permitted —
+/// relay-side validation is optional and never a trust dependency, and the
+/// resolver re-verifies every record independently (RELAYRES-002). When this
+/// listener shares a blob store with a validating WebSocket relay, that relay's
+/// registry-gated QUERY still returns only the genuine slot; a DID resolver
+/// reaching a DID record over this non-validating transport gets best-effort
+/// (availability-only) suppression resistance and relies on client re-verify,
+/// the DHT, and multi-relay publishing (§3.10.8). Validating this transport too
+/// (sharing the WS relay's slot index via `RelayServer::did_slot_registry`) is a
+/// clean future extension, not a correctness gap here.
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish<S: BlobStorage>(
     send: SendStream,

@@ -41,6 +41,13 @@ scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
 # the leaf directly (rather than only via scp-core) is acyclic — scp-protocol has
 # no scp-transport edge (SCP-RELAYRES-002).
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+# BEP44 signable-payload construction + Ed25519 signature verification for the
+# OPTIONAL validating-relay DID-record path (SCP-RELAYRES-003, §3.10.2). Default
+# features only — the `testing` feature (which compiles the InMemoryDhtClient
+# resolve nullifier, ADR-062 §Decision 1) is deliberately NOT enabled on this
+# shipped edge; only the pure `bep44_signable` / `verify_bep44_signature`
+# helpers are used.
+scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
 scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 # The relay wire types (ClientMessage/RelayMessage + constants + code) live in
 # the wasm-safe scp-relay-client leaf, shared with the in-browser client
@@ -127,11 +134,10 @@ scp-core = { path = "../scp-core" }
 ed25519-dalek = { workspace = true }
 scp-platform = { path = "../scp-platform" }
 scp-testing = { path = "../scp-testing" }
-# TransportRelayQuerier + RealMultiRelayQuerier integration tests build signed
-# DID-record frames: DID document (scp-did), BEP44 signable payload (scp-dht),
-# and DID-from-key derivation (scp-did). Dev-only (SCP-RELAYRES-002).
+# DID-record frame tests build a DID document (scp-did) for the frame `value`.
+# The BEP44 signable payload / verify helpers (scp-dht) are now a NORMAL
+# dependency (validating-relay path, SCP-RELAYRES-003). Dev-only: scp-did.
 scp-did = { path = "../scp-did" }
-scp-dht = { path = "../scp-dht" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 futures = "0.3"

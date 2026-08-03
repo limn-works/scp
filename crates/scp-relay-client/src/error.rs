@@ -47,6 +47,24 @@ pub mod code {
     /// The client has too many active subscriptions on this connection.
     pub const TOO_MANY_SUBSCRIPTIONS: u16 = 4021;
 
+    /// A validating SCP-native relay rejected a PUBLISH at a DID-domain
+    /// `routing_id` (§3.10.2 relay-side validation, §9.10.12, ADR-004
+    /// "DID-Record Slot-Exclusivity").
+    ///
+    /// The blob decoded as a `DidRecordV1` frame but failed the
+    /// `SHA-256("scp:did:" || did(public_key)) == routing_id` binding or the
+    /// BEP44 signature; or its `seq` did not supersede the stored slot (and it
+    /// was not a byte-identical equal-`seq` refresh); or it was a non-frame /
+    /// wrong-binding / invalid-signature blob published to a `routing_id` whose
+    /// DID slot is already claimed (slot-exclusivity rule (a)).
+    ///
+    /// Do not retry as-is. This is a **defense-in-depth availability** measure,
+    /// never a trust dependency: the client re-verifies every record
+    /// independently, so a relay's acceptance or rejection is never a client
+    /// trust input. A non-validating relay would have stored the same blob
+    /// opaquely and resolution would still be correct via client re-verification.
+    pub const DID_RECORD_REJECTED: u16 = 4040;
+
     /// The relay does not support the BRIDGE operation (section 10.12.4).
     /// The client should try a different relay configured with
     /// `bridge: BridgeRole::Enabled`.
