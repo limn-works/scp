@@ -1760,6 +1760,83 @@ mod resolution_seam_tests {
         }
     }
 
+    /// A fully-valid **`#agent`-persona** Add `Fx`: the credential and
+    /// attestation both use [`SigningKeyId::Agent`], the attestation is signed by
+    /// the **agent** key, and the resolved document carries an *unrelated*
+    /// `#active` VM plus (when `include_agent_vm`) an `#agent` VM equal to the
+    /// signer's agent key. The unrelated `#active` is the discriminator: a
+    /// persona-blind verifier that hardwired `#active` would resolve that
+    /// unrelated key and fail check 3, so reaching `Ok` / `CurrentKeyNotFound`
+    /// proves the seam resolved the credential-named `#agent` VM.
+    fn agent_fixture(include_agent_vm: bool) -> Fx {
+        let signer = SigningKey::generate(&mut OsRng);
+        let agent_pub = signer.verifying_key().to_bytes();
+        let leaf_sig = fresh_pub();
+        let leaf_enc = fresh_pub();
+        let leaf_wrap = fresh_pub();
+        let kp_init = fresh_pub();
+        let mut att = KeyPackageAttestation {
+            did: TEST_DID.to_owned(),
+            leaf_signature_key: leaf_sig,
+            leaf_encryption_key: leaf_enc,
+            init_key: kp_init,
+            wrapping_key: leaf_wrap,
+            signing_key_id: SigningKeyId::Agent,
+            issued_at: ISSUED,
+            expires_at: EXPIRES,
+            signature: [0u8; SIGNATURE_SIZE],
+        };
+        att.signature = signer.sign(&att.signing_hash()).to_bytes();
+        // `#active` is an UNRELATED key — the persona discriminator.
+        let mut doc = did_doc_with_active(&fresh_pub());
+        if include_agent_vm {
+            doc.verification_method.push(scp_did::VerificationMethod {
+                id: format!("{TEST_DID}#agent"),
+                method_type: "Ed25519VerificationKey2020".to_owned(),
+                controller: TEST_DID.to_owned(),
+                public_key_multibase: format!("z{}", bs58::encode(agent_pub).into_string()),
+            });
+        }
+        Fx {
+            att,
+            credential: ScpCredential::new(TEST_DID.to_owned(), None, SigningKeyId::Agent).unwrap(),
+            leaf_sig,
+            leaf_enc,
+            leaf_wrap,
+            kp_init,
+            doc,
+            kind: Kind::Add,
+        }
+    }
+
+    // -- FIX 2: #agent persona resolves the persona-correct VM ----------------
+
+    #[test]
+    fn agent_persona_resolves_agent_vm_and_delegates_ok() {
+        // Check 1 resolves the `#agent` VM (NOT the unrelated `#active`), and
+        // delegation succeeds because the signature verifies against the resolved
+        // agent key. Proves the seam reaches the pure core on the agent persona.
+        let fx = agent_fixture(true);
+        assert_eq!(fx.credential.signing_key_id, SigningKeyId::Agent);
+        assert_eq!(
+            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn agent_persona_missing_agent_vm_is_current_key_not_found() {
+        // The resolved doc lacks an `#agent` VM (only the unrelated `#active`):
+        // check 1 must reject with CurrentKeyNotFound — proving the seam resolves
+        // the VM named by the credential's signing_key_id (`#agent`), never a
+        // hardwired `#active`.
+        let fx = agent_fixture(false);
+        let err =
+            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW)
+                .unwrap_err();
+        assert_eq!(err, AttestationResolutionVerifyError::CurrentKeyNotFound);
+    }
+
     // -- AC1: the function is pure and callable from a scp-mls unit test -------
 
     #[test]
