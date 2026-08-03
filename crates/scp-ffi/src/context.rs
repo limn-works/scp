@@ -1521,6 +1521,56 @@ pub(crate) fn resolve_signing_key(
         })
 }
 
+/// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
+/// for a **message send** under the requested persona (ADR-039 Enforcement-Stack
+/// Layer 2).
+///
+/// This is the persona-aware counterpart of [`resolve_signing_key`] (which
+/// stays hard-`#active` for governance / Category-A signing). It selects BOTH
+/// the key handle AND the persona in a single match, so the `#active`/`#agent`
+/// stamp and the signing key are chosen together and cannot diverge:
+/// - [`SigningKeyId::Active`](scp_did::SigningKeyId::Active) → the identity's
+///   active signing key.
+/// - [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) → the identity's
+///   agent signing key. **Fail-closed**: if the identity has no agent key this
+///   returns `SCP-IDENT-1023`; it NEVER falls back to `#active` (that would let
+///   an `#agent`-intended send be silently attributed to the human).
+///
+/// The custody `Arc` and key handle are cloned OUT of the `with_identity`
+/// closure before the blocking export, mirroring [`resolve_signing_key`] so no
+/// `DashMap` shard guard is held across the async export (#1940).
+fn resolve_message_signer(
+    bi: &crate::runtime::PyBridgeInstance,
+    identity_did: &str,
+    persona: scp_did::SigningKeyId,
+) -> PyResult<scp_ffi_common::persona::ResolvedMessageSigner> {
+    let rt = crate::runtime()?;
+    let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
+        let handle = match persona {
+            scp_did::SigningKeyId::Active => entry.identity.active_signing_key,
+            scp_did::SigningKeyId::Agent => entry.identity.agent_signing_key.ok_or_else(|| {
+                crate::error::ScpPyError::identity_with_code(
+                    format!(
+                        "identity '{identity_did}' has no agent signing key — cannot send \
+                             under #agent; add one with add_agent_key first"
+                    ),
+                    scp_ffi_common::error_codes::IDENT_1023,
+                )
+            })?,
+        };
+        Ok((entry.custody.clone(), handle))
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let key = rt
+        .block_on(async move { custody.export_ed25519_signing_key(&handle).await })
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to export signing key for send: {e}"))
+        })?;
+    Ok(scp_ffi_common::persona::ResolvedMessageSigner::new(
+        key, persona,
+    ))
+}
+
 /// Helper: resolve the Ed25519 *verifying* key for an identity DID without
 /// materializing the private signing key (ADR-006).
 ///
@@ -3360,10 +3410,15 @@ impl crate::scp::PyScp {
         let identity_did_owned = identity_did.to_owned();
         let rt = crate::runtime()?;
 
-        // Resolve the signing key from the identity registry so the ContextManager
-        // can produce a valid inner envelope signature. Passing None would cause
-        // the encrypted send path to fail with "signing key required".
-        let signing_key = resolve_signing_key(bi, &identity_did_owned)?;
+        // ADR-039 Enforcement-Stack Layer 2: consult the per-instance
+        // persona-source seam to choose the send persona (default `#active`;
+        // a future determiner — RFC #2242 — overrides it), then resolve BOTH
+        // the VM stamp and the matching key handle from that one persona so the
+        // stamped persona and the signing key cannot diverge. Fail-closed on a
+        // `#agent` request with no agent key. Passing no signer would cause the
+        // encrypted send path to fail with "signing key required".
+        let persona = (bi.core.persona_source())();
+        let resolved_signer = resolve_message_signer(bi, &identity_did_owned, persona)?;
 
         // Delegate to ContextManager for message delivery through the transport.
         let context_id_for_drain = context_id.clone();
@@ -3381,12 +3436,11 @@ impl crate::scp::PyScp {
                     &temp_handle,
                     &sender_did,
                     &payload_bytes,
-                    // ADR-039: the PyO3 bridge sends under the human `#active`
-                    // key today; per-message persona selection is out of scope
-                    // for this runtime-pipeline wiring (FFI is mechanically
-                    // widened only). `MessageSigner` pairs key + persona so they
-                    // cannot diverge.
-                    scp_core::context::supervisor::MessageSigner::Active(&signing_key),
+                    // The `MessageSigner` is derived from the same persona that
+                    // selected the key handle (see `resolve_message_signer`), so
+                    // the persona stamped on the wire and the key that signs are
+                    // one source of truth (ADR-039).
+                    resolved_signer.message_signer(),
                     None,
                     spending_ucan.as_ref(),
                 )
@@ -8433,5 +8487,165 @@ class SignOnlyCustody:
             vec!["outlet:query:*".to_owned()],
             "not-a-capability".to_owned()
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-039 Enforcement-Stack Layer 2 — message-send persona-source seam.
+    //
+    // These exercise the NEW FFI code directly: the per-instance persona-source
+    // seam (default `#active`) and `resolve_message_signer`, which binds the VM
+    // stamp and the key handle from ONE persona (fail-closed on `#agent` with no
+    // agent key). The encrypted-#agent-verifying end-to-end for the exact
+    // `MessageSigner` this produces is proven at the runtime layer
+    // (`scp_runtime::context::agent_binding_pipeline_tests::live_supervisor_send`,
+    // tests (d)) — the two-party MLS decrypt harness it uses is scp-runtime
+    // internal and not reachable from this bridge crate.
+    // -----------------------------------------------------------------------
+
+    /// Registers a fresh identity in `bi` (optionally carrying an `#agent`
+    /// signing key) and returns `(did, active_key, agent_key)` with the two keys
+    /// exported so the resolver's output can be byte-compared against them.
+    #[cfg(feature = "testing")]
+    fn register_persona_test_identity(
+        bi: &crate::runtime::PyBridgeInstance,
+        with_agent_key: bool,
+    ) -> (
+        String,
+        ed25519_dalek::SigningKey,
+        Option<ed25519_dalek::SigningKey>,
+    ) {
+        crate::init_runtime().ok();
+        let rt = crate::runtime().unwrap();
+        let custody = std::sync::Arc::new(crate::custody::FfiKeyCustody::InMemory(
+            scp_platform::testing::InMemoryKeyCustody::new(),
+        ));
+        let pre_rotation_custody =
+            std::sync::Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, pre_rotation_handle) = rt.block_on(async {
+            let did_method = scp_identity::DidDht::with_client(std::sync::Arc::new(
+                scp_dht::InMemoryDhtClient::new(),
+            ));
+            if with_agent_key {
+                did_method
+                    .create_with_agent_key(custody.as_ref(), pre_rotation_custody.as_ref())
+                    .await
+                    .unwrap()
+            } else {
+                scp_identity::DidMethod::create(
+                    &did_method,
+                    custody.as_ref(),
+                    pre_rotation_custody.as_ref(),
+                )
+                .await
+                .unwrap()
+            }
+        });
+        let did = identity.did.clone();
+        // Export the raw keys BEFORE moving `identity` into the registry entry
+        // (`KeyHandle` is `Copy`).
+        let active_key = rt
+            .block_on(custody.export_ed25519_signing_key(&identity.active_signing_key))
+            .unwrap();
+        let agent_key = identity
+            .agent_signing_key
+            .map(|h| rt.block_on(custody.export_ed25519_signing_key(&h)).unwrap());
+        crate::runtime::register_identity(
+            bi,
+            &did,
+            crate::runtime::IdentityEntry {
+                identity,
+                custody,
+                document,
+                identity_link_attestations: Vec::new(),
+                pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
+        (did, active_key, agent_key)
+    }
+
+    /// The default persona source is `#active` — the permanent conservative
+    /// fail-safe (persona-uncertain ⇒ attribute to the human).
+    #[test]
+    fn persona_source_defaults_to_active() {
+        let bi = __bi();
+        assert_eq!(
+            (bi.core.persona_source())(),
+            scp_did::SigningKeyId::Active,
+            "the default (no determiner) persona source must be #active"
+        );
+    }
+
+    /// The test seam installs a non-default source; production has no such
+    /// setter (RFC #2242 owns the determiner). Proves the send path actually
+    /// *consults* the seam rather than pinning a constant.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn persona_source_test_seam_overrides_default() {
+        let bi = __bi();
+        bi.core
+            .set_persona_source_for_test(std::sync::Arc::new(|| scp_did::SigningKeyId::Agent));
+        assert_eq!((bi.core.persona_source())(), scp_did::SigningKeyId::Agent);
+    }
+
+    /// `resolve_message_signer` binds the `#agent` VM stamp to the identity's
+    /// AGENT key (never the active key), and `#active` to the active key —
+    /// atomically. This is the property that makes an `#agent`-stamped-but-
+    /// `#active`-signed message unrepresentable at the FFI send boundary.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn resolve_message_signer_binds_stamp_and_key_atomically() {
+        use scp_core::context::supervisor::MessageSigner;
+        let bi = __bi();
+        let (did, active_key, agent_key) = register_persona_test_identity(&bi, true);
+        let agent_key = agent_key.expect("agent-keyed identity has an agent key");
+        assert_ne!(
+            active_key.to_bytes(),
+            agent_key.to_bytes(),
+            "test identity must have distinct active and agent keys"
+        );
+
+        // #agent persona → agent key + #agent stamp.
+        let signer = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Agent).unwrap();
+        assert_eq!(signer.persona(), scp_did::SigningKeyId::Agent);
+        assert!(matches!(signer.message_signer(), MessageSigner::Agent(_)));
+        assert_eq!(
+            signer.message_signer().signing_key_id(),
+            scp_did::SigningKeyId::Agent
+        );
+        assert_eq!(
+            signer.key().to_bytes(),
+            agent_key.to_bytes(),
+            "#agent persona MUST resolve the agent key, never the active key"
+        );
+
+        // #active persona → active key + #active stamp (default path unchanged).
+        let signer = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Active).unwrap();
+        assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
+        assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
+        assert_eq!(signer.key().to_bytes(), active_key.to_bytes());
+    }
+
+    /// Fail-closed: `#agent` requested for an identity with NO agent key returns
+    /// a typed error (SCP-IDENT-1023) and NEVER falls back to the active key.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn resolve_message_signer_agent_without_agent_key_fails_closed() {
+        let bi = __bi();
+        let (did, active_key, agent_key) = register_persona_test_identity(&bi, false);
+        assert!(agent_key.is_none(), "active-only identity has no agent key");
+
+        let err = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Agent)
+            .expect_err("#agent send without an agent key must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-IDENT-1023"),
+            "expected fail-closed no-agent-key code SCP-IDENT-1023, got: {msg}"
+        );
+
+        // The active path still resolves — the failure is specific to #agent,
+        // not a broken identity.
+        let signer = resolve_message_signer(&bi, &did, scp_did::SigningKeyId::Active).unwrap();
+        assert_eq!(signer.key().to_bytes(), active_key.to_bytes());
     }
 }

@@ -1768,8 +1768,13 @@ pub(crate) async fn context_send_on(
     let did = DID(identity_did.clone());
 
     // Validate inner envelope signing via the retained KeyCustody
-    // (SCP-214 criterion 6). Ensures the identity's active signing key
-    // can produce a valid Ed25519 signature before sending.
+    // (SCP-214 criterion 6). Ensures the identity's mandatory `#active` signing
+    // key can produce a valid Ed25519 signature before sending. This is a
+    // discarded custody smoke-test on the baseline operational key (identity
+    // plumbing), NOT the wire persona — the persona actually stamped on the
+    // message is chosen below via the ADR-039 persona-source seam and validated
+    // for the chosen persona by `resolve_napi_message_signer` (which fail-closes
+    // on `#agent` with no agent key).
     if let (Some(custody), Some(signing_key)) = (&handle.in_memory_custody, handle.signing_key) {
         let context_id = handle.context_id.clone();
         let sender_did_str = identity_did.clone();
@@ -1799,12 +1804,6 @@ pub(crate) async fn context_send_on(
             })?;
     }
 
-    // Resolve the signing key from the handle's retained custody so the
-    // ContextManager can produce a valid inner envelope signature. Passing
-    // None would cause the encrypted send path to fail with "signing key
-    // required".
-    let resolved_signing_key = resolve_napi_signing_key(handle).await.ok();
-
     // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
     let spending_ucan = spending_ucan_jwt
         .as_deref()
@@ -1826,27 +1825,19 @@ pub(crate) async fn context_send_on(
     use scp_core::context::actor::commands::{
         MessagingCommand, SendMessagePayload, SigningKeyBytes,
     };
-    use scp_core::context::supervisor::MessageSigner;
     let sup = crate::runtime::supervisor(bi)?;
     let context_id = core_handle.context_id().to_owned();
     let params = core_handle.params().clone();
-    // Every send path requires a signing key. Fail closed when the key cannot
-    // be resolved rather than enqueueing a `None` the handler would only
-    // reject downstream.
-    let signing_key = resolved_signing_key.ok_or_else(|| {
-        NapiError::from(ScpNapiError::Crypto {
-            message: "signing key required for send: could not resolve the sender's signing key \
-                      from retained custody"
-                .to_owned(),
-            code: codes::CRYPTO_4001.to_owned(),
-        })
-    })?;
-    // ADR-039: NAPI bridge sends under the human `#active` key today;
-    // per-message persona selection is out of scope for this runtime-pipeline
-    // wiring (FFI is mechanically widened only). Derive BOTH payload fields
-    // from a single `MessageSigner` so the stamped persona and the key bytes
-    // cannot diverge.
-    let signer = MessageSigner::Active(&signing_key);
+    // ADR-039 Enforcement-Stack Layer 2: consult the per-instance persona-source
+    // seam to choose the send persona (default `#active`; a future determiner —
+    // RFC #2242 — overrides it), then resolve BOTH the key handle and the
+    // persona from that one value (fail-closed on `#agent` with no agent key).
+    // The NAPI path decomposes the signer into `(bytes, signing_key_id)` across
+    // the actor mailbox, so BOTH fields are taken from the SAME `MessageSigner`
+    // (derived from the same persona) — they cannot diverge.
+    let persona = (bi.core.persona_source())();
+    let resolved_signer = resolve_napi_message_signer(bi, handle, &identity_did, persona).await?;
+    let signer = resolved_signer.message_signer();
     let signing_key_bytes = SigningKeyBytes::from_signing_key(signer.key());
     let signing_key_id = signer.signing_key_id();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3669,6 +3660,70 @@ async fn resolve_napi_signing_key(
                 code: codes::CTX_2040.to_owned(),
             })
         })
+}
+
+/// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
+/// for a **message send** under the requested persona (ADR-039 Enforcement-Stack
+/// Layer 2).
+///
+/// Selects BOTH the key handle and the persona so the `#active`/`#agent` stamp
+/// and the signing key are chosen together and cannot diverge:
+/// - [`SigningKeyId::Active`](scp_did::SigningKeyId::Active) → the handle's
+///   retained active signing key (byte-identical to [`resolve_napi_signing_key`],
+///   so the default send path is unchanged).
+/// - [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) → the sender
+///   identity's agent signing key (from the identity registry), exported via the
+///   handle's retained custody. **Fail-closed** with `SCP-IDENT-1023` if the
+///   identity has no agent key — NEVER falls back to `#active`.
+///
+/// The `#agent` key handle comes from the identity registry (the handle only
+/// caches the active key), while the custody comes from the handle so
+/// callback/keychain-backed identities are supported and the active path is
+/// untouched.
+async fn resolve_napi_message_signer(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    sender_did: &str,
+    persona: scp_did::SigningKeyId,
+) -> napi::Result<scp_ffi_common::persona::ResolvedMessageSigner> {
+    let key = match persona {
+        scp_did::SigningKeyId::Active => resolve_napi_signing_key(handle).await?,
+        scp_did::SigningKeyId::Agent => {
+            let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+                NapiError::from(ScpNapiError::Context {
+                    message: "no custody provider on context handle — sending under #agent \
+                              requires an identity created with custody"
+                        .to_owned(),
+                    code: codes::CTX_2040.to_owned(),
+                })
+            })?;
+            let agent_handle = crate::runtime::with_identity(bi, sender_did, |entry| {
+                entry
+                    .identity
+                    .agent_signing_key
+                    .ok_or_else(|| ScpNapiError::Identity {
+                        message: format!(
+                            "identity '{sender_did}' has no agent signing key — cannot send \
+                             under #agent; add one with identityAddAgentKey first"
+                        ),
+                        code: codes::IDENT_1023.to_owned(),
+                    })
+            })
+            .map_err(NapiError::from)?;
+            custody
+                .export_ed25519_signing_key(&agent_handle)
+                .await
+                .map_err(|e| {
+                    NapiError::from(ScpNapiError::Context {
+                        message: format!("failed to export agent signing key for send: {e}"),
+                        code: codes::CTX_2040.to_owned(),
+                    })
+                })?
+        }
+    };
+    Ok(scp_ffi_common::persona::ResolvedMessageSigner::new(
+        key, persona,
+    ))
 }
 
 /// Resolves the exporter identity's custody provider and `#active` signing-key

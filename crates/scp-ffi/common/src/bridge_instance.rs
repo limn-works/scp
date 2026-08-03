@@ -505,6 +505,26 @@ pub struct CoreFields {
     /// only wraps the `validate_command` / `configure` / `disable_enforcement`
     /// / `reset` / `snapshot` calls — there is never a reason to nest.
     mcp_allowlist: Mutex<scp_mcp::allowlist::StdioAllowlist>,
+
+    // -----------------------------------------------------------------
+    // Persona-source seam — ADR-039 Enforcement-Stack Layer 2
+    // -----------------------------------------------------------------
+    /// Per-send message signing persona source (ADR-039 Enforcement-Stack
+    /// Layer 2).
+    ///
+    /// Consulted at every message-send site across the three native bridges
+    /// (`PyO3`, NAPI, `UniFFI`) to choose the `#active`/`#agent` signing persona.
+    /// Defaults to [`crate::persona::default_persona_source`] — always
+    /// `#active`, the permanent conservative fail-safe (persona-uncertain ⇒
+    /// attribute to the human). Held in a `RwLock` so a future determiner
+    /// (RFC #2242, <https://github.com/limn-works/scp/discussions/2242>) can
+    /// install a real per-instance source once the persona *selection* policy
+    /// and Layer-1 custody enforcement exist. There is intentionally **no**
+    /// production setter today (the SDK exposes no lie-able per-call persona
+    /// flag); only the test seam ([`Self::set_persona_source_for_test`])
+    /// overrides the default. Reads clone the `Arc` (cheap) so the lock is
+    /// never held across the send.
+    persona_source: RwLock<crate::persona::PersonaSource>,
 }
 
 impl Default for CoreFields {
@@ -558,6 +578,7 @@ impl CoreFields {
             handle_registries: Mutex::new(HashMap::new()),
             scope_registries: Mutex::new(HashMap::new()),
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
+            persona_source: RwLock::new(crate::persona::default_persona_source()),
         }
     }
 
@@ -642,6 +663,7 @@ impl CoreFields {
             handle_registries: Mutex::new(HashMap::new()),
             scope_registries: Mutex::new(HashMap::new()),
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
+            persona_source: RwLock::new(crate::persona::default_persona_source()),
         }
     }
 
@@ -2119,6 +2141,44 @@ impl CoreFields {
     /// Clears all bridge connector state entries. Called during shutdown.
     pub fn clear_bridge_state(&self) {
         self.bridge_state.clear();
+    }
+
+    // -----------------------------------------------------------------
+    // Persona-source seam accessors (ADR-039 Enforcement-Stack Layer 2)
+    // -----------------------------------------------------------------
+
+    /// Returns a clone of the current message-send persona source (ADR-039
+    /// Enforcement-Stack Layer 2).
+    ///
+    /// Consulted once per message-send at each native bridge's send site to
+    /// choose the `#active`/`#agent` signing persona. Cloning the `Arc` (cheap)
+    /// means the send never holds the lock. Defaults to `#active` (the
+    /// permanent conservative fail-safe) until a determiner (RFC #2242) installs
+    /// a real source.
+    #[must_use]
+    pub fn persona_source(&self) -> crate::persona::PersonaSource {
+        self.persona_source
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Installs a message-send persona source. **Test-only.**
+    ///
+    /// Production has no persona-source setter: the *determiner* that would
+    /// install a non-default (`#agent`-capable) source is owned by RFC #2242
+    /// (<https://github.com/limn-works/scp/discussions/2242>), together with the
+    /// Layer-1 custody enforcement that makes a persona claim non-forgeable.
+    /// Gating this behind `test`/`testing` keeps every shipped production path
+    /// pinned to the `#active` fail-safe until that determiner lands, so the
+    /// seam cannot silently attribute a send to `#agent` before the enforcement
+    /// exists.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_persona_source_for_test(&self, source: crate::persona::PersonaSource) {
+        *self
+            .persona_source
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = source;
     }
 
     // -----------------------------------------------------------------

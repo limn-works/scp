@@ -5988,6 +5988,94 @@ pub(crate) async fn resolve_uniffi_signing_key(
     })
 }
 
+/// Exports the raw Ed25519 signing key for an arbitrary key handle via the
+/// context handle's retained custody, mirroring the resolution order of
+/// [`resolve_uniffi_signing_key`] (platform/callback custody first, then — only
+/// under `testing` — the in-memory dev custody).
+async fn export_uniffi_key_via_handle_custody(
+    handle: &ContextHandle,
+    key_handle: &KeyHandle,
+) -> Result<ed25519_dalek::SigningKey, ScpError> {
+    if let Some(ref cb) = handle.callback_custody {
+        return cb
+            .export_ed25519_signing_key(key_handle)
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("failed to export signing key from platform custody: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            });
+    }
+
+    #[cfg(feature = "testing")]
+    if let Some(ref imc) = handle.in_memory_custody {
+        return imc
+            .0
+            .export_ed25519_signing_key(key_handle)
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("failed to export signing key from in-memory custody: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            });
+    }
+
+    Err(ScpError::Context {
+        msg: "no custody provider on context handle — sending requires an identity \
+                  created with custody"
+            .to_owned(),
+        code: codes::CTX_2040.to_owned(),
+    })
+}
+
+/// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
+/// for a **message send** under the requested persona (ADR-039 Enforcement-Stack
+/// Layer 2).
+///
+/// Selects BOTH the key handle and the persona so the `#active`/`#agent` stamp
+/// and the signing key are chosen together and cannot diverge:
+/// - [`SigningKeyId::Active`](scp_did::SigningKeyId::Active) → the handle's
+///   retained active signing key (byte-identical to [`resolve_uniffi_signing_key`],
+///   so the default send path is unchanged).
+/// - [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) → the sender
+///   identity's agent signing key (from its retained [`ScpIdentity`]), exported
+///   via the handle's retained custody. **Fail-closed** with `SCP-IDENT-1023`
+///   when the identity has no retained key material or no agent key — NEVER
+///   falls back to `#active`.
+async fn resolve_uniffi_message_signer(
+    handle: &ContextHandle,
+    identity: &Identity,
+    persona: scp_did::SigningKeyId,
+) -> Result<scp_ffi_common::persona::ResolvedMessageSigner, ScpError> {
+    let key = match persona {
+        scp_did::SigningKeyId::Active => resolve_uniffi_signing_key(handle).await?,
+        scp_did::SigningKeyId::Agent => {
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: format!(
+                        "identity '{}' has no retained key material — cannot send under #agent",
+                        identity.did
+                    ),
+                    code: codes::IDENT_1023.to_owned(),
+                })?;
+            let agent_handle = core_id
+                .agent_signing_key
+                .ok_or_else(|| ScpError::Identity {
+                    msg: format!(
+                        "identity '{}' has no agent signing key — cannot send under #agent; \
+                     add one with add_agent_key first",
+                        identity.did
+                    ),
+                    code: codes::IDENT_1023.to_owned(),
+                })?;
+            export_uniffi_key_via_handle_custody(handle, &agent_handle).await?
+        }
+    };
+    Ok(scp_ffi_common::persona::ResolvedMessageSigner::new(
+        key, persona,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a) — bridge helpers
 // ---------------------------------------------------------------------------
@@ -11010,9 +11098,15 @@ impl Scp {
                 drop(state);
 
                 // Validate inner envelope signing via the retained KeyCustody
-                // (SCP-214 criterion 6). This ensures the identity's active signing
-                // key can produce a valid Ed25519 signature before delegating to
-                // the ContextManager for message delivery.
+                // (SCP-214 criterion 6). This ensures the identity's mandatory
+                // `#active` signing key can produce a valid Ed25519 signature
+                // before delegating to the ContextManager. This is a discarded
+                // custody smoke-test on the baseline operational key (identity
+                // plumbing), NOT the wire persona — the persona actually stamped
+                // on the message is chosen below via the ADR-039 persona-source
+                // seam and validated for the chosen persona by
+                // `resolve_uniffi_message_signer` (fail-closed on `#agent` with
+                // no agent key).
                 if let Some(core_id) = identity.core_id.as_ref() {
                     let context_id = handle.context_id.clone();
                     let sender_did_str = identity.did.clone();
@@ -11060,11 +11154,16 @@ impl Scp {
                     }
                 }
 
-                // Resolve the signing key from the handle's retained custody so the
-                // ContextManager can produce a valid inner envelope signature. Passing
-                // None would cause the encrypted send path to fail with "signing key
-                // required".
-                let resolved_signing_key = resolve_uniffi_signing_key(&handle).await.ok();
+                // ADR-039 Enforcement-Stack Layer 2: consult the per-instance
+                // persona-source seam to choose the send persona (default
+                // `#active`; a future determiner — RFC #2242 — overrides it),
+                // then resolve BOTH the VM stamp and the matching key handle
+                // from that one persona (fail-closed on `#agent` with no agent
+                // key). Passing no signer would cause the encrypted send path to
+                // fail with "signing key required".
+                let persona = (bi.core.persona_source())();
+                let resolved_signer =
+                    resolve_uniffi_message_signer(&handle, &identity, persona).await?;
 
                 // Delegate to the shared ContextManager for message delivery
                 // through the transport provider.
@@ -11086,27 +11185,17 @@ impl Scp {
                     })?;
 
                 let sender_did: scp_did::DID = identity.did.clone().into();
-                // Every send path requires a signing key; `MessageSigner` is
-                // non-optional. Fail closed with a descriptive error when the
-                // key cannot be resolved rather than handing the send path a
-                // `None` it would only reject downstream.
-                let signing_key = resolved_signing_key.ok_or_else(|| ScpError::Crypto {
-                    msg: "signing key required for send: could not resolve the sender's signing \
-                          key from retained custody"
-                        .to_owned(),
-                    code: codes::CRYPTO_4001.to_owned(),
-                })?;
                 manager
                     .send_message(
                         &core_handle,
                         &sender_did,
                         &payload,
-                        // ADR-039: UniFFI bridge sends under the human `#active`
-                        // key today; per-message persona selection is out of
-                        // scope for this runtime-pipeline wiring (FFI is
-                        // mechanically widened only). `MessageSigner` pairs key +
-                        // persona so they cannot diverge.
-                        scp_core::context::supervisor::MessageSigner::Active(&signing_key),
+                        // The `MessageSigner` is derived from the same persona
+                        // that selected the key handle (see
+                        // `resolve_uniffi_message_signer`), so the persona
+                        // stamped on the wire and the key that signs are one
+                        // source of truth (ADR-039).
+                        resolved_signer.message_signer(),
                         None,
                         spending_ucan.as_ref(),
                     )
