@@ -987,10 +987,10 @@ pub async fn execute_revoke(
     // author whose broadcast key was rotated by the governance ban. Each rotation
     // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
     // ADR-011: governance ban is a convergent trigger → KeyEpochAdvance leaves
-    // are convergent (fail-closed). A failure here is surfaced as an error —
+    // are convergent (fail-closed). A failure here propagates an error —
     // the ban state was already durably persisted (Class-S above) and the
-    // AccessRevoked leaf appended (fail-closed above), so failing the KEA leaf
-    // will cause the caller to retry rather than silently drop the leaf.
+    // AccessRevoked leaf appended (fail-closed above), so a KEA failure
+    // surfaces to the caller rather than silently dropping the leaf.
     for rotation in &rotated_authors {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
         let payload = scp_event_log::payload::encode_payload(
