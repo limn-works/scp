@@ -1088,6 +1088,15 @@ impl NativeRelayClient {
                         }
                         // query_complete (or any other terminal response for this
                         // ref_id): drain blobs already delivered, then stop.
+                        // SAFETY of the drain: this relies on the `biased` select
+                        // above — `rx` is polled first every iteration, so the
+                        // terminator arm is only reached once `rx` is empty, and
+                        // the single-task in-order reader has already enqueued every
+                        // blob before it sends the terminator. The drain is thus a
+                        // belt-and-suspenders sweep of an already-empty channel. If
+                        // `biased` is ever removed, this `try_recv` (which stops at
+                        // the first non-Blob message) could drop a trailing blob —
+                        // keep the two coupled.
                         Ok(_) => {
                             while let Ok(SubscriptionMessage::Relay(RelayMessage::Blob {
                                 blob,
@@ -1101,8 +1110,12 @@ impl NativeRelayClient {
                             }
                             break;
                         }
-                        // Sender dropped without a response (e.g. reconnect
-                        // cleared pending): stop with what we have.
+                        // The oneshot sender was dropped without delivering a
+                        // terminal response (the pending entry was removed — e.g.
+                        // a `send_request` timeout elsewhere reclaimed it, or the
+                        // reader task ended). Defensive fallback: stop with what we
+                        // have. (`reconnect` re-subscribes but does not bulk-clear
+                        // `pending`, so it is not the trigger here.)
                         Err(_) => break,
                     }
                 }
