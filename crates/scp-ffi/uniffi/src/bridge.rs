@@ -15895,8 +15895,7 @@ impl Scp {
                     })?
                     .event_log_provider_arc()
                     .ok_or_else(|| ScpError::Context {
-                        msg: "event-log provider not initialised — \
-                              call context_create or context_join first"
+                        msg: "event-log provider not configured on this supervisor instance"
                             .to_owned(),
                         code: codes::CTX_2057.to_owned(),
                     })?;
@@ -16013,8 +16012,7 @@ impl Scp {
                     })?
                     .event_log_provider_arc()
                     .ok_or_else(|| ScpError::Context {
-                        msg: "event-log provider not initialised — \
-                              call context_create or context_join first"
+                        msg: "event-log provider not configured on this supervisor instance"
                             .to_owned(),
                         code: codes::CTX_2057.to_owned(),
                     })?;

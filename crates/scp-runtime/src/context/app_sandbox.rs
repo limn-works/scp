@@ -350,7 +350,20 @@ impl CapabilityDeclaration {
         // introduced in a spec version it doesn't know about (spec §8.4.1).
         let decl_parts: Vec<&str> = self.scp_version.splitn(3, '.').collect();
         let decl_major = *decl_parts.first().unwrap_or(&"0");
-        let decl_minor: u64 = decl_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let decl_minor: u64 = decl_parts
+            .get(1)
+            .ok_or_else(|| {
+                SandboxError::InvalidDeclaration(
+                    "scp_version must be MAJOR.MINOR format".to_string(),
+                )
+            })
+            .and_then(|s| {
+                s.parse::<u64>().map_err(|_| {
+                    SandboxError::InvalidDeclaration(format!(
+                        "scp_version minor component is not a valid integer: '{s}'"
+                    ))
+                })
+            })?;
 
         let current_parts: Vec<&str> = CURRENT_SCP_VERSION.splitn(3, '.').collect();
         let current_major = *current_parts.first().unwrap_or(&"0");
@@ -909,7 +922,7 @@ pub async fn bind_app(
         .collect();
     capabilities.sort_unstable();
     let payload = encode_payload(&AppBoundPayload {
-        app_did: scoped.app_did().to_string(),
+        app_did: scoped.app_did().trim().to_string(),
         app_name: scoped.declaration().app_name.clone(),
         app_version: scoped.declaration().app_version.clone(),
         capabilities,
@@ -2302,6 +2315,37 @@ mod tests {
         assert!(matches!(
             decl.validate_structure(),
             Err(SandboxError::InvalidDeclaration(msg)) if msg.contains("incompatible")
+        ));
+    }
+
+    #[test]
+    fn validate_structure_malformed_minor_version_rejected() {
+        // A malformed minor like "1.bad" must be rejected with
+        // InvalidDeclaration rather than silently treated as 0 (which
+        // previously would have allowed an unknown version through).
+        let (_, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        decl.scp_version = "1.bad".to_owned();
+
+        assert!(matches!(
+            decl.validate_structure(),
+            Err(SandboxError::InvalidDeclaration(msg))
+                if msg.contains("not a valid integer")
+        ));
+    }
+
+    #[test]
+    fn validate_structure_missing_minor_version_rejected() {
+        // A version string with no minor component ("1") must be rejected
+        // since it cannot be validated against the MAJOR.MINOR spec requirement.
+        let (_, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        decl.scp_version = "1".to_owned();
+
+        assert!(matches!(
+            decl.validate_structure(),
+            Err(SandboxError::InvalidDeclaration(msg))
+                if msg.contains("MAJOR.MINOR")
         ));
     }
 

@@ -6250,8 +6250,7 @@ impl crate::scp::PyScp {
                 .event_log_provider_arc()
                 .ok_or_else(|| {
                     PyRuntimeError::new_err(format!(
-                        "[{}] event-log provider not initialised — \
-                         call context_create or context_join first",
+                        "[{}] event-log provider not configured on this supervisor instance",
                         codes::CTX_2057
                     ))
                 })?;
@@ -6356,8 +6355,7 @@ impl crate::scp::PyScp {
                 .event_log_provider_arc()
                 .ok_or_else(|| {
                     PyRuntimeError::new_err(format!(
-                        "[{}] event-log provider not initialised — \
-                         call context_create or context_join first",
+                        "[{}] event-log provider not configured on this supervisor instance",
                         codes::CTX_2057
                     ))
                 })?;

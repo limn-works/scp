@@ -2263,16 +2263,19 @@ impl Supervisor {
         self.event_log.get()
     }
 
-    /// Returns a clone of the event-log provider's [`Arc`], if one was
-    /// configured via [`Self::with_providers`].
+    /// Returns the event-log provider configured for this supervisor instance.
     ///
-    /// FFI bridges must call this to obtain the SAME provider instance whose
-    /// in-memory `logs` map was populated by `init_event_log` during context
-    /// creation/join/restore. A freshly-constructed
-    /// `MerkleEventLogProvider` would have an empty map and every
-    /// `append_event` call would fail with `CTX-2057` ("no event log for
-    /// context"). Returns `None` if the supervisor has not been initialised
-    /// yet (i.e. no context has been created or joined on this instance).
+    /// FFI bridges must call this to obtain the SAME [`Arc`] that context
+    /// creation populates via `init_event_log` — so bridges must use this
+    /// (not a freshly-constructed provider) when appending events outside
+    /// the actor's own handler. A freshly-constructed `MerkleEventLogProvider`
+    /// would have an empty `logs` map and every `append_event` call would
+    /// fail with `CTX-2057` ("no event log for context").
+    ///
+    /// Returns `None` only if the supervisor was constructed without an
+    /// event-log provider (test configurations); in all production bridges
+    /// the provider is set at construction time via
+    /// [`Self::with_providers_and_journal`].
     #[must_use]
     pub fn event_log_provider_arc(&self) -> Option<Arc<dyn ContextEventLogProvider>> {
         self.event_log.get().cloned()

@@ -243,7 +243,7 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // core `scp_core::trust::check_capability_requirements` call and the production
 // `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 57;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 59;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -3583,6 +3583,57 @@ fn app_unbind_wired_through_unbind_app_all_bridges() {
         fn_body_contains(UNIFFI_BRIDGE_SRC, "app_unbind", "unbind_app("),
         "UniFFI app_unbind must route through unbind_app (spec §8.4.2 — \
          AppUnbound event log wiring)"
+    );
+}
+
+/// Verifies that `app_bind` / `app_bind_on` in all three bridges fetch the
+/// shared `event_log_provider_arc()` from the supervisor rather than
+/// constructing a fresh provider via `build_event_log_provider`. A fresh
+/// provider has an empty `logs` map, so every append would fail with
+/// CTX-2057 ("no event log for context"). The regression the original bug
+/// introduced was identical to the `bind_app(` check above — both checks are
+/// needed because satisfying `bind_app(` does not preclude passing the wrong
+/// provider argument.
+#[test]
+fn event_log_provider_arc_wired_in_all_bridges() {
+    assert!(
+        fn_body_contains(PYO3_CONTEXT_SRC, "app_bind", "event_log_provider_arc("),
+        "PyO3 app_bind must obtain the provider via event_log_provider_arc() \
+         (spec §8.4.1 — must reuse supervisor's provider, not build a fresh one)"
+    );
+    assert!(
+        fn_body_contains(NAPI_CONTEXT_SRC, "app_bind_on", "event_log_provider_arc("),
+        "NAPI app_bind_on must obtain the provider via event_log_provider_arc() \
+         (spec §8.4.1 — must reuse supervisor's provider, not build a fresh one)"
+    );
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "app_bind", "event_log_provider_arc("),
+        "UniFFI app_bind must obtain the provider via event_log_provider_arc() \
+         (spec §8.4.1 — must reuse supervisor's provider, not build a fresh one)"
+    );
+}
+
+/// Verifies that none of the three FFI bridge sources call
+/// `build_event_log_provider` anywhere. That constructor produces a provider
+/// with an empty context-map; any bridge that reaches for it (instead of
+/// `event_log_provider_arc()`) would silently break every AppBound /
+/// AppUnbound append with CTX-2057 even when the supervisor is fully wired.
+#[test]
+fn build_event_log_provider_absent_from_all_bridges() {
+    assert!(
+        !PYO3_CONTEXT_SRC.contains("build_event_log_provider("),
+        "PyO3 bridge must NOT call build_event_log_provider() — \
+         use event_log_provider_arc() to obtain the shared provider"
+    );
+    assert!(
+        !NAPI_CONTEXT_SRC.contains("build_event_log_provider("),
+        "NAPI bridge must NOT call build_event_log_provider() — \
+         use event_log_provider_arc() to obtain the shared provider"
+    );
+    assert!(
+        !UNIFFI_BRIDGE_SRC.contains("build_event_log_provider("),
+        "UniFFI bridge must NOT call build_event_log_provider() — \
+         use event_log_provider_arc() to obtain the shared provider"
     );
 }
 
