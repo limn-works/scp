@@ -359,7 +359,7 @@ impl<P: ContextProvider> McpServer<P> {
             }
 
             // Context-registered outlets -- filtered by capability. Names are
-            // kind-projected per §8.5.1 (Query → `query.{id}`, Action →
+            // kind-projected per §8.5 (Query → `query.{id}`, Action →
             // `call.{id}`) so MCP-consuming models can distinguish them
             // lexically.
             for outlet_info in self.provider.context_tools(&context_id) {
@@ -430,16 +430,17 @@ impl<P: ContextProvider> McpServer<P> {
             }
         };
 
-        // Kind-prefix stripping per §8.5.1: MCP tool.name may carry a
+        // Kind-prefix stripping per §8.5: MCP tool.name may carry a
         // `query.` / `call.` prefix projected from the outlet kind. The
         // authorization layer works with the SCP outlet_id, so strip the
         // prefix before validation and invocation. An unrecognized prefix
         // falls back to using the full name as the outlet_id with kind =
         // Action (fail-safe default per AC14).
         let (outlet_kind, owned_outlet_id) = parse_mcp_tool_name(mcp_tool_name);
-        let _ = outlet_kind; // Kind is recorded in the provenance path; the
-        // invocation handler itself is kind-agnostic until SCP-OUT-017 wires
-        // the Query / Action dispatch difference.
+        // The recovered kind is intentionally unused here: the invocation
+        // handler is kind-agnostic until SCP-OUT-017 wires the Query / Action
+        // dispatch difference. It is NOT currently recorded in provenance.
+        let _ = outlet_kind;
         let tool_name: &str = owned_outlet_id.as_str();
 
         // Verify caller is a member of the target context.

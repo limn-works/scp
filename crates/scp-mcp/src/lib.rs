@@ -11,18 +11,23 @@
 //!   splitting) and built-in tool definitions (`send_message`, `read_messages`,
 //!   `list_members`).
 //! - [`translator`] -- Purely lexical `outlet` ↔ `tool` boundary translation
-//!   per §8.5.1 / ADR-049. MCP messages inbound are rewritten to SCP outlet
+//!   per §8.5 / ADR-049. MCP messages inbound are rewritten to SCP outlet
 //!   vocabulary; SCP messages outbound are rewritten to MCP tool vocabulary.
-//!   Wire shape is preserved in both directions; each message is translated
-//!   in isolation (no state is kept across translations).
+//!   Only ENVELOPE identifiers and field names are translated (method names,
+//!   `tool.name` ↔ `outlet_id`, schema field names, the error envelope); opaque
+//!   caller payloads (`arguments`, `_meta`) pass through VERBATIM. Wire shape is
+//!   preserved in both directions; each message is translated in isolation (no
+//!   state is kept across translations).
 //! - [`server`] -- MCP server: tool listing with capability filtering,
 //!   outlet invocation routing, resource listing/reading/subscriptions, and
 //!   MCP lifecycle handling. Uses SCP outlet vocabulary internally; the MCP
 //!   wire boundary goes through [`translator`].
 //! - [`client`] -- MCP client used by an SCP agent to consume tools from
-//!   external MCP servers. Outbound requests are rewritten via
-//!   [`translator::scp_to_mcp`] so the external server receives MCP-shaped
-//!   JSON; inbound responses are rewritten via [`translator::mcp_to_scp`].
+//!   external MCP servers. It speaks MCP directly on the wire (the external
+//!   server owns its tool naming); [`client::McpClient::list_outlets`] and
+//!   [`client::McpClient::invoke_outlet`] expose an SCP-vocabulary surface that
+//!   carries each tool's verbatim `tool.name` and an advisory outlet `kind`.
+//!   Payloads are not envelope-translated on this path.
 //!
 //! Any MCP-compatible model (Claude, GPT, Gemini, open-source models) can
 //! participate in SCP contexts without knowing SCP exists — it sees MCP tools
@@ -67,7 +72,7 @@
 //! # let _ = OutletKind::Query;
 //! ```
 //!
-//! See ADR-015 in `.docs/adrs/phase-3.md` and ADR-049 §8.5.1 for the full
+//! See ADR-015 in `.docs/adrs/phase-3.md` and ADR-049 §8.5 for the full
 //! design.
 
 #![forbid(unsafe_code)]

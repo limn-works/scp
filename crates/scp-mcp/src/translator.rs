@@ -1,4 +1,4 @@
-//! Lexical translator between MCP and SCP message vocabularies (§8.5.1).
+//! Lexical translator between MCP and SCP message vocabularies (§8.5).
 //!
 //! MCP ecosystems speak "tool" (agent-centric); SCP speaks "outlet"
 //! (context-centric — §5.4). The two describe the same wire shape — stateless
@@ -92,7 +92,7 @@ pub const MCP_TOOLS_CALL: &str = "tools/call";
 pub const MCP_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
 
 /// SCP method name for listing outlets. The `outlet list` spelling is a
-/// boundary-translation-only identifier (see §8.5.1); inside SCP contexts the
+/// boundary-translation-only identifier (see §8.5); inside SCP contexts the
 /// call is routed through `ctx.outlets.list`.
 pub const SCP_OUTLET_LIST: &str = "outlet list";
 
@@ -116,7 +116,7 @@ pub const MCP_QUERY_PREFIX: &str = "query.";
 pub const MCP_CALL_PREFIX: &str = "call.";
 
 /// JSON Schema extension key used by MCP servers to advertise the SCP outlet
-/// kind for inbound translation. Per §8.5.1.
+/// kind for inbound translation. Per §8.5.
 pub const X_SCP_KIND_EXT: &str = "x-scp-kind";
 
 // ---------------------------------------------------------------------------
@@ -309,8 +309,13 @@ fn translate_tools_call_params_to_invoke(mut map: Map<String, Value>) -> Map<Str
     let mut out = Map::new();
     out.insert("outlet_id".to_owned(), Value::String(outlet_id));
     out.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+    // Opaque payload: move `arguments` VERBATIM. It is caller-owned tool input
+    // whose keys are arbitrary; recursing would re-run envelope shape-detection
+    // and could destroy or invent keys (e.g. an `arguments.name` string misread
+    // as a tools/call and rewritten to `outlet_id`). Only envelope keys are
+    // translated; payloads pass through untouched.
     if let Some(args) = map.remove("arguments") {
-        out.insert("arguments".to_owned(), translate_mcp_to_scp_value(args));
+        out.insert("arguments".to_owned(), args);
     }
     // Preserve any remaining fields (unknown extensions) verbatim — recursive
     // translation is a no-op for fields outside the mapping table.
@@ -400,8 +405,10 @@ fn translate_call_tool_result_to_outlet_result(mut map: Map<String, Value>) -> M
     let chunks = collect_content_as_chunks(&content);
     out.insert("chunks".to_owned(), Value::Array(chunks));
     out.insert("content".to_owned(), content);
+    // `_meta` is an opaque MCP payload — move it VERBATIM (no recursion) so its
+    // arbitrary keys survive the round-trip untouched.
     if let Some(meta) = meta {
-        out.insert("_meta".to_owned(), translate_mcp_to_scp_value(meta));
+        out.insert("_meta".to_owned(), meta);
     }
     for (k, v) in map {
         if k == "isError" {
@@ -497,9 +504,13 @@ fn translate_scp_to_mcp_object(mut map: Map<String, Value>) -> Map<String, Value
         return map;
     }
 
-    // OutletError envelope: { "error": { ... } }.
+    // OutletError envelope: { "error": { ... } }. Peek with `matches!` before
+    // the `map.remove` — the peek short-circuits the `&&`, so the removing side
+    // effect only runs once we know the value is an object. Without the peek, a
+    // let-chain `remove` would drop a non-object `error` value even when the
+    // `Value::Object` pattern fails, silently discarding it.
     if map.len() == 1
-        && map.contains_key("error")
+        && matches!(map.get("error"), Some(Value::Object(_)))
         && let Some(Value::Object(err)) = map.remove("error")
     {
         return translate_outlet_error_to_call_tool_result(err);
@@ -565,8 +576,10 @@ fn translate_invoke_params_to_tools_call(mut map: Map<String, Value>) -> Map<Str
 
     let mut out = Map::new();
     out.insert("name".to_owned(), Value::String(mcp_name));
+    // Opaque payload: move `arguments` VERBATIM (no recursion) — it is
+    // caller-owned tool input and must not be re-shape-detected.
     if let Some(args) = map.remove("arguments") {
-        out.insert("arguments".to_owned(), translate_scp_to_mcp_value(args));
+        out.insert("arguments".to_owned(), args);
     }
     for (k, v) in map {
         out.insert(k, translate_scp_to_mcp_value(v));
@@ -725,8 +738,10 @@ fn translate_outlet_stream_to_call_tool_result(mut map: Map<String, Value>) -> M
     let mut out = Map::new();
     out.insert("content".to_owned(), content);
     out.insert("isError".to_owned(), Value::Bool(false));
+    // `_meta` is an opaque MCP payload — move it VERBATIM (no recursion) so its
+    // arbitrary keys survive the round-trip untouched.
     if let Some(meta) = meta {
-        out.insert("_meta".to_owned(), translate_scp_to_mcp_value(meta));
+        out.insert("_meta".to_owned(), meta);
     }
     for (k, v) in map {
         out.insert(k, translate_scp_to_mcp_value(v));

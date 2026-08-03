@@ -9,7 +9,7 @@
 //! - `scp_to_mcp(mcp_to_scp(mcp))` reconstructs the original MCP value up to
 //!   the expected `x-scp-kind` annotation the translator injects to keep the
 //!   kind recoverable. A normalization pass strips that annotation for
-//!   comparison — the ADR-049 §8.5.1 round-trip contract permits the
+//!   comparison — the ADR-049 §8.5 round-trip contract permits the
 //!   annotation because the alternative (silently dropping the kind) would
 //!   make MCP→SCP→MCP round-trips lossy for Query outlets.
 //!
@@ -338,6 +338,109 @@ fn unknown_fields_are_preserved_through_both_directions() {
     let scp_back = scp_to_mcp(scp);
     assert_eq!(scp_back["params"]["vendor_ext"], "abc");
     assert_eq!(scp_back["meta_ext"]["trace_id"], "tr-1");
+}
+
+// ---------------------------------------------------------------------------
+// Opaque payload verbatim (regression for the HIGH finding)
+// ---------------------------------------------------------------------------
+//
+// `arguments` and `_meta` are opaque caller payloads. The translator must move
+// them VERBATIM and only rewrite envelope identifiers/field names. The old code
+// recursed into these payloads and re-ran envelope shape-detection, so a
+// payload key like `name` was rewritten to `outlet_id`, `content` was collapsed
+// into stream `chunks`, etc. — destroying and inventing keys. These tests use
+// payloads whose keys deliberately collide with envelope keys and assert
+// byte-exact survival through both round-trip directions; they FAIL against the
+// old recursing code and PASS with the pass-through fix.
+
+#[test]
+fn arguments_with_envelope_colliding_keys_survive_verbatim_both_directions() {
+    // Keys here collide with every envelope key the translator branches on:
+    // `name`, `content`, `tools`, `outlets`, `error`, `chunks`, `outlet_id`,
+    // `inputSchema`, `isError`. Built fresh per use so no clones are needed.
+    let payload = || {
+        json!({
+            "name": "Alice",
+            "outlet_id": "not-an-outlet",
+            "content": [ { "type": "text", "text": "hi" } ],
+            "tools": [ { "name": "x", "inputSchema": {} } ],
+            "outlets": [ "a", "b" ],
+            "error": { "code": "not-an-scp-error" },
+            "chunks": [ 1, 2, 3 ],
+            "isError": true,
+            "nested": { "name": "Bob", "tools": [] }
+        })
+    };
+
+    // --- MCP tools/call → SCP → MCP ---
+    let mcp = || {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": { "name": "call.echo", "arguments": payload() },
+            "id": 7
+        })
+    };
+    let scp = mcp_to_scp(mcp());
+    assert_eq!(
+        scp["params"]["arguments"],
+        payload(),
+        "arguments corrupted on mcp_to_scp (envelope shape-detection leaked into the payload)"
+    );
+    let back = scp_to_mcp(scp);
+    assert_eq!(back, mcp(), "tools/call did not round-trip byte-for-byte");
+
+    // --- SCP outlet invoke → MCP → SCP ---
+    let scp_msg = || {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "outlet invoke",
+            "params": { "outlet_id": "echo", "kind": "Action", "arguments": payload() },
+            "id": 7
+        })
+    };
+    let mcp_out = scp_to_mcp(scp_msg());
+    assert_eq!(
+        mcp_out["params"]["arguments"],
+        payload(),
+        "arguments corrupted on scp_to_mcp"
+    );
+    let scp_back = mcp_to_scp(mcp_out);
+    assert_eq!(
+        scp_back,
+        scp_msg(),
+        "outlet invoke did not round-trip byte-for-byte"
+    );
+}
+
+#[test]
+fn result_meta_with_arbitrary_keys_survives_verbatim() {
+    // `_meta` is opaque and must pass through byte-for-byte in both directions
+    // (no recursion, no scp_* reinterpretation of arbitrary keys).
+    let meta = || {
+        json!({
+            "name": "meta-name",
+            "tools": [ "t1" ],
+            "outlet_id": "meta-outlet",
+            "vendor": { "trace": "abc", "content": [ 1, 2 ] }
+        })
+    };
+
+    // CallToolResult (non-error) → SCP.
+    let mcp = json!({
+        "content": [ { "type": "text", "text": "ok" } ],
+        "_meta": meta()
+    });
+    let scp = mcp_to_scp(mcp);
+    assert_eq!(scp["_meta"], meta(), "_meta corrupted on mcp_to_scp");
+
+    // Collected-stream result → MCP.
+    let scp_stream = json!({
+        "chunks": [ { "@type": "End", "sequence": 0, "aggregate": [] } ],
+        "_meta": meta()
+    });
+    let mcp_out = scp_to_mcp(scp_stream);
+    assert_eq!(mcp_out["_meta"], meta(), "_meta corrupted on scp_to_mcp");
 }
 
 // ---------------------------------------------------------------------------

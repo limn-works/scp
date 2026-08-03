@@ -830,7 +830,7 @@ impl scp_core::crypto::ucan::revoke::RevocationDistributor for BridgeRevocationD
 /// Uses `append_unsigned_event` because `KeyCustody::sign()` is async and
 /// the revocation path is called from sync FFI bridge functions. The event
 /// is chain-validated and Merkle-committed but carries an empty signature.
-/// This follows the same pattern as `FfiBridgeProvider::invoke_tool` in
+/// This follows the same pattern as `FfiBridgeProvider::invoke_outlet` in
 /// `crates/scp-ffi/src/mcp.rs`.
 ///
 /// When async FFI signing lands (SCP-214 migration), migrate to signed events
