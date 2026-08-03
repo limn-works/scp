@@ -979,6 +979,10 @@ pub async fn execute_revoke(
             timestamp_secs,
         )
         .await?;
+    // Class-C counter: bump +1 immediately after each durable leaf (mirroring
+    // execute_reconfigure_governance) so a mid-loop failure leaves the counter
+    // exactly reflecting whichever leaves are already durable.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
     // Spec §5.14.8 / §5.14.10: emit one fail-closed KeyEpochAdvance leaf per
     // author whose broadcast key was rotated by the governance ban. Each rotation
     // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
@@ -1006,10 +1010,8 @@ pub async fn execute_revoke(
             )
             .await
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        *cell.class_c_view().checkpoint_events_since_mut() += 1;
     }
-    // Coalesced Class-C counter bump: 1 for AccessRevoked + one per
-    // KeyEpochAdvance leaf. All-or-nothing (fail-closed) so the count is exact.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + rotated_authors.len() as u64;
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -3169,6 +3171,10 @@ pub async fn execute_rotate_content_keys(
             timestamp_secs,
         )
         .await?;
+    // Class-C counter: bump +1 immediately after each durable leaf (mirroring
+    // execute_reconfigure_governance) so a mid-loop failure leaves the counter
+    // exactly reflecting whichever leaves are already durable.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // Emit one fail-closed `KeyEpochAdvance` leaf per broadcast author whose
     // key was rotated (§5.14.10, #1847). ADR-011: convergent governance trigger
@@ -3202,10 +3208,8 @@ pub async fn execute_rotate_content_keys(
             )
             .await
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        *cell.class_c_view().checkpoint_events_since_mut() += 1;
     }
-    // Coalesced Class-C counter bump: 1 for ContentKeysRotated + one per
-    // KeyEpochAdvance leaf. All-or-nothing (fail-closed) so the count is exact.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + key_advances.len() as u64;
     Ok(())
 }
 
