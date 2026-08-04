@@ -35,16 +35,18 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use scp_clock::SystemClock;
-use scp_dht::{DisabledDhtClient, PkarrDhtClient};
+use scp_dht::{DhtClient, DisabledDhtClient, PkarrDhtClient};
 // `InMemoryDhtClient` backs the test-harness-only `build_memory_did_method`
 // (`DhtMode::Memory`); it is a §17.17.3 nullifier, gated out of shipped builds.
 #[cfg(any(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::SequenceStore;
-use scp_identity::{DidCache, DidDht, IdentityError};
+use scp_identity::republish::{RepublishConfig, RepublishEntry, RepublishManager};
+use scp_identity::{DidCache, DidDht, IdentityError, extract_public_key};
 use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
+use scp_transport::native::TransportRelayPublisher;
 
 use crate::config::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
 use crate::{ApplicationNode, PublicSurface, projection};
@@ -1340,6 +1342,7 @@ where
                  default; set DhtMode::Production to host publicly)"
             );
             let (did_method, seq_init) = build_disabled_did_method(cache);
+            let dht_client = Arc::clone(did_method.dht_client());
             let key_resolver = build_shared_cache_key_resolver(
                 Arc::clone(did_method.dht_client()),
                 Arc::clone(did_method.cache()),
@@ -1348,7 +1351,15 @@ where
             // `sequence_store` is unused for a non-publishing node; drop it
             // explicitly so the move is intentional, not an oversight.
             drop(sequence_store);
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(
+                common,
+                did_method,
+                dht_client,
+                key_resolver,
+                seq_init,
+                shutdown,
+            )
+            .await
         }
         // Gated `feature = "testing"` ONLY (ADR-062 A5) to match the
         // `DhtMode::Memory` variant's single activation path.
@@ -1360,12 +1371,21 @@ where
             );
             let (did_method, seq_init) =
                 build_memory_did_method(Arc::clone(&common.custody), cache, sequence_store);
+            let dht_client = Arc::clone(did_method.dht_client());
             let key_resolver = build_shared_cache_key_resolver(
                 Arc::clone(did_method.dht_client()),
                 Arc::clone(did_method.cache()),
                 handle,
             );
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(
+                common,
+                did_method,
+                dht_client,
+                key_resolver,
+                seq_init,
+                shutdown,
+            )
+            .await
         }
         DhtMode::Production => {
             tracing::warn!(
@@ -1379,12 +1399,21 @@ where
                 sequence_store,
                 dht_gateways,
             )?;
+            let dht_client = Arc::clone(did_method.dht_client());
             let key_resolver = build_shared_cache_key_resolver(
                 Arc::clone(did_method.dht_client()),
                 Arc::clone(did_method.cache()),
                 handle,
             );
-            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+            serve_hosted_site(
+                common,
+                did_method,
+                dht_client,
+                key_resolver,
+                seq_init,
+                shutdown,
+            )
+            .await
         }
     }
 }
@@ -1415,6 +1444,143 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
         Vec::new(),
     ));
     colocated_document_vm_key_resolver(resolver, handle)
+}
+
+// ---------------------------------------------------------------------------
+// Self-DID republishing (SCP-RELAYRES-004, §3.10.2/§3.10.5/§3.10.6)
+// ---------------------------------------------------------------------------
+
+/// Sources the self-host node's own DID-document [`RepublishEntry`] from the
+/// signed record it published to its DHT client.
+///
+/// The BEP44 `(value, signature, seq)` triple is byte-identical across both
+/// publishing layers (§3.10.5), so the node's own DHT record is a faithful
+/// source for the relay frame — no re-signing, no fabrication. Returns `None`
+/// (the honest, protocol-supported absent state) when the node has no published
+/// record to source: `DhtMode::Disabled` (the shipped fail-closed default)
+/// publishes nothing, and a lookup miss/error yields nothing. No entry is
+/// invented from thin air.
+async fn self_did_republish_entry<D: DhtClient>(
+    dht_client: &D,
+    did: &str,
+) -> Option<RepublishEntry> {
+    let public_key = match extract_public_key(did) {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::warn!(
+                did = %did,
+                error = %e,
+                "self-DID republish: cannot extract public key from DID — not republishing"
+            );
+            return None;
+        }
+    };
+    match dht_client.resolve(&public_key).await {
+        Ok(Some(record)) => Some(RepublishEntry {
+            did: did.to_owned(),
+            public_key,
+            document_bytes: record.value,
+            signature: record.signature,
+            sequence: record.seq,
+        }),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(
+                did = %did,
+                error = %e,
+                "self-DID republish: no DHT record to source a republish entry from"
+            );
+            None
+        }
+    }
+}
+
+/// Constructs the production [`RepublishManager`] (the real `scp-transport`
+/// [`TransportRelayPublisher`] is the `R` type parameter, paired with the node's
+/// DHT client) and drives the self-host node's own DID-document republishing —
+/// or leaves it **fully dormant** when there is no signed record to source.
+/// Returns the running manager for teardown, or `None` when dormant.
+///
+/// # Layer selection — DHT keep-alive is independent of relay binding
+///
+/// The two layers are gated **independently**, because they protect different
+/// things (§3.10.6 anti-segmentation treats them as independent):
+///
+/// - **DHT (2-hour keep-alive) — always runs when a record exists.** Mainline
+///   DHT records expire and pkarr performs no internal republish, so this
+///   `RepublishManager` arm is the *only* thing keeping the node's DID record
+///   resolvable on the DHT. It must never be coupled to relay availability.
+/// - **Relay (6-day cycle) — additive, runs only when a live relay is bound.**
+///   The self-host node exposes a relay *server*, not a bound relay *client* to
+///   publish through; establishing that relay-client connection set (own +
+///   bootstrap relays, §18.5.1) and binding it onto the
+///   [`TransportRelayPublisher`] is not yet wired — the same not-yet-wired
+///   binding the READ-path `TransportRelayQuerier` awaits. With
+///   `bound_relay_count() == 0` the relay arm is disabled
+///   ([`RepublishConfig::disable_relay`]) so no unserviceable relay task is
+///   advertised; no anti-segmentation opt-out warning is emitted because this is
+///   infrastructure-not-yet-wired (disclosed here), not a deliberate user
+///   disable.
+///
+/// # Full dormancy — honest disclosure (do not read as active resilience)
+///
+/// When the node has **no signed record to source** ([`self_did_republish_entry`]
+/// returns `None`) there is nothing to keep alive on either layer, so the whole
+/// manager stays dormant. This is the shipped reality today: `DhtMode::Disabled`
+/// (the fail-closed default) publishes nothing, and node self-provisioning is
+/// under correction (**#2135**) with the standalone production `Identity::create`
+/// ceremony fail-closed pending the pre-rotation backend (RFC #2130 / **#1729**,
+/// ADR-062 §Decision 4). When a signed record appears, the DHT keep-alive
+/// activates automatically; the relay arm additionally activates once a relay is
+/// bound.
+async fn start_self_did_republishing<D: DhtClient + 'static>(
+    dht_client: Arc<D>,
+    relay_publisher: Arc<TransportRelayPublisher>,
+    did: &str,
+) -> Option<Arc<RepublishManager<D, TransportRelayPublisher>>> {
+    // Prerequisite for ANY republishing: a signed record. None → fully dormant;
+    // there is no DHT record to keep alive and nothing to publish to relays.
+    let Some(entry) = self_did_republish_entry(dht_client.as_ref(), did).await else {
+        tracing::info!(
+            did = %did,
+            "self-DID republishing dormant: no signed record to source, so there \
+             is no DHT record to keep alive (DhtMode::Disabled no-publish default, \
+             or node self-provisioning pending #2135 / production \
+             Identity::create fail-closed pending #1729)."
+        );
+        return None;
+    };
+
+    // A record exists → the DHT keep-alive arm ALWAYS runs. The relay arm is
+    // additive and runs only when a live relay is bound.
+    let mut config = RepublishConfig::default();
+    if relay_publisher.bound_relay_count() > 0 {
+        tracing::info!(
+            did = %did,
+            "self-DID republishing active on BOTH layers: DHT (2h keep-alive) + \
+             relay (6d) (§3.10.6 anti-segmentation)"
+        );
+    } else {
+        // No relay wired yet → DHT-only keep-alive. Disabling the relay arm here
+        // avoids advertising an unserviceable task; no layer-disabled callback is
+        // set, so no anti-segmentation opt-out warning fires (this is
+        // infrastructure-not-yet-wired, disclosed here, not a user opt-out).
+        config.disable_relay();
+        tracing::info!(
+            did = %did,
+            "self-DID republishing active on the DHT (2h keep-alive) only; relay \
+             (6d) dormant — no relay transport bound (self-host relay-client \
+             wiring pending, mirrors the unbound READ-path TransportRelayQuerier)."
+        );
+    }
+
+    let manager = Arc::new(RepublishManager::with_relay_publisher(
+        dht_client,
+        relay_publisher,
+        config,
+    ));
+    manager.start_republishing(entry).await;
+    Some(manager)
 }
 
 /// The DHT-mode-independent inputs threaded from [`host_site_until`] into the
@@ -1452,15 +1618,17 @@ struct ServeHostedSite {
 // sequenced with its own error/teardown handling, so it reads as one flat body
 // rather than fragmenting into helpers that would obscure the ordering.
 #[allow(clippy::too_many_lines)]
-async fn serve_hosted_site<D, F>(
+async fn serve_hosted_site<D, DC, F>(
     common: ServeHostedSite,
     did_method: Arc<D>,
+    dht_client: Arc<DC>,
     key_resolver: scp_core::context::governance::KeyResolver,
     seq_init: SeqInitFn,
     shutdown: F,
 ) -> Result<(), HostSiteError>
 where
     D: scp_identity::DidMethod + 'static,
+    DC: DhtClient + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
     let ServeHostedSite {
@@ -1498,6 +1666,15 @@ where
     if let Err(e) = seq_init(node_did.clone()).await {
         tracing::error!(error = %e, "failed to initialize BEP44 sequence — publishing may fail");
     }
+
+    // -- Self-DID republishing (SCP-RELAYRES-004, §3.10.2/§3.10.5/§3.10.6). The
+    //    real TransportRelayPublisher (the `R` type parameter) is constructed
+    //    here; production has no relay-client to bind onto it yet (see
+    //    `start_self_did_republishing`), so the relay arm stays dormant while the
+    //    DHT keep-alive runs whenever a signed record exists. Driven below, once
+    //    the site is deployed and the public surface is open, so an early
+    //    build/deploy failure never leaves a republish task running. --
+    let relay_publisher = Arc::new(TransportRelayPublisher::new());
 
     let context_id = self_host_context_id(&node_did);
 
@@ -1571,6 +1748,19 @@ where
     )
     .await?;
 
+    // -- Drive self-DID republishing now the node is up and the surface is open.
+    //    Runs the DHT keep-alive whenever a signed record exists, plus the relay
+    //    arm once a relay is bound; fully dormant with no record. The honest
+    //    disclosure of why production is currently dormant lives in
+    //    `start_self_did_republishing`. The returned manager (if any) is held for
+    //    the serve lifetime and torn down after shutdown. --
+    let republish_manager = start_self_did_republishing(
+        Arc::clone(&dht_client),
+        Arc::clone(&relay_publisher),
+        &node_did,
+    )
+    .await;
+
     // -- Run the refresh + NAT-renewal loops, await shutdown, and tear down. --
     run_refresh_and_serve_until_shutdown(RefreshAndServe {
         deployer,
@@ -1584,6 +1774,12 @@ where
         shutdown,
     })
     .await;
+
+    // Tear down self-DID republishing (aborts any running arms). A dormant node
+    // (no record) has no manager and nothing to stop.
+    if let Some(manager) = republish_manager {
+        manager.stop_all().await;
+    }
 
     tracing::info!("host_site stopped");
     Ok(())
@@ -2965,5 +3161,254 @@ mod tests {
              the current-thread regime drives the resolve on a dedicated thread \
              instead of panicking in block_in_place)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-DID republishing (SCP-RELAYRES-004) — §3.10.2/§3.10.5/§3.10.6
+    //
+    // The production wiring constructs a RepublishManager over the REAL
+    // `TransportRelayPublisher` and, when the node has a published signed record
+    // to source, drives BOTH the DHT (2h) and relay (6d) cycles. These tests
+    // exercise that wiring end-to-end with a testing-gated identity (a genuinely
+    // BEP44-signed record seeded into the in-memory DHT) — proving the wiring
+    // activates, publishes the full DID-record frame to relays, and covers both
+    // layers.
+    // -----------------------------------------------------------------------
+
+    type AdapterFut<'a, T> = Pin<
+        Box<
+            dyn std::future::Future<Output = Result<T, scp_transport::error::TransportError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Minimal recording relay adapter: captures every `publish_raw` blob so a
+    /// test can decode the DID-record frame the relay layer received. Every other
+    /// method is an honest "not connected" (never a fabricated success).
+    #[derive(Default)]
+    struct RecordingRelayAdapter {
+        published: std::sync::Mutex<Vec<(scp_transport::traits::RoutingId, u64, Vec<u8>)>>,
+    }
+
+    impl RecordingRelayAdapter {
+        fn recorded(&self) -> Vec<(scp_transport::traits::RoutingId, u64, Vec<u8>)> {
+            self.published.lock().expect("published lock").clone()
+        }
+    }
+
+    impl scp_transport::traits::TransportAdapter for RecordingRelayAdapter {
+        fn send(
+            &self,
+            _envelope: &scp_core::envelope::OuterEnvelope,
+        ) -> AdapterFut<'_, scp_transport::traits::BlobId> {
+            Box::pin(async { Err(scp_transport::error::TransportError::NotConnected) })
+        }
+
+        fn subscribe(
+            &self,
+            _routing_id: &scp_transport::traits::RoutingId,
+            _since: Option<u64>,
+        ) -> AdapterFut<'_, scp_transport::traits::SubscriptionStream> {
+            Box::pin(async { Err(scp_transport::error::TransportError::NotConnected) })
+        }
+
+        fn unsubscribe(
+            &self,
+            _routing_id: &scp_transport::traits::RoutingId,
+        ) -> AdapterFut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn query(
+            &self,
+            _routing_id: &scp_transport::traits::RoutingId,
+            _since: Option<u64>,
+        ) -> AdapterFut<'_, Vec<scp_core::envelope::OuterEnvelope>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn delete(&self, _blob_id: &scp_transport::traits::BlobId) -> AdapterFut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn publish_raw(
+            &self,
+            routing_id: &scp_transport::traits::RoutingId,
+            blob_ttl: u64,
+            blob: Vec<u8>,
+        ) -> AdapterFut<'_, ()> {
+            self.published
+                .lock()
+                .expect("published lock")
+                .push((*routing_id, blob_ttl, blob));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Binds a recording relay adapter onto `publisher` and returns the adapter
+    /// so the test can inspect what the relay layer received.
+    fn bind_recording_relay(publisher: &TransportRelayPublisher) -> Arc<RecordingRelayAdapter> {
+        let adapter = Arc::new(RecordingRelayAdapter::default());
+        publisher.bind(
+            "wss://relay.example/scp/v1",
+            Arc::clone(&adapter) as Arc<dyn scp_transport::traits::TransportAdapter>,
+        );
+        adapter
+    }
+
+    /// AC 3: a node schedules relay republishing ALONGSIDE the DHT cycle. With a
+    /// bound relay and a published record to source, `start_self_did_republishing`
+    /// starts both a DHT (2h) and a relay (6d) task on the production
+    /// `RepublishManager`.
+    #[tokio::test]
+    async fn self_did_republishing_schedules_both_dht_and_relay_layers() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let (did, _active) = seed_self_host_identity(dht.as_ref()).await;
+
+        let publisher = Arc::new(TransportRelayPublisher::new());
+        let _adapter = bind_recording_relay(publisher.as_ref());
+        let manager = start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), &did)
+            .await
+            .expect("a node with a bound relay and a published record activates republishing");
+
+        assert_eq!(
+            manager.active_count().await,
+            1,
+            "the DHT (2h) republish cycle is scheduled"
+        );
+        assert_eq!(
+            manager.active_relay_count().await,
+            1,
+            "the relay (6d) republish cycle is scheduled ALONGSIDE the DHT cycle (§3.10.6)"
+        );
+
+        manager.stop_all().await;
+    }
+
+    /// AC 5: the production `RepublishManager` publishes to BOTH layers — the DHT
+    /// record is present and the relay layer independently receives the frame.
+    #[tokio::test]
+    async fn production_republish_manager_publishes_both_layers() {
+        use scp_dht::DhtClient as _;
+
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let (did, _active) = seed_self_host_identity(dht.as_ref()).await;
+
+        let publisher = Arc::new(TransportRelayPublisher::new());
+        let adapter = bind_recording_relay(publisher.as_ref());
+
+        let manager = start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), &did)
+            .await
+            .expect("started with a bound relay + record");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        manager.stop_all().await;
+
+        // DHT layer: the record is present (the DHT arm publishes it too).
+        let pk = extract_public_key(&did).expect("DID yields a public key");
+        assert!(
+            dht.resolve(&pk).await.expect("resolve ok").is_some(),
+            "the DHT layer holds the DID record (2h cycle)"
+        );
+        // Relay layer: the frame reached the bound relay (6d cycle) — additive.
+        assert!(
+            !adapter.recorded().is_empty(),
+            "the relay layer received the DID record (additive to the DHT layer, §3.10.6)"
+        );
+    }
+
+    /// AC 4: a node's DID record reaches the relay as a valid DID-record FRAME
+    /// whose `(value, signature, seq)` verifies against the node's DID-derived
+    /// key, stored at `did_routing_id` (§9.10.12 publish contract) — never bare
+    /// bytes, never an `OuterEnvelope`.
+    #[tokio::test]
+    async fn node_did_record_reaches_relay_as_verifiable_frame() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let (did, _active) = seed_self_host_identity(dht.as_ref()).await;
+
+        let publisher = Arc::new(TransportRelayPublisher::new());
+        let adapter = bind_recording_relay(publisher.as_ref());
+
+        let manager = start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), &did)
+            .await
+            .expect("started with a bound relay + record");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        manager.stop_all().await;
+
+        let recorded = adapter.recorded();
+        assert!(!recorded.is_empty(), "relay received the node's DID record");
+        let (rid, ttl, blob) = &recorded[0];
+
+        // Stored at the DID routing_id with the 7-day blob TTL.
+        assert_eq!(
+            rid.as_bytes(),
+            &scp_identity::did_routing_id(&did),
+            "published at SHA-256('scp:did:' || did)"
+        );
+        assert_eq!(
+            *ttl,
+            scp_identity::republish::RELAY_BLOB_TTL_SECS,
+            "blob_ttl is the 7-day DID-record TTL (§3.10.2)"
+        );
+
+        // The blob is a valid DID-record frame (not bare bytes, not an envelope).
+        let frame = scp_core::envelope::did_record::DidRecordV1::decode(blob)
+            .expect("relay blob decodes as a DID-record frame (§9.10.12)");
+
+        // Its (value, signature, seq) verify against the node's DID-derived key.
+        let pk = extract_public_key(&did).expect("DID yields a public key");
+        scp_dht::verify_bep44_signature(&pk, frame.signature(), frame.value(), frame.seq())
+            .expect("the framed record verifies against the node's DID-derived key");
+    }
+
+    /// No signed record to source (even with a relay bound) → FULLY dormant: no
+    /// manager, no DHT task, no relay task. The honest absent state, never a
+    /// fabricated entry.
+    #[tokio::test]
+    async fn self_did_republishing_fully_dormant_without_published_record() {
+        // A syntactically valid did:dht string whose key never published a record.
+        let unpublished = scp_identity::did_from_ed25519_public_key(&[0x5A; 32]);
+        let dht = Arc::new(InMemoryDhtClient::new());
+
+        let publisher = Arc::new(TransportRelayPublisher::new());
+        let _adapter = bind_recording_relay(publisher.as_ref());
+        let manager =
+            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), &unpublished)
+                .await;
+
+        assert!(
+            manager.is_none(),
+            "no published record → fully dormant (no manager, no entry fabricated)"
+        );
+    }
+
+    /// The shipped production reality: a signed record exists but NO relay is
+    /// bound → the DHT keep-alive (2h) still runs (DHT records expire and this is
+    /// their only republish — it MUST NOT be coupled to relay availability),
+    /// while the relay arm stays dormant and advertises no unserviceable task.
+    #[tokio::test]
+    async fn self_did_republishing_dht_keepalive_runs_without_bound_relay() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        // A genuine signed record exists — only the relay binding is missing.
+        let (did, _active) = seed_self_host_identity(dht.as_ref()).await;
+
+        let publisher = Arc::new(TransportRelayPublisher::new());
+        assert_eq!(publisher.bound_relay_count(), 0, "no relay bound");
+        let manager = start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), &did)
+            .await
+            .expect("a record exists → the DHT keep-alive runs even without a relay");
+
+        assert_eq!(
+            manager.active_count().await,
+            1,
+            "the DHT (2h) keep-alive runs independently of relay binding"
+        );
+        assert_eq!(
+            manager.active_relay_count().await,
+            0,
+            "the relay arm is disabled (no bound relay) — no unserviceable task advertised"
+        );
+
+        manager.stop_all().await;
     }
 }
