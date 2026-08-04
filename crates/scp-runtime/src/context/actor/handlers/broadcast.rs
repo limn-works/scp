@@ -1695,4 +1695,247 @@ mod tests {
              (forward secrecy) — a cached peer key must go stale"
         );
     }
+    // =======================================================================
+    // §9.9.3 checkpoint-leaf accounting + KeyEpochAdvance durability signalling
+    //
+    // `checkpoint_events_since` must equal the number of leaves that actually
+    // became durable. A helper that appends N leaves and bumps once drifts the
+    // checkpoint position by N-1 for every invocation.
+    // =======================================================================
+
+    /// Event log that fails `KeyEpochAdvance` appends from the
+    /// `fail_kea_from`-th one onward (0 = fail every KEA), and succeeds for
+    /// every other event type. This models the exact partial-progress shape the
+    /// governance KEA loops must signal: the anchor leaf lands, then a KEA leaf
+    /// mid-sequence does not.
+    struct KeaFailingEventLog {
+        appended: Arc<AtomicUsize>,
+        kea_seen: AtomicUsize,
+        fail_kea_from: usize,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for KeaFailingEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if event == scp_event_log::EventType::KeyEpochAdvance {
+                let seen = self.kea_seen.fetch_add(1, Ordering::SeqCst);
+                if seen >= self.fail_kea_from {
+                    return Err(
+                        scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                            "fixture: KeyEpochAdvance append deliberately fails".to_owned(),
+                        ),
+                    );
+                }
+            }
+            self.appended.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Swap `deps.event_log` for a [`KeaFailingEventLog`] and return the shared
+    /// success-append counter.
+    fn inject_kea_failing_log(deps: &mut ActorDeps, fail_kea_from: usize) -> Arc<AtomicUsize> {
+        let appended = Arc::new(AtomicUsize::new(0));
+        deps.event_log = Arc::new(KeaFailingEventLog {
+            appended: Arc::clone(&appended),
+            kea_seen: AtomicUsize::new(0),
+            fail_kea_from,
+        });
+        appended
+    }
+
+    /// Three authors, deliberately not in sorted insertion order.
+    const AUTHORS_3: [&str; 3] = [
+        "did:example:author-zulu",
+        "did:example:author-alpha",
+        "did:example:author-mike",
+    ];
+
+    /// Zero the leaf counter so an assertion measures ONLY the operation under
+    /// test, not the fixture's own setup leaves.
+    fn reset_leaf_counter(cell: &mut ClassSCell) {
+        *cell.class_c_view().checkpoint_events_since_mut() = 0;
+    }
+
+    /// `block_broadcast_subscriber` appends TWO durable leaves — `MemberBlocked`
+    /// and `KeyEpochAdvance` — so it must credit TWO.
+    #[tokio::test]
+    async fn block_broadcast_subscriber_credits_both_durable_leaves() {
+        let (deps, appends) = build_deps().await;
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(CREATOR_DID.to_owned()),
+            &DID(SUBSCRIBER_DID.to_owned()),
+        )
+        .await
+        .expect("block succeeds");
+
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            2,
+            "block appends MemberBlocked + KeyEpochAdvance"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 2,
+            "checkpoint_events_since must equal the durable-leaf count \
+             (MemberBlocked + KeyEpochAdvance); crediting only one drifts the \
+             §9.9.3 checkpoint position by one leaf per block"
+        );
+    }
+
+    /// `unsubscribe_broadcast` with key rotation appends `MemberLeft` plus one
+    /// `KeyEpochAdvance` per author, so it must credit 1 + N.
+    #[tokio::test]
+    async fn unsubscribe_broadcast_credits_every_key_epoch_advance_leaf() {
+        let (deps, appends) = build_deps().await;
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        appends.store(0, Ordering::SeqCst);
+        reset_leaf_counter(&mut cell);
+
+        crate::context::broadcast_helpers::unsubscribe_broadcast(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(SUBSCRIBER_DID.to_owned()),
+            true,
+        )
+        .await
+        .expect("unsubscribe succeeds");
+
+        let expected = 1 + AUTHORS_3.len() as u64;
+        assert_eq!(
+            appends.load(Ordering::SeqCst) as u64,
+            expected,
+            "unsubscribe appends MemberLeft + one KeyEpochAdvance per author"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, expected,
+            "checkpoint_events_since must credit MemberLeft AND every rotated \
+             author's KeyEpochAdvance leaf"
+        );
+    }
+
+    /// `execute_rotate_content_keys` must SURFACE a `KeyEpochAdvance` append
+    /// failure instead of swallowing it, and must still credit the leaves that
+    /// landed before it.
+    ///
+    /// This is durability-SIGNALLING, not fail-atomicity: the rotation and the
+    /// `ContentKeysRotated` anchor leaf are already durable when the loop runs,
+    /// so `Err` here means "the log is short some leaves", not "nothing
+    /// happened". The assertion pins exactly that: `Err` returned AND the
+    /// pre-failure leaves credited.
+    #[tokio::test]
+    async fn rotate_content_keys_surfaces_key_epoch_advance_append_failure() {
+        let (mut deps, _appends) = build_deps().await;
+        // Anchor leaf + first KEA succeed; the SECOND KEA (of three) fails.
+        let appends = inject_kea_failing_log(&mut deps, 1);
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        reset_leaf_counter(&mut cell);
+
+        let result = crate::context::governance_helpers::execute_rotate_content_keys(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            None,
+            commit_meta(0xc1),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ContextError::EventLogFailed(_))),
+            "a KeyEpochAdvance append failure must reach the caller as \
+             EventLogFailed, not be swallowed into Ok(()); got {result:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            2,
+            "ContentKeysRotated + the first KeyEpochAdvance became durable"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 2,
+            "the inline per-leaf bump must credit the leaves that landed \
+             (ContentKeysRotated + first KeyEpochAdvance) even though a later \
+             leaf failed — a coalesced end-of-loop bump would credit none"
+        );
+    }
+
+    /// `execute_revoke`'s governance-ban KeyEpochAdvance loop, same contract.
+    #[tokio::test]
+    async fn revoke_surfaces_key_epoch_advance_append_failure() {
+        use scp_protocol::context::governance::AccessScope;
+
+        let (mut deps, _appends) = build_deps().await;
+        let (mut cell, ctx_hex) =
+            build_broadcast_cell_with_authors(BroadcastAdmission::Open, &AUTHORS_3);
+        dispatch_subscribe(&mut cell, &deps, &ctx_hex, None)
+            .await
+            .expect("open subscribe");
+        cell.class_c_view().membership_class_c_mut().add_member(
+            DID(SUBSCRIBER_DID.to_owned()),
+            "member".to_owned(),
+            vec![],
+        );
+        // AccessRevoked + first KEA succeed; the SECOND KEA (of three) fails.
+        let appends = inject_kea_failing_log(&mut deps, 1);
+        reset_leaf_counter(&mut cell);
+
+        let result = crate::context::governance_helpers::execute_revoke(
+            &mut cell,
+            &deps,
+            &ctx_hex,
+            &DID(SUBSCRIBER_DID.to_owned()),
+            AccessScope::Read,
+            commit_meta(0xc2),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ContextError::EventLogFailed(_))),
+            "a KeyEpochAdvance append failure must reach the caller as \
+             EventLogFailed, not be swallowed; got {result:?}"
+        );
+        assert_eq!(
+            appends.load(Ordering::SeqCst),
+            2,
+            "AccessRevoked + the first KeyEpochAdvance became durable"
+        );
+        assert_eq!(
+            cell.checkpoint_events_since, 2,
+            "the inline per-leaf bump must credit AccessRevoked and the first \
+             KeyEpochAdvance even though a later leaf failed"
+        );
+    }
 }

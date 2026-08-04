@@ -979,56 +979,54 @@ pub async fn execute_revoke(
             timestamp_secs,
         )
         .await?;
-    // Spec §2008 / §2015: emit one best-effort KeyEpochAdvance leaf per author
-    // whose broadcast key was rotated by the governance ban.  Each rotation
-    // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
-    // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
-    let mut kea_success_count: u64 = 0;
+    // Class-C counter bump for the AccessRevoked leaf, inline immediately after
+    // its `?`-append. The counter must track the true durable-leaf count
+    // (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position drift.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
+    // §5.14.10: one KeyEpochAdvance leaf per author whose broadcast key was
+    // rotated by the governance ban. Each rotation advances by exactly 1, so
+    // old_epoch = new_epoch.saturating_sub(1).
+    //
+    // DURABILITY-SIGNALLING, NOT FAIL-ATOMIC. `?`-propagating an append failure
+    // rolls nothing back: by the time this loop runs, the ban and the key
+    // rotation are already durably persisted (the fail-closed
+    // `commit_class_s_keep` above) and the `AccessRevoked` anchor leaf is
+    // already appended. A failure on leaf k of n returns `Err` while leaving
+    // leaves 0..k durable and leaves k..n absent, with no repair path. What `?`
+    // buys over the previous warn-and-continue is that the failure reaches the
+    // caller instead of being swallowed, giving operators a concrete error
+    // signal that the log is short some leaves — the same rationale as the
+    // GovernanceDeadlockRecovery companion leaf in
+    // `execute_reconfigure_governance`.
+    //
+    // The counter is bumped INLINE after each successful append, never
+    // coalesced at the end, so the leaves that did land are still credited when
+    // a later one fails.
+    //
+    // Aborting here cannot skip the H7 sender-key rotation below: `rotated_authors`
+    // is non-empty only for a broadcast context, and `needs_sender_key_rotation`
+    // requires `broadcast_context.is_none()` — the two are mutually exclusive.
     for rotation in &rotated_authors {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
+        let payload = scp_event_log::payload::encode_payload(
             &scp_event_log::payload::KeyEpochAdvancePayload {
                 old_epoch,
                 new_epoch: rotation.new_epoch,
             },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        rotation.author_did.as_str(),
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        author_did = %rotation.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed after governance ban (best-effort)"
-                    );
-                } else {
-                    kea_success_count += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    author_did = %rotation.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed after governance ban (best-effort)"
-                );
-            }
-        }
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        deps.event_log
+            .append_context_event_with_payload(
+                &context_id_bytes,
+                scp_event_log::EventType::KeyEpochAdvance,
+                rotation.author_did.as_str(),
+                payload,
+                timestamp_secs,
+            )
+            .await?;
+        *cell.class_c_view().checkpoint_events_since_mut() += 1;
     }
-    // Coalesced Class-C counter bump: 1 for AccessRevoked + each KeyEpochAdvance
-    // leaf that actually appended. The counter must track the true durable-leaf
-    // count (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position
-    // drift. Best-effort leaves that failed are excluded — they were never durable.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_success_count;
 
     // H7: Rotate sender key after write-side revocation.
     if needs_sender_key_rotation {
@@ -3189,64 +3187,59 @@ pub async fn execute_rotate_content_keys(
         )
         .await?;
 
-    // Emit one `KeyEpochAdvance` leaf per broadcast author whose key was
-    // rotated (§5.14.10, #1847). Best-effort: warn on failure, no error
-    // propagation — same pattern as governance_ban_subscriber in
-    // `execute_revoke`. `key_advances` is empty on the non-broadcast path.
+    // Class-C counter bump for the ContentKeysRotated leaf, inline immediately
+    // after its `?`-append. The counter must track the true durable-leaf count
+    // (governance_logic.rs:156-158) to prevent §9.9.3 checkpoint-position drift.
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
+    // One `KeyEpochAdvance` leaf per broadcast author whose key was rotated
+    // (§5.14.10, #1847). `key_advances` is empty on the non-broadcast path, and
+    // arrives in DID-lexicographic order by construction (the `authors`
+    // `BTreeMap` in `scp_protocol::context::broadcast`), so the leaf sequence —
+    // and therefore the Merkle root — is identical on every member and across
+    // replays.
     //
-    // NOTE: `advance.timestamp` (milliseconds) is not used here — the
-    // event-log append takes `timestamp_secs` directly. The ms field is
-    // carried by `BroadcastKeyEpochAdvance` for the relay-message consumer
-    // on the per-author block path; it is dead data in this governance path.
-    // `old_epoch` is derived as `new_epoch - 1` because `rotate_all_author_keys`
-    // always increments by exactly 1 (pre-validated, sound by construction).
-    let mut kea_success_count: u64 = 0;
+    // DURABILITY-SIGNALLING, NOT FAIL-ATOMIC. `?`-propagating an append failure
+    // rolls nothing back: the rotation is already durably persisted (the
+    // fail-closed `commit_class_s_keep` above) and the `ContentKeysRotated`
+    // anchor leaf is already appended. A failure on leaf k of n returns `Err`
+    // while leaving leaves 0..k durable and leaves k..n absent, with no repair
+    // path. What `?` buys over the previous warn-and-continue is that the
+    // failure reaches the caller instead of being swallowed, giving operators a
+    // concrete error signal that the log is short some leaves — the same
+    // rationale as the GovernanceDeadlockRecovery companion leaf in
+    // `execute_reconfigure_governance`.
+    //
+    // The counter is bumped INLINE after each successful append, never coalesced
+    // at the end, so the leaves that did land are still credited when a later
+    // one fails.
+    //
+    // NOTE: `advance.timestamp` (milliseconds) is not used here — the event-log
+    // append takes `timestamp_secs` directly. The ms field is carried by
+    // `BroadcastKeyEpochAdvance` for the relay-message consumer on the per-author
+    // block path; it is dead data in this governance path. `old_epoch` is
+    // derived as `new_epoch - 1` because `rotate_all_author_keys` always
+    // increments by exactly 1 (pre-validated, sound by construction).
     for advance in &key_advances {
         let old_epoch = advance.new_epoch.saturating_sub(1);
-        match scp_event_log::payload::encode_payload(
+        let payload = scp_event_log::payload::encode_payload(
             &scp_event_log::payload::KeyEpochAdvancePayload {
                 old_epoch,
                 new_epoch: advance.new_epoch,
             },
-        ) {
-            Ok(payload) => {
-                if let Err(e) = deps
-                    .event_log
-                    .append_context_event_with_payload(
-                        &context_id_bytes,
-                        scp_event_log::EventType::KeyEpochAdvance,
-                        advance.author_did.as_str(),
-                        payload,
-                        timestamp_secs,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        author_did = %advance.author_did,
-                        error = %e,
-                        "KeyEpochAdvance event-log append failed after RotateContentKeys (best-effort)"
-                    );
-                } else {
-                    kea_success_count += 1;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %context_id,
-                    author_did = %advance.author_did,
-                    error = %e,
-                    "KeyEpochAdvance payload encode failed after RotateContentKeys (best-effort)"
-                );
-            }
-        }
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        deps.event_log
+            .append_context_event_with_payload(
+                &context_id_bytes,
+                scp_event_log::EventType::KeyEpochAdvance,
+                advance.author_did.as_str(),
+                payload,
+                timestamp_secs,
+            )
+            .await?;
+        *cell.class_c_view().checkpoint_events_since_mut() += 1;
     }
-    // Coalesced Class-C counter bump: 1 for ContentKeysRotated + each
-    // KeyEpochAdvance leaf that actually appended. The counter must track the
-    // true durable-leaf count (governance_logic.rs:156-158) to prevent §9.9.3
-    // checkpoint-position drift. Best-effort leaves that failed are excluded —
-    // they were never durable.
-    *cell.class_c_view().checkpoint_events_since_mut() += 1 + kea_success_count;
     Ok(())
 }
 
@@ -3345,6 +3338,11 @@ pub async fn execute_reconfigure_governance(
             timestamp_secs,
         )
         .await?;
+    // Inline Class-C counter bump for THIS leaf. This helper appends TWO durable
+    // leaves; each needs its own bump immediately after its `?`-append so a
+    // failure on the second still credits the first (governance_logic.rs:156-158,
+    // §9.9.3 checkpoint-position drift).
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // Append the companion GovernanceDeadlockRecovery leaf carrying the
     // structured recovery justification (issue #1847).  The two leaves share
@@ -3380,7 +3378,6 @@ pub async fn execute_reconfigure_governance(
             timestamp_secs,
         )
         .await?;
-
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -6449,6 +6446,67 @@ mod commit_broadcast_retry_tests {
             .build_actor_deps(&DID(ADMIN.to_owned()))
             .await
             .expect("build_actor_deps")
+    }
+
+    /// `execute_reconfigure_governance` appends TWO durable leaves —
+    /// `GovernanceReconfigured` and its `GovernanceDeadlockRecovery` companion
+    /// — so `checkpoint_events_since` must advance by TWO. Crediting one drifts
+    /// the §9.9.3 checkpoint position by a leaf per deadlock recovery.
+    #[tokio::test]
+    async fn reconfigure_governance_credits_both_durable_leaves() {
+        use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};
+
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }),
+            Box::new(CountingOkPersistence {
+                persists: Arc::new(AtomicUsize::new(0)),
+                last_snapshot: Arc::new(Mutex::new(None)),
+            }),
+        )
+        .await;
+        let mut state = fresh_state();
+        state
+            .handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .expect("activate");
+        state.governance.class_s.threshold_signers = vec![
+            DID(ADMIN.to_owned()),
+            DID(TARGET.to_owned()),
+            DID("did:dht:z6MkThirdSigner".to_owned()),
+        ];
+        state.governance.class_s.threshold_value = 2;
+        let mut cell = ClassSCell::new(state);
+        *cell.class_c_view().checkpoint_events_since_mut() = 0;
+
+        super::execute_reconfigure_governance(
+            &mut cell,
+            &deps,
+            &ctx_hex(),
+            &[GovernanceReconfigAction::RemoveInactiveSigner {
+                did: DID(TARGET.to_owned()),
+            }],
+            &DeadlockJustification {
+                unavailable_dids: vec![DID(TARGET.to_owned())],
+                missed_windows: vec![(DID(TARGET.to_owned()), 3)],
+                detected_at: 1_700_000_000,
+            },
+            super::CommitMeta {
+                pid: [0x4d; 32],
+                actor_did: ADMIN,
+                timestamp_secs: 1_700_000_000,
+            },
+        )
+        .await
+        .expect("reconfigure succeeds");
+
+        assert_eq!(
+            cell.checkpoint_events_since, 2,
+            "checkpoint_events_since must equal the durable-leaf count: \
+             GovernanceReconfigured AND its GovernanceDeadlockRecovery companion"
+        );
     }
 
     /// A fresh encrypted test state with an empty pending-commit queue.

@@ -260,6 +260,16 @@ pub async fn unsubscribe_broadcast(
     // unsubscription. `rotate_sender_key_for_block` (reused internally by
     // `unsubscribe`) always increments by exactly 1, so `old_epoch =
     // new_epoch.saturating_sub(1)` is exact.
+    //
+    // `key_rotations` arrives in DID-lexicographic order by construction (the
+    // `authors` `BTreeMap` in `scp_protocol::context::broadcast`), so the leaf
+    // sequence is identical on every member and across replays.
+    //
+    // Each leaf that lands is a DURABLE leaf and MUST bump
+    // `checkpoint_events_since` — the counter tracks the true durable-leaf count
+    // (governance_logic.rs:156-158) and a missed bump drifts the §9.9.3
+    // checkpoint position. The bump is INLINE in the success arm, never
+    // coalesced, so a mid-sequence failure still credits the leaves that landed.
     for rotation in &result.key_rotations {
         let old_epoch = rotation.new_epoch.saturating_sub(1);
         match scp_event_log::payload::encode_payload(
@@ -286,6 +296,8 @@ pub async fn unsubscribe_broadcast(
                         error = %e,
                         "KeyEpochAdvance event-log append failed on unsubscribe (best-effort)"
                     );
+                } else {
+                    *cell.class_c_view().checkpoint_events_since_mut() += 1;
                 }
             }
             Err(e) => {
@@ -718,6 +730,11 @@ pub async fn block_broadcast_subscriber(
             block_ts,
         )
         .await?;
+    // Inline Class-C counter bump for the MemberBlocked leaf. This helper
+    // appends TWO durable leaves; each needs its own bump immediately after its
+    // append so a failure on the second still credits the first
+    // (governance_logic.rs:156-158, §9.9.3 checkpoint-position drift).
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // ADR-007 §5: blocking a subscriber rotates the author's sender-key epoch.
     // Append the KeyEpochAdvance leaf immediately after MemberBlocked so the
@@ -745,6 +762,10 @@ pub async fn block_broadcast_subscriber(
                     error = %e,
                     "KeyEpochAdvance event-log append failed (best-effort)"
                 );
+            } else {
+                // The KeyEpochAdvance leaf is durable — credit it. Best-effort
+                // leaves that failed are excluded: they were never durable.
+                *cell.class_c_view().checkpoint_events_since_mut() += 1;
             }
         }
         Err(e) => {
@@ -755,7 +776,6 @@ pub async fn block_broadcast_subscriber(
             );
         }
     }
-    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
 }
