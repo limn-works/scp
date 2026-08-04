@@ -449,6 +449,155 @@ pub enum OutletError {
     },
 }
 
+impl OutletError {
+    /// Projects this registration / update / verification error onto the
+    /// structured [`OutletErrorSurface`](errors::OutletErrorSurface) with its
+    /// §5.4.4 `(class, code, slug, detail, retry)` intact (SCP-OUT-031 PR-2a).
+    ///
+    /// Single-sources the legacy-enum → §5.4.4 taxonomy mapping so the FFI
+    /// bridges never re-derive it. Structured `detail` is extracted where a
+    /// variant field maps DIRECTLY onto a typed [`errors::DetailBody`] shape
+    /// (schema errors → `FieldViolation`,
+    /// [`InterfaceRateLimited`](Self::InterfaceRateLimited) → `TransportRateLimit`);
+    /// variants carrying only free-text or identity fields carry `detail = None`
+    /// (never a fabricated placeholder). Authorization denials carry no detail
+    /// so outlet existence / membership is never leaked.
+    // Exhaustive one-arm-per-variant match over a 30+ variant enum: length is
+    // the taxonomy, not incidental complexity. Splitting it would only scatter
+    // the single-source mapping the doc promises.
+    #[allow(clippy::too_many_lines)]
+    #[must_use]
+    pub fn to_surface(&self) -> errors::OutletErrorSurface {
+        use crate::context::outlets::error_codes::{
+            CODE_EXECUTION_FAULT, CODE_INPUT_VIOLATION, CODE_OUTPUT_VIOLATION,
+            CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION, CODE_TRANSPORT_FAULT,
+            SLUG_AUTHORIZATION_DENIED, SLUG_EXECUTION_HANDLER_PANIC,
+            SLUG_EXECUTION_NON_DETERMINISTIC, SLUG_INPUT_SCHEMA_VIOLATION, SLUG_INPUT_TOO_LARGE,
+            SLUG_OUTPUT_SCHEMA_VIOLATION, SLUG_OUTPUT_TOO_LARGE,
+            SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM, SLUG_PROTOCOL_UNKNOWN_SESSION,
+            SLUG_PROTOCOL_VIOLATION, SLUG_QUERY_COST_VIOLATION, SLUG_STRUCTURAL_FLOOR_VIOLATION,
+            SLUG_TRANSPORT_CONCURRENT_STREAMS_PER_INVOKER,
+            SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE, SLUG_TRANSPORT_RATE_LIMITED,
+        };
+        use errors::{DetailBody, OutletErrorSurface};
+
+        match self {
+            // Authorization-class denials — collapse onto `authorization.denied`
+            // with NO detail so identity / existence / membership is not leaked.
+            Self::RegistrantNotAuthorized { .. }
+            | Self::UpdaterNotAuthorized { .. }
+            | Self::InvokerNotAuthorized { .. }
+            | Self::InterfaceAdminRequired { .. }
+            | Self::InterfaceNotApproved { .. }
+            | Self::InterfaceInvokerNotAuthorized { .. }
+            | Self::InterfaceCallerNotAllowed { .. }
+            | Self::SignatureVerificationFailed { .. } => {
+                OutletErrorSurface::from_class(SLUG_AUTHORIZATION_DENIED, None)
+            }
+
+            // Input-class — schema-structure failure carries a FieldViolation;
+            // an over-large request payload is `input.too-large`.
+            Self::InvalidInputSchema(e) => OutletErrorSurface::from_code(
+                CODE_INPUT_VIOLATION,
+                SLUG_INPUT_SCHEMA_VIOLATION,
+                Some(e.field_violation()),
+            ),
+            Self::InputValidationFailed { .. } => OutletErrorSurface::from_code(
+                CODE_INPUT_VIOLATION,
+                SLUG_INPUT_SCHEMA_VIOLATION,
+                None,
+            ),
+            Self::InterfacePayloadTooLarge { .. } => {
+                OutletErrorSurface::from_code(CODE_INPUT_VIOLATION, SLUG_INPUT_TOO_LARGE, None)
+            }
+
+            // Output-class — the same FieldViolation shape, Output code/slug;
+            // an over-large response payload is `output.too-large`.
+            Self::InvalidOutputSchema(e) => OutletErrorSurface::from_code(
+                CODE_OUTPUT_VIOLATION,
+                SLUG_OUTPUT_SCHEMA_VIOLATION,
+                Some(e.field_violation()),
+            ),
+            Self::InterfaceResponseTooLarge { .. } => {
+                OutletErrorSurface::from_code(CODE_OUTPUT_VIOLATION, SLUG_OUTPUT_TOO_LARGE, None)
+            }
+
+            // Protocol-class registration / validation / classification.
+            Self::InvalidImplementationHash { .. }
+            | Self::UnresolvableDid { .. }
+            | Self::OutletNotFound { .. }
+            | Self::OutletIdMismatch { .. }
+            | Self::OutletAlreadyRegistered { .. }
+            | Self::InterfaceContextMismatch { .. }
+            | Self::ChainDepthExceeded { .. }
+            | Self::CanonicalizationFailed { .. } => OutletErrorSurface::from_code(
+                CODE_PROTOCOL_VIOLATION,
+                SLUG_PROTOCOL_VIOLATION,
+                None,
+            ),
+            Self::SchemaSpecificityFloor { .. } => OutletErrorSurface::from_code(
+                CODE_PROTOCOL_VIOLATION,
+                SLUG_STRUCTURAL_FLOOR_VIOLATION,
+                None,
+            ),
+            Self::QueryCostViolation { .. } => OutletErrorSurface::from_code(
+                CODE_PROTOCOL_VIOLATION,
+                SLUG_QUERY_COST_VIOLATION,
+                None,
+            ),
+
+            // Protocol-session lifecycle — context teardown and session state.
+            Self::ContextNotActive { .. } => OutletErrorSurface::from_code(
+                CODE_PROTOCOL_SESSION,
+                SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+                None,
+            ),
+            Self::SessionNotFound { .. } | Self::SessionExpired { .. } => {
+                OutletErrorSurface::from_code(
+                    CODE_PROTOCOL_SESSION,
+                    SLUG_PROTOCOL_UNKNOWN_SESSION,
+                    None,
+                )
+            }
+
+            // Execution-class — handler failure / test-vector mismatch.
+            Self::ExecutionFailed { .. } => OutletErrorSurface::from_code(
+                CODE_EXECUTION_FAULT,
+                SLUG_EXECUTION_HANDLER_PANIC,
+                None,
+            ),
+            Self::VerificationFailed { .. } => OutletErrorSurface::from_code(
+                CODE_EXECUTION_FAULT,
+                SLUG_EXECUTION_NON_DETERMINISTIC,
+                None,
+            ),
+
+            // Transport-class — cross-context bridge / rate / concurrency.
+            Self::InterfaceRateLimited {
+                retry_after_secs, ..
+            } => OutletErrorSurface::from_code(
+                CODE_TRANSPORT_FAULT,
+                SLUG_TRANSPORT_RATE_LIMITED,
+                Some(DetailBody::TransportRateLimit {
+                    // `retry_after_secs` is a `u64` window hint; the §5.4.4
+                    // detail field is a `u32`. Saturate rather than truncate.
+                    retry_after_secs: u32::try_from(*retry_after_secs).unwrap_or(u32::MAX),
+                }),
+            ),
+            Self::InterfaceExecutionFailed { .. } => OutletErrorSurface::from_code(
+                CODE_TRANSPORT_FAULT,
+                SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE,
+                None,
+            ),
+            Self::SessionCapExceeded { .. } => OutletErrorSurface::from_code(
+                CODE_TRANSPORT_FAULT,
+                SLUG_TRANSPORT_CONCURRENT_STREAMS_PER_INVOKER,
+                None,
+            ),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OutletEvent (event log integration types)
 // ---------------------------------------------------------------------------
@@ -646,5 +795,267 @@ pub fn has_outlet_invocation_capability(
     match kind {
         OutletKind::Query => has_outlet_query_capability(role_state, did, outlet_id),
         OutletKind::Action => has_outlet_call_capability(role_state, did, outlet_id),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — legacy OutletError::to_surface (SCP-OUT-031 PR-2a)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::too_many_lines)]
+mod to_surface_tests {
+    use super::*;
+    use crate::context::outlets::error_codes::{error_code_to_class, slug_to_class};
+    use crate::context::outlets::errors::{DetailBody, OutletErrorClass};
+    use crate::context::outlets::schema::SchemaValidationError;
+
+    /// Every legacy `OutletError` variant projects onto a §5.4.4-consistent
+    /// surface: `error_code_to_class(code) == class == slug_to_class(slug)`.
+    fn assert_consistent(err: &OutletError, want_class: OutletErrorClass) {
+        let s = err.to_surface();
+        assert_eq!(s.class, want_class, "variant {err:?} class");
+        assert_eq!(
+            error_code_to_class(&s.code),
+            Some(s.class),
+            "variant {err:?}: code {} must map to class {:?}",
+            s.code,
+            s.class
+        );
+        assert_eq!(
+            slug_to_class(&s.slug),
+            Some(s.class),
+            "variant {err:?}: slug {} must map to class {:?}",
+            s.slug,
+            s.class
+        );
+    }
+
+    #[test]
+    fn every_legacy_variant_maps_to_a_consistent_surface() {
+        let cases: Vec<(OutletError, OutletErrorClass)> = vec![
+            (
+                OutletError::RegistrantNotAuthorized { did: "d".into() },
+                OutletErrorClass::Authorization,
+            ),
+            (
+                OutletError::UpdaterNotAuthorized { did: "d".into() },
+                OutletErrorClass::Authorization,
+            ),
+            (
+                OutletError::InvalidInputSchema(SchemaValidationError::MissingTypeField),
+                OutletErrorClass::Input,
+            ),
+            (
+                OutletError::InvalidOutputSchema(SchemaValidationError::MissingTypeField),
+                OutletErrorClass::Output,
+            ),
+            (
+                OutletError::InvalidImplementationHash { length: 7 },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::UnresolvableDid { did: "d".into() },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::OutletNotFound {
+                    outlet_id: "o".into(),
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::OutletIdMismatch {
+                    expected: "a".into(),
+                    actual: "b".into(),
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::OutletAlreadyRegistered {
+                    outlet_id: "o".into(),
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::VerificationFailed {
+                    message: "m".into(),
+                },
+                OutletErrorClass::Execution,
+            ),
+            (
+                OutletError::ContextNotActive {
+                    current_state: "Closing".into(),
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::InvokerNotAuthorized {
+                    did: "d".into(),
+                    outlet_id: "o".into(),
+                },
+                OutletErrorClass::Authorization,
+            ),
+            (
+                OutletError::InputValidationFailed {
+                    message: "m".into(),
+                },
+                OutletErrorClass::Input,
+            ),
+            (
+                OutletError::ExecutionFailed {
+                    message: "m".into(),
+                },
+                OutletErrorClass::Execution,
+            ),
+            (
+                OutletError::SessionNotFound {
+                    session_id: "s".into(),
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::SessionExpired {
+                    session_id: "s".into(),
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::InterfaceAdminRequired { did: "d".into() },
+                OutletErrorClass::Authorization,
+            ),
+            (
+                OutletError::InterfaceNotApproved {
+                    source_approved: true,
+                    target_approved: false,
+                },
+                OutletErrorClass::Authorization,
+            ),
+            (
+                OutletError::InterfaceInvokerNotAuthorized {
+                    did: "d".into(),
+                    outlet_id: "o".into(),
+                },
+                OutletErrorClass::Authorization,
+            ),
+            (
+                OutletError::InterfaceRateLimited {
+                    max_calls: 10,
+                    window_ms: 1000,
+                    retry_after_secs: 5,
+                },
+                OutletErrorClass::Transport,
+            ),
+            (
+                OutletError::InterfaceContextMismatch {
+                    expected: "a".into(),
+                    actual: "b".into(),
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::InterfaceExecutionFailed {
+                    message: "m".into(),
+                },
+                OutletErrorClass::Transport,
+            ),
+            (
+                OutletError::ChainDepthExceeded {
+                    depth: 5,
+                    max_depth: 4,
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::SessionCapExceeded {
+                    source_context: "c".into(),
+                    current: 5,
+                    max: 4,
+                },
+                OutletErrorClass::Transport,
+            ),
+            (
+                OutletError::SchemaSpecificityFloor {
+                    side: "input".into(),
+                    field_count: 0,
+                    min_fields: 1,
+                },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::SignatureVerificationFailed { reason: "r".into() },
+                OutletErrorClass::Authorization,
+            ),
+            (
+                OutletError::InterfaceCallerNotAllowed { did: "d".into() },
+                OutletErrorClass::Authorization,
+            ),
+            (
+                OutletError::InterfacePayloadTooLarge {
+                    actual: 100,
+                    max: 10,
+                },
+                OutletErrorClass::Input,
+            ),
+            (
+                OutletError::InterfaceResponseTooLarge {
+                    actual: 100,
+                    max: 10,
+                },
+                OutletErrorClass::Output,
+            ),
+            (
+                OutletError::CanonicalizationFailed { reason: "r".into() },
+                OutletErrorClass::Protocol,
+            ),
+            (
+                OutletError::QueryCostViolation { reason: "r".into() },
+                OutletErrorClass::Protocol,
+            ),
+        ];
+        for (err, want_class) in &cases {
+            assert_consistent(err, *want_class);
+        }
+    }
+
+    #[test]
+    fn interface_rate_limited_extracts_transport_rate_limit_detail() {
+        let s = OutletError::InterfaceRateLimited {
+            max_calls: 10,
+            window_ms: 1000,
+            retry_after_secs: 42,
+        }
+        .to_surface();
+        match s.detail {
+            Some(DetailBody::TransportRateLimit { retry_after_secs }) => {
+                assert_eq!(retry_after_secs, 42);
+            }
+            other => panic!("expected TransportRateLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_errors_extract_field_violation_detail() {
+        let s =
+            OutletError::InvalidOutputSchema(SchemaValidationError::MissingTypeField).to_surface();
+        assert_eq!(s.class, OutletErrorClass::Output);
+        assert!(matches!(s.detail, Some(DetailBody::FieldViolation { .. })));
+    }
+
+    #[test]
+    fn authorization_denials_carry_no_detail() {
+        // Oracle-collapse / privacy: identity-bearing denials must not leak
+        // structured detail.
+        for err in [
+            OutletError::RegistrantNotAuthorized { did: "d".into() },
+            OutletError::InvokerNotAuthorized {
+                did: "d".into(),
+                outlet_id: "o".into(),
+            },
+        ] {
+            let s = err.to_surface();
+            assert_eq!(s.class, OutletErrorClass::Authorization);
+            assert!(s.detail.is_none(), "auth denial must carry no detail");
+        }
     }
 }

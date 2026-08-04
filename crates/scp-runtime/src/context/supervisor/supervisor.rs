@@ -25854,8 +25854,10 @@ mod tests {
 
     /// #2196 — a non-active (Closing) CALLER context rejects the UNARY
     /// cross-context outlet-invocation saga at Prepare-A's caller-side reserve
-    /// (`reserve_outlet_economy`, now gated by `ensure_context_active`),
-    /// surfacing SCP-OUTLET-6080 "context not active". Prepare-A fails before
+    /// (`reserve_outlet_economy`, gated by `ensure_context_active`), surfacing
+    /// the typed `ContextError::OutletContextNotActive` carrier — rendered as
+    /// the structured, state-free `SCP-OUTLET-6101`
+    /// `protocol.context-closed-mid-stream` (SCP-OUT-031 PR-2a). Prepare-A fails before
     /// Prepare-B / Commit, so the outlet NEVER executes and no A-side reservation
     /// is applied. Covers the caller/A-leg of the unary saga, which the runtime
     /// previously left ungated (bridge-guard only, on a stale handle cache).
@@ -25918,9 +25920,21 @@ mod tests {
             .await
             .expect_err("a Closing caller must reject the unary saga at Prepare-A");
 
+        // SCP-OUT-031 PR-2a: the caller reserve gate now surfaces the TYPED
+        // `ContextError::OutletContextNotActive`, whose Display is the
+        // structured, state-free Protocol-session teardown surface — NOT the old
+        // raw `SCP-OUTLET-6080: context not active: {state}` prose.
+        let rendered = format!("{err}");
         assert!(
-            format!("{err}").contains("not active") || format!("{err}").contains("6080"),
-            "the abort surfaces the caller context-not-active reserve rejection: {err}"
+            rendered
+                .contains(scp_protocol::context::outlets::error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM)
+                || rendered
+                    .contains(scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION),
+            "the abort surfaces the caller context-not-active reserve rejection (structured): {err}"
+        );
+        assert!(
+            !rendered.contains("Closing"),
+            "the structured surface must NOT leak the raw lifecycle state: {rendered}"
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -32713,8 +32727,10 @@ mod streaming_saga_tests {
                 assert!(
                     message.contains("not in Active state") && message.contains("Closing"),
                     "the abort surfaces the context-not-active reserve rejection naming the \
-                     state (the 6080 gate flowed through reserve_error_to_open_rejection → \
-                     ContextNotActive): {message}"
+                     state (the typed OutletContextNotActive carrier flowed through \
+                     reserve_error_to_open_rejection → OpenStreamRejection::ContextNotActive → \
+                     to_invocation_error, preserving current_state for an authorized interface \
+                     peer): {message}"
                 );
             }
             other => panic!("expected SagaError::Aborted, got {other:?}"),

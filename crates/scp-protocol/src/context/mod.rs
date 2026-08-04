@@ -731,6 +731,56 @@ pub enum ContextError {
     /// `SCP-CTX-2001` fallthrough — so a caller can detect a single-use replay.
     #[error("SCP-CTX-2136: key package already consumed (init-key replay rejected): {0}")]
     KeyPackageReplay(String),
+
+    /// A structured outlet error surfaced from the runtime with its full
+    /// §5.4.4 taxonomy intact (SCP-OUT-031 PR-2a).
+    ///
+    /// This is the typed replacement for the pre-PR-2a
+    /// `PermissionDenied(String)` flattening of outlet **invocation** errors:
+    /// the runtime → `ContextError` seam
+    /// (`invocation_error_to_context`) now carries the
+    /// [`OutletErrorSurface`](outlets::errors::OutletErrorSurface) —
+    /// `class` / `code` / `slug` / `retry` / `detail` / `source_chain` — so the
+    /// FFI bridges and SDKs can rebuild the typed error hierarchy losslessly
+    /// instead of re-parsing a prose string.
+    ///
+    /// Boxed to keep `ContextError` small: the enum is passed by value across
+    /// the actor mailbox on every command reply, and the surface is the
+    /// largest variant.
+    ///
+    /// The `Display` rendering is the faithful, catalog-free
+    /// `[<code>] <class>: <slug>` form (the `message` HMAC is not part of this
+    /// surface). PR-2b adds the rich per-field render at each FFI bridge.
+    #[error("[{code}] {class}: {slug}",
+        code = .0.code, class = .0.class.as_wire(), slug = .0.slug)]
+    Outlet(Box<outlets::errors::OutletErrorSurface>),
+
+    /// The outlet forward-debit reserve gate observed a non-`Active` context
+    /// (SCP-OUT-031 PR-2a; #2196). A **typed internal carrier**: the raw
+    /// lifecycle `current_state` is a §5.4.4-untyped operator diagnostic, so it
+    /// is carried here ONLY for the in-process streaming reverse-map
+    /// (`reserve_error_to_open_rejection` →
+    /// `OpenStreamRejection::ContextNotActive { current_state }`), which never
+    /// surfaces it to the FFI caller either (the stream-open FFI seam emits only
+    /// the `error_code()` + `slug()`).
+    ///
+    /// The `Display` (and therefore every FFI bridge's `From<ContextError>`
+    /// render) is the structured, **state-free** `[SCP-OUTLET-6101] protocol:
+    /// protocol.context-closed-mid-stream` — the non-retryable Protocol-session
+    /// context-teardown class. This closes the pre-fix leak where the unary
+    /// invoke path propagated the raw `SCP-OUTLET-6080: context not active:
+    /// {state}` prose to the FFI caller (revealing the exact lifecycle state
+    /// BEFORE the authorization gate ran). `current_state` is NEVER part of the
+    /// rendered string.
+    #[error("[{code}] protocol: {slug}",
+        code = outlets::error_codes::CODE_PROTOCOL_SESSION,
+        slug = outlets::error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM)]
+    OutletContextNotActive {
+        /// The observed lifecycle state — INTERNAL diagnostic only; read typed
+        /// by the streaming reverse-map, NEVER rendered by `Display` / the FFI
+        /// bridges.
+        current_state: ContextState,
+    },
 }
 
 // ---------------------------------------------------------------------------

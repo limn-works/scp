@@ -3188,6 +3188,179 @@ pub fn invocation_error_to_terminal_payload(err: &InvocationError) -> ChunkPaylo
     }
 }
 
+impl InvocationError {
+    /// Projects this invocation error onto the structured
+    /// [`OutletErrorSurface`](scp_protocol::context::outlets::errors::OutletErrorSurface)
+    /// carried across the runtime → [`ContextError`](scp_protocol::context::ContextError)
+    /// seam (SCP-OUT-031 PR-2a).
+    ///
+    /// # Relationship to [`invocation_error_to_terminal_payload`]
+    ///
+    /// The two maps share a source-of-truth *intent* but are NOT identical: the
+    /// surface is normalized to the *registered* §5.4.4 slug taxonomy so it
+    /// satisfies its class/code/slug consistency invariants
+    /// (`error_code_to_class(code) == Some(class)` and
+    /// `slug_to_class(slug) == Some(class)`), whereas the wire terminal chunk
+    /// (a §5.4.4 wire artifact) predates that invariant and carries some
+    /// unregistered wire slugs. They therefore **intentionally diverge on
+    /// exactly these variants** (pinned by `to_surface_vs_terminal_payload_drift_guard`):
+    ///
+    /// 1. [`ContextNotActive`](InvocationError::ContextNotActive): terminal
+    ///    `(6100, "protocol.context-not-active")` → surface `(6101,
+    ///    protocol.context-closed-mid-stream)` — the registered Protocol-session
+    ///    teardown class (both code AND slug differ).
+    /// 2. [`Cancelled`](InvocationError::Cancelled): terminal `(6130,
+    ///    "execution.cancelled")` → surface `(6135, execution.cancel-ack-timeout)`
+    ///    — the nearest registered cancellation-family slug (both differ).
+    /// 3. [`CaveatViolation`](InvocationError::CaveatViolation): slug-first
+    ///    (`from_class`). An unregistered diagnostic slug (e.g. the camelCase
+    ///    counter kind `maxCalls`) collapses to `authorization.denied` (slug
+    ///    differs from terminal's verbatim slug); a registered *cross-class*
+    ///    slug (e.g. `economic.escrow-overflow`) upgrades the code to its own
+    ///    class's canonical code (6150) where terminal keeps the Authorization
+    ///    umbrella (6110) (code differs). A registered *same-class* slug (e.g.
+    ///    `authorization.*`, `input.schema-violation`) is identical.
+    ///
+    /// Reconciling the wire terminal slugs to the registered taxonomy is
+    /// PR-2c/golden-bytes work (it changes wire bytes) and is out of scope here.
+    /// Every OTHER variant produces an identical `(code, slug)` on both maps.
+    ///
+    /// Structured `detail` is extracted from the variant's own fields where a
+    /// typed `DetailBody` shape exists ([`Timeout`](InvocationError::Timeout)
+    /// → `ExecutionTimeout`, [`HandlerPanic`](InvocationError::HandlerPanic)
+    /// → `ExecutionPanic` with the FULL 32-byte SHA-256 of a stable location
+    /// identifier — the outlet id — never the panic message and never
+    /// truncated). Variants with only free-text diagnostics carry
+    /// `detail = None` — never a fabricated placeholder. The §5.4.4
+    /// oracle-collapse variants ([`InvokerNotAuthorized`](InvocationError::InvokerNotAuthorized)
+    /// / [`OutletNotFound`](InvocationError::OutletNotFound)) carry no detail so
+    /// outlet existence is never leaked.
+    #[must_use]
+    pub fn to_surface(&self) -> scp_protocol::context::outlets::errors::OutletErrorSurface {
+        use scp_protocol::context::outlets::error_codes::{
+            CODE_ECONOMIC_FAULT, CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_FAULT,
+            CODE_INPUT_VIOLATION, CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_SESSION,
+            CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_DENIED, SLUG_ECONOMIC_BUDGET_EXCEEDED,
+            SLUG_EXECUTION_CANCEL_ACK_TIMEOUT, SLUG_EXECUTION_HANDLER_PANIC,
+            SLUG_EXECUTION_TIMEOUT, SLUG_INPUT_SCHEMA_VIOLATION, SLUG_KIND_MISMATCH,
+            SLUG_OUTPUT_SCHEMA_VIOLATION, SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+            SLUG_QUERY_COST_VIOLATION, SLUG_QUERY_VIOLATION,
+        };
+        use scp_protocol::context::outlets::errors::{DetailBody, OutletErrorSurface};
+        use sha2::{Digest, Sha256};
+
+        match self {
+            // §5.4.4 has no dedicated "context-not-active" slug; the registered
+            // Protocol-session slug `protocol.context-closed-mid-stream`
+            // (SCP-OUTLET-6101, non-retryable Protocol class) is the closest
+            // registry-consistent match — and it aligns exactly with the
+            // stream-open surface's own `OpenStreamRejection::ContextNotActive`
+            // slug/code. The free-text `current_state` is not part of the
+            // structured surface (structured errors carry no prose); the wire
+            // terminal chunk keeps the descriptive string.
+            Self::ContextNotActive { .. } => OutletErrorSurface::from_code(
+                CODE_PROTOCOL_SESSION,
+                SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+                None,
+            ),
+            // §5.4.4 query-oracle-collapse: unauthorized callers AND unknown
+            // outlets both collapse onto `authorization.denied` with NO detail,
+            // so outlet existence/registration is never leaked.
+            Self::InvokerNotAuthorized { .. } | Self::OutletNotFound { .. } => {
+                OutletErrorSurface::from_class(SLUG_AUTHORIZATION_DENIED, None)
+            }
+            // Free-text validation message — no structured field_path/violation
+            // is derivable, so no FieldViolation detail (never fabricated).
+            Self::InputValidationFailed { .. } => OutletErrorSurface::from_code(
+                CODE_INPUT_VIOLATION,
+                SLUG_INPUT_SCHEMA_VIOLATION,
+                None,
+            ),
+            Self::OutputValidationFailed { .. } => OutletErrorSurface::from_code(
+                CODE_OUTPUT_VIOLATION,
+                SLUG_OUTPUT_SCHEMA_VIOLATION,
+                None,
+            ),
+            Self::Timeout { timeout_ms } => OutletErrorSurface::from_code(
+                CODE_EXECUTION_FAULT,
+                SLUG_EXECUTION_TIMEOUT,
+                Some(DetailBody::ExecutionTimeout {
+                    elapsed_ms: u64::from(*timeout_ms),
+                }),
+            ),
+            // §5.4.4 allocates no dedicated "cancelled" slug; the nearest
+            // cancellation-family Execution slug/code (`execution.cancel-ack-
+            // timeout`, SCP-OUTLET-6135) is the class-consistent normalization.
+            Self::Cancelled => OutletErrorSurface::from_code(
+                CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+                SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
+                None,
+            ),
+            // Free-text failure — no structured detail.
+            Self::ExecutionFailed { .. } => OutletErrorSurface::from_code(
+                CODE_EXECUTION_FAULT,
+                SLUG_EXECUTION_HANDLER_PANIC,
+                None,
+            ),
+            // Full 32-byte SHA-256 of a STABLE location identifier — the
+            // `outlet_id` — NEVER truncated (§5.4.4 round-3 fix), and NEVER the
+            // free-text panic message. The runtime does not capture the panic's
+            // `file:line` at this `catch_unwind` seam (the guard recovers only
+            // the payload), so we fingerprint the panicking code by its stable
+            // outlet identity rather than by the dynamic message — hashing a
+            // free-text message that may embed dynamic values would be a weak
+            // confirmation oracle. The `panic_message` itself is bounded and
+            // reported via the wire terminal chunk, not the structured surface.
+            Self::HandlerPanic { outlet_id, .. } => {
+                let mut hasher = Sha256::new();
+                hasher.update(outlet_id.as_bytes());
+                let digest = hasher.finalize();
+                let mut panic_location_hash = [0u8; 32];
+                panic_location_hash.copy_from_slice(digest.as_slice());
+                OutletErrorSurface::from_code(
+                    CODE_EXECUTION_FAULT,
+                    SLUG_EXECUTION_HANDLER_PANIC,
+                    Some(DetailBody::ExecutionPanic {
+                        panic_location_hash,
+                    }),
+                )
+            }
+            // Economic-class rejections. `BudgetExceeded` carries no ISO-4217
+            // currency at this seam, so no `EconomicInsufficient` detail is
+            // derivable without fabricating a currency.
+            // `CrossContextPaidActionUnsupported` is an open-time zero-escrow
+            // rejection (§5.4.5) — semantically distinct but shares the same
+            // registered `economic.budget-exceeded` surface (the discriminating
+            // detail rides in the error's Display, not the structured surface).
+            Self::BudgetExceeded { .. } | Self::CrossContextPaidActionUnsupported { .. } => {
+                OutletErrorSurface::from_code(
+                    CODE_ECONOMIC_FAULT,
+                    SLUG_ECONOMIC_BUDGET_EXCEEDED,
+                    None,
+                )
+            }
+            Self::OutletQueryCostViolation { .. } => OutletErrorSurface::from_code(
+                CODE_PROTOCOL_VIOLATION,
+                SLUG_QUERY_COST_VIOLATION,
+                None,
+            ),
+            Self::QueryViolation { .. } => {
+                OutletErrorSurface::from_code(CODE_PROTOCOL_VIOLATION, SLUG_QUERY_VIOLATION, None)
+            }
+            Self::KindMismatch { .. } => {
+                OutletErrorSurface::from_code(CODE_PROTOCOL_VIOLATION, SLUG_KIND_MISMATCH, None)
+            }
+            // Slug-first classification: the caveat rule's slug is authoritative.
+            // Registered economic/input/transport slugs (e.g. the open-time
+            // stream-reserve rejections routed through here) keep their class;
+            // unregistered diagnostic slugs (the camelCase caveat-counter kinds
+            // `maxCalls` / `amountMaxCumulative` / `rateWindow`) collapse onto
+            // the Authorization oracle-collapse target.
+            Self::CaveatViolation { slug, .. } => OutletErrorSurface::from_class(slug, None),
+        }
+    }
+}
+
 /// Maps an [`OutletExecutorError`] returned by `exec_*_stream` into the
 /// terminal `ChunkPayload::Error { terminal: true, .. }` chunk the
 /// framework appends to the stream (SCP-OUT-033 AC6).
@@ -8880,6 +9053,329 @@ mod tests {
                 verify_chunk_signature(&recovered, &operator_pk, B_CTX, OUTLET, &CB),
                 "B's operator SCP-OUTLET-CHUNK-SIG-V1 signature is preserved end-to-end \
                  (never re-signed by the bridge) and verifies against B's pinned context_id"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // InvocationError::to_surface — SCP-OUT-031 PR-2a
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn invocation_error_to_surface_is_consistent_per_variant() {
+        use scp_protocol::context::outlets::error_codes::{
+            CODE_ECONOMIC_FAULT, CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_FAULT,
+            CODE_INPUT_VIOLATION, CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_SESSION,
+            CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_DENIED, SLUG_ECONOMIC_ESCROW_OVERFLOW,
+            error_code_to_class, slug_to_class,
+        };
+        use scp_protocol::context::outlets::errors::{DetailBody, OutletErrorClass};
+
+        // (variant, expected class, expected code, expected slug)
+        let cases: Vec<(InvocationError, OutletErrorClass, &str, &str)> = vec![
+            (
+                InvocationError::ContextNotActive {
+                    current_state: "Closing".into(),
+                },
+                OutletErrorClass::Protocol,
+                CODE_PROTOCOL_SESSION,
+                "protocol.context-closed-mid-stream",
+            ),
+            (
+                InvocationError::InvokerNotAuthorized {
+                    did: "d".into(),
+                    outlet_id: "o".into(),
+                },
+                OutletErrorClass::Authorization,
+                scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+                SLUG_AUTHORIZATION_DENIED,
+            ),
+            (
+                InvocationError::OutletNotFound {
+                    outlet_id: "o".into(),
+                },
+                OutletErrorClass::Authorization,
+                scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+                SLUG_AUTHORIZATION_DENIED,
+            ),
+            (
+                InvocationError::InputValidationFailed {
+                    message: "m".into(),
+                },
+                OutletErrorClass::Input,
+                CODE_INPUT_VIOLATION,
+                "input.schema-violation",
+            ),
+            (
+                InvocationError::OutputValidationFailed {
+                    message: "m".into(),
+                },
+                OutletErrorClass::Output,
+                CODE_OUTPUT_VIOLATION,
+                "output.schema-violation",
+            ),
+            (
+                InvocationError::Timeout { timeout_ms: 1234 },
+                OutletErrorClass::Execution,
+                CODE_EXECUTION_FAULT,
+                "execution.timeout",
+            ),
+            (
+                InvocationError::Cancelled,
+                OutletErrorClass::Execution,
+                CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+                "execution.cancel-ack-timeout",
+            ),
+            (
+                InvocationError::ExecutionFailed {
+                    message: "m".into(),
+                },
+                OutletErrorClass::Execution,
+                CODE_EXECUTION_FAULT,
+                "execution.handler-panic",
+            ),
+            (
+                InvocationError::HandlerPanic {
+                    outlet_id: "o".into(),
+                    panic_message: "boom".into(),
+                },
+                OutletErrorClass::Execution,
+                CODE_EXECUTION_FAULT,
+                "execution.handler-panic",
+            ),
+            (
+                InvocationError::BudgetExceeded {
+                    did: "d".into(),
+                    cost: 5,
+                    remaining: 1,
+                },
+                OutletErrorClass::Economic,
+                CODE_ECONOMIC_FAULT,
+                "economic.budget-exceeded",
+            ),
+            (
+                InvocationError::OutletQueryCostViolation { reason: "r".into() },
+                OutletErrorClass::Protocol,
+                CODE_PROTOCOL_VIOLATION,
+                "query-cost-violation",
+            ),
+            (
+                InvocationError::QueryViolation {
+                    outlet_id: "o".into(),
+                    operation: "send_message",
+                },
+                OutletErrorClass::Protocol,
+                CODE_PROTOCOL_VIOLATION,
+                "query-violation",
+            ),
+            (
+                InvocationError::KindMismatch {
+                    outlet_id: "o".into(),
+                    kind: scp_protocol::context::outlets::OutletKind::Query,
+                },
+                OutletErrorClass::Protocol,
+                CODE_PROTOCOL_VIOLATION,
+                "kind-mismatch",
+            ),
+            // Caveat with a registered economic slug — slug-first classification
+            // keeps the discriminating slug + upgrades the class/code.
+            (
+                InvocationError::CaveatViolation {
+                    slug: SLUG_ECONOMIC_ESCROW_OVERFLOW.to_owned(),
+                    message: "m".into(),
+                },
+                OutletErrorClass::Economic,
+                CODE_ECONOMIC_FAULT,
+                SLUG_ECONOMIC_ESCROW_OVERFLOW,
+            ),
+            // Caveat with an unregistered camelCase counter kind — collapses to
+            // the Authorization oracle-collapse target.
+            (
+                InvocationError::CaveatViolation {
+                    slug: "maxCalls".to_owned(),
+                    message: "m".into(),
+                },
+                OutletErrorClass::Authorization,
+                scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+                SLUG_AUTHORIZATION_DENIED,
+            ),
+            (
+                InvocationError::CrossContextPaidActionUnsupported {
+                    outlet_id: "o".into(),
+                },
+                OutletErrorClass::Economic,
+                CODE_ECONOMIC_FAULT,
+                "economic.budget-exceeded",
+            ),
+        ];
+
+        for (err, class, code, slug) in &cases {
+            let s = err.to_surface();
+            assert_eq!(s.class, *class, "variant {err:?} class");
+            assert_eq!(s.code, *code, "variant {err:?} code");
+            assert_eq!(s.slug, *slug, "variant {err:?} slug");
+            // Consistency invariant.
+            assert_eq!(error_code_to_class(&s.code), Some(s.class), "{err:?}");
+            assert_eq!(slug_to_class(&s.slug), Some(s.class), "{err:?}");
+        }
+
+        // Structured detail extraction.
+        let timeout = InvocationError::Timeout { timeout_ms: 4321 }.to_surface();
+        assert_eq!(
+            timeout.detail,
+            Some(DetailBody::ExecutionTimeout { elapsed_ms: 4321 })
+        );
+
+        // HandlerPanic carries the FULL 32-byte SHA-256 of a STABLE location
+        // identifier — the `outlet_id` — never truncated, and NEVER the
+        // free-text panic message (which would be a weak confirmation oracle).
+        let panic_surface = InvocationError::HandlerPanic {
+            outlet_id: "o".into(),
+            panic_message: "boom".into(),
+        }
+        .to_surface();
+        match panic_surface.detail {
+            Some(DetailBody::ExecutionPanic {
+                panic_location_hash,
+            }) => {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(b"o"); // outlet_id, NOT the panic message
+                let want: [u8; 32] = h.finalize().into();
+                assert_eq!(panic_location_hash, want);
+                // Prove it is NOT the message hash (oracle-resistance).
+                let mut hm = Sha256::new();
+                hm.update(b"boom");
+                let msg_hash: [u8; 32] = hm.finalize().into();
+                assert_ne!(
+                    panic_location_hash, msg_hash,
+                    "panic_location_hash must not be the message digest"
+                );
+            }
+            other => panic!("expected ExecutionPanic detail, got {other:?}"),
+        }
+
+        // Oracle-collapse variants carry NO detail (no existence leak).
+        assert!(
+            InvocationError::OutletNotFound {
+                outlet_id: "o".into()
+            }
+            .to_surface()
+            .detail
+            .is_none()
+        );
+    }
+
+    /// SCP-OUT-031 PR-2a drift-guard: `to_surface` and
+    /// `invocation_error_to_terminal_payload` are two independent variant→(code,
+    /// slug) maps. They must stay IDENTICAL on every variant EXCEPT the three
+    /// documented registry-normalizations (`ContextNotActive`, `Cancelled`, and
+    /// `CaveatViolation` on unregistered / cross-class slugs). Pins the intended
+    /// relationship so future drift on any OTHER variant fails a test, and so
+    /// the three normalizations cannot silently revert.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn to_surface_vs_terminal_payload_drift_guard() {
+        // Extracts (code, slug) from the terminal-chunk payload
+        // (`message == "{slug}: {err}"`).
+        fn terminal(err: &InvocationError) -> (String, String) {
+            match invocation_error_to_terminal_payload(err) {
+                ChunkPayload::Error { code, message, .. } => {
+                    let slug = message
+                        .split_once(": ")
+                        .map_or(message.as_str(), |(s, _)| s)
+                        .to_owned();
+                    (code, slug)
+                }
+                other => panic!("expected terminal Error chunk, got {other:?}"),
+            }
+        }
+        fn surface(err: &InvocationError) -> (String, String) {
+            let s = err.to_surface();
+            (s.code, s.slug)
+        }
+
+        // Variants that MUST be identical across both maps.
+        let identical: Vec<InvocationError> = vec![
+            InvocationError::InvokerNotAuthorized {
+                did: "d".into(),
+                outlet_id: "o".into(),
+            },
+            InvocationError::OutletNotFound {
+                outlet_id: "o".into(),
+            },
+            InvocationError::InputValidationFailed {
+                message: "m".into(),
+            },
+            InvocationError::OutputValidationFailed {
+                message: "m".into(),
+            },
+            InvocationError::Timeout { timeout_ms: 1 },
+            InvocationError::ExecutionFailed {
+                message: "m".into(),
+            },
+            InvocationError::HandlerPanic {
+                outlet_id: "o".into(),
+                panic_message: "p".into(),
+            },
+            InvocationError::BudgetExceeded {
+                did: "d".into(),
+                cost: 1,
+                remaining: 0,
+            },
+            InvocationError::OutletQueryCostViolation { reason: "r".into() },
+            InvocationError::QueryViolation {
+                outlet_id: "o".into(),
+                operation: "send_message",
+            },
+            InvocationError::KindMismatch {
+                outlet_id: "o".into(),
+                kind: scp_protocol::context::outlets::OutletKind::Query,
+            },
+            InvocationError::CrossContextPaidActionUnsupported {
+                outlet_id: "o".into(),
+            },
+            // Registered SAME-class caveat slugs are identical on both maps.
+            InvocationError::CaveatViolation {
+                slug: "authorization.revoked".into(),
+                message: "m".into(),
+            },
+            InvocationError::CaveatViolation {
+                slug: "input.schema-violation".into(),
+                message: "m".into(),
+            },
+        ];
+        for err in &identical {
+            assert_eq!(
+                surface(err),
+                terminal(err),
+                "surface and terminal must be identical for {err:?}"
+            );
+        }
+
+        // The THREE documented registry-normalizations: surface != terminal.
+        let normalized: Vec<InvocationError> = vec![
+            InvocationError::ContextNotActive {
+                current_state: "Closing".into(),
+            },
+            InvocationError::Cancelled,
+            // Unregistered diagnostic slug — collapses to authorization.denied.
+            InvocationError::CaveatViolation {
+                slug: "maxCalls".into(),
+                message: "m".into(),
+            },
+            // Registered CROSS-class slug — code upgrades 6110 → 6150.
+            InvocationError::CaveatViolation {
+                slug: "economic.escrow-overflow".into(),
+                message: "m".into(),
+            },
+        ];
+        for err in &normalized {
+            assert_ne!(
+                surface(err),
+                terminal(err),
+                "surface MUST diverge from terminal for the documented normalization {err:?}"
             );
         }
     }

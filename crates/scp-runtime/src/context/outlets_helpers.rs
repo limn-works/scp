@@ -560,15 +560,6 @@ pub struct InvocationCaveatBinding {
 // Context-lifecycle Active gate (shared by every forward-debit reserve path)
 // ---------------------------------------------------------------------------
 
-/// The `SCP-OUTLET-6080` "context not active" marker string.
-///
-/// Stamped into the `PermissionDenied` message by [`invocation_error_to_context`]
-/// and matched back out by [`reserve_error_to_open_rejection`]. Kept as one
-/// const so the producer and the reverse-map consumer move together if the code
-/// is ever renamed (mirrors the `SLUG_*`-constant discipline the escrow /
-/// insufficient-funds reverse-map arms already use).
-const SCP_OUTLET_6080_MARKER: &str = "SCP-OUTLET-6080";
-
 /// The `SCP-OUTLET-6089` "invoker is not a member" marker string.
 ///
 /// Stamped into the `PermissionDenied` message by the
@@ -595,27 +586,47 @@ const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
 /// This is the single authoritative runtime gate that closes the root cause: it
 /// reads the sync lock-free authoritative [`ContextHandle::state`] (an `ArcSwap`
 /// load — never the lagging FFI handle cache) and, when the context is not
-/// `Active`, returns the canonical `SCP-OUTLET-6080` error via the SAME path the
-/// SESSION path (`create_session` / `invoke_session`) uses —
-/// [`InvocationError::ContextNotActive`] → [`invocation_error_to_context`]. The
-/// per-bridge guards are thereby demoted to true defense-in-depth.
+/// `Active`, returns the typed
+/// [`ContextError::OutletContextNotActive`](scp_protocol::context::ContextError::OutletContextNotActive)
+/// carrier. The per-bridge guards are thereby demoted to true defense-in-depth.
 ///
 /// Called as the FIRST predicate on each reserve path (before any escrow debit
 /// or bookkeeping mutation), so a rejected open touches no state and needs no
 /// rollback.
 ///
+/// # FFI safety (SCP-OUT-031 PR-2a)
+///
+/// This gate runs BEFORE the authorization/membership check on BOTH reserve
+/// paths, so its error can reach an unauthorized caller. It therefore must NOT
+/// carry the raw lifecycle state as FFI-facing prose (the pre-fix
+/// `SCP-OUTLET-6080: context not active: {state}` `PermissionDenied` leaked the
+/// exact state — `Closing` / `Expired` / `MigratingOut` — before authz):
+///
+/// - **Unary path** (`reserve_outlet_economy` → `?` →
+///   `Supervisor::invoke_outlet_with_economy`): the `ContextError` propagates
+///   verbatim to the FFI bridge, which renders `Display` = the structured,
+///   **state-free** `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`.
+/// - **Streaming path** (`reserve_outlet_stream_economy` /
+///   `reserve_stream_grant_escrow`): the `ContextError` is reverse-mapped by
+///   [`reserve_error_to_open_rejection`], which reads `current_state` **typed**
+///   into [`OpenStreamRejection::ContextNotActive`]; the stream-open FFI seam
+///   (`open_rejection_to_err`) then emits only `error_code()` + `slug()` — also
+///   state-free.
+///
+/// So `current_state` stays available internally (streaming reverse-map) yet
+/// never reaches any FFI caller.
+///
 /// # Errors
 ///
-/// [`ContextError::PermissionDenied`] carrying `SCP-OUTLET-6080: context not
-/// active: {current_state}` when `handle.state() != ContextState::Active`.
+/// [`ContextError::OutletContextNotActive`] carrying the observed
+/// [`ContextState`] (typed, internal-only) when
+/// `handle.state() != ContextState::Active`.
 fn ensure_context_active(handle: &ContextHandle) -> Result<(), ContextError> {
     let state = handle.state();
     if state != ContextState::Active {
-        return Err(invocation_error_to_context(
-            InvocationError::ContextNotActive {
-                current_state: state.to_string(),
-            },
-        ));
+        return Err(ContextError::OutletContextNotActive {
+            current_state: state,
+        });
     }
     Ok(())
 }
@@ -2880,13 +2891,42 @@ fn consume_caveat_counters(
 /// onto the Authorization-class [`InvocationError::CaveatViolation`] → typed
 /// [`ContextError`], naming the caveat kind that fired (slug) and the owning
 /// UCAN CID.
+///
+/// SCP-OUT-031 PR-2a: the slug is the **registered §5.4.4 authorization slug**
+/// for the exhausted counter kind — NOT the camelCase internal
+/// [`CaveatKind::as_str`](scp_protocol::CaveatKind::as_str) name (which is not
+/// a §5.4.4 slug). This keeps the resulting [`OutletErrorSurface`] registry-
+/// consistent while preserving the cumulative/rate distinction. `MaxCalls` has
+/// no dedicated §5.4.4 slug, so it collapses onto the `authorization.denied`
+/// oracle-collapse target.
 fn counter_exhausted_to_context(
     ucan_cid: &str,
     err: &crate::trust::caveat_counters::CounterExhausted,
 ) -> ContextError {
+    use scp_protocol::context::outlets::error_codes::{
+        SLUG_AUTHORIZATION_CUMULATIVE_EXCEEDED, SLUG_AUTHORIZATION_DENIED,
+        SLUG_AUTHORIZATION_RATE_EXCEEDED,
+    };
+
+    let slug = match err.kind() {
+        CaveatKind::AmountCumulative => SLUG_AUTHORIZATION_CUMULATIVE_EXCEEDED,
+        CaveatKind::RateWindow => SLUG_AUTHORIZATION_RATE_EXCEEDED,
+        // No dedicated §5.4.4 slug for an invocation `max_calls` cap — collapse
+        // onto the Authorization oracle-collapse target.
+        CaveatKind::MaxCalls => SLUG_AUTHORIZATION_DENIED,
+    };
+    // SCP-OUT-031 PR-2a: the structured `OutletErrorSurface` reads only the slug
+    // (no free-text message), so log the `ucan_cid` + exact counter kind here so
+    // the operator diagnostic is not silently lost across the seam.
+    tracing::debug!(
+        ucan_cid = %ucan_cid,
+        caveat_kind = %err.kind().as_str(),
+        slug = %slug,
+        "outlet caveat counter exhausted"
+    );
     invocation_error_to_context(InvocationError::CaveatViolation {
-        slug: err.kind().as_str().to_owned(),
-        message: format!("ucan_cid={ucan_cid}: {err}"),
+        slug: slug.to_owned(),
+        message: format!("ucan_cid={ucan_cid} ({}): {err}", err.kind().as_str()),
     })
 }
 
@@ -2896,86 +2936,38 @@ fn counter_exhausted_to_context(
 fn check_invocation_error_to_context(
     err: &scp_protocol::trust::caveats::CheckInvocationError,
 ) -> ContextError {
+    // SCP-OUT-031 PR-2a: the structured surface keeps only the slug, so log the
+    // full rule diagnostic here so it is not silently lost across the seam.
+    tracing::debug!(slug = %err.slug(), detail = %err, "outlet §7.3.8 caveat local-check rejected");
     invocation_error_to_context(InvocationError::CaveatViolation {
         slug: err.slug().to_owned(),
         message: err.to_string(),
     })
 }
 
+/// Projects an [`InvocationError`] onto the typed
+/// [`ContextError::Outlet`](scp_protocol::context::ContextError::Outlet)
+/// carrying the full §5.4.4 [`OutletErrorSurface`](scp_protocol::context::outlets::errors::OutletErrorSurface)
+/// (SCP-OUT-031 PR-2a).
+///
+/// This is the **root-cause fix** for SCP-OUT-031 PR-2a. Outlet invocation
+/// errors previously flattened here to `ContextError::PermissionDenied(String)`
+/// — collapsing every `class` / `detail` / `retry` / `source_chain`
+/// distinction into a prose `SCP-OUTLET-NNNN:` string BEFORE the FFI boundary,
+/// so the three `From<OutletError>` bridge impls (and every SDK) could only
+/// re-parse a code prefix out of the message. The structured surface now
+/// crosses the runtime → `ContextError` seam intact; the bridges (PR-2b) and
+/// SDKs rebuild the typed error hierarchy losslessly.
+///
+/// The per-variant `(class, code, slug, detail, retry)` mapping is
+/// single-sourced on [`InvocationError::to_surface`] — never re-derived in the
+/// bridges.
+// Ownership-consuming conversion (a `From`-like seam): every caller hands over
+// an owned `InvocationError` it no longer needs. `to_surface` borrows, so the
+// value is dropped at the end — the by-value signature is the natural shape.
+#[allow(clippy::needless_pass_by_value)]
 fn invocation_error_to_context(err: InvocationError) -> ContextError {
-    match err {
-        InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
-            format!("{SCP_OUTLET_6080_MARKER}: context not active: {current_state}"),
-        ),
-        InvocationError::InvokerNotAuthorized { did, outlet_id } => ContextError::PermissionDenied(
-            format!("SCP-OUTLET-6081: invoker {did} lacks OutletCall({outlet_id})"),
-        ),
-        InvocationError::OutletNotFound { outlet_id } => ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6082: outlet not found: {outlet_id}"
-        )),
-        InvocationError::InputValidationFailed { message } => ContextError::PermissionDenied(
-            format!("SCP-OUTLET-6083: input schema validation failed: {message}"),
-        ),
-        InvocationError::OutputValidationFailed { message } => ContextError::PermissionDenied(
-            format!("SCP-OUTLET-6084: output schema validation failed: {message}"),
-        ),
-        InvocationError::ExecutionFailed { message } => ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6085: outlet execution failed: {message}"
-        )),
-        InvocationError::Timeout { timeout_ms } => ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6086: outlet execution timed out after {timeout_ms}ms"
-        )),
-        InvocationError::Cancelled => ContextError::PermissionDenied(
-            "SCP-OUTLET-6087: outlet invocation cancelled".to_owned(),
-        ),
-        InvocationError::BudgetExceeded {
-            did,
-            cost,
-            remaining,
-        } => ContextError::PermissionDenied(format!(
-            "SCP-ECON-12010: budget exceeded for {did}: cost {cost}, remaining {remaining}"
-        )),
-        // §7.3.8 caveat violations (synchronous local check or counter-bearing
-        // cap) surface as an Authorization-class permission denial; the slug
-        // names the exact caveat rule that fired (§5.4.4 / §7.3.8).
-        InvocationError::CaveatViolation { slug, message } => ContextError::PermissionDenied(
-            format!("SCP-OUTLET-6110: caveat violation [{slug}]: {message}"),
-        ),
-        // §5.4.2 Protocol-class violations (SCP-OUT-013): Query cost rule,
-        // ReadOnlyInvocation write-deny, and executor kind mismatch all map
-        // to the Protocol code family.
-        InvocationError::OutletQueryCostViolation { reason } => ContextError::PermissionDenied(
-            format!("SCP-OUTLET-6100: Query outlet cost violation (§5.4.2): {reason}"),
-        ),
-        InvocationError::QueryViolation {
-            outlet_id,
-            operation,
-        } => ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6100: Query outlet {outlet_id} attempted write {operation} through ReadOnlyInvocation (§5.4.2)"
-        )),
-        InvocationError::KindMismatch { outlet_id, kind } => {
-            ContextError::PermissionDenied(format!(
-                "SCP-OUTLET-6100: outlet {outlet_id} registered as {kind:?} but executor returned KindMismatch (§5.4.2)"
-            ))
-        }
-        // §5.4.2 / §5.4.4 executor panic (SCP-OUT-028): Execution-class fault.
-        InvocationError::HandlerPanic {
-            outlet_id,
-            panic_message,
-        } => ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6130: outlet {outlet_id} handler panicked (execution.handler-panic): {panic_message}"
-        )),
-        // §5.4.5 "Cross-context economy" (ADR-061): a best-effort cross-context
-        // open of a PAID Action outlet is rejected zero-escrow. This is an
-        // open-time Economic-class rejection (`SCP-OUTLET-6150`) — NOT a
-        // Transport fault — directing the caller to the streaming saga
-        // (SCP-OUT-046) for a metered paid cross-context stream.
-        InvocationError::CrossContextPaidActionUnsupported { outlet_id } => {
-            ContextError::PermissionDenied(format!(
-                "SCP-OUTLET-6150: outlet {outlet_id} is a paid Action outlet; the best-effort cross-context bridge is zero-escrow — use the streaming saga (SCP-OUT-046) for a metered paid cross-context stream"
-            ))
-        }
-    }
+    ContextError::Outlet(Box::new(err.to_surface()))
 }
 
 // ---------------------------------------------------------------------------
@@ -3021,35 +3013,38 @@ pub fn reserve_error_to_open_rejection(
         ContextError::RateLimited { .. } => OpenStreamRejection::AdmissionRateLimited {
             slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
         },
-        ContextError::PermissionDenied(msg)
-            if msg.contains(error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW) =>
+        // SCP-OUT-031 PR-2a: outlet errors now cross the actor mailbox as the
+        // typed `ContextError::Outlet(surface)` (the pre-PR-2a
+        // `PermissionDenied(String)` flattening is gone). Route by the surface's
+        // structured `slug` / `code` — the SAME `error_codes::SLUG_*` / `CODE_*`
+        // constants the reserve stamped — instead of `msg.contains(...)` on a
+        // prose string, so the two ends still move together if a slug/code is
+        // renamed.
+        ContextError::Outlet(surface)
+            if surface.slug == error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW =>
         {
             OpenStreamRejection::EscrowOverflow
         }
-        ContextError::PermissionDenied(msg)
-            if msg.contains(error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS) =>
+        ContextError::Outlet(surface)
+            if surface.slug == error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS =>
         {
             OpenStreamRejection::InsufficientFunds
         }
-        // #2196 error-masking fix — the new `ensure_context_active` gate stamps
-        // the canonical `SCP-OUTLET-6080` marker into a `PermissionDenied`. Map
-        // it to the stream-open surface's `ContextNotActive` rejection
-        // (`protocol.context-closed-mid-stream` / `SCP-OUTLET-6101`, the
-        // NON-retryable Protocol class) rather than letting it fall through to
-        // the catch-all below, which collapses everything into the RETRYABLE
-        // transport rate-limit slug. A permanent "context not active" failure
-        // must never be reported as a transient, retryable condition. The
-        // `current_state` is recovered from the message tail (the marker format
-        // is `{marker}: context not active: {current_state}`; `ContextState`
-        // renders with no embedded `": "`, so the last segment is the state).
-        ContextError::PermissionDenied(msg) if msg.contains(SCP_OUTLET_6080_MARKER) => {
-            let current_state = msg
-                .rsplit(": ")
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            OpenStreamRejection::ContextNotActive { current_state }
+        // #2196 error-masking fix — the `ensure_context_active` gate returns the
+        // typed `ContextError::OutletContextNotActive { current_state }` carrier
+        // (SCP-OUT-031 PR-2a). Read `current_state` TYPED into the stream-open
+        // surface's `ContextNotActive` rejection (`protocol.context-closed-mid-
+        // stream` / `SCP-OUTLET-6101`, the NON-retryable Protocol class) rather
+        // than letting it fall through to the catch-all below, which collapses
+        // everything into the RETRYABLE transport rate-limit slug — a permanent
+        // "context not active" failure must never be reported as a transient,
+        // retryable condition. `current_state` stays internal: it rides the
+        // typed carrier here and the stream-open FFI seam (`open_rejection_to_err`)
+        // emits only the code + slug, never the state.
+        ContextError::OutletContextNotActive { current_state } => {
+            OpenStreamRejection::ContextNotActive {
+                current_state: current_state.to_string(),
+            }
         }
         // #2196 error-masking fix — the membership gate emits SCP-OUTLET-6089
         // (invoker is not a member of the context) as a plain `PermissionDenied`.
@@ -3615,7 +3610,122 @@ mod tests {
         use crate::context::actor::class_s::ClassSCell;
         use crate::context::actor::deps::ActorDeps;
         use crate::context::actor::state::PerContextState;
+        use crate::context::outlets::invoke::InvocationError;
         use crate::trust::caveat_counters::CaveatCounters;
+
+        /// SCP-OUT-031 PR-2a root-cause proof: the runtime → `ContextError`
+        /// seam (`invocation_error_to_context`) NO LONGER flattens outlet
+        /// invocation errors into `PermissionDenied(String)` — it carries the
+        /// typed `ContextError::Outlet(OutletErrorSurface)`.
+        #[test]
+        fn invocation_error_to_context_yields_typed_outlet_never_permission_denied() {
+            use scp_protocol::context::outlets::errors::OutletErrorClass;
+
+            let timeout = super::super::invocation_error_to_context(InvocationError::Timeout {
+                timeout_ms: 100,
+            });
+            match timeout {
+                ContextError::Outlet(surface) => {
+                    assert_eq!(surface.class, OutletErrorClass::Execution);
+                    assert_eq!(
+                        surface.code,
+                        scp_protocol::context::outlets::error_codes::CODE_EXECUTION_FAULT
+                    );
+                }
+                other => panic!("expected ContextError::Outlet, got {other:?}"),
+            }
+
+            // Every outlet invocation error must be typed Outlet — never the
+            // pre-PR-2a `PermissionDenied(String)` flattening.
+            for err in [
+                InvocationError::Cancelled,
+                InvocationError::OutletNotFound {
+                    outlet_id: "o".into(),
+                },
+                InvocationError::CaveatViolation {
+                    slug: "maxCalls".into(),
+                    message: "m".into(),
+                },
+            ] {
+                assert!(
+                    matches!(
+                        super::super::invocation_error_to_context(err),
+                        ContextError::Outlet(_)
+                    ),
+                    "outlet errors must not flatten to PermissionDenied(String)"
+                );
+            }
+        }
+
+        /// SCP-OUT-031 PR-2a — direct coverage of the supervisor-side
+        /// `reserve_error_to_open_rejection` reverse-map arms (previously only
+        /// exercised indirectly through Display-string assertions).
+        #[test]
+        fn reserve_error_reverse_map_arms() {
+            use crate::context::outlets::dispatch::OpenStreamRejection;
+            use scp_protocol::context::outlets::error_codes;
+            use scp_protocol::context::outlets::errors::OutletErrorSurface;
+
+            // Economic reserve rejections cross the mailbox as the typed
+            // `Outlet(surface)` and are routed by the surface's structured slug.
+            let escrow = super::super::reserve_error_to_open_rejection(&ContextError::Outlet(
+                Box::new(OutletErrorSurface::from_class(
+                    error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW,
+                    None,
+                )),
+            ));
+            assert!(
+                matches!(escrow, OpenStreamRejection::EscrowOverflow),
+                "{escrow:?}"
+            );
+
+            let funds = super::super::reserve_error_to_open_rejection(&ContextError::Outlet(
+                Box::new(OutletErrorSurface::from_class(
+                    error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
+                    None,
+                )),
+            ));
+            assert!(
+                matches!(funds, OpenStreamRejection::InsufficientFunds),
+                "{funds:?}"
+            );
+
+            // The typed context-not-active carrier keeps `current_state`.
+            let not_active = super::super::reserve_error_to_open_rejection(
+                &ContextError::OutletContextNotActive {
+                    current_state: ContextState::Closing,
+                },
+            );
+            match not_active {
+                OpenStreamRejection::ContextNotActive { current_state } => {
+                    assert!(
+                        current_state.contains("Closing"),
+                        "reverse-map recovers the typed lifecycle state: {current_state}"
+                    );
+                }
+                other => panic!("expected ContextNotActive, got {other:?}"),
+            }
+
+            // Hard-rate-limit → transport admission slug.
+            let rl = super::super::reserve_error_to_open_rejection(&ContextError::RateLimited {
+                resource: "outlet_call".to_owned(),
+                message: "bucket empty".to_owned(),
+                retry_after_ms: None,
+            });
+            assert!(
+                matches!(rl, OpenStreamRejection::AdmissionRateLimited { .. }),
+                "{rl:?}"
+            );
+
+            // Any other error is genuinely transient → retryable transport slug.
+            let other = super::super::reserve_error_to_open_rejection(
+                &ContextError::PersistenceFailed("disk".to_owned()),
+            );
+            assert!(
+                matches!(other, OpenStreamRejection::AdmissionRateLimited { .. }),
+                "{other:?}"
+            );
+        }
 
         const INVOKER: &str = "did:dht:z6MkCaveatInvoker";
         const CTX_BYTE: u8 = 0xCA;
@@ -3660,8 +3770,11 @@ mod tests {
                 1_000,
             )
             .expect_err("amount cap already met — the consume must reject");
+            // SCP-OUT-031 PR-2a: the typed surface carries the registered
+            // §5.4.4 slug (`authorization.cumulative-exceeded`), not the
+            // camelCase counter-kind name.
             assert!(
-                format!("{err}").contains("amountMaxCumulative"),
+                format!("{err}").contains("authorization.cumulative-exceeded"),
                 "must reject on the amount kind: {err}"
             );
             let rec = &counters[cid];
@@ -3737,9 +3850,13 @@ mod tests {
             )
             .expect_err("second exceeds cap");
             let msg = format!("{err}");
+            // SCP-OUT-031 PR-2a: `max_calls` has no dedicated §5.4.4 slug, so
+            // the typed surface collapses onto `authorization.denied` under the
+            // Authorization code (SCP-OUTLET-6110).
             assert!(
-                msg.contains(scp_protocol::CODE_AUTHORIZATION_DENIED) && msg.contains("maxCalls"),
-                "exhaustion must map to the Authorization code + kind slug: {msg}"
+                msg.contains(scp_protocol::CODE_AUTHORIZATION_DENIED)
+                    && msg.contains("authorization.denied"),
+                "exhaustion must map to the Authorization code + collapse slug: {msg}"
             );
         }
 
@@ -4003,9 +4120,12 @@ mod tests {
             )
             .await
             .expect_err("second invocation must exceed max_calls=1");
+            // SCP-OUT-031 PR-2a: `max_calls` collapses onto `authorization.denied`
+            // (no dedicated §5.4.4 slug); the counter-state assertions below are
+            // the authoritative proof it was the max_calls path.
             assert!(
-                format!("{err}").contains("maxCalls"),
-                "reject must name the maxCalls caveat: {err}"
+                format!("{err}").contains("authorization.denied"),
+                "reject must surface the Authorization collapse slug: {err}"
             );
             assert_eq!(
                 cell.class_s.caveat_counters[cid].max_calls_used, 1,
@@ -4142,9 +4262,10 @@ mod tests {
             )
             .await
             .expect_err("second within the same window exceeds max=1");
+            // SCP-OUT-031 PR-2a: registered §5.4.4 slug for the rate-window cap.
             assert!(
-                format!("{err}").contains("rateWindow"),
-                "reject must name the rateWindow caveat: {err}"
+                format!("{err}").contains("authorization.rate-exceeded"),
+                "reject must name the rate-window caveat slug: {err}"
             );
         }
 
@@ -4533,9 +4654,10 @@ mod tests {
             let err = paid_reserve_step(&mut cell, &deps, &spending2, &caveats, cid, &input, now)
                 .await
                 .expect_err("second paid reserve must exceed max_calls=1");
+            // SCP-OUT-031 PR-2a: `max_calls` collapses onto `authorization.denied`.
             assert!(
-                format!("{err}").contains("maxCalls"),
-                "the PAID-path reject must name the maxCalls caveat: {err}"
+                format!("{err}").contains("authorization.denied"),
+                "the PAID-path reject must surface the Authorization collapse slug: {err}"
             );
 
             // (b) Compensation ran: the CounterExhausted reject rolled the
@@ -4615,9 +4737,10 @@ mod tests {
             let err = paid_reserve_step(&mut cell, &deps, &spending3, &caveats, cid, &input, now)
                 .await
                 .expect_err("third paid reserve: cumulative would be 15 > 12");
+            // SCP-OUT-031 PR-2a: registered §5.4.4 slug for the cumulative cap.
             assert!(
-                format!("{err}").contains("amountMaxCumulative"),
-                "the reject must name the amountMaxCumulative caveat: {err}"
+                format!("{err}").contains("authorization.cumulative-exceeded"),
+                "the reject must name the cumulative caveat slug: {err}"
             );
             // The rejected call did not advance the cumulative counter past its
             // last admitted value (all-or-nothing consume on a clone).
@@ -4629,14 +4752,17 @@ mod tests {
 
         /// #2196 — fail-closed `ContextState::Active` gate on the unary reserve.
         /// A non-active (Closing / Expired / `MigratingOut`) context rejects with
-        /// SCP-OUTLET-6080 BEFORE any budget debit, spending-nonce consume, or
+        /// the typed `ContextError::OutletContextNotActive` carrier (SCP-OUT-031
+        /// PR-2a) BEFORE any budget debit, spending-nonce consume, or
         /// caveat-counter mutation — the gate is the FIRST predicate. A paid
         /// reserve that WOULD charge leaves the funded budget untouched and
-        /// touches no counter. That the error is the 6080 `PermissionDenied` (not a
-        /// `RateLimited` / `maxCalls` / insufficient-funds reject) proves the gate
-        /// short-circuited BEFORE the hard-rate / velocity / pre-check gates ran
-        /// (no rollback path was taken). Also covers the caller side of the unary
-        /// cross-context saga (`prepare_a` → `reserve_outlet_economy`).
+        /// touches no counter. That the error is the typed `OutletContextNotActive`
+        /// carrier (not a `RateLimited` / `maxCalls` / insufficient-funds reject)
+        /// proves the gate short-circuited BEFORE the hard-rate / velocity /
+        /// pre-check gates ran (no rollback path was taken); its `Display` is the
+        /// structured, state-free `SCP-OUTLET-6101` surface (no pre-authz leak).
+        /// Also covers the caller side of the unary cross-context saga
+        /// (`prepare_a` → `reserve_outlet_economy`).
         #[tokio::test]
         async fn unary_reserve_gated_on_non_active_context() {
             let deps = build_deps_paid(Box::new(OkPersistence)).await;
@@ -4668,12 +4794,31 @@ mod tests {
                 )
                 .await
                 .expect_err("a non-active context must reject the unary reserve before any debit");
-                let ContextError::PermissionDenied(msg) = &err else {
-                    panic!("expected PermissionDenied(SCP-OUTLET-6080), got {err:?}");
+                // SCP-OUT-031 PR-2a: the shared `ensure_context_active` gate
+                // returns the TYPED `OutletContextNotActive` carrier. It carries
+                // `current_state` for the streaming reverse-map, but its
+                // `Display` (and therefore the unary FFI render) is state-free —
+                // the raw lifecycle state MUST NOT leak to an unauthorized caller
+                // (this gate runs before authz).
+                let ContextError::OutletContextNotActive { current_state } = &err else {
+                    panic!("expected ContextError::OutletContextNotActive, got {err:?}");
                 };
+                assert_eq!(
+                    *current_state, target,
+                    "the typed carrier retains the lifecycle state INTERNALLY ({target})"
+                );
+                let rendered = format!("{err}");
                 assert!(
-                    msg.contains("SCP-OUTLET-6080") && msg.contains(&target.to_string()),
-                    "reject must be the 6080 context-not-active error naming {target}: {msg}"
+                    rendered
+                        .contains(scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION)
+                        && rendered.contains(
+                            scp_protocol::context::outlets::error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM
+                        ),
+                    "Display must be the structured Protocol-session surface: {rendered}"
+                );
+                assert!(
+                    !rendered.contains(&target.to_string()),
+                    "Display MUST NOT leak the raw lifecycle state {target}: {rendered}"
                 );
                 assert_eq!(
                     cell.governance.budget_tracker.remaining(&invoker).0,
@@ -5476,11 +5621,12 @@ mod tests {
         }
 
         /// Streaming open reserve (SCP-OUT-037 same-context open; SCP-OUT-047
-        /// target-side saga reserve): a non-active context rejects with
-        /// SCP-OUTLET-6080 naming the state, debiting NO escrow. The 6080
-        /// `PermissionDenied` (not a `RateLimited` / membership / overflow reject)
-        /// proves the gate ran before the hard-rate / velocity / membership /
-        /// overflow / funds gates.
+        /// target-side saga reserve): a non-active context rejects with the typed
+        /// `ContextError::OutletContextNotActive` carrier (SCP-OUT-031 PR-2a),
+        /// debiting NO escrow. The typed carrier (not a `RateLimited` /
+        /// membership / overflow reject) proves the gate ran before the hard-rate
+        /// / velocity / membership / overflow / funds gates; the reverse-map reads
+        /// `current_state` typed into `OpenStreamRejection::ContextNotActive`.
         #[tokio::test]
         async fn stream_reserve_gated_on_non_active_context() {
             let deps = build_deps(Box::new(OkPersistence)).await;
@@ -5490,12 +5636,23 @@ mod tests {
                 let err = reserve(&mut cell, &deps, 10, 4, None).await.expect_err(
                     "a non-active context must reject the stream open before any debit",
                 );
-                let ContextError::PermissionDenied(msg) = &err else {
-                    panic!("expected PermissionDenied(SCP-OUTLET-6080), got {err:?}");
+                // SCP-OUT-031 PR-2a: the shared `ensure_context_active` gate
+                // returns the TYPED `OutletContextNotActive` carrier — it keeps
+                // `current_state` internally for the reverse-map, but its
+                // `Display` is state-free (no leak to an unauthorized caller).
+                let ContextError::OutletContextNotActive { current_state } = &err else {
+                    panic!("expected ContextError::OutletContextNotActive, got {err:?}");
                 };
+                assert_eq!(
+                    *current_state, target,
+                    "the typed carrier retains the lifecycle state INTERNALLY ({target})"
+                );
+                let rendered = format!("{err}");
                 assert!(
-                    msg.contains("SCP-OUTLET-6080") && msg.contains(&target.to_string()),
-                    "reject must be the 6080 context-not-active error naming {target}: {msg}"
+                    rendered.contains(
+                        scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+                    ) && !rendered.contains(&target.to_string()),
+                    "Display must be the structured state-free surface: {rendered}"
                 );
                 assert_eq!(
                     cell.governance.budget_tracker.total_spent(&invoker()),
@@ -5520,12 +5677,23 @@ mod tests {
                 let err = grant_reserve(&mut cell, &deps, 10, 4)
                     .await
                     .expect_err("a non-active context must reject a mid-stream grant top-up");
-                let ContextError::PermissionDenied(msg) = &err else {
-                    panic!("expected PermissionDenied(SCP-OUTLET-6080), got {err:?}");
+                // SCP-OUT-031 PR-2a: the shared `ensure_context_active` gate
+                // returns the TYPED `OutletContextNotActive` carrier — it keeps
+                // `current_state` internally for the reverse-map, but its
+                // `Display` is state-free (no leak to an unauthorized caller).
+                let ContextError::OutletContextNotActive { current_state } = &err else {
+                    panic!("expected ContextError::OutletContextNotActive, got {err:?}");
                 };
+                assert_eq!(
+                    *current_state, target,
+                    "the typed carrier retains the lifecycle state INTERNALLY ({target})"
+                );
+                let rendered = format!("{err}");
                 assert!(
-                    msg.contains("SCP-OUTLET-6080") && msg.contains(&target.to_string()),
-                    "reject must be the 6080 context-not-active error naming {target}: {msg}"
+                    rendered.contains(
+                        scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+                    ) && !rendered.contains(&target.to_string()),
+                    "Display must be the structured state-free surface: {rendered}"
                 );
                 assert_eq!(
                     cell.governance.budget_tracker.total_spent(&invoker()),

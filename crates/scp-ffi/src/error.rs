@@ -437,14 +437,19 @@ impl From<scp_identity::IdentityError> for ScpPyError {
 
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
-/// `ContextManager::invoke_outlet_with_economy` and several other paths
-/// surface category-specific error codes inside `PermissionDenied(String)`
-/// (e.g. `"SCP-ECON-12010: budget exceeded for ..."`,
-/// `"SCP-OUTLET-6080: context not active: ..."`). Without this parser the
-/// bridge would bucket every such error under the generic `SCP-CTX-2001`
-/// envelope and Python callers would have to string-match the message
-/// body. This helper preserves the existing typed-envelope contract by
-/// recovering the embedded code prefix.
+/// Several runtime paths surface category-specific error codes inside
+/// `PermissionDenied(String)` (e.g. `"SCP-ECON-12010: budget exceeded for
+/// ..."`, or the settle-path `"SCP-OUTLET-6089: outlet-economy settle ...
+/// found no context"`). Without this parser the bridge would bucket every
+/// such error under the generic `SCP-CTX-2001` envelope and Python callers
+/// would have to string-match the message body. This helper preserves the
+/// existing typed-envelope contract by recovering the embedded code prefix.
+///
+/// SCP-OUT-031 PR-2a note: outlet INVOCATION errors and the reserve-gate
+/// context-not-active condition no longer travel as `PermissionDenied` prose —
+/// they are the typed `ContextError::Outlet` / `OutletContextNotActive` arms
+/// handled ABOVE this parser. This helper now serves the economy + residual
+/// outlet-coded diagnostics only.
 ///
 /// Returns `None` when the message does not start with a recognizable
 /// `SCP-` prefix or the prefix does not parse as `LETTERS-DIGITS`.
@@ -575,6 +580,30 @@ impl From<scp_core::context::ContextError> for ScpPyError {
             CE::NothingToRestore(_) => Self::ContextError {
                 message: format!("{e}"),
                 code: codes::CTX_2137.to_owned(),
+            },
+            // SCP-OUT-031 PR-2a: outlet invocation errors now arrive as the
+            // typed `ContextError::Outlet(surface)` carrying the §5.4.4
+            // class/code/slug/retry/detail (was `PermissionDenied(String)`).
+            // Preserve at least the concrete outlet code — parity with the
+            // pre-PR-2a path, which re-parsed the `SCP-OUTLET-NNNN` prefix out
+            // of the message and routed it to `ContextError`. The `Display`
+            // renders the faithful `[code] class: slug`.
+            //
+            // PR-2b: render the structured surface here (class/detail/retry/
+            // source_chain) into a richer typed Python exception.
+            CE::Outlet(surface) => Self::ContextError {
+                message: format!("{e}"),
+                code: surface.code.clone(),
+            },
+            // SCP-OUT-031 PR-2a: the outlet reserve-gate context-not-active
+            // carrier. `Display` is the structured, STATE-FREE
+            // `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`
+            // — the raw lifecycle `current_state` is NEVER rendered here, so an
+            // unauthorized caller (this gate runs before authz) learns only that
+            // the context is not active, not which lifecycle state it is in.
+            CE::OutletContextNotActive { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
             },
             _ => Self::ContextError {
                 message: format!("{e} — verify context state, membership, and permissions"),
@@ -1059,6 +1088,36 @@ mod tests {
         )
         .into();
         assert_eq!(context_code_of(err), codes::CTX_2137);
+    }
+
+    /// SCP-OUT-031 PR-2a (SECURITY): the outlet reserve-gate context-not-active
+    /// carrier — which reaches the FFI caller VERBATIM on the unary invoke path,
+    /// BEFORE authorization — must surface as the STRUCTURED, state-free
+    /// `SCP-OUTLET-6101` Protocol-session surface. The raw lifecycle state
+    /// (`Closing` / `Expired` / …) MUST NOT appear in the message, else an
+    /// unauthorized caller learns the exact lifecycle state pre-authz.
+    #[test]
+    fn outlet_context_not_active_surfaces_structured_state_free() {
+        let err: ScpPyError = scp_core::context::ContextError::OutletContextNotActive {
+            current_state: scp_core::context::ContextState::Closing,
+        }
+        .into();
+        let (message, code) = match err {
+            ScpPyError::ContextError { message, code } => (message, code),
+            other => panic!("expected ContextError, got {other:?}"),
+        };
+        assert_eq!(
+            code,
+            scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+        );
+        assert!(
+            !message.contains("Closing"),
+            "raw lifecycle state must NOT leak to the FFI caller: {message}"
+        );
+        assert!(
+            message.contains("protocol.context-closed-mid-stream"),
+            "message must be the structured state-free surface: {message}"
+        );
     }
 
     // ------------------------------------------------------------------

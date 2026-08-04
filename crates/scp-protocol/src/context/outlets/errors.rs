@@ -467,10 +467,20 @@ pub enum DetailBody {
         /// Elapsed time in milliseconds before the timeout fired.
         elapsed_ms: u64,
     },
-    /// Execution-class detail variant for handler panics (full SHA-256 hash
-    /// of `"file:line"` per §5.4.4 round-3 fix — 32 bytes, NOT truncated).
+    /// Execution-class detail variant for handler panics: the full 32-byte
+    /// SHA-256 of a **stable panic-location identifier** (§5.4.4 round-3 fix —
+    /// 32 bytes, NOT truncated).
+    ///
+    /// The canonical identifier is the panic's `"file:line"`. Producers that do
+    /// not capture the source location at their recovery seam (e.g. the runtime
+    /// `catch_unwind` outlet guard, which recovers only the payload) instead
+    /// hash a stable location proxy — the panicking outlet's id. In no case is
+    /// the free-text panic *message* hashed: an unsalted deterministic hash of
+    /// a message that may embed dynamic values would be a weak confirmation
+    /// oracle.
     ExecutionPanic {
-        /// SHA-256 of the panic location (`"file:line"`).
+        /// SHA-256 of a stable panic-location identifier (`"file:line"`, or a
+        /// stable location proxy such as the outlet id) — never the message.
         #[serde(with = "serde_hash_32")]
         panic_location_hash: [u8; 32],
     },
@@ -1069,6 +1079,170 @@ impl std::fmt::Display for OutletError {
             slug = self.slug,
             class = self.class.as_wire(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OutletErrorSurface — the runtime → FFI structured error projection
+// ---------------------------------------------------------------------------
+
+/// The structured projection of an outlet error carried from the runtime to
+/// the FFI boundary (SCP-OUT-031 PR-2a).
+///
+/// # Why this exists
+///
+/// Before PR-2a, outlet **invocation** errors were flattened to a
+/// `ContextError::PermissionDenied(String)` at the runtime →
+/// [`ContextError`](crate::context::ContextError) seam — every
+/// `class` / `detail` / `retry` / `source_chain` distinction was destroyed and
+/// the SDK could only re-parse an `SCP-OUTLET-NNNN:` prefix out of a prose
+/// string. `OutletErrorSurface` is the plain-data structure that carries the
+/// full §5.4.4 taxonomy across that seam instead, so the FFI bridge renders
+/// (PR-2b) and the SDK-side typed error hierarchy can be rebuilt losslessly.
+///
+/// # Relationship to the wire envelope
+///
+/// This is **not** a wire type. The §5.4.4 wire envelope is [`OutletError`],
+/// which additionally carries the HMAC `message`, the `pad_nonce`, and the
+/// `registration_event_id` — all of which are wire-opacity fields that a
+/// cross-context receiver needs but the in-process SDK does not. Where a typed
+/// envelope is available (the cross-context path), [`Self::from_envelope`]
+/// projects an `OutletError` onto this surface, dropping those three fields.
+///
+/// # Invariants (by construction)
+///
+/// Every `OutletErrorSurface` produced by [`Self::from_code`] or
+/// [`Self::from_class`] satisfies:
+///
+/// - `error_code_to_class(code) == Some(class)`, and
+/// - `slug_to_class(slug) == Some(class)`.
+///
+/// i.e. the `(class, code, slug)` triple is mutually consistent with the
+/// §5.4.4 registry ([`super::error_codes`]). The exhaustive unit tests assert
+/// this for every producer.
+///
+/// `Send` (all fields are `Send`), so it crosses the actor mailbox freely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutletErrorSurface {
+    /// Root §5.4.4 class. Consistent with `code` and `slug` by construction.
+    pub class: OutletErrorClass,
+    /// `SCP-OUTLET-NNNN` §5.4.4 sub-block code.
+    pub code: String,
+    /// §5.4.4 slug (registered — `slug_to_class(slug) == Some(class)`).
+    pub slug: String,
+    /// Retry guidance for this error (§5.4.4 tag 5).
+    pub retry: RetryPolicy,
+    /// Typed per-class detail, when the source error carried structured
+    /// fields. `None` when the source variant has no structured detail — never
+    /// a fabricated placeholder.
+    pub detail: Option<DetailBody>,
+    /// Cross-context hop trail (§5.4.4 tag 8). Empty for non-cross-context
+    /// errors; populated only via [`Self::from_envelope`].
+    pub source_chain: Vec<ContextHop>,
+}
+
+impl OutletErrorSurface {
+    /// Builds a class-consistent surface from a §5.4.4 `code`, a *preferred*
+    /// slug, and an optional typed `detail`.
+    ///
+    /// - `class` is derived from `code` via
+    ///   [`error_code_to_class`](super::error_codes::error_code_to_class).
+    /// - `slug` keeps `preferred_slug` **iff** it is a registered slug of the
+    ///   same class (`slug_to_class(preferred_slug) == Some(class)`);
+    ///   otherwise it falls back to the code's canonical default slug
+    ///   ([`error_code_to_default_slug`](super::error_codes::error_code_to_default_slug)),
+    ///   which is registered and class-consistent by construction. This keeps
+    ///   the [invariants](Self) intact even when a runtime error surfaces an
+    ///   unregistered diagnostic slug (e.g. the camelCase caveat-counter
+    ///   kinds `maxCalls` / `amountMaxCumulative` / `rateWindow`, which §5.4.4
+    ///   collapses onto `authorization.denied`).
+    /// - `retry` is the code's default
+    ///   ([`error_code_to_retry_policy`](super::error_codes::error_code_to_retry_policy)).
+    ///
+    /// `code` MUST be an allocated §5.4.4 sub-block constant (every caller
+    /// passes a `CODE_*` constant); an unallocated code degrades to the
+    /// `Protocol` root class + `Never` retry rather than panicking.
+    #[must_use]
+    pub fn from_code(code: &str, preferred_slug: &str, detail: Option<DetailBody>) -> Self {
+        use super::error_codes::{
+            error_code_to_class, error_code_to_default_slug, error_code_to_retry_policy,
+            slug_to_class,
+        };
+
+        let class = error_code_to_class(code).unwrap_or(OutletErrorClass::Protocol);
+        // Defense-in-depth for CALLER miswiring: a `preferred_slug` that IS a
+        // registered §5.4.4 slug but of a DIFFERENT class than `code` is
+        // silently swapped for the code's default below (to preserve the
+        // class/code/slug consistency invariant). That silent swap is correct
+        // for genuinely-unregistered diagnostic slugs, but a registered
+        // wrong-class slug almost always means the caller paired the wrong
+        // (code, slug) — surface it in tests. (Unregistered slugs return `None`
+        // and are the expected, non-asserting fallback path.)
+        debug_assert!(
+            slug_to_class(preferred_slug).is_none_or(|c| c == class),
+            "OutletErrorSurface::from_code: preferred_slug {preferred_slug:?} is a registered \
+             {:?}-class slug but code {code:?} is {class:?} — likely a miswired (code, slug) pair; \
+             use from_class for slug-first classification",
+            slug_to_class(preferred_slug),
+        );
+        let slug = if slug_to_class(preferred_slug) == Some(class) {
+            preferred_slug.to_owned()
+        } else {
+            error_code_to_default_slug(code)
+                .unwrap_or(preferred_slug)
+                .to_owned()
+        };
+        let retry = error_code_to_retry_policy(code).unwrap_or(RetryPolicy::Never);
+        Self {
+            class,
+            code: code.to_owned(),
+            slug,
+            retry,
+            detail,
+            source_chain: Vec::new(),
+        }
+    }
+
+    /// Builds a class-consistent surface where the **slug** is the authoritative
+    /// signal of the class (slug-first classification).
+    ///
+    /// Used when a runtime error is identified by a §5.4.4 slug whose class may
+    /// differ from any pre-assigned code — e.g. an open-time stream rejection
+    /// routed through `InvocationError::CaveatViolation` can carry an
+    /// `economic.*` slug even though the caveat path's default code is the
+    /// Authorization umbrella. Deriving the code from the slug's class
+    /// (via [`class_to_canonical_code`](super::error_codes::class_to_canonical_code))
+    /// keeps the surface consistent AND preserves the discriminating slug for
+    /// downstream reverse-mapping.
+    ///
+    /// `class` is taken from `slug_to_class(preferred_slug)`, defaulting to
+    /// [`OutletErrorClass::Authorization`] (the §5.4.4 oracle-collapse target)
+    /// when the slug is unregistered.
+    #[must_use]
+    pub fn from_class(preferred_slug: &str, detail: Option<DetailBody>) -> Self {
+        use super::error_codes::{class_to_canonical_code, slug_to_class};
+
+        let class = slug_to_class(preferred_slug).unwrap_or(OutletErrorClass::Authorization);
+        Self::from_code(class_to_canonical_code(class), preferred_slug, detail)
+    }
+
+    /// Projects a typed §5.4.4 [`OutletError`] wire envelope onto this surface.
+    ///
+    /// Keeps `class` / `code` / `slug` / `retry` / `detail` / `source_chain`
+    /// verbatim and DROPS the three wire-opacity fields (`message` HMAC,
+    /// `pad_nonce`, `registration_event_id`) — those are needed by a
+    /// cross-context receiver to reverse-lookup the catalog, not by the
+    /// in-process SDK rebuilding the typed error.
+    #[must_use]
+    pub fn from_envelope(env: &OutletError) -> Self {
+        Self {
+            class: env.class,
+            code: env.code.clone(),
+            slug: env.slug.clone(),
+            retry: env.retry.clone(),
+            detail: env.detail.clone(),
+            source_chain: env.source_chain.clone(),
+        }
     }
 }
 
@@ -2475,5 +2649,143 @@ mod tests {
             display.contains('4') || display.to_ascii_lowercase().contains("missing"),
             "decode error must indicate the missing tag-4 field; got: {display}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // OutletErrorSurface — SCP-OUT-031 PR-2a
+    // -----------------------------------------------------------------------
+
+    use super::super::error_codes::CODE_TRANSPORT_FAULT as SURFACE_TEST_CODE_TRANSPORT_FAULT;
+    use super::super::error_codes::{
+        CODE_ECONOMIC_FAULT, CODE_INPUT_VIOLATION, SLUG_AUTHORIZATION_DENIED,
+        SLUG_ECONOMIC_ESCROW_OVERFLOW, SLUG_INPUT_SCHEMA_VIOLATION, class_to_canonical_code,
+        error_code_to_class, error_code_to_retry_policy, slug_to_class,
+    };
+
+    /// The core soundness invariant asserted for every surface producer:
+    /// `(class, code, slug)` are mutually consistent with the §5.4.4 registry.
+    fn assert_surface_consistent(s: &OutletErrorSurface) {
+        assert_eq!(
+            error_code_to_class(&s.code),
+            Some(s.class),
+            "code {} must map to class {:?}",
+            s.code,
+            s.class
+        );
+        assert_eq!(
+            slug_to_class(&s.slug),
+            Some(s.class),
+            "slug {} must map to class {:?}",
+            s.slug,
+            s.class
+        );
+        // retry must be the code's registered default.
+        assert_eq!(error_code_to_retry_policy(&s.code), Some(s.retry.clone()));
+    }
+
+    #[test]
+    fn from_code_keeps_registered_same_class_slug() {
+        let s = OutletErrorSurface::from_code(
+            CODE_INPUT_VIOLATION,
+            SLUG_INPUT_SCHEMA_VIOLATION,
+            Some(DetailBody::FieldViolation {
+                field_path: "/x".to_owned(),
+                violation: "type".to_owned(),
+            }),
+        );
+        assert_eq!(s.class, OutletErrorClass::Input);
+        assert_eq!(s.code, CODE_INPUT_VIOLATION);
+        assert_eq!(s.slug, SLUG_INPUT_SCHEMA_VIOLATION);
+        assert!(s.detail.is_some());
+        assert_surface_consistent(&s);
+    }
+
+    #[test]
+    fn from_code_falls_back_to_default_slug_for_unregistered() {
+        // An unregistered diagnostic slug (camelCase caveat-counter kind)
+        // must fall back to the code's canonical default slug so the surface
+        // stays registry-consistent.
+        let s = OutletErrorSurface::from_code(
+            class_to_canonical_code(OutletErrorClass::Authorization),
+            "maxCalls",
+            None,
+        );
+        assert_eq!(s.class, OutletErrorClass::Authorization);
+        assert_eq!(s.slug, SLUG_AUTHORIZATION_DENIED);
+        assert_surface_consistent(&s);
+    }
+
+    // A registered slug of a DIFFERENT class than the code is a caller
+    // miswiring: the `debug_assert!` in `from_code` fires (in debug/test
+    // builds) so the mispairing is caught rather than silently swapped. In a
+    // release build the assert is compiled out and the slug is swapped for the
+    // code's default (preserving the class/code/slug consistency invariant).
+    // Gated on `debug_assertions` because `#[should_panic]` requires the assert
+    // to actually be compiled in.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "likely a miswired (code, slug) pair")]
+    fn from_code_debug_asserts_on_registered_wrong_class_slug() {
+        let _ = OutletErrorSurface::from_code(
+            CODE_INPUT_VIOLATION,
+            SLUG_ECONOMIC_ESCROW_OVERFLOW, // Economic slug, Input code — miswiring
+            None,
+        );
+    }
+
+    #[test]
+    fn from_class_is_slug_first() {
+        // Slug-first: the economic slug drives the class + canonical code,
+        // preserving the discriminating slug.
+        let s = OutletErrorSurface::from_class(SLUG_ECONOMIC_ESCROW_OVERFLOW, None);
+        assert_eq!(s.class, OutletErrorClass::Economic);
+        assert_eq!(s.code, CODE_ECONOMIC_FAULT);
+        assert_eq!(s.slug, SLUG_ECONOMIC_ESCROW_OVERFLOW);
+        assert_surface_consistent(&s);
+    }
+
+    #[test]
+    fn from_class_unregistered_slug_collapses_to_authorization() {
+        let s = OutletErrorSurface::from_class("totally-unregistered", None);
+        assert_eq!(s.class, OutletErrorClass::Authorization);
+        assert_eq!(s.slug, SLUG_AUTHORIZATION_DENIED);
+        assert_surface_consistent(&s);
+    }
+
+    #[test]
+    fn from_envelope_drops_wire_opacity_fields_keeps_taxonomy() {
+        let mut env = build_authorization_error();
+        env.source_chain = vec![ContextHop {
+            context_id: "ctx-a".to_owned(),
+            hop_index: 0,
+            wrapped_code: env.code.clone(),
+        }];
+        let s = OutletErrorSurface::from_envelope(&env);
+        assert_eq!(s.class, env.class);
+        assert_eq!(s.code, env.code);
+        assert_eq!(s.slug, env.slug);
+        assert_eq!(s.retry, env.retry);
+        assert_eq!(s.detail, env.detail);
+        assert_eq!(s.source_chain, env.source_chain);
+        // The wire-opacity fields (message HMAC / pad_nonce /
+        // registration_event_id) have no home on the surface — proven by the
+        // struct's field set (this compiles only because they are absent).
+        assert_surface_consistent(&s);
+    }
+
+    #[test]
+    fn surface_round_trips_json_and_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<OutletErrorSurface>();
+        let s = OutletErrorSurface::from_code(
+            SURFACE_TEST_CODE_TRANSPORT_FAULT,
+            super::super::error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+            Some(DetailBody::TransportRateLimit {
+                retry_after_secs: 30,
+            }),
+        );
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let back: OutletErrorSurface = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(s, back);
     }
 }

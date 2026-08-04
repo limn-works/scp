@@ -311,19 +311,27 @@ pub enum OpenStreamRejection {
     },
     /// The context is not in the `Active` state at open time (#2196). The
     /// runtime reserve path (`reserve_outlet_stream_economy` via
-    /// `ensure_context_active`) and the synchronous `invoke_outlet` open
-    /// validation both surface `SCP-OUTLET-6080` "context not active"; this
-    /// open-surface rejection carries that state forward so the FFI / SDK
-    /// layer shapes it identically to the in-stream
-    /// `protocol.context-closed-mid-stream` terminal chunk the pump emits when
-    /// a context is torn down MID-stream. Reuses that existing slug
+    /// `ensure_context_active`) surfaces the typed
+    /// [`ContextError::OutletContextNotActive`](crate::context::ContextError::OutletContextNotActive)
+    /// carrier (SCP-OUT-031 PR-2a; formerly a raw `SCP-OUTLET-6080`
+    /// `PermissionDenied`), which the supervisor-side reverse-map
+    /// ([`reserve_error_to_open_rejection`](crate::context::outlets_helpers::reserve_error_to_open_rejection))
+    /// reads TYPED into this rejection — carrying `current_state` forward for
+    /// the terminal-chunk diagnostic. This shapes it identically to the
+    /// in-stream `protocol.context-closed-mid-stream` terminal chunk the pump
+    /// emits when a context is torn down MID-stream. Reuses that existing slug
     /// (`protocol.context-closed-mid-stream`) + code
     /// ([`CODE_PROTOCOL_SESSION`](error_codes::CODE_PROTOCOL_SESSION),
     /// `SCP-OUTLET-6101`, the NON-retryable Protocol class) rather than minting
     /// a new code: a pre-open teardown and a mid-stream teardown are the same
-    /// permanent, non-retryable protocol condition to a receiver. (The
-    /// canonical runtime reserve error stays `SCP-OUTLET-6080`; only the
-    /// open-stream wire surface maps to `6101`.)
+    /// permanent, non-retryable protocol condition to a receiver.
+    ///
+    /// `current_state` is surfaced only to an authorized cross-context /
+    /// same-context peer (the stream-open FFI seam `open_rejection_to_err` emits
+    /// only the code + slug; the streaming-saga path surfaces it to a caller
+    /// that already cleared gates 1/2 — an established interface). It is NOT
+    /// exposed pre-authorization: the unary reserve path renders the carrier
+    /// STATE-FREE at the FFI boundary (SCP-OUT-031 PR-2a).
     ContextNotActive {
         /// The context's current lifecycle state, rendered from
         /// [`ContextState`](crate::context::ContextState) (e.g. `"Closing"`),
@@ -392,9 +400,12 @@ impl OpenStreamRejection {
     pub fn to_invocation_error(&self) -> InvocationError {
         match self {
             // #2196 — round-trip as the canonical `InvocationError::ContextNotActive`
-            // (→ `invocation_error_to_context` → `SCP-OUTLET-6080`) rather than a
-            // misleading `CaveatViolation`, preserving the state string so the
-            // surfaced message names the actual lifecycle state.
+            // rather than a misleading `CaveatViolation`, preserving the state
+            // string so the wire terminal-chunk message names the actual
+            // lifecycle state. (SCP-OUT-031 PR-2a: the same-context reserve gate
+            // now classifies this as the Protocol-session context-teardown class
+            // `protocol.context-closed-mid-stream` / `SCP-OUTLET-6101` — the
+            // legacy `SCP-OUTLET-6080` marker is gone.)
             Self::ContextNotActive { current_state } => InvocationError::ContextNotActive {
                 current_state: current_state.clone(),
             },
@@ -3556,9 +3567,9 @@ mod tests {
     /// #2196 — the open-stream `ContextNotActive` rejection maps to the
     /// NON-retryable Protocol class (reusing the mid-stream teardown slug +
     /// `SCP-OUTLET-6101`), and round-trips as the canonical
-    /// `InvocationError::ContextNotActive` (→ `SCP-OUTLET-6080`) preserving the
-    /// state string. A permanent context-not-active failure is thereby never
-    /// reported as a transient, retryable condition.
+    /// `InvocationError::ContextNotActive` preserving the state string. A
+    /// permanent context-not-active failure is thereby never reported as a
+    /// transient, retryable condition.
     #[test]
     fn context_not_active_rejection_is_non_retryable_protocol() {
         use scp_protocol::context::outlets::errors::RetryPolicy;
