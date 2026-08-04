@@ -323,7 +323,15 @@ impl ContextExport {
     /// `member_capabilities`, and `suspended_capabilities`, plus
     /// `CapabilityCeiling::capabilities` and `RoleDefinition::capabilities`
     /// (reached via `role_state` and `context_params.roles`). See
-    /// [`scp_protocol::serde_util`]. Producer ([`create_export`]) and verifier
+    /// [`scp_protocol::serde_util`].
+    ///
+    /// The broadcast subtree reaches the same guarantee by TYPE rather than by
+    /// serde attribute: `BroadcastContextSnapshot::banned_subscribers` and
+    /// `AuthorStateSnapshot::block_list` are `BTreeSet`s (and the `authors` /
+    /// `subscribers` rosters `BTreeMap`s), so they serialize in content-sorted
+    /// order by construction with no canonicalizer to forget.
+    ///
+    /// Producer ([`create_export`]) and verifier
     /// ([`validate_export_for_import`]) both call this method, so they always
     /// agree on the digest. Because the digest is computed over the *current*
     /// contents of `self.snapshot`, a `Public` export (whose snapshot has
@@ -1650,6 +1658,96 @@ mod tests {
              set/map insertion order — a snapshot field is missing its \
              deterministic #[serde(with = ...)] canonicalizer"
         );
+    }
+
+    /// §23.16.8 determinism for the BROADCAST set-derived snapshot fields.
+    ///
+    /// RFC 8785 JCS canonicalizes JSON *object* member order but NOT *array*
+    /// element order, so every set-derived field reachable from the signed
+    /// snapshot must be serialized in content-sorted order AT THE SOURCE. The
+    /// sibling test above covers the non-broadcast fields, which get there via
+    /// `#[serde(with = "serde_sorted_set")]`. The broadcast fields
+    /// (`BroadcastContextSnapshot::banned_subscribers` and
+    /// `AuthorStateSnapshot::block_list`) get there via their `BTreeSet` type —
+    /// deterministic by construction, no serde canonicalizer needed.
+    ///
+    /// Without that, a broadcast context's export would be UNIMPORTABLE
+    /// nondeterministically: the verifier recomputes
+    /// `canonical_snapshot_hash` over the snapshot it deserialized, whose
+    /// rebuilt `HashSet` iterates in its OWN randomized order, so the digest
+    /// diverges from the producer's and a legitimate export fails
+    /// `SnapshotSignatureInvalid`.
+    ///
+    /// Ten elements per set: a randomized container landing in exactly sorted
+    /// order has probability 1/10! (~2.8e-7).
+    #[test]
+    fn canonical_snapshot_hash_orders_broadcast_set_fields() {
+        use scp_protocol::context::broadcast::{
+            AuthorStateSnapshot, BroadcastAdmission, BroadcastContextSnapshot,
+        };
+
+        const UNSORTED_DIDS: [&str; 10] = [
+            "did:example:zeta",
+            "did:example:mu",
+            "did:example:alpha",
+            "did:example:tau",
+            "did:example:beta",
+            "did:example:omega",
+            "did:example:kappa",
+            "did:example:delta",
+            "did:example:sigma",
+            "did:example:iota",
+        ];
+        let mut expected: Vec<String> = UNSORTED_DIDS.iter().map(|d| (*d).to_owned()).collect();
+        expected.sort();
+
+        let banned = UNSORTED_DIDS.iter().map(|d| (*d).to_owned()).collect();
+        let blocked = UNSORTED_DIDS.iter().map(|d| (*d).to_owned()).collect();
+
+        let mut authors = std::collections::BTreeMap::new();
+        authors.insert(
+            "did:example:author".to_owned(),
+            AuthorStateSnapshot {
+                author_did: "did:example:author".to_owned(),
+                broadcast_key: scp_protocol::crypto::sender_keys::SenderKey::from_bytes([7u8; 32]),
+                epoch: 3,
+                next_sequence: 9,
+                block_list: blocked,
+            },
+        );
+
+        let mut snapshot = test_snapshot("ctx-broadcast-determinism");
+        snapshot.broadcast = Some(BroadcastContextSnapshot {
+            context_id: "ctx-broadcast-determinism".to_owned(),
+            admission: BroadcastAdmission::Open,
+            subscribers: std::collections::BTreeMap::new(),
+            authors,
+            banned_subscribers: banned,
+        });
+
+        // The JCS bytes ARE the signed preimage (see `canonical_snapshot_hash`),
+        // so asserting on them asserts on the digest.
+        let jcs = String::from_utf8(scp_protocol::jcs::to_vec(&snapshot).expect("JCS"))
+            .expect("JCS output is UTF-8");
+
+        for field in ["banned_subscribers", "block_list"] {
+            let start = jcs
+                .find(&format!("\"{field}\":["))
+                .unwrap_or_else(|| panic!("{field} present in JCS snapshot"));
+            let open = start + jcs[start..].find('[').expect("array opens");
+            let close = open + jcs[open..].find(']').expect("array closes");
+            let emitted: Vec<String> = jcs[open + 1..close]
+                .split(',')
+                .map(|e| e.trim_matches('"').to_owned())
+                .collect();
+            assert_eq!(
+                emitted, expected,
+                "{field} must reach the signed snapshot preimage in content-sorted \
+                 order — JCS does not canonicalize array element order, so a \
+                 randomized container here makes a legitimate broadcast export \
+                 fail signature verification on the importer"
+            );
+        }
     }
 
     #[tokio::test]
