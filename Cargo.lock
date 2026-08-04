@@ -5380,6 +5380,7 @@ dependencies = [
  "scp-dht",
  "scp-did",
  "scp-platform",
+ "scp-protocol",
  "serde",
  "serde_bytes",
  "serde_json",

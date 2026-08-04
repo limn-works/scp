@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 use super::IdentityError;
 use super::resolution::did_routing_id;
 use scp_dht::DhtClient;
+use scp_protocol::envelope::did_record::{DidRecordBuildError, DidRecordV1};
 
 /// Republish interval for DHT: every 2 hours (in seconds).
 pub const REPUBLISH_INTERVAL_SECS: u64 = 2 * 60 * 60;
@@ -95,43 +96,84 @@ const LAYER_DISABLED_WARNING: &str =
 
 /// Abstraction over SCP relay PUBLISH operations for DID documents (§3.10.2).
 ///
-/// Production implementations wrap the relay client from `scp-transport`.
-/// `InMemoryRelayPublisher` (test-harness-only, gated behind
-/// `#[cfg(any(test, feature = "testing"))]`) provides a test implementation
-/// that records all PUBLISH operations for assertion.
+/// Production implementations wrap the relay client from `scp-transport`
+/// (`TransportRelayPublisher`). `InMemoryRelayPublisher` (test-harness-only,
+/// gated behind `#[cfg(any(test, feature = "testing"))]`) provides a test
+/// implementation that records all PUBLISH operations for assertion.
 ///
-/// `scp-core` defines the trait; `scp-transport` implements it. This avoids
-/// a direct dependency from `scp-core` to `scp-transport`.
+/// `scp-identity` defines the trait; `scp-transport` implements the production
+/// [`TransportRelayPublisher`]. This avoids a direct dependency from
+/// `scp-identity` to `scp-transport`.
+///
+/// # Why the contract carries a [`DidRecordV1`], not `&[u8]`
+///
+/// The DID relay blob MUST be the DID-record frame (§9.10.12) that carries the
+/// full BEP44 `(public_key, seq, signature, value)` — not the bare DID-document
+/// bytes. An earlier opaque `blob: &[u8]` contract let a caller pass bare
+/// `document_bytes`, which silently **dropped the BEP44 signature and sequence**
+/// (an api-design review flagged the opaque contract as exactly that footgun, and
+/// it caused a heal-arm bare-bytes bug too). By taking a `&DidRecordV1` — a type
+/// that can only be built through the validating [`DidRecordV1::try_new`] — the
+/// signature and sequence are *structurally* part of what is published, and
+/// unframed bytes are **unrepresentable**. Frame-wrapping happens in exactly one
+/// place: the implementation calls [`DidRecordV1::encode`] on the record it is
+/// handed (SCP-RELAYRES-004).
 pub trait RelayPublisher: Send + Sync {
-    /// Publishes a blob to SCP relays with the given routing ID and TTL.
+    /// Publishes a DID-record frame to SCP relays at the routing ID **derived
+    /// from the frame's own key** (not a caller argument — see below), with the
+    /// given TTL.
     ///
-    /// Corresponds to the PUBLISH operation defined in ADR-004:
+    /// Corresponds to the PUBLISH operation defined in ADR-004 (§3.10.2):
     /// ```text
     /// PUBLISH {
     ///     routing_id: <32-byte hash>,
     ///     blob_ttl: <seconds>,
-    ///     blob: <BEP44-signed DID document bytes>,
+    ///     blob: <DidRecordV1 frame bytes (§9.10.12)>,
     /// }
     /// ```
     ///
-    /// Implementations SHOULD publish to the identity's own relays plus
-    /// bootstrap relays from the fallback relay list (§18.5.1).
+    /// The implementation [`encode`](DidRecordV1::encode)s `record` into its
+    /// canonical frame bytes and publishes those bytes — never the bare
+    /// `record.value()` — at the DID `routing_id` **derived from the frame's own
+    /// key** ([`did_record_routing_id`]). The routing ID is not a caller argument:
+    /// a DID record can only be published at the one routing ID its
+    /// `public_key` binds to (§9.10.12 DID→`routing_id` binding), so a valid frame
+    /// published at a mismatched routing ID is unrepresentable — the same
+    /// misuse-resistance discipline that made bare bytes unrepresentable.
+    /// Implementations SHOULD publish to the identity's own relays plus bootstrap
+    /// relays from the fallback relay list (§18.5.1).
     ///
     /// # Arguments
     ///
-    /// * `routing_id` — The 32-byte routing ID derived via [`did_routing_id`].
     /// * `blob_ttl` — TTL in seconds (604800 for DID documents).
-    /// * `blob` — The BEP44-signed DID document bytes.
+    /// * `record` — The DID-record frame carrying the BEP44
+    ///   `(public_key, seq, signature, value)` (§9.10.12).
     ///
     /// # Errors
     ///
     /// Returns [`IdentityError::RelayPublishFailed`] if the publish fails.
     fn publish(
         &self,
-        routing_id: &[u8; 32],
         blob_ttl: u64,
-        blob: &[u8],
+        record: &DidRecordV1,
     ) -> impl Future<Output = Result<(), IdentityError>> + Send;
+}
+
+/// The DID `routing_id` a DID-record frame MUST be published at, and resolved
+/// from: `SHA-256("scp:did:" || did:dht(record.public_key()))` (§3.10.2 routing
+/// derivation, §9.10.12 DID→`routing_id` binding).
+///
+/// Deriving the routing ID from the frame's own key — rather than accepting it
+/// as an independent argument — makes a frame/`routing_id` mismatch
+/// **unrepresentable**: a frame can only ever be published at the single routing
+/// ID its `public_key` binds to. That binding is exactly what a validating relay
+/// re-checks on PUBLISH (SCP-RELAYRES-003 `did_slot`, which derives it via the
+/// same [`did_from_ed25519_public_key`](crate::did_from_ed25519_public_key) +
+/// [`did_routing_id`]). The whole relay DID-record path is `did:dht`-specific
+/// (§9.10.12).
+#[must_use]
+pub fn did_record_routing_id(record: &DidRecordV1) -> [u8; 32] {
+    did_routing_id(&crate::did_from_ed25519_public_key(record.public_key()))
 }
 
 // ---------------------------------------------------------------------------
@@ -200,16 +242,22 @@ impl InMemoryRelayPublisher {
 impl RelayPublisher for InMemoryRelayPublisher {
     fn publish(
         &self,
-        routing_id: &[u8; 32],
         blob_ttl: u64,
-        blob: &[u8],
+        record: &DidRecordV1,
     ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        // Derive the routing_id from the frame's own key (§9.10.12 binding) —
+        // exactly as a real publisher does — and record the encoded FRAME bytes,
+        // what a real relay would store, so tests decode `blob` back via
+        // `DidRecordV1::decode` and confirm the full `(public_key, seq, signature,
+        // value)` reached the wire, never the bare document bytes.
+        let routing_id = did_record_routing_id(record);
+        let blob = record.encode();
         async move {
             let mut publishes = self.publishes.lock().await;
             publishes.push(RecordedRelayPublish {
-                routing_id: *routing_id,
+                routing_id,
                 blob_ttl,
-                blob: blob.to_vec(),
+                blob,
             });
             drop(publishes);
             Ok(())
@@ -362,6 +410,30 @@ pub struct RepublishEntry {
     pub signature: [u8; 64],
     /// The current BEP44 sequence number.
     pub sequence: u64,
+}
+
+impl RepublishEntry {
+    /// Wraps this entry's BEP44 `(public_key, seq, signature, value)` into the
+    /// DID-record relay frame (§9.10.12) that the relay layer stores.
+    ///
+    /// This is the single place the relay-republish path turns an entry into a
+    /// publishable frame: the [`relay_republish_loop`] builds the frame once via
+    /// this method before it publishes, so the loop can NEVER publish bare
+    /// `document_bytes` (which would drop the signature and sequence).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidRecordBuildError`] if `document_bytes` is empty or exceeds
+    /// the maximum frame `value` length (§9.10.12) — the frame invariants
+    /// enforced at construction by [`DidRecordV1::try_new`].
+    pub fn to_did_record(&self) -> Result<DidRecordV1, DidRecordBuildError> {
+        DidRecordV1::try_new(
+            self.public_key,
+            self.sequence,
+            self.signature,
+            self.document_bytes.clone(),
+        )
+    }
 }
 
 /// A warning event emitted when DID publishing has degraded.
@@ -705,10 +777,17 @@ async fn dht_republish_loop<D: DhtClient>(
 /// Publishes immediately using the PUBLISH operation with:
 /// - `routing_id` = `did_routing_id(did_string)` (§3.10.2)
 /// - `blob_ttl` = config-derived TTL (default 604800 = 7 days, §3.10.2)
-/// - `blob` = BEP44-signed DID document bytes
+/// - `blob` = the DID-record frame (§9.10.12) carrying the BEP44
+///   `(public_key, seq, signature, value=document_bytes)` — NOT the bare
+///   document bytes (which would drop the signature and sequence)
 ///
 /// Then waits for the derived republish interval before the next publish.
 /// On failure, retries with exponential backoff.
+///
+/// The frame is built ONCE, up front, via [`RepublishEntry::to_did_record`].
+/// A malformed entry (empty/oversize `document_bytes`) can never encode to a
+/// valid frame, so the loop fails closed: it logs and returns rather than
+/// spinning or ever publishing unframed bytes.
 async fn relay_republish_loop<R: RelayPublisher>(
     relay_publisher: Arc<R>,
     entry: RepublishEntry,
@@ -716,13 +795,28 @@ async fn relay_republish_loop<R: RelayPublisher>(
     blob_ttl_secs: u64,
     republish_interval_secs: u64,
 ) {
-    let routing_id = did_routing_id(&entry.did);
+    // Build the DID-record frame once. This is the sole wrap site for the loop;
+    // publishing the bare `document_bytes` (dropping the BEP44 signature/seq) is
+    // now structurally impossible — the publisher only accepts a `DidRecordV1`,
+    // and it derives the routing_id from the frame's own key (§9.10.12 binding),
+    // so the loop never hands over a routing_id at all.
+    let record = match entry.to_did_record() {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::error!(
+                did = %entry.did,
+                error = %e,
+                "relay republish: DID document cannot be wrapped into a DID-record \
+                 frame (§9.10.12); relay republishing disabled for this identity"
+            );
+            return;
+        }
+    };
+
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        let result = relay_publisher
-            .publish(&routing_id, blob_ttl_secs, &entry.document_bytes)
-            .await;
+        let result = relay_publisher.publish(blob_ttl_secs, &record).await;
 
         if result.is_ok() {
             consecutive_failures = 0;
@@ -965,10 +1059,13 @@ mod tests {
         let manager =
             RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
 
-        let did_str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        // A consistent identity: the DID is derived from the public key, so the
+        // frame-key-derived routing_id equals SHA-256("scp:did:" || did_string).
+        let public_key = [7u8; 32];
+        let did_str = crate::did_from_ed25519_public_key(&public_key);
         let entry = RepublishEntry {
-            did: did_str.to_owned(),
-            public_key: [1u8; 32],
+            did: did_str.clone(),
+            public_key,
             document_bytes: b"BEP44-signed DID document".to_vec(),
             signature: [2u8; 64],
             sequence: 1,
@@ -984,25 +1081,122 @@ mod tests {
         assert_eq!(publishes.len(), 1, "exactly one relay PUBLISH expected");
 
         let publish = &publishes[0];
-        let expected_routing_id = did_routing_id(did_str);
+        let expected_routing_id = did_routing_id(&did_str);
         assert_eq!(
             publish.routing_id, expected_routing_id,
-            "routing_id must be SHA-256('scp:did:' || did_string)"
+            "routing_id must be SHA-256('scp:did:' || did_string), derived from the frame key"
         );
         assert_eq!(
             publish.blob_ttl, RELAY_BLOB_TTL_SECS,
             "blob_ttl must be 604800 (7 days)"
         );
-        assert_eq!(
+
+        // The blob is the DID-record FRAME (§9.10.12), NOT the bare document
+        // bytes. Decoding it must recover the full (public_key, seq, signature,
+        // value) — the exact assertion the old bare-`document_bytes` publish
+        // would fail (the frame prefix ≠ the document bytes).
+        assert_ne!(
             publish.blob, b"BEP44-signed DID document",
-            "blob must be the BEP44-signed DID document bytes"
+            "blob must be the framed record, never the bare document bytes"
+        );
+        let frame = DidRecordV1::decode(&publish.blob)
+            .expect("relay blob must decode as a DidRecordV1 frame");
+        assert_eq!(frame.public_key(), &public_key, "frame carries public_key");
+        assert_eq!(frame.seq(), 1, "frame carries the BEP44 sequence");
+        assert_eq!(frame.signature(), &[2u8; 64], "frame carries the signature");
+        assert_eq!(
+            frame.value(),
+            b"BEP44-signed DID document",
+            "frame value is the document bytes"
         );
 
         // Verify DHT publish also happened.
-        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap();
+        let dht_record = dht.resolve(&public_key).await.unwrap();
         assert!(
             dht_record.is_some(),
             "DHT publish should also have occurred"
+        );
+
+        manager.stop_all().await;
+    }
+
+    /// AC 2: the relay-republish loop publishes the FULL DID-record frame — the
+    /// signature and sequence are no longer dropped. Decoding the recorded blob
+    /// via `DidRecordV1::decode` recovers the SAME `(public_key, signature, seq,
+    /// value)` as the source `RepublishEntry` (`value` == `document_bytes`). This
+    /// test would FAIL against the pre-fix bare-`document_bytes` publish (the
+    /// recorded blob would be the bare document, not a frame, and would not decode).
+    #[tokio::test]
+    async fn relay_republish_publishes_full_frame_not_bare_document_bytes() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(InMemoryRelayPublisher::new());
+        let manager = RepublishManager::with_relay_publisher(
+            Arc::clone(&dht),
+            Arc::clone(&relay),
+            RepublishConfig::new(),
+        );
+
+        let did_str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+        let source = RepublishEntry {
+            did: did_str.to_owned(),
+            public_key: [0xAB; 32],
+            document_bytes: b"the signed DID document body".to_vec(),
+            signature: [0xCD; 64],
+            sequence: 42,
+        };
+
+        manager.start_republishing(source.clone()).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let publishes = relay.recorded_publishes().await;
+        assert_eq!(publishes.len(), 1, "exactly one relay PUBLISH expected");
+
+        // The recorded blob is a frame — decode it and compare field-by-field.
+        let frame = DidRecordV1::decode(&publishes[0].blob)
+            .expect("recorded blob must be a valid DID-record frame, not bare bytes");
+        assert_eq!(frame.public_key(), &source.public_key);
+        assert_eq!(frame.signature(), &source.signature);
+        assert_eq!(frame.seq(), source.sequence);
+        assert_eq!(frame.value(), &source.document_bytes[..]);
+
+        // Cross-check: the frame is strictly larger than the bare document
+        // (105-byte fixed prefix + value), so a bare-bytes publish is ruled out.
+        assert_eq!(publishes[0].blob.len(), 105 + source.document_bytes.len());
+
+        manager.stop_all().await;
+    }
+
+    /// A malformed entry (empty `document_bytes`) can never wrap into a valid
+    /// frame; the relay loop fails closed (no publish) rather than emit unframed
+    /// or empty bytes.
+    #[tokio::test]
+    async fn relay_republish_fails_closed_on_unframeable_entry() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(InMemoryRelayPublisher::new());
+        let manager = RepublishManager::with_relay_publisher(
+            Arc::clone(&dht),
+            Arc::clone(&relay),
+            RepublishConfig::new(),
+        );
+
+        let entry = RepublishEntry {
+            did: "did:dht:zEmptyDoc".to_owned(),
+            public_key: [1u8; 32],
+            document_bytes: Vec::new(), // empty → unframeable (§9.10.12)
+            signature: [2u8; 64],
+            sequence: 1,
+        };
+        assert!(
+            entry.to_did_record().is_err(),
+            "empty document must be unframeable"
+        );
+
+        manager.start_republishing(entry).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert!(
+            relay.recorded_publishes().await.is_empty(),
+            "no relay publish must occur for an unframeable entry (fail-closed)"
         );
 
         manager.stop_all().await;
@@ -1253,9 +1447,8 @@ mod tests {
     impl RelayPublisher for AlwaysFailRelayPublisher {
         fn publish(
             &self,
-            _routing_id: &[u8; 32],
             _blob_ttl: u64,
-            _blob: &[u8],
+            _record: &DidRecordV1,
         ) -> impl Future<Output = Result<(), IdentityError>> + Send {
             async move { Err(IdentityError::RelayPublishFailed("always fails".into())) }
         }
