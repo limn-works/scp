@@ -13,6 +13,7 @@
 - **What's missing**: The section describes the capability declaration as "a structured, machine-readable manifest" but provides zero wire format. No JSON schema. No field names. No version envelope. No example beyond pseudocode fragments like `"I need: messaging, member_list, outlet_invoke(outlet_a, outlet_b)"`. The open-questions file (00-open-questions.md) marks this resolved by saying it uses "JSON Schema (MCP-compatible)" with "resource URIs (`scp:ctx:{context_id}/{capability}`)" but no actual schema definition exists anywhere.
 - **Why it matters**: An implementor cannot build capability declaration parsing, validation, or exchange without guessing the format. Two independent implementations will produce incompatible declarations. Since the declaration is described as the "boundary that makes generated apps safe," this is a security-relevant gap -- the safety boundary has no concrete shape.
 - **Severity**: HIGH
+- **Resolution (later)**: Rejected by design, not fixed. A wire format *was* added in a later revision (§8.4.1 "Capability Declaration Wire Format", with an `app_id` DID and an Ed25519 publisher signature) and has since been removed: it contradicted §8.1 four paragraphs above it ("An app is not a protocol entity. It has no DID, is not an agent, and is not a context."). Capability scoping is SDK-local. A declaration never crosses the wire, so there is no interoperability requirement and nothing to specify a wire format for; two implementations cannot disagree about a value neither transmits. See §8.4.1 "Scope Boundary: SDK-Local, Not Protocol State". Preserved as historical record.
 
 ---
 
@@ -23,6 +24,7 @@
 - **What's missing**: "The protocol validates the declaration against the context's capability ceiling and the user's granted permissions, then provides exactly what was requested." How? At what point in the lifecycle is this validation performed -- at app registration, at connection time, or per-invocation? What happens when validation fails partially (app requests 5 capabilities, 3 are granted, 2 are denied)? Is it all-or-nothing or partial grant? The pseudocode shows a binary granted/denied, but the text says "provides exactly what was requested" (implying full match required).
 - **Why it matters**: Partial grant vs. all-or-nothing is a critical design decision. An app that receives partial capability without knowing which capabilities were denied could malfunction or expose unexpected behavior.
 - **Severity**: MEDIUM
+- **Resolution (later)**: Out of protocol scope. Validation is performed locally by the member's own SDK against the context ceiling (§5.3) and the member's role (§5.5). Grant/deny semantics are an SDK API concern, not a protocol interop concern: no other party observes the outcome, and binding produces no protocol state. See §8.4.1. Preserved as historical record.
 
 ---
 
@@ -33,6 +35,7 @@
 - **What's missing**: "Declarations carry a protocol version. Apps built against older declarations continue to work. Forward compatibility is a protocol constraint." No version format (SemVer? integer?). No backward compatibility rules. No deprecation mechanism. No specification of what "continue to work" means when a newer protocol version removes a capability the old declaration references.
 - **Why it matters**: Without version negotiation rules, protocol upgrades can silently break apps or silently grant capabilities that didn't exist when the app was declared.
 - **Severity**: MEDIUM
+- **Resolution (later)**: Out of protocol scope. §8.4's "versionable" property is an SDK compatibility concern, not a wire-compatibility one — declarations are not protocol state and never cross the wire, so a protocol upgrade cannot break another party's parse of them. See §8.4.1. Preserved as historical record.
 
 ---
 
@@ -557,6 +560,7 @@
 - **What's missing**: The spec says "the attack surface of a badly-generated app is bounded by the declaration contract" (section 8.4) but this is only true if the declaration contract is enforced at the protocol level, not just at the agent presentation layer. The agent has full context access via MLS membership. A compromised or malicious app running within the agent runtime has access to all MLS key material. No sandboxing between apps within the same agent process is specified.
 - **Why it matters**: The capability declaration creates a false sense of security if apps can bypass it by accessing the agent's MLS state directly. The "generated apps are safe" claim requires either process isolation or an in-process sandboxing mechanism that the spec does not describe.
 - **Severity**: MEDIUM
+- **Resolution (later)**: Premise accepted; the claim it attacks was withdrawn. §8.4.1 now states plainly that capability scoping is SDK-local and produces no protocol state. An app runs on the member's device, under the member's identity, with the member's keys — it is inside the member's own trust boundary by construction, and the member is accountable for what it does. The declaration bounds the blast radius of a *badly generated* client; it was never a protocol-enforced sandbox against a *malicious* one, and no protocol-level enforcement is claimed. See §8.4.1. Preserved as historical record.
 
 ---
 
@@ -591,6 +595,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 - **What's missing**: The capability declaration is described as "structured, machine-readable" but no schema, no field names, no envelope, no serialization format. The open-questions file says it uses JSON Schema / MCP-compatible resource URIs but no actual schema definition exists.
 - **Why it matters**: Two independent implementations cannot produce interoperable capability declarations. This is the "safety boundary for generated apps" with no concrete shape.
 - **Severity**: HIGH
+- **Resolution (later)**: Rejected by design, not fixed. A wire format *was* added in a later revision (§8.4.1 "Capability Declaration Wire Format", with an `app_id` DID and an Ed25519 publisher signature) and has since been removed: it contradicted §8.1 four paragraphs above it ("An app is not a protocol entity. It has no DID, is not an agent, and is not a context."). Capability scoping is SDK-local. A declaration never crosses the wire, so there is no interoperability requirement and nothing to specify a wire format for; two implementations cannot disagree about a value neither transmits. See §8.4.1 "Scope Boundary: SDK-Local, Not Protocol State". Preserved as historical record.
 
 ### [9.3] Earned Capacity Has No Protocol-Level Defaults
 - **Category**: Missing constants/defaults
@@ -716,6 +721,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 - **What's missing**: What happens when an app requests 5 capabilities and 3 are granted? Binary grant/denial vs partial grant is unspecified.
 - **Why it matters**: Partial grant without notification could cause app malfunction.
 - **Severity**: MEDIUM
+- **Resolution (later)**: Out of protocol scope. Validation is performed locally by the member's own SDK against the context ceiling (§5.3) and the member's role (§5.5). Grant/deny semantics are an SDK API concern, not a protocol interop concern: no other party observes the outcome, and binding produces no protocol state. See §8.4.1. Preserved as historical record.
 
 ### [8.4] Capability Declaration Version Format Missing
 - **Category**: Missing constants/defaults
@@ -723,6 +729,7 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 - **What's missing**: "Declarations carry a protocol version" -- no version format, no backward compatibility rules, no deprecation mechanism.
 - **Why it matters**: Protocol upgrades could silently break apps.
 - **Severity**: MEDIUM
+- **Resolution (later)**: Out of protocol scope. §8.4's "versionable" property is an SDK compatibility concern, not a wire-compatibility one — declarations are not protocol state and never cross the wire, so a protocol upgrade cannot break another party's parse of them. See §8.4.1. Preserved as historical record.
 
 ### [8.5] MCP Namespace Collision Resolution Unspecified
 - **Category**: Missing edge cases

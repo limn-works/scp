@@ -360,7 +360,7 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 ### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
 
-Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 75-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77); tags 74–75 are left unassigned by the removal of the app-binding variants, §8.4.1). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
 
 ```
 Signing key seed (32 bytes): 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
@@ -370,50 +370,45 @@ Context ID: "ctx-kat"
 
 Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
 
-  seq 0  AppBound                 ts 1700000000
-         payload = rmp(AppBoundPayload{ app_did:"did:key:app", app_name:"Scheduler",
-                       app_version:"1.0.0", capabilities:["outlet:call:*"] })
-         leaf = 0xe0c0691d264ca38d086375a0274afb630e9bbb906f2e12e0112adf4d1b4fcd38
-
-  seq 1  SpendApproved            ts 1700000001
+  seq 0  SpendApproved            ts 1700000000
          payload = rmp(SpendApprovedPayload{ spender:"did:key:agent", amount:5000,
                        purpose:"inference" })
-         leaf = 0xf2f973a4df60ef87abcb99dd1f3afcd537037cbd1aae6297582c52be3bd8e695
+         leaf = 0x6a202edba387e4795a56e88bf2f9cf0d02ad27ccdba46254c56e9c08e7e3bfa8
 
-  seq 2  TtlExtended              ts 1700000002
+  seq 1  TtlExtended              ts 1700000001
          payload = rmp(TtlExtendedPayload{ old_deadline_unix:1700000000,
                        new_deadline_unix:1800000000, proposal_id:[0xAB;32],
                        consenting_members:["did:key:a","did:key:b"] })
-         leaf = 0xccdbb8dfa15a7abff3fbd0c08efe45e99d9fc4cb5f042f8f7db5f9e36e3fb0b0
+         leaf = 0x00d2fde09a56c927e9748c393182b2acdee77a333f9687f55bc2632a53237a0d
 
-  seq 3  RecoveryEpochAdvanced    ts 1700000003
+  seq 2  RecoveryEpochAdvanced    ts 1700000002
          payload = rmp(RecoveryEpochAdvancedPayload{ old_epoch:7, new_epoch:8 })
-         leaf = 0x7a1a91c33ddaa1a92c02f70a3f567f065bed48b578124a803c07dca2f9a47863
+         leaf = 0x2d16b88f5026910e289c5769873960cf43dfe332c14c127d611dbcd298dcd04a
 
-  seq 4  ContextTombstoned        ts 1700000004
+  seq 3  ContextTombstoned        ts 1700000003
          payload = rmp(ContextTombstonedPayload{ destination_id:"ctx-dest",
                        migration_proposal_id:[0xCD;32] })
-         leaf = 0x3848718f23aefaba0e47743e72f5ce3bcc3254bc09b4cb38c3f5c263c9c4dd8d
+         leaf = 0x85498ec404b462b0991151aa7a9ec4dced1ae412446ecf8bd299f4b1fed4a691
 
-  seq 5  ConsequenceTriggered     ts 1700000005
+  seq 4  ConsequenceTriggered     ts 1700000004
          payload = b"member_did=did:key:m;rule_index=2;trigger_kind=absence;action_type=suspend"
-         leaf = 0x7ea6b6a020d94e0850cb84410af43e69ecd1c945223cbf478356d93503724507
+         leaf = 0x73b2a74256b07c46bc4dd0f6b841b608c85ed8ec476704a084779931241275b1
 
-  seq 6  CommitBroadcastSucceeded ts 1700000006
+  seq 5  CommitBroadcastSucceeded ts 1700000005
          payload = b"operation=join;attempts=3"
-         leaf = 0x87e3cde25168f4af4328f010369313e28fde305dbc6f706be3392fdf7b8e7f3c
+         leaf = 0x1ee12b6fbda50bb4c8633061f282db9cf8446fbb18202186118a97d186105477
 
-  seq 7  RoleAssigned             ts 1700000007
+  seq 6  RoleAssigned             ts 1700000006
          payload = rmp(RoleAssignedPayload{ subject_did:"did:key:carol", role:"admin" })
-         leaf = 0x9455cca66b6528ff7061d27b70ddab795ffff1e790fc1f797f22e21687e5f449
+         leaf = 0x2d4d7f59f2dac77bf2fbb298bee38118ce5ead2949b3944bc4c3ad14987a1edc
 
-  seq 8  MemberJoined             ts 1700000008
+  seq 7  MemberJoined             ts 1700000007
          payload = rmp(MembershipChangePayload{ subject_did:"did:key:dave",
                        role_name:"member" })
-         leaf = 0x28860f95688e8b0604db7349fd79deed13d3b9a10198a9623ea288a6eeea58f2
+         leaf = 0xf25c8cc0313555052cf50f67dcf59187a05ebb35e40c530581c70c4709e1846d
 
-RFC 6962 tree::root over the 9 leaves:
-  0x0c6f6a09ecdda29319880ca609060ec15aa8055ee9fbc85099e5f6e8b1ba4117
+RFC 6962 tree::root over the 8 leaves:
+  0x70a0b90909fa9f9432799bc6589f9b7cc63162995c8b2c68f0194aefa9183468
 ```
 
 ### Vector 33: Checkpoint Root KAT (§23.16.1)
@@ -422,8 +417,8 @@ A `ConsistencyCheckpoint` generated over the Vector 32 log MUST carry `merkle_ro
 
 ```
 checkpoint.merkle_root == tree::root (Vector 32)
-  = 0x0c6f6a09ecdda29319880ca609060ec15aa8055ee9fbc85099e5f6e8b1ba4117
-checkpoint.event_count == 9
+  = 0x70a0b90909fa9f9432799bc6589f9b7cc63162995c8b2c68f0194aefa9183468
+checkpoint.event_count == 8
 ```
 
 Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_32_typed_leaf_and_checkpoint_kat`, `vector_33_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.

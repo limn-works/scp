@@ -52,82 +52,12 @@ Properties:
 - **Machine-readable and self-documenting.** An agent can read a capability declaration and understand what an app does without running it. This enables trust evaluation of apps themselves.
 - **Versionable.** Declarations carry a protocol version. Apps built against older declarations continue to work. Forward compatibility is a protocol constraint.
 
-### 8.4.1 Capability Declaration Wire Format
+### 8.4.1 Scope Boundary: SDK-Local, Not Protocol State
 
-The capability declaration uses JSON Schema (MCP-compatible) with SCP-specific extensions. The declaration is a JSON object with the following structure:
+Capability scoping is enforced locally, by the member's own SDK. It produces no protocol state. An app runs on the member's device, under the member's identity, with the member's keys — so to the protocol, and to every other member of the context, an action taken by an app that a member has bound *is* an action by that member. There is no second principal, and therefore nothing to authenticate: an app has no DID, presents no signature, and is not a party to the context. This follows directly from §8.1 — an app is not a protocol entity.
 
-```json
-{
-  "scp_version": "1.0",
-  "app_id": "did:dht:app_publisher_did",
-  "app_name": "My App",
-  "app_version": "2.1.0",
-  "capabilities": [
-    {
-      "resource": "scp:ctx:{context_id}/messaging",
-      "actions": ["read", "write"],
-      "constraints": {
-        "max_message_size": 65536,
-        "media_types": ["text/plain", "application/json"]
-      }
-    },
-    {
-      "resource": "scp:ctx:{context_id}/members",
-      "actions": ["read"]
-    },
-    {
-      "resource": "scp:ctx:{context_id}/outlets/{outlet_id}",
-      "actions": ["invoke"],
-      "constraints": {
-        "max_invocations_per_minute": 60
-      }
-    }
-  ],
-  "min_role": "member",
-  "signature": "<Ed25519 signature by app_id over canonical JSON of this object excluding the signature field>"
-}
-```
-
-**Field definitions:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `scp_version` | string | Yes | SCP protocol version this declaration targets. Format: `"MAJOR.MINOR"`. SDKs MUST support declarations with the same MAJOR version and any MINOR version <= current. |
-| `app_id` | DID | Yes | DID of the app publisher. Used for trust evaluation and revocation. |
-| `app_name` | string | Yes | Human-readable app name. Maximum 128 UTF-8 bytes. |
-| `app_version` | string | Yes | App version. SemVer format (`MAJOR.MINOR.PATCH`). |
-| `capabilities` | array | Yes | List of requested capabilities. Each entry specifies a resource URI and actions. Minimum 1 entry, maximum 64 entries. |
-| `capabilities[].resource` | string | Yes | SCP resource URI. Format: `scp:ctx:{context_id}/{capability_category}` or `scp:ctx:{context_id}/outlets/{outlet_id}` for specific outlets. The `{context_id}` is a template variable resolved at binding time. |
-| `capabilities[].actions` | array | Yes | Actions requested on the resource: `"read"`, `"write"`, `"invoke"`, `"admin"`. Minimum 1 action. |
-| `capabilities[].constraints` | object | No | Optional constraints on the capability (rate limits, size limits, type restrictions). App-defined; the protocol validates that constraints are a subset of the context's ceiling. |
-| `min_role` | string | Yes | Minimum context role required for this app to function. Built-in roles: `"observer"`, `"member"`, `"moderator"`, `"admin"` (§5.5). Contexts may also define custom roles; apps targeting custom roles should use the custom role name here. |
-| `signature` | string | Yes | Ed25519 signature by `app_id` over the canonical JSON serialization (RFC 8785 JCS) of the declaration with the `signature` field removed. |
-
-**Validation:** The SDK validates the declaration at binding time (when an app attaches to a context):
-
-1. Verify `scp_version` is compatible with the SDK's protocol version.
-2. Verify `signature` against `app_id`.
-3. For each requested capability, check that the capability category exists in the context's ceiling (§5.3) AND the agent's role includes the requested actions.
-4. If all capabilities are grantable, the declaration is accepted. If any capability is denied, the entire declaration is rejected (all-or-nothing). The rejection response includes a `denied_capabilities` array listing which capabilities failed and why.
-5. The validated declaration is stored in the context's outlet registry for auditability.
-
-### 8.4.2 SDK-Level Enforcement
-
-The SDK is the enforcement boundary for capability declarations. Apps interact with the protocol exclusively through SDK-provided handles that are scoped to their declared capabilities. The SDK MUST NOT provide unscoped or privileged access to any app — all protocol access flows through capability-checked entry points.
-
-**Enforcement mechanics:**
-
-1. **Registration.** Apps register their capability declaration (§8.4.1) with the SDK before binding to any context. The SDK validates the declaration's signature, protocol version compatibility, and structural correctness. Invalid declarations are rejected at registration time — the app never receives a handle.
-
-2. **Bind-time validation.** When an app binds to a context, the SDK checks every declared capability against the context's ceiling (§5.3) and the agent's current role (§5.5). If any capability is not grantable, the entire binding is rejected (all-or-nothing semantics). On success, the SDK returns a **scoped handle** — a context handle that only exposes the APIs corresponding to granted capabilities.
-
-3. **Runtime enforcement.** The SDK MUST reject API calls that exceed the app's declared capabilities at the call site. An app that declared `["read"]` on `messaging` MUST receive an error if it attempts to call `send_message()`. This is a hard enforcement boundary, not a suggestion. The rejection is immediate (no governance vote, no capability negotiation) and returns a `CapabilityDenied` error with the missing capability.
-
-4. **No capability escalation.** Once bound, an app cannot request additional capabilities without re-registration with a new declaration. The SDK does not support runtime capability grants. If an app needs expanded capabilities, it must present a new (or updated) signed declaration from its publisher.
-
-5. **Scoped handle isolation.** Each app receives its own scoped handle to the context. Scoped handles are not interchangeable — an app cannot use another app's handle to access capabilities it did not declare. The SDK maintains per-app-binding state that maps the handle to the validated declaration.
-
-**Auditability.** The validated declaration is recorded in the context's event log at bind time. Context members can inspect which apps are bound and what capabilities they hold. App binding and unbinding events are visible in the event log — silent app attachment is not possible.
+- **No protocol record.** Binding or unbinding an app produces no event-log entry, no governance action, and no membership change. Which client software a member runs is that member's business, not a fact the context converges on — recording it would leak each member's software inventory to every peer and turn a local permission check into a consensus problem.
+- **The member is accountable.** A declaration bounds what a member's own app can reach, never more than the context ceiling and the member's role already allow. It limits the blast radius of a badly generated client; it does not create a separate accountable actor, and a member cannot disclaim what their app did.
 
 ## 8.5 MCP Compatibility (Model Context Protocol)
 

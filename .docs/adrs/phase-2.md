@@ -863,10 +863,6 @@ pub enum EventType {
     // records an MLS *group*-epoch advance (Update + self-Commit, broadcast to
     // members) performed during trust recovery. actor_did = "system:recovery".
     RecoveryEpochAdvanced,        // §9.12 step 2 MLS group-epoch advance; payload: old_epoch, new_epoch
-    // App-sandbox binding lifecycle (§8; "App binding and unbinding events are
-    // visible in the event log"). Parameters live in EventPayload.
-    AppBound,                     // §8 app bound to context; payload: app_did, app_name, app_version, capabilities
-    AppUnbound,                   // §8 app unbound from context; payload: app_did
 }
 ```
 
