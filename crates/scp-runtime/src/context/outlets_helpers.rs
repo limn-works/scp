@@ -609,7 +609,7 @@ const SCP_OUTLET_6089_MARKER: &str = "SCP-OUTLET-6089";
 /// - **Streaming path** (`reserve_outlet_stream_economy` /
 ///   `reserve_stream_grant_escrow`): the `ContextError` is reverse-mapped by
 ///   [`reserve_error_to_open_rejection`], which reads `current_state` **typed**
-///   into [`OpenStreamRejection::ContextNotActive`]; the stream-open FFI seam
+///   into [`OpenStreamRejection::ContextNotActive`](crate::context::outlets::dispatch::OpenStreamRejection::ContextNotActive); the stream-open FFI seam
 ///   (`open_rejection_to_err`) then emits only `error_code()` + `slug()` — also
 ///   state-free.
 ///
@@ -2894,8 +2894,9 @@ fn consume_caveat_counters(
 ///
 /// SCP-OUT-031 PR-2a: the slug is the **registered §5.4.4 authorization slug**
 /// for the exhausted counter kind — NOT the camelCase internal
-/// [`CaveatKind::as_str`](scp_protocol::CaveatKind::as_str) name (which is not
-/// a §5.4.4 slug). This keeps the resulting [`OutletErrorSurface`] registry-
+/// [`CaveatKind::as_str`](scp_protocol::trust::CaveatKind::as_str) name (which
+/// is not a §5.4.4 slug). This keeps the resulting
+/// [`OutletErrorSurface`](scp_protocol::context::outlets::errors::OutletErrorSurface) registry-
 /// consistent while preserving the cumulative/rate distinction. `MaxCalls` has
 /// no dedicated §5.4.4 slug, so it collapses onto the `authorization.denied`
 /// oracle-collapse target.
