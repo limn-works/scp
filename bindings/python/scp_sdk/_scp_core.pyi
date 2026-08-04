@@ -902,9 +902,6 @@ def shutdown_runtime(_timeout_millis: int) -> None:
 def py_check_scoped_capability(
     granted_capabilities: tuple[str, ...], required_capability: str
 ) -> bool: ...
-def py_validate_capability_declaration(
-    declaration_json: str, ceiling_capabilities: list[str], role_capabilities: list[str]
-) -> str: ...
 def evaluate_invitation(
     *args: Any, **kwargs: Any
 ) -> str: ...  # placeholder; live surface is SCP.evaluate_invitation

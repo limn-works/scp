@@ -2338,24 +2338,6 @@ export class SCP {
   // Domain: Capability / Invitation / Metadata
   // ───────────────────────────────────────────────────────────────────────
 
-  validateCapabilityDeclaration(
-    declarationJson: string,
-    ceilingCapabilities: readonly string[],
-    roleCapabilities: readonly string[],
-  ): string {
-    try {
-      return (
-        this.#native.validateCapabilityDeclaration as (
-          d: string,
-          c: readonly string[],
-          r: readonly string[],
-        ) => string
-      )(declarationJson, ceilingCapabilities, roleCapabilities);
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
   checkScopedCapability(
     grantedCapabilities: readonly string[],
     requiredCapability: string,

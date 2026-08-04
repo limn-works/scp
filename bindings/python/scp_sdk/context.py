@@ -565,28 +565,6 @@ class Context:
 # ---------------------------------------------------------------------------
 
 
-def validate_capability_declaration(
-    declaration_json: str,
-    ceiling_capabilities: list[str],
-    role_capabilities: list[str],
-) -> dict[str, Any]:
-    """Validate a capability declaration against a context ceiling and role.
-
-    Returns a dict with ``valid`` (bool), ``granted_capabilities`` (list of str),
-    ``error`` (str or None), and ``app_did`` (str).
-
-    See spec sections 8.4.1 and 8.4.2. This helper touches only static
-    validation state in the Rust bridge — it does not depend on an
-    :class:`SCP` instance.
-    """
-    import _scp_core
-
-    result_json = _scp_core.py_validate_capability_declaration(
-        declaration_json, ceiling_capabilities, role_capabilities
-    )
-    return json.loads(result_json)
-
-
 def metadata_record_to_json(
     context_id: str,
     sequence: int,
@@ -718,7 +696,6 @@ __all__ = [
     "validate_admission",
     "validate_against_template",
     "validate_broadcast_key_hex",
-    "validate_capability_declaration",
     "validate_content_path",
     "validate_context_params",
     "validate_deploy_id",

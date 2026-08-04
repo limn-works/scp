@@ -66,7 +66,6 @@ pub mod context {
     // All pure types from scp-protocol::context (includes params, roles, etc.)
     pub use scp_protocol::context::*;
     // Async modules from scp-runtime
-    pub use scp_runtime::context::app_sandbox;
     pub use scp_runtime::context::builder;
     pub use scp_runtime::context::export_import;
     pub use scp_runtime::context::invitation_helpers;

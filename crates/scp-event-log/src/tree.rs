@@ -439,11 +439,12 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         // Provenance event types (issue #586)
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
-        // Typed-event unification variants (ADR-011 Amendment). Tags 36..=75
+        // Typed-event unification variants (ADR-011 Amendment). Tags 36..=73
         // are assigned in ADR declaration order, with tag 59 retired (see the
-        // PseudonymAnnounced removal note below). Tags 76..=77 (below) are the
-        // ADR-011 Amendment §6 cross-context-saga carve-out. Tags 0-35 above are
-        // protocol constants and MUST NOT change.
+        // PseudonymAnnounced removal note below) and tags 74..=75 retired (see
+        // the AppBound/AppUnbound removal note below). Tags 76..=77 (below) are
+        // the ADR-011 Amendment §6 cross-context-saga carve-out. Tags 0-35 above
+        // are protocol constants and MUST NOT change.
         EventType::AdminTransferred => 36,
         EventType::CeilingModified => 37,
         EventType::CeilingModificationPending => 38,
@@ -485,11 +486,18 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::CommitBroadcastSucceeded => 71,
         EventType::CommitBroadcastFailed => 72,
         EventType::RecoveryEpochAdvanced => 73,
-        EventType::AppBound => 74,
-        EventType::AppUnbound => 75,
+        // 74..=75 retired: AppBound/AppUnbound removed — an app is not a
+        // protocol entity (spec §8.1, §8.4.1). An app runs on the member's
+        // device under the member's identity, so an app binding is a local
+        // permission check, never a converged Merkle leaf. As with tag 59, the
+        // values are intentionally left as a gap and MUST NOT be reused: every
+        // other variant's canonical tag (and the §25 KAT preimages) stays
+        // byte-stable, and a reused tag would silently reinterpret any leaf
+        // signed under the old meaning.
         // Cross-context outlet-call saga (ADR-011 Amendment §6 carve-out). Tags
-        // 76..=77 are the next free values after the current max (75); tag 59
-        // stays retired. These are convergent commit-ordered durable leaves.
+        // 76..=77 were the next free values after the then-current max (75);
+        // tags 59 and 74..=75 stay retired. These are convergent commit-ordered
+        // durable leaves.
         EventType::CrossContextOutletInvoked => 76,
         EventType::CrossContextDivergenceMarker => 77,
     }
@@ -1307,15 +1315,17 @@ mod tests {
     // -----------------------------------------------------------------------
     // Closed-taxonomy tag invariants (ADR-011 typed-event unification):
     //   - tags 0-35 are protocol constants and MUST NOT change;
-    //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
+    //   - the 37 unification variants occupy tags 36..=73 with tag 59 retired
     //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
+    //   - tags 74..=75 are retired (AppBound/AppUnbound removed — an app is not
+    //     a protocol entity, spec §8.1/§8.4.1);
     //   - the 2 ADR-011 Amendment §6 cross-context-saga variants occupy 76..=77;
-    //   - all 77 tags are distinct.
+    //   - all 75 tags are distinct.
     // -----------------------------------------------------------------------
 
     /// The complete `EventType` taxonomy in ADR declaration order, used to
     /// cross-check against `event_type_tag`.
-    const ALL_EVENT_TYPES: [EventType; 77] = [
+    const ALL_EVENT_TYPES: [EventType; 75] = [
         EventType::ContextCreated,
         EventType::ContextClosing,
         EventType::ContextClosed,
@@ -1389,8 +1399,6 @@ mod tests {
         EventType::CommitBroadcastSucceeded,
         EventType::CommitBroadcastFailed,
         EventType::RecoveryEpochAdvanced,
-        EventType::AppBound,
-        EventType::AppUnbound,
         EventType::CrossContextOutletInvoked,
         EventType::CrossContextDivergenceMarker,
     ];
@@ -1398,19 +1406,25 @@ mod tests {
     #[test]
     fn all_event_type_tags_are_distinct() {
         let mut tags: Vec<u16> = ALL_EVENT_TYPES.iter().map(event_type_tag).collect();
-        assert_eq!(tags.len(), 77, "taxonomy must enumerate all 77 variants");
+        assert_eq!(tags.len(), 75, "taxonomy must enumerate all 75 variants");
         tags.sort_unstable();
         tags.dedup();
         assert_eq!(
             tags.len(),
-            77,
-            "all 77 EventType tags must be distinct (no two variants share a tag)"
+            75,
+            "all 75 EventType tags must be distinct (no two variants share a tag)"
         );
-        // Tag 59 is intentionally retired (PseudonymAnnounced removed); the tag
-        // space is therefore 0..=75 minus {59}. This is the only gap.
+        // Tags 59 and 74..=75 are intentionally retired; the tag space is
+        // therefore 0..=77 minus {59, 74, 75}. These are the only gaps.
         assert!(
             !tags.contains(&59),
             "tag 59 is retired and must not be reused (PseudonymAnnounced removal)"
+        );
+        assert!(
+            !tags.contains(&74) && !tags.contains(&75),
+            "tags 74-75 are retired and must not be reused \
+             (AppBound/AppUnbound removal — an app is not a protocol entity, \
+              spec §8.1/§8.4.1)"
         );
     }
 
@@ -1460,8 +1474,9 @@ mod tests {
 
     #[test]
     fn unification_variant_tags_occupy_36_through_77() {
-        // The 39 typed-event unification variants occupy tags 36..=75 in ADR
-        // declaration order, with tag 59 retired (PseudonymAnnounced removed).
+        // The 37 typed-event unification variants occupy tags 36..=73 in ADR
+        // declaration order, with tag 59 retired (PseudonymAnnounced removed)
+        // and tags 74..=75 retired (AppBound/AppUnbound removed).
         // The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
         // 76..=77.
         assert_eq!(event_type_tag(&EventType::AdminTransferred), 36);
@@ -1505,10 +1520,11 @@ mod tests {
         assert_eq!(event_type_tag(&EventType::CommitBroadcastSucceeded), 71);
         assert_eq!(event_type_tag(&EventType::CommitBroadcastFailed), 72);
         assert_eq!(event_type_tag(&EventType::RecoveryEpochAdvanced), 73);
-        assert_eq!(event_type_tag(&EventType::AppBound), 74);
-        assert_eq!(event_type_tag(&EventType::AppUnbound), 75);
+        // Tags 74-75 retired: AppBound/AppUnbound removed (an app is not a
+        // protocol entity — spec §8.1/§8.4.1).
         // Cross-context-saga carve-out (ADR-011 Amendment §6): the next free
-        // tags after 75 (tag 59 stays retired).
+        // tags after 75 at the time they were assigned (tags 59 and 74-75 stay
+        // retired).
         assert_eq!(event_type_tag(&EventType::CrossContextOutletInvoked), 76);
         assert_eq!(event_type_tag(&EventType::CrossContextDivergenceMarker), 77);
     }

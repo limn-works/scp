@@ -5050,71 +5050,8 @@ pub(crate) fn context_get_economic_policy_on(
 }
 
 // ---------------------------------------------------------------------------
-// App Sandboxing (#595, spec §8.4.1, §8.4.2)
+// App capability scoping (spec §8.4.1 — SDK-local, not protocol state)
 // ---------------------------------------------------------------------------
-
-/// Per-bridge-instance implementation of `validate_capability_declaration`.
-pub(crate) fn validate_capability_declaration_on(
-    _bi: &NapiBridgeInstance,
-    declaration_json: String,
-    ceiling_capabilities: Vec<String>,
-    role_capabilities: Vec<String>,
-) -> napi::Result<String> {
-    use scp_core::context::app_sandbox::{CapabilityDeclaration, validate_declaration};
-    use scp_core::context::roles::Capability;
-    use scp_core::context::{ContextHandle, ContextParams};
-
-    let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
-        .map_err(|e| NapiError::from_reason(format!("invalid declaration JSON: {e}")))?;
-
-    let ceiling: Vec<Capability> = ceiling_capabilities
-        .iter()
-        .map(|s| {
-            Capability::new(s).ok_or_else(|| {
-                NapiError::from_reason(format!(
-                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                ))
-            })
-        })
-        .collect::<napi::Result<Vec<_>>>()?;
-    let role_caps: Vec<Capability> = role_capabilities
-        .iter()
-        .map(|s| {
-            Capability::new(s).ok_or_else(|| {
-                NapiError::from_reason(format!(
-                    "invalid capability {s:?} in role (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                ))
-            })
-        })
-        .collect::<napi::Result<Vec<_>>>()?;
-
-    let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
-
-    let result_json = match validate_declaration(&decl, &ceiling, &role_caps, handle) {
-        Ok(scoped) => {
-            let granted: Vec<String> = scoped
-                .allowed_capabilities()
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            serde_json::json!({
-                "valid": true,
-                "grantedCapabilities": granted,
-                "error": null,
-                "appDid": decl.app_id.to_string()
-            })
-        }
-        Err(e) => serde_json::json!({
-            "valid": false,
-            "grantedCapabilities": [],
-            "error": e.to_string(),
-            "appDid": decl.app_id.to_string()
-        }),
-    };
-
-    serde_json::to_string(&result_json)
-        .map_err(|e| NapiError::from_reason(format!("serialization failed: {e}")))
-}
 
 /// Checks whether a given capability is allowed for an app binding.
 #[napi]
@@ -5126,14 +5063,6 @@ pub fn check_scoped_capability(
     // Pure capability check — no bridge-instance state involved, so it is a
     // module-level free fn (ADR-048 §1), not a method on the `Scp` object, and
     // has no per-instance `_on` variant.
-    check_scoped_capability_inner(granted_capabilities, required_capability)
-}
-
-/// Shared implementation used by both the free function and the `Scp` method.
-pub(crate) fn check_scoped_capability_inner(
-    granted_capabilities: Vec<String>,
-    required_capability: String,
-) -> bool {
     use scp_core::context::roles::{Capability, CapabilityCeiling};
     use std::collections::HashSet;
 

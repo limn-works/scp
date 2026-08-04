@@ -34,7 +34,6 @@
 //! Concurrency Model.
 
 pub mod actor;
-pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
 pub mod builder;
 pub mod config;

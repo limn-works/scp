@@ -16951,22 +16951,6 @@ public func sandboxCheckCapability(grantedCapabilities: [String], requiredCapabi
 })
 }
 /**
- * Validates a capability declaration JSON string against a context ceiling and
- * role capabilities.
- *
- * Returns a JSON string with fields: `valid` (bool), `granted_capabilities`
- * (string[]), `error` (string | null), `app_did` (string).
- */
-public func sandboxValidateDeclaration(declarationJson: String, ceilingCapabilities: [String], roleCapabilities: [String])throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_sandbox_validate_declaration(
-        FfiConverterString.lower(declarationJson),
-        FfiConverterSequenceString.lower(ceilingCapabilities),
-        FfiConverterSequenceString.lower(roleCapabilities),$0
-    )
-})
-}
-/**
  * Generates an SCPID challenge for the given audience (§3.11.8).
  *
  * Returns the challenge as a JSON string containing `protocol`, `nonce`,
@@ -17270,9 +17254,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_sandbox_check_capability() != 25855) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_sandbox_validate_declaration() != 13375) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_challenge() != 19241) {

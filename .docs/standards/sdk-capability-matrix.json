@@ -310,16 +310,6 @@
           "swift": true
         },
         {
-          "name": "validate_capability_declaration",
-          "python": true,
-          "typescript": true,
-          "kotlin": false,
-          "swift": true,
-          "exemptions": {
-            "kotlin": "SDK does not expose validateCapabilityDeclaration wrapper"
-          }
-        },
-        {
           "name": "metadata_record_serialize",
           "python": true,
           "typescript": true,

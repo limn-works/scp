@@ -1832,8 +1832,6 @@ pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
         | ContextEvent::VoteWithdrawn { .. }
         | ContextEvent::ProposalTimedOut { .. }
         | ContextEvent::DeadlockDetected { .. }
-        | ContextEvent::AppBound { .. }
-        | ContextEvent::AppUnbound { .. }
         | ContextEvent::DegradedMode { .. }
         | ContextEvent::WelcomeGenerated { .. }
         | ContextEvent::BufferOverflow { .. }

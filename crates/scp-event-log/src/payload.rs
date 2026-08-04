@@ -95,28 +95,6 @@ pub struct ContextMigrationCancelledPayload {
     pub original_proposal_id: [u8; 32],
 }
 
-/// Payload for [`EventType::AppBound`](crate::EventType::AppBound) (§8 app bound
-/// to context).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppBoundPayload {
-    /// The DID of the app being bound.
-    pub app_did: String,
-    /// The app's declared name.
-    pub app_name: String,
-    /// The app's declared version.
-    pub app_version: String,
-    /// The capabilities granted to the app on binding.
-    pub capabilities: Vec<String>,
-}
-
-/// Payload for [`EventType::AppUnbound`](crate::EventType::AppUnbound) (§8 app
-/// unbound from context).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppUnboundPayload {
-    /// The DID of the app being unbound.
-    pub app_did: String,
-}
-
 /// Payload for [`EventType::SpendApproved`](crate::EventType::SpendApproved)
 /// (`ApproveSpend` governance action, §19.6.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,31 +487,6 @@ mod tests {
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 1);
         let decoded: ContextMigrationCancelledPayload = decode_payload(&encoded).unwrap();
-        assert_eq!(p, decoded);
-    }
-
-    #[test]
-    fn app_bound_round_trip() {
-        let p = AppBoundPayload {
-            app_did: "did:key:app".to_owned(),
-            app_name: "Scheduler".to_owned(),
-            app_version: "1.2.3".to_owned(),
-            capabilities: vec!["outlet:call:*".to_owned(), "message:send".to_owned()],
-        };
-        let encoded = encode_payload(&p).unwrap();
-        assert_positional_array(&encoded.data, 4);
-        let decoded: AppBoundPayload = decode_payload(&encoded).unwrap();
-        assert_eq!(p, decoded);
-    }
-
-    #[test]
-    fn app_unbound_round_trip() {
-        let p = AppUnboundPayload {
-            app_did: "did:key:app".to_owned(),
-        };
-        let encoded = encode_payload(&p).unwrap();
-        assert_positional_array(&encoded.data, 1);
-        let decoded: AppUnboundPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 

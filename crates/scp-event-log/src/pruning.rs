@@ -449,8 +449,6 @@ pub const fn is_structural_event(event_type: &EventType) -> bool {
         | EventType::ConsequenceEnforced
         | EventType::ConsequenceEnforcementFailed
         | EventType::ConsequenceEscalatedToSuspendAll
-        | EventType::AppBound
-        | EventType::AppUnbound
         // Cross-context-saga divergence marker (ADR-011 Amendment §6): a durable
         // non-repudiation/accountability record of a one-sided saga commit,
         // essential for operator repair and state-reconstruction verification —
@@ -1137,14 +1135,14 @@ mod tests {
 
     #[test]
     fn structural_events_classified_correctly() {
-        // The full closed `EventType` taxonomy (77 variants) paired with its
+        // The full closed `EventType` taxonomy (75 variants) paired with its
         // EXPECTED structural/operational classification. `true` = structural
         // (retained longer per ADR-030 §2c); `false` = operational. This pins
         // the CORRECT decision for every variant — not merely that a decision
         // exists — so a future re-classification of any variant must update this
         // table deliberately. The expected values mirror the cryptographer-
         // confirmed classification in `is_structural_event`.
-        const EXPECTED: [(EventType, bool); 77] = [
+        const EXPECTED: [(EventType, bool); 75] = [
             // --- Base variants ---
             (EventType::ContextCreated, true),
             (EventType::ContextClosing, true),
@@ -1220,20 +1218,18 @@ mod tests {
             (EventType::CommitBroadcastSucceeded, false),
             (EventType::CommitBroadcastFailed, false),
             (EventType::RecoveryEpochAdvanced, true),
-            (EventType::AppBound, true),
-            (EventType::AppUnbound, true),
             // --- Cross-context-saga carve-out (ADR-011 Amendment §6) ---
             (EventType::CrossContextOutletInvoked, false),
             (EventType::CrossContextDivergenceMarker, true),
         ];
 
         // Exhaustiveness guard: the table must cover the full closed taxonomy
-        // (exactly 77 variants). Adding a variant to `EventType` without adding
+        // (exactly 75 variants). Adding a variant to `EventType` without adding
         // it here leaves it unclassified-by-test, so this count is pinned.
         assert_eq!(
             EXPECTED.len(),
-            77,
-            "classification table must cover all 77 EventType variants"
+            75,
+            "classification table must cover all 75 EventType variants"
         );
 
         for (event_type, expected_structural) in &EXPECTED {

@@ -138,9 +138,8 @@ pub use bridge::{
     // Free functions — provenance (#370)
     provenance_check_chain_depth,
     // Free functions — local DID management (#387)
-    // Free functions — app sandboxing (#595)
+    // Free functions — app capability scoping (spec §8.4.1)
     sandbox_check_capability,
-    sandbox_validate_declaration,
     // Free functions — SCPID authentication (#1056)
     scpid_challenge,
     // Free functions — sync (#370)

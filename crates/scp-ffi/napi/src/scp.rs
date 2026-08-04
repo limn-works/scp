@@ -2744,22 +2744,6 @@ impl Scp {
         crate::context::context_get_economic_policy_on(&self.inner, handle)
     }
 
-    /// Per-instance equivalent of the free-function `validate_capability_declaration`.
-    #[napi(js_name = "validateCapabilityDeclaration")]
-    pub fn validate_capability_declaration(
-        &self,
-        declaration_json: String,
-        ceiling_capabilities: Vec<String>,
-        role_capabilities: Vec<String>,
-    ) -> napi::Result<String> {
-        crate::context::validate_capability_declaration_on(
-            &self.inner,
-            declaration_json,
-            ceiling_capabilities,
-            role_capabilities,
-        )
-    }
-
     // `check_scoped_capability` is exposed as a module-level free fn at
     // `crates/scp-ffi/napi/src/context.rs::check_scoped_capability` per
     // ADR-048 §1 — the operation reads no `Scp` state, so binding it to

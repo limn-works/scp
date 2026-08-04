@@ -360,18 +360,6 @@ export class Context {
 }
 
 // ---------------------------------------------------------------------------
-// App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
-// ---------------------------------------------------------------------------
-
-/** Result of validating a capability declaration. */
-export interface DeclarationValidationResult {
-  valid: boolean;
-  grantedCapabilities: readonly string[];
-  error: string | null;
-  appDid: string;
-}
-
-// ---------------------------------------------------------------------------
 // Invitation evaluation (#614)
 // ---------------------------------------------------------------------------
 

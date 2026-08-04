@@ -596,12 +596,7 @@ export interface Bridge {
     contextIds: string[],
   ): Promise<string>;
 
-  // App Sandboxing (#595, spec §8.4.1, §8.4.2)
-  validateCapabilityDeclaration(
-    declarationJson: string,
-    ceilingCapabilities: string[],
-    roleCapabilities: string[],
-  ): string;
+  // App capability scoping (spec §8.4.1 — SDK-local, not protocol state)
   checkScopedCapability(
     grantedCapabilities: readonly string[],
     requiredCapability: string,
@@ -884,8 +879,8 @@ const _nativeBridgeForScp = new WeakMap<SCP, Bridge>();
  * (which triggers `getBridge()` and caches the bridge). If called before
  * initialization, throws an error.
  *
- * Used by synchronous SDK functions (`ScopedHandle.hasCapability`,
- * `validateCapabilityDeclaration`) that cannot await.
+ * Used by synchronous SDK functions (e.g. `checkScopedCapability`) that
+ * cannot await.
  *
  * @param scp The SCP instance whose bridge should be returned.
  * @returns The cached `Bridge` instance.

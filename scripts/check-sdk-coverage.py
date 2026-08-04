@@ -521,11 +521,6 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["evaluateInvitation"],
         "swift": ["evaluateInvitation"],
     },
-    ("Context", "validate_capability_declaration"): {
-        "python": ["validate_capability_declaration"],
-        "typescript": ["validateCapabilityDeclaration"],
-        "swift": ["validateCapabilityDeclaration"],
-    },
     ("Context", "template_get_params"): {
         "python": ["template_get_params"],
         "typescript": ["templateGetParams"],

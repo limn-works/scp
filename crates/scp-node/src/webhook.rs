@@ -634,8 +634,6 @@ pub fn map_context_event(
         | ContextEvent::VoteWithdrawn { .. }
         | ContextEvent::ProposalTimedOut { .. }
         | ContextEvent::DeadlockDetected { .. }
-        | ContextEvent::AppBound { .. }
-        | ContextEvent::AppUnbound { .. }
         | ContextEvent::DegradedMode { .. }
         // `WelcomeGenerated` is suppressed upstream in `emit_event_into`
         // (state.rs): it carries MLS key material and is pushed to the receive

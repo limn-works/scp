@@ -1757,17 +1757,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(did, target, contextIds);
     },
 
-    // App Sandboxing (#595, spec §8.4.1, §8.4.2)
-    validateCapabilityDeclaration(
-      declarationJson: string,
-      ceilingCapabilities: string[],
-      roleCapabilities: string[],
-    ): string {
-      return (
-        native.validateCapabilityDeclaration as (d: string, c: string[], r: string[]) => string
-      )(declarationJson, ceilingCapabilities, roleCapabilities);
-    },
-
+    // App capability scoping (spec §8.4.1 — SDK-local, not protocol state)
     checkScopedCapability(
       grantedCapabilities: readonly string[],
       requiredCapability: string,

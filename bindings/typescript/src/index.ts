@@ -59,7 +59,6 @@ export { Identity, IdentityAttestation, RevocationStatus } from "./identity";
 // ---------------------------------------------------------------------------
 
 export type {
-  DeclarationValidationResult,
   InvitationEvaluationResult,
   MetadataRecord,
   OperationalMetadata,

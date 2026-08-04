@@ -2755,19 +2755,6 @@
       ]
     },
     {
-      "canonical": "sandbox_validate_declaration",
-      "category": "context",
-      "pyo3": [
-        "py_validate_capability_declaration"
-      ],
-      "uniffi": [
-        "sandbox_validate_declaration"
-      ],
-      "napi": [
-        "validate_capability_declaration"
-      ]
-    },
-    {
       "canonical": "configure_relay_transport",
       "category": "transport",
       "pyo3": [

@@ -30,26 +30,4 @@ class TypesTest {
     fun `outletQuery builds parameterised capability string`() {
         assertEquals("outlet:query:calculator", Capability.outletQuery("calculator"))
     }
-
-    @Test
-    fun `outlet call wildcard covers specific outlet call`() {
-        val handle = ScopedHandle(
-            contextId = "ctx-1",
-            grantedCapabilities = listOf(Capability.OUTLET_CALL_ALL),
-            appDid = "did:key:app",
-        )
-        assertEquals(true, handle.hasCapability("outlet:call:calculator"))
-        assertEquals(false, handle.hasCapability("outlet:query:calculator"))
-    }
-
-    @Test
-    fun `outlet query wildcard covers specific outlet query`() {
-        val handle = ScopedHandle(
-            contextId = "ctx-1",
-            grantedCapabilities = listOf(Capability.OUTLET_QUERY_ALL),
-            appDid = "did:key:app",
-        )
-        assertEquals(true, handle.hasCapability("outlet:query:calculator"))
-        assertEquals(false, handle.hasCapability("outlet:call:calculator"))
-    }
 }

@@ -20,7 +20,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 77 event type variants.
+//! - [`EventType`] -- The 75 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -88,7 +88,7 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 77 event type variants for SCP context event logs.
+/// The 75 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
@@ -390,21 +390,11 @@ pub enum EventType {
     /// `new_epoch: u64`. See [`crate::payload`].
     RecoveryEpochAdvanced,
 
-    // -------------------------------------------------------------------
-    // App-sandbox binding lifecycle (§8; "App binding and unbinding events
-    // are visible in the event log"). Parameters live in [`EventPayload`].
-    // -------------------------------------------------------------------
-    /// An app was bound to a context (§8).
-    ///
-    /// Payload (positional `MessagePack`): `app_did: String`,
-    /// `app_name: String`, `app_version: String`,
-    /// `capabilities: Vec<String>`. See [`crate::payload`].
-    AppBound,
-    /// An app was unbound from a context (§8).
-    ///
-    /// Payload (positional `MessagePack`): `app_did: String`. See
-    /// [`crate::payload`].
-    AppUnbound,
+    // Tags 74-75 retired: `AppBound` / `AppUnbound` were removed because an
+    // app is not a protocol entity (spec §8.1, §8.4.1). An app runs on the
+    // member's device under the member's identity; a binding is a local
+    // permission check, never a converged Merkle leaf. The tag values are
+    // permanently retired -- see `tree::event_type_tag`.
 
     // -------------------------------------------------------------------
     // Cross-context outlet-call saga event types (ADR-011 Amendment §6
@@ -726,8 +716,8 @@ mod tests {
     #[test]
     fn event_type_serialization_roundtrip_all_variants() {
         // Round-trips every variant of the closed taxonomy through serde JSON.
-        // The 77-variant count and wire-distinctness are pinned separately in
-        // `event_type_taxonomy_is_closed_at_77_distinct_variants`.
+        // The 75-variant count and wire-distinctness are pinned separately in
+        // `event_type_taxonomy_is_closed_at_75_distinct_variants`.
         for event_type in all_event_types() {
             let json = serde_json::to_string(&event_type).expect("serialize");
             let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
@@ -814,23 +804,21 @@ mod tests {
             EventType::CommitBroadcastSucceeded,
             EventType::CommitBroadcastFailed,
             EventType::RecoveryEpochAdvanced,
-            EventType::AppBound,
-            EventType::AppUnbound,
             EventType::CrossContextOutletInvoked,
             EventType::CrossContextDivergenceMarker,
         ]
     }
 
     #[test]
-    fn event_type_taxonomy_is_closed_at_77_distinct_variants() {
+    fn event_type_taxonomy_is_closed_at_75_distinct_variants() {
         // Pins the closed-set count and asserts wire-distinctness, independent
         // of the round-trip test (which would otherwise exceed the function
         // line limit).
         let event_types = all_event_types();
         assert_eq!(
             event_types.len(),
-            77,
-            "closed EventType taxonomy must enumerate exactly 77 variants"
+            75,
+            "closed EventType taxonomy must enumerate exactly 75 variants"
         );
 
         let mut serialized: Vec<String> = event_types
@@ -841,8 +829,8 @@ mod tests {
         serialized.dedup();
         assert_eq!(
             serialized.len(),
-            77,
-            "all 77 EventType variants must serialize to distinct values"
+            75,
+            "all 75 EventType variants must serialize to distinct values"
         );
     }
 
