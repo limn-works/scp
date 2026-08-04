@@ -37,10 +37,11 @@ use crate::IdentityError;
 use crate::cache::DidCache;
 use crate::dht::extract_public_key;
 use crate::republish::RelayPublisher;
-use crate::resolution::{did_routing_id, verify_relay_record};
+use crate::resolution::verify_relay_record;
 use scp_clock::{Clock, SystemClock};
 use scp_dht::{DhtClient, DhtRecord};
 use scp_did::{DidDocument, decode_multibase_key};
+use scp_protocol::envelope::did_record::DidRecordV1;
 
 // ---------------------------------------------------------------------------
 // Core types (§3.10.10)
@@ -355,10 +356,24 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> HealingPublisher
                     // Publish the fresher document to relays via the relay
                     // publisher. The relay publisher distributes to the
                     // identity's own relays + bootstrap relays (§18.5.1).
-                    let routing_id = did_routing_id(&did);
+                    //
+                    // Wrap (public_key, seq, signature, value=document_bytes)
+                    // into the DID-record frame (§9.10.12) — healing publishes
+                    // the SAME self-certifying frame the republish loop does,
+                    // never the bare document bytes (which would drop the BEP44
+                    // signature/seq and be unverifiable by the resolver).
+                    let record = DidRecordV1::try_new(public_key, seq, signature, document_bytes)
+                        .map_err(|e| {
+                        IdentityError::RelayPublishFailed(format!(
+                            "healing: DID document cannot be wrapped into a \
+                             DID-record frame (§9.10.12): {e}"
+                        ))
+                    })?;
+                    // The publisher derives the routing_id from the frame's own
+                    // key (§9.10.12 binding); the heal arm never passes one.
                     debug!(did = %did, seq, "healing: republishing to relay");
                     relay_publisher
-                        .publish(&routing_id, DID_DOCUMENT_BLOB_TTL_SECS, &document_bytes)
+                        .publish(DID_DOCUMENT_BLOB_TTL_SECS, &record)
                         .await
                 }
             }
@@ -1647,6 +1662,57 @@ mod tests {
             vec!["wss://bootstrap.example.com/scp/v1".to_owned()],
             healer,
         )
+    }
+
+    /// AC (heal-arm frames correctly): the production `DualLayerHealingPublisher`
+    /// Relay arm publishes a DID-record FRAME (§9.10.12), never bare document
+    /// bytes. Drive `heal` directly with a `StaleLayer::Relay` and assert the
+    /// `InMemoryRelayPublisher` recorded a blob that decodes to the same
+    /// `(public_key, signature, seq, value)` (with `value` == `document_bytes`).
+    #[tokio::test]
+    async fn healing_relay_arm_publishes_did_record_frame() {
+        use crate::republish::InMemoryRelayPublisher;
+        use scp_dht::InMemoryDhtClient;
+
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay_pub = Arc::new(InMemoryRelayPublisher::new());
+        let healer = DualLayerHealingPublisher::new(Arc::clone(&dht), Arc::clone(&relay_pub));
+
+        // Consistent identity: DID derived from the public key, so the
+        // frame-key-derived routing_id equals did_routing_id(did).
+        let public_key = [0x11; 32];
+        let did = crate::did_from_ed25519_public_key(&public_key);
+        let signature = [0x22; 64];
+        let document_bytes = b"fresher signed DID document".to_vec();
+        let seq = 7u64;
+
+        healer
+            .heal(
+                &did,
+                &StaleLayer::Relay {
+                    relay_urls: vec!["wss://relay1.example.com/scp/v1".to_owned()],
+                },
+                &document_bytes,
+                &signature,
+                seq,
+                &public_key,
+            )
+            .await
+            .expect("relay heal succeeds");
+
+        let publishes = relay_pub.recorded_publishes().await;
+        assert_eq!(publishes.len(), 1, "exactly one relay heal PUBLISH");
+        assert_eq!(
+            publishes[0].routing_id,
+            did_routing_id(&did),
+            "healed record is published at the frame-key-derived DID routing_id"
+        );
+        let frame = DidRecordV1::decode(&publishes[0].blob)
+            .expect("healed relay blob must be a DID-record frame, not bare bytes");
+        assert_eq!(frame.public_key(), &public_key);
+        assert_eq!(frame.signature(), &signature);
+        assert_eq!(frame.seq(), seq);
+        assert_eq!(frame.value(), &document_bytes[..]);
     }
 
     #[tokio::test]
