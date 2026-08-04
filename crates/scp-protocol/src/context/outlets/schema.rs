@@ -43,6 +43,53 @@ pub enum SchemaValidationError {
     },
 }
 
+impl SchemaValidationError {
+    /// Returns the §5.4.4 `FieldViolation` detail for this schema-structure
+    /// failure — the `(field_path, violation)` pair that pinpoints what was
+    /// wrong with the schema object.
+    ///
+    /// The pointers/tags are structural facts derived directly from the
+    /// variant (not fabricated placeholders): a malformed root object reports
+    /// the root pointer; the `"type"`-field failures report `/type`.
+    ///
+    /// Shared by [`Self::to_surface`] (Input class) and the legacy
+    /// [`super::OutletError::to_surface`] output-schema projection (Output
+    /// class) — both the §5.4.4 Input and Output classes share the
+    /// `FieldViolation` detail shape.
+    #[must_use]
+    pub fn field_violation(&self) -> crate::context::outlets::errors::DetailBody {
+        use crate::context::outlets::errors::DetailBody;
+        let (field_path, violation) = match self {
+            Self::NotAnObject { .. } => ("", "type"),
+            Self::MissingTypeField => ("/type", "required"),
+            Self::TypeFieldNotString { .. } => ("/type", "type"),
+            Self::UnrecognizedType { .. } => ("/type", "enum"),
+        };
+        DetailBody::FieldViolation {
+            field_path: field_path.to_owned(),
+            violation: violation.to_owned(),
+        }
+    }
+
+    /// Projects this schema-validation failure onto the structured
+    /// [`OutletErrorSurface`](crate::context::outlets::errors::OutletErrorSurface)
+    /// as an §5.4.4 **Input**-class error (`SCP-OUTLET-6120`,
+    /// `input.schema-violation`) carrying the [`Self::field_violation`] detail
+    /// (SCP-OUT-031 PR-2a).
+    #[must_use]
+    pub fn to_surface(&self) -> crate::context::outlets::errors::OutletErrorSurface {
+        use crate::context::outlets::error_codes::{
+            CODE_INPUT_VIOLATION, SLUG_INPUT_SCHEMA_VIOLATION,
+        };
+        use crate::context::outlets::errors::OutletErrorSurface;
+        OutletErrorSurface::from_code(
+            CODE_INPUT_VIOLATION,
+            SLUG_INPUT_SCHEMA_VIOLATION,
+            Some(self.field_violation()),
+        )
+    }
+}
+
 /// Valid JSON Schema type values per the JSON Schema specification.
 const VALID_SCHEMA_TYPES: &[&str] = &[
     "object", "array", "string", "number", "integer", "boolean", "null",
@@ -696,5 +743,61 @@ mod tests {
         let (side, count) = result.unwrap_err();
         assert_eq!(side, "input");
         assert_eq!(count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // SchemaValidationError::to_surface — SCP-OUT-031 PR-2a
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schema_validation_error_surface_is_input_class_with_field_violation() {
+        use crate::context::outlets::error_codes::{
+            CODE_INPUT_VIOLATION, SLUG_INPUT_SCHEMA_VIOLATION, error_code_to_class, slug_to_class,
+        };
+        use crate::context::outlets::errors::{DetailBody, OutletErrorClass};
+
+        let cases = [
+            (
+                SchemaValidationError::NotAnObject {
+                    kind: "string".to_owned(),
+                },
+                "",
+                "type",
+            ),
+            (SchemaValidationError::MissingTypeField, "/type", "required"),
+            (
+                SchemaValidationError::TypeFieldNotString {
+                    kind: "number".to_owned(),
+                },
+                "/type",
+                "type",
+            ),
+            (
+                SchemaValidationError::UnrecognizedType {
+                    value: "widget".to_owned(),
+                },
+                "/type",
+                "enum",
+            ),
+        ];
+        for (err, want_path, want_violation) in cases {
+            let s = err.to_surface();
+            assert_eq!(s.class, OutletErrorClass::Input);
+            assert_eq!(s.code, CODE_INPUT_VIOLATION);
+            assert_eq!(s.slug, SLUG_INPUT_SCHEMA_VIOLATION);
+            // Consistency invariant.
+            assert_eq!(error_code_to_class(&s.code), Some(s.class));
+            assert_eq!(slug_to_class(&s.slug), Some(s.class));
+            match s.detail {
+                Some(DetailBody::FieldViolation {
+                    field_path,
+                    violation,
+                }) => {
+                    assert_eq!(field_path, want_path);
+                    assert_eq!(violation, want_violation);
+                }
+                other => panic!("expected FieldViolation detail, got {other:?}"),
+            }
+        }
     }
 }

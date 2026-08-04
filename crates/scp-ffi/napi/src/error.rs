@@ -342,6 +342,14 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                         code,
                     }
                 } else if code.starts_with("SCP-OUTLET-") {
+                    // SCP-OUT-031 PR-2a: outlet INVOCATION errors no longer flow
+                    // through this string path — they arrive as the typed
+                    // `CE::Outlet` / `CE::OutletContextNotActive` arms above.
+                    // This branch is now RESIDUAL: it still catches the handful
+                    // of outlet-coded diagnostics the runtime emits as a raw
+                    // `PermissionDenied` (e.g. the settle-path `SCP-OUTLET-6089`
+                    // "context vanished during settle" carrier in
+                    // `supervisor.rs`), so keep it as defense-in-depth.
                     Self::Outlet {
                         message: format!("{e}"),
                         code,
@@ -353,6 +361,29 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                     }
                 }
             }
+            // SCP-OUT-031 PR-2a: outlet invocation errors now arrive as the
+            // typed `ContextError::Outlet(surface)` (was flattened to
+            // `PermissionDenied(String)`). Route to the dedicated `Outlet`
+            // variant preserving at least the concrete §5.4.4 code — parity
+            // with the pre-PR-2a `SCP-OUTLET-` prefix routing above. The
+            // `Display` renders `[code] class: slug`.
+            //
+            // PR-2b: render the structured surface (class/detail/retry/
+            // source_chain) into a richer typed TS error here.
+            CE::Outlet(surface) => Self::Outlet {
+                message: format!("{e}"),
+                code: surface.code.clone(),
+            },
+            // SCP-OUT-031 PR-2a: the outlet reserve-gate context-not-active
+            // carrier. `Display` is the structured, STATE-FREE
+            // `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`
+            // — the raw lifecycle `current_state` is NEVER rendered here (this
+            // gate runs before authz, so an unauthorized caller must not learn
+            // the exact lifecycle state).
+            CE::OutletContextNotActive { .. } => Self::Outlet {
+                message: format!("{e}"),
+                code: scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
+            },
             _ => Self::Context {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: codes::CTX_2001.to_owned(),
@@ -780,5 +811,34 @@ mod tests {
         let err: ScpNapiError =
             scp_core::context::ContextError::MembershipFailed("nope".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2001);
+    }
+
+    /// SCP-OUT-031 PR-2a (SECURITY): the outlet reserve-gate context-not-active
+    /// carrier must surface as the STRUCTURED, state-free `SCP-OUTLET-6101`
+    /// outlet error — the raw lifecycle state MUST NOT leak to the FFI caller
+    /// (this gate runs before authz on the unary invoke path). Cross-bridge
+    /// parity with the `PyO3` + `UniFFI` bridges.
+    #[test]
+    fn outlet_context_not_active_surfaces_structured_state_free() {
+        let err: ScpNapiError = scp_core::context::ContextError::OutletContextNotActive {
+            current_state: scp_core::context::ContextState::Closing,
+        }
+        .into();
+        let (message, code) = match err {
+            ScpNapiError::Outlet { message, code } => (message, code),
+            other => panic!("expected ScpNapiError::Outlet, got {other:?}"),
+        };
+        assert_eq!(
+            code,
+            scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+        );
+        assert!(
+            !message.contains("Closing"),
+            "raw lifecycle state must NOT leak to the FFI caller: {message}"
+        );
+        assert!(
+            message.contains("protocol.context-closed-mid-stream"),
+            "{message}"
+        );
     }
 }

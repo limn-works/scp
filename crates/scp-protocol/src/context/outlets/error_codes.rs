@@ -725,6 +725,34 @@ pub fn error_code_to_retry_policy(code: &str) -> Option<RetryPolicy> {
     }
 }
 
+/// Returns the canonical (primary) `SCP-OUTLET-NNNN` code for a root
+/// [`OutletErrorClass`].
+///
+/// Each of the eight §5.4.4 root classes has exactly one *primary* code — the
+/// lowest-numbered, most-representative code the registry allocates for that
+/// class (e.g. `Protocol → SCP-OUTLET-6100`, `Authorization → SCP-OUTLET-6110`).
+/// The sub-class codes (`SCP-OUTLET-6114` attenuation, `SCP-OUTLET-6131`
+/// credit, …) all share the same root class as their primary; picking the
+/// primary is therefore always class-consistent
+/// (`error_code_to_class(class_to_canonical_code(c)) == Some(c)` for every `c`).
+///
+/// Used by [`OutletErrorSurface::from_class`](super::errors::OutletErrorSurface::from_class)
+/// to derive a class-consistent code when a runtime error is classified by its
+/// slug rather than by a pre-assigned code.
+#[must_use]
+pub const fn class_to_canonical_code(class: OutletErrorClass) -> &'static str {
+    match class {
+        OutletErrorClass::Protocol => CODE_PROTOCOL_VIOLATION,
+        OutletErrorClass::Authorization => CODE_AUTHORIZATION_DENIED,
+        OutletErrorClass::Input => CODE_INPUT_VIOLATION,
+        OutletErrorClass::Execution => CODE_EXECUTION_FAULT,
+        OutletErrorClass::Output => CODE_OUTPUT_VIOLATION,
+        OutletErrorClass::Economic => CODE_ECONOMIC_FAULT,
+        OutletErrorClass::Transport => CODE_TRANSPORT_FAULT,
+        OutletErrorClass::Governance => CODE_GOVERNANCE_FAULT,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slug → class
 // ---------------------------------------------------------------------------
