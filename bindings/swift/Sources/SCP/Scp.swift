@@ -766,7 +766,10 @@ public extension SCP {
     /// Fails closed (#2240): the §9.12 recovery WIRE is not yet built (Part B,
     /// pending human sign-off), so the bridge throws a typed `SCP-IDENT-1022`
     /// error ("recovery backend not configured — provide a real backend via SDK
-    /// layer") rather than fabricating a success.
+    /// layer") rather than fabricating a success. A `did` this instance does not
+    /// host is rejected with `SCP-IDENT-1020`, and an unknown `tier`
+    /// ("agent", "active_signing", or "identity_key") with `SCP-IDENT-1021`,
+    /// before the fail-closed return.
     func identityExecuteRecovery(did: String, tier: String, contextIds: [String]) throws -> String {
         try inner.identityExecuteRecovery(did: did, tier: tier, contextIds: contextIds)
     }

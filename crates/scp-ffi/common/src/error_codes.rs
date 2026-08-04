@@ -123,13 +123,36 @@ pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// `UniFFI` only; the registry-based NAPI/PyO3 delegate paths surface
 /// `IDENT_1001` instead — see sdk-common.md.)
 pub const IDENT_1017: &str = "SCP-IDENT-1017";
-/// Identity agent key creation.
+/// Recovery ownership rejection.
+///
+/// `identity_execute_recovery` was called for a DID that is not owned by this
+/// SCP instance (absent from the bridge's identity/custody registry). Recovery
+/// is restricted to identities registered on this instance (ADR-048 §7).
+/// Distinct from `IDENT_1021` — a well-formed request whose compromise tier is
+/// unrecognized.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";
-/// Identity DID document error.
+/// Invalid compromise tier.
+///
+/// `identity_execute_recovery` was called with a tier string that is not one of
+/// `agent`, `active_signing`, or `identity_key`. A caller-input error, kept
+/// distinct from `IDENT_1020` (a valid tier for a DID this instance does not
+/// own) so callers can tell "wrong instance" from "bad tier".
+pub const IDENT_1021: &str = "SCP-IDENT-1021";
+/// Recovery fail-closed (no configured backend).
+///
+/// `identity_execute_recovery` has no configured backend (the §9.12 WIRE is
+/// #2240 Part B), so — after passing the ownership/tier gates — it returns this
+/// typed error rather than fabricating a success. Recovery never silently
+/// succeeds.
 pub const IDENT_1022: &str = "SCP-IDENT-1022";
 /// Identity agent key validation.
 pub const IDENT_1023: &str = "SCP-IDENT-1023";
-/// Identity agent key operation error.
+/// Custody-migration rejection.
+///
+/// `identity_execute_custody_migration` was rejected because either the DID is
+/// not owned by this SCP instance (ownership check, ADR-048 §7) or the
+/// requested migration target was not one of `platform_managed`, `hardware`,
+/// `software`, or `in_memory`.
 pub const IDENT_1024: &str = "SCP-IDENT-1024";
 /// Identity custody error.
 pub const IDENT_1025: &str = "SCP-IDENT-1025";

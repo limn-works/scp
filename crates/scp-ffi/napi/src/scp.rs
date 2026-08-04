@@ -1170,7 +1170,7 @@ impl Scp {
                     message: format!(
                         "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
                     ),
-                    code: codes::IDENT_1020.to_owned(),
+                    code: codes::IDENT_1021.to_owned(),
                 }));
             }
         }
@@ -5002,6 +5002,28 @@ mod concurrency_cap_tests {
         assert!(
             msg.contains("not configured"),
             "expected 'not configured' in fail-closed message, got: {msg}"
+        );
+    }
+
+    /// Recovery rejects an unrecognized compromise tier with the dedicated
+    /// `SCP-IDENT-1021` code (distinct from the `SCP-IDENT-1020` ownership
+    /// rejection), before reaching the fail-closed return. The DID is owned, so
+    /// the ownership gate passes and the tier check is what rejects the call.
+    #[test]
+    fn recovery_rejects_unknown_tier() {
+        let (scp, did) = build_scp_with_identity();
+
+        let err = scp
+            .identity_execute_recovery(did, "bogus-tier".to_owned(), Vec::new())
+            .expect_err("unknown tier must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-IDENT-1021"),
+            "expected dedicated invalid-tier code SCP-IDENT-1021, got: {msg}"
+        );
+        assert!(
+            msg.contains("invalid compromise tier"),
+            "expected invalid-tier message, got: {msg}"
         );
     }
 
