@@ -151,16 +151,39 @@ pub struct RecoveryResult {
 /// Errors produced by the compromise recovery orchestrator.
 ///
 /// Step 1 (key rotation) failure is fatal — the orchestrator cannot proceed
-/// without new key material. Steps 2–4 failures are per-context and recorded
-/// in `RecoveryResult::failed_contexts`. Steps 5–6 failures are non-fatal
-/// cleanup errors.
+/// without new key material. Steps 2–4 failures are normally per-context and
+/// recorded in `RecoveryResult::failed_contexts`; but a *total* failure (every
+/// context failed) fails the whole call closed via
+/// [`RecoveryError::AllContextsFailed`] rather than returning an all-failed
+/// `RecoveryResult` that could masquerade as success. Steps 5–6 failures are
+/// non-fatal cleanup errors.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
-    /// Step 1 failed: key rotation on trusted device.
+    /// Step 1 failed: key rotation on trusted device did not occur.
     ///
-    /// This is fatal — cannot proceed without new key material.
+    /// This is fatal — the orchestrator cannot proceed without new key
+    /// material. Also returned when the caller passes `key_rotation: None` to
+    /// [`CompromiseRecoveryOrchestrator::execute_recovery`] (step 1 did not
+    /// occur): the per-context steps rotate/replace material that only exists
+    /// once step 1 has actually run, so recovery fails closed instead of
+    /// fabricating a `RecoveryResult` that would imply a completed rotation.
     #[error("key rotation failed (step 1): {0}")]
     KeyRotationFailed(String),
+
+    /// Total failure: there were contexts to recover but not one made real
+    /// progress — every context landed in `failed_contexts`, none completed and
+    /// none is pending an ADR-029 rejoin.
+    ///
+    /// Returned instead of an all-failed `RecoveryResult` so a total failure —
+    /// e.g. a no-op / unconfigured backend that rejects every context — cannot
+    /// be observed as a success (fail-closed, #2240). A recovery for an
+    /// identity in *zero* contexts is NOT a total failure (there is simply no
+    /// per-context work) and stays on the `Ok` path.
+    #[error("recovery failed for all {attempted} context(s): zero contexts recovered")]
+    AllContextsFailed {
+        /// Number of contexts attempted, all of which failed.
+        attempted: usize,
+    },
 
     /// The compromise tier requires an agent key but none exists.
     #[error("agent key not found in identity")]
@@ -433,10 +456,11 @@ pub trait RecoveryBackend {
 /// );
 /// let result = orchestrator.execute_recovery(
 ///     CompromiseTier::Agent,
-///     &key_rotation_outcome,
+///     Some(&key_rotation_outcome), // step 1 ran; None would fail closed
 ///     &contact_dids,
 ///     None, // no PSK rotation for agent key compromise
 ///     &backend,
+///     &clock,
 /// ).await?;
 /// ```
 ///
@@ -478,7 +502,13 @@ impl CompromiseRecoveryOrchestrator {
     /// # Arguments
     ///
     /// * `tier` — The compromise tier being addressed.
-    /// * `key_rotation` — Outcome of step 1 (key rotation), completed externally.
+    /// * `key_rotation` — Step-1 (key rotation) outcome, completed externally.
+    ///   `Some(outcome)` means step 1 *actually* ran and supplies the material
+    ///   the per-context steps consume; `None` means step 1 did not occur, so
+    ///   recovery fails closed (see Errors) before any context is touched. This
+    ///   single `Option` makes the invalid "populated outcome but rotation did
+    ///   not happen" state unrepresentable, and drives
+    ///   `RecoveryResult::key_rotation_completed` (`= key_rotation.is_some()`).
     /// * `contact_dids` — DIDs to notify in step 5. Empty set skips notification.
     /// * `psk_params` — Parameters for step 6. `None` skips PSK re-encryption
     ///   (appropriate for agent key compromise where PSK is unaffected).
@@ -486,19 +516,55 @@ impl CompromiseRecoveryOrchestrator {
     ///
     /// # Errors
     ///
-    /// Per-context failures are recorded in `RecoveryResult::failed_contexts`,
-    /// NOT as errors from this method.
+    /// Ordinary *per-context* failures are non-fatal and recorded in
+    /// `RecoveryResult::failed_contexts` (partial success). This method fails
+    /// closed with a typed [`RecoveryError`] only when nothing real backs the
+    /// call:
+    ///
+    /// * [`RecoveryError::KeyRotationFailed`] — `key_rotation` is `None`
+    ///   (step 1 did not occur).
+    /// * [`RecoveryError::AllContextsFailed`] — there were contexts to recover
+    ///   but every one failed (none completed, none pending an ADR-029
+    ///   rejoin). A recovery for an identity in *zero* contexts is not a total
+    ///   failure and stays on the `Ok` path.
+    // `key_rotation` is an `Option` rather than a `&KeyRotationOutcome` plus a
+    // parallel `performed: bool`: the two-field shape admits an invalid state
+    // (a populated outcome paired with "rotation did not happen"), whereas the
+    // `Option` encodes "step 1 ran" in the presence of the outcome the steps
+    // need — so the `None`/fail-closed and `Some`/proceed arms cannot disagree
+    // (#2240). `KeyRotationOutcome` itself is unchanged (its serialized shape
+    // and helper constructors always denote a *performed* rotation).
     #[allow(clippy::future_not_send)] // backend trait object is not Sync by design
     pub async fn execute_recovery(
         &self,
         tier: CompromiseTier,
-        key_rotation: &KeyRotationOutcome,
+        key_rotation: Option<&KeyRotationOutcome>,
         contact_dids: &HashSet<DID>,
         psk_params: Option<&PskRotationParams>,
         backend: &dyn RecoveryBackend,
         clock: &dyn Clock,
     ) -> Result<RecoveryResult, RecoveryError> {
         let initiated_at = clock.now_millis();
+
+        // `key_rotation_completed` derives from whether step 1 produced an
+        // outcome — no hardcoded `true`.
+        let key_rotation_completed = key_rotation.is_some();
+
+        // FAIL CLOSED (#2240): step 1 (key rotation on a trusted device) is the
+        // precondition for every subsequent step — steps 2–4 rotate/replace key
+        // material that exists only if rotation actually happened. `None` means
+        // step 1 did not occur (the outcome the steps would consume is genuinely
+        // absent), so recovery fails closed with the fatal step-1 error rather
+        // than fabricate a `RecoveryResult` whose `key_rotation_completed` would
+        // imply a completed rotation. `Some` unwraps to the outcome the steps
+        // below use.
+        let Some(key_rotation) = key_rotation else {
+            return Err(RecoveryError::KeyRotationFailed(
+                "step 1 key rotation did not occur (no KeyRotationOutcome supplied) — cannot \
+                 recover without new key material"
+                    .to_owned(),
+            ));
+        };
 
         let mut completed_contexts = Vec::new();
         let mut failed_contexts = Vec::new();
@@ -557,6 +623,23 @@ impl CompromiseRecoveryOrchestrator {
             }
         }
 
+        // FAIL CLOSED (#2240): if there were contexts to recover but not one
+        // made real progress — every context landed in `failed_contexts`, none
+        // completed and none is pending an ADR-029 rejoin — then nothing real
+        // backs this call (e.g. a no-op / unconfigured backend that rejects
+        // every context). Returning an all-failed `RecoveryResult` would let a
+        // total failure be observed as a success; fail closed instead. Zero
+        // contexts is NOT a total failure: there is simply no per-context work,
+        // and the (performed) key rotation above is the real work.
+        if !self.context_ids.is_empty()
+            && completed_contexts.is_empty()
+            && pending_rejoin.is_empty()
+        {
+            return Err(RecoveryError::AllContextsFailed {
+                attempted: self.context_ids.len(),
+            });
+        }
+
         // Steps 5 and 6 are independent cleanup after step 4.
         // They can execute in any order (or parallel).
 
@@ -592,7 +675,11 @@ impl CompromiseRecoveryOrchestrator {
             completed_contexts,
             failed_contexts,
             pending_rejoin,
-            key_rotation_completed: true, // Step 1 was provided as input.
+            // Derived from whether step 1 supplied an outcome (`is_some()`),
+            // computed above. Reaching this point implies it was `Some` — the
+            // `None` arm fails closed — so it is `true` here, but by derivation,
+            // never a hardcoded literal that could lie about step 1.
+            key_rotation_completed,
             contacts_notified,
             private_state_reencrypted,
             initiated_at,
@@ -1549,7 +1636,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::Agent,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 None,
                 &backend,
@@ -1588,7 +1675,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::ActiveSigning,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 Some(&psk_params),
                 &backend,
@@ -1621,7 +1708,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::IdentityKey,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 Some(&psk_params),
                 &backend,
@@ -1647,7 +1734,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::Agent,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 None,
                 &backend,
@@ -1659,6 +1746,144 @@ mod tests {
         assert!(result.completed_contexts.is_empty());
         assert!(result.failed_contexts.is_empty());
         assert!(result.pending_rejoin.is_empty());
+        // Zero contexts + a performed rotation is a valid no-context recovery,
+        // and the field reflects the performed rotation.
+        assert!(result.key_rotation_completed);
+    }
+
+    #[tokio::test]
+    async fn recovery_partial_failure_stays_ok() {
+        // One context succeeds, one fails at step 2. Per-context isolation keeps
+        // this an `Ok` partial success with the failure recorded — NOT a
+        // fail-closed error (that is reserved for a *total* failure). #2240.
+        let orch = CompromiseRecoveryOrchestrator::new(
+            did("did:dht:alice"),
+            vec!["ctx-ok".to_owned(), "ctx-fail".to_owned()],
+        );
+        let key_rotation = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend {
+            mls_update_error: Some((
+                "ctx-fail".to_owned(),
+                RecoveryStepError {
+                    step: 2,
+                    description: "MLS group unavailable".to_owned(),
+                },
+            )),
+            ..MockRecoveryBackend::new()
+        };
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                Some(&key_rotation),
+                &contacts,
+                None,
+                &backend,
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("partial failure must remain Ok");
+
+        assert_eq!(result.completed_contexts, vec!["ctx-ok"]);
+        assert_eq!(result.failed_contexts.len(), 1);
+        assert_eq!(result.failed_contexts[0].0, "ctx-fail");
+        assert!(result.pending_rejoin.is_empty());
+        assert!(result.key_rotation_completed);
+    }
+
+    #[tokio::test]
+    async fn recovery_fails_closed_when_all_contexts_fail() {
+        // The backend rejects the (only) context's step-2 MLS update, so no
+        // context recovers. The orchestrator must fail closed with
+        // `AllContextsFailed` rather than return an all-failed `RecoveryResult`
+        // that could be observed as success (#2240).
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
+        let key_rotation = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend {
+            mls_update_error: Some((
+                "ctx-1".to_owned(),
+                RecoveryStepError {
+                    step: 2,
+                    description: "MLS group unavailable".to_owned(),
+                },
+            )),
+            ..MockRecoveryBackend::new()
+        };
+
+        let err = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                Some(&key_rotation),
+                &contacts,
+                None,
+                &backend,
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect_err("total per-context failure must fail closed");
+
+        assert!(
+            matches!(&err, RecoveryError::AllContextsFailed { attempted } if *attempted == 1),
+            "expected AllContextsFailed {{ attempted: 1 }}, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_fails_closed_when_rotation_not_performed() {
+        // `key_rotation: None` means step 1 never ran; recovery must fail closed
+        // with `KeyRotationFailed` before touching any context, and never
+        // fabricate a `RecoveryResult` claiming a completed rotation.
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
+
+        let err = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                None,
+                &contacts,
+                None,
+                &backend,
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect_err("key_rotation: None must fail closed");
+
+        assert!(
+            matches!(
+                &err,
+                RecoveryError::KeyRotationFailed(msg) if msg.contains("no KeyRotationOutcome supplied")
+            ),
+            "expected KeyRotationFailed mentioning the no-rotation reason, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_fails_closed_zero_contexts_no_rotation() {
+        // Zero contexts with a *performed* rotation is a valid no-context Ok
+        // (see `recovery_with_no_contexts`); but a rotation that did not occur
+        // still fails closed even with no contexts to recover.
+        let orch = CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec![]);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
+
+        let err = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                None,
+                &contacts,
+                None,
+                &backend,
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect_err("zero contexts + no rotation must fail closed");
+
+        assert!(matches!(err, RecoveryError::KeyRotationFailed(_)));
     }
 
     #[tokio::test]
@@ -1674,7 +1899,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::ActiveSigning,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 None,
                 &backend,
@@ -1705,7 +1930,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::ActiveSigning,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 Some(&psk_params),
                 &backend,
@@ -1740,7 +1965,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::ActiveSigning,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 Some(&psk_params),
                 &backend,
@@ -1764,7 +1989,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::Agent,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 None,
                 &backend,
@@ -1851,7 +2076,7 @@ mod tests {
             let result = orch
                 .execute_recovery(
                     CompromiseTier::Agent,
-                    &kr,
+                    Some(&kr),
                     &contacts,
                     None,
                     &backend,
@@ -1873,7 +2098,7 @@ mod tests {
             let result = orch
                 .execute_recovery(
                     CompromiseTier::ActiveSigning,
-                    &kr,
+                    Some(&kr),
                     &contacts,
                     Some(&psk_params),
                     &backend,
@@ -1894,7 +2119,7 @@ mod tests {
             let result = orch
                 .execute_recovery(
                     CompromiseTier::IdentityKey,
-                    &kr,
+                    Some(&kr),
                     &contacts,
                     Some(&psk_params),
                     &backend,
@@ -2294,7 +2519,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::Agent,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 None,
                 &backend,
@@ -2338,7 +2563,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::ActiveSigning,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 Some(&psk_params),
                 &backend,
@@ -2381,7 +2606,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::IdentityKey,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 Some(&psk_params),
                 &backend,
@@ -2422,7 +2647,7 @@ mod tests {
         let result = orch
             .execute_recovery(
                 CompromiseTier::Agent,
-                &key_rotation,
+                Some(&key_rotation),
                 &contacts,
                 None,
                 &backend,

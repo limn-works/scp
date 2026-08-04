@@ -128,7 +128,7 @@ async fn compromise_tier_agent() {
     let result = orch
         .execute_recovery(
             CompromiseTier::Agent,
-            &kr,
+            Some(&kr),
             &HashSet::new(),
             None,
             &backend,
@@ -171,7 +171,7 @@ async fn compromise_tier_active_signing() {
     let result = orch
         .execute_recovery(
             CompromiseTier::ActiveSigning,
-            &kr,
+            Some(&kr),
             &contacts,
             Some(&psk_params),
             &backend,
@@ -214,7 +214,7 @@ async fn compromise_tier_identity_key() {
     let result = orch
         .execute_recovery(
             CompromiseTier::IdentityKey,
-            &kr,
+            Some(&kr),
             &contacts,
             Some(&psk_params),
             &backend,
@@ -440,7 +440,7 @@ async fn recovery_result_completed_vs_failed() {
     let result = orch
         .execute_recovery(
             CompromiseTier::Agent,
-            &kr,
+            Some(&kr),
             &HashSet::new(),
             None,
             &backend,
@@ -488,7 +488,7 @@ async fn recovery_result_with_rejoin_context() {
     let result = orch
         .execute_recovery(
             CompromiseTier::Agent,
-            &kr,
+            Some(&kr),
             &HashSet::new(),
             None,
             &backend,
@@ -547,7 +547,7 @@ async fn psk_rotation_params() {
     let result = orch
         .execute_recovery(
             CompromiseTier::ActiveSigning,
-            &kr,
+            Some(&kr),
             &HashSet::new(),
             None,
             &backend,
@@ -561,7 +561,7 @@ async fn psk_rotation_params() {
     let result_with = orch
         .execute_recovery(
             CompromiseTier::ActiveSigning,
-            &kr,
+            Some(&kr),
             &HashSet::new(),
             Some(&params_clean),
             &backend,
@@ -600,6 +600,11 @@ async fn recovery_error_variants() {
     let e5 = RecoveryError::CustodyError("keychain locked".to_owned());
     assert!(e5.to_string().contains("custody error"));
     assert!(e5.to_string().contains("keychain locked"));
+
+    // AllContextsFailed (total per-context failure → fail-closed, #2240).
+    let e6 = RecoveryError::AllContextsFailed { attempted: 3 };
+    assert!(e6.to_string().contains("all 3 context"));
+    assert!(e6.to_string().contains("zero contexts recovered"));
 
     // RecoveryStepError Display.
     let step_err = RecoveryStepError {
@@ -644,7 +649,7 @@ async fn recovery_with_contact_notification_failure() {
     let result = orch
         .execute_recovery(
             CompromiseTier::Agent,
-            &kr,
+            Some(&kr),
             &contacts,
             None,
             &backend,
@@ -681,7 +686,7 @@ async fn recovery_with_psk_rotation_failure() {
     let result = orch
         .execute_recovery(
             CompromiseTier::ActiveSigning,
-            &kr,
+            Some(&kr),
             &HashSet::new(),
             Some(&psk_params),
             &backend,
@@ -751,7 +756,7 @@ async fn recovery_with_no_contexts() {
     let result = orch
         .execute_recovery(
             CompromiseTier::Agent,
-            &kr,
+            Some(&kr),
             &HashSet::new(),
             None,
             &backend,

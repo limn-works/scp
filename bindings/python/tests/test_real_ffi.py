@@ -285,10 +285,14 @@ class TestIdentity:
 
     async def test_execute_recovery_invalid_tier(self, scp: SCP):
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
-        # Invalid-tier rejection carries the canonical SCP-IDENT-1020 code on
-        # every bridge (parity with NAPI/UniFFI). Match the distinctive message
-        # too — 1020 is shared with the ownership-rejection path, so the message
-        # is what pins THIS path (the identity is owned, so ownership passes).
+        # Invalid-tier rejection carries its own dedicated SCP-IDENT-1021 code on
+        # every bridge (parity with NAPI/UniFFI), distinct from the
+        # SCP-IDENT-1020 ownership rejection — so a caller can tell "bad tier"
+        # from "wrong instance". The identity is owned, so ownership passes and
+        # the tier check is what rejects the call. Match the distinctive message
+        # too.
+        with pytest.raises(Exception, match="SCP-IDENT-1021"):
+            await scp.identity_execute_recovery(identity.did, "invalid_tier", [])
         with pytest.raises(Exception, match="invalid compromise tier"):
             await scp.identity_execute_recovery(identity.did, "invalid_tier", [])
 

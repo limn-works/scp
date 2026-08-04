@@ -817,6 +817,10 @@ class SCP:
             that was only resolved via :meth:`identity_load` is not
             registered for recovery. DIDs absent from the instance's
             registry are rejected with ``SCP-IDENT-1020``.
+        :param tier: Compromise tier: ``"agent"``, ``"active_signing"``, or
+            ``"identity_key"``. An unknown tier is rejected with
+            ``SCP-IDENT-1021`` (distinct from the ``SCP-IDENT-1020`` ownership
+            rejection above).
         :param context_ids: Contexts to run the recovery protocol
             against. Accepted for signature symmetry with the wired
             backend (#2240 Part B); ignored on the current fail-closed

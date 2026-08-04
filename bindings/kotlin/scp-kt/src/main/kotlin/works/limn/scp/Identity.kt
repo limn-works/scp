@@ -127,6 +127,7 @@ interface IdentityAdvancedBindings {
      *
      * @param did DID string to recover.
      * @param tier Compromise tier: "agent", "active_signing", or "identity_key".
+     *   An unknown tier is rejected with `SCP-IDENT-1021`.
      * @param contextIds Context IDs where the DID is a member.
      * @return JSON string with the recovery result.
      * @throws BridgeException if recovery fails.
@@ -367,11 +368,15 @@ class IdentityAdvancedBridge internal constructor(
      * configured — provide a real backend via SDK layer") rather than
      * fabricating a success.
      *
-     * @param did The DID string to recover.
+     * @param did The DID string to recover. A DID this instance does not host
+     *   is rejected with `SCP-IDENT-1020`.
      * @param tier Compromise tier: "agent", "active_signing", or "identity_key".
+     *   An unknown tier is rejected with `SCP-IDENT-1021` (distinct from the
+     *   `SCP-IDENT-1020` ownership rejection).
      * @param contextIds Context IDs where this DID is a member.
      * @return JSON string with the recovery result (once the backend is wired).
-     * @throws BridgeException `SCP-IDENT-1022` while recovery is not configured.
+     * @throws BridgeException `SCP-IDENT-1021` for an unknown tier, or
+     *   `SCP-IDENT-1022` while recovery is not configured.
      */
     suspend fun executeRecovery(
         did: String,

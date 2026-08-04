@@ -2588,7 +2588,7 @@ impl crate::scp::PyScp {
                     format!(
                         "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
                     ),
-                    scp_ffi_common::error_codes::IDENT_1020,
+                    scp_ffi_common::error_codes::IDENT_1021,
                 )));
             }
         }
