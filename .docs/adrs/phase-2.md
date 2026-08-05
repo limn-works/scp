@@ -874,13 +874,13 @@ pub enum EventType {
    groups (governance-action coverage, lifecycle/migration per §5.10–§5.11A,
    content-access per §5, economic per §19.6.1, consequence-enforcement per
    §7.3.7, commit-broadcast reconciliation per §9.9.4, compromise recovery per
-   §9.12, and app-sandbox binding per §8) were added by the native↔WASM
+   §9.12) were added by the native↔WASM
    unification amendment below.
    The closure obligation spans **every** source that appends to the Merkle log —
    governance actions (ADR-031 §3), lifecycle/migration transitions (ADR-049 §9 /
    §5.11A), membership and access changes (§5), media (ADR-024), economic actions
-   (§19), consequence enforcement (phase-4 trust engine / §7.3.7), app-sandbox
-   binding (§8), compromise recovery (§9.12 step 2 MLS group-epoch advance), and
+   (§19), consequence enforcement (phase-4 trust engine / §7.3.7),
+   compromise recovery (§9.12 step 2 MLS group-epoch advance), and
    provenance (§7.3) — not governance actions alone. Each new
    variant carries its parameters in `EventPayload`; no parameter is ever baked
    into the type name. The canonical Merkle log carries only **convergent**
@@ -927,7 +927,7 @@ pub enum EventType {
    > identically and in the same order, i.e. the MLS-commit-ordered stream
    > (governance, membership, lifecycle, role, access, provenance,
    > economic *governance actions* — policy changes, spending-UCAN grants/revocations,
-   > compromise recovery, app-binding). Attestations are NOT in this stream — they
+   > compromise recovery). Attestations are NOT in this stream — they
    > are credential-layer artifacts (§7.4), not context-log leaves, and there is no
    > `AttestationPublished`/`AttestationRevoked` `EventType` variant.
    > Per-member-observed
@@ -988,7 +988,7 @@ pub enum EventType {
    >    even under ADR-051** (a transport-send outcome is not a causal-DAG
    >    application event; it has no cross-member referent to linearize), so they
    >    are excluded **permanently**, not interim. They remain in the closed
-   >    `EventType` set (the 77-variant set is not narrowed) but are NEVER passed to
+   >    `EventType` set (the 75-variant set is not narrowed) but are NEVER passed to
    >    `append_context_event`; the three retry-sweep lifecycle states
    >    (`CommitBroadcastSucceeded` / `CommitBroadcastPending` /
    >    `CommitBroadcastFailed`) and the enqueue-time `CommitBroadcastPending` are
@@ -1045,6 +1045,46 @@ pub enum EventType {
    > writes `TTLExtended`/`TTLExtensionRejected` — the `EventType` variant spelling
    > is authoritative.)
 
+   > **Amendment (app-binding removal — an app is not a protocol entity).** The
+   > `AppBound` / `AppUnbound` variants, and every clause above that named
+   > "app-sandbox binding (§8)" as a source of convergent Merkle leaves, are
+   > **removed**. They were never authorized by a human-authored source: they
+   > rested on two agent-fabricated spec subsections (§8.4.1 "capability
+   > declaration wire format" and §8.4.2 "scoped handle / bind-time event log")
+   > that directly contradicted human-authored §8.1 — *"An app is not a protocol
+   > entity. It has no DID, is not an agent, and is not a context. The protocol
+   > has no `App` type."* Those subsections are reverted; §8.4.1 is now the
+   > **Scope Boundary** subsection, which states the correct rule: capability
+   > scoping is enforced locally by the member's own SDK and **produces no
+   > protocol state**.
+   >
+   > The convergence argument is why this is a defect and not a preference. An
+   > app runs on one member's device, under that member's identity. Which client
+   > software a member runs is not a fact the context converges on: a bind leaf
+   > would be minted by exactly one member and by no other, so two honest members
+   > would diverge at equal `event_count` — the same §9.9.3 false-positive
+   > equivocation the exclusion taxonomy above removes for `MessageReceived` /
+   > `PseudonymAnnounced`. A durable bind leaf would additionally leak every
+   > member's software inventory to every peer. There is no second principal to
+   > authenticate: an app has no DID and presents no signature, so the removed
+   > `AppBound` payload's `app_did` field named a principal that does not exist.
+   >
+   > **Wire tags 74–75 are permanently retired and MUST NEVER be reused.** As with
+   > tag 59 (`PseudonymAnnounced`), the values are left as a deliberate gap rather
+   > than renumbered, so every other variant's canonical tag — and therefore the
+   > §25 KAT leaf preimages — stays byte-stable. Reusing either value would
+   > silently reinterpret a leaf signed under the old meaning. The closed taxonomy
+   > narrows **77 → 75**; the surviving tag map is `0..=35` (protocol constants),
+   > `36..=73` (unification variants, tag 59 retired), `74..=75` (retired here),
+   > `76..=77` (the §6 cross-context-saga carve-out). Enforced by
+   > `tree::event_type_tag` and its distinctness tests in `scp-event-log`.
+   >
+   > The **name-string defect note above** is retained deliberately: the
+   > `"AppBound:{did}:{name}:{ver}:[{caps}]"` / `"AppUnbound:{did}"` format strings
+   > are a historical record of a real defect this ADR corrected. An ADR is a
+   > decision record, not a current-state spec — the record of the correction
+   > stands even though the variants it corrected no longer exist.
+
    **Rejected alternative — typed catch-all (`EventType::Other(String)`).**
    Rejected because it reintroduces free-form strings into the signed preimage
    (the non-convergence vector being removed), violates the closed/complete-set
@@ -1053,9 +1093,9 @@ pub enum EventType {
    a finite, governing source: governance actions (ADR-031 §3 `GovernanceAction`),
    lifecycle/migration transitions (ADR-049 §9 / §5.11A), membership and access
    changes (§5), media sessions (ADR-024), economic actions (§19),
-   consequence-enforcement outcomes (phase-4 trust engine / §7.3.7), app-sandbox
-   binding (§8), compromise recovery (§9.12 step 2 MLS group-epoch advance), and
-   provenance (§7.3). Lifecycle, consequence, recovery, and app-sandbox
+   consequence-enforcement outcomes (phase-4 trust engine / §7.3.7),
+   compromise recovery (§9.12 step 2 MLS group-epoch advance), and
+   provenance (§7.3). Lifecycle, consequence, and recovery
    events are enumerable yet are **not** `GovernanceAction`s — the closure
    argument rests on the union of all these sources, not on
    `GovernanceAction::variant_name()` alone. Enum expansion is strictly superior.
