@@ -6,6 +6,7 @@
 //! 1. **Key rotation** on a trusted device (3 tiers: agent, active, identity).
 //! 2. **MLS `Update`** in all active contexts (per-context, failure-isolated).
 //! 3. **UCAN revocation** of all tokens issued by the compromised key.
+//!    ([`ProductionRecoveryBackend`] fails this step closed — see #2069.)
 //! 4. **`KeyPackage` rotation** — delete old, publish new.
 //! 5. **Contact notification** — key-change alerts to all known contacts.
 //! 6. **Identity private state re-encryption** — PSK rotation, device removal.
@@ -387,9 +388,16 @@ pub trait RecoveryBackend {
     /// via MLS application messages (§9.5). Issues new tokens signed by the
     /// new key.
     ///
+    /// This is the **contract a backend must satisfy**, not a description of
+    /// what ships: [`ProductionRecoveryBackend::revoke_ucans`] cannot satisfy
+    /// it today and fails closed (#2069). An `Ok(())` from this method is a
+    /// claim that the compromised key's tokens are now rejected at the
+    /// revocation gates — only return it when that is true.
+    ///
     /// # Errors
     ///
-    /// Returns [`RecoveryStepError`] if UCAN revocation or re-issuance fails.
+    /// Returns [`RecoveryStepError`] if UCAN revocation or re-issuance fails,
+    /// or if the backend has no revocation capability at all.
     async fn revoke_ucans(
         &self,
         context_id: &str,
@@ -839,7 +847,7 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Optio
 /// | Trait method         | Mailbox command                                          |
 /// |----------------------|----------------------------------------------------------|
 /// | `mls_update`         | `RecoveryAdvanceEpoch` + `RecoverySendNotification` (seq 0) |
-/// | `revoke_ucans`       | `RecoverySendNotification` (seq 1)                       |
+/// | `revoke_ucans`       | *none — fails closed (#2069); seq 1 is unallocated*      |
 /// | `rotate_key_packages`| `RecoverySendNotification` (seq 2)                       |
 /// | `notify_contacts`    | `RecoveryNotifyContact` (cross-context fan-out)          |
 /// | `rotate_psk`         | `RecoverySendNotification` (seq 3)                       |
@@ -1052,57 +1060,63 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         }
     }
 
+    /// Step 3 — **not wired; always fails closed** (#2069).
+    ///
+    /// This step previously built a throwaway
+    /// [`RevocationList`](scp_protocol::crypto::ucan::revoke::RevocationList),
+    /// `revoke`d a *synthetic marker string*
+    /// (`"recovery:{ctx}:scopes={..}:before={ts}"`) into it, distributed the
+    /// serialized list over the recovery-notification channel and returned
+    /// `Ok(())`. Nothing was revoked by that: every revocation gate in the
+    /// system is an **exact SHA-256 token-CID** lookup
+    /// ([`compute_revocation_cid`](scp_protocol::crypto::ucan::revoke::compute_revocation_cid)
+    /// against `governance.revoked_spending_ucan_cids`, consulted through the
+    /// crate-private `ContextRevocationChecker` adapter in
+    /// `context::economy_logic`), so a marker can never match a real token; and
+    /// no receive-side handler
+    /// merges a distributed list into that enforcement set. The step reported
+    /// success for a security action that did not happen — the nullifier class
+    /// the builder tenets forbid.
+    ///
+    /// It now returns a typed error instead. Recovery therefore surfaces the
+    /// missing capability (a failed context, and
+    /// [`RecoveryError::AllContextsFailed`] when no context recovers) rather
+    /// than a false guarantee that a compromised key's outstanding capabilities
+    /// were invalidated.
+    ///
+    /// The real wire — enumerating the compromised scope's outstanding tokens
+    /// (or a scope+timestamp revocation predicate) and merging revocations into
+    /// the enforcement set on receive — is blocked on the §9.12 revocation-model
+    /// design decisions catalogued in #2240 Part B item 1 and tracked by #2069.
+    /// It is deliberately NOT invented here.
+    ///
+    /// # Errors
+    ///
+    /// Always returns a step-3 [`RecoveryStepError`].
     async fn revoke_ucans(
         &self,
         context_id: &str,
         key_rotation: &KeyRotationOutcome,
     ) -> Result<(), RecoveryStepError> {
-        // Step 3: Revoke all UCAN tokens issued by the compromised key.
-        //
-        // Build a per-context RevocationList and mark all tokens from the
-        // compromised key scopes as Revoked. Then distribute the revocation
-        // via a recovery notification so other members update their local
-        // revocation lists.
-        use scp_protocol::crypto::ucan::revoke::RevocationList;
-
-        let scopes = key_rotation.rotated_key_scopes.join(",");
-
-        // Create a revocation list for this context and add a blanket
-        // revocation entry keyed by the compromised scopes and timestamp.
-        // This acts as a revocation marker: all tokens issued by the
-        // compromised key scopes before the rotation timestamp are invalid.
-        let mut revocation_list = RevocationList::new(context_id.to_owned());
-        let revocation_cid = format!(
-            "recovery:{}:scopes={}:before={}",
-            context_id, scopes, key_rotation.rotated_at,
-        );
-        revocation_list.revoke(revocation_cid);
-
-        // Serialize the revocation list for distribution.
-        let revocation_payload =
-            serde_json::to_vec(&revocation_list).map_err(|e| RecoveryStepError {
-                step: 3,
-                description: format!("failed to serialize revocation list: {e}"),
-            })?;
-
-        // Distribute the revocation via the context manager's recovery
-        // notification channel so all members receive and merge it.
-        let result = self
-            .dispatch_recovery_send_notification(
-                context_id,
-                key_rotation.did_after.as_ref(),
-                &revocation_payload,
-                1, // sequence 1: UCAN revocation notification
-            )
-            .await
-            .map_err(Self::dispatch_step_error);
-        match result {
-            Ok(()) => Ok(()),
-            Err(mut e) => {
-                e.step = 3;
-                Err(e)
-            }
-        }
+        // FAIL CLOSED (#2069): there is no live write path into the revocation
+        // enforcement set, so this node cannot revoke anything. Report the
+        // absence instead of the previous marker-string no-op that returned
+        // `Ok(())` and let the orchestrator set `ucan_revoked = true`.
+        Err(RecoveryStepError {
+            step: 3,
+            description: format!(
+                "UCAN revocation is not wired — revocation enforcement matches exact SHA-256 \
+                 token CIDs (`compute_revocation_cid` against \
+                 `governance.revoked_spending_ucan_cids`, consulted via \
+                 `ContextRevocationChecker`) and no live write path merges recovery \
+                 revocations into that set, so no token issued by the compromised key \
+                 scope(s) [{scopes}] in context `{context_id}` can be revoked. Failing \
+                 closed rather than reporting a revocation that did not happen \
+                 (see #2069; the enumeration + receive-side merge wire is blocked on the \
+                 §9.12 revocation-model decisions in #2240 Part B item 1)",
+                scopes = key_rotation.rotated_key_scopes.join(", "),
+            ),
+        })
     }
 
     async fn rotate_key_packages(
@@ -2376,19 +2390,89 @@ mod tests {
         assert_eq!(result.unwrap_err().step, 2);
     }
 
+    /// #2069: step 3 has no live write path into the revocation enforcement
+    /// set, so the production backend MUST fail closed — even for a fully
+    /// healthy, registered context where the old marker-string implementation
+    /// happily returned `Ok(())`. This is the regression guard against the
+    /// nullifier coming back.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_revoke_ucans_succeeds() {
+    async fn production_backend_revoke_ucans_fails_closed() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let context_id = "ctx-prod-2";
 
+        // A healthy, registered context: nothing about the *environment* is
+        // making this fail — the capability is genuinely absent.
         setup_context(&manager, context_id, &alice).await;
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
-        let result = backend.revoke_ucans(context_id, &key_rotation).await;
-        assert!(result.is_ok(), "revoke_ucans should succeed: {result:?}");
+        let err = backend
+            .revoke_ucans(context_id, &key_rotation)
+            .await
+            .expect_err("revoke_ucans must fail closed until #2069 is wired");
+
+        assert_eq!(err.step, 3, "must be attributed to §9.12 step 3");
+        assert!(
+            err.description.contains("UCAN revocation is not wired"),
+            "error must plainly state the capability is absent: {}",
+            err.description
+        );
+        assert!(
+            err.description.contains("#2069"),
+            "error must point at the tracking issue: {}",
+            err.description
+        );
+        // The rotated scope(s) are surfaced so an operator can see exactly
+        // which capabilities were NOT revoked.
+        assert!(
+            err.description.contains("#agent"),
+            "error must name the un-revoked key scope(s): {}",
+            err.description
+        );
+    }
+
+    /// The step-3 failure is *capability absence*, not a dispatch failure: it
+    /// is identical for an unregistered context and never reaches the
+    /// trust-recovery mailbox. A dispatch failure would surface with the
+    /// `dispatch_step_error` shape (a `ContextError` string), so asserting the
+    /// same not-wired description for both contexts pins that no revocation
+    /// notification is emitted at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_backend_revoke_ucans_fails_closed_without_dispatching() {
+        let manager = test_context_manager();
+        let alice = did("did:dht:alice");
+        let registered = "ctx-prod-2b";
+
+        setup_context(&manager, registered, &alice).await;
+
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
+        let key_rotation = agent_key_rotation_outcome(&alice, 1000);
+
+        let registered_err = backend
+            .revoke_ucans(registered, &key_rotation)
+            .await
+            .expect_err("revoke_ucans must fail closed");
+        let unknown_err = backend
+            .revoke_ucans("ctx-never-created", &key_rotation)
+            .await
+            .expect_err("revoke_ucans must fail closed");
+
+        assert_eq!(registered_err.step, 3);
+        assert_eq!(unknown_err.step, 3);
+        // Same failure mode either way (modulo the echoed context id) — the
+        // step never consults the actor, so it cannot have distributed a
+        // revocation list.
+        assert!(registered_err.description.contains(registered));
+        assert!(unknown_err.description.contains("ctx-never-created"));
+        assert_eq!(
+            registered_err.description.replace(registered, "<ctx>"),
+            unknown_err
+                .description
+                .replace("ctx-never-created", "<ctx>"),
+            "the failure must not depend on mailbox dispatch"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2500,8 +2584,16 @@ mod tests {
         assert!(!result, "rotate_psk should fail with no eligible devices");
     }
 
+    /// #2069: with step 3 failing closed, a single-context production recovery
+    /// can no longer complete — and, critically, it does NOT report success.
+    /// The orchestrator's zero-contexts-recovered guard turns the step-3
+    /// failure into a typed [`RecoveryError::AllContextsFailed`].
+    ///
+    /// Before this fix the same call returned `Ok` with
+    /// `completed_contexts == ["ctx-full-recovery"]` while nothing had been
+    /// revoked.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_full_recovery_agent_tier() {
+    async fn production_backend_full_recovery_agent_tier_fails_closed_on_step_3() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let bob = did("did:dht:bob");
@@ -2516,7 +2608,14 @@ mod tests {
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
         let contacts = HashSet::from([bob]);
 
-        let result = orch
+        // Step 2 (MLS epoch advance) genuinely succeeds for this context, so
+        // the total failure is attributable to step 3 alone.
+        assert!(
+            backend.mls_update(context_id, &key_rotation).await.is_ok(),
+            "step 2 must still succeed — step 3 is the blocking gap"
+        );
+
+        let err = orch
             .execute_recovery(
                 CompromiseTier::Agent,
                 Some(&key_rotation),
@@ -2526,18 +2625,19 @@ mod tests {
                 &scp_clock::SystemClock,
             )
             .await
-            .unwrap();
+            .expect_err("recovery must fail closed while step 3 is unwired");
 
-        assert_eq!(result.tier, CompromiseTier::Agent);
-        assert_eq!(result.completed_contexts, vec![context_id]);
-        assert!(result.failed_contexts.is_empty());
-        assert!(result.key_rotation_completed);
-        assert!(result.contacts_notified);
-        assert!(result.private_state_reencrypted);
+        assert!(
+            matches!(&err, RecoveryError::AllContextsFailed { attempted } if *attempted == 1),
+            "expected AllContextsFailed {{ attempted: 1 }}, got: {err:?}"
+        );
     }
 
+    /// `ActiveSigning` tier: same step-3 fail-closed contract (#2069). The tier
+    /// plumbing (PSK params, identity-private-state group seeding) is still
+    /// exercised up to the point recovery fails closed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_full_recovery_active_signing_tier() {
+    async fn production_backend_full_recovery_active_signing_tier_fails_closed_on_step_3() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let bob = did("did:dht:bob");
@@ -2560,7 +2660,7 @@ mod tests {
             compromised_device_pubkey: None,
         };
 
-        let result = orch
+        let err = orch
             .execute_recovery(
                 CompromiseTier::ActiveSigning,
                 Some(&key_rotation),
@@ -2570,16 +2670,26 @@ mod tests {
                 &scp_clock::SystemClock,
             )
             .await
-            .unwrap();
+            .expect_err("recovery must fail closed while step 3 is unwired");
 
-        assert_eq!(result.tier, CompromiseTier::ActiveSigning);
-        assert_eq!(result.completed_contexts, vec![context_id]);
-        assert!(result.contacts_notified);
-        assert!(result.private_state_reencrypted);
+        assert!(
+            matches!(&err, RecoveryError::AllContextsFailed { attempted } if *attempted == 1),
+            "expected AllContextsFailed {{ attempted: 1 }}, got: {err:?}"
+        );
+
+        // Step 6 (PSK rotation) is independent of step 3 and still works — the
+        // fail-closed verdict is not masking an unrelated regression.
+        assert!(
+            backend.rotate_psk(&psk_params).await,
+            "PSK rotation must still succeed on its own"
+        );
     }
 
+    /// `IdentityKey` tier: same step-3 fail-closed contract (#2069). The most
+    /// severe tier is exactly the one that must not report a phantom
+    /// revocation of the compromised identity key's outstanding tokens.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_full_recovery_identity_key_tier() {
+    async fn production_backend_full_recovery_identity_key_tier_fails_closed_on_step_3() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let bob = did("did:dht:bob");
@@ -2603,7 +2713,7 @@ mod tests {
             compromised_device_pubkey: None,
         };
 
-        let result = orch
+        let err = orch
             .execute_recovery(
                 CompromiseTier::IdentityKey,
                 Some(&key_rotation),
@@ -2613,22 +2723,43 @@ mod tests {
                 &scp_clock::SystemClock,
             )
             .await
-            .unwrap();
+            .expect_err("recovery must fail closed while step 3 is unwired");
 
-        assert_eq!(result.tier, CompromiseTier::IdentityKey);
-        assert_eq!(result.new_did, Some(did("did:dht:alice-new")));
-        assert_eq!(result.completed_contexts, vec![context_id]);
-        assert!(result.key_rotation_completed);
-        assert!(result.contacts_notified);
-        assert!(result.private_state_reencrypted);
+        assert!(
+            matches!(&err, RecoveryError::AllContextsFailed { attempted } if *attempted == 1),
+            "expected AllContextsFailed {{ attempted: 1 }}, got: {err:?}"
+        );
+
+        // The identity-migration outcome the tier helper builds is untouched by
+        // the fail-closed verdict — the DID rotation itself (step 1) happened.
+        assert!(key_rotation.did_changed);
+        assert_eq!(key_rotation.did_after, did("did:dht:alice-new"));
+
+        // Both rotated scopes are named in the step-3 error so an operator can
+        // see exactly which capabilities remain live.
+        let step_err = backend
+            .revoke_ucans(context_id, &key_rotation)
+            .await
+            .expect_err("step 3 must fail closed");
+        assert_eq!(step_err.step, 3);
+        assert!(step_err.description.contains("#active"));
+        assert!(step_err.description.contains("#agent"));
     }
 
+    /// Multi-context production recovery, post-#2069. Per-context failure
+    /// isolation still attributes failures to the right step — the two
+    /// registered contexts get past step 2 and fail at step 3, the unregistered
+    /// one fails at step 2 — but because *no* context can complete, the whole
+    /// call fails closed rather than reporting partial success.
+    ///
+    /// (Orchestrator-level partial-success isolation stays covered by the
+    /// configurable `TestBackend` tests above, which can still let step 3
+    /// succeed.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_multi_context_with_failure_isolation() {
+    async fn production_backend_multi_context_all_fail_closed() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
 
-        // Create two contexts. The second will exist but both should work.
         setup_context(&manager, "ctx-ok-1", &alice).await;
         setup_context(&manager, "ctx-ok-2", &alice).await;
 
@@ -2638,13 +2769,40 @@ mod tests {
             vec![
                 "ctx-ok-1".to_owned(),
                 "ctx-ok-2".to_owned(),
-                "ctx-nonexistent".to_owned(), // This should fail.
+                "ctx-nonexistent".to_owned(),
             ],
         );
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
         let contacts = HashSet::new();
 
-        let result = orch
+        // Per-step attribution, observed directly on the backend (the
+        // orchestrator drops `failed_contexts` when it fails closed).
+        for registered in ["ctx-ok-1", "ctx-ok-2"] {
+            assert!(
+                backend.mls_update(registered, &key_rotation).await.is_ok(),
+                "{registered}: step 2 must succeed"
+            );
+            assert_eq!(
+                backend
+                    .revoke_ucans(registered, &key_rotation)
+                    .await
+                    .expect_err("step 3 must fail closed")
+                    .step,
+                3,
+                "{registered}: must fail at step 3"
+            );
+        }
+        assert_eq!(
+            backend
+                .mls_update("ctx-nonexistent", &key_rotation)
+                .await
+                .expect_err("unknown context must fail")
+                .step,
+            2,
+            "unregistered context must fail at step 2"
+        );
+
+        let err = orch
             .execute_recovery(
                 CompromiseTier::Agent,
                 Some(&key_rotation),
@@ -2654,13 +2812,12 @@ mod tests {
                 &scp_clock::SystemClock,
             )
             .await
-            .unwrap();
+            .expect_err("zero contexts can recover — must fail closed");
 
-        // Two contexts should succeed, one should fail.
-        assert_eq!(result.completed_contexts.len(), 2);
-        assert_eq!(result.failed_contexts.len(), 1);
-        assert_eq!(result.failed_contexts[0].0, "ctx-nonexistent");
-        assert_eq!(result.failed_contexts[0].1.step, 2);
+        assert!(
+            matches!(&err, RecoveryError::AllContextsFailed { attempted } if *attempted == 3),
+            "expected AllContextsFailed {{ attempted: 3 }}, got: {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
