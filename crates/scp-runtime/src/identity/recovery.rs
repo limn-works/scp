@@ -8,6 +8,8 @@
 //! 3. **UCAN revocation** of all tokens issued by the compromised key.
 //!    ([`ProductionRecoveryBackend`] fails this step closed — see #2069.)
 //! 4. **`KeyPackage` rotation** — delete old, publish new.
+//!    ([`ProductionRecoveryBackend`] fails this step closed — see #2240 Part B
+//!    item 2 / #1083 finding 6.)
 //! 5. **Contact notification** — key-change alerts to all known contacts.
 //! 6. **Identity private state re-encryption** — PSK rotation, device removal.
 //!
@@ -410,10 +412,19 @@ pub trait RecoveryBackend {
     /// `key_rotation` outcome is used to identify the recovering member's
     /// DID for the notification payload.
     ///
+    /// This is the **contract a backend must satisfy**, not a description of
+    /// what ships: [`ProductionRecoveryBackend::rotate_key_packages`] cannot
+    /// satisfy it today and fails closed (#2240 Part B item 2, #1083 finding
+    /// 6). An `Ok(())` from this method is a claim that the compromised
+    /// identity's published `KeyPackages` are gone from the relay and
+    /// replacements are live — only return it when that is true. Notifying
+    /// peers to drop cached copies is not sufficient.
+    ///
     /// # Errors
     ///
     /// Returns [`RecoveryStepError`] if old key packages cannot be deleted
-    /// or new ones cannot be published.
+    /// or new ones cannot be published, or if the backend has no relay
+    /// transport seam to do either.
     async fn rotate_key_packages(
         &self,
         context_id: &str,
@@ -848,7 +859,7 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Optio
 /// |----------------------|----------------------------------------------------------|
 /// | `mls_update`         | `RecoveryAdvanceEpoch` + `RecoverySendNotification` (seq 0) |
 /// | `revoke_ucans`       | *none — fails closed (#2069); seq 1 is unallocated*      |
-/// | `rotate_key_packages`| `RecoverySendNotification` (seq 2)                       |
+/// | `rotate_key_packages`| *none — fails closed (#2240 Part B item 2); seq 2 is unallocated* |
 /// | `notify_contacts`    | `RecoveryNotifyContact` (cross-context fan-out)          |
 /// | `rotate_psk`         | `RecoverySendNotification` (seq 3)                       |
 ///
@@ -956,8 +967,10 @@ impl ProductionRecoveryBackend {
     ///
     /// Wraps the shared payload construction (context, sender DID,
     /// sequence, signing key) used by every recovery step that sends a
-    /// notification to an already-known context (spec §9.12 steps 2–4,
-    /// 6). The signing key is copied into the boxed payload via
+    /// notification to an already-known context. That is now steps 2 (seq 0)
+    /// and 6 (seq 3) only: steps 3 and 4 fail closed before dispatching, so
+    /// seq 1 and seq 2 are unallocated (#2069, #2240 Part B item 2). The
+    /// signing key is copied into the boxed payload via
     /// [`SigningKeyBytes::from_signing_key`](crate::context::actor::commands::SigningKeyBytes::from_signing_key) so it zeroizes on drop while
     /// the command is in flight.
     async fn dispatch_recovery_send_notification(
@@ -1119,54 +1132,67 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         })
     }
 
+    /// Step 4 — **not wired; always fails closed** (#2240 Part B item 2).
+    ///
+    /// This step previously sent a single literal notification —
+    /// `"recovery:key_package_rotation:context={id}"` — over the
+    /// recovery-notification channel and returned `Ok(())`, after which the
+    /// orchestrator set `key_packages_rotated = true` and counted the context
+    /// completed. Its own comment conceded the problem: the implementation was
+    /// "notification-only — it does not interact with the relay to
+    /// delete/publish actual `KeyPackage` objects because the `RecoveryBackend`
+    /// trait does not expose relay transport APIs."
+    ///
+    /// A hint to peers to drop cached key packages is not the step. §9.12
+    /// step 4 exists to stop new group additions from using compromised key
+    /// material, and that requires deleting the published `KeyPackages` at the
+    /// relay and publishing replacements. Neither happened: after recovery
+    /// reported step 4 done, the old `KeyPackages` were still published and
+    /// still usable to add the compromised member to new groups. The step
+    /// reported success for a security action that did not happen — the same
+    /// nullifier class as [`Self::revoke_ucans`] (#2069).
+    ///
+    /// It now returns a typed error instead, so recovery surfaces the missing
+    /// capability (a failed context, and [`RecoveryError::AllContextsFailed`]
+    /// when no context recovers) rather than a false guarantee that the
+    /// compromised key material was withdrawn from circulation.
+    ///
+    /// The real wire needs a relay-transport seam on the [`RecoveryBackend`]
+    /// trait (delete-then-publish against the recovering identity's published
+    /// `KeyPackages`), which does not exist. That is #2240 Part B item 2 and
+    /// #1083 finding 6. It is deliberately NOT invented here.
+    ///
+    /// Note that step 2's MLS epoch advance still protects *existing* groups
+    /// (post-compromise security within the group); it does nothing about
+    /// `KeyPackages` published for *future* additions, which is exactly the
+    /// gap this step was supposed to close.
+    ///
+    /// # Errors
+    ///
+    /// Always returns a step-4 [`RecoveryStepError`].
     async fn rotate_key_packages(
         &self,
         context_id: &str,
         key_rotation: &KeyRotationOutcome,
     ) -> Result<(), RecoveryStepError> {
-        // Step 4: Delete old KeyPackages and publish new ones.
-        //
-        // Old key packages are implicitly invalidated by the MLS epoch
-        // advancement in step 2. This step signals to other members that
-        // they should discard cached key packages for this member and
-        // records the rotation in the event log.
-        //
-        // NOTE: This implementation is notification-only — it does not
-        // interact with the relay to delete/publish actual KeyPackage
-        // objects because the RecoveryBackend trait does not expose relay
-        // transport APIs. The notification informs other members to purge
-        // their cached key packages for the recovering member. Actual
-        // KeyPackage lifecycle management happens at the SDK integration
-        // layer. See issue #1083 finding 6.
-        //
-        // We build a key-package-rotation notification and send it via
-        // the context manager. The payload tells recipients to purge
-        // cached key packages for the recovering member.
-        let payload = format!("recovery:key_package_rotation:context={context_id}");
-
-        // Use the recovering member's DID from the key rotation outcome
-        // as the sender — this is the authoritative identity performing
-        // recovery, not an arbitrary first member from the context.
-        let sender_did = key_rotation.did_after.as_ref();
-
-        // Send the key-package-rotation notification via the recovery
-        // notification channel. This records the event and alerts members.
-        let result = self
-            .dispatch_recovery_send_notification(
-                context_id,
-                sender_did,
-                payload.as_bytes(),
-                2, // sequence 2: key-package rotation notification
-            )
-            .await
-            .map_err(Self::dispatch_step_error);
-        match result {
-            Ok(()) => Ok(()),
-            Err(mut e) => {
-                e.step = 4;
-                Err(e)
-            }
-        }
+        // FAIL CLOSED (#2240 Part B item 2): the RecoveryBackend trait exposes
+        // no relay transport seam, so this node can neither delete the old
+        // published KeyPackages nor publish replacements. Report the absence
+        // instead of the previous notification-only no-op that returned
+        // `Ok(())` and let the orchestrator set `key_packages_rotated = true`.
+        Err(RecoveryStepError {
+            step: 4,
+            description: format!(
+                "KeyPackage rotation is not wired — the `RecoveryBackend` trait exposes no \
+                 relay transport seam, so the old `KeyPackages` published for `{did}` cannot \
+                 be deleted and replacements cannot be published; they stay usable to add the \
+                 compromised member to new groups in context `{context_id}`. Failing closed \
+                 rather than reporting a rotation that did not happen (see #2240 Part B item 2 \
+                 and #1083 finding 6). Step 2's MLS epoch advance protects existing groups \
+                 only, not future additions",
+                did = key_rotation.did_after.as_ref(),
+            ),
+        })
     }
 
     async fn notify_contacts(
@@ -2475,21 +2501,92 @@ mod tests {
         );
     }
 
+    /// #2240 Part B item 2 / #1083 finding 6: step 4 has no relay transport
+    /// seam, so the production backend MUST fail closed — even for a fully
+    /// healthy, registered context where the old notification-only
+    /// implementation happily returned `Ok(())` while the compromised
+    /// identity's `KeyPackages` stayed published and usable. This is the
+    /// regression guard against the nullifier coming back.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_rotate_key_packages_succeeds() {
+    async fn production_backend_rotate_key_packages_fails_closed() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let context_id = "ctx-prod-3";
 
+        // A healthy, registered context: nothing about the *environment* is
+        // making this fail — the capability is genuinely absent.
         setup_context(&manager, context_id, &alice).await;
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
-        let result = backend.rotate_key_packages(context_id, &key_rotation).await;
+        let err = backend
+            .rotate_key_packages(context_id, &key_rotation)
+            .await
+            .expect_err("rotate_key_packages must fail closed until the relay seam exists");
+
+        assert_eq!(err.step, 4, "must be attributed to §9.12 step 4");
         assert!(
-            result.is_ok(),
-            "rotate_key_packages should succeed: {result:?}"
+            err.description.contains("KeyPackage rotation is not wired"),
+            "error must plainly state the capability is absent: {}",
+            err.description
+        );
+        assert!(
+            err.description.contains("#2240") && err.description.contains("#1083"),
+            "error must point at the tracking work: {}",
+            err.description
+        );
+        // The reason must be legible: no relay transport seam on the trait.
+        assert!(
+            err.description.contains("relay transport seam"),
+            "error must name the missing seam: {}",
+            err.description
+        );
+        // The recovering identity is surfaced so an operator knows whose
+        // KeyPackages are still published.
+        assert!(
+            err.description.contains(alice.as_ref()),
+            "error must name the identity whose KeyPackages remain live: {}",
+            err.description
+        );
+    }
+
+    /// The step-4 failure is *capability absence*, not a dispatch failure: it
+    /// is identical for an unregistered context and never reaches the
+    /// trust-recovery mailbox. A dispatch failure would surface with the
+    /// `dispatch_step_error` shape (a `ContextError` string), so asserting the
+    /// same not-wired description for both contexts pins that no
+    /// key-package-rotation notification is emitted at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_backend_rotate_key_packages_fails_closed_without_dispatching() {
+        let manager = test_context_manager();
+        let alice = did("did:dht:alice");
+        let registered = "ctx-prod-3b";
+
+        setup_context(&manager, registered, &alice).await;
+
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
+        let key_rotation = agent_key_rotation_outcome(&alice, 1000);
+
+        let registered_err = backend
+            .rotate_key_packages(registered, &key_rotation)
+            .await
+            .expect_err("rotate_key_packages must fail closed");
+        let unknown_err = backend
+            .rotate_key_packages("ctx-never-created", &key_rotation)
+            .await
+            .expect_err("rotate_key_packages must fail closed");
+
+        assert_eq!(registered_err.step, 4);
+        assert_eq!(unknown_err.step, 4);
+        assert!(registered_err.description.contains(registered));
+        assert!(unknown_err.description.contains("ctx-never-created"));
+        assert_eq!(
+            registered_err.description.replace(registered, "<ctx>"),
+            unknown_err
+                .description
+                .replace("ctx-never-created", "<ctx>"),
+            "the failure must not depend on mailbox dispatch"
         );
     }
 
@@ -2584,16 +2681,21 @@ mod tests {
         assert!(!result, "rotate_psk should fail with no eligible devices");
     }
 
-    /// #2069: with step 3 failing closed, a single-context production recovery
-    /// can no longer complete — and, critically, it does NOT report success.
-    /// The orchestrator's zero-contexts-recovered guard turns the step-3
-    /// failure into a typed [`RecoveryError::AllContextsFailed`].
+    /// With steps 3 (#2069) and 4 (#2240 Part B item 2) both failing closed, a
+    /// single-context production recovery can no longer complete — and,
+    /// critically, it does NOT report success. The orchestrator's
+    /// zero-contexts-recovered guard turns the failure into a typed
+    /// [`RecoveryError::AllContextsFailed`].
     ///
-    /// Before this fix the same call returned `Ok` with
+    /// Before these fixes the same call returned `Ok` with
     /// `completed_contexts == ["ctx-full-recovery"]` while nothing had been
-    /// revoked.
+    /// revoked and no `KeyPackage` had been rotated.
+    ///
+    /// Step 3 is the first gate the orchestrator hits, so step 4 is not
+    /// reachable through `execute_recovery`; it is pinned directly on the
+    /// backend below so this test cannot pass for the wrong reason.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_full_recovery_agent_tier_fails_closed_on_step_3() {
+    async fn production_backend_full_recovery_agent_tier_fails_closed_on_steps_3_and_4() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let bob = did("did:dht:bob");
@@ -2609,10 +2711,30 @@ mod tests {
         let contacts = HashSet::from([bob]);
 
         // Step 2 (MLS epoch advance) genuinely succeeds for this context, so
-        // the total failure is attributable to step 3 alone.
+        // the total failure is attributable to the unwired steps, not to a
+        // broken environment.
         assert!(
             backend.mls_update(context_id, &key_rotation).await.is_ok(),
-            "step 2 must still succeed — step 3 is the blocking gap"
+            "step 2 must still succeed"
+        );
+        // Step 3 is what `execute_recovery` trips on first...
+        assert_eq!(
+            backend
+                .revoke_ucans(context_id, &key_rotation)
+                .await
+                .expect_err("step 3 must fail closed")
+                .step,
+            3
+        );
+        // ...and step 4 would fail closed too, so the orchestrator's verdict is
+        // not hiding a step-4 success that never happens.
+        assert_eq!(
+            backend
+                .rotate_key_packages(context_id, &key_rotation)
+                .await
+                .expect_err("step 4 must fail closed")
+                .step,
+            4
         );
 
         let err = orch
@@ -2633,11 +2755,12 @@ mod tests {
         );
     }
 
-    /// `ActiveSigning` tier: same step-3 fail-closed contract (#2069). The tier
-    /// plumbing (PSK params, identity-private-state group seeding) is still
-    /// exercised up to the point recovery fails closed.
+    /// `ActiveSigning` tier: same fail-closed contract on steps 3 (#2069) and
+    /// 4 (#2240 Part B item 2). The tier plumbing (PSK params,
+    /// identity-private-state group seeding) is still exercised up to the
+    /// point recovery fails closed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_full_recovery_active_signing_tier_fails_closed_on_step_3() {
+    async fn production_backend_full_recovery_active_signing_tier_fails_closed_on_steps_3_and_4() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let bob = did("did:dht:bob");
@@ -2670,26 +2793,48 @@ mod tests {
                 &scp_clock::SystemClock,
             )
             .await
-            .expect_err("recovery must fail closed while step 3 is unwired");
+            .expect_err("recovery must fail closed while steps 3 and 4 are unwired");
 
         assert!(
             matches!(&err, RecoveryError::AllContextsFailed { attempted } if *attempted == 1),
             "expected AllContextsFailed {{ attempted: 1 }}, got: {err:?}"
         );
 
-        // Step 6 (PSK rotation) is independent of step 3 and still works — the
-        // fail-closed verdict is not masking an unrelated regression.
+        // Pin WHICH steps are responsible, so this cannot pass because step 2
+        // broke: step 2 succeeds, steps 3 and 4 fail closed.
+        assert!(backend.mls_update(context_id, &key_rotation).await.is_ok());
+        assert_eq!(
+            backend
+                .revoke_ucans(context_id, &key_rotation)
+                .await
+                .expect_err("step 3 must fail closed")
+                .step,
+            3
+        );
+        assert_eq!(
+            backend
+                .rotate_key_packages(context_id, &key_rotation)
+                .await
+                .expect_err("step 4 must fail closed")
+                .step,
+            4
+        );
+
+        // Step 6 (PSK rotation) is independent of steps 3–4 and still works —
+        // the fail-closed verdict is not masking an unrelated regression.
         assert!(
             backend.rotate_psk(&psk_params).await,
             "PSK rotation must still succeed on its own"
         );
     }
 
-    /// `IdentityKey` tier: same step-3 fail-closed contract (#2069). The most
-    /// severe tier is exactly the one that must not report a phantom
-    /// revocation of the compromised identity key's outstanding tokens.
+    /// `IdentityKey` tier: same fail-closed contract on steps 3 (#2069) and 4
+    /// (#2240 Part B item 2). The most severe tier is exactly the one that must
+    /// not report a phantom revocation of the compromised identity key's
+    /// outstanding tokens, nor a phantom withdrawal of its published
+    /// `KeyPackages`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_full_recovery_identity_key_tier_fails_closed_on_step_3() {
+    async fn production_backend_full_recovery_identity_key_tier_fails_closed_on_steps_3_and_4() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let bob = did("did:dht:bob");
@@ -2737,24 +2882,38 @@ mod tests {
 
         // Both rotated scopes are named in the step-3 error so an operator can
         // see exactly which capabilities remain live.
-        let step_err = backend
+        let step3_err = backend
             .revoke_ucans(context_id, &key_rotation)
             .await
             .expect_err("step 3 must fail closed");
-        assert_eq!(step_err.step, 3);
-        assert!(step_err.description.contains("#active"));
-        assert!(step_err.description.contains("#agent"));
+        assert_eq!(step3_err.step, 3);
+        assert!(step3_err.description.contains("#active"));
+        assert!(step3_err.description.contains("#agent"));
+
+        // Step 4 also fails closed, and names the POST-migration DID whose
+        // KeyPackages are still published.
+        let step4_err = backend
+            .rotate_key_packages(context_id, &key_rotation)
+            .await
+            .expect_err("step 4 must fail closed");
+        assert_eq!(step4_err.step, 4);
+        assert!(
+            step4_err.description.contains("did:dht:alice-new"),
+            "step 4 error must name the recovering identity: {}",
+            step4_err.description
+        );
     }
 
-    /// Multi-context production recovery, post-#2069. Per-context failure
-    /// isolation still attributes failures to the right step — the two
-    /// registered contexts get past step 2 and fail at step 3, the unregistered
-    /// one fails at step 2 — but because *no* context can complete, the whole
-    /// call fails closed rather than reporting partial success.
+    /// Multi-context production recovery, post-#2069 / #2240 Part B item 2.
+    /// Per-context failure isolation still attributes failures to the right
+    /// step — the two registered contexts get past step 2 and fail at step 3
+    /// (and would fail at step 4), the unregistered one fails at step 2 — but
+    /// because *no* context can complete, the whole call fails closed rather
+    /// than reporting partial success.
     ///
     /// (Orchestrator-level partial-success isolation stays covered by the
-    /// configurable `TestBackend` tests above, which can still let step 3
-    /// succeed.)
+    /// configurable `TestBackend` tests above, which can still let steps 3 and
+    /// 4 succeed.)
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_multi_context_all_fail_closed() {
         let manager = test_context_manager();
@@ -2790,6 +2949,15 @@ mod tests {
                     .step,
                 3,
                 "{registered}: must fail at step 3"
+            );
+            assert_eq!(
+                backend
+                    .rotate_key_packages(registered, &key_rotation)
+                    .await
+                    .expect_err("step 4 must fail closed")
+                    .step,
+                4,
+                "{registered}: step 4 is unwired too"
             );
         }
         assert_eq!(
