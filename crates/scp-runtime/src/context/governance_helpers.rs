@@ -1230,6 +1230,26 @@ pub async fn execute_restore_access(
 // execute_add_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
+/// Relabels a `PerContextState::add_member` failure for the governance seam.
+///
+/// The historical behaviour is preserved for every MLS/crypto failure (they
+/// surface as [`ContextError::MembershipFailed`], which is what the add's
+/// callers, the FFI error-code map, and the compensating-remove logic expect).
+///
+/// [`ContextError::InvalidState`] is passed through UNCHANGED: that is the
+/// #2028 fail-closed ceiling-currency refusal
+/// (`PerContextState::check_genesis_ceiling_covered_by_live`), which is a
+/// context-state verdict rather than a membership/MLS fault. Flattening it into
+/// a stringly `MembershipFailed` would erase the variant — and with it the
+/// distinct FFI error code and the caller's ability to tell "this context can no
+/// longer admit Welcome joiners" apart from "the `KeyPackage` was malformed".
+fn relabel_add_member_error(e: ContextError) -> ContextError {
+    match e {
+        ContextError::InvalidState(_) => e,
+        other => ContextError::MembershipFailed(other.to_string()),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn execute_add_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -1313,7 +1333,7 @@ pub async fn execute_add_member(
         .commit_class_s_keep(deps, context_id, |mut v| {
             v.rest_mut()
                 .add_member(did.as_ref(), key_package, deps.clock.as_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))
+                .map_err(relabel_add_member_error)
         })
         .await?;
 
@@ -2680,7 +2700,7 @@ pub async fn execute_reset_member(
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             let add_output = s
                 .add_member(did.as_ref(), None, deps.clock.as_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+                .map_err(relabel_add_member_error)?;
             Ok((remove_output, add_output))
         })
         .await?;

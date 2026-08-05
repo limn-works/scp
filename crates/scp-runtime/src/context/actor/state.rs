@@ -2539,6 +2539,10 @@ impl PerContextState {
     ///
     /// # Errors
     ///
+    /// [`ContextError::InvalidState`] if the live capability ceiling no longer
+    /// covers the genesis ceiling a Welcome-joiner would install — see
+    /// [`check_genesis_ceiling_covered_by_live`](crate::context::state::check_genesis_ceiling_covered_by_live)
+    /// (#2028);
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
     /// `KeyPackage`, no `KeyPackage` in production, or any MLS / serialization
     /// failure.
@@ -2548,6 +2552,18 @@ impl PerContextState {
         key_package_bytes: Option<&[u8]>,
         clock: &dyn Clock,
     ) -> Result<AddMemberOutput, ContextError> {
+        // #2028 fail-closed authority-currency gate. This method is the SINGLE
+        // primitive that produces a Welcome, and the Welcome is what a joiner
+        // converts into installed authority, so the gate belongs HERE — ahead of
+        // both the real MLS add and the no-crypto `testing` return, and ahead of
+        // every mutation (reject-before-mutate: no member is added, no epoch
+        // advances, nothing is persisted).
+        crate::context::state::check_genesis_ceiling_covered_by_live(
+            &self.handle.params().ceiling,
+            self.role_state.ceiling(),
+            "add_member",
+        )?;
+
         // The invitee's KeyPackage is supplied explicitly (the governance
         // `AddMember` path carries it on the actor command envelope).
         if let Some(bytes) = key_package_bytes {

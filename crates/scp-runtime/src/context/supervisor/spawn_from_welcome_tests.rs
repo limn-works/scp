@@ -3299,3 +3299,372 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
         "the response carries bob's sender key (not an empty/echoed answer)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test M8 — #2028: a governed ceiling LOWERING closes the Welcome seam
+//           fail-closed (no stale-genesis authority downgrade).
+// ---------------------------------------------------------------------------
+
+/// Drives the `ModifyCeiling` decision chain to completion through the REAL
+/// governance path: propose (`execute_modify_ceiling` stages the pending
+/// modification + the §5.3.2 notification window) then apply
+/// (`apply_pending_ceiling_modification` writes the lowered ceiling into
+/// `role_state`). `apply` takes the evaluation instant as a parameter, so the
+/// mandatory 72-hour notification window is satisfied by evaluating at a
+/// timestamp past it rather than by sleeping — the window is
+/// `max(effective_at, observed_at + PERIOD)`, and both anchors are ≤ `now`, so
+/// `now + 2 × PERIOD` clears them without any clock injection.
+async fn lower_ceiling_through_governance(
+    sup: &Arc<Supervisor>,
+    ctx_id: &str,
+    admin: &DID,
+    new_ceiling: Vec<Capability>,
+) {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    sup.propose_governance_action(
+        ctx_id,
+        admin,
+        GovernanceAction::ModifyCeiling { new_ceiling },
+        &alice_signing_key(),
+    )
+    .await
+    .expect("the admin proposes ModifyCeiling in a Governed-ceiling context");
+
+    // 72h notification period (§5.3.2 step 2/4); evaluate well past it.
+    let past_window =
+        scp_clock::Clock::now_secs(&scp_clock::SystemClock).saturating_add(2 * 259_200);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sup.dispatch_governance_command(
+        crate::context::actor::commands::GovernanceCommand::ApplyPendingCeilingModification {
+            context_id: ctx_id.to_owned(),
+            current_timestamp: past_window,
+            reply: tx,
+        },
+    )
+    .await
+    .expect("dispatch ApplyPendingCeilingModification");
+    let applied = rx
+        .await
+        .expect("apply reply")
+        .expect("apply_pending_ceiling_modification succeeds");
+    assert!(
+        applied,
+        "the notification window has elapsed, so the staged ceiling modification must APPLY"
+    );
+}
+
+/// #2028 (F5) — the fail-OPEN authorization downgrade at the Welcome seam, and
+/// its fail-closed refusal.
+///
+/// A Welcome-joiner builds its entire authority from the creator-signed bundle's
+/// GENESIS `ContextParams` (`build_welcome_joiner_state` seeds `ContextRoleState`
+/// with `CapabilityCeiling::new(params.ceiling)`), and both artifacts the joiner
+/// can authenticate carry genesis: `ContextHandle::params` is immutable after
+/// creation, and the `0xFF02` extension the joiner cross-checks against commits
+/// the genesis `ceiling_hash` once at group build. A governed `ModifyCeiling`
+/// (§5.3.2) writes the new ceiling ONLY into the live `role_state`. So after a
+/// LOWERING the two diverge, and — because the authenticated post-genesis
+/// catch-up §5.13.3 rule 8 assumes does not exist yet (#2028) — a member joining
+/// afterwards would install the WIDER genesis ceiling: authority the context no
+/// longer grants.
+///
+/// This test pins both halves:
+///
+/// 1. **The divergence is real.** After the governed lowering the live
+///    `role_state` ceiling has dropped `messages:write`, while
+///    `context_params().ceiling` — the exact value `invite_member` signs into
+///    the bundle and `build_welcome_joiner_state` would install — still carries
+///    it.
+/// 2. **The seam is closed.** `invite_member` is refused with a typed
+///    `InvalidState` naming the stale capability, before any MLS add: no member
+///    is added, no Welcome is minted, no bundle is sealed, and no governance
+///    proposal survives.
+///
+/// Against the pre-fix code this test FAILS at step 2: the invite succeeds and
+/// seals a bundle carrying the wide genesis ceiling.
+#[tokio::test]
+async fn governed_ceiling_lowering_refuses_the_welcome_seam_fail_closed() {
+    let ctx_id = ctx_hex(0xe1);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    // A Governed-ceiling context — the only policy under which §5.3.2 admits a
+    // ceiling change at all.
+    let governed_params = ContextParams {
+        ceiling_policy: CeilingPolicy::Governed,
+        ..joiner_params()
+    };
+    // `member:invite` is in the GENESIS ceiling but is NOT one of the built-in
+    // `member` role's desired capabilities ({messages:read, messages:write,
+    // outlet_query:*, outlet_call:*} — `roles::builtin_member`). That matters:
+    // dropping a capability the `member` role DOES want would incidentally trip
+    // the adder's own `system_assign_role` ceiling check (role definitions are
+    // not reconciled when `set_ceiling` lowers the ceiling), masking the real
+    // defect behind an unrelated error. Dropping `member:invite` leaves the
+    // adder's role assignment perfectly happy — so PRE-FIX the invite SUCCEEDS
+    // and seals a bundle whose genesis ceiling still grants `member:invite`,
+    // which is exactly the fail-OPEN downgrade this test pins closed.
+    assert!(
+        governed_params.ceiling.contains(&Capability::MemberInvite),
+        "fixture precondition: the genesis ceiling grants member:invite"
+    );
+    assert!(
+        !scp_protocol::context::roles::builtin_member(&CapabilityCeiling::new(
+            governed_params.ceiling.iter().cloned()
+        ))
+        .capabilities
+        .contains(&Capability::MemberInvite),
+        "fixture precondition: member:invite is NOT in the built-in `member` role, so \
+         lowering it does not trip the adder's own role-assignment ceiling check"
+    );
+
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            governed_params.clone(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the Governed-ceiling SingleAdmin context");
+
+    // Lower the ceiling through the real governance path: drop `messages:write`.
+    let lowered: Vec<Capability> = governed_params
+        .ceiling
+        .iter()
+        .filter(|cap| **cap != Capability::MemberInvite)
+        .cloned()
+        .collect();
+    lower_ceiling_through_governance(&alice_sup, &ctx_id, &alice, lowered).await;
+
+    // ---- 1. Ground truth: live authority and genesis authority have diverged.
+    let live_ceiling = alice_sup
+        .get_role_state(&ctx_id)
+        .await
+        .expect("the live context has role state")
+        .ceiling()
+        .clone();
+    assert!(
+        !live_ceiling.contains(&Capability::MemberInvite),
+        "the governed lowering must remove member:invite from the LIVE ceiling"
+    );
+    let genesis_ceiling = alice_sup
+        .context_params(&ctx_id)
+        .await
+        .expect("the live context has params")
+        .ceiling;
+    assert!(
+        genesis_ceiling.contains(&Capability::MemberInvite),
+        "the genesis params a joiner would install (bundle + 0xFF02) still carry \
+         member:invite — this is the stale-authority source #2028 describes"
+    );
+
+    // ---- 2. The Welcome seam refuses fail-closed.
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let err = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect_err(
+            "inviting after a governed ceiling LOWERING must be refused — the Welcome \
+             would install the wider genesis ceiling (#2028)",
+        );
+
+    // `check-handler-no-panic.sh` scans this file's source text and cannot see
+    // that it is a `#[cfg(test)]` module, so it would flag a bare `panic!` here
+    // as a production actor panic. The assert carries the same diagnostic; the
+    // `else { return }` arm is the asserted-unreachable branch (same idiom as
+    // the sender-key test above).
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidState(_)),
+        "expected a typed InvalidState refusal, got {err:?}"
+    );
+    let crate::context::ContextError::InvalidState(message) = &err else {
+        return;
+    };
+    assert!(
+        message.contains("member:invite"),
+        "the refusal must name the genesis capability the live ceiling no longer \
+         covers, got: {message}"
+    );
+    assert!(
+        message.contains("2028"),
+        "the refusal must cite the tracked authenticated-catch-up gap, got: {message}"
+    );
+
+    // Reject-before-mutate: nothing was added, minted, or staged.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "the refused invite adds NO member"
+    );
+    assert!(
+        !alice_sup.is_member(&ctx_id, &bob).await,
+        "bob must not be a member of the context"
+    );
+    // The reversible front door refuses BEFORE proposing, so the invite leaves
+    // no dead-on-arrival `AddMember` record behind (only the executed
+    // `ModifyCeiling` proposal that produced the lowering remains).
+    let add_member_proposals: Vec<_> = alice_sup
+        .list_proposals(&ctx_id)
+        .await
+        .expect("listing proposals succeeds")
+        .into_iter()
+        .filter(|p| {
+            matches!(
+                p.action,
+                scp_protocol::context::governance::GovernanceAction::AddMember { .. }
+            )
+        })
+        .collect();
+    assert!(
+        add_member_proposals.is_empty(),
+        "the refused invite must leave NO dead-on-arrival AddMember proposal behind, \
+         got {add_member_proposals:?}"
+    );
+}
+
+/// The #2028 gate refuses only the fail-OPEN direction. A governed ceiling
+/// WIDENING leaves the live ceiling still covering every genesis entry, so a
+/// joiner installing the (now narrower) genesis set gains nothing the context
+/// withholds — the invite must still succeed. This pins the gate's precision:
+/// it is a coverage check, not a blanket "any post-genesis evolution blocks
+/// joins" cut.
+#[tokio::test]
+async fn governed_ceiling_widening_still_admits_a_welcome_join() {
+    let ctx_id = ctx_hex(0xe2);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    let governed_params = ContextParams {
+        ceiling_policy: CeilingPolicy::Governed,
+        ..joiner_params()
+    };
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            governed_params.clone(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the Governed-ceiling SingleAdmin context");
+
+    // Widen: keep every genesis entry and add one more.
+    let mut widened = governed_params.ceiling.clone();
+    widened.push(Capability::MediaVoice);
+    lower_ceiling_through_governance(&alice_sup, &ctx_id, &alice, widened).await;
+
+    let live_ceiling = alice_sup
+        .get_role_state(&ctx_id)
+        .await
+        .expect("the live context has role state")
+        .ceiling()
+        .clone();
+    assert!(
+        live_ceiling.contains(&Capability::MediaVoice),
+        "the widening applied to the LIVE ceiling"
+    );
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let outcome = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect("a widened ceiling still covers every genesis entry, so the invite proceeds");
+    assert!(
+        matches!(outcome, InviteMemberOutcome::Sealed { .. }),
+        "the invite seals a bundle as usual"
+    );
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(2),
+        "bob is added"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M9 — #2028 ground truth: the joiner installs the BUNDLE's ceiling
+//           verbatim; it has no current-state input to reconcile against.
+// ---------------------------------------------------------------------------
+
+/// Pins WHY the #2028 gate has to live on the ADDING side.
+///
+/// `build_welcome_joiner_state` seeds the joiner's `ContextRoleState` with
+/// `CapabilityCeiling::new(params.ceiling)` where `params` is the creator-signed
+/// bundle's genesis `ContextParams` — cross-checked against the group's
+/// MLS-committed `0xFF02` extension, which also carries genesis. A successful
+/// join therefore installs exactly the bundle ceiling, byte for byte: there is
+/// no event-log replay, no authenticated current-state transfer, nothing at all
+/// on the join path that could narrow it to the context's live policy.
+///
+/// So a joiner cannot self-defend against a stale (over-broad) genesis ceiling —
+/// which is precisely why
+/// [`crate::context::state::check_genesis_ceiling_covered_by_live`] is enforced
+/// where both values are visible (the adder), not here.
+#[tokio::test]
+async fn welcome_joiner_installs_the_bundle_ceiling_verbatim() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0xe3);
+
+    let (sup, _bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+
+    let params = joiner_params();
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let bundle = signed_bundle(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &ctx_id,
+        &params,
+        welcome,
+    );
+    sup.spawn_actor_from_welcome(
+        bob,
+        &bob_custody,
+        &bob_handle,
+        seal_bundle(
+            &bundle,
+            &bob_recipient,
+            &ctx_id,
+            &DID::from(ALICE_DID),
+            reservation_id,
+            some_pseudonym(),
+        ),
+    )
+    .await
+    .expect("bob joins from the creator-signed Welcome");
+
+    let installed = sup
+        .get_role_state(&ctx_id)
+        .await
+        .expect("the joined context has role state")
+        .ceiling()
+        .clone();
+    assert_eq!(
+        installed,
+        CapabilityCeiling::new(params.ceiling.iter().cloned()),
+        "the joiner installs the BUNDLE's (genesis) ceiling verbatim — nothing on the \
+         join path reconciles it against the context's live policy (#2028)"
+    );
+}

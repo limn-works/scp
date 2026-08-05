@@ -2114,6 +2114,101 @@ pub(crate) fn restore_governance_engine_from_snapshot(
     }
 }
 
+/// Fail-closed gate for the Welcome-join authority seam (#2028): refuses to
+/// mint a Welcome once the LIVE capability ceiling has stopped covering the
+/// GENESIS ceiling a joiner would install.
+///
+/// # Why this gate exists
+///
+/// A Welcome-joiner's authority is built entirely from the creator-signed
+/// bundle's genesis [`ContextParams`] —
+/// `Supervisor::build_welcome_joiner_state` seeds [`ContextRoleState`] with
+/// `CapabilityCeiling::new(params.ceiling)`, the default role definitions (and
+/// therefore the joiner's minted "member" tokens) are capped by that ceiling,
+/// and each FFI bridge additionally seeds its own outlet/UCAN authorization
+/// cache from the same `params.ceiling` (`sync_ceiling_from_params`). Those
+/// genesis params are frozen at creation on BOTH sides of the join:
+///
+/// - [`ContextHandle::params`] is immutable after creation (the only
+///   spec-authorized mutation is `promote_params`, which touches
+///   `memory_scope`/`ttl`), so the bundle `Supervisor::invite_member` signs
+///   always carries the GENESIS ceiling; and
+/// - the `0xFF02` `ScpContextExtension` the joiner cross-checks the bundle
+///   against commits the genesis `ceiling_hash` once at group build and is
+///   never rewritten — spec §5.13.3 rule 8 is explicit that `0xFF02` "pins the
+///   **genesis** creator" and that post-genesis evolution "appl[ies] from the
+///   authenticated event log after join".
+///
+/// A governed `ModifyCeiling` (spec §5.3.2) writes the new ceiling ONLY into the
+/// live `role_state` (`governance_helpers::apply_pending_ceiling_modification`
+/// → `ContextRoleState::set_ceiling`). So after a ceiling LOWERING the two
+/// diverge, and the authenticated event-log catch-up §5.13.3 rule 8 assumes does
+/// not exist yet (#2028) — leaving the joiner nothing to reconcile against.
+/// Handing out a Welcome anyway would install a ceiling WIDER than the context's
+/// current policy: a fail-OPEN authorization downgrade.
+///
+/// # Why the gate is on the adding side
+///
+/// The joiner cannot detect the divergence: every artifact it can authenticate
+/// (the creator-signed bundle, the MLS-committed `0xFF02` extension) carries the
+/// genesis ceiling, and it holds no event log. The adding node is the only party
+/// that can see both values, so the invariant is enforced where it is knowable —
+/// before the Welcome is minted. Per the fail-closed tenet the capability is
+/// honestly absent (a typed error) until #2028 lands an authenticated
+/// current-state transfer; it does NOT silently install the stale genesis
+/// default.
+///
+/// Residual, stated honestly: a node running patched software could skip this
+/// check. That grants no privilege — a party authorized to execute `AddMember`
+/// in a `Governed`-ceiling context is by construction the party that can raise
+/// the ceiling through governance anyway, so the realistic threat this closes is
+/// an HONEST adder unknowingly onboarding stale, over-broad authority. Making
+/// the property joiner-verifiable requires the authenticated current-state
+/// transfer #2028 tracks.
+///
+/// # Direction
+///
+/// Only the fail-OPEN direction is refused: the gate asks whether the LIVE
+/// ceiling still COVERS every genesis entry. A pure WIDENING still admits joins
+/// — the joiner then installs the narrower genesis set, which grants no
+/// authority the context withholds (that residual staleness is #2028's scope,
+/// not a fail-open). Coverage is decided by `CapabilityCeiling::contains`, the
+/// same predicate UCAN validation and role definition use, so this gate can
+/// never be laxer than the ceiling check it protects; where `contains` has no
+/// implicit coverage rule (a custom `{resource}:*` wildcard subsuming a concrete
+/// entry) it errs CLOSED, refusing a join it could in principle have admitted.
+///
+/// # Errors
+///
+/// [`ContextError::InvalidState`] naming the genesis capabilities the live
+/// ceiling no longer covers.
+pub(crate) fn check_genesis_ceiling_covered_by_live(
+    genesis_ceiling: &[Capability],
+    live_ceiling: &scp_protocol::context::roles::CapabilityCeiling,
+    site: &str,
+) -> Result<(), ContextError> {
+    let mut stale: Vec<String> = genesis_ceiling
+        .iter()
+        .filter(|genesis_cap| !live_ceiling.contains(genesis_cap))
+        .map(Capability::ucan_capability_name)
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    // Deterministic, deduplicated message: the genesis ceiling is a `Vec` and
+    // may repeat an entry.
+    stale.sort_unstable();
+    stale.dedup();
+    Err(ContextError::InvalidState(format!(
+        "{site} refused: the live capability ceiling no longer covers the genesis ceiling a \
+         Welcome-joiner would install (spec §5.3.2 lowered it; the invitation bundle and the \
+         MLS-committed 0xFF02 extension both carry the GENESIS ceiling, and no authenticated \
+         post-genesis catch-up exists at join — see #2028). Admitting a member now would grant \
+         them [{}], which this context no longer permits. Refusing fail-closed.",
+        stale.join(", ")
+    )))
+}
+
 /// Validates governance model parameters at context creation time.
 ///
 /// Rejects configurations that would make governance impossible:

@@ -13078,6 +13078,37 @@ impl Supervisor {
             ));
         }
 
+        // 1b. #2028 authority-currency gate — the REVERSIBLE front door. `params`
+        //     above are the GENESIS params: they are what this method signs into
+        //     the bundle and what the joiner turns into installed authority, and
+        //     they no longer describe the context once a governed `ModifyCeiling`
+        //     (§5.3.2) has LOWERED the live ceiling. `PerContextState::add_member`
+        //     enforces the same invariant in-actor — that is the sound chokepoint,
+        //     covering every Welcome-producing path — but it only runs INSIDE
+        //     `execute_add_member`, i.e. after `propose_governance_action_checked`
+        //     has already created and logged an `AddMember` proposal, leaving a
+        //     dead-on-arrival approved-but-unexecuted record behind. Refuse HERE,
+        //     before proposing, for exactly the reason the Broadcast and
+        //     voting-governance gates above refuse here: no dead proposal, no
+        //     staged KeyPackage, no MLS add. Both gates share ONE predicate
+        //     (`check_genesis_ceiling_covered_by_live`), so they cannot drift.
+        //
+        //     A read fault is fail-closed: without the live ceiling we cannot
+        //     prove the genesis ceiling is still current, so we refuse rather than
+        //     fall back to the genesis default.
+        let live_role_state = self.get_role_state(&context_id).await.ok_or_else(|| {
+            ContextError::InvalidState(format!(
+                "invite_member: cannot read the live role state for '{context_id}' to verify \
+                 that the genesis capability ceiling is still current (#2028) — refusing \
+                 fail-closed rather than sealing a bundle whose authority may be stale"
+            ))
+        })?;
+        crate::context::state::check_genesis_ceiling_covered_by_live(
+            &params.ceiling,
+            live_role_state.ceiling(),
+            "invite_member",
+        )?;
+
         // 2. Resolve the invitee's #active key -> X25519 recipient.
         let resolver = self.key_resolver_ref().ok_or_else(|| {
             ContextError::NotInitialized("invite_member: key resolver not configured".to_owned())
