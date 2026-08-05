@@ -4070,14 +4070,15 @@ impl Supervisor {
             // lazily respawns the target context's actor from its persisted
             // snapshot and dispatches the notification to that actor's mailbox,
             // where the actor-shape `recovery_send_notification` handler seals
-            // through the authoritative owned `ContextCryptoState`. Real
-            // (64-hex) member contexts (`revoke_ucans` seq 1 /
-            // `rotate_key_packages` seq 2) respawn and seal via the mailbox; the
-            // synthetic `identity-private-state` pseudo-context (PSK rotation
-            // §9.12 step 6) is non-64-hex with no snapshot and no production MLS
-            // group, so it returns the same "no MLS group" error the retired
-            // provider seal produced (best-effort no-op). See
-            // `recovery_send_notification_direct` for the full contract.
+            // through the authoritative owned `ContextCryptoState`. The one
+            // surviving real (64-hex) member-context producer is the step-2
+            // epoch-advance notification (`mls_update`, seq 0); it respawns and
+            // seals via the mailbox. The synthetic `identity-private-state`
+            // pseudo-context (PSK rotation §9.12 step 6) is non-64-hex with no
+            // snapshot and no production MLS group, so it returns the same "no
+            // MLS group" error the retired provider seal produced (best-effort
+            // no-op). See `recovery_send_notification_direct` for the full
+            // contract.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
                 let signing_key = payload.signing_key.to_signing_key();
                 let send_result = self
@@ -4121,15 +4122,22 @@ impl Supervisor {
     ///
     /// Two shapes reach here at recovery time (ADR-049 lazy-spawn):
     ///
-    /// - Real (64-hex) member contexts that simply have no spawned actor —
-    ///   e.g. the [`revoke_ucans`](crate::identity::recovery) (seq 1) and
-    ///   [`rotate_key_packages`](crate::identity::recovery) (seq 2)
-    ///   compromise-recovery notifications, which dispatch to a real member
-    ///   context id with no registration gate. These respawn from their
-    ///   persisted Active snapshot and seal via the mailbox. In practice
-    ///   `restore_on_startup` eagerly spawns an actor for every persisted
-    ///   Active context, so live recovery flows normally reach the mailbox
-    ///   directly; this fallback covers only the transient crash-respawn gap.
+    /// - Real (64-hex) member contexts that simply have no spawned actor — now
+    ///   only the step-2 epoch-advance notification
+    ///   ([`mls_update`](crate::identity::recovery), seq 0). These respawn from
+    ///   their persisted Active snapshot and seal via the mailbox.
+    ///
+    ///   Note this producer is itself gated: it is emitted only after
+    ///   `RecoveryAdvanceEpoch` has already succeeded for the context, which
+    ///   requires a registered actor. So the window this fallback covers is
+    ///   narrow — a deregistration between the epoch advance and the
+    ///   notification (crash/respawn). In practice `restore_on_startup` eagerly
+    ///   spawns an actor for every persisted Active context, so live recovery
+    ///   flows normally reach the mailbox directly.
+    ///
+    ///   The former `revoke_ucans` (seq 1) and `rotate_key_packages` (seq 2)
+    ///   producers are gone: both steps fail closed and dispatch nothing
+    ///   (#2069, #2240 Part B item 2).
     /// - The synthetic `identity-private-state` pseudo-context (PSK rotation
     ///   §9.12 step 6), which is never a real (64-hex) context id, never a
     ///   registered actor, and has no persisted snapshot. In production it has
@@ -22167,8 +22175,10 @@ mod tests {
     ///
     /// This direct path is reached for ANY unregistered context — including
     /// REAL 64-hex member contexts whose actor is not spawned at recovery time
-    /// (the `revoke_ucans` / `rotate_key_packages` compromise-recovery
-    /// notifications). For a real id, the chokepoint DECODES the 64-hex string
+    /// (the surviving producer being the step-2 epoch-advance
+    /// compromise-recovery notification, seq 0, when the actor deregisters
+    /// between the epoch advance and the send). For a real id, the chokepoint
+    /// DECODES the 64-hex string
     /// to its 32-byte digest, whereas the raw primitive would double-hash it
     /// (`SHA-256(hex(digest))`) and key a slot no member listens on — the
     /// ADR-056 fail-open.

@@ -32,7 +32,8 @@ fn did(s: &str) -> DID {
 struct MockBackend {
     mls_update_error: Option<(String, RecoveryStepError)>,
     revoke_ucans_error: Option<(String, RecoveryStepError)>,
-    rotate_key_packages_error: Option<(String, RecoveryStepError)>,
+    /// Not keyed by context: step 4 is identity-scoped and runs once.
+    rotate_key_packages_error: Option<RecoveryStepError>,
     notify_contacts_result: bool,
     rotate_psk_result: bool,
 }
@@ -79,15 +80,11 @@ impl RecoveryBackend for MockBackend {
 
     async fn rotate_key_packages(
         &self,
-        context_id: &str,
         _key_rotation: &KeyRotationOutcome,
     ) -> Result<(), RecoveryStepError> {
-        if let Some((ref ctx, ref err)) = self.rotate_key_packages_error
-            && ctx == context_id
-        {
-            return Err(err.clone());
-        }
-        Ok(())
+        self.rotate_key_packages_error
+            .as_ref()
+            .map_or(Ok(()), |err| Err(err.clone()))
     }
 
     async fn notify_contacts(
@@ -602,7 +599,13 @@ async fn recovery_error_variants() {
     assert!(e5.to_string().contains("keychain locked"));
 
     // AllContextsFailed (total per-context failure → fail-closed, #2240).
-    let e6 = RecoveryError::AllContextsFailed { attempted: 3 };
+    let e6 = RecoveryError::AllContextsFailed {
+        attempted: 3,
+        failed_contexts: Vec::new(),
+        key_packages_rotated: false,
+        contacts_notified: false,
+        private_state_reencrypted: false,
+    };
     assert!(e6.to_string().contains("all 3 context"));
     assert!(e6.to_string().contains("zero contexts recovered"));
 
@@ -718,6 +721,7 @@ async fn recovery_result_serialization() {
         )],
         pending_rejoin: vec!["ctx-3".to_owned()],
         key_rotation_completed: true,
+        key_packages_rotated: true,
         contacts_notified: true,
         private_state_reencrypted: true,
         initiated_at: 1000,
@@ -731,6 +735,7 @@ async fn recovery_result_serialization() {
     assert_eq!(parsed.completed_contexts, vec!["ctx-1"]);
     assert_eq!(parsed.failed_contexts.len(), 1);
     assert_eq!(parsed.pending_rejoin, vec!["ctx-3"]);
+    assert!(parsed.key_packages_rotated);
     assert_eq!(parsed.initiated_at, 1000);
     assert_eq!(parsed.completed_at, 2000);
 
