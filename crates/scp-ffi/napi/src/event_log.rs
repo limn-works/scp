@@ -279,7 +279,7 @@ fn authoritative_log_unreachable(
 /// provider reports NO LOG for the context). FAILS CLOSED: it never falls back
 /// to the UCAN-state tree. Proof-generation failures over a readable log (empty
 /// log, out-of-range index, absence claimed for a present event) keep
-/// [`codes::CTX_2025`].
+/// [`codes::CTX_2139`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
@@ -289,7 +289,12 @@ pub(crate) async fn event_log_verify_on(
     claim_json: String,
 ) -> napi::Result<NapiProof> {
     crate::napi_check_handle!(&bi.core, handle);
-    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
+    // NO `ensure_registered` here. It ran BEFORE the `check_ready` gate below
+    // and INSERTS a `UcanContextState` when absent, so a not-ready instance
+    // mutated the registry before failing closed — and verification was not
+    // read-only, contradicting the contract 001c38544 established. It also
+    // served no purpose once proofs stopped reading the UCAN-state tree.
+    // Matches PyO3, which touches no bridge-local state on this path.
 
     let claim: serde_json::Value =
         serde_json::from_str(&claim_json).map_err(|e| ScpNapiError::Validation {
@@ -340,7 +345,7 @@ pub(crate) async fn event_log_verify_on(
             let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index).map_err(|e| {
                 napi::Error::from(ScpNapiError::Context {
                     message: format!("inclusion proof failed: {e}"),
-                    code: codes::CTX_2025.to_owned(),
+                    code: codes::CTX_2139.to_owned(),
                 })
             })?;
             let mut details = scp_ffi_common::event_log::inclusion_proof_json(&proof);
@@ -373,7 +378,7 @@ pub(crate) async fn event_log_verify_on(
             let proof = scp_event_log::proof::prove_absence(&log, &event_hash).map_err(|e| {
                 napi::Error::from(ScpNapiError::Context {
                     message: format!("absence proof failed: {e}"),
-                    code: codes::CTX_2025.to_owned(),
+                    code: codes::CTX_2139.to_owned(),
                 })
             })?;
 

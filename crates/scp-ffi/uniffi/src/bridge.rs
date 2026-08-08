@@ -15131,14 +15131,14 @@ impl Scp {
                 let claim: serde_json::Value =
                     serde_json::from_str(&claim_json).map_err(|e| ScpError::Context {
                         msg: format!("invalid claim JSON: {e}"),
-                        code: codes::CTX_2025.to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     })?;
 
                 let claim_type = claim.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
                     ScpError::Context {
                         msg: "claim must include 'type' field ('inclusion' or 'absence')"
                             .to_owned(),
-                        code: codes::CTX_2025.to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }
                 })?;
 
@@ -15173,13 +15173,13 @@ impl Scp {
                             .ok_or_else(|| ScpError::Context {
                                 msg: "inclusion claim must include 'leaf_index' (integer)"
                                     .to_owned(),
-                                code: codes::CTX_2025.to_owned(),
+                                code: codes::VALID_7000.to_owned(),
                             })?;
 
                         let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index)
                             .map_err(|e| ScpError::Context {
                                 msg: format!("inclusion proof failed: {e}"),
-                                code: codes::CTX_2025.to_owned(),
+                                code: codes::CTX_2139.to_owned(),
                             })?;
                         let mut details = scp_ffi_common::event_log::inclusion_proof_json(&proof);
                         if let Some(obj) = details.as_object_mut() {
@@ -15198,26 +15198,26 @@ impl Scp {
                             .ok_or_else(|| ScpError::Context {
                                 msg: "absence claim must include 'event_hash' (hex string)"
                                     .to_owned(),
-                                code: codes::CTX_2025.to_owned(),
+                                code: codes::VALID_7000.to_owned(),
                             })?;
 
                         let event_hash_bytes =
                             hex::decode(event_hash_hex).map_err(|e| ScpError::Context {
                                 msg: format!("invalid event_hash hex: {e}"),
-                                code: codes::CTX_2025.to_owned(),
+                                code: codes::VALID_7000.to_owned(),
                             })?;
                         let event_hash: [u8; 32] =
                             event_hash_bytes.try_into().map_err(|v: Vec<u8>| {
                                 ScpError::Context {
                                     msg: format!("event_hash must be 32 bytes, got {}", v.len()),
-                                    code: codes::CTX_2025.to_owned(),
+                                    code: codes::VALID_7000.to_owned(),
                                 }
                             })?;
 
                         let proof = scp_event_log::proof::prove_absence(&log, &event_hash)
                             .map_err(|e| ScpError::Context {
                                 msg: format!("absence proof failed: {e}"),
-                                code: codes::CTX_2025.to_owned(),
+                                code: codes::CTX_2139.to_owned(),
                             })?;
 
                         // Both bracketing neighbours ship their FULL inclusion
@@ -15248,7 +15248,7 @@ impl Scp {
                         msg: format!(
                             "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
                         ),
-                        code: codes::CTX_2025.to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }),
                 }
             })

@@ -521,8 +521,27 @@ pub const CTX_2137: &str = "SCP-CTX-2137";
 ///
 /// Distinct from a proof-generation failure over a log the bridge *could* read
 /// (empty log, out-of-range leaf index, absence claimed for a present event) —
-/// those are honest answers and keep their existing per-bridge codes.
+/// those are honest answers and carry [`CTX_2139`].
 pub const CTX_2138: &str = "SCP-CTX-2138";
+/// Event-log Merkle proof generation failed over a log the bridge COULD read.
+///
+/// The honest-negative counterpart to [`CTX_2138`]: the authoritative log was
+/// reached, and the answer to the caller's claim is "no". Raised when
+/// `prove_inclusion` / `prove_absence` reject the claim — an empty log, a
+/// leaf index past the end of the tree, or an absence claimed for an event
+/// that IS present.
+///
+/// One code across all three bridges. Before this existed, `PyO3` raised the
+/// catch-all `CTX_2001` while NAPI and `UniFFI` reused `CTX_2025` — whose
+/// registry meaning is "context broadcast unsubscribe error", unrelated to
+/// event logs. A caller could neither distinguish "your claim is false" from
+/// an unrelated context failure, nor write one handler across the SDKs.
+///
+/// Malformed CLAIM input (missing `type`, missing `leaf_index`, an
+/// `event_hash` that is not 32 hex-decoded bytes, an unsupported claim type)
+/// is NOT this code — that is caller input validation and carries
+/// `VALID_7000` on every bridge.
+pub const CTX_2139: &str = "SCP-CTX-2139";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.

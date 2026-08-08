@@ -2110,9 +2110,12 @@ class SCP:
         """
         from scp_sdk.event_log import SignedCheckpoint
 
-        raw = await asyncio.to_thread(
-            self._native.event_log_checkpoint, context_id, identity_did, epoch
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.event_log_checkpoint, context_id, identity_did, epoch
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return SignedCheckpoint(
             context_id=raw.context_id,
             sender_did=raw.sender_did,
@@ -2134,9 +2137,12 @@ class SCP:
         """
         from scp_sdk.event_log import SignedCheckpoint
 
-        raw = await asyncio.to_thread(
-            self._native.event_log_checkpoint_by_did, context_id, did, epoch
-        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.event_log_checkpoint_by_did, context_id, did, epoch
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return SignedCheckpoint(
             context_id=raw.context_id,
             sender_did=raw.sender_did,
@@ -2178,7 +2184,10 @@ class SCP:
         """
         from scp_sdk.event_log import Proof
 
-        raw = await asyncio.to_thread(self._native.event_log_verify, context_id, claim)
+        try:
+            raw = await asyncio.to_thread(self._native.event_log_verify, context_id, claim)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Proof(
             proof_type=raw.proof_type,
             details=raw.details,
