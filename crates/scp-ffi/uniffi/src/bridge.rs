@@ -14932,6 +14932,26 @@ impl Scp {
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
+    ///
+    /// # The answer comes from the AUTHORITATIVE log only
+    ///
+    /// Every event returned is a leaf of the supervisor's canonical event log —
+    /// the same source [`Self::event_log_verify`] proves against and
+    /// [`Self::event_log_checkpoint`] commits to. There is no UCAN-state
+    /// fallback.
+    ///
+    /// This method used to try the manager, and on ANY failure or on an empty
+    /// result fall through to the per-context UCAN-state `EventLog` —
+    /// publishing THAT tree's root as `merkle_root` in a synthesized
+    /// `LogSummary` event, under the same field name the authoritative answers
+    /// use. Two consequences (GitHub #1933): a consumer pinning a verify proof
+    /// against a queried root could accept a root a caller had shaped through
+    /// `provenance_attach` / outlet calls; and the empty-result fall-through
+    /// collapsed the empty-but-live vs unknown distinction, so query and verify
+    /// returned contradictory answers about the same context.
+    ///
+    /// Now: an empty-but-live log returns an EMPTY list, and an unreachable or
+    /// unknown log FAILS CLOSED with `SCP-CTX-2138`.
     pub async fn event_log_query(
         &self,
         handle: Arc<ContextHandle>,
@@ -14944,13 +14964,6 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                // Ensure UCAN state (which contains the event log) is registered.
-                bi.ensure_ucan_registered(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    &handle.ceiling_strings,
-                );
-
                 // Parse optional filter JSON.
                 let filter: Option<serde_json::Value> =
                     match filter_json {
@@ -14988,203 +15001,79 @@ impl Scp {
                     .and_then(serde_json::Value::as_u64)
                     .map(|v| v as usize);
 
-                // Pre-compute timestamp for the fallback summary event outside the
-                // closure so we can propagate clock errors properly.
-                let fallback_now = scp_clock::SystemClock.now_secs();
+                let context_id = handle.context_id.clone();
 
-                // First, try the ContextManager's event log provider — the
-                // authoritative source populated by `create_context`
-                // (`ContextCreated` at step 7) and subsequent manager
-                // operations. The per-context UCAN-state `EventLog` is a
-                // separate tree used for UCAN-layer writes (revocations,
-                // tests bypassing the manager); it starts empty on context
-                // create and never receives the manager's lifecycle events
-                // unless explicitly synced (see `event_log_verify` below).
-                //
-                // Mirrors `scp-ffi/src/event_log.rs::query_manager_entries`
-                // (PyO3) and `scp-ffi-napi/src/event_log.rs::event_log_query_on`
-                // (NAPI). Aligned across PyO3/NAPI/UniFFI — pinned by the
-                // cross-bridge parity harness's `OP_EVENT_LOG_APPEND` and
-                // `OP_EVENT_LOG_FILTERED` (ADR-046).
-                if let Some(manager) = bi.try_context_manager_ready() {
-                    // ADR-056: resolve the context-id string to its 32-byte
-                    // digest via the canonical chokepoint (NOT the raw SHA-256
-                    // routing primitive, which double-hashes a real 64-hex id
-                    // and queries the wrong event-log key).
-                    let ctx_id_bytes =
-                        scp_core::context::state::context_id_to_bytes(&handle.context_id);
-                    if let Ok(Some(entries)) = manager.event_log_entries(&ctx_id_bytes)
-                        && !entries.is_empty()
-                    {
-                        // Canonical filter — pinned across PyO3/NAPI/UniFFI by
-                        // `scp_ffi_common::event_log::filter_manager_entries`
-                        // so the three bridges cannot drift on
-                        // `after_sequence` / `before_sequence` / `event_type` /
-                        // `actor_did` / `limit`. Each bridge still owns its
-                        // native `Event` mapping below.
-                        let filter = scp_ffi_common::event_log::EventLogFilter {
-                            after_sequence: filter_after_seq,
-                            before_sequence: filter_before_seq,
-                            event_type: filter_event_type.as_deref(),
-                            actor_did: filter_actor_did.as_deref(),
-                            limit: filter_limit,
-                        };
-                        let filtered =
-                            scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
-                        let mut manager_events: Vec<Event> = Vec::with_capacity(filtered.len());
-                        for (seq, entry) in filtered {
-                            let leaf_hash = scp_event_log::tree::leaf_hash(entry).map_err(|e| {
-                                ScpError::Context {
-                                    msg: format!("event leaf hash failed: {e}"),
-                                    code: codes::CTX_2000.to_owned(),
-                                }
-                            })?;
-                            // Project the typed payload's bridge-facing fields
-                            // (e.g. `target_did` for governance/access-revocation
-                            // events, `subject_did` for role/membership events)
-                            // through the single shared helper so all bridges
-                            // surface byte-identical values. Each key is omitted
-                            // when the projection yields `None`.
-                            let mut payload_value = serde_json::json!({
-                                "hash": hex::encode(leaf_hash),
-                            });
-                            scp_ffi_common::event_log::inject_projection(
-                                &mut payload_value,
-                                &entry.event_type,
-                                &entry.payload,
-                            );
-                            manager_events.push(Event {
-                                event_type: scp_ffi_common::event_log::event_type_label(
-                                    &entry.event_type,
-                                ),
-                                actor_did: entry.actor_did.0.clone(),
-                                timestamp: entry.timestamp,
-                                payload_json: payload_value.to_string(),
-                                sequence: seq,
-                            });
-                        }
-                        // Once the outer `!entries.is_empty()` guard passes we
-                        // return the (possibly filtered-empty) manager result
-                        // instead of falling through to the UCAN-state event
-                        // log. Mirrors PyO3's `query_manager_entries` which
-                        // unconditionally returns `Ok(Some(py_events))` once
-                        // entries is non-empty, regardless of filter outcome.
-                        return Ok(manager_events);
-                    }
-                }
+                // Same fail-closed gate as `event_log_verify` / the checkpoint
+                // path.
+                bi.core
+                    .check_ready()
+                    .map_err(|e| authoritative_log_unreachable("query", &context_id, &e))?;
+                let supervisor = bi
+                    .context_manager_or_error()
+                    .map_err(|e| authoritative_log_unreachable("query", &context_id, &e))?;
 
-                // Fallback: query the event log from per-context UCAN state.
-                let events = bi
-                    .with_ucan_state(&handle.context_id, |ucan_state| {
-                        let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
-
-                        if event_count == 0 {
-                            return Vec::new();
-                        }
-
-                        let merkle_root = scp_event_log::tree::root(&ucan_state.event_log);
-                        let merkle_root_hex = hex::encode(merkle_root);
-
-                        // Query events stored in the event log by iterating the
-                        // stored events slice and applying filters.
-                        let all_events = ucan_state.event_log.events();
-
-                        if !all_events.is_empty() {
-                            let mut results: Vec<Event> = Vec::new();
-                            for evt in all_events {
-                                // Apply sequence range filters.
-                                if let Some(after) = filter_after_seq
-                                    && evt.sequence <= after
-                                {
-                                    continue;
-                                }
-                                if let Some(before) = filter_before_seq
-                                    && evt.sequence >= before
-                                {
-                                    continue;
-                                }
-                                // Apply event type filter.
-                                if let Some(ref et) = filter_event_type
-                                    && format!("{:?}", evt.event_type) != *et
-                                {
-                                    continue;
-                                }
-                                // Apply actor DID filter.
-                                if let Some(ref actor) = filter_actor_did
-                                    && evt.actor_did.0 != *actor
-                                {
-                                    continue;
-                                }
-
-                                // Try to interpret payload bytes as UTF-8 JSON; fall
-                                // back to hex encoding for binary payloads.
-                                let mut payload_value: serde_json::Value =
-                                    std::str::from_utf8(&evt.payload.data)
-                                        .ok()
-                                        .and_then(|s| {
-                                            serde_json::from_str::<serde_json::Value>(s).ok()
-                                        })
-                                        .unwrap_or_else(|| {
-                                            serde_json::json!({
-                                                "hex": hex::encode(&evt.payload.data),
-                                            })
-                                        });
-                                // Project the typed payload's bridge-facing fields
-                                // (`target_did`, `subject_did`) through the single
-                                // shared helper, agreeing with the manager-path
-                                // projection above. Each key is injected only when
-                                // the surfaced payload is a JSON object and the
-                                // projection yields a value.
-                                scp_ffi_common::event_log::inject_projection(
-                                    &mut payload_value,
-                                    &evt.event_type,
-                                    &evt.payload,
-                                );
-                                let payload_json = payload_value.to_string();
-
-                                results.push(Event {
-                                    event_type: format!("{:?}", evt.event_type),
-                                    actor_did: evt.actor_did.0.clone(),
-                                    timestamp: evt.timestamp,
-                                    payload_json,
-                                    sequence: evt.sequence,
-                                });
-
-                                if let Some(lim) = filter_limit
-                                    && results.len() >= lim
-                                {
-                                    break;
-                                }
-                            }
-                            if !results.is_empty() {
-                                return results;
-                            }
-                        }
-
-                        // Fallback: return a summary event with Merkle root metadata.
-                        let summary = Event {
-                            event_type: "LogSummary".to_owned(),
-                            actor_did: String::new(),
-                            timestamp: fallback_now,
-                            payload_json: serde_json::json!({
-                                "event_count": event_count,
-                                "merkle_root": merkle_root_hex,
-                            })
-                            .to_string(),
-                            sequence: event_count.saturating_sub(1),
-                        };
-
-                        let summary_events = vec![summary];
-                        if let Some(lim) = filter_limit {
-                            summary_events.into_iter().take(lim).collect()
-                        } else {
-                            summary_events
-                        }
-                    })
-                    .ok_or_else(|| ScpError::Context {
-                        msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                        code: codes::CTX_2023.to_owned(),
+                // ADR-056: resolve the context-id string to its 32-byte digest
+                // via the canonical chokepoint (NOT the raw SHA-256 routing
+                // primitive, which double-hashes a real 64-hex id and queries
+                // the wrong event-log key).
+                let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
+                let entries = supervisor
+                    .event_log_entries(&ctx_id_bytes)
+                    .map_err(|e| authoritative_log_unreachable("query", &context_id, &e))?
+                    // `None` means UNKNOWN — never initialised, or destroyed on
+                    // actor shutdown / create-rollback. An empty-but-live log
+                    // is `Ok(Some(vec![]))` and returns an empty list below.
+                    .ok_or_else(|| {
+                        authoritative_log_unreachable(
+                            "query",
+                            &context_id,
+                            &"no event log for this context",
+                        )
                     })?;
+
+                // Canonical filter — pinned across PyO3/NAPI/UniFFI by
+                // `scp_ffi_common::event_log::filter_manager_entries` so the
+                // three bridges cannot drift on `after_sequence` /
+                // `before_sequence` / `event_type` / `actor_did` / `limit`.
+                // Each bridge still owns its native `Event` mapping below.
+                let filter = scp_ffi_common::event_log::EventLogFilter {
+                    after_sequence: filter_after_seq,
+                    before_sequence: filter_before_seq,
+                    event_type: filter_event_type.as_deref(),
+                    actor_did: filter_actor_did.as_deref(),
+                    limit: filter_limit,
+                };
+                let filtered = scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
+
+                let mut events: Vec<Event> = Vec::with_capacity(filtered.len());
+                for (seq, entry) in filtered {
+                    let leaf_hash =
+                        scp_event_log::tree::leaf_hash(entry).map_err(|e| ScpError::Context {
+                            msg: format!("event leaf hash failed: {e}"),
+                            code: codes::CTX_2000.to_owned(),
+                        })?;
+                    // Project the typed payload's bridge-facing fields (e.g.
+                    // `target_did` for governance/access-revocation events,
+                    // `subject_did` for role/membership events) through the
+                    // single shared helper so all bridges surface
+                    // byte-identical values. Each key is omitted when the
+                    // projection yields `None`.
+                    let mut payload_value = serde_json::json!({
+                        "hash": hex::encode(leaf_hash),
+                    });
+                    scp_ffi_common::event_log::inject_projection(
+                        &mut payload_value,
+                        &entry.event_type,
+                        &entry.payload,
+                    );
+                    events.push(Event {
+                        event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
+                        actor_did: entry.actor_did.0.clone(),
+                        timestamp: entry.timestamp,
+                        payload_json: payload_value.to_string(),
+                        sequence: seq,
+                    });
+                }
 
                 Ok(events)
             })
@@ -21047,47 +20936,73 @@ mod tests {
         }
     }
 
+    /// Appends one typed event to the AUTHORITATIVE supervisor log.
+    ///
+    /// The projection tests below need a leaf of a SPECIFIC type. Since #1933
+    /// `event_log_query` reads the authoritative log exclusively, and a full
+    /// governance round-trip is not drivable from this harness (the governance
+    /// key resolver only resolves DID-document-published identities; in-memory
+    /// test identities are never published), the event is appended through the
+    /// runtime's real provider via the `testing`-gated
+    /// `Supervisor::test_append_event`.
+    #[cfg(feature = "testing")]
+    async fn append_authoritative_event(
+        bi: &crate::runtime::UniffiBridgeInstance,
+        context_id: &str,
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+    ) {
+        bi.context_manager_or_error()
+            .expect("supervisor attached")
+            .test_append_event(context_id, event_type, actor_did, payload, 1_700_000_000)
+            .await
+            .expect("authoritative append succeeds");
+    }
+
     /// `event_log_query` must project a `GovernanceActionExecuted` leaf's
     /// `target_did` into the returned event's `payload_json`, decoded through the
     /// shared `scp_event_log::payload::project_payload` so the value is
-    /// byte-identical across the three native bridges.
+    /// byte-identical across the three native bridges. Driven over the
+    /// AUTHORITATIVE log — since #1933 there is no UCAN-state fallback to
+    /// project from.
     #[tokio::test]
+    #[cfg(feature = "testing")]
     async fn event_log_query_projects_governance_target_did() {
         let scp = scp_test();
-        let handle = test_handle_for(&scp);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create");
         let bi = Arc::clone(&scp.inner);
+        let context_id = handle.context_id();
         let target_did = "did:dht:z6MkTargetMember";
 
-        // Register UCAN state and append a GovernanceActionExecuted leaf to the
-        // per-context event log (the fallback path event_log_query reads).
-        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
-        let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
-            let payload = scp_event_log::payload::encode_payload(
+        append_authoritative_event(
+            &bi,
+            &context_id,
+            scp_event_log::EventType::GovernanceActionExecuted,
+            &identity.did(),
+            scp_event_log::payload::encode_payload(
                 &scp_event_log::payload::GovernanceActionExecutedPayload {
                     target_did: target_did.to_owned(),
                     action_type: "RemoveMember".to_owned(),
                 },
             )
-            .expect("governance payload encodes");
-            let event = scp_event_log::Event {
-                event_type: scp_event_log::EventType::GovernanceActionExecuted,
-                actor_did: handle.creator_did.clone().into(),
-                timestamp: 1_700_000_000,
-                sequence: scp_event_log::tree::event_count(&ucan_state.event_log),
-                payload,
-                prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
-                signature: Vec::new(),
-            };
-            scp_event_log::tree::append_unsigned_event(&mut ucan_state.event_log, &event)
-                .expect("append succeeds");
-        });
-        assert!(append.is_some(), "ucan state must be registered for append");
+            .expect("governance payload encodes"),
+        )
+        .await;
 
+        let filter = serde_json::json!({ "event_type": "GovernanceActionExecuted" }).to_string();
         let events = scp
-            .event_log_query(Arc::clone(&handle), None)
+            .event_log_query(Arc::clone(&handle), Some(filter))
             .await
             .expect("query succeeds");
-        assert_eq!(events.len(), 1, "exactly one event was appended");
+        assert_eq!(events.len(), 1, "the governance leaf is returned");
 
         let payload_json: serde_json::Value =
             serde_json::from_str(&events[0].payload_json).expect("payload_json is a JSON object");
@@ -21102,44 +21017,42 @@ mod tests {
     /// affected member, NOT the governance actor) into the returned event's
     /// `payload_json`, decoded through the shared
     /// `scp_event_log::payload::project_payload` so the value is byte-identical
-    /// across the three native bridges.
+    /// across the three native bridges. Driven over the AUTHORITATIVE log.
     #[tokio::test]
+    #[cfg(feature = "testing")]
     async fn event_log_query_projects_role_assigned_subject_did() {
         let scp = scp_test();
-        let handle = test_handle_for(&scp);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create");
         let bi = Arc::clone(&scp.inner);
+        let context_id = handle.context_id();
         let subject_did = "did:dht:z6MkSubjectMember";
 
-        // Register UCAN state and append a RoleAssigned leaf to the per-context
-        // event log (the fallback path event_log_query reads).
-        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
-        let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
-            let payload = scp_event_log::payload::encode_payload(
-                &scp_event_log::payload::RoleAssignedPayload {
-                    subject_did: subject_did.to_owned(),
-                    role: "moderator".to_owned(),
-                },
-            )
-            .expect("role payload encodes");
-            let event = scp_event_log::Event {
-                event_type: scp_event_log::EventType::RoleAssigned,
-                actor_did: handle.creator_did.clone().into(),
-                timestamp: 1_700_000_000,
-                sequence: scp_event_log::tree::event_count(&ucan_state.event_log),
-                payload,
-                prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
-                signature: Vec::new(),
-            };
-            scp_event_log::tree::append_unsigned_event(&mut ucan_state.event_log, &event)
-                .expect("append succeeds");
-        });
-        assert!(append.is_some(), "ucan state must be registered for append");
+        append_authoritative_event(
+            &bi,
+            &context_id,
+            scp_event_log::EventType::RoleAssigned,
+            &identity.did(),
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
+                subject_did: subject_did.to_owned(),
+                role: "moderator".to_owned(),
+            })
+            .expect("role payload encodes"),
+        )
+        .await;
 
+        let filter = serde_json::json!({ "event_type": "RoleAssigned" }).to_string();
         let events = scp
-            .event_log_query(Arc::clone(&handle), None)
+            .event_log_query(Arc::clone(&handle), Some(filter))
             .await
             .expect("query succeeds");
-        assert_eq!(events.len(), 1, "exactly one event was appended");
+        assert_eq!(events.len(), 1, "the role-assigned leaf is returned");
 
         let payload_json: serde_json::Value =
             serde_json::from_str(&events[0].payload_json).expect("payload_json is a JSON object");
@@ -21153,6 +21066,35 @@ mod tests {
             payload_json.get("target_did").is_none(),
             "RoleAssigned leaf carries a subject, not a target"
         );
+    }
+
+    /// #1933 — an UNKNOWN authoritative log must FAIL CLOSED, not fall through
+    /// to the UCAN-state tree and publish its root as `merkle_root` in a
+    /// synthesized `LogSummary` event.
+    #[tokio::test]
+    #[cfg(feature = "testing")]
+    async fn event_log_query_fails_closed_when_the_authoritative_log_is_unknown() {
+        let scp = scp_test();
+        // A synthetic handle: the context was never created through the
+        // supervisor, so the authoritative log is UNKNOWN.
+        let handle = test_handle_for(&scp);
+        let bi = Arc::clone(&scp.inner);
+        let context_id = handle.context_id();
+
+        bi.ensure_ucan_registered(&context_id, &handle.creator_did, &[]);
+        bi.with_ucan_state(&context_id, |st| {
+            st.event_log.push_leaf_raw([0xABu8; 32]);
+        })
+        .expect("ucan state registered");
+
+        let err = scp
+            .event_log_query(handle, None)
+            .await
+            .expect_err("an unknown authoritative log must fail closed");
+        match err {
+            ScpError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2138),
+            other => panic!("expected ScpError::Context SCP-CTX-2138, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

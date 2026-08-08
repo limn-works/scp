@@ -83,6 +83,26 @@ pub struct NapiProof {
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of [`event_log_query`].
+///
+/// # The answer comes from the AUTHORITATIVE log only
+///
+/// Every event returned is a leaf of the supervisor's canonical event log — the
+/// same source [`event_log_verify_on`] proves against and the checkpoint path
+/// commits to. There is no UCAN-state fallback.
+///
+/// This function used to end
+/// `supervisor(bi).ok().and_then(|s| s.event_log_entries(..).ok().flatten())`
+/// and, on ANY failure or on an empty result, fall through to the per-context
+/// UCAN-state `EventLog` — publishing THAT tree's root as `merkle_root` in a
+/// synthesized `LogSummary` event, under the same field name the authoritative
+/// answers use. Two consequences (GitHub #1933): a consumer pinning a verify
+/// proof against a queried root could accept a root a caller had shaped through
+/// `provenance_attach` / outlet calls; and `entries.is_empty() -> fall through`
+/// collapsed the empty-but-live vs unknown distinction, so query and verify
+/// returned contradictory answers about the same context.
+///
+/// Now: an empty-but-live log returns an EMPTY list, and an unreachable or
+/// unknown log FAILS CLOSED with [`codes::CTX_2138`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub(crate) async fn event_log_query_on(
     bi: &NapiBridgeInstance,
@@ -90,7 +110,6 @@ pub(crate) async fn event_log_query_on(
     filter_json: Option<String>,
 ) -> napi::Result<Vec<NapiEvent>> {
     crate::napi_check_handle!(&bi.core, handle);
-    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     let filter: Option<serde_json::Value> = match filter_json {
         Some(ref json_str) => {
@@ -130,115 +149,79 @@ pub(crate) async fn event_log_query_on(
         .and_then(|f| f.get("before_sequence").or_else(|| f.get("beforeSequence")))
         .and_then(serde_json::Value::as_u64);
 
-    // Query the per-instance Supervisor's event log provider for real
-    // Merkle entries. The UCAN state event log is a separate per-context
-    // instance; the supervisor-owned `MerkleEventLogProvider` is the
-    // authoritative source.
-    let context_id_str = handle.context_id();
+    let context_id = handle.context_id();
+
+    // Same fail-closed gate as `event_log_verify_on` / the checkpoint path.
+    bi.core
+        .check_ready()
+        .map_err(|e| authoritative_log_unreachable("query", &context_id, &e))?;
+    let supervisor = crate::runtime::supervisor(bi)
+        .map_err(|e| authoritative_log_unreachable("query", &context_id, &e))?;
+
     // ADR-056: resolve the context-id string to its 32-byte digest via the
     // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
     // double-hashes a real 64-hex id and queries the wrong event-log key).
-    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id_str);
+    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
+    let entries = supervisor
+        .event_log_entries(&ctx_id_bytes)
+        .map_err(|e| authoritative_log_unreachable("query", &context_id, &e))?
+        // `None` means UNKNOWN — never initialised, or destroyed on actor
+        // shutdown / create-rollback. An empty-but-live log is
+        // `Ok(Some(vec![]))` and returns an empty list below.
+        .ok_or_else(|| {
+            authoritative_log_unreachable("query", &context_id, &"no event log for this context")
+        })?;
 
-    let manager_entries = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten());
-
-    if let Some(entries) = manager_entries
-        && !entries.is_empty()
-    {
-        // Canonical filter — pinned across PyO3/NAPI/UniFFI by
-        // `scp_ffi_common::event_log::filter_manager_entries` so the three
-        // bridges cannot drift on `after_sequence` / `before_sequence` /
-        // `event_type` / `actor_did` / `limit`. Each bridge still owns its
-        // `Event`/`NapiEvent`/`PyEvent` mapping; the helper only encodes the
-        // filter contract. Filter semantics: `after_sequence` /
-        // `before_sequence` exclusive on both ends (matches UniFFI reference).
-        let filter = scp_ffi_common::event_log::EventLogFilter {
-            after_sequence: after_sequence_filter,
-            before_sequence: before_sequence_filter,
-            event_type: event_type_filter.as_deref(),
-            actor_did: actor_did_filter.as_deref(),
-            limit,
-        };
-        let filtered = scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
-
-        #[allow(clippy::cast_precision_loss)]
-        let mut events: Vec<NapiEvent> = Vec::with_capacity(filtered.len());
-        for (seq, entry) in filtered {
-            let leaf_hash = scp_event_log::tree::leaf_hash(entry).map_err(|e| {
-                napi::Error::from(ScpNapiError::Context {
-                    message: format!("event leaf hash failed: {e}"),
-                    code: codes::CTX_2000.to_owned(),
-                })
-            })?;
-            // Project the typed payload's bridge-facing fields (e.g.
-            // `target_did` for governance/access-revocation events,
-            // `subject_did` for role/membership events) through the single
-            // shared `scp_event_log::payload::project_payload` decoder (via the
-            // `inject_projection` helper) so all three native bridges surface
-            // byte-identical values. Each key is omitted when the projection
-            // yields `None`.
-            let mut payload_value = serde_json::json!({
-                "hash": hex::encode(leaf_hash),
-            });
-            scp_ffi_common::event_log::inject_projection(
-                &mut payload_value,
-                &entry.event_type,
-                &entry.payload,
-            );
-            #[allow(clippy::cast_precision_loss)]
-            events.push(NapiEvent {
-                event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
-                actor_did: entry.actor_did.0.clone(),
-                timestamp: entry.timestamp as f64,
-                payload_json: payload_value.to_string(),
-                sequence: seq as f64,
-            });
-        }
-
-        return Ok(events);
-    }
-
-    // Fallback: read from the per-context UCAN state event log.
-    let (event_count, merkle_root_hex) = crate::runtime::with_context(bi, &context_id_str, |rt| {
-        let count = scp_event_log::tree::event_count(&rt.core.event_log);
-        let root = scp_event_log::tree::root(&rt.core.event_log);
-        Ok((count, hex::encode(root)))
-    })
-    .map_err(napi::Error::from)?;
-
-    if event_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let payload_json = serde_json::json!({
-        "event_count": event_count,
-        "merkle_root": merkle_root_hex,
-    })
-    .to_string();
-
-    // Unix timestamp seconds fit in f64 mantissa for centuries.
-    #[allow(clippy::cast_precision_loss)]
-    let timestamp = scp_clock::SystemClock.now_secs() as f64;
-
-    let summary_event = NapiEvent {
-        event_type: "LogSummary".to_owned(),
-        actor_did: String::new(),
-        timestamp,
-        payload_json,
-        // Sequence number is a small counter; precision loss is negligible.
-        #[allow(clippy::cast_precision_loss)]
-        sequence: event_count.saturating_sub(1) as f64,
+    // Canonical filter — pinned across PyO3/NAPI/UniFFI by
+    // `scp_ffi_common::event_log::filter_manager_entries` so the three
+    // bridges cannot drift on `after_sequence` / `before_sequence` /
+    // `event_type` / `actor_did` / `limit`. Each bridge still owns its
+    // `Event`/`NapiEvent`/`PyEvent` mapping; the helper only encodes the
+    // filter contract. Filter semantics: `after_sequence` /
+    // `before_sequence` exclusive on both ends (matches UniFFI reference).
+    let filter = scp_ffi_common::event_log::EventLogFilter {
+        after_sequence: after_sequence_filter,
+        before_sequence: before_sequence_filter,
+        event_type: event_type_filter.as_deref(),
+        actor_did: actor_did_filter.as_deref(),
+        limit,
     };
+    let filtered = scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
 
-    let events = vec![summary_event];
-
-    if let Some(lim) = limit {
-        Ok(events.into_iter().take(lim).collect())
-    } else {
-        Ok(events)
+    let mut events: Vec<NapiEvent> = Vec::with_capacity(filtered.len());
+    for (seq, entry) in filtered {
+        let leaf_hash = scp_event_log::tree::leaf_hash(entry).map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("event leaf hash failed: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?;
+        // Project the typed payload's bridge-facing fields (e.g.
+        // `target_did` for governance/access-revocation events,
+        // `subject_did` for role/membership events) through the single
+        // shared `scp_event_log::payload::project_payload` decoder (via the
+        // `inject_projection` helper) so all three native bridges surface
+        // byte-identical values. Each key is omitted when the projection
+        // yields `None`.
+        let mut payload_value = serde_json::json!({
+            "hash": hex::encode(leaf_hash),
+        });
+        scp_ffi_common::event_log::inject_projection(
+            &mut payload_value,
+            &entry.event_type,
+            &entry.payload,
+        );
+        #[allow(clippy::cast_precision_loss)]
+        events.push(NapiEvent {
+            event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
+            actor_did: entry.actor_did.0.clone(),
+            timestamp: entry.timestamp as f64,
+            payload_json: payload_value.to_string(),
+            sequence: seq as f64,
+        });
     }
+
+    Ok(events)
 }
 
 /// Maps a runtime authoritative-log failure into the fail-closed bridge error.
@@ -1099,6 +1082,41 @@ mod tests {
                 "shutdown={shutdown}: expected SCP-CTX-2138, got: {msg}"
             );
         }
+    }
+
+    /// #1933 — an UNKNOWN authoritative log must FAIL CLOSED, not fall through
+    /// to the UCAN-state tree and publish its root as `merkle_root` in a
+    /// synthesized `LogSummary` event.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_query_fails_closed_when_the_authoritative_log_is_unknown() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        // A synthetic handle: the context was never created through the
+        // supervisor, so the authoritative log is UNKNOWN.
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-unknown-log-query".to_owned(),
+            "did:dht:z6MkCreatorUnknownLogQuery".to_owned(),
+        );
+        crate::runtime::ensure_registered(&bi, &handle).expect("ucan state registered");
+        crate::runtime::with_context(&bi, &handle.context_id(), |rt| {
+            rt.core.event_log.push_leaf_raw([0xABu8; 32]);
+            Ok(())
+        })
+        .expect("seed succeeds");
+
+        let reason = match event_log_query_on(&bi, &handle, None).await {
+            Ok(events) => panic!(
+                "an unknown authoritative log must fail closed, got {} event(s)",
+                events.len()
+            ),
+            Err(err) => err.reason.clone(),
+        };
+        assert!(
+            reason.contains(codes::CTX_2138),
+            "expected SCP-CTX-2138, got: {reason}"
+        );
     }
 
     // -----------------------------------------------------------------------
