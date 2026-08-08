@@ -1837,6 +1837,15 @@ impl RecoveryBackend for ProductionRecoveryBackend {
     ///   compromised key scope, so it cannot drive that per-CID path; and
     /// * the runtime-side enforcement set has **no write path at all** — no
     ///   receive-side handler merges a distributed revocation list into it.
+    ///   `governance.revoked_spending_ucan_cids` has 41 references across
+    ///   `crates/` and **zero writes**: every one is a `HashSet::new()`
+    ///   construction, a snapshot restore of an already-empty set, a read, a
+    ///   clone, or a doc comment. The set is therefore **permanently empty by
+    ///   construction**, so even a fully wired `revoke_ucans` would enforce
+    ///   nothing at this gate until a write path exists (tracked separately as
+    ///   #2072 — out of scope here). Do not read "consulted through
+    ///   `ContextRevocationChecker`" above as "operative": it is read, and it
+    ///   is always empty.
     ///
     /// So this method returns a typed error rather than a false guarantee.
     /// Recovery surfaces the missing capability (a failed context, and
@@ -1966,6 +1975,26 @@ impl RecoveryBackend for ProductionRecoveryBackend {
     /// `delete_published`, `provider.rs:161`), mint attestations at §9.7.1, and
     /// invoke the Add verifier. That is #2240 Part B item 2 and #1083 finding 6,
     /// and is deliberately NOT invented here.
+    ///
+    /// # What a wired step 4 would still NOT bound
+    ///
+    /// Even fully wired, step 4 removes the **relay-fetchable distribution
+    /// channel** — it reduces reach, not duration (§9.12 "What step 4 does and
+    /// does not bound"). It does not close the rotation-propagation window,
+    /// because the tiers it addresses are `#active`/`#agent` compromise: within
+    /// `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` the attacker still holds the
+    /// *signing* key and can mint a brand-new `KeyPackage` and attestation over
+    /// a leaf of their choosing, with no fetchable artifact involved at all —
+    /// and the bytes already handed out out-of-band (above) stay presentable
+    /// regardless. §9.7.3 names the two controls that do bound it: rotation
+    /// propagation and `MAX_KEYPACKAGE_ATTESTATION_LIFETIME`.
+    ///
+    /// Three successive attempts to justify this step with a *mechanism*
+    /// argument have been refuted (no relay seam — false; §9.7.1 bounds it to
+    /// 300s — false; step 4 makes the window unexploitable — false). Do not
+    /// construct a fourth. The gate is justified by the add vector alone: a
+    /// surviving fetchable `KeyPackage` can add the compromised member to a new
+    /// group.
     ///
     /// # Errors
     ///
