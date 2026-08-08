@@ -26,7 +26,7 @@ use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::KeyResolver;
-use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::membership::{ContextEvent, ContextEventEnvelope};
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
@@ -133,9 +133,9 @@ fn bob() -> DID {
 /// channel explicitly via `with_providers` to exercise the producer path.
 fn supervisor_with_event_channel() -> (
     Arc<Supervisor>,
-    tokio::sync::broadcast::Sender<(String, ContextEvent)>,
+    tokio::sync::broadcast::Sender<ContextEventEnvelope>,
 ) {
-    let (event_tx, _seed_rx) = tokio::sync::broadcast::channel::<(String, ContextEvent)>(1024);
+    let (event_tx, _seed_rx) = tokio::sync::broadcast::channel::<ContextEventEnvelope>(1024);
     let mls_storage: Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
         Arc::new(
             scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -246,7 +246,10 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
     let observed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok((cid, event)) => {
+                Ok(ContextEventEnvelope {
+                    context_id: cid,
+                    event,
+                }) => {
                     assert_eq!(cid, ctx_id, "events carry their originating context id");
                     // WelcomeGenerated must NEVER cross the broadcast channel —
                     // it is pushed to the receive buffer only (it carries MLS
@@ -325,7 +328,10 @@ async fn supervisor_leave_emits_member_left_audit_event_to_subscriber() {
     let observed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok((cid, event)) => {
+                Ok(ContextEventEnvelope {
+                    context_id: cid,
+                    event,
+                }) => {
                     assert_eq!(cid, ctx_id, "events carry their originating context id");
                     if let ContextEvent::MemberLeft { member_did } = &event {
                         assert_eq!(

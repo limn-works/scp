@@ -27,7 +27,7 @@ use scp_protocol::context::broadcast::{
     BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision, SubscriptionResult,
     UnsubscribeResult,
 };
-use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::membership::{ContextEvent, ContextEventEnvelope};
 use scp_protocol::context::roles::Capability;
 use scp_protocol::crypto::sender_keys::BroadcastEnvelope;
 use scp_protocol::crypto::ucan::UcanToken;
@@ -936,7 +936,7 @@ fn emit_event(
     receive_buffer: &mut scp_protocol::context::membership::ReceiveBuffer,
     event: ContextEvent,
     context_id: &str,
-    tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    tx: Option<&tokio::sync::broadcast::Sender<ContextEventEnvelope>>,
 ) {
     if matches!(event, ContextEvent::WelcomeGenerated { .. }) {
         let _ = receive_buffer.push(event);
@@ -946,7 +946,7 @@ fn emit_event(
     let _ = receive_buffer.push(event.clone());
     if let Some(tx) = tx {
         let sanitized = strip_event_payload(&event);
-        let _ = tx.send((context_id.to_owned(), sanitized));
+        let _ = tx.send(ContextEventEnvelope::new(context_id.to_owned(), sanitized));
     }
 }
 
