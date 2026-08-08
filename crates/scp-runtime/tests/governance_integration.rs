@@ -1354,7 +1354,7 @@ async fn execute_remove_member_clears_suspension() {
     assert_eq!(susp.status, ProposalStatus::Approved);
 
     // Precondition: the suspension is present in role state.
-    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    let rs = manager.get_role_state(ctx_id).await.unwrap().unwrap();
     assert!(
         rs.suspended_for(bob().as_ref()).is_some(),
         "bob should have a suspended_capabilities entry before removal"
@@ -1376,7 +1376,7 @@ async fn execute_remove_member_clears_suspension() {
     assert_eq!(rm.status, ProposalStatus::Approved);
 
     // Postcondition: the suspension entry is gone (spec §5.6.1).
-    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    let rs = manager.get_role_state(ctx_id).await.unwrap().unwrap();
     assert!(
         rs.suspended_for(bob().as_ref()).is_none(),
         "execute_remove_member MUST clear the removed member's suspended_capabilities (spec §5.6.1)"
@@ -1472,7 +1472,7 @@ async fn execute_remove_then_readmit_regression() {
         .unwrap();
 
     // During suspension bob is denied messages:write.
-    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    let rs = manager.get_role_state(ctx_id).await.unwrap().unwrap();
     assert!(!rs.member_has_capability(
         bob().as_ref(),
         &Capability::new("messages:write").expect("known capability")
@@ -1512,7 +1512,7 @@ async fn execute_remove_then_readmit_regression() {
         .unwrap();
     assert_eq!(re_add.status, ProposalStatus::Approved);
 
-    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    let rs = manager.get_role_state(ctx_id).await.unwrap().unwrap();
     assert!(
         rs.member_has_capability(
             bob().as_ref(),
@@ -1568,7 +1568,7 @@ async fn leave_context_clears_suspension() {
         .unwrap();
     assert_eq!(susp.status, ProposalStatus::Approved);
 
-    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    let rs = manager.get_role_state(ctx_id).await.unwrap().unwrap();
     assert!(rs.suspended_for(bob().as_ref()).is_some());
 
     // Bob self-leaves.
@@ -1577,7 +1577,7 @@ async fn leave_context_clears_suspension() {
         .await
         .unwrap();
 
-    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    let rs = manager.get_role_state(ctx_id).await.unwrap().unwrap();
     assert!(
         rs.suspended_for(bob().as_ref()).is_none(),
         "leave_context MUST clear the departing member's suspended_capabilities (spec §5.6.1)"

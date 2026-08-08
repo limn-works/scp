@@ -1732,9 +1732,16 @@ pub fn sync_role_state_from_manager(
 ) -> Result<(), ScpPyError> {
     let sup = supervisor(bi)?;
     let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-    let new_role_state = rt.block_on(sup.get_role_state(context_id)).ok_or_else(|| {
-        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
-    })?;
+    let new_role_state = rt
+        .block_on(sup.get_role_state(context_id))
+        .map_err(|e| {
+            ScpPyError::context(format!(
+                "cannot read role state for context '{context_id}': {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
+        })?;
 
     with_ffi_state(bi, context_id, |st| {
         st.role_state = new_role_state;
@@ -1761,9 +1768,17 @@ pub async fn sync_role_state_from_manager_async(
     context_id: &str,
 ) -> Result<(), ScpPyError> {
     let sup = supervisor(bi)?;
-    let new_role_state = sup.get_role_state(context_id).await.ok_or_else(|| {
-        ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
-    })?;
+    let new_role_state = sup
+        .get_role_state(context_id)
+        .await
+        .map_err(|e| {
+            ScpPyError::context(format!(
+                "cannot read role state for context '{context_id}': {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ScpPyError::context(format!("context '{context_id}' not found in supervisor"))
+        })?;
 
     with_ffi_state(bi, context_id, |st| {
         st.role_state = new_role_state;

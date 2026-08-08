@@ -360,7 +360,9 @@ fn context_create_establishes_mls_group() {
     );
 
     // Verify role state exists (populated during creation).
-    let role_state = rt.block_on(supervisor.get_role_state(&ctx_id));
+    let role_state = rt
+        .block_on(supervisor.get_role_state(&ctx_id))
+        .expect("role-state query must not fault");
     assert!(
         role_state.is_some(),
         "Context should have role state after creation"

@@ -3443,6 +3443,7 @@ async fn governed_ceiling_lowering_refuses_the_welcome_seam_fail_closed() {
     let live_ceiling = alice_sup
         .get_role_state(&ctx_id)
         .await
+        .expect("the role-state query must not fault")
         .expect("the live context has role state")
         .ceiling()
         .clone();
@@ -3569,6 +3570,7 @@ async fn governed_ceiling_widening_still_admits_a_welcome_join() {
     let live_ceiling = alice_sup
         .get_role_state(&ctx_id)
         .await
+        .expect("the role-state query must not fault")
         .expect("the live context has role state")
         .ceiling()
         .clone();
@@ -3658,6 +3660,7 @@ async fn welcome_joiner_installs_the_bundle_ceiling_verbatim() {
     let installed = sup
         .get_role_state(&ctx_id)
         .await
+        .expect("the role-state query must not fault")
         .expect("the joined context has role state")
         .ceiling()
         .clone();

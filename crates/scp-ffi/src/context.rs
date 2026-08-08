@@ -3574,6 +3574,11 @@ impl crate::scp::PyScp {
         // role state — never a nondeterministic membership-map iteration.
         let exporter_did = rt
             .block_on(async { sup.get_role_state(&ctx_id).await })
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "context export failed: cannot read role state for '{ctx_id}': {e}"
+                ))
+            })?
             .map(|role_state| scp_did::DID::from(role_state.creator_did))
             .ok_or_else(|| {
                 PyRuntimeError::new_err(format!(

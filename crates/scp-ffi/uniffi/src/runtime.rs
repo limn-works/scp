@@ -987,14 +987,21 @@ impl UniffiBridgeInstance {
         context_id: &str,
     ) -> Result<(), crate::ScpError> {
         let supervisor = self.context_manager_or_error()?;
-        let _role_state = supervisor.get_role_state(context_id).await.ok_or_else(|| {
-            crate::ScpError::Context {
+        let _role_state = supervisor
+            .get_role_state(context_id)
+            .await
+            .map_err(|e| crate::ScpError::Context {
+                msg: format!(
+                    "cannot read role state for context '{context_id}' during role state sync: {e}"
+                ),
+                code: codes::CTX_2040.to_owned(),
+            })?
+            .ok_or_else(|| crate::ScpError::Context {
                 msg: format!(
                     "context '{context_id}' not found in Supervisor during role state sync"
                 ),
                 code: codes::CTX_2040.to_owned(),
-            }
-        })?;
+            })?;
         tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
         Ok(())
     }

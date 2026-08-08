@@ -11371,25 +11371,53 @@ impl Supervisor {
         }
     }
 
-    /// Returns a clone of the context's role state, or `None` if the
+    /// Returns a clone of the context's role state, or `Ok(None)` if the
     /// context is unknown. Routes through the actor mailbox via
     /// [`Self::dispatch_query`].
-    #[must_use]
+    ///
+    /// Unlike the soft-default query siblings above, this one is `Result`-typed
+    /// because the role state carries the context's live capability ceiling and
+    /// is consulted by fail-closed AUTHORIZATION gates (the #2028 Welcome-seam
+    /// currency check in [`Self::invite_member`]; the FFI ceiling-cache refresh).
+    /// Collapsing "no such context" and "the actor did not answer" into one
+    /// `None` forces every such caller to report a TRANSIENT fault as a permanent
+    /// policy verdict — an SDK caller cannot then tell "retry this" from "this
+    /// context will never admit you". Both outcomes still fail closed; only their
+    /// retryability differs, and that distinction is only recoverable if the
+    /// query preserves it.
+    ///
+    /// # Errors
+    ///
+    /// - Any dispatch error from [`Self::dispatch_query`] (mailbox enqueue
+    ///   failure, unconfigured provider), propagated unchanged.
+    /// - [`ContextError::TransportFailed`] if the actor dropped the reply sender
+    ///   before answering (typically a terminated/replaced actor).
+    /// - [`ContextError::ActorBusy`] — retryable — if the actor did not reply
+    ///   within [`REPLY_TIMEOUT`](crate::context::actor::handle::REPLY_TIMEOUT).
+    /// - Any error the handler itself returned.
+    ///
+    /// The [`BoundedReplyError`] mapping mirrors
+    /// `SupervisorHandle`'s reply-await sites verbatim so the two cannot drift.
     pub async fn get_role_state(
         &self,
         context_id: &str,
-    ) -> Option<scp_protocol::context::roles::ContextRoleState> {
+    ) -> Result<Option<scp_protocol::context::roles::ContextRoleState>, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = QueriesCommand::GetRoleState {
             context_id: context_id.to_owned(),
             reply: tx,
         };
-        if self.dispatch_query(cmd).await.is_err() {
-            return None;
-        }
+        self.dispatch_query(cmd).await?;
         match bounded_reply_await(rx).await {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(_)) | Err(_) => None,
+            Ok(inner) => inner,
+            Err(BoundedReplyError::Dropped) => Err(ContextError::TransportFailed(format!(
+                "get_role_state: actor for '{context_id}' dropped the reply channel before \
+                 answering"
+            ))),
+            Err(BoundedReplyError::Elapsed) => Err(ContextError::ActorBusy(format!(
+                "get_role_state: actor for '{context_id}' did not reply within the bounded \
+                 reply budget"
+            ))),
         }
     }
 
@@ -13095,8 +13123,14 @@ impl Supervisor {
         //
         //     A read fault is fail-closed: without the live ceiling we cannot
         //     prove the genesis ceiling is still current, so we refuse rather than
-        //     fall back to the genesis default.
-        let live_role_state = self.get_role_state(&context_id).await.ok_or_else(|| {
+        //     fall back to the genesis default. `get_role_state` distinguishes a
+        //     TRANSIENT fault (mailbox enqueue failure, dropped reply channel,
+        //     reply timeout — surfaced as the retryable `TransportFailed` /
+        //     `ActorBusy` variants) from the terminal "no such context" answer, so
+        //     a wedged actor is not reported to SDK callers as a ceiling-policy
+        //     verdict they can never satisfy. Both are refusals; only their
+        //     retryability differs.
+        let live_role_state = self.get_role_state(&context_id).await?.ok_or_else(|| {
             ContextError::InvalidState(format!(
                 "invite_member: cannot read the live role state for '{context_id}' to verify \
                  that the genesis capability ceiling is still current (#2028) — refusing \
