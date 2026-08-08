@@ -161,11 +161,10 @@ describe("type definitions", () => {
 
   it("Proof has all required fields", () => {
     const proof: Proof = {
-      verified: true,
       proofType: "inclusion",
       details: { path: [] },
     };
-    expect(proof.verified).toBe(true);
+    expect(proof.proofType).toBe("inclusion");
   });
 
   // -- Address Resolution types (§22.2.1, §22.7) ---------------------------

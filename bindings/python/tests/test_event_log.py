@@ -125,18 +125,20 @@ class TestProofDataclass:
 
     def test_proof_construction(self) -> None:
         proof = Proof(
-            verified=True,
             proof_type="inclusion",
             details={"leaf_index": 5, "path": []},
         )
-        assert proof.verified is True
         assert proof.proof_type == "inclusion"
         assert proof.details == {"leaf_index": 5, "path": []}
 
+    def test_proof_carries_no_verified_flag(self) -> None:
+        # `verified` was a producer-set constant True on every success path.
+        # Raising IS the negative answer; a self-reported flag is not evidence.
+        assert not hasattr(Proof(proof_type="absence", details=None), "verified")
+
     def test_proof_absence_type(self) -> None:
-        proof = Proof(verified=False, proof_type="absence", details=None)
+        proof = Proof(proof_type="absence", details=None)
         assert proof.proof_type == "absence"
-        assert proof.verified is False
 
 
 class TestCheckpointDataclass:
@@ -381,7 +383,6 @@ class TestScpEventLogVerify:
 
         native = MagicMock()
         native.event_log_verify.return_value = SimpleNamespace(
-            verified=True,
             proof_type="inclusion",
             details={"leaf_index": 0},
         )
@@ -391,7 +392,6 @@ class TestScpEventLogVerify:
             scp, "ctx-verify", {"type": "inclusion", "leaf_index": 0}
         )
         assert isinstance(proof, Proof)
-        assert proof.verified is True
         assert proof.proof_type == "inclusion"
 
     @pytest.mark.asyncio
@@ -400,7 +400,6 @@ class TestScpEventLogVerify:
 
         native = MagicMock()
         native.event_log_verify.return_value = SimpleNamespace(
-            verified=True,
             proof_type="absence",
             details={},
         )

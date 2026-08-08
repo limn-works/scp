@@ -1787,9 +1787,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const proof = (await scp.eventLogVerify(
         ctx._rawHandle,
         JSON.stringify({ type: "inclusion", leaf_index: 0 }),
-      )) as { verified: boolean; proofType: string };
-      expect(proof.verified).toBe(true);
+      )) as { proofType: string; detailsJson: string };
       expect(proof.proofType).toBe("inclusion");
+      // Success IS the positive answer — a rejected claim throws. What the
+      // caller can actually check is the shipped Merkle material.
+      const details = JSON.parse(proof.detailsJson) as Record<string, unknown>;
+      expect(typeof details.root).toBe("string");
+      expect(Array.isArray(details.path)).toBe(true);
     });
 
     it("scp.eventLogCheckpoint returns a merkleRoot + event count", async () => {

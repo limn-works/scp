@@ -11293,19 +11293,42 @@ public func FfiConverterTypeParticipationRecordView_lower(_ value: Participation
 /**
  * A Merkle proof from the event log.
  *
+ * # There is no `verified` field
+ *
+ * This type used to carry `verified: bool`. It was a constant `true` on every
+ * success path: the bridge generated the proof and then "verified" that same
+ * proof against the same snapshot, so the check was tautological and only
+ * success-vs-throw ever carried information. A boolean named `verified` that no
+ * independent verifier computed is a false guarantee, so it is gone —
+ * `event_log_verify` throwing IS the negative answer.
+ *
+ * Real verification is done by the recipient from `details_json`, which carries
+ * the full Merkle material for both proof types: the leaf hash, the sibling
+ * path with per-step direction, and the root the path reaches. An absence
+ * answer carries the same complete material for BOTH bracketing neighbours.
+ *
+ * # What an `"absence"` answer does and does not establish
+ *
+ * The neighbour material lets a recipient check that both bracketing leaves
+ * really are in the tree the reported `root` commits to, and that the queried
+ * hash sorts strictly between them. It does NOT establish that the two
+ * neighbours are ADJACENT in sorted order: the log's Merkle root commits to
+ * append order, and the sorted index the neighbours are drawn from is local
+ * state the root does not cover. Treat an `"absence"` answer as the log's own
+ * assertion plus checkable neighbour-inclusion, not as a self-contained
+ * negative proof.
+ *
  * See ADR-011 (Event Log).
  */
 public struct Proof {
-    /**
-     * `true` if the claim was verified successfully.
-     */
-    public var verified: Bool
     /**
      * The proof type: `"inclusion"` or `"absence"`.
      */
     public var proofType: String
     /**
-     * Proof details serialized as a JSON string (Merkle path or sorted neighbors).
+     * Proof material serialized as a JSON string: the Merkle path (for
+     * inclusion proofs) or the two sorted neighbours with their own inclusion
+     * proofs (for absence proofs).
      */
     public var detailsJson: String
 
@@ -11313,15 +11336,13 @@ public struct Proof {
     // declare one manually.
     public init(
         /**
-         * `true` if the claim was verified successfully.
-         */verified: Bool, 
-        /**
          * The proof type: `"inclusion"` or `"absence"`.
          */proofType: String, 
         /**
-         * Proof details serialized as a JSON string (Merkle path or sorted neighbors).
+         * Proof material serialized as a JSON string: the Merkle path (for
+         * inclusion proofs) or the two sorted neighbours with their own inclusion
+         * proofs (for absence proofs).
          */detailsJson: String) {
-        self.verified = verified
         self.proofType = proofType
         self.detailsJson = detailsJson
     }
@@ -11334,9 +11355,6 @@ extension Proof: Sendable {}
 
 extension Proof: Equatable, Hashable {
     public static func ==(lhs: Proof, rhs: Proof) -> Bool {
-        if lhs.verified != rhs.verified {
-            return false
-        }
         if lhs.proofType != rhs.proofType {
             return false
         }
@@ -11347,7 +11365,6 @@ extension Proof: Equatable, Hashable {
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(verified)
         hasher.combine(proofType)
         hasher.combine(detailsJson)
     }
@@ -11362,14 +11379,12 @@ public struct FfiConverterTypeProof: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Proof {
         return
             try Proof(
-                verified: FfiConverterBool.read(from: &buf), 
                 proofType: FfiConverterString.read(from: &buf), 
                 detailsJson: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: Proof, into buf: inout [UInt8]) {
-        FfiConverterBool.write(value.verified, into: &buf)
         FfiConverterString.write(value.proofType, into: &buf)
         FfiConverterString.write(value.detailsJson, into: &buf)
     }

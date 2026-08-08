@@ -144,8 +144,86 @@ pub fn filter_manager_entries<'a>(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Merkle proof → JSON (shared by all three bridges)
+// ---------------------------------------------------------------------------
+
+/// Renders an RFC 6962 inclusion proof as the bridge-facing JSON object.
+///
+/// One shape for every proof a bridge surfaces — the top-level `"inclusion"`
+/// answer AND the neighbour proofs carried by an absence answer — so a caller
+/// re-verifying off-box parses one structure:
+///
+/// ```json
+/// {
+///   "leaf_index": 3,
+///   "leaf_hash": "<hex>",
+///   "root": "<hex>",
+///   "path": [{ "sibling_hash": "<hex>", "direction": "left" | "right" }],
+///   "path_length": 1
+/// }
+/// ```
+///
+/// `direction` is the SIBLING's side, matching
+/// [`scp_event_log::proof::Direction`].
+///
+/// # Why the neighbour proofs are included
+///
+/// An absence answer used to ship only each neighbour's `leaf_hash` +
+/// `leaf_index`, with no path — so nothing in it could be checked by the
+/// recipient, while the response nonetheless carried a `verified` flag the
+/// producer had set. Shipping the full neighbour paths is what makes the
+/// neighbour-inclusion half of the claim independently checkable against the
+/// reported `root`.
+#[must_use]
+pub fn inclusion_proof_json(proof: &scp_event_log::proof::InclusionProof) -> serde_json::Value {
+    let path: Vec<serde_json::Value> = proof
+        .path
+        .iter()
+        .map(|step| {
+            let direction = match step.direction {
+                scp_event_log::proof::Direction::Left => "left",
+                scp_event_log::proof::Direction::Right => "right",
+            };
+            serde_json::json!({
+                "sibling_hash": hex::encode(step.sibling_hash),
+                "direction": direction,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "leaf_index": proof.leaf_index,
+        "leaf_hash": hex::encode(proof.leaf_hash),
+        "root": hex::encode(proof.root),
+        "path_length": path.len(),
+        "path": path,
+    })
+}
+
+/// Renders one side of an absence proof — the neighbour leaf plus its full
+/// inclusion proof — as the bridge-facing JSON object.
+///
+/// `None` (no lower neighbour below the query hash, or no upper neighbour above
+/// it) maps to JSON `null`.
+#[must_use]
+pub fn absence_neighbor_json(
+    neighbor: Option<&scp_event_log::proof::LeafWithProof>,
+) -> serde_json::Value {
+    neighbor.map_or(serde_json::Value::Null, |n| {
+        serde_json::json!({
+            "leaf_hash": hex::encode(n.leaf_hash),
+            "leaf_index": n.leaf_index,
+            "inclusion_proof": inclusion_proof_json(&n.inclusion_proof),
+        })
+    })
+}
+
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+// Test-only: the proof round-trip fixtures assert on well-formed values they
+// just built, so a `None`/`Err` there IS the test failure. Mirrors the
+// `#[allow]` set every other bridge test module carries.
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -291,5 +369,117 @@ mod tests {
         // limit=0 is post-push: first entry pushes, then len==1 >= 0 breaks.
         // Matches legacy PyO3/NAPI/UniFFI behavior (none of them special-cased zero).
         assert_eq!(out.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Merkle proof → JSON
+    //
+    // The bridges' `Proof` no longer carries a `verified` boolean (it was a
+    // producer-set constant). These pin that the JSON they DO ship is complete
+    // enough for a recipient to re-derive the root itself.
+    // -----------------------------------------------------------------------
+
+    /// Builds a real 5-leaf log so the proofs below have non-trivial paths.
+    ///
+    /// `corpus()` events are filter fixtures with a flat `sequence: 0` /
+    /// genesis `prev_hash`; `append_unsigned_event` enforces the hash chain, so
+    /// the sequence and `prev_hash` are stamped here as the appender would.
+    fn proof_corpus() -> scp_event_log::EventLog {
+        let mut log = scp_event_log::EventLog::new("ctx-proof".to_owned());
+        let mut prev_hash = [0u8; 32];
+        for (i, mut event) in corpus().into_iter().enumerate() {
+            event.sequence = i as u64;
+            event.prev_hash = prev_hash;
+            scp_event_log::tree::append_unsigned_event(&mut log, &event).unwrap();
+            prev_hash = scp_event_log::tree::leaf_hash(&event).unwrap();
+        }
+        log
+    }
+
+    #[test]
+    fn inclusion_json_carries_everything_needed_to_recompute_the_root() {
+        let log = proof_corpus();
+        let root = scp_event_log::tree::root(&log);
+
+        for leaf_index in 0..scp_event_log::tree::event_count(&log) {
+            let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index).unwrap();
+            let json = inclusion_proof_json(&proof);
+
+            assert_eq!(json["leaf_index"].as_u64(), Some(leaf_index));
+            assert_eq!(
+                json["leaf_hash"].as_str(),
+                Some(hex::encode(proof.leaf_hash).as_str())
+            );
+            assert_eq!(json["root"].as_str(), Some(hex::encode(root).as_str()));
+            let path = json["path"].as_array().expect("path is an array");
+            assert_eq!(json["path_length"].as_u64(), Some(path.len() as u64));
+            assert_eq!(path.len(), proof.path.len());
+
+            // Rebuild from the JSON alone and re-verify — the off-box path.
+            let rebuilt = scp_event_log::proof::InclusionProof {
+                leaf_index: json["leaf_index"].as_u64().unwrap(),
+                leaf_hash: decode32(json["leaf_hash"].as_str().unwrap()),
+                root: decode32(json["root"].as_str().unwrap()),
+                path: path
+                    .iter()
+                    .map(|step| scp_event_log::proof::ProofStep {
+                        sibling_hash: decode32(step["sibling_hash"].as_str().unwrap()),
+                        direction: match step["direction"].as_str().unwrap() {
+                            "left" => scp_event_log::proof::Direction::Left,
+                            "right" => scp_event_log::proof::Direction::Right,
+                            other => panic!("unknown direction {other:?}"),
+                        },
+                    })
+                    .collect(),
+            };
+            assert!(
+                scp_event_log::proof::verify_inclusion(&rebuilt),
+                "leaf {leaf_index}: the shipped JSON must re-verify on its own"
+            );
+        }
+    }
+
+    #[test]
+    fn absence_neighbors_ship_their_full_inclusion_proofs() {
+        let log = proof_corpus();
+        let absent = [0xEEu8; 32];
+        let proof = scp_event_log::proof::prove_absence(&log, &absent).unwrap();
+        assert!(
+            proof.lower.is_some() || proof.upper.is_some(),
+            "precondition: at least one bracketing neighbour exists"
+        );
+
+        for side in [proof.lower.as_ref(), proof.upper.as_ref()] {
+            let json = absence_neighbor_json(side);
+            let Some(neighbor) = side else {
+                assert!(json.is_null(), "a missing neighbour maps to JSON null");
+                continue;
+            };
+            assert_eq!(json["leaf_index"].as_u64(), Some(neighbor.leaf_index));
+            assert_eq!(
+                json["leaf_hash"].as_str(),
+                Some(hex::encode(neighbor.leaf_hash).as_str())
+            );
+            // The neighbour's OWN inclusion proof is present and complete —
+            // this is what the absence arm used to omit entirely.
+            let inclusion = &json["inclusion_proof"];
+            assert_eq!(
+                inclusion["root"].as_str(),
+                Some(hex::encode(proof.root).as_str()),
+                "the neighbour must prove against the SAME root the absence answer reports"
+            );
+            assert!(inclusion["path"].is_array());
+            assert_eq!(
+                inclusion["leaf_hash"].as_str(),
+                Some(hex::encode(neighbor.leaf_hash).as_str())
+            );
+        }
+    }
+
+    fn decode32(hex_str: &str) -> [u8; 32] {
+        hex::decode(hex_str)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes")
     }
 }

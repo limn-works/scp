@@ -42,15 +42,39 @@ pub struct NapiEvent {
 
 /// A Merkle proof from the event log.
 ///
+/// # There is no `verified` field
+///
+/// This type used to carry `verified: bool`. It was a constant `true` on every
+/// success path: the bridge generated the proof and then "verified" that same
+/// proof against the same snapshot, so the check was tautological and only
+/// `Ok`-vs-`Err` ever carried information. A boolean named `verified` that no
+/// independent verifier computed is a false guarantee, so it is gone —
+/// `event_log_verify` returning `Err` IS the negative answer.
+///
+/// Real verification is done by the recipient from `details_json`, which carries
+/// the full Merkle material for both proof types: the leaf hash, the sibling
+/// path with per-step direction, and the root the path reaches. An absence
+/// answer carries the same complete material for BOTH bracketing neighbours.
+///
+/// # What an `"absence"` answer does and does not establish
+///
+/// The neighbour material lets a recipient check that both bracketing leaves
+/// really are in the tree the reported `root` commits to, and that the queried
+/// hash sorts strictly between them. It does NOT establish that the two
+/// neighbours are ADJACENT in sorted order: the log's Merkle root commits to
+/// append order, and the sorted index the neighbours are drawn from is local
+/// state the root does not cover. Treat an `"absence"` answer as the log's own
+/// assertion plus checkable neighbour-inclusion, not as a self-contained
+/// negative proof.
+///
 /// See ADR-011 (Event Log).
 #[napi(object)]
 pub struct NapiProof {
-    /// `true` if the claim was verified successfully.
-    pub verified: bool,
     /// The proof type: `"inclusion"` or `"absence"`.
     pub proof_type: String,
-    /// Proof details serialized as a JSON string (Merkle path or sorted
-    /// neighbors).
+    /// Proof material serialized as a JSON string: the Merkle path (for
+    /// inclusion proofs) or the two sorted neighbours with their own inclusion
+    /// proofs (for absence proofs).
     pub details_json: String,
 }
 
@@ -336,34 +360,12 @@ pub(crate) async fn event_log_verify_on(
                     code: codes::CTX_2025.to_owned(),
                 })
             })?;
-            let verified = scp_event_log::proof::verify_inclusion(&proof);
-
-            let path_steps: Vec<serde_json::Value> = proof
-                .path
-                .iter()
-                .map(|step| {
-                    let direction = match step.direction {
-                        scp_event_log::proof::Direction::Left => "left",
-                        scp_event_log::proof::Direction::Right => "right",
-                    };
-                    serde_json::json!({
-                        "sibling_hash": hex::encode(step.sibling_hash),
-                        "direction": direction,
-                    })
-                })
-                .collect();
-
-            let details = serde_json::json!({
-                "leaf_index": proof.leaf_index,
-                "leaf_hash": hex::encode(proof.leaf_hash),
-                "root": hex::encode(proof.root),
-                "path": path_steps,
-                "path_length": proof.path.len(),
-                "leaf_count": leaf_count,
-            });
+            let mut details = scp_ffi_common::event_log::inclusion_proof_json(&proof);
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert("leaf_count".to_owned(), leaf_count.into());
+            }
 
             Ok(NapiProof {
-                verified,
                 proof_type: "inclusion".to_owned(),
                 details_json: details.to_string(),
             })
@@ -392,40 +394,21 @@ pub(crate) async fn event_log_verify_on(
                 })
             })?;
 
-            let lower = proof.lower.as_ref().map(|lwp| {
-                serde_json::json!({
-                    "leaf_hash": hex::encode(lwp.leaf_hash),
-                    "leaf_index": lwp.leaf_index,
-                })
-            });
-
-            let upper = proof.upper.as_ref().map(|uwp| {
-                serde_json::json!({
-                    "leaf_hash": hex::encode(uwp.leaf_hash),
-                    "leaf_index": uwp.leaf_index,
-                })
-            });
-
-            let lower_verified = proof
-                .lower
-                .as_ref()
-                .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
-            let upper_verified = proof
-                .upper
-                .as_ref()
-                .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
-            let verified = lower_verified && upper_verified;
-
+            // Both bracketing neighbours ship their FULL inclusion proofs
+            // (sibling path + root), so the neighbour-inclusion half of the
+            // claim is checkable off-box against the reported `root`. Shipping
+            // only `leaf_hash` + `leaf_index` — as this arm used to — left the
+            // recipient nothing to check while the response still carried a
+            // producer-set `verified` flag.
             let details = serde_json::json!({
                 "query_hash": hex::encode(proof.query_hash),
                 "root": hex::encode(proof.root),
                 "leaf_count": proof.leaf_count,
-                "lower": lower,
-                "upper": upper,
+                "lower": scp_ffi_common::event_log::absence_neighbor_json(proof.lower.as_ref()),
+                "upper": scp_ffi_common::event_log::absence_neighbor_json(proof.upper.as_ref()),
             });
 
             Ok(NapiProof {
-                verified,
                 proof_type: "absence".to_owned(),
                 details_json: details.to_string(),
             })
@@ -949,8 +932,8 @@ mod tests {
         .to_string();
         let msg = match event_log_verify_on(&bi, &handle, absence_claim).await {
             Ok(proof) => panic!(
-                "absence of a present authoritative event must be rejected, got verified={}",
-                proof.verified
+                "absence of a present authoritative event must be rejected, got {}",
+                proof.details_json
             ),
             Err(err) => format!("{err}"),
         };
@@ -967,7 +950,6 @@ mod tests {
         let proof = event_log_verify_on(&bi, &handle, absence_claim)
             .await
             .expect("absence of an unknown event proves");
-        assert!(proof.verified);
         let details: serde_json::Value = serde_json::from_str(&proof.details_json).unwrap();
         assert_eq!(
             details["root"].as_str(),
@@ -987,7 +969,6 @@ mod tests {
                     "authoritative leaf {leaf_index} must still be provable"
                 ),
                 Ok(proof) => {
-                    assert!(proof.verified);
                     let details: serde_json::Value =
                         serde_json::from_str(&proof.details_json).unwrap();
                     let leaf_hash = details["leaf_hash"].as_str().unwrap().to_owned();
@@ -1060,8 +1041,8 @@ mod tests {
         .to_string();
         let msg = match event_log_verify_on(&bi, &handle, absence_claim).await {
             Ok(proof) => panic!(
-                "an unknown authoritative log must fail closed, got verified={}",
-                proof.verified
+                "an unknown authoritative log must fail closed, got {}",
+                proof.details_json
             ),
             Err(err) => format!("{err}"),
         };
@@ -1108,8 +1089,8 @@ mod tests {
             .to_string();
             let msg = match event_log_verify_on(&bi, &handle, absence_claim).await {
                 Ok(proof) => panic!(
-                    "a not-ready instance (shutdown={shutdown}) must fail closed, got verified={}",
-                    proof.verified
+                    "a not-ready instance (shutdown={shutdown}) must fail closed, got {}",
+                    proof.details_json
                 ),
                 Err(err) => format!("{err}"),
             };

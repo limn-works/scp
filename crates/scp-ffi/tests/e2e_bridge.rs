@@ -755,6 +755,51 @@ fn bridge_local_leaves(bi: &PyBridgeInstance, context_id: &str) -> Vec<[u8; 32]>
     runtime::with_context(bi, context_id, |rt| Ok(rt.event_log.leaves().to_vec())).unwrap()
 }
 
+/// Rebuilds an [`scp_event_log::proof::InclusionProof`] from the JSON a bridge
+/// shipped and re-verifies it INDEPENDENTLY — recomputing the root from the
+/// leaf hash and the sibling path, exactly as an off-box relying party would.
+///
+/// This replaces the `Proof.verified` boolean the bridge used to self-report.
+/// That flag was a constant `true` on every success path (the bridge verified
+/// the proof it had just generated against the same snapshot), so asserting on
+/// it tested nothing. Reconstructing the proof from the shipped fields is what
+/// actually pins that the material is complete and checkable.
+fn reverify_inclusion_json(details: &Bound<'_, pyo3::types::PyAny>) -> bool {
+    let decode32 = |v: String| -> [u8; 32] {
+        hex::decode(v)
+            .expect("hex")
+            .try_into()
+            .expect("32-byte hash")
+    };
+    let leaf_hash = decode32(details.get_item("leaf_hash").unwrap().extract().unwrap());
+    let root = decode32(details.get_item("root").unwrap().extract().unwrap());
+    let leaf_index: u64 = details.get_item("leaf_index").unwrap().extract().unwrap();
+
+    let path_obj = details.get_item("path").unwrap();
+    let mut path = Vec::new();
+    for i in 0..path_obj.len().unwrap() {
+        let step = path_obj.get_item(i).unwrap();
+        let sibling_hash = decode32(step.get_item("sibling_hash").unwrap().extract().unwrap());
+        let dir: String = step.get_item("direction").unwrap().extract().unwrap();
+        let direction = match dir.as_str() {
+            "left" => scp_event_log::proof::Direction::Left,
+            "right" => scp_event_log::proof::Direction::Right,
+            other => unreachable!("unknown direction {other:?}"),
+        };
+        path.push(scp_event_log::proof::ProofStep {
+            sibling_hash,
+            direction,
+        });
+    }
+
+    scp_event_log::proof::verify_inclusion(&scp_event_log::proof::InclusionProof {
+        leaf_index,
+        leaf_hash,
+        root,
+        path,
+    })
+}
+
 /// Injects a caller-influenced leaf into the BRIDGE-LOCAL tree through a real
 /// public bridge call (`provenance_attach` appends a `ProvenanceAttached` leaf
 /// whose payload is the caller-derived provenance hash).
@@ -806,8 +851,11 @@ fn event_log_verify_inclusion_proof_after_append() {
         let proof = scp
             .event_log_verify(py, &ctx_id, &claim.as_borrowed())
             .unwrap();
-        assert!(proof.verified);
         assert_eq!(proof.proof_type, "inclusion");
+        assert!(
+            reverify_inclusion_json(proof.details.bind(py)),
+            "the shipped inclusion material must re-verify off-box"
+        );
 
         // The proven leaf is the AUTHORITATIVE leaf 0, not the bridge-local
         // append above.
@@ -995,7 +1043,6 @@ fn event_log_verify_details_carry_the_authoritative_root_and_leaf_count() {
         let proof = scp
             .event_log_verify(py, &ctx_id, &absence.as_borrowed())
             .unwrap();
-        assert!(proof.verified);
         let details = proof.details.bind(py);
         let root: String = details.get_item("root").unwrap().extract().unwrap();
         assert_eq!(
@@ -1003,6 +1050,25 @@ fn event_log_verify_details_carry_the_authoritative_root_and_leaf_count() {
             hex::encode(auth_root),
             "absence root must be authoritative"
         );
+        // Both bracketing neighbours ship FULL inclusion proofs, and each
+        // re-verifies independently against that same authoritative root.
+        for side in ["lower", "upper"] {
+            let neighbor = details.get_item(side).unwrap();
+            if neighbor.is_none() {
+                continue;
+            }
+            let inclusion = neighbor.get_item("inclusion_proof").unwrap();
+            assert!(
+                reverify_inclusion_json(&inclusion),
+                "the {side} neighbour's inclusion proof must re-verify off-box"
+            );
+            let neighbor_root: String = inclusion.get_item("root").unwrap().extract().unwrap();
+            assert_eq!(
+                neighbor_root, root,
+                "the {side} neighbour must prove against the SAME root the \
+                 absence answer reports"
+            );
+        }
         let leaf_count: u64 = details.get_item("leaf_count").unwrap().extract().unwrap();
         assert_eq!(leaf_count, auth_count);
     });
@@ -1205,11 +1271,11 @@ fn event_log_verify_inclusion_of_an_authoritative_event_verifies() {
             let proof = scp
                 .event_log_verify(py, &ctx_id, &claim.as_borrowed())
                 .unwrap();
-            assert!(
-                proof.verified,
-                "authoritative leaf {index} must prove included"
-            );
             let details = proof.details.bind(py);
+            assert!(
+                reverify_inclusion_json(details),
+                "authoritative leaf {index} must ship material that re-verifies"
+            );
             let proven_leaf: String = details.get_item("leaf_hash").unwrap().extract().unwrap();
             assert_eq!(proven_leaf, hex::encode(leaf));
         }
