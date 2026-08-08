@@ -2810,7 +2810,7 @@ mod tests {
             projection_ucan_cache: std::sync::RwLock::new(ProjectionUcanCache::new()),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_did::DidDocument {
+            did_document: crate::NodeDidDocument::new(scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:test".to_owned(),
                 verification_method: vec![],
@@ -2818,7 +2818,7 @@ mod tests {
                 assertion_method: vec![],
                 also_known_as: vec![],
                 service: vec![],
-            },
+            }),
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
