@@ -296,13 +296,19 @@ pub struct ApplicationNode<S: Storage> {
     /// Set by [`serve_background`](Self::serve_background) after successful bind.
     /// Wrapped in `Arc` so the spawned background task can clear it on exit.
     serving_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
-    /// The signed BEP44 record this node published at startup, if it published
-    /// one (§3.10.5). `None` for a `DhtMode::Disabled` node — the honest absent
-    /// state: nothing was published, so there is nothing to keep alive.
+    /// The node's live "most recently published signed BEP44 record" slot
+    /// (§3.10.5), holding `None` while the node has published nothing — the
+    /// honest absent state for a `DhtMode::Disabled` node.
     ///
-    /// This is the record produced by THIS node's signing pass, not a read-back
-    /// (see `DidMethod::publish`). Republishing is sourced from it.
-    published_did_record: Option<scp_identity::republish::RepublishEntry>,
+    /// A live slot rather than a startup snapshot: the node re-publishes on a NAT
+    /// tier change (`apply_tier_change`), and the republish keep-alive must
+    /// re-assert the record from the LATEST publish, not the first one. Written
+    /// only by the publish seam ([`DidPublisher::publish`]); see
+    /// [`PublishedDidRecord`].
+    ///
+    /// The records are produced by THIS node's signing pass, never a read-back
+    /// (see `DidMethod::publish`).
+    published_did_record: PublishedDidRecord,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -330,19 +336,38 @@ impl<S: Storage> ApplicationNode<S> {
         self.domain.as_deref()
     }
 
-    /// The signed BEP44 DID record this node published at startup, if any
+    /// The signed BEP44 DID record this node has most recently published
     /// (§3.10.5).
     ///
-    /// `None` when the node published nothing — the `DhtMode::Disabled`
+    /// `None` when the node has published nothing — the `DhtMode::Disabled`
     /// fail-safe default. That absence is protocol-supported and detectable;
     /// callers MUST NOT synthesize a record in its place.
     ///
-    /// The value is the output of this node's own signing pass, so a caller
-    /// (e.g. the self-host republish cycle) never has to reconstruct the
-    /// `(value, signature, seq)` triple by reading it back off the network.
+    /// The value is the output of this node's own signing pass, so a caller never
+    /// has to reconstruct the `(value, signature, seq)` triple by reading it back
+    /// off the network.
+    ///
+    /// This is a **snapshot**: a NAT tier change re-publishes the document with a
+    /// new sequence, after which this returns the newer record. A long-lived
+    /// consumer (the self-host republish cycle) subscribes to the slot via
+    /// `subscribe_published_did_record` instead of holding a snapshot — a held
+    /// snapshot goes stale the moment the tier changes.
     #[must_use]
-    pub const fn published_did_record(&self) -> Option<&scp_identity::republish::RepublishEntry> {
-        self.published_did_record.as_ref()
+    pub fn published_did_record(&self) -> Option<scp_identity::republish::RepublishEntry> {
+        self.published_did_record.get()
+    }
+
+    /// A live view of this node's published-record slot, yielding every
+    /// subsequent publish (§3.10.5).
+    ///
+    /// The republish keep-alive observes this so that any re-publish — the NAT
+    /// tier change today, and any publish path added later — re-seeds it. Holding
+    /// [`published_did_record`](Self::published_did_record)'s snapshot instead is
+    /// the frozen-snapshot defect.
+    pub(crate) fn subscribe_published_did_record(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<scp_identity::republish::RepublishEntry>> {
+        self.published_did_record.subscribe()
     }
 
     /// Returns a reference to the relay handle.
@@ -2078,45 +2103,151 @@ impl TlsProvider for SelfSignedTlsProvider {
 }
 
 // ---------------------------------------------------------------------------
-// DidPublisher — object-safe trait for DID document publishing (SCP-243)
+// The node's DID-document publish seam (SCP-243, SCP-RELAYRES-004)
 // ---------------------------------------------------------------------------
 
-/// Object-safe trait for publishing DID documents.
+/// The node's live "signed BEP44 record I most recently published" slot
+/// (§3.10.5).
 ///
-/// The full [`DidMethod`] trait is not object-safe because it uses `impl Future`
-/// in return types. This trait wraps just the `publish` method with a boxed
-/// future, enabling the tier re-evaluation background task (SCP-243) to
-/// republish the DID document on tier changes without requiring generic
-/// parameters.
+/// # Why a shared slot and not a return value
+///
+/// The record a publish signs is consumed by a background cycle that outlives
+/// the publish call: the [`RepublishManager`](scp_identity::republish::RepublishManager)
+/// keep-alive, which must re-assert the CURRENT `(value, signature, seq)`. Handing
+/// the republish path a `RepublishEntry` *by value* makes it a frozen snapshot of
+/// whatever was published first; every later publish then produces a new `seq`
+/// that the keep-alive never learns about, so it re-puts a superseded record that
+/// BEP44 nodes reject (the DHT copy silently expires) and pushes a superseded
+/// frame that a validating relay rejects (miscounted as a publish failure).
+///
+/// Sharing the slot removes the snapshot: the republish path observes the slot,
+/// so it is always pointed at the latest record.
+///
+/// # Only the publish seam writes it
+///
+/// [`set`](Self::set) is private to this module and its single caller is
+/// [`NodeDidPublisher::publish`], which writes the slot in the same expression
+/// that produces the record. A caller therefore cannot re-publish this node's DID
+/// document *without* the observers seeing the new record — there is no "remember
+/// to re-seed" step that a future call site could forget.
+#[derive(Clone)]
+pub(crate) struct PublishedDidRecord(
+    Arc<tokio::sync::watch::Sender<Option<scp_identity::republish::RepublishEntry>>>,
+);
+
+impl PublishedDidRecord {
+    /// A slot for a node that has not published anything yet.
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(None)))
+    }
+
+    /// Records the signed record a publish just produced.
+    ///
+    /// Private on purpose — see the type docs. `send_replace` (not `send`) so the
+    /// write never fails when no observer is subscribed yet: the builders publish
+    /// before the self-host republish cycle subscribes.
+    fn set(&self, entry: scp_identity::republish::RepublishEntry) {
+        self.0.send_replace(Some(entry));
+    }
+
+    /// A snapshot of the current record, or `None` if the node published none.
+    pub(crate) fn get(&self) -> Option<scp_identity::republish::RepublishEntry> {
+        self.0.borrow().clone()
+    }
+
+    /// A live view of the slot that yields every subsequent publish.
+    pub(crate) fn subscribe(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<scp_identity::republish::RepublishEntry>> {
+        self.0.subscribe()
+    }
+}
+
+impl std::fmt::Debug for PublishedDidRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PublishedDidRecord")
+            .field(&self.0.borrow().as_ref().map(|entry| entry.sequence))
+            .finish()
+    }
+}
+
+/// The node's **single** DID-document publish seam.
+///
+/// Object-safe (the full [`DidMethod`] trait is not — it returns `impl Future`),
+/// so the tier re-evaluation background task (SCP-243) can re-publish without
+/// carrying a generic parameter.
+///
+/// Every path that publishes this node's DID document — startup
+/// ([`build_domain_inner`] / [`build_no_domain_inner`]) and tier change
+/// ([`apply_tier_change`]) alike — goes through this one method, so two
+/// properties hold by construction rather than by each call site remembering:
+///
+/// 1. the configured [`DhtMode`](crate::DhtMode) gate is honored (a
+///    `DhtMode::Disabled` node discloses nothing, on *any* publish, not just the
+///    startup one);
+/// 2. the signed record becomes the node's current [`PublishedDidRecord`], which
+///    the republish keep-alive observes.
 pub(crate) trait DidPublisher: Send + Sync {
-    /// Publishes a DID document to the underlying DID infrastructure.
+    /// Publishes a DID document per the node's configured `DhtMode` and makes the
+    /// resulting signed record the node's current published record.
+    ///
+    /// Returns the record that was signed, or `Ok(None)` when the configured mode
+    /// publishes nothing (`DhtMode::Disabled`) — the honest absent state, never a
+    /// synthesized record.
     fn publish<'a>(
         &'a self,
         identity: &'a ScpIdentity,
         document: &'a DidDocument,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>>;
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
+                > + Send
+                + 'a,
+        >,
+    >;
 }
 
-/// Blanket implementation wrapping any [`DidMethod`] into a [`DidPublisher`].
-struct DidMethodPublisher<D: DidMethod> {
+/// The production [`DidPublisher`]: a [`DidMethod`], the node's `DhtMode`, and
+/// the node's [`PublishedDidRecord`] slot bound together.
+///
+/// All three fields are required — there is no constructor that omits the slot or
+/// the mode, so a publisher that publishes without honoring the mode, or without
+/// updating the node's current record, is not constructible.
+struct NodeDidPublisher<D: DidMethod> {
     inner: Arc<D>,
+    dht_mode: DhtMode,
+    records: PublishedDidRecord,
 }
 
-impl<D: DidMethod + 'static> DidPublisher for DidMethodPublisher<D> {
+impl<D: DidMethod + 'static> DidPublisher for NodeDidPublisher<D> {
     fn publish<'a>(
         &'a self,
         identity: &'a ScpIdentity,
         document: &'a DidDocument,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>>
-    {
-        // The tier-change republish does not consume the signed record: it is
-        // an object-safe boxed surface whose only caller re-publishes on relay
-        // URL change. Discarded explicitly so the drop is a decision.
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
-            self.inner
-                .publish(identity, document)
-                .await
-                .map(|_signed_record| ())
+            let published = publish_did_document_for_mode(
+                self.dht_mode,
+                self.inner.as_ref(),
+                identity,
+                document,
+            )
+            .await?;
+            // The publish and the re-seed are ONE step. Splitting them (returning
+            // the record and trusting the caller to forward it) is exactly the
+            // frozen-snapshot defect this seam exists to make unrepresentable.
+            if let Some(ref entry) = published {
+                self.records.set(entry.clone());
+            }
+            Ok(published)
         })
     }
 }
@@ -2424,9 +2555,18 @@ pub fn spawn_self_host_mapping_renewal(
     tokio::spawn(run_mapping_renewal_loop(mappers, port, cancel))
 }
 
-/// Handles a detected tier change: updates the DID document, republishes it,
-/// and emits the event only after successful publish. Returns the new URL and
-/// document on success.
+/// Handles a detected tier change: updates the DID document, re-publishes it
+/// through the node's publish seam, and emits the event only after the publish
+/// resolved. Returns the new URL and document on success.
+///
+/// # Re-seeding the keep-alive is not this function's job
+///
+/// Re-publishing produces a NEW `(value, signature, seq)`, and the running
+/// republish keep-alive must re-assert *that* record rather than the startup one.
+/// This function does not forward it: [`DidPublisher::publish`] writes the node's
+/// [`PublishedDidRecord`] slot itself, so the keep-alive observes the new record
+/// whether or not this — or any future — call site remembers to pass it on. See
+/// [`PublishedDidRecord`].
 async fn apply_tier_change(
     current_url: &str,
     new_relay_url: &str,
@@ -2443,10 +2583,29 @@ async fn apply_tier_change(
         }
     }
     match publisher.publish(identity, &updated_doc).await {
-        Ok(()) => {
-            // Emit the tier-change event only after the DID document has been
-            // successfully published. This ensures consumers see events that
-            // correspond to actual state changes in the DHT.
+        Ok(signed) => {
+            if let Some(entry) = signed {
+                tracing::info!(
+                    new_url = %new_relay_url, did = %identity.did, sequence = entry.sequence,
+                    "DID document republished with new relay URL"
+                );
+            } else {
+                // `DhtMode::Disabled`: the node is intentionally not published, so
+                // there is no record to update — the same non-disclosing behavior
+                // the startup publish has. The tier itself DID change, so the
+                // local URL still advances (otherwise every re-evaluation would
+                // re-detect and re-attempt the identical change forever) and the
+                // event still fires: it reports this node's reachability, which is
+                // true regardless of whether a DHT record exists.
+                tracing::info!(
+                    new_url = %new_relay_url, did = %identity.did,
+                    "reachability tier changed; DID document NOT published \
+                     (DhtMode::Disabled — not discoverable by design)"
+                );
+            }
+            // Emit the tier-change event only after the publish has resolved, so
+            // consumers never see an event for a change that then failed to
+            // publish.
             if let Some(tx) = event_tx {
                 let _ = tx
                     .send(NatTierChange::TierChanged {
@@ -2456,8 +2615,6 @@ async fn apply_tier_change(
                     })
                     .await;
             }
-            tracing::info!(new_url = %new_relay_url, did = %identity.did,
-                "DID document republished with new relay URL");
             Some((new_relay_url.to_owned(), updated_doc))
         }
         Err(e) => {
@@ -3118,8 +3275,18 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // (and the test-only `Memory`) publish FATALLY, exactly as this path did
     // before. `Domain + Disabled` is never rejected: erroring on the fail-safe
     // direction would itself violate M2.
-    let published_did_record =
-        publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
+    //
+    // Published through the node's single publish seam (`NodeDidPublisher`) — the
+    // same one the no-domain builder and the tier-change task use — so the signed
+    // record lands in the node's `PublishedDidRecord` slot by construction.
+    let published_did_record = PublishedDidRecord::new();
+    NodeDidPublisher {
+        inner: Arc::clone(&did_method),
+        dht_mode,
+        records: published_did_record.clone(),
+    }
+    .publish(&identity, &document)
+    .await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3249,9 +3416,15 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
     });
 }
 
-/// Publishes a node's DID document on the no-domain build path, discriminating
-/// on the configured [`DhtMode`] so the two semantically-opposite outcomes are
-/// never conflated.
+/// Publishes a node's DID document, discriminating on the configured
+/// [`DhtMode`] so the two semantically-opposite outcomes are never conflated.
+///
+/// The `DhtMode` gate itself. Its ONLY caller is [`NodeDidPublisher::publish`],
+/// so every publish this node performs — startup and NAT tier change alike —
+/// honors the mode. It is deliberately not called directly: a call site that
+/// reached the [`DidMethod`] around this gate would both (a) publish a
+/// `DhtMode::Disabled` node's address, and (b) leave the node's
+/// [`PublishedDidRecord`] pointing at a superseded record.
 ///
 /// The asymmetry is deliberate and honest:
 ///
@@ -3284,9 +3457,10 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 /// Returns `Some(entry)` carrying the BEP44 `(public_key, seq, signature,
 /// value)` this publish signed, and `None` for `DhtMode::Disabled` — where the
 /// absence is the literal truth that nothing was published, not a lookup miss.
-/// Downstream (the self-host republish cycle) consumes the record directly, so
-/// the triple is never reconstructed by resolving the node's own record back off
-/// the network.
+/// [`NodeDidPublisher::publish`] files the record into the node's
+/// [`PublishedDidRecord`] slot, from which the self-host republish cycle reads it
+/// directly, so the triple is never reconstructed by resolving the node's own
+/// record back off the network.
 async fn publish_did_document_for_mode<D: DidMethod + 'static>(
     dht_mode: DhtMode,
     did_method: &D,
@@ -3368,13 +3542,22 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 
     push_relay_service(&mut document, &relay_url);
 
-    // 4. Publish the DID document per the configured DhtMode: skipped for
-    //    `Disabled` (fail-safe, not discoverable by design), FATAL on failure for
-    //    a publishing node (`Production` / test-only `Memory`) so a genuine
-    //    startup publish failure fails the node closed rather than advertising a
-    //    false discoverability guarantee.
-    let published_did_record =
-        publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
+    // 4. Publish the DID document through the node's SINGLE publish seam. The
+    //    seam applies the configured DhtMode gate — skipped for `Disabled`
+    //    (fail-safe, not discoverable by design), FATAL on failure for a
+    //    publishing node (`Production` / test-only `Memory`) so a genuine startup
+    //    publish failure fails the node closed rather than advertising a false
+    //    discoverability guarantee — and files the signed record into
+    //    `published_did_record`. The SAME publisher instance drives the
+    //    tier-change re-publish below, which is what keeps the republish
+    //    keep-alive pointed at the current record instead of this first one.
+    let published_did_record = PublishedDidRecord::new();
+    let publisher: Arc<dyn DidPublisher> = Arc::new(NodeDidPublisher {
+        inner: Arc::clone(&did_method),
+        dht_mode,
+        records: published_did_record.clone(),
+    });
+    publisher.publish(&identity, &document).await?;
 
     tracing::info!(
         tier = ?tier,
@@ -3385,9 +3568,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         "application node started (no-domain mode, §10.12.8)"
     );
 
-    let publisher: Arc<dyn DidPublisher> = Arc::new(DidMethodPublisher {
-        inner: Arc::clone(&did_method),
-    });
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
     let bg_identity = identity.clone();
     // No tier to re-evaluate when the probe was skipped: the node is reached via
@@ -5521,7 +5701,9 @@ mod tests {
         }
     }
 
-    /// Mock `DidPublisher` that records publish calls.
+    /// Mock `DidPublisher` that records publish calls and models the real seam's
+    /// monotonically-increasing BEP44 sequence, so a test can tell the record
+    /// produced by the Nth publish apart from the previous one.
     struct RecordingPublisher {
         publish_count: std::sync::atomic::AtomicU32,
     }
@@ -5542,13 +5724,31 @@ mod tests {
         fn publish<'a>(
             &'a self,
             _identity: &'a ScpIdentity,
-            _document: &'a DidDocument,
+            document: &'a DidDocument,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
+                    > + Send
+                    + 'a,
+            >,
         > {
-            self.publish_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            let sequence = u64::from(
+                self.publish_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            ) + 1;
+            let document_bytes = document
+                .to_json()
+                .expect("test document serializes")
+                .into_bytes();
+            Box::pin(async move {
+                Ok(Some(scp_identity::republish::RepublishEntry {
+                    public_key: [7u8; 32],
+                    document_bytes,
+                    signature: [0u8; 64],
+                    sequence,
+                }))
+            })
         }
     }
 
