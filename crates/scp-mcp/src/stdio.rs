@@ -13,14 +13,14 @@
 
 use std::sync::Arc;
 
-use scp_core::context::membership::ContextEvent;
+use scp_core::context::membership::ContextEventEnvelope;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use crate::protocol::{
     JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
 };
-use crate::server::{ContextProvider, McpServer};
+use crate::server::{ContextEventPump, ContextProvider, McpServer};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -164,16 +164,17 @@ impl StdioNotifier {
 ///
 /// # Resource subscriptions
 ///
-/// Pass `events` — a receiver from
-/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events)
-/// — to enable `resources/subscribe`. When `Some`, this function enables the
-/// subscription capability on `server` and runs a pump that turns each
+/// `pump` is the [`ContextEventPump`] that
+/// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source)
+/// returned alongside `server`. Passing it runs a delivery loop that turns each
 /// [`ContextEvent`] into `notifications/resources/updated` for the subscribed
 /// resources it invalidates.
 ///
-/// When `None`, the server advertises `resources.subscribe: false` and
-/// rejects `resources/subscribe` with a typed error. The capability is never
-/// advertised without the machinery to honour it.
+/// `None` is only constructible for a server built with
+/// [`McpServer::new`](crate::server::McpServer::new), which advertises
+/// `resources.subscribe: false` and rejects `resources/subscribe` with a typed
+/// error — the capability cannot be advertised without the machinery to honour
+/// it, because the same call produces both.
 ///
 /// The server is shared behind a mutex so the pump can consult the same
 /// subscription registry as the read loop; the lock is only ever held for the
@@ -188,24 +189,21 @@ impl StdioNotifier {
 /// Returns [`StdioError`] if an I/O error occurs on stdin or stdout.
 pub async fn run_stdio<P: ContextProvider + 'static>(
     server: &Arc<std::sync::Mutex<McpServer<P>>>,
-    events: Option<broadcast::Receiver<(String, ContextEvent)>>,
+    pump: Option<ContextEventPump>,
 ) -> Result<(), StdioError> {
     let notifier = StdioNotifier::new();
 
-    // Enabling the capability and starting the pump are the same step, so the
-    // advertisement can never outrun the delivery machinery.
-    let pump = events.map(|rx| {
-        if let Ok(mut srv) = server.lock() {
-            srv.enable_subscriptions();
-        } else {
-            tracing::error!("MCP server mutex poisoned enabling subscriptions");
-        }
-        tokio::spawn(pump_events(Arc::clone(server), rx, notifier.clone()))
+    let pump_task = pump.map(|pump| {
+        tokio::spawn(pump_events(
+            Arc::clone(server),
+            pump.into_receiver(),
+            notifier.clone(),
+        ))
     });
 
     let result = read_loop(server, &notifier).await;
 
-    if let Some(handle) = pump {
+    if let Some(handle) = pump_task {
         handle.abort();
     }
     result
@@ -214,11 +212,11 @@ pub async fn run_stdio<P: ContextProvider + 'static>(
 /// Forwards runtime context events to the client as MCP notifications.
 async fn pump_events<P: ContextProvider>(
     server: Arc<std::sync::Mutex<McpServer<P>>>,
-    mut events: broadcast::Receiver<(String, ContextEvent)>,
+    mut events: broadcast::Receiver<ContextEventEnvelope>,
     notifier: StdioNotifier,
 ) {
     loop {
-        let (context_id, event) = match events.recv().await {
+        let ContextEventEnvelope { context_id, event } = match events.recv().await {
             Ok(v) => v,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 // The client may have missed a change. Over-notify rather
@@ -247,13 +245,49 @@ async fn pump_events<P: ContextProvider>(
     }
 }
 
-/// Reads and dispatches client messages until EOF.
+/// Where the read loop writes its JSON-RPC responses.
+///
+/// Exists so [`read_loop_from`] — the loop that actually ships — can be driven
+/// over an in-memory buffer in tests instead of being reimplemented there.
+trait LineSink {
+    /// Writes one complete line, terminator included.
+    fn write_line(
+        &self,
+        json: &str,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
+}
+
+impl LineSink for StdioNotifier {
+    async fn write_line(&self, json: &str) -> std::io::Result<()> {
+        Self::write_line(self, json).await
+    }
+}
+
+/// Reads and dispatches client messages from stdin until EOF.
 async fn read_loop<P: ContextProvider>(
     server: &Arc<std::sync::Mutex<McpServer<P>>>,
     notifier: &StdioNotifier,
 ) -> Result<(), StdioError> {
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
+    read_loop_from(server, BufReader::new(tokio::io::stdin()), notifier).await
+}
+
+/// The transport read loop, parameterized over its input and its response
+/// sink.
+///
+/// [`read_loop`] binds it to stdin/stdout; tests bind it to in-memory buffers.
+/// Keeping one body means the JSON-RPC notification handling, the
+/// [`MAX_LINE_BYTES`] truncation guard and the dispatch path that ship are the
+/// ones under test — a test-local reimplementation would verify a copy.
+async fn read_loop_from<P, R, S>(
+    server: &Arc<std::sync::Mutex<McpServer<P>>>,
+    mut reader: BufReader<R>,
+    sink: &S,
+) -> Result<(), StdioError>
+where
+    P: ContextProvider,
+    R: tokio::io::AsyncRead + Unpin + Send,
+    S: LineSink + Sync,
+{
     let mut line = String::new();
 
     loop {
@@ -305,7 +339,7 @@ async fn read_loop<P: ContextProvider>(
                     continue;
                 }
             };
-            notifier.write_line(&json).await?;
+            sink.write_line(&json).await?;
         }
     }
 
@@ -445,6 +479,13 @@ mod tests {
         ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({"status": "ok"}))
         }
+        fn validate_resource_access(
+            &self,
+            _context_id: &str,
+            _resource: crate::server::ResourceKind,
+        ) -> Result<(), String> {
+            Ok(())
+        }
         fn context_members(&self, _context_id: &str) -> Vec<MemberInfo> {
             Vec::new()
         }
@@ -564,10 +605,8 @@ mod tests {
         });
 
         let input = format!("{init_req}\n{ping_req}\n");
-        let mut output = Vec::new();
-
-        let mut server = McpServer::new(MockProvider::default());
-        process_lines(&mut server, input.as_bytes(), &mut output).await;
+        let server = shared_server();
+        let output = process_lines(&server, input.as_bytes()).await;
 
         // Parse output lines.
         let output_str = String::from_utf8(output).unwrap();
@@ -585,19 +624,15 @@ mod tests {
 
     #[tokio::test]
     async fn run_stdio_skips_empty_lines() {
-        let input = "\n\n";
-        let mut output = Vec::new();
-        let mut server = McpServer::new(MockProvider::default());
-        process_lines(&mut server, input.as_bytes(), &mut output).await;
+        let server = shared_server();
+        let output = process_lines(&server, b"\n\n").await;
         assert!(output.is_empty());
     }
 
     #[tokio::test]
     async fn run_stdio_handles_invalid_json() {
-        let input = "not json\n";
-        let mut output = Vec::new();
-        let mut server = McpServer::new(MockProvider::default());
-        process_lines(&mut server, input.as_bytes(), &mut output).await;
+        let server = shared_server();
+        let output = process_lines(&server, b"not json\n").await;
 
         let output_str = String::from_utf8(output).unwrap();
         let resp: JsonRpcResponse = serde_json::from_str(output_str.trim()).unwrap();
@@ -608,49 +643,109 @@ mod tests {
         );
     }
 
-    /// Helper: processes lines from a reader (simulating stdin) and writes
-    /// responses to a writer (simulating stdout). Mirrors `run_stdio` logic
-    /// but accepts generic async readers/writers for testing.
+    /// Per JSON-RPC 2.0 a *notification* never draws a response. This is the
+    /// defect the three duplicated hand-rolled bridge loops had — they decoded
+    /// every line as `JsonRpcRequest`, whose `id` is required, so the mandatory
+    /// `notifications/initialized` handshake step drew an error response.
+    ///
+    /// This drives the shipped loop, not a copy of it.
+    #[tokio::test]
+    async fn read_loop_never_answers_a_notification() {
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_INITIALIZE,
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test" }
+            },
+            "id": 1
+        });
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_INITIALIZED
+        });
+
+        let server = shared_server();
+        let output = process_lines(&server, format!("{init}\n{initialized}\n").as_bytes()).await;
+
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only `initialize` may draw a response, got: {text}"
+        );
+        let resp: JsonRpcResponse = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(resp.id, RequestId::Number(1));
+        assert!(resp.error.is_none());
+        assert!(server.lock().unwrap().is_initialized());
+    }
+
+    /// A line that hits `MAX_LINE_BYTES` with no terminator was truncated;
+    /// acting on a partial message is worse than stopping. This path had no
+    /// coverage at all.
+    #[tokio::test]
+    async fn read_loop_stops_on_a_truncated_over_long_line() {
+        // A well-formed prefix, then an unterminated flood that trips the cap.
+        let ping = serde_json::json!({"jsonrpc": "2.0", "method": METHOD_PING, "id": 7});
+        let mut input = format!("{ping}\n").into_bytes();
+        let flood = usize::try_from(MAX_LINE_BYTES).expect("cap fits in usize on test targets");
+        input.extend(std::iter::repeat_n(b'x', flood));
+
+        let server = shared_server();
+        // `ping` is allowed pre-initialization, so the first line answers.
+        let output = process_lines(&server, &input).await;
+
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the truncated line must stop the loop, not be dispatched: {text}"
+        );
+        let resp: JsonRpcResponse = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(resp.id, RequestId::Number(7));
+    }
+
+    /// Drives the REAL `read_loop_from` — the loop `run_stdio` runs — over an
+    /// in-memory reader, returning everything the loop wrote.
+    ///
+    /// The previous helper reimplemented the loop, so the JSON-RPC
+    /// notification handling this crate claims to have fixed was verified
+    /// against a copy of itself rather than against shipped code.
     async fn process_lines<P: ContextProvider>(
-        server: &mut McpServer<P>,
+        server: &Arc<std::sync::Mutex<McpServer<P>>>,
         input: &[u8],
-        output: &mut Vec<u8>,
-    ) {
-        let mut reader = BufReader::new(input);
-        let mut line = String::new();
+    ) -> Vec<u8> {
+        let sink = VecSink::default();
+        read_loop_from(server, BufReader::new(input), &sink)
+            .await
+            .expect("read loop must not error on in-memory input");
+        sink.lines.lock().await.clone()
+    }
 
-        loop {
-            line.clear();
-            let bytes_read = reader.read_line(&mut line).await.unwrap();
-            if bytes_read == 0 {
-                break;
+    /// In-memory [`LineSink`] capturing everything the loop writes.
+    #[derive(Default)]
+    struct VecSink {
+        lines: tokio::sync::Mutex<Vec<u8>>,
+    }
+
+    impl LineSink for VecSink {
+        async fn write_line(&self, json: &str) -> std::io::Result<()> {
+            {
+                let mut buf = self.lines.lock().await;
+                buf.extend_from_slice(json.as_bytes());
+                buf.push(b'\n');
             }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let response = match parse_incoming(trimmed) {
-                Ok(Incoming::Request(req)) => server.handle_request(&req),
-                Ok(Incoming::Notification(notif)) => {
-                    let synthetic = JsonRpcRequest {
-                        jsonrpc: notif.jsonrpc,
-                        method: notif.method,
-                        params: notif.params,
-                        id: RequestId::Number(0),
-                    };
-                    server.handle_request(&synthetic);
-                    None
-                }
-                Err(err_response) => Some(*err_response),
-            };
-
-            if let Some(resp) = response {
-                let json = serde_json::to_string(&resp).unwrap();
-                output.extend_from_slice(json.as_bytes());
-                output.extend_from_slice(b"\n");
-            }
+            Ok(())
         }
+    }
+
+    /// Wraps a mock-backed server for the in-memory loop.
+    fn shared_server() -> Arc<std::sync::Mutex<McpServer<MockProvider>>> {
+        Arc::new(std::sync::Mutex::new(McpServer::new(
+            MockProvider::default(),
+        )))
     }
 }
