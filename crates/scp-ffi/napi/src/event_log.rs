@@ -226,12 +226,21 @@ pub(crate) async fn event_log_query_on(
 /// destroyed on actor shutdown or create-rollback reads exactly the same as one
 /// that never existed; an empty-but-live log is `Ok(Some(vec![]))`).
 ///
-/// Verification MUST NOT fall back to the UCAN-state tree here: an absence
-/// proof over a non-authoritative or unknown log is a forgeable FALSE NEGATIVE.
-fn authoritative_log_unreachable(context_id: &str, detail: &impl std::fmt::Display) -> napi::Error {
+/// Neither verification nor checkpointing may fall back to the UCAN-state tree
+/// here: an absence proof over a non-authoritative or unknown log is a forgeable
+/// FALSE NEGATIVE, and a checkpoint over one is a validly-SIGNED false
+/// commitment.
+///
+/// `operation` names the refused operation ("verification" / "checkpointing") so
+/// the message identifies which surface failed closed.
+fn authoritative_log_unreachable(
+    operation: &str,
+    context_id: &str,
+    detail: &impl std::fmt::Display,
+) -> napi::Error {
     napi::Error::from(ScpNapiError::Context {
         message: format!(
-            "event log verification cannot reach the authoritative log for context \
+            "event log {operation} cannot reach the authoritative log for context \
              '{context_id}': {detail}"
         ),
         code: codes::CTX_2138.to_owned(),
@@ -298,16 +307,16 @@ pub(crate) async fn event_log_verify_on(
     // typically been destroyed).
     bi.core
         .check_ready()
-        .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
+        .map_err(|e| authoritative_log_unreachable("verification", &context_id, &e))?;
     let supervisor = crate::runtime::supervisor(bi)
-        .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
+        .map_err(|e| authoritative_log_unreachable("verification", &context_id, &e))?;
 
     // The ONE authoritative snapshot every answer below is derived from. Its
     // failure is the only "cannot answer" case (CTX-2138), which keeps it
     // distinct from "the claim is false" (a proof error over a readable log).
     let log = supervisor
         .authoritative_event_log(&context_id)
-        .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
+        .map_err(|e| authoritative_log_unreachable("verification", &context_id, &e))?;
     let leaf_count = scp_event_log::tree::event_count(&log);
 
     match claim_type {
@@ -454,6 +463,96 @@ pub struct NapiCheckpoint {
     pub signature: String,
 }
 
+/// Builds the unsigned §9.9.3 checkpoint over the AUTHORITATIVE event log.
+///
+/// Shared by both checkpoint entry points so they cannot drift on WHICH log the
+/// signed commitment is taken over — the bridge entry points differ only in how
+/// they resolve key material.
+///
+/// # The commitment is taken over the AUTHORITATIVE log
+///
+/// The `(event_count, merkle_root)` pair comes from ONE
+/// `Supervisor::unsigned_authoritative_checkpoint` snapshot — the same single
+/// proof seam [`event_log_verify_on`] uses. This NEVER reads the per-context
+/// UCAN-state `EventLog` (`NapiContextRuntime::core.event_log`).
+///
+/// A checkpoint is signed, non-repudiable evidence: a peer that sees the same
+/// `event_count` with a different `merkle_root` raises `EquivocationDetected`
+/// against its signer (§9.9.3). Signing over the UCAN-state tree — whose leaves
+/// a caller shapes at will through ordinary `provenance_attach` /
+/// `media_session_start` / outlet calls — let ANY member mint validly-signed
+/// equivocation evidence against honest peers, and left honest members'
+/// checkpoints simply wrong about their own history (GitHub #1933).
+///
+/// # Errors
+///
+/// Returns [`codes::CTX_2138`] when the authoritative log is unreachable (the
+/// instance is suspended or shut down, no supervisor is attached, or the
+/// provider reports NO LOG for the context). FAILS CLOSED: no checkpoint is
+/// signed at all, because an absent checkpoint is an honest, detectable state
+/// while a signed fabricated commitment is not.
+fn unsigned_authoritative_checkpoint(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    sender_did: &scp_did::DID,
+    epoch: u64,
+) -> napi::Result<scp_event_log::checkpoint::UnsignedCheckpoint> {
+    // #1933 fail-closed gate, identical to `event_log_verify_on`. `check_ready`
+    // rejects BOTH suspended and shut-down instances (`supervisor()` only
+    // rejects suspended, and merely warns after shutdown — while a shut-down
+    // context's authoritative log has typically been destroyed).
+    bi.core
+        .check_ready()
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;
+    let supervisor = crate::runtime::supervisor(bi)
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;
+
+    // ONE authoritative snapshot: `event_count` and `merkle_root` are taken
+    // together so the SIGNED pair describes one tree state by construction.
+    supervisor
+        .unsigned_authoritative_checkpoint(
+            context_id,
+            sender_did,
+            Some(epoch),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))
+}
+
+/// Signs an unsigned checkpoint with retained key custody and maps it to the
+/// bridge record.
+///
+/// `generate_checkpoint`'s signing step is async — these sync NAPI functions run
+/// on a libuv worker thread (not inside tokio), so the stored runtime drives it.
+fn sign_checkpoint(
+    unsigned: scp_event_log::checkpoint::UnsignedCheckpoint,
+    custody: &crate::custody::NapiKeyCustody,
+    key: scp_platform::traits::KeyHandle,
+) -> napi::Result<NapiCheckpoint> {
+    let checkpoint = crate::runtime()
+        .block_on(async {
+            let signer = scp_core::event_log::KeyCustodySigner { custody, key: &key };
+            unsigned.sign_with(&signer).await
+        })
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("checkpoint generation failed: {e}"),
+                code: codes::CTX_2023.to_owned(),
+            })
+        })?;
+
+    #[allow(clippy::cast_precision_loss)]
+    Ok(NapiCheckpoint {
+        context_id: checkpoint.context_id,
+        sender_did: checkpoint.sender_did.0,
+        event_count: checkpoint.event_count as f64,
+        merkle_root: hex::encode(checkpoint.merkle_root),
+        epoch: checkpoint.epoch.map(|e| e as f64),
+        timestamp: checkpoint.timestamp as f64,
+        signature: hex::encode(checkpoint.signature),
+    })
+}
+
 /// Per-bridge-instance implementation of [`event_log_checkpoint`].
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
 pub(crate) fn event_log_checkpoint_on(
@@ -463,66 +562,30 @@ pub(crate) fn event_log_checkpoint_on(
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
     crate::napi_check_handle!(&bi.core, handle, identity);
-    {
-        crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
-        let custody = identity.inner.in_memory_custody.as_ref().ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Identity {
-                message: "event log checkpoint requires retained signing custody — this identity \
+    let custody = identity.inner.in_memory_custody.as_ref().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Identity {
+            message: "event log checkpoint requires retained signing custody — this identity \
                       has no retained custody (it was externally loaded)"
-                    .to_owned(),
-                code: codes::IDENT_1017.to_owned(),
-            })
-        })?;
-        let scp_id = identity.inner.scp_identity.as_ref().ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Identity {
-                message: "event log checkpoint requires retained identity state — the identity \
-                          was externally loaded"
-                    .to_owned(),
-                code: codes::IDENT_1007.to_owned(),
-            })
-        })?;
-
-        let context_id = handle.context_id();
-        let sender_did = scp_did::DID(identity.inner.did.clone());
-        let epoch_u64 = validate_non_negative_epoch(epoch)?;
-
-        let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
-            let signer = scp_core::event_log::KeyCustodySigner {
-                custody: custody.as_ref(),
-                key: &scp_id.active_signing_key,
-            };
-
-            // generate_checkpoint is async — this sync NAPI function runs on
-            // a libuv worker thread (not inside tokio), so we use the stored
-            // runtime to block_on the future.
-            crate::runtime().block_on(async {
-                scp_event_log::checkpoint::generate_checkpoint(
-                    &rt.core.event_log,
-                    &sender_did,
-                    epoch_u64,
-                    &signer,
-                )
-                .await
-                .map_err(|e| ScpNapiError::Context {
-                    message: format!("checkpoint generation failed: {e}"),
-                    code: codes::CTX_2023.to_owned(),
-                })
-            })
+                .to_owned(),
+            code: codes::IDENT_1017.to_owned(),
         })
-        .map_err(napi::Error::from)?;
-
-        #[allow(clippy::cast_precision_loss)]
-        Ok(NapiCheckpoint {
-            context_id: checkpoint.context_id,
-            sender_did: checkpoint.sender_did.0,
-            event_count: checkpoint.event_count as f64,
-            merkle_root: hex::encode(checkpoint.merkle_root),
-            epoch: checkpoint.epoch.map(|e| e as f64),
-            timestamp: checkpoint.timestamp as f64,
-            signature: hex::encode(checkpoint.signature),
+    })?;
+    let scp_id = identity.inner.scp_identity.as_ref().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Identity {
+            message: "event log checkpoint requires retained identity state — the identity \
+                      was externally loaded"
+                .to_owned(),
+            code: codes::IDENT_1007.to_owned(),
         })
-    }
+    })?;
+
+    let context_id = handle.context_id();
+    let sender_did = scp_did::DID(identity.inner.did.clone());
+    let epoch_u64 = validate_non_negative_epoch(epoch)?;
+
+    let unsigned = unsigned_authoritative_checkpoint(bi, &context_id, &sender_did, epoch_u64)?;
+    sign_checkpoint(unsigned, custody.as_ref(), scp_id.active_signing_key)
 }
 
 /// Per-bridge-instance implementation of [`event_log_checkpoint_by_did`].
@@ -534,54 +597,21 @@ pub(crate) fn event_log_checkpoint_by_did_on(
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
     crate::napi_check_handle!(&bi.core, handle);
-    {
-        crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
-        let (scp_id, custody) = crate::runtime::with_identity(bi, &did, |entry| {
-            Ok((
-                entry.identity.clone(),
-                std::sync::Arc::clone(&entry.custody),
-            ))
-        })
-        .map_err(napi::Error::from)?;
+    let (scp_id, custody) = crate::runtime::with_identity(bi, &did, |entry| {
+        Ok((
+            entry.identity.clone(),
+            std::sync::Arc::clone(&entry.custody),
+        ))
+    })
+    .map_err(napi::Error::from)?;
 
-        let context_id = handle.context_id();
-        let sender_did = scp_did::DID(did);
-        let epoch_u64 = validate_non_negative_epoch(epoch)?;
+    let context_id = handle.context_id();
+    let sender_did = scp_did::DID(did);
+    let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
-        let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
-            let signer = scp_core::event_log::KeyCustodySigner {
-                custody: custody.as_ref(),
-                key: &scp_id.active_signing_key,
-            };
-
-            crate::runtime().block_on(async {
-                scp_event_log::checkpoint::generate_checkpoint(
-                    &rt.core.event_log,
-                    &sender_did,
-                    epoch_u64,
-                    &signer,
-                )
-                .await
-                .map_err(|e| ScpNapiError::Context {
-                    message: format!("checkpoint generation failed: {e}"),
-                    code: codes::CTX_2023.to_owned(),
-                })
-            })
-        })
-        .map_err(napi::Error::from)?;
-
-        #[allow(clippy::cast_precision_loss)]
-        Ok(NapiCheckpoint {
-            context_id: checkpoint.context_id,
-            sender_did: checkpoint.sender_did.0,
-            event_count: checkpoint.event_count as f64,
-            merkle_root: hex::encode(checkpoint.merkle_root),
-            epoch: checkpoint.epoch.map(|e| e as f64),
-            timestamp: checkpoint.timestamp as f64,
-            signature: hex::encode(checkpoint.signature),
-        })
-    }
+    let unsigned = unsigned_authoritative_checkpoint(bi, &context_id, &sender_did, epoch_u64)?;
+    sign_checkpoint(unsigned, custody.as_ref(), scp_id.active_signing_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1116,176 @@ mod tests {
             assert!(
                 msg.contains(codes::CTX_2138),
                 "shutdown={shutdown}: expected SCP-CTX-2138, got: {msg}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // event_log_checkpoint — the SIGNED commitment covers the AUTHORITATIVE
+    // log only (GitHub #1933 follow-up)
+    //
+    // A `ConsistencyCheckpoint` is signed, non-repudiable evidence: a peer that
+    // sees the same `event_count` with a different `merkle_root` raises
+    // `EquivocationDetected` against its signer (§9.9.3). Signing over the
+    // caller-shapeable UCAN-state tree let ANY member mint validly-signed
+    // equivocation evidence against honest peers.
+    // -----------------------------------------------------------------------
+
+    /// A caller who shapes the UCAN-state tree must not be able to move the
+    /// signed commitment one bit. Fails pre-fix: `event_count`/`merkle_root`
+    /// were read straight off `rt.core.event_log`.
+    ///
+    /// A plain `#[test]`, not a `#[tokio::test]`: `event_log_checkpoint_on` is a
+    /// SYNC napi entry point that drives its async signing step through
+    /// `crate::runtime().block_on(...)`, which panics if the calling thread is
+    /// already driving a tokio runtime. The async setup runs through the same
+    /// stored runtime and completes before the checkpoint call.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn event_log_checkpoint_commits_to_the_authoritative_log_only() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let (identity, handle) = crate::runtime().block_on(async {
+            let identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let handle =
+                crate::context::context_create_on(&bi, &identity, verify_test_params_json())
+                    .await
+                    .expect("context_create should succeed");
+            (identity, handle)
+        });
+        let did = identity.did();
+        let context_id = handle.context_id();
+
+        let auth_log = authoritative_log(&bi, &context_id);
+        let auth_count = scp_event_log::tree::event_count(&auth_log);
+        let auth_root = scp_event_log::tree::root(&auth_log);
+
+        // Shape the UCAN-state tree away from the authoritative one: the
+        // authoritative prefix plus real caller-injected leaves.
+        crate::runtime::ensure_registered(&bi, &handle).expect("ucan state registered");
+        crate::runtime::with_context(&bi, &context_id, |rt| {
+            for leaf in auth_log.leaves() {
+                rt.core.event_log.push_leaf_raw(*leaf);
+            }
+            Ok(())
+        })
+        .expect("seed succeeds");
+        inject_local_leaf(&bi, &context_id, &did);
+        inject_local_leaf(&bi, &context_id, &did);
+
+        let local_root = crate::runtime::with_context(&bi, &context_id, |rt| {
+            Ok(scp_event_log::tree::root(&rt.core.event_log))
+        })
+        .unwrap();
+        assert_ne!(
+            local_root, auth_root,
+            "precondition: the caller has shaped the UCAN-state tree away from \
+             the authoritative one"
+        );
+
+        let checkpoint = event_log_checkpoint_on(&bi, &handle, &identity, 3.0)
+            .expect("checkpoint over a readable authoritative log");
+        #[allow(clippy::cast_precision_loss)]
+        {
+            assert!((checkpoint.event_count - auth_count as f64).abs() < f64::EPSILON);
+        }
+        assert_eq!(checkpoint.merkle_root, hex::encode(auth_root));
+        assert_ne!(
+            checkpoint.merkle_root,
+            hex::encode(local_root),
+            "a caller-shaped UCAN-state root must never reach a signed field"
+        );
+
+        // `event_log_checkpoint_by_did` commits identically — both public
+        // surfaces share one implementation.
+        let by_did = event_log_checkpoint_by_did_on(&bi, &handle, did, 3.0)
+            .expect("checkpoint_by_did over a readable authoritative log");
+        assert_eq!(by_did.merkle_root, hex::encode(auth_root));
+    }
+
+    /// An UNKNOWN authoritative log must yield NO checkpoint at all — pre-fix
+    /// the bridge signed a commitment over whatever the UCAN-state tree held.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_checkpoint_fails_closed_when_the_authoritative_log_is_unknown() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        // A synthetic handle: the context was never created through the
+        // supervisor, so the authoritative log is UNKNOWN.
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-unknown-log-checkpoint".to_owned(),
+            identity.did(),
+        );
+        crate::runtime::ensure_registered(&bi, &handle).expect("ucan state registered");
+        crate::runtime::with_context(&bi, &handle.context_id(), |rt| {
+            rt.core.event_log.push_leaf_raw([0xABu8; 32]);
+            Ok(())
+        })
+        .expect("seed succeeds");
+
+        let reason = match event_log_checkpoint_on(&bi, &handle, &identity, 0.0) {
+            Ok(cp) => panic!(
+                "an unknown authoritative log must not be signed over, got \
+                 event_count={} merkle_root={}",
+                cp.event_count, cp.merkle_root
+            ),
+            Err(err) => err.reason.clone(),
+        };
+        assert!(
+            reason.contains(codes::CTX_2138),
+            "expected SCP-CTX-2138, got: {reason}"
+        );
+    }
+
+    /// A shut-down or suspended instance is rejected the same way verification
+    /// is.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_checkpoint_fails_closed_after_shutdown_and_suspend() {
+        for shutdown in [false, true] {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+            let identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let handle =
+                crate::context::context_create_on(&bi, &identity, verify_test_params_json())
+                    .await
+                    .expect("context_create should succeed");
+
+            crate::runtime::ensure_registered(&bi, &handle).expect("ucan state registered");
+            crate::runtime::with_context(&bi, &handle.context_id(), |rt| {
+                rt.core.event_log.push_leaf_raw([0xABu8; 32]);
+                Ok(())
+            })
+            .expect("seed succeeds");
+
+            if shutdown {
+                bi.core.shutdown();
+            } else {
+                bi.core.suspend().expect("suspend");
+            }
+
+            let reason = match event_log_checkpoint_on(&bi, &handle, &identity, 0.0) {
+                Ok(cp) => panic!(
+                    "a not-ready instance (shutdown={shutdown}) must not sign a \
+                     checkpoint, got event_count={} merkle_root={}",
+                    cp.event_count, cp.merkle_root
+                ),
+                Err(err) => err.reason.clone(),
+            };
+            assert!(
+                reason.contains(codes::CTX_2138),
+                "shutdown={shutdown}: expected SCP-CTX-2138, got: {reason}"
             );
         }
     }

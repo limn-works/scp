@@ -305,16 +305,83 @@ fn no_pre_rotation_backend() -> ScpError {
 /// destroyed on actor shutdown or create-rollback reads exactly the same as one
 /// that never existed; an empty-but-live log is `Ok(Some(vec![]))`).
 ///
-/// Verification MUST NOT fall back to the UCAN-state tree here: an absence
-/// proof over a non-authoritative or unknown log is a forgeable FALSE NEGATIVE.
-fn authoritative_log_unreachable(context_id: &str, detail: &impl fmt::Display) -> ScpError {
+/// Neither verification nor checkpointing may fall back to the UCAN-state tree
+/// here: an absence proof over a non-authoritative or unknown log is a forgeable
+/// FALSE NEGATIVE, and a checkpoint over one is a validly-SIGNED false
+/// commitment.
+///
+/// `operation` names the refused operation ("verification" / "checkpointing") so
+/// the message identifies which surface failed closed.
+fn authoritative_log_unreachable(
+    operation: &str,
+    context_id: &str,
+    detail: &impl fmt::Display,
+) -> ScpError {
     ScpError::Context {
         msg: format!(
-            "event log verification cannot reach the authoritative log for context \
+            "event log {operation} cannot reach the authoritative log for context \
              '{context_id}': {detail}"
         ),
         code: codes::CTX_2138.to_owned(),
     }
+}
+
+/// Builds the unsigned §9.9.3 checkpoint over the AUTHORITATIVE event log.
+///
+/// Shared by both `UniFFI` checkpoint entry points so they cannot drift on WHICH
+/// log the signed commitment is taken over — the entry points differ only in how
+/// they resolve the recorded `sender_did`.
+///
+/// # The commitment is taken over the AUTHORITATIVE log
+///
+/// The `(event_count, merkle_root)` pair comes from ONE
+/// `Supervisor::unsigned_authoritative_checkpoint` snapshot — the same single
+/// proof seam `event_log_verify` uses. This NEVER reads the per-context
+/// UCAN-state `EventLog`.
+///
+/// A checkpoint is signed, non-repudiable evidence: a peer that sees the same
+/// `event_count` with a different `merkle_root` raises `EquivocationDetected`
+/// against its signer (§9.9.3). Signing over the UCAN-state tree — whose leaves
+/// a caller shapes at will through ordinary `provenance_attach` /
+/// `media_session_start` / outlet calls — let ANY member mint validly-signed
+/// equivocation evidence against honest peers, and left honest members'
+/// checkpoints simply wrong about their own history (GitHub #1933).
+///
+/// # Errors
+///
+/// Returns `SCP-CTX-2138` when the authoritative log is unreachable (the
+/// instance is suspended or shut down, no supervisor is attached, or the
+/// provider reports NO LOG for the context). FAILS CLOSED: no checkpoint is
+/// signed at all, because an absent checkpoint is an honest, detectable state
+/// while a signed fabricated commitment is not.
+fn unsigned_authoritative_checkpoint(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    context_id: &str,
+    sender_did: &scp_did::DID,
+    epoch: u64,
+) -> Result<scp_event_log::checkpoint::UnsignedCheckpoint, ScpError> {
+    // #1933 fail-closed gate, identical to `event_log_verify`. `check_ready`
+    // rejects BOTH suspended and shut-down instances
+    // (`context_manager_or_error` only rejects suspended, and merely warns after
+    // shutdown — while a shut-down context's authoritative log has typically
+    // been destroyed).
+    bi.core
+        .check_ready()
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;
+    let supervisor = bi
+        .context_manager_or_error()
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;
+
+    // ONE authoritative snapshot: `event_count` and `merkle_root` are taken
+    // together so the SIGNED pair describes one tree state by construction.
+    supervisor
+        .unsigned_authoritative_checkpoint(
+            context_id,
+            sender_did,
+            Some(epoch),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))
 }
 
 /// Selects the DHT client that key-rotation / agent-key / migration operations
@@ -5759,47 +5826,24 @@ async fn event_log_checkpoint_impl(
                     code: codes::IDENT_1007.to_owned(),
                 })?;
 
-            // Ensure UCAN state (which contains the event log) is registered
-            // on this bridge instance.
-            bi.ensure_ucan_registered(
-                &handle.context_id,
-                &handle.creator_did,
-                &handle.ceiling_strings,
-            );
-
             let sender_did = scp_did::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
 
-            let checkpoint = bi
-                .with_ucan_state(&context_id, |ucan_state| {
-                    let signer = scp_core::event_log::KeyCustodySigner {
-                        custody: &*custody,
-                        key: &core_id.active_signing_key,
-                    };
-                    // generate_checkpoint is async — use block_in_place to allow
-                    // blocking inside this spawned async task. block_in_place moves
-                    // the worker thread to blocking mode (requires multi-thread runtime).
-                    let handle = tokio::runtime::Handle::current();
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async {
-                            scp_event_log::checkpoint::generate_checkpoint(
-                                &ucan_state.event_log,
-                                &sender_did,
-                                epoch,
-                                &signer,
-                            )
-                            .await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("checkpoint generation failed: {e}"),
-                                code: codes::CTX_2027.to_owned(),
-                            })
-                        })
-                    })
-                })
-                .ok_or_else(|| ScpError::Context {
-                    msg: format!("context '{context_id}' not found in UCAN registry"),
+            // ONE authoritative snapshot — never the caller-shapeable
+            // UCAN-state tree (GitHub #1933).
+            let unsigned = unsigned_authoritative_checkpoint(&bi, &context_id, &sender_did, epoch)?;
+
+            let signer = scp_core::event_log::KeyCustodySigner {
+                custody: &*custody,
+                key: &core_id.active_signing_key,
+            };
+            let checkpoint = unsigned
+                .sign_with(&signer)
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("checkpoint generation failed: {e}"),
                     code: codes::CTX_2027.to_owned(),
-                })??;
+                })?;
 
             Ok(Checkpoint {
                 context_id: checkpoint.context_id,
@@ -5884,47 +5928,24 @@ async fn event_log_checkpoint_by_did_impl(
                     code: codes::IDENT_1007.to_owned(),
                 })?;
 
-            // Ensure UCAN state (which contains the event log) is registered
-            // on this bridge instance.
-            bi.ensure_ucan_registered(
-                &handle.context_id,
-                &handle.creator_did,
-                &handle.ceiling_strings,
-            );
-
             let sender_did = scp_did::DID(did);
             let context_id = handle.context_id.clone();
 
-            let checkpoint = bi
-                .with_ucan_state(&context_id, |ucan_state| {
-                    let signer = scp_core::event_log::KeyCustodySigner {
-                        custody: &*custody,
-                        key: &core_id.active_signing_key,
-                    };
-                    // generate_checkpoint is async — use block_in_place to allow
-                    // blocking inside this spawned async task. block_in_place moves
-                    // the worker thread to blocking mode (requires multi-thread runtime).
-                    let handle = tokio::runtime::Handle::current();
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async {
-                            scp_event_log::checkpoint::generate_checkpoint(
-                                &ucan_state.event_log,
-                                &sender_did,
-                                epoch,
-                                &signer,
-                            )
-                            .await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("checkpoint generation failed: {e}"),
-                                code: codes::CTX_2027.to_owned(),
-                            })
-                        })
-                    })
-                })
-                .ok_or_else(|| ScpError::Context {
-                    msg: format!("context '{context_id}' not found in UCAN registry"),
+            // ONE authoritative snapshot — never the caller-shapeable
+            // UCAN-state tree (GitHub #1933).
+            let unsigned = unsigned_authoritative_checkpoint(&bi, &context_id, &sender_did, epoch)?;
+
+            let signer = scp_core::event_log::KeyCustodySigner {
+                custody: &*custody,
+                key: &core_id.active_signing_key,
+            };
+            let checkpoint = unsigned
+                .sign_with(&signer)
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("checkpoint generation failed: {e}"),
                     code: codes::CTX_2027.to_owned(),
-                })??;
+                })?;
 
             Ok(Checkpoint {
                 context_id: checkpoint.context_id,
@@ -15216,10 +15237,10 @@ impl Scp {
                 // destroyed).
                 bi.core
                     .check_ready()
-                    .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
+                    .map_err(|e| authoritative_log_unreachable("verification", &context_id, &e))?;
                 let supervisor = bi
                     .context_manager_or_error()
-                    .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
+                    .map_err(|e| authoritative_log_unreachable("verification", &context_id, &e))?;
 
                 // The ONE authoritative snapshot every answer below is derived
                 // from. Its failure is the only "cannot answer" case
@@ -15227,7 +15248,7 @@ impl Scp {
                 // (a proof error over a readable log).
                 let log = supervisor
                     .authoritative_event_log(&context_id)
-                    .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
+                    .map_err(|e| authoritative_log_unreachable("verification", &context_id, &e))?;
                 let leaf_count = scp_event_log::tree::event_count(&log);
 
                 match claim_type {
@@ -21402,6 +21423,160 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // event_log_checkpoint — the SIGNED commitment covers the AUTHORITATIVE
+    // log only (GitHub #1933 follow-up)
+    //
+    // A `ConsistencyCheckpoint` is signed, non-repudiable evidence: a peer that
+    // sees the same `event_count` with a different `merkle_root` raises
+    // `EquivocationDetected` against its signer (§9.9.3). Signing over the
+    // caller-shapeable UCAN-state tree let ANY member mint validly-signed
+    // equivocation evidence against honest peers.
+    // -----------------------------------------------------------------------
+
+    /// A caller who shapes the UCAN-state tree must not be able to move the
+    /// signed commitment one bit. Fails pre-fix: `event_count`/`merkle_root`
+    /// were read straight off `ucan_state.event_log`.
+    #[tokio::test]
+    #[cfg(feature = "testing")]
+    async fn event_log_checkpoint_commits_to_the_authoritative_log_only() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create");
+        let bi = Arc::clone(&scp.inner);
+        let context_id = handle.context_id();
+        let did = identity.did();
+
+        let auth_log = authoritative_log(&bi, &context_id);
+        let auth_count = scp_event_log::tree::event_count(&auth_log);
+        let auth_root = scp_event_log::tree::root(&auth_log);
+
+        // Shape the UCAN-state tree away from the authoritative one through
+        // real public bridge calls plus the authoritative prefix.
+        bi.ensure_ucan_registered(&context_id, &handle.creator_did, &[]);
+        bi.with_ucan_state(&context_id, |st| {
+            for leaf in auth_log.leaves() {
+                st.event_log.push_leaf_raw(*leaf);
+            }
+        })
+        .expect("ucan state registered");
+        inject_local_leaf(&scp, &context_id, &did);
+        inject_local_leaf(&scp, &context_id, &did);
+
+        let local_root = bi
+            .with_ucan_state(&context_id, |st| scp_event_log::tree::root(&st.event_log))
+            .unwrap();
+        assert_ne!(
+            local_root, auth_root,
+            "precondition: the caller has shaped the UCAN-state tree away from \
+             the authoritative one"
+        );
+
+        let checkpoint = scp
+            .event_log_checkpoint(Arc::clone(&handle), Arc::clone(&identity), 3)
+            .await
+            .expect("checkpoint over a readable authoritative log");
+        assert_eq!(checkpoint.event_count, auth_count);
+        assert_eq!(checkpoint.merkle_root, hex::encode(auth_root));
+        assert_ne!(
+            checkpoint.merkle_root,
+            hex::encode(local_root),
+            "a caller-shaped UCAN-state root must never reach a signed field"
+        );
+
+        // `event_log_checkpoint_by_did` commits identically — both public
+        // surfaces share one implementation.
+        let by_did = scp
+            .event_log_checkpoint_by_did(handle, identity, did, 3)
+            .await
+            .expect("checkpoint_by_did over a readable authoritative log");
+        assert_eq!(by_did.event_count, auth_count);
+        assert_eq!(by_did.merkle_root, hex::encode(auth_root));
+    }
+
+    /// An UNKNOWN authoritative log must yield NO checkpoint at all — pre-fix
+    /// the bridge signed a commitment over whatever the UCAN-state tree held.
+    #[tokio::test]
+    #[cfg(feature = "testing")]
+    async fn event_log_checkpoint_fails_closed_when_the_authoritative_log_is_unknown() {
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        // A synthetic handle: the context was never created through the
+        // supervisor, so the authoritative log is UNKNOWN.
+        let handle = test_handle_for(&scp);
+        let bi = Arc::clone(&scp.inner);
+        let context_id = handle.context_id();
+
+        bi.ensure_ucan_registered(&context_id, &handle.creator_did, &[]);
+        bi.with_ucan_state(&context_id, |st| {
+            st.event_log.push_leaf_raw([0xABu8; 32]);
+        })
+        .expect("ucan state registered");
+
+        let err = scp
+            .event_log_checkpoint(handle, identity, 0)
+            .await
+            .expect_err("an unknown authoritative log must not be signed over");
+        match err {
+            ScpError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2138),
+            other => panic!("expected ScpError::Context SCP-CTX-2138, got {other:?}"),
+        }
+    }
+
+    /// A shut-down or suspended instance is rejected the same way verification
+    /// is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn event_log_checkpoint_fails_closed_after_shutdown_and_suspend() {
+        for shutdown in [false, true] {
+            let scp = scp_test();
+            let identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create");
+            let handle = scp
+                .context_create(Arc::clone(&identity), encrypted_join_test_params())
+                .await
+                .expect("context_create");
+            let bi = Arc::clone(&scp.inner);
+            let context_id = handle.context_id();
+
+            bi.ensure_ucan_registered(&context_id, &handle.creator_did, &[]);
+            bi.with_ucan_state(&context_id, |st| {
+                st.event_log.push_leaf_raw([0xABu8; 32]);
+            })
+            .expect("ucan state registered");
+
+            if shutdown {
+                bi.core.shutdown();
+            } else {
+                bi.core.suspend().expect("suspend");
+            }
+
+            let err = scp
+                .event_log_checkpoint(handle, identity, 0)
+                .await
+                .expect_err("a not-ready instance must not sign a checkpoint");
+            match err {
+                ScpError::Context { ref code, .. } => assert_eq!(
+                    code,
+                    codes::CTX_2138,
+                    "shutdown={shutdown} must fail closed with SCP-CTX-2138"
+                ),
+                other => panic!("expected ScpError::Context SCP-CTX-2138, got {other:?}"),
+            }
+        }
+    }
+
     /// `UniFFI` `outlet_invoke` must reject `None` `ucan_token` with a
     /// `Permission` error. Matches `PyO3`/NAPI behavior where the token
     /// is a required non-optional parameter. See issue #423.
@@ -24553,11 +24728,15 @@ mod tests {
             .await
             .expect("identity_create_with_custody");
 
-        // A synthetic handle stamped with this instance's id; the checkpoint
-        // impl registers fresh UCAN state (event log) for the context, so no
-        // full `context_create` is required. Custody comes from `identity`, not
-        // the handle.
-        let handle = test_handle_for(&scp);
+        // A REAL supervisor-created context: since the #1933 follow-up the
+        // commitment is taken over the authoritative event log, so a synthetic
+        // handle (whose authoritative log is UNKNOWN) correctly fails closed
+        // with SCP-CTX-2138 and would test nothing about custody. Custody still
+        // comes from `identity`, not the handle.
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create");
 
         let checkpoint = event_log_checkpoint_impl(Arc::clone(&scp.inner), handle, identity, 0u64)
             .await
@@ -24585,11 +24764,15 @@ mod tests {
             .await
             .expect("identity_create_with_custody");
 
-        // A synthetic handle stamped with this instance's id; the checkpoint
-        // impl registers fresh UCAN state (event log) for the context, so no
-        // full `context_create` is required. Custody comes from `identity`, not
-        // the handle.
-        let handle = test_handle_for(&scp);
+        // A REAL supervisor-created context: since the #1933 follow-up the
+        // commitment is taken over the authoritative event log, so a synthetic
+        // handle (whose authoritative log is UNKNOWN) correctly fails closed
+        // with SCP-CTX-2138 and would test nothing about custody. Custody still
+        // comes from `identity`, not the handle.
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create");
 
         // Pass the identity's own DID so the `did == identity.did` binding
         // (VALID_7000) is satisfied — the production happy path.
@@ -24636,7 +24819,14 @@ mod tests {
             .identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create");
-        let handle = test_handle_for(&scp);
+        // A REAL supervisor-created context: since the #1933 follow-up the
+        // commitment is taken over the authoritative event log, so the happy
+        // path below needs a context whose authoritative log exists. (The
+        // mismatch arm is rejected before any log is touched.)
+        let handle = scp
+            .context_create(Arc::clone(&identity), encrypted_join_test_params())
+            .await
+            .expect("context_create");
 
         // Mismatch: a different, syntactically valid DID is rejected because it
         // does not match the signing identity's DID.

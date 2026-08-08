@@ -535,12 +535,21 @@ fn parse_event_query_filter(
 /// destroyed on actor shutdown or create-rollback reads exactly the same as one
 /// that never existed; an empty-but-live log is `Ok(Some(vec![]))`).
 ///
-/// Verification MUST NOT fall back to any bridge-local tree here: an absence
-/// proof over a non-authoritative or unknown log is a forgeable FALSE NEGATIVE.
-fn authoritative_log_unreachable(context_id: &str, detail: &impl std::fmt::Display) -> ScpPyError {
+/// Neither verification nor checkpointing may fall back to any bridge-local tree
+/// here: an absence proof over a non-authoritative or unknown log is a forgeable
+/// FALSE NEGATIVE, and a checkpoint over one is a validly-SIGNED false
+/// commitment.
+///
+/// `operation` names the refused operation ("verification" / "checkpointing") so
+/// the message identifies which surface failed closed.
+fn authoritative_log_unreachable(
+    operation: &str,
+    context_id: &str,
+    detail: &impl std::fmt::Display,
+) -> ScpPyError {
     ScpPyError::ContextError {
         message: format!(
-            "event log verification cannot reach the authoritative log for context \
+            "event log {operation} cannot reach the authoritative log for context \
              '{context_id}': {detail}"
         ),
         code: codes::CTX_2138.to_owned(),
@@ -621,16 +630,16 @@ fn event_log_verify_impl(
     // typically been destroyed).
     bi.core
         .check_ready()
-        .map_err(|e| authoritative_log_unreachable(context_id, &e))?;
+        .map_err(|e| authoritative_log_unreachable("verification", context_id, &e))?;
     let supervisor = crate::runtime::supervisor(bi)
-        .map_err(|e| authoritative_log_unreachable(context_id, &e))?;
+        .map_err(|e| authoritative_log_unreachable("verification", context_id, &e))?;
 
     // The ONE authoritative snapshot every answer below is derived from. Its
     // failure is the only "cannot answer" case (CTX-2138), which keeps it
     // distinct from "the claim is false" (a proof error over a readable log).
     let log = supervisor
         .authoritative_event_log(context_id)
-        .map_err(|e| authoritative_log_unreachable(context_id, &e))?;
+        .map_err(|e| authoritative_log_unreachable("verification", context_id, &e))?;
     let leaf_count = scp_event_log::tree::event_count(&log);
 
     match claim_type {
@@ -746,6 +755,21 @@ fn event_log_verify_impl(
 /// enable equivocation detection: members exchange signed Merkle roots and
 /// compare them to detect relay misbehavior.
 ///
+/// # The commitment is taken over the AUTHORITATIVE log
+///
+/// The `(event_count, merkle_root)` pair comes from ONE
+/// `Supervisor::unsigned_authoritative_checkpoint` snapshot — the same single
+/// proof seam [`event_log_verify`](PyScp::event_log_verify) uses. This function
+/// NEVER reads the bridge-local `FfiBridgeState::event_log`.
+///
+/// A checkpoint is signed, non-repudiable evidence: a peer that sees the same
+/// `event_count` with a different `merkle_root` raises `EquivocationDetected`
+/// against its signer (§9.9.3). Signing over the bridge-local tree — whose
+/// leaves a caller shapes at will through ordinary `provenance_attach` /
+/// `media_session_start` / outlet calls — let ANY member mint validly-signed
+/// equivocation evidence against honest peers, and left honest members'
+/// checkpoints simply wrong about their own history (GitHub #1933).
+///
 /// # Arguments
 ///
 /// * `context_id` -- The ID of the context whose event log to checkpoint.
@@ -759,9 +783,12 @@ fn event_log_verify_impl(
 ///
 /// # Errors
 ///
-/// Raises `ContextError` if the context is not connected to the runtime
-/// or if signing fails. Raises `IdentityError` if the identity is not
-/// found in the registry.
+/// Raises `ContextError` with `SCP-CTX-2138` when the authoritative log is
+/// unreachable (instance not ready, no supervisor, or no log for the context) —
+/// FAIL CLOSED: no checkpoint is signed at all, because an absent checkpoint is
+/// an honest, detectable state while a signed fabricated commitment is not.
+/// Raises `ContextError` if signing fails, and `IdentityError` if the identity
+/// is not found in the registry.
 ///
 /// See ADR-011 acceptance criterion 8 and ADR-030.
 ///
@@ -781,29 +808,39 @@ fn event_log_checkpoint_impl(
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
 
-    let context_id_owned = context_id.to_owned();
     let did_owned = did.to_owned();
-
     let sender_did = scp_did::DID(did_owned.clone());
 
-    let checkpoint = crate::runtime::with_identity(bi, &did_owned, |entry| {
-        crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {
-            let result = rt.block_on(async {
-                let signer = scp_core::event_log::KeyCustodySigner {
-                    custody: entry.custody.as_ref(),
-                    key: &entry.identity.active_signing_key,
-                };
-                scp_event_log::checkpoint::generate_checkpoint(
-                    &ctx_rt.event_log,
-                    &sender_did,
-                    epoch,
-                    &signer,
-                )
-                .await
-            });
+    // #1933 fail-closed gate, identical to `event_log_verify`. `check_ready`
+    // rejects BOTH suspended and shut-down instances (`supervisor()` only
+    // rejects suspended, and merely warns after shutdown — while a shut-down
+    // context's authoritative log has typically been destroyed).
+    bi.core
+        .check_ready()
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;
+    let supervisor = crate::runtime::supervisor(bi)
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;
 
-            result.map_err(|e| ScpPyError::context(format!("checkpoint generation failed: {e}")))
+    // ONE authoritative snapshot: `event_count` and `merkle_root` are taken
+    // together so the SIGNED pair describes one tree state by construction.
+    let unsigned = supervisor
+        .unsigned_authoritative_checkpoint(
+            context_id,
+            &sender_did,
+            Some(epoch),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;
+
+    let checkpoint = crate::runtime::with_identity(bi, &did_owned, |entry| {
+        rt.block_on(async {
+            let signer = scp_core::event_log::KeyCustodySigner {
+                custody: entry.custody.as_ref(),
+                key: &entry.identity.active_signing_key,
+            };
+            unsigned.sign_with(&signer).await
         })
+        .map_err(|e| ScpPyError::context(format!("checkpoint generation failed: {e}")))
     })?;
 
     Ok(PyCheckpoint {
