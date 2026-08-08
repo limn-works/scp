@@ -19,6 +19,8 @@
 //! # Types
 //!
 //! - [`ConsistencyCheckpoint`] -- A signed snapshot of the event log state.
+//! - [`UnsignedCheckpoint`] -- The single derivation of the §9.9.3 checkpoint
+//!   fields + canonical hash from ONE event-log snapshot, before signing.
 //! - [`CheckpointComparison`] -- The result of comparing a remote checkpoint
 //!   against local state.
 //! - [`CheckpointScheduler`] -- Tracks when the next checkpoint should be
@@ -89,6 +91,165 @@ pub struct ConsistencyCheckpoint {
     /// (excluding the signature itself).
     #[serde(with = "serde_bytes")]
     pub signature: Ed25519Signature,
+}
+
+// ---------------------------------------------------------------------------
+// UnsignedCheckpoint
+// ---------------------------------------------------------------------------
+
+/// The §9.9.3 checkpoint fields derived from ONE event-log snapshot, together
+/// with the canonical hash a signature must cover.
+///
+/// # Why this exists
+///
+/// A [`ConsistencyCheckpoint`] is signed, non-repudiable evidence: peers that
+/// see the same `event_count` with a different `merkle_root` raise
+/// `EquivocationDetected` against its signer (§9.9.3). Two properties therefore
+/// have to hold by construction, not by convention:
+///
+/// 1. **`event_count` and `merkle_root` describe the SAME tree state.** Reading
+///    the count and the root through two separate provider calls lets a
+///    concurrent append fall between them, producing a *signed* pair that
+///    describes no tree that ever existed — a spurious equivocation alarm as a
+///    pure race. This type takes both from one `&EventLog` snapshot.
+/// 2. **There is ONE canonical-hash computation.** Callers sign with different
+///    key plumbing — the actor holds a raw `ed25519_dalek::SigningKey`, the FFI
+///    bridges hold an async [`EventLogSigner`] over platform key custody — but a
+///    second hand-rolled field-derivation is a divergence risk in signed
+///    evidence, not a convenience. Deriving the fields is separated from
+///    attaching the signature so every signer shares this one derivation.
+///
+/// Construct with [`UnsignedCheckpoint::over_log`], then attach a signature with
+/// [`UnsignedCheckpoint::sign_with`] (async signer) or
+/// [`UnsignedCheckpoint::into_signed`] (a signature produced by other means).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsignedCheckpoint {
+    context_id: ContextId,
+    sender_did: DID,
+    event_count: u64,
+    merkle_root: [u8; 32],
+    epoch: Option<u64>,
+    timestamp: u64,
+    canonical_hash: Vec<u8>,
+}
+
+impl UnsignedCheckpoint {
+    /// Derives the checkpoint fields from ONE `log` snapshot.
+    ///
+    /// `context_id` is supplied explicitly rather than read from
+    /// [`EventLog::context_id`] because a checkpoint's `context_id` is the
+    /// caller-facing context identifier, while a replayed proof snapshot names
+    /// itself by the hex of the context's 32-byte digest. Both agree for real
+    /// 64-hex context ids; passing it explicitly keeps the signed field equal to
+    /// the identifier peers compare against, whichever snapshot it was taken
+    /// over.
+    ///
+    /// `epoch` is `Some(mls_epoch)` for MLS-encrypted contexts and `None` for
+    /// Broadcast contexts, which do not use MLS and have no meaningful epoch.
+    #[must_use]
+    pub fn over_log(
+        log: &EventLog,
+        context_id: &str,
+        sender_did: &DID,
+        epoch: Option<u64>,
+        timestamp: u64,
+    ) -> Self {
+        // ONE snapshot in, both commitment fields out — see the type docs.
+        let event_count = tree::event_count(log);
+        let merkle_root = tree::root(log);
+        Self::over_commitment(
+            context_id,
+            sender_did,
+            event_count,
+            merkle_root,
+            epoch,
+            timestamp,
+        )
+    }
+
+    /// Derives the checkpoint fields from an already-taken `(event_count,
+    /// merkle_root)` commitment.
+    ///
+    /// Prefer [`over_log`](Self::over_log), which takes the pair from one
+    /// snapshot for you. This entry point exists for callers that hold the pair
+    /// directly; it is their responsibility that both values come from the same
+    /// tree state.
+    #[must_use]
+    pub fn over_commitment(
+        context_id: &str,
+        sender_did: &DID,
+        event_count: u64,
+        merkle_root: [u8; 32],
+        epoch: Option<u64>,
+        timestamp: u64,
+    ) -> Self {
+        let canonical_hash = compute_checkpoint_canonical_hash(
+            context_id,
+            sender_did.as_ref(),
+            event_count,
+            &merkle_root,
+            epoch,
+            timestamp,
+        );
+        Self {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.clone(),
+            event_count,
+            merkle_root,
+            epoch,
+            timestamp,
+            canonical_hash,
+        }
+    }
+
+    /// The canonical hash a signature must cover.
+    #[must_use]
+    pub fn canonical_hash(&self) -> &[u8] {
+        &self.canonical_hash
+    }
+
+    /// The number of events the snapshot committed to.
+    #[must_use]
+    pub const fn event_count(&self) -> u64 {
+        self.event_count
+    }
+
+    /// The Merkle root the snapshot committed to.
+    #[must_use]
+    pub const fn merkle_root(&self) -> &[u8; 32] {
+        &self.merkle_root
+    }
+
+    /// Attaches a signature produced over [`canonical_hash`](Self::canonical_hash).
+    #[must_use]
+    pub fn into_signed(self, signature: Ed25519Signature) -> ConsistencyCheckpoint {
+        ConsistencyCheckpoint {
+            context_id: self.context_id,
+            sender_did: self.sender_did,
+            event_count: self.event_count,
+            merkle_root: self.merkle_root,
+            epoch: self.epoch,
+            timestamp: self.timestamp,
+            signature,
+        }
+    }
+
+    /// Signs the canonical hash with `signer` and returns the finished
+    /// checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventLogError::SigningFailed`] if the signing operation fails.
+    pub async fn sign_with(
+        self,
+        signer: &(impl EventLogSigner + ?Sized),
+    ) -> Result<ConsistencyCheckpoint, EventLogError> {
+        let signature = signer
+            .sign(&self.canonical_hash)
+            .await
+            .map_err(EventLogError::SigningFailed)?;
+        Ok(self.into_signed(signature))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -963,6 +1124,10 @@ pub fn compare_checkpoint(
 ///
 /// Used by [`CheckpointManager`] to create checkpoints with a controlled
 /// timestamp (important for deterministic testing).
+///
+/// Derives its fields through [`UnsignedCheckpoint::over_log`] — the single
+/// §9.9.3 field-derivation + canonical-hash computation shared with every other
+/// checkpoint producer in the workspace.
 async fn generate_checkpoint_at(
     log: &EventLog,
     sender_did: &DID,
@@ -970,33 +1135,9 @@ async fn generate_checkpoint_at(
     timestamp: u64,
     signer: &(impl EventLogSigner + ?Sized),
 ) -> Result<ConsistencyCheckpoint, EventLogError> {
-    let context_id = log.context_id().to_owned();
-    let event_count = tree::event_count(log);
-    let merkle_root = tree::root(log);
-
-    let canonical_hash = compute_checkpoint_canonical_hash(
-        &context_id,
-        sender_did,
-        event_count,
-        &merkle_root,
-        Some(epoch),
-        timestamp,
-    );
-
-    let signature = signer
-        .sign(&canonical_hash)
+    UnsignedCheckpoint::over_log(log, log.context_id(), sender_did, Some(epoch), timestamp)
+        .sign_with(signer)
         .await
-        .map_err(EventLogError::SigningFailed)?;
-
-    Ok(ConsistencyCheckpoint {
-        context_id,
-        sender_did: sender_did.clone(),
-        event_count,
-        merkle_root,
-        epoch: Some(epoch),
-        timestamp,
-        signature,
-    })
 }
 
 /// Builds a Merkle proof path from a leaf to the root using pre-computed

@@ -569,6 +569,13 @@ pub fn velocity_for_test(state: &PerContextState, member_did: &DID, now_secs: u6
 /// whether the event/time thresholds have been reached. Takes per-field
 /// references so callers may pass disjoint sub-borrows of the unified
 /// [`PerContextState`] (ADR-049 §Decision 1).
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the authoritative log is
+/// unreachable — see [`build_checkpoint`]. The checkpoint counters are left
+/// UNTOUCHED on that path, so the next attempt is still due; nothing is signed
+/// and nothing is retained.
 #[allow(clippy::too_many_arguments)]
 pub fn force_create_checkpoint_fields(
     context_id: &str,
@@ -581,7 +588,7 @@ pub fn force_create_checkpoint_fields(
     signing_key: &ed25519_dalek::SigningKey,
     now: u64,
     event_log: &dyn ContextEventLogProvider,
-) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
     let cp = build_checkpoint(
         context_id,
         broadcast_context_is_none,
@@ -590,7 +597,7 @@ pub fn force_create_checkpoint_fields(
         signing_key,
         now,
         event_log,
-    );
+    )?;
 
     *checkpoint_events_since = 0;
     *checkpoint_last_time_secs = now;
@@ -606,7 +613,7 @@ pub fn force_create_checkpoint_fields(
         "forced final checkpoint on context close (§9.9.3)"
     );
 
-    cp
+    Ok(cp)
 }
 
 /// Unconditionally creates a consistency checkpoint via a [`ClassCMut`] view,
@@ -619,6 +626,12 @@ pub fn force_create_checkpoint_fields(
 /// the actor handler drive this with no whole `&mut PerContextState`.
 /// `broadcast_context_is_none` and `mls_epoch` are read by the caller from the
 /// view (their borrows released) before this call. Returns the built checkpoint.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the authoritative log is
+/// unreachable — see [`build_checkpoint`]. The view's checkpoint fields are left
+/// UNTOUCHED on that path: nothing is signed and nothing is retained.
 #[allow(clippy::too_many_arguments)]
 pub fn force_create_checkpoint_view(
     view: &mut ClassCMut,
@@ -629,7 +642,7 @@ pub fn force_create_checkpoint_view(
     signing_key: &ed25519_dalek::SigningKey,
     now: u64,
     event_log: &dyn ContextEventLogProvider,
-) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
     let cp = build_checkpoint(
         context_id,
         broadcast_context_is_none,
@@ -638,7 +651,7 @@ pub fn force_create_checkpoint_view(
         signing_key,
         now,
         event_log,
-    );
+    )?;
 
     // Sequential per-field view accessors: each `&mut` borrow ends before the
     // next, so no whole `&mut PerContextState` (nor a 3-field simultaneous
@@ -659,7 +672,7 @@ pub fn force_create_checkpoint_view(
         "forced final checkpoint on context close (§9.9.3)"
     );
 
-    cp
+    Ok(cp)
 }
 
 /// Creates a consistency checkpoint when due (§9.9.3 thresholds) via a
@@ -675,6 +688,14 @@ pub fn force_create_checkpoint_view(
 /// a 3-field simultaneous borrow). `broadcast_context_is_none` and `mls_epoch`
 /// are read by the caller from the view (their borrows released) before this
 /// call. Returns the built checkpoint when one was due, else `None`.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when a checkpoint was due but the
+/// authoritative log is unreachable — see [`build_checkpoint`]. The view's
+/// checkpoint fields are left UNTOUCHED on that path, so the checkpoint stays
+/// due and is retried on the next send rather than being silently skipped with
+/// the counters reset.
 #[allow(clippy::too_many_arguments)]
 pub fn create_checkpoint_if_due_view(
     view: &mut ClassCMut,
@@ -685,7 +706,7 @@ pub fn create_checkpoint_if_due_view(
     signing_key: &ed25519_dalek::SigningKey,
     now: u64,
     event_log: &dyn ContextEventLogProvider,
-) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+) -> Result<Option<scp_event_log::checkpoint::ConsistencyCheckpoint>, ContextError> {
     let events_since = *view.checkpoint_events_since_mut();
     let last_time = *view.checkpoint_last_time_secs_mut();
     let events_due = events_since >= 50;
@@ -694,7 +715,7 @@ pub fn create_checkpoint_if_due_view(
     let time_due = events_since > 0 && now.saturating_sub(last_time) >= 600;
 
     if !events_due && !time_due {
-        return None;
+        return Ok(None);
     }
 
     let cp = build_checkpoint(
@@ -705,7 +726,7 @@ pub fn create_checkpoint_if_due_view(
         signing_key,
         now,
         event_log,
-    );
+    )?;
 
     // Sequential per-field view accessors: each `&mut` borrow ends before the
     // next, so no whole `&mut PerContextState` (nor a 3-field simultaneous
@@ -726,11 +747,42 @@ pub fn create_checkpoint_if_due_view(
         "consistency checkpoint created (§9.9.3)"
     );
 
-    Some(cp)
+    Ok(Some(cp))
 }
 
-/// Builds a signed checkpoint from the current event log. Pure function
-/// over the field slice the §9.9.3 canonical-hash inputs require.
+/// Builds a signed checkpoint over the AUTHORITATIVE event log.
+///
+/// # Security (GitHub #1933 follow-up)
+///
+/// A checkpoint is signed, non-repudiable evidence: peers that see the same
+/// `event_count` with a different `merkle_root` raise
+/// [`ContextEvent::EquivocationDetected`] against its signer (§9.9.3). Two
+/// properties are therefore established by construction here:
+///
+/// - **ONE snapshot.** `event_count` and `merkle_root` both come from a single
+///   [`ContextEventLogProvider::rebuild_event_log_for_proof`] snapshot — the
+///   same single proof seam `event_log_verify` uses. Reading the root and the
+///   count through two separate provider calls let a concurrent `append_event`
+///   fall between them, so a *signed* pair could describe a tree state that
+///   never existed — a spurious equivocation alarm as a pure race.
+/// - **FAILS CLOSED.** An unreachable log yields an error, never a checkpoint.
+///   The previous `unwrap_or([0u8; 32])` / `map_or(0, …)` defaults signed a
+///   FABRICATED commitment: `[0u8; 32]` is not the empty-tree root (§25.8
+///   Vector 15 is `SHA-256("")`), and an erroring root paired with a readable
+///   count produced an all-zero root beside a real event count. Both are the
+///   "provider `None` means UNKNOWN, never empty" rule that #1933 established,
+///   violated on the one path whose output carries a signature.
+///
+/// The §9.9.3 field derivation and canonical hash come from
+/// [`scp_event_log::checkpoint::UnsignedCheckpoint`], shared with every other
+/// checkpoint producer in the workspace, so there is no second implementation
+/// of the signed structure to drift.
+///
+/// # Errors
+///
+/// Returns [`ContextError::EventLogFailed`] when the authoritative log is
+/// unreachable for the context (never initialised, or destroyed on actor
+/// shutdown / create-rollback) or its replayed events break the hash chain.
 fn build_checkpoint(
     context_id: &str,
     broadcast_context_is_none: bool,
@@ -739,16 +791,9 @@ fn build_checkpoint(
     signing_key: &ed25519_dalek::SigningKey,
     now: u64,
     event_log: &dyn ContextEventLogProvider,
-) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
     let context_id_bytes = state::context_id_to_bytes(context_id);
-    let merkle_root = event_log
-        .event_log_merkle_root(&context_id_bytes)
-        .unwrap_or([0u8; 32]);
-    let event_count = event_log
-        .event_log_entries(&context_id_bytes)
-        .ok()
-        .flatten()
-        .map_or(0, |entries| entries.len() as u64);
+    let log = event_log.rebuild_event_log_for_proof(&context_id_bytes)?;
 
     // Encrypted contexts (no broadcast_context) use MLS epochs; broadcast
     // contexts do not use MLS and have no meaningful epoch.
@@ -758,26 +803,11 @@ fn build_checkpoint(
         None
     };
 
-    let canonical_hash = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
-        context_id,
-        sender_did.as_ref(),
-        event_count,
-        &merkle_root,
-        epoch,
-        now,
+    let unsigned = scp_event_log::checkpoint::UnsignedCheckpoint::over_log(
+        &log, context_id, sender_did, epoch, now,
     );
-
-    let signature = ed25519_dalek::Signer::sign(signing_key, &canonical_hash);
-
-    scp_event_log::checkpoint::ConsistencyCheckpoint {
-        context_id: context_id.to_owned(),
-        sender_did: sender_did.clone(),
-        event_count,
-        merkle_root,
-        epoch,
-        timestamp: now,
-        signature: signature.to_bytes().to_vec(),
-    }
+    let signature = ed25519_dalek::Signer::sign(signing_key, unsigned.canonical_hash());
+    Ok(unsigned.into_signed(signature.to_bytes().to_vec()))
 }
 
 /// Fail-closed authenticity gate for a remote checkpoint: the sender must
@@ -1487,6 +1517,320 @@ mod equivocation_dedup_tests {
         assert_eq!(
             seen_len_after, cap,
             "the set must stay capped — the over-cap divergence is emitted but not inserted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_authoritative_source_tests {
+    //! A [`ConsistencyCheckpoint`](scp_event_log::checkpoint::ConsistencyCheckpoint)
+    //! is signed, non-repudiable evidence: peers that see the same
+    //! `event_count` with a different `merkle_root` raise
+    //! `EquivocationDetected` against its signer (§9.9.3). These tests pin the
+    //! two properties [`build_checkpoint`] must establish by construction —
+    //! both were violated before the #1933 follow-up:
+    //!
+    //! 1. The `(event_count, merkle_root)` pair comes from ONE authoritative
+    //!    snapshot. It used to be read through two independent provider calls
+    //!    (`event_log_merkle_root` and `event_log_entries`), so the two halves
+    //!    of a SIGNED commitment could describe different tree states.
+    //! 2. An unreachable log yields an error, never a checkpoint. It used to
+    //!    fall back to `unwrap_or([0u8; 32])` / `map_or(0, …)` — a fabricated
+    //!    commitment (`[0u8; 32]` is not the empty-tree root, which is
+    //!    `SHA-256("")` per §25.8 Vector 15) carrying a real signature.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use scp_did::DID;
+    use scp_protocol::context::ContextError;
+
+    use super::{build_checkpoint, force_create_checkpoint_fields};
+    use crate::context::builder::ContextEventLogProvider;
+    use crate::context::providers::event_log::MerkleEventLogProvider;
+
+    /// A 64-hex context id, so `context_id_to_bytes` is the identity decode and
+    /// the provider key is exactly these bytes.
+    const CTX_HEX: &str = "aa00000000000000000000000000000000000000000000000000000000000011";
+
+    fn ctx_bytes() -> [u8; 32] {
+        crate::context::state::context_id_to_bytes(CTX_HEX)
+    }
+
+    fn signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Seeds an honest provider with `n` chained lifecycle events.
+    async fn honest_provider(n: u64) -> MerkleEventLogProvider {
+        let provider = MerkleEventLogProvider::new();
+        let id = ctx_bytes();
+        provider.init_event_log(&id).await.unwrap();
+        for i in 0..n {
+            let event_type = if i == 0 {
+                scp_event_log::EventType::ContextCreated
+            } else {
+                scp_event_log::EventType::MemberJoined
+            };
+            provider
+                .append_event(
+                    &id,
+                    event_type,
+                    "did:example:actor",
+                    scp_event_log::EventPayload::default(),
+                    1_700_000_000 + i,
+                )
+                .await
+                .unwrap();
+        }
+        provider
+    }
+
+    /// Wraps an honest provider but answers the standalone `event_log_merkle_root`
+    /// accessor with `root_answer`. Models the real hazard the two-call read
+    /// had: the root accessor and the entries accessor are separate reads that
+    /// can disagree — under a concurrent `append_event` benignly, under a
+    /// hostile or buggy provider arbitrarily.
+    struct DisagreeingRootProvider {
+        inner: MerkleEventLogProvider,
+        root_answer: Result<[u8; 32], ContextError>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for DisagreeingRootProvider {
+        async fn init_event_log(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.inner.init_event_log(id).await
+        }
+
+        async fn append_event(
+            &self,
+            id: &[u8; 32],
+            event: scp_event_log::EventType,
+            actor: &str,
+            payload: scp_event_log::EventPayload,
+            timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.inner
+                .append_event(id, event, actor, payload, timestamp_secs)
+                .await
+        }
+
+        async fn destroy_event_log(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.inner.destroy_event_log(id).await
+        }
+
+        fn event_log_entries(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            self.inner.event_log_entries(id)
+        }
+
+        fn event_log_merkle_root(&self, _id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
+            match &self.root_answer {
+                Ok(root) => Ok(*root),
+                Err(e) => Err(ContextError::EventLogFailed(e.to_string())),
+            }
+        }
+    }
+
+    /// A provider that reports NO LOG for the context — `Ok(None)` means
+    /// UNKNOWN (never initialised, or destroyed on actor shutdown /
+    /// create-rollback), never "empty".
+    struct UnknownLogProvider;
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for UnknownLogProvider {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            Ok(None)
+        }
+
+        /// The old code path's other half: a root accessor that cheerfully
+        /// answers even though the log is unknown. Together with the entries
+        /// `None` this is exactly the `(0, [0u8; 32])` fabrication.
+        fn event_log_merkle_root(&self, _id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
+            Ok([0u8; 32])
+        }
+    }
+
+    /// The signed commitment must come from the ONE authoritative snapshot, not
+    /// from the standalone root accessor. Fails against the pre-fix code, which
+    /// signed the accessor's answer (here `[0xAA; 32]`) beside a count read from
+    /// a *different* call.
+    #[tokio::test]
+    async fn signed_commitment_comes_from_one_snapshot_not_the_root_accessor() {
+        let honest = honest_provider(3).await;
+        let truthful_root = honest.event_log_merkle_root(&ctx_bytes()).unwrap();
+        let provider = DisagreeingRootProvider {
+            inner: honest,
+            root_answer: Ok([0xAAu8; 32]),
+        };
+
+        let cp = build_checkpoint(
+            CTX_HEX,
+            true,
+            9,
+            &DID("did:example:signer".to_owned()),
+            &signing_key(),
+            1_700_000_100,
+            &provider,
+        )
+        .expect("a readable authoritative log builds a checkpoint");
+
+        assert_eq!(
+            cp.merkle_root, truthful_root,
+            "the signed root must be the replayed snapshot's root, never the \
+             standalone accessor's answer"
+        );
+        assert_ne!(
+            cp.merkle_root, [0xAAu8; 32],
+            "the disagreeing accessor answer must not reach a signed field"
+        );
+        assert_eq!(cp.event_count, 3);
+        assert_eq!(cp.epoch, Some(9));
+        scp_event_log::checkpoint::verify_checkpoint_signature(&cp, &signing_key().verifying_key())
+            .expect("the checkpoint signature must verify over its own fields");
+    }
+
+    /// The specific pre-fix defect: a readable entries list beside an ERRORING
+    /// root accessor signed an all-zero root next to a real event count.
+    #[tokio::test]
+    async fn an_erroring_root_accessor_never_yields_a_signed_all_zero_root() {
+        let honest = honest_provider(4).await;
+        let truthful_root = honest.event_log_merkle_root(&ctx_bytes()).unwrap();
+        let provider = DisagreeingRootProvider {
+            inner: honest,
+            root_answer: Err(ContextError::EventLogFailed("accessor down".into())),
+        };
+
+        let cp = build_checkpoint(
+            CTX_HEX,
+            true,
+            1,
+            &DID("did:example:signer".to_owned()),
+            &signing_key(),
+            1_700_000_200,
+            &provider,
+        )
+        .expect("the snapshot is readable even when the root accessor is not");
+
+        assert_eq!(cp.event_count, 4);
+        assert_eq!(cp.merkle_root, truthful_root);
+        assert_ne!(
+            cp.merkle_root, [0u8; 32],
+            "an all-zero root is a FABRICATED sentinel, not the empty-tree root"
+        );
+    }
+
+    /// An UNKNOWN authoritative log must produce no checkpoint at all. Fails
+    /// against the pre-fix code, which returned a signed `(0, [0u8; 32])`.
+    #[tokio::test]
+    async fn a_checkpoint_over_an_unknown_log_is_never_signed() {
+        let err = build_checkpoint(
+            CTX_HEX,
+            true,
+            0,
+            &DID("did:example:signer".to_owned()),
+            &signing_key(),
+            1_700_000_300,
+            &UnknownLogProvider,
+        )
+        .expect_err("an unknown authoritative log must not be signed over");
+        assert!(
+            matches!(err, ContextError::EventLogFailed(_)),
+            "expected EventLogFailed, got: {err}"
+        );
+    }
+
+    /// An EMPTY-but-live log is a distinct, honest state: it snapshots to a real
+    /// zero-leaf tree whose root is `SHA-256("")`, NOT the `[0u8; 32]` sentinel
+    /// the old fallback fabricated.
+    #[tokio::test]
+    async fn an_empty_but_live_log_signs_the_real_zero_leaf_root() {
+        let provider = honest_provider(0).await;
+
+        let cp = build_checkpoint(
+            CTX_HEX,
+            true,
+            0,
+            &DID("did:example:signer".to_owned()),
+            &signing_key(),
+            1_700_000_400,
+            &provider,
+        )
+        .expect("an empty-but-live log is readable");
+
+        assert_eq!(cp.event_count, 0);
+        assert_ne!(
+            cp.merkle_root, [0u8; 32],
+            "the empty-tree root is SHA-256(\"\") (§25.8 Vector 15), not all zeros"
+        );
+        assert_eq!(
+            cp.merkle_root,
+            provider.event_log_merkle_root(&ctx_bytes()).unwrap()
+        );
+    }
+
+    /// On the fail-closed path the checkpoint counters are left UNTOUCHED, so
+    /// the checkpoint stays due and is retried rather than silently skipped.
+    #[tokio::test]
+    async fn a_refused_checkpoint_leaves_the_counters_due() {
+        let mut events_since = 73u64;
+        let mut last_time = 1_600_000_000u64;
+        let mut checkpoints = Vec::new();
+
+        let err = force_create_checkpoint_fields(
+            CTX_HEX,
+            true,
+            0,
+            &mut events_since,
+            &mut last_time,
+            &mut checkpoints,
+            &DID("did:example:signer".to_owned()),
+            &signing_key(),
+            1_700_000_500,
+            &UnknownLogProvider,
+        )
+        .expect_err("an unknown authoritative log must not be signed over");
+        assert!(matches!(err, ContextError::EventLogFailed(_)));
+
+        assert_eq!(events_since, 73, "counters must not be reset on refusal");
+        assert_eq!(last_time, 1_600_000_000);
+        assert!(
+            checkpoints.is_empty(),
+            "nothing may be retained when nothing was signed"
         );
     }
 }

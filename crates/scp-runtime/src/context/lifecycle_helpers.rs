@@ -712,7 +712,7 @@ pub async fn close_context_with_key(
             let now = deps.clock.now_secs();
             let broadcast_context_is_none = state.broadcast_context.is_none();
             let mls_epoch = state.epoch.mls_epoch;
-            let cp = crate::context::queries_helpers::force_create_checkpoint_fields(
+            match crate::context::queries_helpers::force_create_checkpoint_fields(
                 &context_id,
                 broadcast_context_is_none,
                 mls_epoch,
@@ -723,12 +723,27 @@ pub async fn close_context_with_key(
                 sk,
                 now,
                 deps.event_log.as_ref(),
-            );
-            tracing::debug!(
-                context_id = %context_id,
-                event_count = cp.event_count,
-                "final checkpoint created on close (§9.9.3)"
-            );
+            ) {
+                Ok(cp) => tracing::debug!(
+                    context_id = %context_id,
+                    event_count = cp.event_count,
+                    "final checkpoint created on close (§9.9.3)"
+                ),
+                // FAIL CLOSED (#1933 follow-up): no honest `(event_count,
+                // merkle_root)` is available, so no checkpoint is signed. An
+                // ABSENT final checkpoint is an honest state peers can detect;
+                // a signed fabricated `(0, [0u8; 32])` commitment would make
+                // them raise `EquivocationDetected` against the closing member.
+                // Close itself still proceeds — the checkpoint is an independent
+                // consistency-monitoring artifact and the context is terminal.
+                Err(e) => tracing::error!(
+                    context_id = %context_id,
+                    error = %e,
+                    "cannot build the final consistency checkpoint over an \
+                     unreachable authoritative event log — closing without one \
+                     rather than signing a fabricated commitment (§9.9.3)"
+                ),
+            }
         }
 
         let close_event = ContextEvent::SystemClose {

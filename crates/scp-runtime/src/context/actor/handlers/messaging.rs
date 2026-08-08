@@ -1061,7 +1061,7 @@ async fn handle_build_local_checkpoint(
         let mut view = cell.class_c_view();
         let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
         let mls_epoch = view.epoch_mut().mls_epoch;
-        crate::context::queries_helpers::force_create_checkpoint_view(
+        match crate::context::queries_helpers::force_create_checkpoint_view(
             &mut view,
             context_id,
             broadcast_context_is_none,
@@ -1070,7 +1070,24 @@ async fn handle_build_local_checkpoint(
             &sk,
             now,
             &*deps.event_log,
-        )
+        ) {
+            Ok(cp) => cp,
+            // FAIL CLOSED (#1933 follow-up): an unreachable authoritative log
+            // means there is no honest `(event_count, merkle_root)` to sign.
+            // The reconnection driver is told so, rather than handed a signed
+            // fabricated commitment that would make peers raise
+            // `EquivocationDetected` against this member (§9.9.3).
+            Err(e) => {
+                tracing::error!(
+                    context_id,
+                    error = %e,
+                    "cannot build a local consistency checkpoint over an \
+                     unreachable authoritative event log — failing closed (§9.9.3)"
+                );
+                let _ = reply.send(Err(e));
+                return Outcome::ok(());
+            }
+        }
     };
 
     // Broadcast the freshly-built checkpoint to peers over the regular
