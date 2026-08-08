@@ -13135,7 +13135,7 @@ impl Supervisor {
         //     before proposing, for exactly the reason the Broadcast and
         //     voting-governance gates above refuse here: no dead proposal, no
         //     staged KeyPackage, no MLS add. Both gates share ONE predicate
-        //     (`check_genesis_ceiling_covered_by_live`), so they cannot drift.
+        //     (`check_genesis_ceiling_still_current`), so they cannot drift.
         //
         //     A read fault is fail-closed: without the live ceiling we cannot
         //     prove the genesis ceiling is still current, so we refuse rather than

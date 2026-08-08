@@ -2552,12 +2552,21 @@ impl PerContextState {
         key_package_bytes: Option<&[u8]>,
         clock: &dyn Clock,
     ) -> Result<AddMemberOutput, ContextError> {
-        // #2028 fail-closed authority-currency gate. This method is the SINGLE
-        // primitive that produces a Welcome, and the Welcome is what a joiner
-        // converts into installed authority, so the gate belongs HERE — ahead of
-        // both the real MLS add and the no-crypto `testing` return, and ahead of
-        // every mutation (reject-before-mutate: no member is added, no epoch
-        // advances, nothing is persisted).
+        // #2028 fail-closed authority-currency gate. Within `scp-runtime` this
+        // method is the SINGLE primitive that produces a Welcome, and the Welcome
+        // is what a joiner converts into installed authority, so the gate belongs
+        // HERE — ahead of both the real MLS add and the no-crypto `testing`
+        // return, and ahead of every mutation (reject-before-mutate: no member is
+        // added, no epoch advances, nothing is persisted).
+        //
+        // Scope, honestly: "single primitive" is a scp-runtime claim, not a
+        // protocol-wide one. `scp_client::add_member` (`crates/scp-client/`, the
+        // ADR-057 in-browser participant driver) mints its own Commit + Welcome
+        // over `scp-mls` and has no `CapabilityCeiling` concept at all, so a
+        // browser participant propagates the genesis ceiling unconditionally.
+        // That is an ADR-057 residual, not something this gate can reach: closing
+        // it needs the authenticated current-state transfer #2028 tracks, since
+        // the browser driver holds no live `role_state` to compare against.
         crate::context::state::check_genesis_ceiling_still_current(
             self.handle.params(),
             self.role_state.ceiling(),

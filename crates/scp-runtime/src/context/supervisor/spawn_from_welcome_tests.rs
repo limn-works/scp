@@ -3308,13 +3308,15 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
 /// Drives the `ModifyCeiling` decision chain to completion through the REAL
 /// governance path: propose (`execute_modify_ceiling` stages the pending
 /// modification + the §5.3.2 notification window) then apply
-/// (`apply_pending_ceiling_modification` writes the lowered ceiling into
-/// `role_state`). `apply` takes the evaluation instant as a parameter, so the
+/// (`apply_pending_ceiling_modification` writes the new ceiling into
+/// `role_state`). The direction is whatever `new_ceiling` says — the widening
+/// tests below drive this same helper — so it is named for the OPERATION, not
+/// for one direction of it. `apply` takes the evaluation instant as a parameter, so the
 /// mandatory 72-hour notification window is satisfied by evaluating at a
 /// timestamp past it rather than by sleeping — the window is
 /// `max(effective_at, observed_at + PERIOD)`, and both anchors are ≤ `now`, so
 /// `now + 2 × PERIOD` clears them without any clock injection.
-async fn lower_ceiling_through_governance(
+async fn apply_ceiling_modification_through_governance(
     sup: &Arc<Supervisor>,
     ctx_id: &str,
     admin: &DID,
@@ -3435,14 +3437,17 @@ async fn governed_ceiling_lowering_refuses_the_welcome_seam_fail_closed() {
         .await
         .expect("alice creates the Governed-ceiling SingleAdmin context");
 
-    // Lower the ceiling through the real governance path: drop `messages:write`.
+    // Lower the ceiling through the real governance path: drop `member:invite`
+    // (the capability the 20-line block above proved the built-in `member` role
+    // does NOT want — dropping one it DOES want would let an incidental
+    // role-assignment error masquerade as the refusal under test).
     let lowered: Vec<Capability> = governed_params
         .ceiling
         .iter()
         .filter(|cap| **cap != Capability::MemberInvite)
         .cloned()
         .collect();
-    lower_ceiling_through_governance(&alice_sup, &ctx_id, &alice, lowered).await;
+    apply_ceiling_modification_through_governance(&alice_sup, &ctx_id, &alice, lowered).await;
 
     // ---- 1. Ground truth: live authority and genesis authority have diverged.
     let live_ceiling = alice_sup
@@ -3571,7 +3576,7 @@ async fn governed_ceiling_widening_still_admits_a_welcome_join() {
     // Widen: keep every genesis entry and add one more.
     let mut widened = governed_params.ceiling.clone();
     widened.push(Capability::MediaVoice);
-    lower_ceiling_through_governance(&alice_sup, &ctx_id, &alice, widened).await;
+    apply_ceiling_modification_through_governance(&alice_sup, &ctx_id, &alice, widened).await;
 
     let live_ceiling = alice_sup
         .get_role_state(&ctx_id)
@@ -3627,7 +3632,7 @@ async fn governed_ceiling_widening_still_admits_a_welcome_join() {
 ///
 /// So a joiner cannot self-defend against a stale (over-broad) genesis ceiling —
 /// which is precisely why
-/// [`crate::context::state::check_genesis_ceiling_covered_by_live`] is enforced
+/// [`crate::context::state::check_genesis_ceiling_still_current`] is enforced
 /// where both values are visible (the adder), not here.
 #[tokio::test]
 async fn welcome_joiner_installs_the_bundle_ceiling_verbatim() {
@@ -3730,7 +3735,7 @@ async fn governed_ceiling_lowering_refuses_the_in_actor_add_member_chokepoint() 
         .filter(|cap| **cap != Capability::MemberInvite)
         .cloned()
         .collect();
-    lower_ceiling_through_governance(&alice_sup, &ctx_id, &alice, lowered).await;
+    apply_ceiling_modification_through_governance(&alice_sup, &ctx_id, &alice, lowered).await;
 
     // The GOVERNANCE add path — `invite_member` is not involved, so its
     // front-door gate cannot be what refuses here.
@@ -3842,7 +3847,7 @@ async fn custom_resource_wildcard_widening_still_admits_a_welcome_join() {
             }
         })
         .collect();
-    lower_ceiling_through_governance(&alice_sup, &ctx_id, &alice, widened).await;
+    apply_ceiling_modification_through_governance(&alice_sup, &ctx_id, &alice, widened).await;
 
     let live_ceiling = alice_sup
         .get_role_state(&ctx_id)
