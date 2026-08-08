@@ -296,9 +296,11 @@ fn event_log_query_impl(
             .map_err(|e| ScpPyError::context(format!("event leaf hash failed: {e}")))?;
         // Project the typed payload's bridge-facing fields (e.g. `target_did`
         // for governance/access-revocation events, `subject_did` for
-        // role/membership events) through the single shared helper so all
-        // bridges surface byte-identical values. Each key is omitted when the
-        // projection yields `None`.
+        // role/membership events) through the single shared
+        // `scp_event_log::payload::project_payload` decoder (via the
+        // `inject_projection` helper) so all three native bridges surface
+        // byte-identical values. Each key is omitted when the projection
+        // yields `None`.
         let mut payload_json = serde_json::json!({
             "hash": encode_hex(&leaf_hash),
         });
@@ -506,8 +508,12 @@ fn event_log_verify_impl(
                     ScpPyError::validation("inclusion claim must include 'leaf_index' (integer)")
                 })?;
 
-            let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index)
-                .map_err(|e| ScpPyError::context(format!("inclusion proof failed: {e}")))?;
+            let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index).map_err(|e| {
+                ScpPyError::ContextError {
+                    message: format!("inclusion proof failed: {e}"),
+                    code: codes::CTX_2139.to_owned(),
+                }
+            })?;
 
             let mut details_json = scp_ffi_common::event_log::inclusion_proof_json(&proof);
             if let Some(obj) = details_json.as_object_mut() {
@@ -532,8 +538,12 @@ fn event_log_verify_impl(
             let event_hash = decode_hex_hash(event_hash_hex)
                 .map_err(|e| ScpPyError::validation(format!("invalid event_hash: {e}")))?;
 
-            let proof = scp_event_log::proof::prove_absence(&log, &event_hash)
-                .map_err(|e| ScpPyError::context(format!("absence proof failed: {e}")))?;
+            let proof = scp_event_log::proof::prove_absence(&log, &event_hash).map_err(|e| {
+                ScpPyError::ContextError {
+                    message: format!("absence proof failed: {e}"),
+                    code: codes::CTX_2139.to_owned(),
+                }
+            })?;
 
             // Both bracketing neighbours ship their FULL inclusion proofs
             // (sibling path + root), so the neighbour-inclusion half of the
