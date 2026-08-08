@@ -722,6 +722,56 @@ fn event_log_query_projects_role_assigned_subject_did_from_storage() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// event_log_verify — proofs are generated against the AUTHORITATIVE log only
+// (F3 / GitHub #1933)
+// ---------------------------------------------------------------------------
+
+/// The AUTHORITATIVE event log — the same source `event_log_query` reads,
+/// distinct from the bridge-local `FfiBridgeState::event_log`.
+fn authoritative_log(bi: &PyBridgeInstance, context_id: &str) -> scp_event_log::EventLog {
+    runtime::supervisor(bi)
+        .expect("supervisor attached")
+        .authoritative_event_log(context_id)
+        .expect("authoritative event log readable")
+}
+
+/// The authoritative `(leaf_count, merkle_root)` commitment.
+fn authoritative_commitment(bi: &PyBridgeInstance, context_id: &str) -> (u64, [u8; 32]) {
+    let log = authoritative_log(bi, context_id);
+    (
+        scp_event_log::tree::event_count(&log),
+        scp_event_log::tree::root(&log),
+    )
+}
+
+/// The canonical leaf hashes of the authoritative log, in append order.
+fn authoritative_leaves(bi: &PyBridgeInstance, context_id: &str) -> Vec<[u8; 32]> {
+    authoritative_log(bi, context_id).leaves().to_vec()
+}
+
+/// The leaf hashes of the BRIDGE-LOCAL verification tree.
+fn bridge_local_leaves(bi: &PyBridgeInstance, context_id: &str) -> Vec<[u8; 32]> {
+    runtime::with_context(bi, context_id, |rt| Ok(rt.event_log.leaves().to_vec())).unwrap()
+}
+
+/// Injects a caller-influenced leaf into the BRIDGE-LOCAL tree through a real
+/// public bridge call (`provenance_attach` appends a `ProvenanceAttached` leaf
+/// whose payload is the caller-derived provenance hash).
+fn inject_local_leaf(scp: &_scp_core::scp::PyScp, py: Python<'_>, ctx_id: &str, actor_did: &str) {
+    scp.provenance_attach(
+        py,
+        "ctx-source-injected".to_owned(),
+        "persistent",
+        "full",
+        vec![actor_did.to_owned()],
+        ctx_id.to_owned(),
+        actor_did.to_owned(),
+        None,
+    )
+    .expect("provenance_attach appends a bridge-local leaf");
+}
+
 #[test]
 fn event_log_verify_inclusion_proof_after_append() {
     Python::with_gil(|py| {
@@ -730,7 +780,10 @@ fn event_log_verify_inclusion_proof_after_append() {
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Append an unsigned event so the log is non-empty.
+        // Append an unsigned event so the BRIDGE-LOCAL log is non-empty. Since
+        // #1933 this tree is irrelevant to verification — the proof below is
+        // generated against the authoritative supervisor log, which already
+        // holds the context's `ContextCreated` leaf.
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
@@ -755,6 +808,411 @@ fn event_log_verify_inclusion_proof_after_append() {
             .unwrap();
         assert!(proof.verified);
         assert_eq!(proof.proof_type, "inclusion");
+
+        // The proven leaf is the AUTHORITATIVE leaf 0, not the bridge-local
+        // append above.
+        let authoritative = authoritative_leaves(scp.bridge_instance(), &ctx_id);
+        let details = proof.details.bind(py);
+        let proven_leaf: String = details.get_item("leaf_hash").unwrap().extract().unwrap();
+        assert_eq!(proven_leaf, hex::encode(authoritative[0]));
+    });
+}
+
+/// F3 / GitHub #1933 — the forgeable false-negative absence proof.
+///
+/// An ABSENCE claim for an event that IS in the authoritative log must be
+/// rejected. Pre-fix the proof ran over the bridge-local tree, which does not
+/// contain that event, so the claim "verified".
+#[test]
+fn event_log_verify_absence_of_an_authoritative_event_is_rejected() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+        let authoritative = authoritative_leaves(scp.bridge_instance(), &ctx_id);
+        assert!(
+            !authoritative.is_empty(),
+            "creating a context appends ContextCreated to the authoritative log"
+        );
+        let present_event = authoritative[0];
+
+        // A non-empty bridge-local tree that does NOT contain the target — the
+        // exact pre-fix precondition for the forged proof.
+        inject_local_leaf(&scp, py, &ctx_id, &did);
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            assert!(
+                scp_event_log::proof::prove_absence(&rt.event_log, &present_event).is_ok(),
+                "precondition: the bridge-local tree alone would yield an absence proof"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let claim = PyDict::new(py);
+        claim.set_item("type", "absence").unwrap();
+        claim
+            .set_item("event_hash", hex::encode(present_event))
+            .unwrap();
+
+        let err = scp
+            .event_log_verify(py, &ctx_id, &claim.as_borrowed())
+            .expect_err("absence of an event present in the authoritative log must be rejected");
+        assert!(
+            err.to_string().contains("present in the log"),
+            "expected an absence-proof-for-present-event rejection, got: {err}"
+        );
+    });
+}
+
+/// (b) #1933 — a caller-injected BRIDGE-LOCAL leaf must never be provable as
+/// included. Pre-fix the synced tree was a UNION of the authoritative leaves
+/// and any bridge-local suffix, so `provenance_attach` + an inclusion claim at
+/// the next index produced `verified: true` for a caller-chosen leaf sitting at
+/// an authoritative-looking index.
+#[test]
+fn event_log_verify_cannot_prove_a_caller_injected_local_leaf() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+        // Pre-seed the bridge-local tree with the authoritative prefix so the
+        // pre-fix "append-only" branch (prefix matches ⇒ push nothing, keep the
+        // local suffix) is the one that would have fired.
+        let authoritative = authoritative_leaves(scp.bridge_instance(), &ctx_id);
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            for leaf in &authoritative {
+                rt.event_log.push_leaf_raw(*leaf);
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        inject_local_leaf(&scp, py, &ctx_id, &did);
+
+        let local = bridge_local_leaves(scp.bridge_instance(), &ctx_id);
+        assert!(
+            local.len() > authoritative.len(),
+            "the injected leaf must extend the bridge-local tree past the authoritative one"
+        );
+        let injected: Vec<[u8; 32]> = local[authoritative.len()..].to_vec();
+        assert!(!injected.is_empty());
+
+        // No leaf index may ever yield a proof committing to an injected leaf.
+        for leaf_index in 0..local.len() {
+            let claim = PyDict::new(py);
+            claim.set_item("type", "inclusion").unwrap();
+            claim.set_item("leaf_index", leaf_index).unwrap();
+
+            match scp.event_log_verify(py, &ctx_id, &claim.as_borrowed()) {
+                // Out of range for the authoritative tree — the honest answer.
+                Err(_) => assert!(
+                    leaf_index >= authoritative.len(),
+                    "authoritative leaf {leaf_index} must still be provable"
+                ),
+                Ok(proof) => {
+                    let details = proof.details.bind(py);
+                    let leaf_hash: String =
+                        details.get_item("leaf_hash").unwrap().extract().unwrap();
+                    for forged in &injected {
+                        assert_ne!(
+                            leaf_hash,
+                            hex::encode(forged),
+                            "leaf_index {leaf_index} proved a caller-injected bridge-local leaf"
+                        );
+                    }
+                    assert_eq!(
+                        leaf_hash,
+                        hex::encode(authoritative[leaf_index]),
+                        "every provable leaf must be the authoritative one at that index"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// (c) #1933 — the proof's `root` must be the AUTHORITATIVE Merkle root, and
+/// the details must carry the authoritative `leaf_count`, so a relying party
+/// can pin the proof against the log's own commitment. Pre-fix the root was
+/// that of the union tree and matched nothing.
+#[test]
+fn event_log_verify_details_carry_the_authoritative_root_and_leaf_count() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+        // Pre-seed the authoritative prefix, then extend it with a real
+        // caller-injected leaf. A union tree over these leaves has a root that
+        // is NOT the authoritative root — which is exactly what a relying party
+        // must be able to detect.
+        let authoritative = authoritative_leaves(scp.bridge_instance(), &ctx_id);
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            for leaf in &authoritative {
+                rt.event_log.push_leaf_raw(*leaf);
+            }
+            Ok(())
+        })
+        .unwrap();
+        inject_local_leaf(&scp, py, &ctx_id, &did);
+
+        let (auth_count, auth_root) = authoritative_commitment(scp.bridge_instance(), &ctx_id);
+        let local_root = runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            Ok(scp_event_log::tree::root(&rt.event_log))
+        })
+        .unwrap();
+        assert_ne!(
+            auth_root, local_root,
+            "precondition: the bridge-local union tree must have a different root"
+        );
+
+        let inclusion = PyDict::new(py);
+        inclusion.set_item("type", "inclusion").unwrap();
+        inclusion.set_item("leaf_index", 0).unwrap();
+        let proof = scp
+            .event_log_verify(py, &ctx_id, &inclusion.as_borrowed())
+            .unwrap();
+        let details = proof.details.bind(py);
+        let root: String = details.get_item("root").unwrap().extract().unwrap();
+        assert_eq!(
+            root,
+            hex::encode(auth_root),
+            "inclusion root must be authoritative"
+        );
+        let leaf_count: u64 = details.get_item("leaf_count").unwrap().extract().unwrap();
+        assert_eq!(leaf_count, auth_count);
+
+        let absence = PyDict::new(py);
+        absence.set_item("type", "absence").unwrap();
+        absence
+            .set_item("event_hash", hex::encode([0xEEu8; 32]))
+            .unwrap();
+        let proof = scp
+            .event_log_verify(py, &ctx_id, &absence.as_borrowed())
+            .unwrap();
+        assert!(proof.verified);
+        let details = proof.details.bind(py);
+        let root: String = details.get_item("root").unwrap().extract().unwrap();
+        assert_eq!(
+            root,
+            hex::encode(auth_root),
+            "absence root must be authoritative"
+        );
+        let leaf_count: u64 = details.get_item("leaf_count").unwrap().extract().unwrap();
+        assert_eq!(leaf_count, auth_count);
+    });
+}
+
+/// (d) #1933 — verification is READ-ONLY. Pre-fix the "rebuild on divergence"
+/// branch discarded the bridge-local log's leaves AND its stored events,
+/// destroying real bridge-local records (UCAN revocations, outlet invocations,
+/// provenance) and resetting the sequence counter that `mcp.rs` derives its
+/// storage key from.
+#[test]
+fn event_log_verify_never_mutates_the_bridge_local_log() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+        // A bridge-local record that CONTRADICTS the authoritative prefix —
+        // exactly the shape that triggered the pre-fix truncating rebuild.
+        inject_local_leaf(&scp, py, &ctx_id, &did);
+        let before = bridge_local_leaves(scp.bridge_instance(), &ctx_id);
+        let events_before = runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            Ok(rt.event_log.events().len())
+        })
+        .unwrap();
+        assert!(!before.is_empty() && events_before > 0);
+
+        let authoritative = authoritative_leaves(scp.bridge_instance(), &ctx_id);
+        assert_ne!(
+            before.first(),
+            authoritative.first(),
+            "precondition: the local prefix must diverge from the authoritative one"
+        );
+
+        for claim in [("inclusion", None), ("absence", Some([0xEEu8; 32]))] {
+            let dict = PyDict::new(py);
+            dict.set_item("type", claim.0).unwrap();
+            match claim.1 {
+                Some(h) => dict.set_item("event_hash", hex::encode(h)).unwrap(),
+                None => dict.set_item("leaf_index", 0).unwrap(),
+            }
+            let _ = scp.event_log_verify(py, &ctx_id, &dict.as_borrowed());
+        }
+
+        let events_after = runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            Ok(rt.event_log.events().len())
+        })
+        .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "verification must not discard the bridge-local log's stored events"
+        );
+        assert_eq!(
+            bridge_local_leaves(scp.bridge_instance(), &ctx_id),
+            before,
+            "verification must not touch the bridge-local log's leaves"
+        );
+    });
+}
+
+/// (a) #1933 — the provider reporting NO LOG (`Ok(None)`) means UNKNOWN, never
+/// "empty". Pre-fix the sync silently no-op'd on `None` and the proof fell
+/// through to the bridge-local tree, so an absence claim "verified".
+#[test]
+fn event_log_verify_fails_closed_when_the_authoritative_log_is_unknown() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+
+        // FFI state registered, but the context was never created through the
+        // supervisor — the authoritative provider holds no log for it, exactly
+        // as it would after `destroy_event_log` on actor shutdown or
+        // create-rollback.
+        let ctx_id = random_context_id();
+        runtime::register_context(scp.bridge_instance(), &ctx_id, "did:key:creator", &[]).unwrap();
+        let ctx_bytes = scp_core::context::state::context_id_to_bytes(&ctx_id);
+        assert!(
+            runtime::supervisor(scp.bridge_instance())
+                .unwrap()
+                .event_log_entries(&ctx_bytes)
+                .unwrap()
+                .is_none(),
+            "precondition: the authoritative log is UNKNOWN for this context"
+        );
+
+        // A non-empty bridge-local tree that would happily yield a proof.
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            rt.event_log.push_leaf_raw([0xABu8; 32]);
+            Ok(())
+        })
+        .unwrap();
+
+        let claim = PyDict::new(py);
+        claim.set_item("type", "absence").unwrap();
+        claim
+            .set_item("event_hash", hex::encode([0xCDu8; 32]))
+            .unwrap();
+
+        let err = scp
+            .event_log_verify(py, &ctx_id, &claim.as_borrowed())
+            .expect_err("an unknown authoritative log must fail closed, not verify");
+        assert!(
+            err.to_string().contains("SCP-CTX-2138"),
+            "expected the fail-closed authoritative-log code, got: {err}"
+        );
+    });
+}
+
+/// (e) #1933 — a SHUT-DOWN instance must be rejected, not merely a suspended
+/// one. `supervisor()` only errors on suspend and just warns after shutdown,
+/// so gating on it alone left the shutdown path open; `check_ready()` rejects
+/// both.
+#[test]
+fn event_log_verify_fails_closed_after_shutdown() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+        let present_event = authoritative_leaves(scp.bridge_instance(), &ctx_id)[0];
+
+        // A bridge-local tree that would yield a forged absence proof if the
+        // shut-down instance fell back to it.
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            rt.event_log.push_leaf_raw([0xABu8; 32]);
+            Ok(())
+        })
+        .unwrap();
+
+        scp.shutdown(py, 0).unwrap();
+
+        let claim = PyDict::new(py);
+        claim.set_item("type", "absence").unwrap();
+        claim
+            .set_item("event_hash", hex::encode(present_event))
+            .unwrap();
+
+        let err = scp
+            .event_log_verify(py, &ctx_id, &claim.as_borrowed())
+            .expect_err("a shut-down instance must fail closed");
+        assert!(
+            err.to_string().contains("SCP-CTX-2138"),
+            "expected the fail-closed authoritative-log code, got: {err}"
+        );
+    });
+}
+
+/// A suspended instance is rejected the same way.
+#[test]
+fn event_log_verify_fails_closed_when_suspended() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+        let present_event = authoritative_leaves(scp.bridge_instance(), &ctx_id)[0];
+
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            rt.event_log.push_leaf_raw([0xABu8; 32]);
+            Ok(())
+        })
+        .unwrap();
+
+        scp.suspend().unwrap();
+
+        let claim = PyDict::new(py);
+        claim.set_item("type", "absence").unwrap();
+        claim
+            .set_item("event_hash", hex::encode(present_event))
+            .unwrap();
+
+        let err = scp
+            .event_log_verify(py, &ctx_id, &claim.as_borrowed())
+            .expect_err("a suspended instance must fail closed");
+        assert!(
+            err.to_string().contains("SCP-CTX-2138"),
+            "expected the fail-closed authoritative-log code, got: {err}"
+        );
+    });
+}
+
+/// Every authoritative leaf proves included, committing to its own leaf hash.
+#[test]
+fn event_log_verify_inclusion_of_an_authoritative_event_verifies() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+        let authoritative = authoritative_leaves(scp.bridge_instance(), &ctx_id);
+        assert!(!authoritative.is_empty());
+
+        for (index, leaf) in authoritative.iter().enumerate() {
+            let claim = PyDict::new(py);
+            claim.set_item("type", "inclusion").unwrap();
+            claim.set_item("leaf_index", index).unwrap();
+
+            let proof = scp
+                .event_log_verify(py, &ctx_id, &claim.as_borrowed())
+                .unwrap();
+            assert!(
+                proof.verified,
+                "authoritative leaf {index} must prove included"
+            );
+            let details = proof.details.bind(py);
+            let proven_leaf: String = details.get_item("leaf_hash").unwrap().extract().unwrap();
+            assert_eq!(proven_leaf, hex::encode(leaf));
+        }
     });
 }
 

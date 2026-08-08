@@ -217,7 +217,53 @@ pub(crate) async fn event_log_query_on(
     }
 }
 
+/// Maps a runtime authoritative-log failure into the fail-closed bridge error.
+///
+/// GitHub #1933. Raised when the bridge cannot reach the context's
+/// AUTHORITATIVE event log at all — the instance is not ready (suspended or
+/// shut down), no supervisor / event-log provider is attached, or the provider
+/// reports NO LOG for the context (`Ok(None)`, which means UNKNOWN — a log
+/// destroyed on actor shutdown or create-rollback reads exactly the same as one
+/// that never existed; an empty-but-live log is `Ok(Some(vec![]))`).
+///
+/// Verification MUST NOT fall back to the UCAN-state tree here: an absence
+/// proof over a non-authoritative or unknown log is a forgeable FALSE NEGATIVE.
+fn authoritative_log_unreachable(context_id: &str, detail: &impl std::fmt::Display) -> napi::Error {
+    napi::Error::from(ScpNapiError::Context {
+        message: format!(
+            "event log verification cannot reach the authoritative log for context \
+             '{context_id}': {detail}"
+        ),
+        code: codes::CTX_2138.to_owned(),
+    })
+}
+
 /// Per-bridge-instance implementation of [`event_log_verify`].
+///
+/// # The proof is generated against the AUTHORITATIVE log
+///
+/// Both proof types are generated from ONE `Supervisor::authoritative_event_log`
+/// snapshot — the runtime's single proof seam, replayed from the supervisor's
+/// own canonical event log, the same source [`event_log_query`] reads. This
+/// function NEVER reads or mutates the per-context UCAN-state `EventLog`
+/// (`NapiContextRuntime::core.event_log`), a separate tree holding only
+/// bridge-local records whose leaves a caller can influence; proving over it
+/// produced forgeable absence AND inclusion results (GitHub #1933).
+///
+/// Because the proof and the reported `(leaf_count, root)` commitment come from
+/// that ONE snapshot, they describe the same tree state by construction — a
+/// relying party can pin the proof against the commitment beside it. Taking
+/// them from two snapshots would let a concurrent append separate them, and a
+/// root paired with another snapshot's leaf count commits to nothing.
+///
+/// # Errors
+///
+/// Returns [`codes::CTX_2138`] when the authoritative log is unreachable (the
+/// instance is suspended or shut down, no supervisor is attached, or the
+/// provider reports NO LOG for the context). FAILS CLOSED: it never falls back
+/// to the UCAN-state tree. Proof-generation failures over a readable log (empty
+/// log, out-of-range index, absence claimed for a present event) keep
+/// [`codes::CTX_2025`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
@@ -246,59 +292,23 @@ pub(crate) async fn event_log_verify_on(
 
     let context_id = handle.context_id();
 
-    // Sync the supervisor's Merkle event log entries into the UCAN-state
-    // EventLog so that prove_inclusion / prove_absence operate on the same
-    // tree that tracks lifecycle events. The UCAN-state EventLog starts
-    // empty; this populates it from the authoritative MerkleEventLogProvider.
-    // ADR-056: resolve the context-id string to its 32-byte digest via the
-    // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
-    // double-hashes a real 64-hex id and queries the wrong event-log key).
-    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    if let Some(entries) = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten())
-    {
-        // Precompute the canonical leaf hash for each source event
-        // (`SHA-256(0x00 ‖ rmp_serde(Event))`) via the substrate helper so the
-        // synced UCAN-state tree commits to byte-identical leaves.
-        let mut leaf_hashes: Vec<[u8; 32]> = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            leaf_hashes.push(scp_event_log::tree::leaf_hash(entry).map_err(|e| {
-                napi::Error::from(ScpNapiError::Context {
-                    message: format!("event leaf hash failed: {e}"),
-                    code: codes::CTX_2000.to_owned(),
-                })
-            })?);
-        }
+    // #1933 fail-closed gate. `check_ready` rejects BOTH suspended and
+    // shut-down instances (`supervisor()` only rejects suspended, and merely
+    // warns after shutdown — while a shut-down context's authoritative log has
+    // typically been destroyed).
+    bi.core
+        .check_ready()
+        .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
+    let supervisor = crate::runtime::supervisor(bi)
+        .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
 
-        crate::runtime::with_context(bi, &context_id, |rt| {
-            let existing_leaves = rt.core.event_log.leaves();
-            let existing_count = existing_leaves.len();
-
-            // Prefix consistency check: if existing leaves diverge from the
-            // source (e.g. after reimport), clear and re-sync the entire tree.
-            let prefix_matches = existing_leaves
-                .iter()
-                .zip(leaf_hashes.iter())
-                .all(|(leaf, hash)| leaf == hash);
-
-            if !prefix_matches && existing_count > 0 {
-                // Leaves diverge — rebuild from scratch.
-                let ctx_id = rt.core.event_log.context_id().to_owned();
-                rt.core.event_log = scp_event_log::EventLog::new(ctx_id);
-                for hash in &leaf_hashes {
-                    rt.core.event_log.push_leaf_raw(*hash);
-                }
-            } else {
-                // Append-only: push entries that haven't been synced yet.
-                for hash in leaf_hashes.iter().skip(existing_count) {
-                    rt.core.event_log.push_leaf_raw(*hash);
-                }
-            }
-            Ok(())
-        })
-        .map_err(napi::Error::from)?;
-    }
+    // The ONE authoritative snapshot every answer below is derived from. Its
+    // failure is the only "cannot answer" case (CTX-2138), which keeps it
+    // distinct from "the claim is false" (a proof error over a readable log).
+    let log = supervisor
+        .authoritative_event_log(&context_id)
+        .map_err(|e| authoritative_log_unreachable(&context_id, &e))?;
+    let leaf_count = scp_event_log::tree::event_count(&log);
 
     match claim_type {
         "inclusion" => {
@@ -311,45 +321,42 @@ pub(crate) async fn event_log_verify_on(
                 })
                 .map_err(napi::Error::from)?;
 
-            let (verified, details_json) = crate::runtime::with_context(bi, &context_id, |rt| {
-                let proof = scp_event_log::proof::prove_inclusion(&rt.core.event_log, leaf_index)
-                    .map_err(|e| ScpNapiError::Context {
+            let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index).map_err(|e| {
+                napi::Error::from(ScpNapiError::Context {
                     message: format!("inclusion proof failed: {e}"),
                     code: codes::CTX_2025.to_owned(),
-                })?;
-                let verified = scp_event_log::proof::verify_inclusion(&proof);
+                })
+            })?;
+            let verified = scp_event_log::proof::verify_inclusion(&proof);
 
-                let path_steps: Vec<serde_json::Value> = proof
-                    .path
-                    .iter()
-                    .map(|step| {
-                        let direction = match step.direction {
-                            scp_event_log::proof::Direction::Left => "left",
-                            scp_event_log::proof::Direction::Right => "right",
-                        };
-                        serde_json::json!({
-                            "sibling_hash": hex::encode(step.sibling_hash),
-                            "direction": direction,
-                        })
+            let path_steps: Vec<serde_json::Value> = proof
+                .path
+                .iter()
+                .map(|step| {
+                    let direction = match step.direction {
+                        scp_event_log::proof::Direction::Left => "left",
+                        scp_event_log::proof::Direction::Right => "right",
+                    };
+                    serde_json::json!({
+                        "sibling_hash": hex::encode(step.sibling_hash),
+                        "direction": direction,
                     })
-                    .collect();
+                })
+                .collect();
 
-                let details = serde_json::json!({
-                    "leaf_index": proof.leaf_index,
-                    "leaf_hash": hex::encode(proof.leaf_hash),
-                    "root": hex::encode(proof.root),
-                    "path": path_steps,
-                    "path_length": proof.path.len(),
-                });
-
-                Ok((verified, details.to_string()))
-            })
-            .map_err(napi::Error::from)?;
+            let details = serde_json::json!({
+                "leaf_index": proof.leaf_index,
+                "leaf_hash": hex::encode(proof.leaf_hash),
+                "root": hex::encode(proof.root),
+                "path": path_steps,
+                "path_length": proof.path.len(),
+                "leaf_count": leaf_count,
+            });
 
             Ok(NapiProof {
                 verified,
                 proof_type: "inclusion".to_owned(),
-                details_json,
+                details_json: details.to_string(),
             })
         }
         "absence" => {
@@ -369,53 +376,49 @@ pub(crate) async fn event_log_verify_on(
                 })
             })?;
 
-            let (verified, details_json) = crate::runtime::with_context(bi, &context_id, |rt| {
-                let proof = scp_event_log::proof::prove_absence(&rt.core.event_log, &event_hash)
-                    .map_err(|e| ScpNapiError::Context {
-                        message: format!("absence proof failed: {e}"),
-                        code: codes::CTX_2025.to_owned(),
-                    })?;
+            let proof = scp_event_log::proof::prove_absence(&log, &event_hash).map_err(|e| {
+                napi::Error::from(ScpNapiError::Context {
+                    message: format!("absence proof failed: {e}"),
+                    code: codes::CTX_2025.to_owned(),
+                })
+            })?;
 
-                let lower = proof.lower.as_ref().map(|lwp| {
-                    serde_json::json!({
-                        "leaf_hash": hex::encode(lwp.leaf_hash),
-                        "leaf_index": lwp.leaf_index,
-                    })
-                });
+            let lower = proof.lower.as_ref().map(|lwp| {
+                serde_json::json!({
+                    "leaf_hash": hex::encode(lwp.leaf_hash),
+                    "leaf_index": lwp.leaf_index,
+                })
+            });
 
-                let upper = proof.upper.as_ref().map(|uwp| {
-                    serde_json::json!({
-                        "leaf_hash": hex::encode(uwp.leaf_hash),
-                        "leaf_index": uwp.leaf_index,
-                    })
-                });
+            let upper = proof.upper.as_ref().map(|uwp| {
+                serde_json::json!({
+                    "leaf_hash": hex::encode(uwp.leaf_hash),
+                    "leaf_index": uwp.leaf_index,
+                })
+            });
 
-                let lower_verified = proof
-                    .lower
-                    .as_ref()
-                    .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
-                let upper_verified = proof
-                    .upper
-                    .as_ref()
-                    .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
-                let verified = lower_verified && upper_verified;
+            let lower_verified = proof
+                .lower
+                .as_ref()
+                .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
+            let upper_verified = proof
+                .upper
+                .as_ref()
+                .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
+            let verified = lower_verified && upper_verified;
 
-                let details = serde_json::json!({
-                    "query_hash": hex::encode(proof.query_hash),
-                    "root": hex::encode(proof.root),
-                    "leaf_count": proof.leaf_count,
-                    "lower": lower,
-                    "upper": upper,
-                });
-
-                Ok((verified, details.to_string()))
-            })
-            .map_err(napi::Error::from)?;
+            let details = serde_json::json!({
+                "query_hash": hex::encode(proof.query_hash),
+                "root": hex::encode(proof.root),
+                "leaf_count": proof.leaf_count,
+                "lower": lower,
+                "upper": upper,
+            });
 
             Ok(NapiProof {
                 verified,
                 proof_type: "absence".to_owned(),
-                details_json,
+                details_json: details.to_string(),
             })
         }
         other => Err(ScpNapiError::Validation {
@@ -799,5 +802,291 @@ mod tests {
     fn validate_epoch_rejects_positive_infinity() {
         let result = validate_non_negative_epoch(f64::INFINITY);
         assert!(result.is_err(), "INFINITY epoch should error");
+    }
+
+    // -----------------------------------------------------------------------
+    // event_log_verify — AUTHORITATIVE-log-only proofs (F3 / GitHub #1933)
+    // -----------------------------------------------------------------------
+
+    /// The AUTHORITATIVE supervisor event log.
+    #[cfg(feature = "testing")]
+    fn authoritative_log(bi: &NapiBridgeInstance, context_id: &str) -> scp_event_log::EventLog {
+        crate::runtime::supervisor(bi)
+            .expect("supervisor attached")
+            .authoritative_event_log(context_id)
+            .expect("authoritative event log readable")
+    }
+
+    /// The canonical leaf hashes of the AUTHORITATIVE supervisor log.
+    #[cfg(feature = "testing")]
+    fn authoritative_leaves(bi: &NapiBridgeInstance, context_id: &str) -> Vec<[u8; 32]> {
+        authoritative_log(bi, context_id).leaves().to_vec()
+    }
+
+    /// Minimal params for a supervisor-created context.
+    #[cfg(feature = "testing")]
+    fn verify_test_params_json() -> String {
+        serde_json::json!({
+            "ceiling": ["messages:read", "messages:write"],
+            "ceilingPolicy": "immutable",
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string()
+    }
+
+    /// Injects a caller-influenced leaf into the UCAN-state tree through a real
+    /// public bridge call.
+    #[cfg(feature = "testing")]
+    fn inject_local_leaf(bi: &NapiBridgeInstance, context_id: &str, actor_did: &str) {
+        crate::provenance::provenance_attach_on(
+            bi,
+            "ctx-source-injected".to_owned(),
+            "persistent".to_owned(),
+            "full".to_owned(),
+            vec![actor_did.to_owned()],
+            context_id.to_owned(),
+            actor_did.to_owned(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("provenance_attach appends a bridge-local leaf");
+    }
+
+    /// F3 / GitHub #1933 — proofs come from the AUTHORITATIVE log only.
+    ///
+    /// Covers: an absence claim for a present authoritative event is rejected;
+    /// every authoritative leaf proves included; a caller-injected UCAN-state
+    /// leaf is NEVER provable; the details carry the authoritative root + leaf
+    /// count; and the UCAN-state log is left completely untouched.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_verify_proves_against_the_authoritative_log_only() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let did = identity.did();
+        let handle = crate::context::context_create_on(&bi, &identity, verify_test_params_json())
+            .await
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        let authoritative = authoritative_leaves(&bi, &context_id);
+        assert!(
+            !authoritative.is_empty(),
+            "creating a context appends ContextCreated to the authoritative log"
+        );
+        let auth_log = authoritative_log(&bi, &context_id);
+        let auth_count = scp_event_log::tree::event_count(&auth_log);
+        let auth_root = scp_event_log::tree::root(&auth_log);
+
+        // Seed the UCAN-state tree with the authoritative prefix (so the old
+        // append-only branch would have kept a local suffix) plus a real
+        // caller-injected leaf.
+        crate::runtime::ensure_registered(&bi, &handle).expect("ucan state registered");
+        crate::runtime::with_context(&bi, &context_id, |rt| {
+            for leaf in &authoritative {
+                rt.core.event_log.push_leaf_raw(*leaf);
+            }
+            Ok(())
+        })
+        .expect("seed succeeds");
+        inject_local_leaf(&bi, &context_id, &did);
+
+        let local_before = crate::runtime::with_context(&bi, &context_id, |rt| {
+            Ok(rt.core.event_log.leaves().to_vec())
+        })
+        .unwrap();
+        let local_events_before = crate::runtime::with_context(&bi, &context_id, |rt| {
+            Ok(rt.core.event_log.events().len())
+        })
+        .unwrap();
+        assert!(
+            local_before.len() > authoritative.len(),
+            "precondition: the injected leaf extends the UCAN-state tree"
+        );
+        let injected: Vec<[u8; 32]> = local_before[authoritative.len()..].to_vec();
+
+        // --- absence of a PRESENT authoritative event is rejected -----------
+        let absence_claim = serde_json::json!({
+            "type": "absence", "event_hash": hex::encode(authoritative[0]),
+        })
+        .to_string();
+        let msg = match event_log_verify_on(&bi, &handle, absence_claim).await {
+            Ok(proof) => panic!(
+                "absence of a present authoritative event must be rejected, got verified={}",
+                proof.verified
+            ),
+            Err(err) => format!("{err}"),
+        };
+        assert!(
+            msg.contains("present in the log"),
+            "expected an absence-proof-for-present-event rejection, got: {msg}"
+        );
+
+        // --- absence of a genuinely-unknown event carries the auth root -----
+        let absence_claim = serde_json::json!({
+            "type": "absence", "event_hash": hex::encode([0xEEu8; 32]),
+        })
+        .to_string();
+        let proof = event_log_verify_on(&bi, &handle, absence_claim)
+            .await
+            .expect("absence of an unknown event proves");
+        assert!(proof.verified);
+        let details: serde_json::Value = serde_json::from_str(&proof.details_json).unwrap();
+        assert_eq!(
+            details["root"].as_str(),
+            Some(hex::encode(auth_root).as_str())
+        );
+        assert_eq!(details["leaf_count"].as_u64(), Some(auth_count));
+
+        // --- no index ever proves a caller-injected leaf --------------------
+        for leaf_index in 0..local_before.len() {
+            let claim = serde_json::json!({
+                "type": "inclusion", "leaf_index": leaf_index,
+            })
+            .to_string();
+            match event_log_verify_on(&bi, &handle, claim).await {
+                Err(_) => assert!(
+                    leaf_index >= authoritative.len(),
+                    "authoritative leaf {leaf_index} must still be provable"
+                ),
+                Ok(proof) => {
+                    assert!(proof.verified);
+                    let details: serde_json::Value =
+                        serde_json::from_str(&proof.details_json).unwrap();
+                    let leaf_hash = details["leaf_hash"].as_str().unwrap().to_owned();
+                    for forged in &injected {
+                        assert_ne!(
+                            leaf_hash,
+                            hex::encode(forged),
+                            "leaf_index {leaf_index} proved a caller-injected UCAN-state leaf"
+                        );
+                    }
+                    assert_eq!(leaf_hash, hex::encode(authoritative[leaf_index]));
+                    assert_eq!(
+                        details["root"].as_str(),
+                        Some(hex::encode(auth_root).as_str()),
+                        "inclusion root must be authoritative"
+                    );
+                    assert_eq!(details["leaf_count"].as_u64(), Some(auth_count));
+                }
+            }
+        }
+
+        // --- verification is READ-ONLY -------------------------------------
+        assert_eq!(
+            crate::runtime::with_context(&bi, &context_id, |rt| Ok(rt
+                .core
+                .event_log
+                .leaves()
+                .to_vec()))
+            .unwrap(),
+            local_before,
+            "verification must not touch the UCAN-state log's leaves"
+        );
+        assert_eq!(
+            crate::runtime::with_context(&bi, &context_id, |rt| Ok(rt
+                .core
+                .event_log
+                .events()
+                .len()))
+            .unwrap(),
+            local_events_before,
+            "verification must not discard the UCAN-state log's stored events"
+        );
+    }
+
+    /// #1933 — the provider reporting NO LOG (`Ok(None)`) means UNKNOWN, never
+    /// "empty". Must fail closed rather than fall through to the UCAN-state
+    /// tree.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_verify_fails_closed_when_the_authoritative_log_is_unknown() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_supervisor_for_test_on(&bi);
+        // A synthetic handle: UCAN state exists, but the context was never
+        // created through the supervisor, so the authoritative log is UNKNOWN.
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-unknown-authoritative-log".to_owned(),
+            "did:dht:z6MkCreatorUnknownLog".to_owned(),
+        );
+        crate::runtime::ensure_registered(&bi, &handle).expect("ucan state registered");
+        crate::runtime::with_context(&bi, &handle.context_id(), |rt| {
+            rt.core.event_log.push_leaf_raw([0xABu8; 32]);
+            Ok(())
+        })
+        .expect("seed succeeds");
+
+        let absence_claim = serde_json::json!({
+            "type": "absence", "event_hash": hex::encode([0xCDu8; 32]),
+        })
+        .to_string();
+        let msg = match event_log_verify_on(&bi, &handle, absence_claim).await {
+            Ok(proof) => panic!(
+                "an unknown authoritative log must fail closed, got verified={}",
+                proof.verified
+            ),
+            Err(err) => format!("{err}"),
+        };
+        assert!(
+            msg.contains(codes::CTX_2138),
+            "expected the fail-closed authoritative-log code SCP-CTX-2138, got: {msg}"
+        );
+    }
+
+    /// #1933 — a SHUT-DOWN instance must be rejected, not just a suspended one.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_log_verify_fails_closed_after_shutdown_and_suspend() {
+        for shutdown in [false, true] {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+            let identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let handle =
+                crate::context::context_create_on(&bi, &identity, verify_test_params_json())
+                    .await
+                    .expect("context_create should succeed");
+            let context_id = handle.context_id();
+            let present = authoritative_leaves(&bi, &context_id)[0];
+
+            crate::runtime::ensure_registered(&bi, &handle).expect("ucan state registered");
+            crate::runtime::with_context(&bi, &context_id, |rt| {
+                rt.core.event_log.push_leaf_raw([0xABu8; 32]);
+                Ok(())
+            })
+            .expect("seed succeeds");
+
+            if shutdown {
+                bi.core.shutdown();
+            } else {
+                bi.core.suspend().expect("suspend");
+            }
+
+            let absence_claim = serde_json::json!({
+                "type": "absence", "event_hash": hex::encode(present),
+            })
+            .to_string();
+            let msg = match event_log_verify_on(&bi, &handle, absence_claim).await {
+                Ok(proof) => panic!(
+                    "a not-ready instance (shutdown={shutdown}) must fail closed, got verified={}",
+                    proof.verified
+                ),
+                Err(err) => format!("{err}"),
+            };
+            assert!(
+                msg.contains(codes::CTX_2138),
+                "shutdown={shutdown}: expected SCP-CTX-2138, got: {msg}"
+            );
+        }
     }
 }

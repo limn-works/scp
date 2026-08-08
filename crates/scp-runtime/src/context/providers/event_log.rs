@@ -1776,4 +1776,171 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].event_type, EventType::MemberLeft);
     }
+
+    // -----------------------------------------------------------------------
+    // Proof seam — the single authoritative snapshot (GitHub #1933)
+    //
+    // `rebuild_event_log_for_proof` is the ONE call every Merkle answer is
+    // derived from. These tests pin its two security-critical properties: the
+    // snapshot reconstructs the live tree exactly, and it FAILS CLOSED on an
+    // unknown log rather than presenting one as empty.
+    // -----------------------------------------------------------------------
+
+    /// Seeds a provider with `n` lifecycle events.
+    async fn provider_with_events(ctx_id: &[u8; 32], n: u64) -> MerkleEventLogProvider {
+        use crate::context::builder::ContextEventLogProvider;
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(ctx_id).await.unwrap();
+        for i in 0..n {
+            let event_type = if i == 0 {
+                EventType::ContextCreated
+            } else {
+                EventType::MemberJoined
+            };
+            provider
+                .append_event(
+                    ctx_id,
+                    event_type,
+                    "did:example:actor",
+                    EventPayload::default(),
+                    1_700_000_000 + i,
+                )
+                .await
+                .unwrap();
+        }
+        provider
+    }
+
+    /// The replayed snapshot must reconstruct the live tree byte-for-byte —
+    /// root, leaf count AND leaf hashes. This is the invariant that makes a
+    /// proof generated from the snapshot a statement about the real log.
+    #[tokio::test]
+    async fn snapshot_reconstructs_the_live_tree_exactly() {
+        use crate::context::builder::ContextEventLogProvider;
+        let ctx_id = [31u8; 32];
+        let provider = provider_with_events(&ctx_id, 4).await;
+
+        let log = provider.rebuild_event_log_for_proof(&ctx_id).unwrap();
+
+        assert_eq!(scp_event_log::tree::event_count(&log), 4);
+        assert_eq!(
+            scp_event_log::tree::root(&log),
+            provider.event_log_merkle_root(&ctx_id).unwrap(),
+            "the proof snapshot must reconstruct the live tree's root byte-for-byte"
+        );
+        assert_eq!(
+            scp_event_log::tree::root(&log),
+            provider.merkle_root(&ctx_id).unwrap()
+        );
+
+        let expected: Vec<[u8; 32]> = provider
+            .entries(&ctx_id)
+            .unwrap()
+            .iter()
+            .map(|e| scp_event_log::tree::leaf_hash(e).unwrap())
+            .collect();
+        assert_eq!(log.leaves(), expected.as_slice());
+    }
+
+    /// Every answer derived from ONE snapshot agrees with every other: each
+    /// inclusion proof, the absence proof, and the `(leaf_count, root)`
+    /// commitment all carry the same root. This is what lets a relying party
+    /// pin a proof against the commitment reported beside it.
+    #[tokio::test]
+    async fn one_snapshot_yields_mutually_consistent_answers() {
+        use crate::context::builder::ContextEventLogProvider;
+        let ctx_id = [32u8; 32];
+        let provider = provider_with_events(&ctx_id, 3).await;
+
+        let log = provider.rebuild_event_log_for_proof(&ctx_id).unwrap();
+        let root = scp_event_log::tree::root(&log);
+        let leaf_count = scp_event_log::tree::event_count(&log);
+
+        for leaf_index in 0..leaf_count {
+            let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index).unwrap();
+            assert_eq!(proof.root, root);
+            assert!(scp_event_log::proof::verify_inclusion(&proof));
+        }
+
+        let absence = scp_event_log::proof::prove_absence(&log, &[0xEEu8; 32]).unwrap();
+        assert_eq!(absence.root, root);
+        assert_eq!(absence.leaf_count, leaf_count);
+        assert_eq!(absence.query_hash, [0xEEu8; 32]);
+    }
+
+    /// An absence claim for an event that IS in the authoritative log must be
+    /// rejected, not "proved".
+    #[tokio::test]
+    async fn absence_of_a_present_event_is_rejected() {
+        use crate::context::builder::ContextEventLogProvider;
+        let ctx_id = [33u8; 32];
+        let provider = provider_with_events(&ctx_id, 3).await;
+
+        let log = provider.rebuild_event_log_for_proof(&ctx_id).unwrap();
+        let present =
+            scp_event_log::tree::leaf_hash(&provider.entries(&ctx_id).unwrap()[1]).unwrap();
+
+        let err = scp_event_log::proof::prove_absence(&log, &present)
+            .expect_err("absence of a present event must be rejected");
+        assert!(
+            matches!(
+                err,
+                scp_event_log::EventLogError::AbsenceProofForPresentEvent
+            ),
+            "expected AbsenceProofForPresentEvent, got: {err}"
+        );
+    }
+
+    /// #1933 — `None` from the provider means UNKNOWN, not empty. A DESTROYED
+    /// log (actor shutdown, create-rollback) must not yield a snapshot at all,
+    /// so no "verified" absence proof can be built for an event it previously
+    /// recorded.
+    #[tokio::test]
+    async fn destroyed_log_fails_closed_instead_of_snapshotting_empty() {
+        use crate::context::builder::ContextEventLogProvider;
+        let ctx_id = [35u8; 32];
+        let provider = provider_with_events(&ctx_id, 3).await;
+
+        provider.destroy_event_log(&ctx_id).await.unwrap();
+        assert!(
+            provider.event_log_entries(&ctx_id).unwrap().is_none(),
+            "a destroyed log reports None (UNKNOWN), not Some(vec![])"
+        );
+
+        assert!(
+            provider.rebuild_event_log_for_proof(&ctx_id).is_err(),
+            "a destroyed log must fail closed, not snapshot as empty"
+        );
+    }
+
+    /// An EMPTY log is a distinct, honest state: `Ok(Some(vec![]))`. It
+    /// snapshots to a real zero-leaf tree (so a commitment is available) but
+    /// carries no absence proof (`EmptyLog`) — the caller can tell "nothing
+    /// recorded yet" from "log unknown", which is exactly the distinction a
+    /// forgeable false negative erases.
+    #[tokio::test]
+    async fn empty_log_is_distinguishable_from_an_unknown_log() {
+        use crate::context::builder::ContextEventLogProvider;
+        let ctx_id = [36u8; 32];
+        let provider = MerkleEventLogProvider::new();
+        provider.init_event_log(&ctx_id).await.unwrap();
+
+        assert!(
+            provider
+                .event_log_entries(&ctx_id)
+                .unwrap()
+                .is_some_and(|e| e.is_empty()),
+            "an initialised empty log is Some(vec![]), never None"
+        );
+
+        let log = provider.rebuild_event_log_for_proof(&ctx_id).unwrap();
+        assert_eq!(scp_event_log::tree::event_count(&log), 0);
+
+        let err = scp_event_log::proof::prove_absence(&log, &[0xEEu8; 32])
+            .expect_err("an empty log cannot carry an absence proof");
+        assert!(
+            matches!(err, scp_event_log::EventLogError::EmptyLog),
+            "expected EmptyLog, got: {err}"
+        );
+    }
 }

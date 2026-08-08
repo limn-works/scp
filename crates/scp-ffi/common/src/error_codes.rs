@@ -499,6 +499,30 @@ pub const CTX_2136: &str = "SCP-CTX-2136";
 ///
 /// Maps from `ContextError::NothingToRestore`.
 pub const CTX_2137: &str = "SCP-CTX-2137";
+/// Event-log verification could not reach the AUTHORITATIVE log — fail closed
+/// (GitHub #1933).
+///
+/// `event_log_verify` generates Merkle inclusion/absence proofs, and a proof is
+/// only meaningful against the context's authoritative event log (the
+/// supervisor's `MerkleEventLogProvider`, the same source `event_log_query`
+/// reads). This code marks a refusal to answer, raised when:
+///
+/// - the bridge instance is suspended or shut down (`check_ready`);
+/// - no supervisor / event-log provider is attached;
+/// - the provider reports **no log** for the context — `Ok(None)`, which means
+///   UNKNOWN, never "empty". A context whose log was destroyed on actor
+///   shutdown or create-rollback reports `None`, and an empty-but-live log
+///   reports `Ok(Some(vec![]))`.
+///
+/// The bridge MUST NOT fall back to any bridge-local tree in these cases:
+/// proving absence against a non-authoritative or unknown log is a forgeable
+/// FALSE NEGATIVE (a caller could "prove" an event absent that the
+/// authoritative log actually recorded).
+///
+/// Distinct from a proof-generation failure over a log the bridge *could* read
+/// (empty log, out-of-range leaf index, absence claimed for a present event) —
+/// those are honest answers and keep their existing per-bridge codes.
+pub const CTX_2138: &str = "SCP-CTX-2138";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.
