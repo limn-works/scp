@@ -212,13 +212,47 @@ impl CapabilityUri {
     ///   a set of capability name strings.
     #[must_use]
     pub fn is_within_ceiling<S: BuildHasher>(&self, ceiling: &HashSet<String, S>) -> bool {
-        // Exact match first (fast path).
-        if ceiling.contains(&self.capability_name()) {
-            return true;
-        }
-        // Check for wildcard: {resource}:* covers all actions on this resource.
-        ceiling.contains(&format!("{}:*", self.resource))
+        ucan_name_within_ceiling(&self.resource, &self.action, ceiling)
     }
+}
+
+/// THE ceiling-coverage relation, over a `{resource}:{action}` name pair and a
+/// ceiling projected to its UCAN name set.
+///
+/// [`CapabilityUri::is_within_ceiling`] is this function; so is the #2028
+/// genesis-ceiling-currency gate in `scp-runtime`
+/// (`context::state::check_genesis_ceiling_still_current`). Coverage is decided
+/// HERE, once, so an authorization decision and a gate that must agree with it
+/// cannot drift.
+///
+/// Deciding coverage on the NAME projection rather than on
+/// [`Capability`](crate::context::roles::Capability) enum-set membership is
+/// load-bearing in both directions:
+///
+/// - a `{resource}:*` entry is a first-class specced ceiling shape (§5.3.1.1
+///   shape 3) that covers every action on that resource; and
+/// - several BUILT-IN variants project onto a wildcard name — `OutletQueryAll`
+///   (`outlet_query:*`), `OutletCallAll` (`outlet_call:*`), `Bridging`
+///   (`bridging:*`) — so a built-in in the ceiling covers a concrete `Custom`
+///   entry in its family (`Custom("bridging:foo")`). Enum-set membership cannot
+///   see either relationship.
+///
+/// The §5.3.1.1 "no built-in-resource wildcard shadow" rule
+/// (`validate_custom_ceiling_entry`) is what keeps this sound: no `Custom`
+/// entry whose action is `*` may name a built-in resource, so a custom wildcard
+/// can never silently subsume a privileged built-in family.
+#[must_use]
+pub fn ucan_name_within_ceiling<S: BuildHasher>(
+    resource: &str,
+    action: &str,
+    ceiling: &HashSet<String, S>,
+) -> bool {
+    // Exact match first (fast path).
+    if ceiling.contains(&format!("{resource}:{action}")) {
+        return true;
+    }
+    // Wildcard: {resource}:* covers all actions on this resource.
+    ceiling.contains(&format!("{resource}:*"))
 }
 
 /// Returns `true` if ANY attestation in `att` carries an outlet stem

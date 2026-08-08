@@ -2161,13 +2161,28 @@ pub(crate) fn restore_governance_engine_from_snapshot(
 /// current-state transfer; it does NOT silently install the stale genesis
 /// default.
 ///
-/// Residual, stated honestly: a node running patched software could skip this
-/// check. That grants no privilege — a party authorized to execute `AddMember`
-/// in a `Governed`-ceiling context is by construction the party that can raise
-/// the ceiling through governance anyway, so the realistic threat this closes is
-/// an HONEST adder unknowingly onboarding stale, over-broad authority. Making
-/// the property joiner-verifiable requires the authenticated current-state
-/// transfer #2028 tracks.
+/// # Residuals, stated honestly
+///
+/// The gate stops only a LOWERING-AWARE adder. Three cases slip past it, none of
+/// which it can close from this seam:
+///
+/// 1. **A node running patched software** could skip the check outright.
+/// 2. **A node that joined AFTER the lowering** installs the (already stale)
+///    genesis ceiling as BOTH its `handle.params()` and its `role_state` — the
+///    two agree, so the gate passes vacuously and that node can go on onboarding
+///    further members with the stale wide ceiling.
+/// 3. **A peer that never applies the modification.**
+///    `apply_pending_ceiling_modification` is SDK-driven, not automatic on event
+///    receipt, so a peer that simply never calls it keeps a wide live ceiling and
+///    passes the gate.
+///
+/// None of the three grants privilege the actor did not already have — a party
+/// authorized to execute `AddMember` in a `Governed`-ceiling context is by
+/// construction the party that can RAISE the ceiling through governance anyway —
+/// so the realistic threat this closes is an HONEST, lowering-aware adder
+/// unknowingly onboarding stale, over-broad authority. Making the property
+/// joiner-verifiable (and closing cases 2 and 3) requires the authenticated
+/// current-state transfer #2028 tracks.
 ///
 /// # Direction
 ///
@@ -2175,8 +2190,12 @@ pub(crate) fn restore_governance_engine_from_snapshot(
 /// ceiling still COVERS every genesis entry. A pure WIDENING still admits joins
 /// — the joiner then installs the narrower genesis set, which grants no
 /// authority the context withholds (that residual staleness is #2028's scope,
-/// not a fail-open). Coverage is decided by [`ceiling_covers`], which implements
-/// the SAME relation the authorization layer enforces (see that function).
+/// not a fail-open). Coverage is decided by [`ceiling_covers`], which is a
+/// projection onto
+/// [`ucan_name_within_ceiling`](scp_protocol::crypto::ucan::capability::ucan_name_within_ceiling)
+/// — literally the function
+/// [`CapabilityUri::is_within_ceiling`](scp_protocol::crypto::ucan::CapabilityUri::is_within_ceiling)
+/// calls, so there is ONE coverage relation, not two that must be kept in sync.
 ///
 /// # Non-vacuity (the genesis value must really be this context's genesis)
 ///
@@ -2190,10 +2209,10 @@ pub(crate) fn restore_governance_engine_from_snapshot(
 /// context's authoritative handle, and the restore path builds that handle from
 /// the PERSISTED snapshot (never from a caller-supplied value).
 ///
-/// This function adds a second, independent detector for the same class. Under
-/// [`CeilingPolicy::Immutable`] the ceiling CANNOT change after creation —
-/// `ModifyCeiling` is refused outright unless the policy is
-/// [`CeilingPolicy::Governed`] (spec §5.3.2, enforced in
+/// This function adds a second detector for the same class — a cheap tripwire,
+/// NOT the guarantee. Under [`CeilingPolicy::Immutable`] the ceiling CANNOT
+/// change after creation — `ModifyCeiling` is refused outright unless the policy
+/// is [`CeilingPolicy::Governed`] (spec §5.3.2, enforced in
 /// `governance_helpers::execute_modify_ceiling`) — so for an `Immutable` context
 /// the live ceiling and the genesis ceiling are equal BY CONSTRUCTION. A live
 /// entry the genesis ceiling does not cover therefore proves the `genesis_params`
@@ -2203,10 +2222,26 @@ pub(crate) fn restore_governance_engine_from_snapshot(
 /// The check is deliberately scoped to `Immutable`: under `Governed` a widening
 /// (including a widening away from an empty genesis ceiling) is a legitimate,
 /// specced operation, so the same asymmetry there is real evolution rather than
-/// evidence of a fabricated handle. Note that a reconstructed
-/// `ContextParams::default()` carries `ceiling_policy: Immutable` — the
-/// `#[default]` variant — so the detector fires on precisely the fabricated-params
-/// case even when the real context is `Governed`.
+/// evidence of a fabricated handle. A reconstructed `ContextParams::default()`
+/// carries `ceiling_policy: Immutable` (the `#[default]` variant), so the common
+/// fabricated shape does land in the detector's scope.
+///
+/// It is a PARTIAL detector, and the two cases it misses are worth naming
+/// because neither is exotic:
+///
+/// - **Empty live ceiling.** A fabricated `ContextParams::default()` against an
+///   EMPTY live ceiling passes both directions vacuously — nothing is
+///   unexplained when there is nothing live to explain. An empty live ceiling is
+///   the MAXIMAL governed lowering, i.e. the most severe case.
+/// - **A fabrication that says `Governed`.** Any reconstructed params carrying
+///   `ceiling_policy: Governed` skip the detector entirely via the early return
+///   above.
+///
+/// Neither is exploitable today: after the restore path was changed to build its
+/// handle from the persisted snapshot, all four production `ContextHandle::new`
+/// sites source genuine params, so no fabricated `ContextParams` reaches this
+/// gate at all. That call-site property is the guarantee; this detector only
+/// catches a future call site that breaks it in the most common shape.
 ///
 /// # Errors
 ///
@@ -2218,10 +2253,15 @@ pub(crate) fn check_genesis_ceiling_still_current(
     live_ceiling: &scp_protocol::context::roles::CapabilityCeiling,
     site: &str,
 ) -> Result<(), ContextError> {
+    // Project both ceilings onto their UCAN name sets ONCE. Coverage is decided
+    // by `ceiling_covers`, which is `CapabilityUri::is_within_ceiling`'s own
+    // relation over exactly this projection.
+    let live_names = live_ceiling.to_ucan_string_set();
+
     // 1. The fail-OPEN direction: would the joiner install authority the context
     //    no longer grants?
     let stale = sorted_uncovered(genesis_params.ceiling.iter(), |cap| {
-        ceiling_covers(live_ceiling, cap)
+        ceiling_covers(&live_names, cap)
     });
     if !stale.is_empty() {
         return Err(ContextError::InvalidState(format!(
@@ -2241,11 +2281,13 @@ pub(crate) fn check_genesis_ceiling_still_current(
     if genesis_params.ceiling_policy != CeilingPolicy::Immutable {
         return Ok(());
     }
-    let genesis_ceiling = scp_protocol::context::roles::CapabilityCeiling::new(
-        genesis_params.ceiling.iter().cloned(),
-    );
+    let genesis_names: HashSet<String> = genesis_params
+        .ceiling
+        .iter()
+        .map(Capability::ucan_capability_name)
+        .collect();
     let unexplained = sorted_uncovered(live_ceiling.iter(), |cap| {
-        ceiling_covers(&genesis_ceiling, cap)
+        ceiling_covers(&genesis_names, cap)
     });
     if unexplained.is_empty() {
         return Ok(());
@@ -2280,45 +2322,44 @@ fn sorted_uncovered<'a>(
     out
 }
 
-/// The ceiling-coverage relation this gate compares against — the same relation
-/// the AUTHORIZATION layer actually enforces.
+/// Does `ceiling_names` cover `capability`?
 ///
+/// This is not a second coverage relation — it projects `capability` onto its
+/// `{resource}:{action}` UCAN name and defers to
+/// [`ucan_name_within_ceiling`](scp_protocol::crypto::ucan::capability::ucan_name_within_ceiling),
+/// the SINGLE relation that also backs
+/// [`CapabilityUri::is_within_ceiling`](scp_protocol::crypto::ucan::CapabilityUri::is_within_ceiling),
+/// i.e. what the authorization layer actually enforces. Callers pass a ceiling
+/// already projected with
+/// [`CapabilityCeiling::to_ucan_string_set`](scp_protocol::context::roles::CapabilityCeiling::to_ucan_string_set)
+/// so the projection is paid once per gate call, not once per entry.
+///
+/// Deciding this on
 /// [`CapabilityCeiling::contains`](scp_protocol::context::roles::CapabilityCeiling::contains)
-/// implements implicit coverage only for the built-in outlet wildcards
-/// (`OutletQueryAll` ⊇ `OutletQuery(id)`, `OutletCallAll` ⊇ `OutletCall(id)`);
-/// for [`Capability::Custom`] it is exact set membership. The authorization layer
-/// is broader: `CapabilityUri::is_within_ceiling` accepts an explicit
-/// `{resource}:*` entry as covering every action on that resource, and
-/// `{resource}:*` is a first-class specced ceiling entry (§5.3.1.1 shape 3).
+/// instead would not be a conservative simplification — it would be a live
+/// defect in two distinct ways, because `contains` sees only exact enum-set
+/// membership plus the two built-in outlet wildcards:
 ///
-/// Using bare `contains` here would therefore NOT be a conservative
-/// simplification — it would be a live defect. A legitimate governed WIDENING
-/// from `Custom("data:read")` to `Custom("data:*")` leaves the live ceiling
-/// genuinely covering genesis, yet bare `contains` marks `data:read` stale and
-/// refuses EVERY subsequent join — permanently, because `params.ceiling` is
-/// immutable and nothing can ever re-narrow the live ceiling back to an exact
-/// match. Matching `is_within_ceiling` keeps the gate sound in the direction that
-/// matters (a joiner installing `data:read` gains nothing a live `data:*` does not
-/// already grant) without bricking the context.
+/// - a legitimate governed WIDENING from `Custom("data:read")` to
+///   `Custom("data:*")` leaves the live ceiling genuinely covering genesis, yet
+///   `contains` marks `data:read` stale; and
+/// - a live BUILT-IN whose name projection is a wildcard — `Bridging`
+///   (`bridging:*`), `OutletQueryAll`, `OutletCallAll` — covers a concrete
+///   `Custom` entry in its family (`Custom("bridging:foo")` is a grammar-valid
+///   §5.3.1.1 entry: the built-in-wildcard-shadow rule fires only when the
+///   ACTION is `*`), yet `contains` sees no match.
 ///
-/// The wildcard arm can only ever match a genuinely custom resource family: the
-/// §5.3.1.1 "no built-in-resource wildcard shadow" rule (enforced in
-/// `validate_custom_ceiling_entry`) rejects any `Custom("{builtin}:*")` entry, so
-/// no synthesized wildcard can silently subsume a built-in capability family.
-fn ceiling_covers(
-    ceiling: &scp_protocol::context::roles::CapabilityCeiling,
-    capability: &Capability,
-) -> bool {
-    if ceiling.contains(capability) {
-        return true;
-    }
-    // `{resource}:*` coverage. A wildcard entry is covered only by itself, which
-    // the exact test above already decided — so only concrete actions reach here.
+/// Either miss refuses EVERY subsequent join — permanently, because
+/// `params.ceiling` is immutable and nothing can re-narrow the live ceiling back
+/// to an exact match — while the authorization layer keeps granting the
+/// capability. The gate must agree with the layer it is protecting.
+fn ceiling_covers(ceiling_names: &HashSet<String>, capability: &Capability) -> bool {
     let (resource, action) = capability.ucan_resource_action();
-    if action == "*" {
-        return false;
-    }
-    ceiling.contains(&Capability::Custom(format!("{resource}:*")))
+    scp_protocol::crypto::ucan::capability::ucan_name_within_ceiling(
+        resource.as_ref(),
+        action.as_ref(),
+        ceiling_names,
+    )
 }
 
 /// Validates governance model parameters at context creation time.
@@ -2843,6 +2884,66 @@ mod genesis_ceiling_currency_tests {
         let live = CapabilityCeiling::new([Capability::MessagesRead]);
         check_genesis_ceiling_still_current(&genesis, &live, "site")
             .expect("a governed widening from an empty ceiling is legitimate");
+    }
+
+    /// A BUILT-IN live entry whose UCAN projection is a `{resource}:*` wildcard
+    /// covers a concrete `Custom` genesis entry in the same resource family.
+    ///
+    /// Three built-in variants project onto a wildcard UCAN name —
+    /// `OutletQueryAll` (`outlet_query:*`), `OutletCallAll` (`outlet_call:*`) and
+    /// `Bridging` (`bridging:*`). The first two are unreachable as a divergence:
+    /// a `Custom` ceiling entry's resource token must be kebab-case
+    /// (`validate_custom_ceiling_entry`), and `outlet_query` / `outlet_call`
+    /// carry underscores, so no `Custom` can ever project onto those resources.
+    /// `bridging` IS a kebab token, so `Custom("bridging:foo")` is a grammar-valid
+    /// ceiling entry (the §5.3.1.1 built-in-wildcard-shadow rule fires only when
+    /// the ACTION is `*`) — and it is the one case where the two relations can
+    /// disagree.
+    ///
+    /// This test pins them together. Deciding coverage by enum-set membership
+    /// (`ceiling.contains(&Custom("bridging:*"))`) cannot see the built-in
+    /// `Bridging` variant, so it would mark `bridging:foo` stale and refuse EVERY
+    /// subsequent join — permanently, because `params.ceiling` is immutable and
+    /// nothing can re-narrow the live ceiling back to an exact match. The
+    /// authorization layer, meanwhile, grants `bridging:foo` to anyone the live
+    /// `bridging:*` covers. The gate MUST agree with the authorization layer.
+    #[test]
+    fn builtin_wildcard_live_entry_covers_a_custom_genesis_entry_in_its_family() {
+        use scp_protocol::crypto::ucan::capability::CapabilityUri;
+
+        let custom_bridging = Capability::Custom("bridging:foo".to_owned());
+
+        // 1. Reachability: this IS a well-formed ceiling entry.
+        custom_bridging
+            .validate_as_ceiling_entry()
+            .expect("Custom(\"bridging:foo\") is a grammar-valid §5.3.1.1 ceiling entry");
+
+        // 2. Ground truth: the AUTHORIZATION layer says a live `Bridging` covers
+        //    it (`Bridging` projects to `bridging:*`).
+        let live = CapabilityCeiling::new([Capability::Bridging]);
+        let live_names = live.to_ucan_string_set();
+        let (resource, action) = custom_bridging.ucan_resource_action();
+        assert!(
+            CapabilityUri::new("ctx", resource.as_ref(), action.as_ref())
+                .is_within_ceiling(&live_names),
+            "precondition: is_within_ceiling grants bridging:foo under a live bridging:*",
+        );
+        assert!(
+            !live.contains(&custom_bridging)
+                && !live.contains(&Capability::Custom("bridging:*".to_owned())),
+            "precondition: neither the concrete entry nor a synthesized \
+             Custom(\"bridging:*\") is in the live enum set — enum-set membership \
+             cannot see this coverage",
+        );
+
+        // 3. The gate must agree. Refusing here would brick every future join in
+        //    a context whose live ceiling still grants strictly more.
+        let genesis = params(vec![custom_bridging], CeilingPolicy::Governed);
+        check_genesis_ceiling_still_current(&genesis, &live, "site").expect(
+            "the gate must decide coverage by the SAME relation the authorization \
+             layer enforces — a live built-in `Bridging` covers a genesis \
+             Custom(\"bridging:foo\")",
+        );
     }
 
     /// An `Immutable` context whose live ceiling equals genesis passes both
