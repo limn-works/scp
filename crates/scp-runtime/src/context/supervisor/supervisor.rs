@@ -20760,6 +20760,88 @@ mod tests {
         }
     }
 
+    /// The RESTORE peer of the B8 create-time precheck. `restore_context` drives
+    /// the rebuilt handle to `Active` unconditionally, so admitting a terminal
+    /// (`Expired` / `Closed` / `Tombstoned`) snapshot resurrects a finished
+    /// context as a live one — undoing closure/expiry and letting the next
+    /// persist overwrite the terminal state the snapshot records.
+    ///
+    /// `restore_all_contexts` (process restart) and `respawn_from_snapshot` (the
+    /// watchdog) each carried their own `state != Active` check, but the
+    /// `LifecycleCommand::RestoreContext` dispatch arm — which is what ALL THREE
+    /// FFI bridges reach, i.e. every SDK — had none. This drives that arm through
+    /// the public `Supervisor::restore_context`, so it FAILS if the precondition
+    /// is moved back out of the primitive and into its callers.
+    /// Restore fixture: [`import_test_snapshot`] with the encrypted routing
+    /// variant its reconstructed mode requires (§9.10.4 — `restore_context`
+    /// rejects a snapshot whose persisted `routing` disagrees with the mode it
+    /// rebuilds). Without this the restore fails on the routing-agreement check
+    /// before reaching anything under test, which would make the terminal-state
+    /// cases below pass for the wrong reason.
+    fn restorable_test_snapshot(
+        context_id: &str,
+        creator: &str,
+    ) -> crate::context::state::ContextSnapshot {
+        let mut snap = import_test_snapshot(context_id, creator);
+        snap.routing = crate::context::actor::state::ContextRouting::for_mode(false, [0x5a_u8; 32]);
+        snap
+    }
+
+    #[tokio::test]
+    async fn restore_after_terminal_snapshot_is_refused() {
+        use scp_protocol::context::ContextState;
+
+        let creator = "did:dht:z6MkRestoreTerminalCreator";
+        let ctx_id = "restore-terminal-precondition-ctx";
+
+        // Counter-case FIRST: the SAME fixture in `Active` restores and registers
+        // a live actor. This is what makes the terminal cases probative — without
+        // it they could pass on any unrelated restore failure.
+        {
+            let map = MapPersistence::default();
+            map.contexts
+                .insert(ctx_id.to_owned(), restorable_test_snapshot(ctx_id, creator));
+            let clock: Arc<dyn Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+            let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
+            sup.restore_context(ctx_id)
+                .await
+                .expect("an Active snapshot restores — the fixture is otherwise sound");
+            assert!(
+                sup.lookup(ctx_id).is_some(),
+                "the Active restore registers a live actor"
+            );
+        }
+
+        for terminal in [
+            ContextState::Expired,
+            ContextState::Closed,
+            ContextState::Tombstoned,
+        ] {
+            let map = MapPersistence::default();
+            let mut snap = restorable_test_snapshot(ctx_id, creator);
+            snap.state = terminal.clone();
+            map.contexts.insert(ctx_id.to_owned(), snap);
+
+            let clock: Arc<dyn Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+            let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
+
+            let err = sup.restore_context(ctx_id).await.expect_err(&format!(
+                "restoring a durable {terminal:?} snapshot must be REFUSED — restore drives \
+                 the handle to Active, so it would resurrect the context"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("RESURRECT") && msg.contains(&format!("{terminal:?}")),
+                "the refusal must name the resurrection it prevented and the snapshot state, \
+                 got: {msg}"
+            );
+            assert!(
+                sup.lookup(ctx_id).is_none(),
+                "a refused restore must leave NO registered actor for {terminal:?}"
+            );
+        }
+    }
+
     /// B8 counter-case: an ABSENT snapshot (no durable state for the id — the
     /// standing-context / fresh-create path) is NOT blocked by the terminal
     /// precheck. The create proceeds past the precheck and succeeds.

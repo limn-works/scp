@@ -2921,13 +2921,19 @@ async fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
 /// previously had to remember to transition it. Owning both steps in one place
 /// means a new call site cannot get either wrong.
 ///
+/// Driving to `Active` unconditionally is precisely why the anti-resurrection
+/// precondition also lives here: a terminal (`Closed` / `Expired` /
+/// `Tombstoned`) snapshot must be refused BEFORE the handle is built, or restore
+/// silently undoes closure. See the check on `ctx_snapshot.state` below.
+///
 /// # Errors
 ///
 /// Returns [`ContextError::PersistenceFailed`] if no persisted state
-/// exists. Returns [`ContextError::MembershipFailed`] if the context
-/// cannot be inserted (already registered). Returns
-/// [`ContextError::InvalidTransition`] if the restored snapshot's state does not
-/// admit a transition to `Active`.
+/// exists. Returns [`ContextError::InvalidState`] if the persisted snapshot
+/// records a state other than [`ContextState::Active`] (restoring it would
+/// resurrect a closed / expired / tombstoned context). Returns
+/// [`ContextError::MembershipFailed`] if the context cannot be inserted
+/// (already registered).
 #[tracing::instrument(skip_all, fields(context_id))]
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)] // Bootstrap entry — see `create_context` rationale.
@@ -2949,6 +2955,34 @@ pub async fn restore_context(
 
     let (mut ctx_snapshot, broadcast_ctx) =
         load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
+
+    // Anti-resurrection precondition, on the PRIMITIVE.
+    //
+    // Restoring drives the handle to `Active` unconditionally (see below), so
+    // without this a `Closed` / `Expired` / `Tombstoned` snapshot comes back as a
+    // LIVE context: closure and expiry are undone, and the terminal state the
+    // snapshot records is silently overwritten by the next persist. Two callers
+    // already refused that — `restore_all_contexts` skips non-`Active` snapshots
+    // and `Supervisor::respawn_from_snapshot` refuses to respawn a terminal one —
+    // but the `LifecycleCommand::RestoreContext` dispatch arm, which is what all
+    // three FFI bridges reach, had no check at all. Any SDK could resurrect a
+    // closed context.
+    //
+    // The check belongs HERE for the same reason the handle is built here: the
+    // snapshot is this context's single source of truth, this function already
+    // holds it, and a precondition that lives only in some callers is a
+    // precondition a new call site gets wrong. The two existing caller checks
+    // remain as fast-paths — `restore_all_contexts` wants to SKIP a terminal
+    // snapshot mid-sweep rather than log a failure per context, and
+    // `respawn_from_snapshot` decides dormancy before spending respawn budget.
+    if ctx_snapshot.state != scp_protocol::context::ContextState::Active {
+        return Err(ContextError::InvalidState(format!(
+            "restore refused: the persisted snapshot for '{context_id}' records state {:?}, not \
+             Active. Restoring drives the context handle to Active, so admitting a terminal \
+             snapshot would RESURRECT a closed/expired/tombstoned context as a live one.",
+            ctx_snapshot.state
+        )));
+    }
 
     // The context's authoritative handle, built from the PERSISTED params — the
     // single source of truth for this context's authority envelope (see the
