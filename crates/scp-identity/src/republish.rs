@@ -19,7 +19,8 @@
 //! Exponential backoff on publish failure: 30s, 1m, 2m, 4m, 8m, 16m, capped
 //! at 30 minutes. After 6 consecutive failures, a [`DhtPublishDegraded`] or
 //! [`RelayPublishDegraded`] warning is emitted via the respective warning
-//! callback.
+//! callback. A relay publish that reaches only SOME of the bound relays warns
+//! immediately instead — see the relay republish loop's docs.
 //!
 //! # Anti-Segmentation Invariant (§3.10.6)
 //!
@@ -35,7 +36,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::IdentityError;
-use super::resolution::did_routing_id;
 use scp_dht::DhtClient;
 use scp_protocol::envelope::did_record::{DidRecordBuildError, DidRecordV1};
 
@@ -94,34 +94,73 @@ const LAYER_DISABLED_WARNING: &str =
 // RelayPublisher trait
 // ---------------------------------------------------------------------------
 
+/// The result of one relay PUBLISH fan-out: how many of the relays that were
+/// attempted actually accepted the DID record (§3.10.2 multi-relay publishing).
+///
+/// # Why the outcome is not collapsed to `()`
+///
+/// Multi-relay publishing is best-effort for *availability* — one relay
+/// accepting means the record is live — but "at least one accepted" and "every
+/// relay accepted" are different security states. A single relay that silently
+/// rejects every PUBLISH is the §3.10.8 intra-relay suppression signature:
+/// resolvers that consult only that relay never see the record, while the
+/// publisher sees a plain success and never retries or warns. Returning the
+/// counts lets the relay republish loop distinguish the two and surface a
+/// partial accept instead of swallowing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayPublishOutcome {
+    /// Relays that accepted the PUBLISH.
+    ///
+    /// In an `Ok` result this is always `>= 1`: zero accepts is
+    /// [`IdentityError::RelayPublishFailed`], never a success.
+    pub accepted: usize,
+    /// Relays the PUBLISH was attempted against — the bound relay set at the
+    /// moment of the call. Always `>= accepted`.
+    pub attempted: usize,
+}
+
+impl RelayPublishOutcome {
+    /// Every attempted relay accepted the record — the only fully healthy state.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.accepted >= self.attempted
+    }
+
+    /// Relays that were attempted but did not accept.
+    #[must_use]
+    pub const fn rejected(&self) -> usize {
+        self.attempted.saturating_sub(self.accepted)
+    }
+}
+
 /// Abstraction over SCP relay PUBLISH operations for DID documents (§3.10.2).
 ///
-/// Production implementations wrap the relay client from `scp-transport`
-/// (`TransportRelayPublisher`). `InMemoryRelayPublisher` (test-harness-only,
-/// gated behind `#[cfg(any(test, feature = "testing"))]`) provides a test
-/// implementation that records all PUBLISH operations for assertion.
-///
 /// `scp-identity` defines the trait; `scp-transport` implements the production
-/// [`TransportRelayPublisher`]. This avoids a direct dependency from
-/// `scp-identity` to `scp-transport`.
+/// `TransportRelayPublisher`. This avoids a direct dependency from
+/// `scp-identity` to `scp-transport`. `InMemoryRelayPublisher`
+/// (test-harness-only, gated behind `#[cfg(any(test, feature = "testing"))]`)
+/// records all PUBLISH operations for assertion.
 ///
 /// # Why the contract carries a [`DidRecordV1`], not `&[u8]`
 ///
-/// The DID relay blob MUST be the DID-record frame (§9.10.12) that carries the
-/// full BEP44 `(public_key, seq, signature, value)` — not the bare DID-document
+/// **This is the authoritative statement of the frame-contract invariant; other
+/// sites point here rather than restate it.**
+///
+/// The DID relay blob MUST be the DID-record frame (§9.10.12) carrying the full
+/// BEP44 `(public_key, seq, signature, value)` — not the bare DID-document
 /// bytes. An earlier opaque `blob: &[u8]` contract let a caller pass bare
 /// `document_bytes`, which silently **dropped the BEP44 signature and sequence**
-/// (an api-design review flagged the opaque contract as exactly that footgun, and
-/// it caused a heal-arm bare-bytes bug too). By taking a `&DidRecordV1` — a type
-/// that can only be built through the validating [`DidRecordV1::try_new`] — the
-/// signature and sequence are *structurally* part of what is published, and
-/// unframed bytes are **unrepresentable**. Frame-wrapping happens in exactly one
-/// place: the implementation calls [`DidRecordV1::encode`] on the record it is
-/// handed (SCP-RELAYRES-004).
+/// (it caused a heal-arm bare-bytes bug too). Taking a `&DidRecordV1` — a type
+/// that can only be built through the validating [`DidRecordV1::try_new`] —
+/// makes the signature and sequence *structurally* part of what is published,
+/// and unframed bytes **unrepresentable**. The same discipline governs the
+/// address: the routing ID is derived from the frame's own key
+/// ([`did_record_routing_id`](crate::did_record_routing_id)) rather than passed
+/// in, so a frame published at a mismatched routing ID is equally
+/// unrepresentable (SCP-RELAYRES-004).
 pub trait RelayPublisher: Send + Sync {
-    /// Publishes a DID-record frame to SCP relays at the routing ID **derived
-    /// from the frame's own key** (not a caller argument — see below), with the
-    /// given TTL.
+    /// Publishes a DID-record frame to SCP relays at the routing ID derived from
+    /// the frame's own key, with the given TTL.
     ///
     /// Corresponds to the PUBLISH operation defined in ADR-004 (§3.10.2):
     /// ```text
@@ -134,61 +173,34 @@ pub trait RelayPublisher: Send + Sync {
     ///
     /// The implementation [`encode`](DidRecordV1::encode)s `record` into its
     /// canonical frame bytes and publishes those bytes — never the bare
-    /// `record.value()` — at the DID `routing_id` **derived from the frame's own
-    /// key** ([`did_record_routing_id`]). The routing ID is not a caller argument:
-    /// a DID record can only be published at the one routing ID its
-    /// `public_key` binds to (§9.10.12 DID→`routing_id` binding), so a valid frame
-    /// published at a mismatched routing ID is unrepresentable — the same
-    /// misuse-resistance discipline that made bare bytes unrepresentable.
-    /// Implementations SHOULD publish to the identity's own relays plus bootstrap
-    /// relays from the fallback relay list (§18.5.1).
+    /// `record.value()`. Implementations SHOULD publish to the identity's own
+    /// relays plus bootstrap relays from the fallback relay list (§18.5.1). See
+    /// the trait docs for why neither the blob nor the address is a free
+    /// parameter.
     ///
     /// # Arguments
     ///
-    /// * `blob_ttl` — TTL in seconds (604800 for DID documents).
+    /// * `blob_ttl_secs` — TTL in seconds (604800 for DID documents).
     /// * `record` — The DID-record frame carrying the BEP44
     ///   `(public_key, seq, signature, value)` (§9.10.12).
     ///
+    /// # Returns
+    ///
+    /// A [`RelayPublishOutcome`] reporting how many attempted relays accepted.
+    /// A partial accept is a **success** for availability but is reported so the
+    /// caller can surface it (§3.10.8); it is never silently collapsed to a
+    /// plain `Ok(())`.
+    ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::RelayPublishFailed`] if the publish fails.
+    /// Returns [`IdentityError::RelayPublishFailed`] if no relay accepted the
+    /// record — including when no relay is bound at all (fail-closed; never a
+    /// phantom success).
     fn publish(
         &self,
-        blob_ttl: u64,
+        blob_ttl_secs: u64,
         record: &DidRecordV1,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send;
-}
-
-/// The DID `routing_id` a DID-record frame MUST be published at, and resolved
-/// from: `SHA-256("scp:did:" || did:dht(record.public_key()))` (§3.10.2 routing
-/// derivation, §9.10.12 DID→`routing_id` binding).
-///
-/// Deriving the routing ID from the frame's own key — rather than accepting it
-/// as an independent argument — makes a frame/`routing_id` mismatch
-/// **unrepresentable**: a frame can only ever be published at the single routing
-/// ID its `public_key` binds to. The whole relay DID-record path is
-/// `did:dht`-specific (§9.10.12).
-///
-/// # The single source of truth for these bytes
-///
-/// This is the **one** derivation of the DID→`routing_id` bytes in the system.
-/// Both halves of the security control call it, and neither re-inlines it:
-///
-/// - the WRITE path — `TransportRelayPublisher` (SCP-RELAYRES-004) — to choose
-///   the PUBLISH address;
-/// - the relay ADMISSION check — `classify_did_record_frame` and
-///   `DidSlotRegistry::classify_stored_frame` (SCP-RELAYRES-003) — to re-derive
-///   the binding a candidate frame must satisfy.
-///
-/// The two MUST agree byte-for-byte forever: were they to drift, every self-DID
-/// republish would be rejected as a binding mismatch by every validating relay
-/// (a silent, total availability failure for DID resolution). Sharing one
-/// function makes that agreement structural rather than a convention that
-/// independent copies could quietly violate. Tests deliberately keep their own
-/// independent recomposition as an oracle; production code never does.
-#[must_use]
-pub fn did_record_routing_id(record: &DidRecordV1) -> [u8; 32] {
-    did_routing_id(&crate::did_from_ed25519_public_key(record.public_key()))
+    ) -> impl Future<Output = Result<RelayPublishOutcome, IdentityError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,25 +269,29 @@ impl InMemoryRelayPublisher {
 impl RelayPublisher for InMemoryRelayPublisher {
     fn publish(
         &self,
-        blob_ttl: u64,
+        blob_ttl_secs: u64,
         record: &DidRecordV1,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+    ) -> impl Future<Output = Result<RelayPublishOutcome, IdentityError>> + Send {
         // Derive the routing_id from the frame's own key (§9.10.12 binding) —
         // exactly as a real publisher does — and record the encoded FRAME bytes,
         // what a real relay would store, so tests decode `blob` back via
         // `DidRecordV1::decode` and confirm the full `(public_key, seq, signature,
-        // value)` reached the wire, never the bare document bytes.
-        let routing_id = did_record_routing_id(record);
+        // value)` reached the wire.
+        let routing_id = crate::did_record_routing_id(record);
         let blob = record.encode();
         async move {
             let mut publishes = self.publishes.lock().await;
             publishes.push(RecordedRelayPublish {
                 routing_id,
-                blob_ttl,
+                blob_ttl: blob_ttl_secs,
                 blob,
             });
             drop(publishes);
-            Ok(())
+            // The recorder models a single always-accepting relay.
+            Ok(RelayPublishOutcome {
+                accepted: 1,
+                attempted: 1,
+            })
         }
     }
 }
@@ -374,6 +390,17 @@ impl RepublishConfig {
         }
     }
 
+    /// Whether the §3.10.6 layer-disabled warning callback is wired.
+    ///
+    /// §3.10.6 requires that disabling a resolution layer be accompanied by a
+    /// warning. A config built WITHOUT a callback can disable a layer silently,
+    /// so a caller that constructs configs on a production path can assert this
+    /// is `true` and make the mandate mechanical rather than a convention.
+    #[must_use]
+    pub const fn has_layer_disabled_callback(&self) -> bool {
+        self.layer_disabled_callback.is_some()
+    }
+
     /// Returns whether DHT publishing is enabled.
     #[must_use]
     pub const fn is_dht_enabled(&self) -> bool {
@@ -412,14 +439,26 @@ impl RepublishConfig {
 // Warning types
 // ---------------------------------------------------------------------------
 
-/// Information needed to republish a DID document.
+/// A signed BEP44 DID record: everything needed to (re)publish a DID document
+/// to either resolution layer.
+///
+/// This is the OUTPUT of the signing step (`DidMethod::publish`), never
+/// something reconstructed from a storage or network read-back — so both layers
+/// receive byte-identical `(value, signature, sequence)` (§3.10.5).
+///
+/// # There is no `did` field
+///
+/// The DID is not stored alongside `public_key`; it is *derived* from it by
+/// [`did`](Self::did). Two independent fields that MUST agree are two fields
+/// that can disagree — and since the wire address (`routing_id`) is derived from
+/// `public_key`, a stored-but-stale `did` would be a second, silently divergent
+/// answer to "whose record is this?". Deriving keeps exactly one answer.
 #[derive(Debug, Clone)]
 pub struct RepublishEntry {
-    /// The DID string being republished.
-    pub did: String,
-    /// The 32-byte Ed25519 public key (derived from the DID).
+    /// The 32-byte Ed25519 identity public key. The DID, and the relay
+    /// `routing_id`, are both derived from this.
     pub public_key: [u8; 32],
-    /// The serialized DID document bytes.
+    /// The serialized DID document bytes (the BEP44 `value`).
     pub document_bytes: Vec<u8>,
     /// The 64-byte Ed25519 signature for BEP44.
     pub signature: [u8; 64],
@@ -428,13 +467,18 @@ pub struct RepublishEntry {
 }
 
 impl RepublishEntry {
+    /// The `did:dht` string this record belongs to, derived from
+    /// [`public_key`](Self::public_key).
+    #[must_use]
+    pub fn did(&self) -> String {
+        crate::did_from_ed25519_public_key(&self.public_key)
+    }
+
     /// Wraps this entry's BEP44 `(public_key, seq, signature, value)` into the
     /// DID-record relay frame (§9.10.12) that the relay layer stores.
     ///
-    /// This is the single place the relay-republish path turns an entry into a
-    /// publishable frame: the [`relay_republish_loop`] builds the frame once via
-    /// this method before it publishes, so the loop can NEVER publish bare
-    /// `document_bytes` (which would drop the signature and sequence).
+    /// The single place the relay-republish path turns an entry into a
+    /// publishable frame (see [`RelayPublisher`] for the frame contract).
     ///
     /// # Errors
     ///
@@ -463,13 +507,24 @@ pub struct DhtPublishDegraded {
 /// Callback type for degraded warnings.
 pub type WarningCallback = Arc<dyn Fn(DhtPublishDegraded) + Send + Sync>;
 
-/// A warning event emitted when relay publishing has degraded.
+/// A warning event emitted when relay publishing has degraded — either it is
+/// failing outright, or it is only *partially* reaching the bound relay set.
 #[derive(Debug, Clone)]
 pub struct RelayPublishDegraded {
-    /// The DID that failed to publish to relays.
+    /// The DID whose relay publishing degraded.
     pub did: String,
-    /// Number of consecutive relay publish failures.
+    /// Number of consecutive relay republish cycles that did not reach EVERY
+    /// bound relay. A total failure and a partial accept both count; only a
+    /// complete accept resets it.
     pub consecutive_failures: u32,
+    /// The per-relay breakdown of the most recent PUBLISH, when one exists.
+    ///
+    /// `Some` on a partial accept (the degradation IS the breakdown). `None`
+    /// when the publisher returned an error: no relay accepted, and the error
+    /// carries no structured per-relay counts — reporting a fabricated `0 of 0`
+    /// would assert "no relay was bound", which a total rejection by N bound
+    /// relays is not. Absence is the honest answer.
+    pub last_outcome: Option<RelayPublishOutcome>,
 }
 
 /// Callback type for relay degraded warnings.
@@ -628,17 +683,22 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
     ///
     /// If the DID is already being republished, existing tasks are replaced.
     pub async fn start_republishing(&self, entry: RepublishEntry) {
+        // The task-map key is the entry's DERIVED DID (`RepublishEntry` stores
+        // no `did` field — see its docs), computed once so both arms key the
+        // same identity.
+        let entry_did = entry.did();
+
         // Start DHT republish task if enabled.
         if self.config.dht_enabled {
             let mut dht_tasks = self.dht_tasks.lock().await;
 
-            if let Some(handle) = dht_tasks.remove(&entry.did) {
+            if let Some(handle) = dht_tasks.remove(&entry_did) {
                 handle.abort_handle.abort();
             }
 
             let dht_client = Arc::clone(&self.dht_client);
             let warning_cb = self.warning_callback.clone();
-            let did = entry.did.clone();
+            let did = entry_did.clone();
             let entry_clone = entry.clone();
 
             let join_handle = tokio::spawn(dht_republish_loop(dht_client, entry_clone, warning_cb));
@@ -657,12 +717,12 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
         {
             let mut relay_tasks = self.relay_tasks.lock().await;
 
-            if let Some(handle) = relay_tasks.remove(&entry.did) {
+            if let Some(handle) = relay_tasks.remove(&entry_did) {
                 handle.abort_handle.abort();
             }
 
             let relay_pub = Arc::clone(relay_publisher);
-            let did = entry.did.clone();
+            let did = entry_did;
             let relay_warning_cb = self.relay_warning_callback.clone();
 
             let blob_ttl = self.config.relay_blob_ttl_secs;
@@ -750,6 +810,7 @@ async fn dht_republish_loop<D: DhtClient>(
     entry: RepublishEntry,
     warning_cb: Option<WarningCallback>,
 ) {
+    let did = entry.did();
     let mut consecutive_failures: u32 = 0;
 
     loop {
@@ -775,7 +836,7 @@ async fn dht_republish_loop<D: DhtClient>(
                 && let Some(ref cb) = warning_cb
             {
                 cb(DhtPublishDegraded {
-                    did: entry.did.clone(),
+                    did: did.clone(),
                     consecutive_failures,
                 });
             }
@@ -799,10 +860,24 @@ async fn dht_republish_loop<D: DhtClient>(
 /// Then waits for the derived republish interval before the next publish.
 /// On failure, retries with exponential backoff.
 ///
-/// The frame is built ONCE, up front, via [`RepublishEntry::to_did_record`].
-/// A malformed entry (empty/oversize `document_bytes`) can never encode to a
-/// valid frame, so the loop fails closed: it logs and returns rather than
-/// spinning or ever publishing unframed bytes.
+/// The frame is built ONCE, up front, via [`RepublishEntry::to_did_record`]
+/// (see [`RelayPublisher`] for the frame contract). A malformed entry
+/// (empty/oversize `document_bytes`) can never encode to a valid frame, so the
+/// loop fails closed: it logs and returns rather than spinning.
+///
+/// # Partial success is reported, not swallowed (§3.10.8)
+///
+/// A publish that reaches *some* bound relays succeeds for availability, but a
+/// relay that permanently rejects is the intra-relay suppression signature: a
+/// resolver consulting only that relay never sees the record. A partial accept
+/// therefore fires the degraded callback on the FIRST occurrence rather than
+/// after [`DEGRADED_THRESHOLD`] cycles. The asymmetry is deliberate: a *total*
+/// failure is indistinguishable from "this node is offline", which the backoff
+/// absorbs and which usually heals itself; a *partial* accept proves the other
+/// relays are reachable and healthy, so no retry heals it and there is nothing
+/// to wait for. It still sleeps the normal interval rather than backing off —
+/// the record IS live on at least one relay, so hammering the healthy relays
+/// would be a self-inflicted denial of service.
 async fn relay_republish_loop<R: RelayPublisher>(
     relay_publisher: Arc<R>,
     entry: RepublishEntry,
@@ -810,16 +885,12 @@ async fn relay_republish_loop<R: RelayPublisher>(
     blob_ttl_secs: u64,
     republish_interval_secs: u64,
 ) {
-    // Build the DID-record frame once. This is the sole wrap site for the loop;
-    // publishing the bare `document_bytes` (dropping the BEP44 signature/seq) is
-    // now structurally impossible — the publisher only accepts a `DidRecordV1`,
-    // and it derives the routing_id from the frame's own key (§9.10.12 binding),
-    // so the loop never hands over a routing_id at all.
+    let did = entry.did();
     let record = match entry.to_did_record() {
         Ok(record) => record,
         Err(e) => {
             tracing::error!(
-                did = %entry.did,
+                did = %did,
                 error = %e,
                 "relay republish: DID document cannot be wrapped into a DID-record \
                  frame (§9.10.12); relay republishing disabled for this identity"
@@ -831,26 +902,56 @@ async fn relay_republish_loop<R: RelayPublisher>(
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        let result = relay_publisher.publish(blob_ttl_secs, &record).await;
-
-        if result.is_ok() {
-            consecutive_failures = 0;
-            tokio::time::sleep(tokio::time::Duration::from_secs(republish_interval_secs)).await;
-        } else {
-            consecutive_failures = consecutive_failures.saturating_add(1);
-
-            // Emit degraded warning after threshold.
-            if consecutive_failures >= DEGRADED_THRESHOLD
-                && let Some(ref cb) = warning_cb
-            {
-                cb(RelayPublishDegraded {
-                    did: entry.did.clone(),
-                    consecutive_failures,
-                });
+        match relay_publisher.publish(blob_ttl_secs, &record).await {
+            Ok(outcome) if outcome.is_complete() => {
+                consecutive_failures = 0;
+                tokio::time::sleep(tokio::time::Duration::from_secs(republish_interval_secs)).await;
             }
+            Ok(outcome) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(
+                    did = %did,
+                    accepted = outcome.accepted,
+                    attempted = outcome.attempted,
+                    rejected = outcome.rejected(),
+                    consecutive_failures,
+                    "relay republish reached only SOME bound relays — the rejecting \
+                     relay(s) suppress this DID for any resolver that consults them \
+                     (§3.10.8)"
+                );
+                if let Some(ref cb) = warning_cb {
+                    cb(RelayPublishDegraded {
+                        did: did.clone(),
+                        consecutive_failures,
+                        last_outcome: Some(outcome),
+                    });
+                }
+                // The record is live on >= 1 relay: wait the normal cycle.
+                tokio::time::sleep(tokio::time::Duration::from_secs(republish_interval_secs)).await;
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(
+                    did = %did,
+                    error = %e,
+                    consecutive_failures,
+                    "relay republish failed on every bound relay — retrying with backoff"
+                );
 
-            let backoff = backoff_secs(consecutive_failures.saturating_sub(1));
-            tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                // Emit degraded warning after threshold.
+                if consecutive_failures >= DEGRADED_THRESHOLD
+                    && let Some(ref cb) = warning_cb
+                {
+                    cb(RelayPublishDegraded {
+                        did: did.clone(),
+                        consecutive_failures,
+                        last_outcome: None,
+                    });
+                }
+
+                let backoff = backoff_secs(consecutive_failures.saturating_sub(1));
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+            }
         }
     }
 }
@@ -965,14 +1066,23 @@ mod tests {
     use crate::resolution::did_routing_id;
     use scp_dht::InMemoryDhtClient;
 
-    fn make_entry(did: &str) -> RepublishEntry {
+    /// An entry for the identity owning `public_key`. The DID is DERIVED (the
+    /// entry has no `did` field), so a test can never construct an entry whose
+    /// DID and key disagree.
+    fn make_entry(public_key: [u8; 32]) -> RepublishEntry {
         RepublishEntry {
-            did: did.to_owned(),
-            public_key: [1u8; 32],
+            public_key,
             document_bytes: b"test document".to_vec(),
             signature: [2u8; 64],
             sequence: 1,
         }
+    }
+
+    /// The DID a test entry is keyed under — recomposed here from the raw key
+    /// rather than via `RepublishEntry::did()`, so the assertion is an
+    /// independent oracle rather than the production accessor checking itself.
+    fn entry_did(public_key: [u8; 32]) -> String {
+        crate::did_from_ed25519_public_key(&public_key)
     }
 
     #[test]
@@ -992,11 +1102,15 @@ mod tests {
         let dht = Arc::new(InMemoryDhtClient::new());
         let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
             RepublishManager::new(Arc::clone(&dht));
-        let entry = make_entry("did:dht:zTest1");
+        let entry = make_entry([1u8; 32]);
+        let did = entry_did([1u8; 32]);
 
         manager.start_republishing(entry).await;
         assert_eq!(manager.active_count().await, 1);
-        assert!(manager.is_republishing("did:dht:zTest1").await);
+        assert!(
+            manager.is_republishing(&did).await,
+            "the task is keyed under the DID DERIVED from the entry's public key"
+        );
 
         // Give the background task time to publish.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1005,7 +1119,7 @@ mod tests {
         let record = dht.resolve(&[1u8; 32]).await.unwrap();
         assert!(record.is_some());
 
-        manager.stop_republishing("did:dht:zTest1").await;
+        manager.stop_republishing(&did).await;
         assert_eq!(manager.active_count().await, 0);
     }
 
@@ -1015,13 +1129,13 @@ mod tests {
         let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
             RepublishManager::new(Arc::clone(&dht));
 
-        manager
-            .start_republishing(make_entry("did:dht:zTest1"))
-            .await;
-        manager
-            .start_republishing(make_entry("did:dht:zTest2"))
-            .await;
-        assert_eq!(manager.active_count().await, 2);
+        manager.start_republishing(make_entry([1u8; 32])).await;
+        manager.start_republishing(make_entry([2u8; 32])).await;
+        assert_eq!(
+            manager.active_count().await,
+            2,
+            "two DISTINCT keys derive two distinct DIDs -> two tasks"
+        );
 
         manager.stop_all().await;
         assert_eq!(manager.active_count().await, 0);
@@ -1033,14 +1147,14 @@ mod tests {
         let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
             RepublishManager::new(Arc::clone(&dht));
 
-        manager
-            .start_republishing(make_entry("did:dht:zTest1"))
-            .await;
-        manager
-            .start_republishing(make_entry("did:dht:zTest1"))
-            .await;
+        manager.start_republishing(make_entry([1u8; 32])).await;
+        manager.start_republishing(make_entry([1u8; 32])).await;
 
-        assert_eq!(manager.active_count().await, 1);
+        assert_eq!(
+            manager.active_count().await,
+            1,
+            "the same key derives the same DID -> the second start replaces the first"
+        );
         manager.stop_all().await;
     }
 
@@ -1049,7 +1163,7 @@ mod tests {
         let dht = Arc::new(InMemoryDhtClient::new());
         let manager: RepublishManager<InMemoryDhtClient, InMemoryRelayPublisher> =
             RepublishManager::new(Arc::clone(&dht));
-        let entry = make_entry("did:dht:zTest1");
+        let entry = make_entry([1u8; 32]);
 
         manager.start_republishing(entry).await;
 
@@ -1079,7 +1193,6 @@ mod tests {
         let public_key = [7u8; 32];
         let did_str = crate::did_from_ed25519_public_key(&public_key);
         let entry = RepublishEntry {
-            did: did_str.clone(),
             public_key,
             document_bytes: b"BEP44-signed DID document".to_vec(),
             signature: [2u8; 64],
@@ -1151,9 +1264,7 @@ mod tests {
             RepublishConfig::new(),
         );
 
-        let did_str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
         let source = RepublishEntry {
-            did: did_str.to_owned(),
             public_key: [0xAB; 32],
             document_bytes: b"the signed DID document body".to_vec(),
             signature: [0xCD; 64],
@@ -1195,7 +1306,6 @@ mod tests {
         );
 
         let entry = RepublishEntry {
-            did: "did:dht:zEmptyDoc".to_owned(),
             public_key: [1u8; 32],
             document_bytes: Vec::new(), // empty → unframeable (§9.10.12)
             signature: [2u8; 64],
@@ -1263,7 +1373,7 @@ mod tests {
         let manager =
             RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
 
-        let entry = make_entry("did:dht:zTest1");
+        let entry = make_entry([1u8; 32]);
         manager.start_republishing(entry).await;
 
         assert_eq!(manager.active_count().await, 1, "one DHT task");
@@ -1295,7 +1405,7 @@ mod tests {
         let manager =
             RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
 
-        let entry = make_entry("did:dht:zTest1");
+        let entry = make_entry([1u8; 32]);
         manager.start_republishing(entry).await;
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1330,7 +1440,7 @@ mod tests {
         let manager =
             RepublishManager::with_relay_publisher(Arc::clone(&dht), Arc::clone(&relay), config);
 
-        let entry = make_entry("did:dht:zTest1");
+        let entry = make_entry([1u8; 32]);
         manager.start_republishing(entry).await;
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1374,12 +1484,48 @@ mod tests {
         assert!(!config.is_relay_enabled());
     }
 
+    /// B3 / §3.10.6: disabling EITHER layer fires the layer-disabled callback
+    /// with the mandated warning text. This is the mechanism half of the
+    /// mandate; the self-host side asserts the production config wires a
+    /// callback into it (`has_layer_disabled_callback`).
+    #[test]
+    fn disabling_either_layer_fires_the_mandated_warning() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let base = RepublishConfig::new().with_layer_disabled_callback(Arc::new(move |m: &str| {
+            sink.lock().unwrap().push(m.to_owned());
+        }));
+        assert!(base.has_layer_disabled_callback());
+
+        let mut relay_off = base.clone();
+        relay_off.disable_relay();
+        let mut dht_off = base;
+        dht_off.disable_dht();
+
+        let logged = seen.lock().unwrap().clone();
+        assert_eq!(
+            logged.len(),
+            2,
+            "each disable must warn — neither layer may be turned off silently"
+        );
+        assert!(
+            logged.iter().all(|m| m == LAYER_DISABLED_WARNING),
+            "the §3.10.6 warning text is the one the spec mandates, got {logged:?}"
+        );
+    }
+
+    /// The complement: a config with no callback reports so. Without this,
+    /// `has_layer_disabled_callback` could be a constant `true`.
+    #[test]
+    fn default_config_has_no_layer_disabled_callback() {
+        assert!(!RepublishConfig::new().has_layer_disabled_callback());
+    }
+
     // --- Migration republisher tests ---
 
     fn make_migration_entry() -> RepublishEntry {
         // Simulate an old DID document that already has alsoKnownAs set.
         RepublishEntry {
-            did: "did:dht:zOldDid".to_owned(),
             public_key: [3u8; 32],
             document_bytes: b"old document with alsoKnownAs redirect".to_vec(),
             signature: [4u8; 64],
@@ -1462,11 +1608,157 @@ mod tests {
     impl RelayPublisher for AlwaysFailRelayPublisher {
         fn publish(
             &self,
-            _blob_ttl: u64,
+            _blob_ttl_secs: u64,
             _record: &DidRecordV1,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<RelayPublishOutcome, IdentityError>> + Send {
             async move { Err(IdentityError::RelayPublishFailed("always fails".into())) }
         }
+    }
+
+    /// A relay publisher modelling `accepted` of `attempted` bound relays
+    /// accepting — the §3.10.8 partial-suppression shape. `accepted >= 1`, so
+    /// every call is an `Ok` (the record IS live) that is nonetheless not
+    /// complete.
+    struct PartialAcceptRelayPublisher {
+        accepted: usize,
+        attempted: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl RelayPublisher for PartialAcceptRelayPublisher {
+        fn publish(
+            &self,
+            _blob_ttl_secs: u64,
+            _record: &DidRecordV1,
+        ) -> impl Future<Output = Result<RelayPublishOutcome, IdentityError>> + Send {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let outcome = RelayPublishOutcome {
+                accepted: self.accepted,
+                attempted: self.attempted,
+            };
+            async move { Ok(outcome) }
+        }
+    }
+
+    #[test]
+    fn outcome_completeness_and_rejected_count() {
+        let complete = RelayPublishOutcome {
+            accepted: 3,
+            attempted: 3,
+        };
+        assert!(complete.is_complete());
+        assert_eq!(complete.rejected(), 0);
+
+        let partial = RelayPublishOutcome {
+            accepted: 1,
+            attempted: 3,
+        };
+        assert!(!partial.is_complete());
+        assert_eq!(partial.rejected(), 2);
+    }
+
+    /// B4 / §3.10.8: an attacker controlling 1 of N relays must not get SILENT
+    /// permanent partial suppression. A publish that only SOME bound relays
+    /// accept is an `Ok` — the record is live — but it fires the degraded
+    /// callback on the FIRST cycle, carrying the per-relay breakdown. Against
+    /// the pre-fix code (`publish -> Result<(), _>`, `is_ok()` resets the
+    /// failure counter) this test cannot even be written: the loop had no way
+    /// to observe the rejection.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // Guard is explicitly dropped before await
+    async fn partial_relay_accept_fires_degraded_callback_immediately() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(PartialAcceptRelayPublisher {
+            accepted: 1,
+            attempted: 3,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let warnings: Arc<std::sync::Mutex<Vec<RelayPublishDegraded>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warnings_clone = Arc::clone(&warnings);
+
+        let manager = RepublishManager::with_relay_publisher(
+            Arc::clone(&dht),
+            Arc::clone(&relay),
+            RepublishConfig::new(),
+        )
+        .with_relay_warning_callback(Arc::new(move |degraded| {
+            warnings_clone.lock().unwrap().push(degraded);
+        }));
+
+        let entry = make_entry([9u8; 32]);
+        manager.start_republishing(entry).await;
+
+        // One poll of the spawned task is enough: no time advance, so the
+        // warning cannot have come from a later cycle.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let logged = warnings.lock().unwrap();
+        assert_eq!(
+            logged.len(),
+            1,
+            "a partial accept fires the degraded callback on the FIRST cycle, \
+             not after {DEGRADED_THRESHOLD} of them"
+        );
+        assert_eq!(logged[0].did, entry_did([9u8; 32]));
+        assert_eq!(logged[0].consecutive_failures, 1);
+        assert_eq!(
+            logged[0].last_outcome,
+            Some(RelayPublishOutcome {
+                accepted: 1,
+                attempted: 3,
+            }),
+            "the callback carries the per-relay breakdown that makes the \
+             suppression legible"
+        );
+        drop(logged);
+
+        manager.stop_all().await;
+    }
+
+    /// The complement: a COMPLETE accept is silent. Without this, the test
+    /// above would pass even if the loop warned on every publish.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // Guard is explicitly dropped before await
+    async fn complete_relay_accept_fires_no_degraded_callback() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(PartialAcceptRelayPublisher {
+            accepted: 3,
+            attempted: 3,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let warnings: Arc<std::sync::Mutex<Vec<RelayPublishDegraded>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warnings_clone = Arc::clone(&warnings);
+
+        let manager = RepublishManager::with_relay_publisher(
+            Arc::clone(&dht),
+            Arc::clone(&relay),
+            RepublishConfig::new(),
+        )
+        .with_relay_warning_callback(Arc::new(move |degraded| {
+            warnings_clone.lock().unwrap().push(degraded);
+        }));
+
+        manager.start_republishing(make_entry([9u8; 32])).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            warnings.lock().unwrap().is_empty(),
+            "every bound relay accepted -> no degradation to report"
+        );
+        assert!(
+            relay.calls.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the publish actually ran (the assertion above is not vacuous)"
+        );
+
+        manager.stop_all().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1487,7 +1779,7 @@ mod tests {
                     w.push(degraded);
                 }));
 
-        let entry = make_entry("did:dht:zTestRelay");
+        let entry = make_entry([0x5Au8; 32]);
         manager.start_republishing(entry).await;
 
         // With start_paused, advance time through the backoff schedule step by
@@ -1516,8 +1808,13 @@ mod tests {
             !logged.is_empty(),
             "relay degraded warning should have fired after {DEGRADED_THRESHOLD} consecutive failures",
         );
-        assert_eq!(logged[0].did, "did:dht:zTestRelay");
+        assert_eq!(logged[0].did, entry_did([0x5Au8; 32]));
         assert_eq!(logged[0].consecutive_failures, DEGRADED_THRESHOLD);
+        assert_eq!(
+            logged[0].last_outcome, None,
+            "a TOTAL failure has no per-relay breakdown — reporting a \
+             fabricated `0 of 0` would assert 'no relay was bound'"
+        );
         drop(logged);
 
         manager.stop_all().await;

@@ -33,7 +33,7 @@
 //! (RELAYRES-002 client re-verification is the guarantee).
 
 use scp_dht::verify_bep44_signature;
-use scp_identity::republish::did_record_routing_id;
+use scp_identity::did_record_routing_id;
 use scp_protocol::envelope::did_record::DidRecordV1;
 
 /// The reason a blob that decoded as a [`DidRecordV1`] frame was nonetheless
@@ -124,12 +124,11 @@ pub fn classify_did_record_frame(routing_id: &[u8; 32], blob: &[u8]) -> DidRecor
     // Step 2 — DID→routing_id binding (a plain hash; runs BEFORE the signature).
     // Mirrors the control-plane BRIDGE_REGISTER check (§10.12.4).
     //
-    // The derivation is NOT re-inlined here: it is the shared
-    // `scp_identity::republish::did_record_routing_id` — the very function the
-    // WRITE path (`TransportRelayPublisher`) computes its PUBLISH address from.
-    // This admission binding and the publisher's address must agree byte-for-byte
-    // forever; one source of truth is what makes that structural rather than a
-    // convention three copies could silently drift out of (SCP-RELAYRES-004).
+    // Derived through the shared `did_record_routing_id` (see its definition in
+    // `scp_identity::resolution` for the agreement invariant this admission
+    // check shares with the WRITE path). Unlike `classify_stored_frame`, the
+    // compare here is REAL: `routing_id` is the caller-supplied WIRE address, so
+    // a frame published at an address its key does not bind to is rejected.
     let derived_routing_id = did_record_routing_id(&frame);
     if &derived_routing_id != routing_id {
         return DidRecordClass::Invalid(DidRecordRejection::BindingMismatch);
