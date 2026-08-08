@@ -1056,10 +1056,10 @@ export class SCP {
    * fabricating a success; it never reports a recovery that did not happen.
    * A `did` this SCP instance does not host is rejected with `SCP-IDENT-1020`,
    * and an unknown `tier` with `SCP-IDENT-1021`, before the fail-closed return.
-   * Because this wrapper delegates to the native (NAPI) binding, a `contextIds`
-   * list over 1024 entries is rejected with `SCP-VALID-7120` and a concurrent
-   * recovery flood with `SCP-VALID-7140` (runtime DoS bounds absent from the
-   * other bindings until #2240 Part B wires them uniformly).
+   * A `contextIds` list over 1024 entries is rejected with `SCP-VALID-7120`
+   * and a concurrent recovery / custody-migration flood with `SCP-VALID-7140`,
+   * before the fail-closed return — the same bounds, in the same order
+   * (ownership -> length cap -> permit), on every binding.
    */
   identityExecuteRecovery(did: string, tier: string, contextIds: readonly string[]): string {
     try {

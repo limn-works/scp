@@ -374,6 +374,24 @@ pub struct UniffiBridgeInstance {
     /// stream via [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) outlet_streaming_saga_registry:
         Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+
+    /// Bounds concurrent compromise-recovery and custody-migration calls.
+    ///
+    /// `Scp::identity_execute_recovery` and
+    /// `Scp::identity_execute_custody_migration` drive an async orchestrator
+    /// via `crate::runtime().block_on(...)` from a synchronous `UniFFI` entry
+    /// point, pinning a worker on the shared runtime for the duration. Without
+    /// a bound, a caller (or a buggy app) issuing concurrent calls against
+    /// valid, owned DIDs could saturate that runtime and starve every other
+    /// bridge operation.
+    ///
+    /// Acquired with `try_acquire_owned` (non-blocking): an exhausted pool
+    /// returns `SCP-VALID-7140` immediately rather than queueing, which would
+    /// itself pin a worker. Shared between the two operations because both
+    /// issue the same shape of work, matching the NAPI and `PyO3` bridges so
+    /// the bindings expose one denial-of-service contract rather than three (RED-PR5-002 /
+    /// BLACK-PR5-002, #1549).
+    pub(crate) recovery_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for UniffiBridgeInstance {
@@ -423,6 +441,9 @@ impl UniffiBridgeInstance {
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                scp_ffi_common::validate::RECOVERY_CONCURRENCY_CAP,
+            )),
         }
     }
 
@@ -458,6 +479,9 @@ impl UniffiBridgeInstance {
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                scp_ffi_common::validate::RECOVERY_CONCURRENCY_CAP,
+            )),
         }
     }
 
@@ -606,6 +630,9 @@ impl UniffiBridgeInstance {
             credential_store,
             outlet_stream_registry: Arc::new(DashMap::new()),
             outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                scp_ffi_common::validate::RECOVERY_CONCURRENCY_CAP,
+            )),
         }
     }
 

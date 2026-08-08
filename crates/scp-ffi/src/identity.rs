@@ -68,7 +68,9 @@ use crate::runtime::IdentityEntry;
 use crate::runtime::PyBridgeInstance;
 use crate::validate;
 
-use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
+use scp_ffi_common::validate::{
+    MAX_CONTEXT_IDS_PER_RECOVERY, MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID, RECOVERY_CONCURRENCY_CAP,
+};
 
 /// Builds the shared [`FfiDhtClient`] for this bridge instance, **failing
 /// closed**.
@@ -2571,16 +2573,48 @@ impl crate::scp::PyScp {
             )));
         }
 
-        // `context_ids` is accepted for FFI/SDK signature symmetry with the
-        // eventual wired backend (#2240 Part B); it is unused on the
-        // fail-closed path (cf. `let _ = old_did;` in recovery.rs). NAPI's
-        // length-cap + libuv-worker concurrency gates bound the orchestrator
-        // work that only runs once that backend lands, so they belong with the
-        // Part B WIRE, not this fail-closed path.
-        let _ = context_ids;
+        // Length cap: prevent DoS by an unbounded context_ids list (round-3
+        // red-hat RED-PR5-003 amplifier). Shared with NAPI and UniFFI via
+        // `scp_ffi_common` so the bound cannot drift between bindings.
+        //
+        // Runs AFTER the ownership gate so an unauthorised caller is rejected
+        // on the cheaper check first.
+        if context_ids.len() > MAX_CONTEXT_IDS_PER_RECOVERY {
+            return Err(PyErr::from(ScpPyError::ValidationError {
+                message: format!(
+                    "identity_execute_recovery: context_ids length {} exceeds cap of {}",
+                    context_ids.len(),
+                    MAX_CONTEXT_IDS_PER_RECOVERY
+                ),
+                code: scp_ffi_common::error_codes::VALID_7120.to_owned(),
+            }));
+        }
+
+        // Concurrency cap (RED-PR5-002 / BLACK-PR5-002): bound in-flight
+        // recovery + custody-migration calls per bridge instance.
+        // `try_acquire_owned` is non-blocking — an exhausted pool returns a
+        // typed busy error rather than queueing the caller, which would itself
+        // pin a runtime worker. The permit drops when `_permit` goes out of
+        // scope at the end of this method.
+        //
+        // Placed AFTER the ownership + length-cap checks so rejected-upstream
+        // callers never consume a permit.
+        let _permit = Arc::clone(&self.inner.recovery_semaphore)
+            .try_acquire_owned()
+            .map_err(|_| {
+                PyErr::from(ScpPyError::ValidationError {
+                    message: format!(
+                        "recovery/custody-migration concurrency cap reached \
+                         ({RECOVERY_CONCURRENCY_CAP} in flight); retry after an in-flight call \
+                         completes"
+                    ),
+                    code: scp_ffi_common::error_codes::VALID_7140.to_owned(),
+                })
+            })?;
 
         // Validate the tier first so callers still get the precise invalid-tier
-        // error rather than the generic fail-closed one.
+        // error rather than the generic fail-closed one. The `_permit` acquired
+        // above is dropped when this method returns.
         match tier {
             "agent" | "active_signing" | "identity_key" => {}
             other => {
@@ -2651,6 +2685,55 @@ impl crate::scp::PyScp {
         use scp_did::DID;
 
         validate::validate_did(did)?;
+
+        // Ownership gate (parity with NAPI's RED-PR5-004 check and with
+        // `identity_execute_recovery` above): custody migration is restricted
+        // to identities THIS instance hosts, so a realm-local caller cannot
+        // drive unmetered orchestrator work against arbitrary DIDs.
+        // `SCP-IDENT-1024` matches NAPI/UniFFI.
+        if !crate::runtime::identity_registry_contains(&self.inner, did) {
+            return Err(PyErr::from(ScpPyError::identity_with_code(
+                format!(
+                    "identity_execute_custody_migration: DID '{did}' is not owned by this SCP \
+                     instance — custody migration is restricted to identities created or loaded \
+                     via this SCP"
+                ),
+                scp_ffi_common::error_codes::IDENT_1024,
+            )));
+        }
+
+        // Length cap: prevent DoS by an unbounded context_ids list. Shares the
+        // recovery bound — the two operations amplify identically.
+        if context_ids.len() > MAX_CONTEXT_IDS_PER_RECOVERY {
+            return Err(PyErr::from(ScpPyError::ValidationError {
+                message: format!(
+                    "identity_execute_custody_migration: context_ids length {} exceeds cap of {}",
+                    context_ids.len(),
+                    MAX_CONTEXT_IDS_PER_RECOVERY
+                ),
+                code: scp_ffi_common::error_codes::VALID_7120.to_owned(),
+            }));
+        }
+
+        // Concurrency cap: shared permit pool with `identity_execute_recovery`
+        // (see that method and `PyBridgeInstance::recovery_semaphore`). Held
+        // across the `block_on` below, which is exactly the work it bounds.
+        //
+        // Placed AFTER the ownership + length-cap checks so rejected-upstream
+        // callers never consume a permit.
+        let _permit = Arc::clone(&self.inner.recovery_semaphore)
+            .try_acquire_owned()
+            .map_err(|_| {
+                PyErr::from(ScpPyError::ValidationError {
+                    message: format!(
+                        "recovery/custody-migration concurrency cap reached \
+                         ({RECOVERY_CONCURRENCY_CAP} in flight); retry after an in-flight call \
+                         completes"
+                    ),
+                    code: scp_ffi_common::error_codes::VALID_7140.to_owned(),
+                })
+            })?;
+
         let did_owned = did.to_owned();
         let target_owned = target.to_owned();
         let rt = crate::runtime()?;
@@ -2770,6 +2853,113 @@ mod tests {
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new_in_memory_for_test()
+    }
+
+    /// #1549 RED-PR5-002/003: the denial-of-service bounds NAPI enforces on
+    /// `identity_execute_recovery` / `identity_execute_custody_migration` —
+    /// a `context_ids` length cap and a per-instance concurrency permit — must
+    /// hold on THIS bridge too. Their absence here was a matrix hole, not a
+    /// runtime-specific exemption: both `PyO3` entry points drive the same
+    /// orchestrator through `rt.block_on(...)`, and the Python SDK docstrings
+    /// already documented the bounds as applying.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn recovery_and_migration_enforce_length_cap_and_concurrency_permit() {
+        use scp_ffi_common::validate::{MAX_CONTEXT_IDS_PER_RECOVERY, RECOVERY_CONCURRENCY_CAP};
+
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            let did = scp.identity_create(py, "in_memory", None).unwrap().did;
+            let over_cap = vec!["ctx".to_owned(); MAX_CONTEXT_IDS_PER_RECOVERY + 1];
+
+            // Length cap — rejected before the fail-closed / orchestrator path.
+            for err in [
+                scp.identity_execute_recovery(&did, "agent", over_cap.clone())
+                    .expect_err("over-cap recovery must be rejected"),
+                scp.identity_execute_custody_migration(py, &did, "hardware", over_cap)
+                    .expect_err("over-cap migration must be rejected"),
+            ] {
+                assert!(
+                    err.to_string()
+                        .contains(scp_ffi_common::error_codes::VALID_7120),
+                    "over-cap call must carry SCP-VALID-7120: {err}"
+                );
+            }
+
+            // At the cap the length gate lets the call through to its own
+            // terminal error, so the bound is `>` and not `>=`.
+            let at_cap = vec!["ctx".to_owned(); MAX_CONTEXT_IDS_PER_RECOVERY];
+            let err = scp
+                .identity_execute_recovery(&did, "agent", at_cap)
+                .expect_err("recovery fails closed regardless (#2240)");
+            assert!(
+                err.to_string()
+                    .contains(scp_ffi_common::error_codes::IDENT_1022),
+                "a call AT the cap must reach the fail-closed path: {err}"
+            );
+
+            // Concurrency permit — exhaust the pool, then the N+1 call must
+            // fail fast rather than queue (queueing would pin a worker).
+            let sem = Arc::clone(&scp.inner.recovery_semaphore);
+            let _permits: Vec<_> = (0..RECOVERY_CONCURRENCY_CAP)
+                .map(|_| sem.clone().try_acquire_owned().unwrap())
+                .collect();
+
+            for err in [
+                scp.identity_execute_recovery(&did, "agent", Vec::new())
+                    .expect_err("N+1 recovery must be rejected"),
+                scp.identity_execute_custody_migration(py, &did, "hardware", Vec::new())
+                    .expect_err("N+1 migration must be rejected"),
+            ] {
+                assert!(
+                    err.to_string()
+                        .contains(scp_ffi_common::error_codes::VALID_7140),
+                    "N+1 call must carry SCP-VALID-7140: {err}"
+                );
+            }
+        });
+    }
+
+    /// The ownership gate runs BEFORE the permit gate, so an unauthorised
+    /// caller cannot burn permits with arbitrary DIDs — the ordering NAPI
+    /// documents, now pinned here.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn unowned_did_is_rejected_without_consuming_a_permit() {
+        use scp_ffi_common::validate::RECOVERY_CONCURRENCY_CAP;
+
+        setup();
+
+        Python::with_gil(|py| {
+            let scp = default_scp();
+            let stranger = "did:dht:zStrangerNotOwnedByThisInstance";
+
+            let err = scp
+                .identity_execute_recovery(stranger, "agent", Vec::new())
+                .expect_err("a DID this instance does not own must be rejected");
+            assert!(
+                err.to_string()
+                    .contains(scp_ffi_common::error_codes::IDENT_1020),
+                "unowned recovery must carry SCP-IDENT-1020: {err}"
+            );
+
+            let err = scp
+                .identity_execute_custody_migration(py, stranger, "hardware", Vec::new())
+                .expect_err("a DID this instance does not own must be rejected");
+            assert!(
+                err.to_string()
+                    .contains(scp_ffi_common::error_codes::IDENT_1024),
+                "unowned migration must carry SCP-IDENT-1024: {err}"
+            );
+
+            assert_eq!(
+                scp.inner.recovery_semaphore.available_permits(),
+                RECOVERY_CONCURRENCY_CAP,
+                "an unauthorised caller must not consume a permit"
+            );
+        });
     }
 
     /// Verifies that `PyScp::identity_migrate` succeeds end-to-end.

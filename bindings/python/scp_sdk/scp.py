@@ -786,11 +786,12 @@ class SCP:
             ``SCP-VALID-7120`` before the orchestrator runs. The
             recovery / migration orchestrator runs on ``crate::runtime``
             via ``block_on`` — the cap bounds per-call amplification.
-            A per-bridge semaphore
-            (``NapiBridgeInstance::recovery_semaphore``) composes with
-            the cap to bound concurrent invocations; exhausted permits
-            return ``SCP-VALID-7140`` non-blockingly (see ADR-048 §7
-            round-2/3 hardening).
+            A per-bridge semaphore composes with the cap to bound
+            concurrent invocations; exhausted permits return
+            ``SCP-VALID-7140`` non-blockingly (see ADR-048 §7
+            round-2/3 hardening). All three bindings enforce the same
+            three gates in the same order (ownership → length cap →
+            permit), from one shared bound in ``scp_ffi_common``.
         """
         import json
 
@@ -824,10 +825,11 @@ class SCP:
         :param context_ids: Contexts to run the recovery protocol
             against. Accepted for signature symmetry with the wired
             backend (#2240 Part B); ignored on the current fail-closed
-            path. The NAPI binding additionally enforces a 1024-entry
-            length cap (``SCP-VALID-7120``) and a concurrency permit
-            (``SCP-VALID-7140``); those DoS bounds are runtime-specific
-            and land on this binding when the Part B orchestrator does.
+            path. A list over **1024** entries is rejected with
+            ``SCP-VALID-7120``, and a concurrent recovery /
+            custody-migration flood with ``SCP-VALID-7140``, before the
+            fail-closed return — the same bounds, in the same order, on
+            every binding.
         """
         import json
 

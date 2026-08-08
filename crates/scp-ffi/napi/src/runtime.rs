@@ -344,14 +344,15 @@ pub struct NapiBridgeInstance {
 
 /// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
 ///
-/// Bounds the number of concurrent `block_on`-driven
-/// `identityExecuteRecovery` + `identityExecuteCustodyMigration` calls on a
-/// single NAPI bridge instance. Chosen to allow at most one recovery plus
-/// one migration (or two of one) to run simultaneously while leaving the
-/// remaining libuv workers free for other NAPI async callbacks. The
-/// happy-path caller sees no throttling; a misbehaving or hostile caller
-/// gets `SCP-VALID-7140` on the N+1 concurrent invocation.
-pub(crate) const RECOVERY_CONCURRENCY_CAP: usize = 2;
+/// Re-exported from `scp_ffi_common` so the three bridges share ONE bound —
+/// the cap is part of the cross-binding contract the SDK wrappers document,
+/// not a NAPI implementation detail. It allows at most one recovery plus one
+/// migration (or two of one) to run simultaneously while leaving the remaining
+/// libuv workers free for other NAPI async callbacks. The happy-path caller
+/// sees no throttling; a misbehaving or hostile caller gets `SCP-VALID-7140`
+/// on the N+1 concurrent invocation.
+pub(crate) const RECOVERY_CONCURRENCY_CAP: usize =
+    scp_ffi_common::validate::RECOVERY_CONCURRENCY_CAP;
 
 impl NapiBridgeInstance {
     /// Constructs a new `NapiBridgeInstance` with EXPLICIT in-memory storage.

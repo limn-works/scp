@@ -21,6 +21,39 @@
 use std::fmt;
 
 // ---------------------------------------------------------------------------
+// Recovery / custody-migration DoS bounds — shared by all three bridges
+// ---------------------------------------------------------------------------
+
+/// Maximum `context_ids` entries accepted by `identity_execute_recovery` and
+/// `identity_execute_custody_migration` on any bridge.
+///
+/// Both drive an async orchestrator whose work is linear in this list, so an
+/// unbounded list is a per-call amplification lever for a realm-local caller
+/// (round-3 red-hat RED-PR5-003 / RED-PR5-004, #1549). Over-cap calls return
+/// `SCP-VALID-7120` before the orchestrator runs.
+///
+/// Lives here rather than as a per-bridge `const` so the three bridges cannot
+/// drift: the bound is part of the cross-binding contract the SDK wrappers
+/// document, not a NAPI implementation detail.
+pub const MAX_CONTEXT_IDS_PER_RECOVERY: usize = 1024;
+
+/// Permit cap for the per-instance recovery / custody-migration semaphore on
+/// every bridge.
+///
+/// Both operations drive the orchestrator through a `block_on` on the bridge's
+/// shared tokio runtime, pinning a worker for the duration (a libuv worker on
+/// NAPI, a runtime worker on `PyO3` / `UniFFI`). A flood of concurrent calls —
+/// even with valid, owned DIDs — could otherwise starve every other async
+/// callback on that bridge instance (RED-PR5-002 / BLACK-PR5-002, #1549).
+///
+/// Acquire with `try_acquire_owned` (non-blocking): queueing on the permit
+/// would itself pin a worker, so an exhausted pool returns `SCP-VALID-7140`
+/// immediately. The cap is deliberately small so a hostile caller burns
+/// negligible work per rejected request; it allows at most one recovery plus
+/// one migration (or two of one) in flight per instance.
+pub const RECOVERY_CONCURRENCY_CAP: usize = 2;
+
+// ---------------------------------------------------------------------------
 // ValidationError — bridge-agnostic validation error
 // ---------------------------------------------------------------------------
 

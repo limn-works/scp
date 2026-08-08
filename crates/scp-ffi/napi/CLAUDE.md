@@ -91,12 +91,18 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
      return `SCP-IDENT-1020` (recovery) / `SCP-IDENT-1024` (migration). Closes the
      realm-local amplifier where any caller could drive unmetered orchestrator work
      on `crate::runtime()` against arbitrary DIDs.
-  2. **Length cap** — `context_ids.len() <= MAX_CONTEXT_IDS_PER_{RECOVERY,MIGRATION} = 1024`;
-     over-cap returns `SCP-VALID-7120`.
+  2. **Length cap** — `context_ids.len() <= scp_ffi_common::validate::MAX_CONTEXT_IDS_PER_RECOVERY`
+     (1024); over-cap returns `SCP-VALID-7120`.
   3. **Concurrency semaphore** — `NapiBridgeInstance::recovery_semaphore`
      (`RECOVERY_CONCURRENCY_CAP` permits, `try_acquire_owned`). Exhausted permits
      return `SCP-VALID-7140` non-blockingly. Queueing would itself pin a libuv
      worker on the wait, so the bridge prefers immediate-busy over queued.
+
+  All three gates, in this order, now hold on **every** bridge — PyO3
+  (`PyBridgeInstance::recovery_semaphore`) and UniFFI
+  (`UniffiBridgeInstance::recovery_semaphore`) enforce the same contract, with the
+  two bounds shared from `scp_ffi_common::validate` so they cannot drift. This is
+  not a NAPI-specific hardening.
   These methods are **sync** napi entry points — the async orchestrator is driven by
   `crate::runtime().block_on(...)`. Do not change them back to `async fn`; the
   napi-rs worker thread has no tokio context (see `3de6cbe30` / `78102c871` history).

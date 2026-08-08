@@ -70,9 +70,10 @@ use uuid::Uuid;
 use scp_core::context::membership::KeyPackage;
 
 use scp_ffi_common::validate::{
-    json_value_type_name, validate_capability_uri, validate_context_id, validate_did,
-    validate_mcp_handle, validate_outlet_id, validate_outlet_name, validate_relay_url,
-    validate_transport_mode, validate_ucan_token,
+    MAX_CONTEXT_IDS_PER_RECOVERY, RECOVERY_CONCURRENCY_CAP, json_value_type_name,
+    validate_capability_uri, validate_context_id, validate_did, validate_mcp_handle,
+    validate_outlet_id, validate_outlet_name, validate_relay_url, validate_transport_mode,
+    validate_ucan_token,
 };
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
@@ -17523,15 +17524,46 @@ impl Scp {
             });
         }
 
-        // `context_ids` is accepted for FFI/SDK signature symmetry with the
-        // eventual wired backend (#2240 Part B); unused on the fail-closed path.
-        // NAPI's length-cap + libuv concurrency gates bound orchestrator work
-        // that only runs once that backend lands (Part B), so they are not
-        // replicated on this fail-closed path.
-        let _ = context_ids;
+        // Length cap: prevent DoS by an unbounded context_ids list (round-3
+        // red-hat RED-PR5-003 amplifier). Shared with NAPI and PyO3 via
+        // `scp_ffi_common` so the bound cannot drift between bindings.
+        //
+        // Runs AFTER the ownership gate so an unauthorised caller is rejected
+        // on the cheaper check first.
+        if context_ids.len() > MAX_CONTEXT_IDS_PER_RECOVERY {
+            return Err(ScpError::Validation {
+                msg: format!(
+                    "identity_execute_recovery: context_ids length {} exceeds cap of {}",
+                    context_ids.len(),
+                    MAX_CONTEXT_IDS_PER_RECOVERY
+                ),
+                code: codes::VALID_7120.to_owned(),
+            });
+        }
+
+        // Concurrency cap (RED-PR5-002 / BLACK-PR5-002): bound in-flight
+        // recovery + custody-migration calls per bridge instance.
+        // `try_acquire_owned` is non-blocking — an exhausted pool returns a
+        // typed busy error rather than queueing the caller, which would itself
+        // pin a runtime worker. The permit drops when `_permit` goes out of
+        // scope at the end of this method.
+        //
+        // Placed AFTER the ownership + length-cap checks so rejected-upstream
+        // callers never consume a permit.
+        let _permit = Arc::clone(&self.inner.recovery_semaphore)
+            .try_acquire_owned()
+            .map_err(|_| ScpError::Validation {
+                msg: format!(
+                    "recovery/custody-migration concurrency cap reached \
+                     ({RECOVERY_CONCURRENCY_CAP} in flight); retry after an in-flight call \
+                     completes"
+                ),
+                code: codes::VALID_7140.to_owned(),
+            })?;
 
         // Validate the tier first so callers still get the precise invalid-tier
-        // error rather than the generic fail-closed one.
+        // error rather than the generic fail-closed one. The `_permit` acquired
+        // above is dropped when this method returns.
         match tier.as_str() {
             "agent" | "active_signing" | "identity_key" => {}
             other => {
@@ -17576,6 +17608,54 @@ impl Scp {
         use scp_did::DID;
 
         validate_did(&did)?;
+
+        // Ownership gate (parity with NAPI's RED-PR5-004 check and with
+        // `identity_execute_recovery` above): custody migration is restricted
+        // to identities THIS bridge instance hosts, so a co-resident caller
+        // cannot drive unmetered orchestrator work against arbitrary DIDs.
+        // `SCP-IDENT-1024` matches NAPI/PyO3.
+        if !identity_custody_registry(&self.inner).contains_key(&did) {
+            return Err(ScpError::Identity {
+                msg: format!(
+                    "identity_execute_custody_migration: DID '{did}' is not owned by this SCP \
+                     instance — custody migration is restricted to identities created or loaded \
+                     via this SCP"
+                ),
+                code: codes::IDENT_1024.to_owned(),
+            });
+        }
+
+        // Length cap: prevent DoS by an unbounded context_ids list. Shares the
+        // recovery bound — the two operations amplify identically.
+        if context_ids.len() > MAX_CONTEXT_IDS_PER_RECOVERY {
+            return Err(ScpError::Validation {
+                msg: format!(
+                    "identity_execute_custody_migration: context_ids length {} exceeds cap of {}",
+                    context_ids.len(),
+                    MAX_CONTEXT_IDS_PER_RECOVERY
+                ),
+                code: codes::VALID_7120.to_owned(),
+            });
+        }
+
+        // Concurrency cap: shared permit pool with `identity_execute_recovery`
+        // (see that method and `UniffiBridgeInstance::recovery_semaphore`).
+        // Held across the `block_on` below, which is exactly the work it
+        // bounds.
+        //
+        // Placed AFTER the ownership + length-cap checks so rejected-upstream
+        // callers never consume a permit.
+        let _permit = Arc::clone(&self.inner.recovery_semaphore)
+            .try_acquire_owned()
+            .map_err(|_| ScpError::Validation {
+                msg: format!(
+                    "recovery/custody-migration concurrency cap reached \
+                     ({RECOVERY_CONCURRENCY_CAP} in flight); retry after an in-flight call \
+                     completes"
+                ),
+                code: codes::VALID_7140.to_owned(),
+            })?;
+
         let did_val = DID::from(did.as_str());
 
         let migration_target = match target.as_str() {
@@ -19124,6 +19204,127 @@ mod tests {
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
         crate::scp::Scp::new_in_memory_for_test()
+    }
+
+    // -----------------------------------------------------------------------
+    // #1549 RED-PR5-002/003/004: recovery + custody-migration DoS and
+    // authorization gates. NAPI enforced all three (ownership, `context_ids`
+    // length cap, per-instance concurrency permit); this bridge enforced only
+    // ownership on recovery and nothing at all on custody migration. That was
+    // a matrix hole, not a runtime-specific exemption — both entry points here
+    // drive the same orchestrator through `crate::runtime().block_on(...)`.
+    // -----------------------------------------------------------------------
+
+    /// Registers `did` in this instance's identity custody registry so the
+    /// ownership gate on `identity_execute_*` accepts it.
+    #[cfg(feature = "testing")]
+    fn register_owned_did(scp: &Arc<crate::scp::Scp>, did: &str) {
+        let custody = Arc::new(UniffiKeyCustody::InMemory(Arc::new(
+            OpaqueInMemoryKeyCustody(scp_platform::testing::InMemoryKeyCustody::new()),
+        )));
+        identity_custody_registry(&scp.inner)
+            .insert(did.to_owned(), (custody, scp_platform::KeyHandle::new(0)));
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn recovery_and_migration_enforce_length_cap() {
+        let scp = scp_test();
+        let did = "did:dht:z6MkRecoveryGateTest";
+        register_owned_did(&scp, did);
+
+        let over_cap = vec!["ctx".to_owned(); MAX_CONTEXT_IDS_PER_RECOVERY + 1];
+        for err in [
+            scp.identity_execute_recovery(did.to_owned(), "agent".to_owned(), over_cap.clone())
+                .expect_err("over-cap recovery must be rejected"),
+            scp.identity_execute_custody_migration(did.to_owned(), "hardware".to_owned(), over_cap)
+                .expect_err("over-cap migration must be rejected"),
+        ] {
+            assert!(
+                err.to_string().contains(codes::VALID_7120),
+                "over-cap call must carry SCP-VALID-7120: {err}"
+            );
+        }
+
+        // At the cap the gate lets the call through to its own terminal error,
+        // so the bound is `>` and not `>=`.
+        let err = scp
+            .identity_execute_recovery(
+                did.to_owned(),
+                "agent".to_owned(),
+                vec!["ctx".to_owned(); MAX_CONTEXT_IDS_PER_RECOVERY],
+            )
+            .expect_err("recovery fails closed regardless (#2240)");
+        assert!(
+            err.to_string().contains(codes::IDENT_1022),
+            "a call AT the cap must reach the fail-closed path: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn recovery_and_migration_reject_when_permits_exhausted() {
+        let scp = scp_test();
+        let did = "did:dht:z6MkPermitGateTest";
+        register_owned_did(&scp, did);
+
+        // Exhaust the pool; the N+1 call must fail fast rather than queue
+        // (queueing would itself pin a runtime worker).
+        let sem = Arc::clone(&scp.inner.recovery_semaphore);
+        let _permits: Vec<_> = (0..RECOVERY_CONCURRENCY_CAP)
+            .map(|_| sem.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        for err in [
+            scp.identity_execute_recovery(did.to_owned(), "agent".to_owned(), Vec::new())
+                .expect_err("N+1 recovery must be rejected"),
+            scp.identity_execute_custody_migration(
+                did.to_owned(),
+                "hardware".to_owned(),
+                Vec::new(),
+            )
+            .expect_err("N+1 migration must be rejected"),
+        ] {
+            assert!(
+                err.to_string().contains(codes::VALID_7140),
+                "N+1 call must carry SCP-VALID-7140: {err}"
+            );
+        }
+    }
+
+    /// The ownership gate runs BEFORE the permit gate, so an unauthorised
+    /// caller cannot burn permits with arbitrary DIDs.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn unowned_did_is_rejected_without_consuming_a_permit() {
+        let scp = scp_test();
+        let stranger = "did:dht:z6MkStrangerNotOwnedHere";
+
+        let err = scp
+            .identity_execute_recovery(stranger.to_owned(), "agent".to_owned(), Vec::new())
+            .expect_err("a DID this instance does not own must be rejected");
+        assert!(
+            err.to_string().contains(codes::IDENT_1020),
+            "unowned recovery must carry SCP-IDENT-1020: {err}"
+        );
+
+        let err = scp
+            .identity_execute_custody_migration(
+                stranger.to_owned(),
+                "hardware".to_owned(),
+                Vec::new(),
+            )
+            .expect_err("a DID this instance does not own must be rejected");
+        assert!(
+            err.to_string().contains(codes::IDENT_1024),
+            "unowned migration must carry SCP-IDENT-1024: {err}"
+        );
+
+        assert_eq!(
+            scp.inner.recovery_semaphore.available_permits(),
+            RECOVERY_CONCURRENCY_CAP,
+            "an unauthorised caller must not consume a permit"
+        );
     }
 
     // -----------------------------------------------------------------------

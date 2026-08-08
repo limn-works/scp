@@ -1124,8 +1124,9 @@ impl Scp {
         }
 
         // Length cap: prevent DoS by unbounded context_ids list
-        // (round-3 red-hat RED-PR5-003 amplifier).
-        const MAX_CONTEXT_IDS_PER_RECOVERY: usize = 1024;
+        // (round-3 red-hat RED-PR5-003 amplifier). Shared across all three
+        // bridges via `scp_ffi_common` so the bound cannot drift.
+        use scp_ffi_common::validate::MAX_CONTEXT_IDS_PER_RECOVERY;
         if context_ids.len() > MAX_CONTEXT_IDS_PER_RECOVERY {
             return Err(NapiError::from(ScpNapiError::Validation {
                 message: format!(
@@ -1240,8 +1241,9 @@ impl Scp {
             }));
         }
 
-        // Length cap: prevent DoS by unbounded context_ids list.
-        const MAX_CONTEXT_IDS_PER_MIGRATION: usize = 1024;
+        // Length cap: prevent DoS by unbounded context_ids list. Shares the
+        // recovery bound — the two operations amplify identically.
+        use scp_ffi_common::validate::MAX_CONTEXT_IDS_PER_RECOVERY as MAX_CONTEXT_IDS_PER_MIGRATION;
         if context_ids.len() > MAX_CONTEXT_IDS_PER_MIGRATION {
             return Err(NapiError::from(ScpNapiError::Validation {
                 message: format!(
