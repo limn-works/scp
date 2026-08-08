@@ -22903,11 +22903,16 @@ mod tests {
         // (it short-circuits before the bridge upgrade).
         assert!(provider.validate_capability("ctx-dropped", "t").is_err());
 
-        // active_context_ids & agent_did don't touch the Weak at all.
-        assert_eq!(
-            provider.active_context_ids(),
-            vec!["ctx-dropped".to_owned()]
+        // active_context_ids: empty. It now resolves live participation through
+        // the bridge's Supervisor, so a dropped instance serves nothing — the
+        // fail-closed answer, since serving a context whose membership can no
+        // longer be checked is worse than serving none.
+        assert!(
+            provider.active_context_ids().is_empty(),
+            "a dropped bridge must serve no contexts"
         );
+
+        // agent_did is provider-local and does not touch the Weak at all.
         assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
     }
 
@@ -23009,7 +23014,17 @@ mod tests {
         supervisor
             .create_context(
                 context_id.to_owned(),
-                scp_core::context::ContextParams::default(),
+                scp_core::context::ContextParams {
+                    // An explicit ceiling: the creator is auto-assigned `admin`,
+                    // whose capabilities ARE the ceiling, so an empty ceiling
+                    // (the `Default`) would grant the creator nothing — and
+                    // correctly deny it every resource.
+                    ceiling: vec![
+                        scp_core::context::roles::Capability::MessagesRead,
+                        scp_core::context::roles::Capability::MessagesWrite,
+                    ],
+                    ..scp_core::context::ContextParams::default()
+                },
                 scp_did::DID("did:dht:z6MkSubscriber".to_owned()),
                 None,
             )
