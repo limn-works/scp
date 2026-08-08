@@ -402,7 +402,8 @@ mod tests {
             &self,
             _identity: &ScpIdentity,
             _document: &DidDocument,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<scp_identity::republish::RepublishEntry, IdentityError>> + Send
+        {
             async { unreachable!("not needed for well_known tests") }
         }
 
