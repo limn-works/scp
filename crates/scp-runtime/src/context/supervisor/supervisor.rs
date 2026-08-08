@@ -10831,11 +10831,14 @@ impl Supervisor {
                 };
                 match state {
                     ContextState::Active => {
-                        // Fetch params through the actor mailbox; `None`
+                        // Fetch params through the actor mailbox. `Ok(None)`
                         // means the actor vanished between the state probe
-                        // and this read (raced close) — treat as not
-                        // reconnectable and move on.
-                        if let Some(params) = self.context_params(&context_id).await {
+                        // and this read (raced close); an `Err` is a transient
+                        // mailbox/reply fault on a best-effort reconnect sweep.
+                        // Either way this context is not reconnectable on this
+                        // pass — skip it (the sweep re-runs), never abort the
+                        // whole sweep for one wedged actor.
+                        if let Ok(Some(params)) = self.context_params(&context_id).await {
                             // ADR-056: resolve through the canonical resolver so
                             // the transport publish keys under the same bytes as
                             // `state.context_id`. A standing-pair id carries the
@@ -11327,25 +11330,54 @@ impl Supervisor {
         }
     }
 
-    /// Returns a clone of the context's creation parameters, or `None`
-    /// if the context is unknown. Routes through the actor mailbox via
+    /// Returns a clone of the context's creation parameters, or `Ok(None)` if
+    /// the context is unknown. Routes through the actor mailbox via
     /// [`Self::dispatch_query`].
-    #[must_use]
+    ///
+    /// `Result`-typed for the same reason as its sibling [`Self::get_role_state`],
+    /// and deliberately kept symmetric with it: the two are the two halves of ONE
+    /// predicate at the #2028 Welcome-seam gate (`params.ceiling` is the genesis
+    /// authority a joiner installs; `role_state.ceiling()` is the live authority
+    /// it is checked against). Collapsing "no such context" and "the actor did not
+    /// answer" into one `None` here would report a TRANSIENT fault as the
+    /// permanent verdict `ContextNotRegistered` — an SDK caller could not tell
+    /// "retry this" from "this context will never admit you" — while the other
+    /// half of the same predicate reported it faithfully. Both outcomes still fail
+    /// closed; only their retryability differs, and that distinction is only
+    /// recoverable if the query preserves it.
+    ///
+    /// # Errors
+    ///
+    /// - Any dispatch error from [`Self::dispatch_query`] (mailbox enqueue
+    ///   failure, unconfigured provider), propagated unchanged.
+    /// - [`ContextError::TransportFailed`] if the actor dropped the reply sender
+    ///   before answering (typically a terminated/replaced actor).
+    /// - [`ContextError::ActorBusy`] — retryable — if the actor did not reply
+    ///   within [`REPLY_TIMEOUT`](crate::context::actor::handle::REPLY_TIMEOUT).
+    /// - Any error the handler itself returned.
+    ///
+    /// The [`BoundedReplyError`] mapping mirrors [`Self::get_role_state`]
+    /// verbatim so the two cannot drift.
     pub async fn context_params(
         &self,
         context_id: &str,
-    ) -> Option<scp_protocol::context::ContextParams> {
+    ) -> Result<Option<scp_protocol::context::ContextParams>, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = QueriesCommand::ContextParams {
             context_id: context_id.to_owned(),
             reply: tx,
         };
-        if self.dispatch_query(cmd).await.is_err() {
-            return None;
-        }
+        self.dispatch_query(cmd).await?;
         match bounded_reply_await(rx).await {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(_)) | Err(_) => None,
+            Ok(inner) => inner,
+            Err(BoundedReplyError::Dropped) => Err(ContextError::TransportFailed(format!(
+                "context_params: actor for '{context_id}' dropped the reply channel before \
+                 answering"
+            ))),
+            Err(BoundedReplyError::Elapsed) => Err(ContextError::ActorBusy(format!(
+                "context_params: actor for '{context_id}' did not reply within the bounded \
+                 reply budget"
+            ))),
         }
     }
 
@@ -12687,11 +12719,12 @@ impl Supervisor {
         // ceilings on the wire: the caps a stream is admitted against are
         // exactly what the context creator declared. Fetched through the actor
         // mailbox, the same path every other supervisor query uses. A vanished
-        // context (raced close between the reserve and this read) fails the
-        // open closed through the transport-fault admission slug; the escrow
-        // ticket armed above reverses the reserve's debited hold on the early
-        // return.
-        let Some(ctx_params) = self.context_params(context_id).await else {
+        // context (raced close between the reserve and this read) — and equally
+        // a transient mailbox/reply fault — fails the open closed through the
+        // transport-fault admission slug, which is the RETRYABLE slug and so
+        // suits both; the escrow ticket armed above reverses the reserve's
+        // debited hold on the early return.
+        let Ok(Some(ctx_params)) = self.context_params(context_id).await else {
             return Err(dispatch::OpenStreamRejection::AdmissionRateLimited {
                 slug: error_codes::SLUG_TRANSPORT_RATE_LIMITED,
             });
@@ -13048,8 +13081,13 @@ impl Supervisor {
         use scp_protocol::context::{InvitationBundle, InvitationKeyMaterial};
         use scp_protocol::crypto::envelope_seal;
 
-        // 1. Live genesis params — the authenticated authority source.
-        let params = self.context_params(&context_id).await.ok_or_else(|| {
+        // 1. Live genesis params — the authenticated authority source. A read
+        //    fault propagates AS a fault (retryable `TransportFailed` /
+        //    `ActorBusy`); only a genuine "no such context" answer becomes the
+        //    terminal `ContextNotRegistered`. Same treatment as the
+        //    `get_role_state` read below, which is the other half of the #2028
+        //    predicate these two feed.
+        let params = self.context_params(&context_id).await?.ok_or_else(|| {
             ContextError::ContextNotRegistered(format!(
                 "invite_member: no live context '{context_id}'"
             ))

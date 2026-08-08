@@ -13797,9 +13797,13 @@ impl Scp {
                 // Validate chain depth (context-configurable, default 8 per ADR-043).
                 let max_chain_depth = {
                     let mgr = bi.context_manager_or_error()?;
+                    // A read fault is a fault, not "the context declared no
+                    // override": silently falling back to the ADR-043 default on
+                    // a wedged/absent actor would apply a policy limit the
+                    // context never chose.
                     let source_max = mgr
                         .context_params(&source_handle.context_id)
-                        .await
+                        .await?
                         .and_then(|p| p.max_chain_depth);
                     scp_core::provenance::attach::effective_max_chain_depth(source_max)
                 };
@@ -14192,7 +14196,7 @@ impl Scp {
                 let cap = {
                     let mgr = bi.context_manager_or_error()?;
                     mgr.context_params(&handle.context_id)
-                        .await
+                        .await?
                         .and_then(|p| p.session_cap)
                         .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER)
                         as usize

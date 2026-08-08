@@ -1007,8 +1007,12 @@ fn outlet_invoke_cross_context_impl(
     let max_chain_depth = {
         let supervisor = crate::runtime::supervisor(bi)?;
         let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+        // A read fault is a fault, not "the context declared no override":
+        // silently falling back to the ADR-043 default on a wedged/absent actor
+        // would apply a policy limit the context never chose.
         let source_max = tokio_rt
             .block_on(supervisor.context_params(source_context_id))
+            .map_err(ScpPyError::from)?
             .and_then(|p| p.max_chain_depth);
         scp_core::provenance::attach::effective_max_chain_depth(source_max)
     };
@@ -1423,6 +1427,7 @@ fn outlet_session_create_impl(
             let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
             tokio_rt
                 .block_on(supervisor.context_params(context_id))
+                .map_err(ScpPyError::from)?
                 .and_then(|p| p.session_cap)
                 .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER)
                 as usize

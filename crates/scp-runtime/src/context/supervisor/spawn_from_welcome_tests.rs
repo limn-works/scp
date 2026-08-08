@@ -3459,6 +3459,7 @@ async fn governed_ceiling_lowering_refuses_the_welcome_seam_fail_closed() {
     let genesis_ceiling = alice_sup
         .context_params(&ctx_id)
         .await
+        .expect("the params query must not fault")
         .expect("the live context has params")
         .ceiling;
     assert!(

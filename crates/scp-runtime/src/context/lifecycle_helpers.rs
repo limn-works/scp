@@ -4195,6 +4195,7 @@ mod restore_reconcile_tests {
         let restored = supervisor
             .context_params(ctx_id)
             .await
+            .expect("the params query must not fault")
             .expect("the restored context is registered and reports its params");
 
         assert_eq!(
