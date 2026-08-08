@@ -2,7 +2,7 @@
 //! WRITE half of Model B relay DID resolution (SCP-RELAYRES-004).
 //!
 //! [`TransportRelayPublisher`] is the concrete, non-test implementation of the
-//! `scp-identity` [`RelayPublisher`](scp_identity::republish::RelayPublisher)
+//! `scp-identity` [`RelayPublisher`]
 //! trait. It lives in `scp-transport` (not `scp-identity`) because only this
 //! crate can talk to a relay: `scp-transport` depends on `scp-identity`, so a
 //! relay-talking publisher in `scp-identity` would be a circular dependency
@@ -11,70 +11,58 @@
 //!
 //! # What it does
 //!
-//! Given a bound set of relays and a DID `routing_id`, it
+//! Given a bound set of relays, it
 //! [`encode`](scp_protocol::envelope::did_record::DidRecordV1::encode)s the
 //! caller-supplied [`DidRecordV1`] frame (§9.10.12) — which carries the full
 //! BEP44 `(public_key, seq, signature, value)` — into its canonical bytes and
-//! publishes those bytes at the routing ID via the transport's raw-blob path
-//! ([`publish_raw`](crate::traits::TransportAdapter::publish_raw)) to every bound
-//! relay (own relays + bootstrap relays, §3.10.2 / §18.5.1). The DID relay blob
-//! is therefore ALWAYS the frame — never the bare document bytes and never an
-//! `OuterEnvelope` (§9.10.12 publish contract).
+//! publishes those bytes, at the routing ID the frame's own key binds to, via
+//! the transport's raw-blob path
+//! ([`publish_raw`](crate::traits::TransportAdapter::publish_raw)) to every
+//! bound relay (own relays + bootstrap relays, §3.10.2 / §18.5.1).
 //!
-//! # Frame-wrapping happens here, and only here
+//! Neither the blob nor the address is a free parameter — see the
+//! [`RelayPublisher`] trait docs for
+//! the authoritative statement of that contract.
 //!
-//! The [`RelayPublisher`](scp_identity::republish::RelayPublisher) contract takes
-//! a `&DidRecordV1`, not an opaque `&[u8]`, so a caller can never hand this
-//! publisher unframed bytes (the footgun that dropped the BEP44 signature/seq at
-//! the republish site before SCP-RELAYRES-004). The single `encode()` call below
-//! is the one place the record becomes wire bytes.
+//! # Late binding, fail-closed, and partial reach
 //!
-//! # Late binding (fail-closed)
+//! Transports are bound **after** construction via
+//! [`bind`](TransportRelayPublisher::bind) (see
+//! `BoundRelays`). A publish with **no** relay
+//! bound, or one that every bound relay rejects, **fails closed** with a typed
+//! [`IdentityError::RelayPublishFailed`]: an unconnected publisher never reports
+//! a phantom success, so the republish loop's backoff + degraded-warning path
+//! (§3.10.6) engages honestly.
 //!
-//! Like the querier, this publisher is constructed at FFI init — before any relay
-//! connection exists — so transports are bound **after** construction via
-//! [`bind`](TransportRelayPublisher::bind). A publish with **no** relay bound,
-//! or one that every bound relay rejects, **fails closed** with a typed
-//! [`IdentityError::RelayPublishFailed`]: an unconnected publisher never reports a
-//! phantom success, so the republish loop's backoff + degraded-warning path
-//! (§3.10.6) engages honestly. A publish that reaches at least one relay
-//! succeeds (multi-relay publishing is best-effort for availability; one relay
-//! accepting is a successful publish, and more relays only improve reach). No
-//! lock is ever held across an `.await`: the adapter handles are cloned out under
-//! a short synchronous lock, which is dropped before any publish future runs.
+//! A publish that reaches at least one relay succeeds — one relay accepting
+//! makes the record resolvable — but the result reports **how many** of the
+//! attempted relays accepted. Collapsing a partial accept to a plain success
+//! would hand an attacker who controls one relay of N permanent, silent
+//! suppression on that relay (§3.10.8): resolvers consulting it would never see
+//! the record while the publisher saw nothing wrong. Per-relay rejections are
+//! additionally logged at `warn` naming the relay URL.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use scp_identity::IdentityError;
-use scp_identity::republish::RelayPublisher;
+use scp_identity::republish::{RelayPublishOutcome, RelayPublisher};
 use scp_protocol::envelope::did_record::DidRecordV1;
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::native::BoundRelays;
 use crate::traits::{RoutingId, TransportAdapter};
 
 /// Production [`RelayPublisher`] that publishes DID-record frames over a live
 /// transport.
 ///
-/// Holds a per-instance, late-bound map of `relay_url -> adapter`. Bindings are
-/// added as relay connections are established (see the module docs) and can be
-/// removed on disconnect. A publish with no bound relay — or one every bound
+/// A thin newtype over the shared late-bound
+/// `BoundRelays` set (the READ-half
+/// [`TransportRelayQuerier`](crate::native::TransportRelayQuerier) is the same
+/// shape over the same type). A publish with no bound relay — or one every bound
 /// relay rejects — fails closed (see the module docs).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct TransportRelayPublisher {
-    /// Late-bound live transports, keyed by relay URL. Guarded by a synchronous
-    /// `RwLock` because every access is a brief clone-out; the lock is never
-    /// held across an `.await` (see the module docs).
-    relays: RwLock<HashMap<String, Arc<dyn TransportAdapter>>>,
-}
-
-impl std::fmt::Debug for TransportRelayPublisher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let bound = self.relays.read().map_or(0, |m| m.len());
-        f.debug_struct("TransportRelayPublisher")
-            .field("bound_relays", &bound)
-            .finish()
-    }
+    relays: BoundRelays,
 }
 
 impl TransportRelayPublisher {
@@ -83,51 +71,22 @@ impl TransportRelayPublisher {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            relays: RwLock::new(HashMap::new()),
+            relays: BoundRelays::new(),
         }
     }
 
     /// Late-binds a live transport adapter for a relay URL.
     ///
     /// Idempotent: a subsequent bind for the same URL replaces the prior
-    /// adapter. A poisoned lock is treated as "no binding possible" and the call
-    /// is a no-op (a publish then fails closed if no relay remains bound).
+    /// adapter.
     pub fn bind(&self, relay_url: impl Into<String>, adapter: Arc<dyn TransportAdapter>) {
-        if let Ok(mut relays) = self.relays.write() {
-            relays.insert(relay_url.into(), adapter);
-        }
+        self.relays.bind(relay_url, adapter);
     }
 
-    /// Removes the binding for a relay URL (e.g. on disconnect). Absent bindings
-    /// are ignored.
+    /// Removes the binding for a relay URL (e.g. on disconnect). Absent
+    /// bindings are ignored.
     pub fn unbind(&self, relay_url: &str) {
-        if let Ok(mut relays) = self.relays.write() {
-            relays.remove(relay_url);
-        }
-    }
-
-    /// Snapshots the currently-bound `(relay_url, adapter)` pairs, cloned out
-    /// under a short synchronous lock so the guard never crosses an `.await`.
-    fn bound_adapters(&self) -> Vec<(String, Arc<dyn TransportAdapter>)> {
-        self.relays.read().map_or_else(
-            |_| Vec::new(),
-            |m| {
-                m.iter()
-                    .map(|(url, a)| (url.clone(), Arc::clone(a)))
-                    .collect()
-            },
-        )
-    }
-
-    /// Number of relays currently bound — the number a `publish` would reach.
-    ///
-    /// A caller wiring a self-DID republish cycle uses this to decide whether the
-    /// relay layer is serviceable at all: with zero bound relays every publish
-    /// fails closed, so driving the relay arm would only spin against no
-    /// transport. Zero here means "do not advertise an active relay task."
-    #[must_use]
-    pub fn bound_relay_count(&self) -> usize {
-        self.relays.read().map_or(0, |m| m.len())
+        self.relays.unbind(relay_url);
     }
 }
 
@@ -138,20 +97,16 @@ impl TransportRelayPublisher {
 impl RelayPublisher for TransportRelayPublisher {
     fn publish(
         &self,
-        blob_ttl: u64,
+        blob_ttl_secs: u64,
         record: &DidRecordV1,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
-        // Wrap ONCE, here: the record becomes its canonical §9.10.12 frame bytes.
-        // The publisher only ever accepts a `DidRecordV1`, so the bytes on the
-        // wire are always the full framed record, never bare `document_bytes`.
+    ) -> impl Future<Output = Result<RelayPublishOutcome, IdentityError>> + Send {
+        // The one place the record becomes wire bytes, and the one place its
+        // address is chosen — both via the shared derivations, so this write
+        // path and the relay ADMISSION check cannot drift.
         let blob = record.encode();
-        // Derive the routing_id from the frame's own key (§9.10.12 binding) — a
-        // record can only be published at the one routing_id its key binds to, so
-        // a frame/routing_id mismatch is unrepresentable. This matches the binding
-        // a validating relay re-checks (SCP-RELAYRES-003).
-        let routing_id = RoutingId::new(scp_identity::republish::did_record_routing_id(record));
+        let routing_id = RoutingId::new(scp_identity::did_record_routing_id(record));
         // Resolve the bound adapters synchronously and drop the lock before await.
-        let adapters = self.bound_adapters();
+        let adapters = self.relays.snapshot();
 
         async move {
             if adapters.is_empty() {
@@ -164,36 +119,46 @@ impl RelayPublisher for TransportRelayPublisher {
                 ));
             }
 
-            let mut any_ok = false;
+            let attempted = adapters.len();
+            let mut accepted = 0usize;
             let mut last_err: Option<String> = None;
             for (relay_url, adapter) in adapters {
                 match adapter
-                    .publish_raw(&routing_id, blob_ttl, blob.clone())
+                    .publish_raw(&routing_id, blob_ttl_secs, blob.clone())
                     .await
                 {
                     Ok(()) => {
-                        any_ok = true;
+                        accepted = accepted.saturating_add(1);
                         debug!(relay_url = %relay_url, "TransportRelayPublisher: PUBLISHed DID record");
                     }
                     Err(e) => {
-                        // A per-relay failure is best-effort: log and keep going
-                        // to the other relays (multi-relay publishing, §3.10.2).
-                        debug!(
+                        // A per-relay failure does not abort the fan-out
+                        // (multi-relay publishing, §3.10.2) — but it is NAMED at
+                        // `warn`, not buried at `debug`: a relay that
+                        // consistently rejects is suppressing this DID for every
+                        // resolver that consults it (§3.10.8), and the operator
+                        // needs to know WHICH relay.
+                        warn!(
                             relay_url = %relay_url,
                             error = %e,
-                            "TransportRelayPublisher: relay PUBLISH failed — trying remaining relays"
+                            "TransportRelayPublisher: relay PUBLISH rejected — this relay \
+                             will not serve this DID; trying remaining relays"
                         );
                         last_err = Some(e.to_string());
                     }
                 }
             }
 
-            if any_ok {
-                Ok(())
+            if accepted > 0 {
+                Ok(RelayPublishOutcome {
+                    accepted,
+                    attempted,
+                })
             } else {
                 // Every bound relay rejected the publish — fail closed.
                 Err(IdentityError::RelayPublishFailed(format!(
-                    "TransportRelayPublisher: all bound relays rejected the DID-record PUBLISH{}",
+                    "TransportRelayPublisher: all {attempted} bound relays rejected the \
+                     DID-record PUBLISH{}",
                     last_err.map_or_else(String::new, |e| format!(": {e}"))
                 )))
             }

@@ -65,3 +65,95 @@ pub use adapter::NativeRelayAdapter;
 pub use cert_pin::{CertPinResult, CertificatePin};
 pub use relay_publisher::TransportRelayPublisher;
 pub use relay_querier::TransportRelayQuerier;
+
+// ---------------------------------------------------------------------------
+// Late-bound relay set — shared by the DID-resolution READ and WRITE halves
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use crate::traits::TransportAdapter;
+
+/// A late-bound `relay_url -> adapter` set.
+///
+/// Both halves of Model B relay DID resolution — [`TransportRelayQuerier`]
+/// (READ, §3.10.4) and [`TransportRelayPublisher`] (WRITE, §3.10.5) — are
+/// constructed at FFI init, **before** any relay connection exists, so they hold
+/// their transports behind exactly this late-binding map. It lives here, once,
+/// rather than being duplicated in each: the two halves await the *same* relay
+/// connection set, so a divergence in how they hold it (locking, poisoning,
+/// rebind semantics) would be a divergence in when DID resolution and DID
+/// publishing are live.
+///
+/// # Locking discipline
+///
+/// A synchronous [`RwLock`], never held across an `.await`: every accessor
+/// clones the `Arc` handles out and drops the guard before returning, so a
+/// caller physically cannot await while holding it. A **poisoned** lock is
+/// treated as "no binding" — reads yield nothing and writes are dropped — so a
+/// panic elsewhere degrades to the fail-closed path (an unbound publisher errors;
+/// an unbound querier returns no candidates) rather than propagating a panic
+/// into the resolution path.
+#[derive(Default)]
+pub(crate) struct BoundRelays {
+    relays: RwLock<HashMap<String, Arc<dyn TransportAdapter>>>,
+}
+
+impl std::fmt::Debug for BoundRelays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundRelays")
+            .field("bound_relays", &self.len())
+            .finish()
+    }
+}
+
+impl BoundRelays {
+    /// Creates an empty set.
+    pub(crate) fn new() -> Self {
+        Self {
+            relays: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Late-binds a live transport adapter for a relay URL.
+    ///
+    /// Idempotent: a subsequent bind for the same URL replaces the prior
+    /// adapter (reconnects rebind rather than accumulate).
+    pub(crate) fn bind(&self, relay_url: impl Into<String>, adapter: Arc<dyn TransportAdapter>) {
+        if let Ok(mut relays) = self.relays.write() {
+            relays.insert(relay_url.into(), adapter);
+        }
+    }
+
+    /// Removes the binding for a relay URL (e.g. on disconnect). Absent
+    /// bindings are ignored.
+    pub(crate) fn unbind(&self, relay_url: &str) {
+        if let Ok(mut relays) = self.relays.write() {
+            relays.remove(relay_url);
+        }
+    }
+
+    /// The adapter bound for `relay_url`, cloned out under a short lock.
+    pub(crate) fn get(&self, relay_url: &str) -> Option<Arc<dyn TransportAdapter>> {
+        self.relays.read().ok()?.get(relay_url).cloned()
+    }
+
+    /// Every currently-bound `(relay_url, adapter)` pair, cloned out under a
+    /// short lock so the guard never crosses an `.await`.
+    pub(crate) fn snapshot(&self) -> Vec<(String, Arc<dyn TransportAdapter>)> {
+        self.relays.read().map_or_else(
+            |_| Vec::new(),
+            |m| {
+                m.iter()
+                    .map(|(url, a)| (url.clone(), Arc::clone(a)))
+                    .collect()
+            },
+        )
+    }
+
+    /// Number of relays currently bound.
+    pub(crate) fn len(&self) -> usize {
+        self.relays.read().map_or(0, |m| m.len())
+    }
+}
