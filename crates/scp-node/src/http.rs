@@ -23,7 +23,6 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use zeroize::Zeroizing;
 
-use scp_did::DidDocument;
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
 use scp_transport::native::storage::BlobStorageBackend;
@@ -164,11 +163,17 @@ pub struct NodeState {
     ///
     /// See spec section 18.6.3 (auto-renewal).
     pub(crate) cert_resolver: Option<Arc<crate::tls::CertResolver>>,
-    /// The operator's DID document, populated at build time.
+    /// The operator's DID document — the node's live slot, NOT a build-time
+    /// copy.
     ///
     /// Used by the dev API identity endpoint to return the full document
-    /// (spec section 18.10.3).
-    pub(crate) did_document: DidDocument,
+    /// (spec section 18.10.3). A NAT tier change (§10.12.1) re-points the
+    /// document's `SCPRelay` service endpoint and re-publishes it; holding a
+    /// `DidDocument` by value here made that endpoint serve the pre-change
+    /// relay URL for the rest of the node's life. The slot is shared with the
+    /// tier re-evaluation task, so the endpoint cannot read a stale document.
+    /// See [`NodeDidDocument`](crate::NodeDidDocument).
+    pub(crate) did_document: crate::NodeDidDocument,
     /// Shared connection tracker from the relay server.
     ///
     /// Tracks active connections per IP address across all transports.
@@ -1190,7 +1195,7 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_did::DidDocument {
+            did_document: crate::NodeDidDocument::new(scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:cors_test".to_owned(),
                 verification_method: vec![],
@@ -1198,7 +1203,7 @@ mod tests {
                 assertion_method: vec![],
                 also_known_as: vec![],
                 service: vec![],
-            },
+            }),
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
@@ -1386,7 +1391,7 @@ mod vhost_tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_did::DidDocument {
+            did_document: crate::NodeDidDocument::new(scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:vhost_test".to_owned(),
                 verification_method: vec![],
@@ -1394,7 +1399,7 @@ mod vhost_tests {
                 assertion_method: vec![],
                 also_known_as: vec![],
                 service: vec![],
-            },
+            }),
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
