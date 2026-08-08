@@ -56,6 +56,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
+use scp_core::context::membership::ContextEvent;
+
 use crate::protocol::{
     JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PARSE_ERROR, RequestId,
 };
@@ -211,21 +213,32 @@ impl ReplayBuffer {
 // Shared state
 // ---------------------------------------------------------------------------
 
-/// Shared state between the SSE endpoint and the POST endpoint.
-pub(crate) struct AppState<P: ContextProvider> {
-    /// The MCP server, protected by a mutex for concurrent access.
-    server: Mutex<McpServer<P>>,
+/// The server→client push fabric for an SSE session.
+///
+/// Notifications share the SSE event-ID sequence and replay buffer with
+/// request responses, so a client reconnecting with `Last-Event-ID` replays
+/// missed notifications exactly as it replays missed responses.
+#[derive(Clone)]
+pub(crate) struct McpNotifier {
     /// Broadcast sender for SSE messages to connected clients.
     tx: broadcast::Sender<(u64, String)>,
     /// Monotonically increasing event ID counter.
-    next_event_id: AtomicU64,
+    next_event_id: Arc<AtomicU64>,
     /// Replay buffer for reconnecting clients.
-    replay_buffer: RwLock<ReplayBuffer>,
-    /// Retry interval in milliseconds sent to SSE clients.
-    retry_ms: u64,
+    replay_buffer: Arc<RwLock<ReplayBuffer>>,
 }
 
-impl<P: ContextProvider> AppState<P> {
+impl McpNotifier {
+    /// Creates the push fabric for an SSE server built from `config`.
+    fn new(config: &SseConfig) -> Self {
+        let (tx, _rx) = broadcast::channel(config.channel_capacity);
+        Self {
+            tx,
+            next_event_id: Arc::new(AtomicU64::new(1)),
+            replay_buffer: Arc::new(RwLock::new(ReplayBuffer::new(config.replay_capacity))),
+        }
+    }
+
     /// Broadcasts a JSON payload to all connected SSE clients and records it
     /// in the replay buffer. Returns the assigned event ID.
     async fn broadcast(&self, data: String) -> u64 {
@@ -234,6 +247,46 @@ impl<P: ContextProvider> AppState<P> {
         let _ = self.tx.send((id, data));
         id
     }
+
+    /// Sends a JSON-RPC notification to all connected SSE clients.
+    ///
+    /// Returns the number of connected clients the notification was
+    /// broadcast to, or 0 if serialization fails or nobody is connected.
+    /// A return of 0 is not an error: the notification is still recorded in
+    /// the replay buffer and reaches a client that reconnects with
+    /// `Last-Event-ID`.
+    async fn notify(&self, notification: &JsonRpcNotification) -> usize {
+        match serde_json::to_string(notification) {
+            Ok(json) => {
+                self.broadcast(json).await;
+                self.tx.receiver_count()
+            }
+            Err(e) => {
+                tracing::error!("failed to serialize MCP notification: {e}");
+                0
+            }
+        }
+    }
+
+    /// Returns the number of currently connected SSE clients.
+    fn client_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
+    /// Reserves the next event ID in the shared sequence.
+    fn next_id(&self) -> u64 {
+        self.next_event_id.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+/// Shared state between the SSE endpoint and the POST endpoint.
+pub(crate) struct AppState<P: ContextProvider> {
+    /// The MCP server, protected by a mutex for concurrent access.
+    server: Mutex<McpServer<P>>,
+    /// The server→client push fabric, shared with any external event pump.
+    notifier: McpNotifier,
+    /// Retry interval in milliseconds sent to SSE clients.
+    retry_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,32 +301,62 @@ impl<P: ContextProvider> AppState<P> {
 ///
 /// The returned router can be served with `axum::serve` or composed into a
 /// larger application.
+///
+/// # Resource subscriptions
+///
+/// See [`run_sse`] for the meaning of `events`. Must be called from within a
+/// tokio runtime when `events` is `Some`, because the event pump is spawned
+/// as a background task.
 pub fn sse_router<P: ContextProvider + 'static>(
     server: McpServer<P>,
     config: &SseConfig,
+    events: Option<broadcast::Receiver<(String, ContextEvent)>>,
 ) -> Router {
-    let (tx, _rx) = broadcast::channel(config.channel_capacity);
+    router_with_pump(server, config, events).0
+}
+
+/// Builds the router and, when an event source is supplied, the pump task
+/// driving it.
+///
+/// The caller owns the returned [`tokio::task::JoinHandle`] so the pump can be
+/// stopped when the server stops. Without that, the pump would outlive the
+/// server it feeds and keep the whole [`AppState`] alive until the runtime's
+/// broadcast sender is dropped.
+fn router_with_pump<P: ContextProvider + 'static>(
+    server: McpServer<P>,
+    config: &SseConfig,
+    events: Option<broadcast::Receiver<(String, ContextEvent)>>,
+) -> (Router, Option<tokio::task::JoinHandle<()>>) {
+    let mut server = server;
+    // Enabling the capability and starting the pump are the same step, so the
+    // advertisement can never outrun the delivery machinery.
+    if events.is_some() {
+        server.enable_subscriptions();
+    }
+
     let state = Arc::new(AppState {
         server: Mutex::new(server),
-        tx,
-        next_event_id: AtomicU64::new(1),
-        replay_buffer: RwLock::new(ReplayBuffer::new(config.replay_capacity)),
+        notifier: McpNotifier::new(config),
         retry_ms: config.retry_ms,
     });
+
+    let pump = events.map(|rx| tokio::spawn(pump_events(Arc::clone(&state), rx)));
 
     let router = Router::new()
         .route("/sse", get(sse_handler::<P>))
         .route("/message", post(message_handler::<P>))
         .with_state(state);
 
-    if let Some(ref token) = config.auth_token {
+    let router = if let Some(ref token) = config.auth_token {
         let expected = token.clone();
         router.layer(middleware::from_fn(move |req, next| {
             bearer_auth_middleware(req, next, expected.clone())
         }))
     } else {
         router
-    }
+    };
+
+    (router, pump)
 }
 
 /// Middleware that validates bearer token authentication.
@@ -309,6 +392,19 @@ async fn bearer_auth_middleware(
 /// Binds to the configured address and serves until the [`ShutdownHandle`] is
 /// triggered or the process is terminated.
 ///
+/// # Resource subscriptions
+///
+/// Pass `events` — a receiver from
+/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events)
+/// — to enable `resources/subscribe`. When `Some`, the server advertises
+/// `resources.subscribe: true` and a pump turns each [`ContextEvent`] into
+/// `notifications/resources/updated` for the subscribed resources it
+/// invalidates.
+///
+/// When `None`, the server advertises `resources.subscribe: false` and
+/// rejects `resources/subscribe` with a typed error. The capability is never
+/// advertised without the machinery to honour it.
+///
 /// # Errors
 ///
 /// Returns [`SseError`] if the server cannot bind or encounters an I/O error.
@@ -316,21 +412,39 @@ pub async fn run_sse<P: ContextProvider + 'static>(
     server: McpServer<P>,
     config: SseConfig,
     shutdown: ShutdownHandle,
+    events: Option<broadcast::Receiver<(String, ContextEvent)>>,
 ) -> Result<(), SseError> {
-    let router = sse_router(server, &config);
+    let (router, pump) = router_with_pump(server, &config, events);
 
-    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+    let listener = match tokio::net::TcpListener::bind(config.bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Bind failed — stop the pump rather than leaving it running
+            // against a server that never started.
+            if let Some(handle) = pump {
+                handle.abort();
+            }
+            return Err(SseError::Io(e));
+        }
+    };
     tracing::info!("MCP SSE server listening on {}", config.bind_addr);
 
     let token = shutdown.token.clone();
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             token.cancelled().await;
             tracing::info!("MCP SSE server shutting down");
         })
-        .await
-        .map_err(SseError::Io)?;
+        .await;
 
+    // The pump holds an `Arc<AppState>`; without this it would outlive the
+    // server and keep the whole session alive until the runtime's broadcast
+    // sender is dropped.
+    if let Some(handle) = pump {
+        handle.abort();
+    }
+
+    result.map_err(SseError::Io)?;
     Ok(())
 }
 
@@ -370,7 +484,7 @@ async fn sse_handler<P: ContextProvider + 'static>(
 
     let replay_events: Vec<Result<Event, Infallible>> = if let Some(last_id) = last_event_id {
         tracing::debug!(last_id, "SSE client reconnecting");
-        let buf = state.replay_buffer.read().await;
+        let buf = state.notifier.replay_buffer.read().await;
         buf.events_after(last_id)
             .into_iter()
             .map(|entry| {
@@ -384,7 +498,7 @@ async fn sse_handler<P: ContextProvider + 'static>(
         Vec::new()
     };
 
-    let rx = state.tx.subscribe();
+    let rx = state.notifier.tx.subscribe();
     let message_stream = BroadcastStream::new(rx).filter_map(|result| {
         result
             .map(|(id, data)| {
@@ -399,6 +513,18 @@ async fn sse_handler<P: ContextProvider + 'static>(
     let initial = tokio_stream::once(Ok(endpoint_event));
     let replay = tokio_stream::iter(replay_events);
     let stream = initial.chain(replay).chain(message_stream);
+
+    // Hold a session guard for the lifetime of the stream. When the client
+    // disconnects the stream is dropped, dropping the guard, which clears the
+    // resource subscriptions once no clients remain — a reconnecting client
+    // must re-subscribe rather than inherit a previous session's registry.
+    let guard = SessionGuard {
+        state: Arc::clone(&state),
+    };
+    let stream = stream.map(move |event| {
+        let _keep_alive = &guard;
+        event
+    });
 
     Sse::new(stream).keep_alive(
         KeepAlive::default()
@@ -427,7 +553,7 @@ async fn message_handler<P: ContextProvider + 'static>(
             server.handle_request(&req)
         }
         Ok(SseIncoming::Notification(notif)) => {
-            let synthetic_id = state.next_event_id.fetch_add(1, Ordering::SeqCst);
+            let synthetic_id = state.notifier.next_id();
             let synthetic = JsonRpcRequest {
                 jsonrpc: notif.jsonrpc,
                 method: notif.method,
@@ -444,34 +570,73 @@ async fn message_handler<P: ContextProvider + 'static>(
     if let Some(resp) = response
         && let Ok(json) = serde_json::to_string(&resp)
     {
-        state.broadcast(json).await;
+        state.notifier.broadcast(json).await;
     }
 
     StatusCode::ACCEPTED
 }
 
 // ---------------------------------------------------------------------------
-// Notification sending
+// Event pump
 // ---------------------------------------------------------------------------
 
-/// Sends a JSON-RPC notification to all connected SSE clients.
-///
-/// This is used for server-initiated messages like
-/// `notifications/tools/list_changed`.
-///
-/// Returns the number of receivers that received the message, or 0 if
-/// serialization fails or no receivers are connected.
-#[cfg(test)]
-pub(crate) async fn send_notification<P: ContextProvider>(
-    state: &Arc<AppState<P>>,
-    notification: &JsonRpcNotification,
-) -> usize {
-    match serde_json::to_string(notification) {
-        Ok(json) => {
-            state.broadcast(json).await;
-            state.tx.receiver_count()
+/// Forwards runtime context events to connected clients as MCP notifications.
+async fn pump_events<P: ContextProvider + 'static>(
+    state: Arc<AppState<P>>,
+    mut events: broadcast::Receiver<(String, ContextEvent)>,
+) {
+    loop {
+        let (context_id, event) = match events.recv().await {
+            Ok(v) => v,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                // Clients may have missed a change. Nothing here can
+                // reconstruct which resources the dropped events touched, so
+                // log and continue; clients re-read on the next notification.
+                tracing::warn!("MCP SSE event pump lagged, {skipped} events dropped");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+
+        let notifications = {
+            let server = state.server.lock().await;
+            server.notifications_for_event(&context_id, &event)
+        };
+
+        for notification in &notifications {
+            state.notifier.notify(notification).await;
         }
-        Err(_) => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session lifecycle
+// ---------------------------------------------------------------------------
+
+/// Clears resource subscriptions when the last SSE client disconnects.
+///
+/// Held alive by the SSE response stream; dropped when the client goes away.
+struct SessionGuard<P: ContextProvider + 'static> {
+    state: Arc<AppState<P>>,
+}
+
+impl<P: ContextProvider + 'static> Drop for SessionGuard<P> {
+    fn drop(&mut self) {
+        // `Drop` is synchronous and clearing needs the async server mutex, so
+        // hand the work to the runtime. Outside a runtime (e.g. a test that
+        // drops the stream after the runtime ends) there is nothing to clean
+        // up, so skipping is correct rather than a lost update.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        handle.spawn(async move {
+            // Another client may still be attached; only the last one out
+            // clears the shared subscription registry.
+            if state.notifier.client_count() == 0 {
+                state.server.lock().await.clear_subscriptions();
+            }
+        });
     }
 }
 
@@ -592,21 +757,20 @@ mod tests {
         fn context_events(&self, _context_id: &str) -> serde_json::Value {
             serde_json::json!([])
         }
-        fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
 
     // -- Helper: create shared state for tests --------------------------------
 
+    fn test_config() -> SseConfig {
+        let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+        config.channel_capacity = 16;
+        config
+    }
+
     fn test_state() -> Arc<AppState<MockProvider>> {
-        let server = McpServer::new(MockProvider::default());
-        let (tx, _) = broadcast::channel(16);
         Arc::new(AppState {
-            server: Mutex::new(server),
-            tx,
-            next_event_id: AtomicU64::new(1),
-            replay_buffer: RwLock::new(ReplayBuffer::new(DEFAULT_REPLAY_CAPACITY)),
+            server: Mutex::new(McpServer::new(MockProvider::default())),
+            notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
         })
     }
@@ -649,13 +813,13 @@ mod tests {
     async fn sse_router_builds_successfully() {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        let _router = sse_router(server, &config);
+        let _router = sse_router(server, &config, None);
     }
 
     #[tokio::test]
     async fn message_handler_processes_initialize() {
         let state = test_state();
-        let mut rx = state.tx.subscribe();
+        let mut rx = state.notifier.tx.subscribe();
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -683,7 +847,7 @@ mod tests {
         assert_eq!(resp.id, RequestId::Number(1));
 
         let json = serde_json::to_string(&resp).unwrap();
-        state.broadcast(json.clone()).await;
+        state.notifier.broadcast(json.clone()).await;
 
         let (_id, received) = rx.recv().await.unwrap();
         assert_eq!(received, json);
@@ -745,7 +909,7 @@ mod tests {
                 srv.handle_request(&req)
             }
             SseIncoming::Notification(notif) => {
-                let synthetic_id = state.next_event_id.fetch_add(1, Ordering::SeqCst);
+                let synthetic_id = state.notifier.next_id();
                 let synthetic = JsonRpcRequest {
                     jsonrpc: notif.jsonrpc,
                     method: notif.method,
@@ -775,10 +939,10 @@ mod tests {
     #[tokio::test]
     async fn send_notification_broadcasts_to_receivers() {
         let state = test_state();
-        let mut rx = state.tx.subscribe();
+        let mut rx = state.notifier.tx.subscribe();
 
         let notif = McpServer::<MockProvider>::tools_list_changed_notification();
-        let count = send_notification(&state, &notif).await;
+        let count = state.notifier.notify(&notif).await;
         assert_eq!(count, 1);
 
         let (_id, received) = rx.recv().await.unwrap();
@@ -788,19 +952,118 @@ mod tests {
 
     #[tokio::test]
     async fn send_notification_returns_zero_with_no_receivers() {
-        let server = McpServer::new(MockProvider::default());
-        let (tx, _) = broadcast::channel::<(u64, String)>(16);
+        // No SSE client attached, so no receivers exist.
+        let state = test_state();
+
+        let notif = McpServer::<MockProvider>::tools_list_changed_notification();
+        let count = state.notifier.notify(&notif).await;
+        assert_eq!(count, 0);
+    }
+
+    // -- End-to-end subscription delivery -------------------------------------
+
+    /// Builds an initialized server with a wired event source, subscribed to
+    /// `uri`.
+    fn subscribed_server(uri: &str) -> McpServer<MockProvider> {
+        let mut server = McpServer::new(MockProvider::default());
+        server.enable_subscriptions();
+
+        let init = JsonRpcRequest {
+            jsonrpc: crate::protocol::JSONRPC_VERSION.to_owned(),
+            method: crate::protocol::METHOD_INITIALIZE.to_owned(),
+            params: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test" }
+            })),
+            id: RequestId::Number(1),
+        };
+        assert!(server.handle_request(&init).unwrap().error.is_none());
+
+        let sub = JsonRpcRequest {
+            jsonrpc: crate::protocol::JSONRPC_VERSION.to_owned(),
+            method: crate::protocol::METHOD_RESOURCES_SUBSCRIBE.to_owned(),
+            params: Some(serde_json::json!({ "uri": uri })),
+            id: RequestId::Number(2),
+        };
+        assert!(server.handle_request(&sub).unwrap().error.is_none());
+
+        server
+    }
+
+    /// Drives the full delivery chain that `resources/subscribe` promises:
+    /// runtime event -> broadcast channel -> pump -> subscription filter ->
+    /// `notifications/resources/updated` on the SSE stream.
+    ///
+    /// This is the test that would have failed against the old no-op
+    /// implementation, which accepted the subscription and then delivered
+    /// nothing (issue #1341).
+    #[tokio::test]
+    async fn subscribe_then_event_delivers_resources_updated() {
+        let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+
+        // A client initializes and subscribes to the context's event stream.
+        let server = subscribed_server("scp://ctx_a/events");
+
         let state = Arc::new(AppState {
             server: Mutex::new(server),
-            tx,
-            next_event_id: AtomicU64::new(1),
-            replay_buffer: RwLock::new(ReplayBuffer::new(DEFAULT_REPLAY_CAPACITY)),
+            notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
         });
 
-        let notif = McpServer::<MockProvider>::tools_list_changed_notification();
-        let count = send_notification(&state, &notif).await;
-        assert_eq!(count, 0);
+        // A client attaches to the SSE stream.
+        let mut client = state.notifier.tx.subscribe();
+
+        let pump = tokio::spawn(pump_events(Arc::clone(&state), event_rx));
+
+        // The runtime emits a context event.
+        event_tx
+            .send((
+                "ctx_a".to_owned(),
+                ContextEvent::ContentKeysRotated { reason: None },
+            ))
+            .unwrap();
+
+        let (_id, payload) = tokio::time::timeout(Duration::from_secs(5), client.recv())
+            .await
+            .expect("notification must arrive")
+            .expect("broadcast channel must stay open");
+
+        let notif: JsonRpcNotification = serde_json::from_str(&payload).unwrap();
+        assert_eq!(notif.method, crate::protocol::METHOD_RESOURCES_UPDATED);
+        assert_eq!(notif.params.unwrap()["uri"], "scp://ctx_a/events");
+
+        pump.abort();
+    }
+
+    /// The same chain must stay silent for a resource nobody subscribed to.
+    #[tokio::test]
+    async fn event_without_subscription_delivers_nothing() {
+        let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+
+        let mut server = McpServer::new(MockProvider::default());
+        server.enable_subscriptions();
+        let state = Arc::new(AppState {
+            server: Mutex::new(server),
+            notifier: McpNotifier::new(&test_config()),
+            retry_ms: DEFAULT_RETRY_MS,
+        });
+
+        let mut client = state.notifier.tx.subscribe();
+        let pump = tokio::spawn(pump_events(Arc::clone(&state), event_rx));
+
+        event_tx
+            .send((
+                "ctx_a".to_owned(),
+                ContextEvent::ContentKeysRotated { reason: None },
+            ))
+            .unwrap();
+
+        // Nothing subscribed, so nothing is pushed.
+        let got = tokio::time::timeout(Duration::from_millis(200), client.recv()).await;
+        assert!(got.is_err(), "unsubscribed resource must not notify");
+
+        pump.abort();
     }
 
     // -- Replay buffer --------------------------------------------------------
@@ -849,10 +1112,10 @@ mod tests {
     #[tokio::test]
     async fn broadcast_assigns_sequential_ids() {
         let state = test_state();
-        let mut rx = state.tx.subscribe();
+        let mut rx = state.notifier.tx.subscribe();
 
-        let id1 = state.broadcast("msg-1".to_owned()).await;
-        let id2 = state.broadcast("msg-2".to_owned()).await;
+        let id1 = state.notifier.broadcast("msg-1".to_owned()).await;
+        let id2 = state.notifier.broadcast("msg-2".to_owned()).await;
 
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
@@ -869,11 +1132,11 @@ mod tests {
     async fn broadcast_populates_replay_buffer() {
         let state = test_state();
 
-        state.broadcast("first".to_owned()).await;
-        state.broadcast("second".to_owned()).await;
-        state.broadcast("third".to_owned()).await;
+        state.notifier.broadcast("first".to_owned()).await;
+        state.notifier.broadcast("second".to_owned()).await;
+        state.notifier.broadcast("third".to_owned()).await;
 
-        let missed = state.replay_buffer.read().await.events_after(1);
+        let missed = state.notifier.replay_buffer.read().await.events_after(1);
         assert_eq!(missed.len(), 2);
         assert_eq!(missed[0].data, "second");
         assert_eq!(missed[1].data, "third");
@@ -926,7 +1189,7 @@ mod tests {
         let handle = ShutdownHandle::new();
 
         let run_handle = handle.clone();
-        let task = tokio::spawn(async move { run_sse(server, config, run_handle).await });
+        let task = tokio::spawn(async move { run_sse(server, config, run_handle, None).await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.shutdown();
@@ -943,7 +1206,7 @@ mod tests {
         let server = McpServer::new(MockProvider::default());
         let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
         config.auth_token = Some("secret-token".to_owned());
-        let _router = sse_router(server, &config);
+        let _router = sse_router(server, &config, None);
     }
 
     #[tokio::test]
@@ -951,7 +1214,7 @@ mod tests {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
         assert!(config.auth_token.is_none());
-        let _router = sse_router(server, &config);
+        let _router = sse_router(server, &config, None);
     }
 
     #[test]
@@ -968,14 +1231,14 @@ mod tests {
         let server = McpServer::new(MockProvider::default());
         let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
         config.auth_token = Some("test-secret".to_owned());
-        sse_router(server, &config)
+        sse_router(server, &config, None)
     }
 
     /// Helper: build an unauthenticated router (`auth_token` = None).
     fn noauth_router() -> Router {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        sse_router(server, &config)
+        sse_router(server, &config, None)
     }
 
     /// Helper: send a request through the router and return the status code.
@@ -1211,14 +1474,14 @@ mod tests {
         }
 
         // First notification uses next_event_id (starts at 1)
-        let id1 = state.next_event_id.load(Ordering::SeqCst);
+        let id1 = state.notifier.next_event_id.load(Ordering::SeqCst);
         let notif_body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": METHOD_INITIALIZED
         })
         .to_string();
         if let SseIncoming::Notification(notif) = parse_sse_incoming(&notif_body).unwrap() {
-            let synthetic_id = state.next_event_id.fetch_add(1, Ordering::SeqCst);
+            let synthetic_id = state.notifier.next_id();
             assert_eq!(synthetic_id, id1);
 
             // Verify the ID is correctly assigned
@@ -1232,7 +1495,7 @@ mod tests {
         }
 
         // Second call produces a different ID
-        let id2 = state.next_event_id.fetch_add(1, Ordering::SeqCst);
+        let id2 = state.notifier.next_event_id.fetch_add(1, Ordering::SeqCst);
         assert_ne!(id1, id2);
     }
 }

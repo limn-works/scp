@@ -12,11 +12,16 @@
 //!   members, and tools as MCP resources.
 //! - **Resource reading** (`resources/read`) -- returns current state of a
 //!   resource.
-//! - **Resource subscriptions** (`resources/subscribe`) -- maps to SCP context
-//!   event streams.
+//! - **Resource subscriptions** (`resources/subscribe` /
+//!   `resources/unsubscribe`) -- backed by the runtime's context event
+//!   broadcast channel (`Supervisor::subscribe_events`). A transport-level
+//!   pump feeds each [`ContextEvent`] to
+//!   [`McpServer::notifications_for_event`], which emits
+//!   `notifications/resources/updated` for every subscribed resource the
+//!   event invalidates.
 //! - **MCP lifecycle** (`initialize`, `notifications/initialized`, `ping`).
-//! - **Dynamic updates** -- emits `notifications/tools/list_changed` on
-//!   context join/leave/tool changes.
+//! - **Dynamic updates** -- emits `notifications/tools/list_changed` when an
+//!   event changes the capability-filtered tool set.
 //!
 //! The server uses trait-based abstractions ([`ContextProvider`]) so it can
 //! be tested independently of the full SCP stack.
@@ -25,6 +30,7 @@
 
 use std::collections::HashSet;
 
+use scp_core::context::membership::ContextEvent;
 use scp_core::context::outlets::validate_value_against_schema;
 use serde_json::Value;
 
@@ -178,14 +184,6 @@ pub trait ContextProvider: Send + Sync {
 
     /// Returns recent events for a context as a JSON value.
     fn context_events(&self, context_id: &str) -> Value;
-
-    /// Subscribes to resource updates for a context resource.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error message if the resource URI is invalid or the context
-    /// does not exist.
-    fn subscribe_resource(&self, uri: &str) -> Result<(), String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +203,15 @@ pub struct McpServer<P: ContextProvider> {
     client_capabilities: Option<ClientCapabilities>,
     /// Active resource subscriptions (URIs).
     subscriptions: HashSet<String>,
+    /// Whether a transport has wired a real runtime event source to this
+    /// server (see [`McpServer::enable_subscriptions`]).
+    ///
+    /// This single flag decides both halves of the `resources.subscribe`
+    /// contract: what `initialize` advertises, and whether
+    /// `resources/subscribe` is accepted. They cannot drift apart, so the
+    /// server can never advertise a subscription capability it is unable to
+    /// deliver on.
+    subscriptions_enabled: bool,
 }
 
 impl<P: ContextProvider> McpServer<P> {
@@ -216,7 +223,29 @@ impl<P: ContextProvider> McpServer<P> {
             initialized: false,
             client_capabilities: None,
             subscriptions: HashSet::new(),
+            // Fail closed: until a transport hands over a real event source,
+            // this server neither advertises nor accepts subscriptions.
+            subscriptions_enabled: false,
         }
+    }
+
+    /// Declares that a real runtime event source is wired to this server, so
+    /// `resources/subscribe` can be honoured.
+    ///
+    /// Called by the transport ([`crate::stdio::run_stdio`],
+    /// [`crate::sse::run_sse`]) only when it actually holds a
+    /// [`ContextEvent`] receiver to pump. Without it the server advertises
+    /// `resources.subscribe: false` and rejects `resources/subscribe` — an
+    /// honest absent capability rather than a subscription that silently
+    /// never fires.
+    pub const fn enable_subscriptions(&mut self) {
+        self.subscriptions_enabled = true;
+    }
+
+    /// Returns whether resource subscriptions are wired and advertised.
+    #[must_use]
+    pub const fn subscriptions_enabled(&self) -> bool {
+        self.subscriptions_enabled
     }
 
     /// Returns a reference to the underlying context provider.
@@ -268,6 +297,9 @@ impl<P: ContextProvider> McpServer<P> {
             protocol::METHOD_RESOURCES_LIST => Some(self.handle_resources_list(request)),
             protocol::METHOD_RESOURCES_READ => Some(self.handle_resources_read(request)),
             protocol::METHOD_RESOURCES_SUBSCRIBE => Some(self.handle_resources_subscribe(request)),
+            protocol::METHOD_RESOURCES_UNSUBSCRIBE => {
+                Some(self.handle_resources_unsubscribe(request))
+            }
             _ => Some(JsonRpcResponse::error(
                 request.id.clone(),
                 JsonRpcError {
@@ -297,7 +329,10 @@ impl<P: ContextProvider> McpServer<P> {
             protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolServerCapability { list_changed: true }),
-                resources: Some(ResourceServerCapability { subscribe: true }),
+                // Advertised only when a transport wired a real event source.
+                resources: Some(ResourceServerCapability {
+                    subscribe: self.subscriptions_enabled,
+                }),
             },
             server_info: ServerInfo {
                 name: SERVER_NAME.to_owned(),
@@ -700,13 +735,52 @@ impl<P: ContextProvider> McpServer<P> {
 
     /// Handles `resources/subscribe` -- registers a subscription for resource
     /// updates.
+    ///
+    /// Authorization: the URI must name a context the agent actually
+    /// participates in. Subscribing to a context the agent is not a member of
+    /// is rejected — otherwise a client could learn that an unrelated context
+    /// is changing by observing notification timing.
     fn handle_resources_subscribe(&mut self, request: &JsonRpcRequest) -> JsonRpcResponse {
+        if let Some(resp) = self.reject_if_subscriptions_unwired(request) {
+            return resp;
+        }
+
         let params: ResourcesSubscribeParams = match parse_params(request.params.as_ref()) {
             Ok(p) => p,
             Err(resp) => return with_id(resp, request.id.clone()),
         };
 
-        // Validate the URI format.
+        if let Err(resp) = self.validate_subscribable_uri(&params.uri, request.id.clone()) {
+            return *resp;
+        }
+
+        self.subscriptions.insert(params.uri);
+
+        JsonRpcResponse::success(
+            request.id.clone(),
+            Value::Object(serde_json::Map::default()),
+        )
+    }
+
+    /// Handles `resources/unsubscribe` -- cancels a resource subscription.
+    ///
+    /// Idempotent: unsubscribing from a URI that is not currently subscribed
+    /// succeeds. The MCP spec defines no distinct "not subscribed" error, and
+    /// a client retrying an unsubscribe after a dropped response must not see
+    /// a spurious failure.
+    fn handle_resources_unsubscribe(&mut self, request: &JsonRpcRequest) -> JsonRpcResponse {
+        if let Some(resp) = self.reject_if_subscriptions_unwired(request) {
+            return resp;
+        }
+
+        let params: protocol::ResourcesUnsubscribeParams =
+            match parse_params(request.params.as_ref()) {
+                Ok(p) => p,
+                Err(resp) => return with_id(resp, request.id.clone()),
+            };
+
+        // Validate the URI format so a malformed URI is reported rather than
+        // silently treated as "nothing to remove".
         if let Err(msg) = parse_resource_uri(&params.uri) {
             return JsonRpcResponse::error(
                 request.id.clone(),
@@ -718,19 +792,7 @@ impl<P: ContextProvider> McpServer<P> {
             );
         }
 
-        // Delegate to the provider for backend subscription.
-        if let Err(msg) = self.provider.subscribe_resource(&params.uri) {
-            return JsonRpcResponse::error(
-                request.id.clone(),
-                JsonRpcError {
-                    code: protocol::RESOURCE_NOT_FOUND,
-                    message: msg,
-                    data: None,
-                },
-            );
-        }
-
-        self.subscriptions.insert(params.uri);
+        self.subscriptions.remove(&params.uri);
 
         JsonRpcResponse::success(
             request.id.clone(),
@@ -738,18 +800,161 @@ impl<P: ContextProvider> McpServer<P> {
         )
     }
 
+    /// Rejects a subscription request when no event source is wired.
+    ///
+    /// Returns `METHOD_NOT_FOUND`, matching the `resources.subscribe: false`
+    /// this server advertised at `initialize`: the capability is honestly
+    /// absent, and a client that ignores the advertisement gets a typed error
+    /// rather than a success that never produces a notification.
+    fn reject_if_subscriptions_unwired(&self, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+        if self.subscriptions_enabled {
+            return None;
+        }
+        Some(JsonRpcResponse::error(
+            request.id.clone(),
+            JsonRpcError {
+                code: protocol::METHOD_NOT_FOUND,
+                message: format!(
+                    "{} is not supported: this server advertises \
+                     resources.subscribe=false because no context event source is wired",
+                    request.method
+                ),
+                data: None,
+            },
+        ))
+    }
+
+    /// Validates that `uri` is a well-formed SCP resource URI naming a context
+    /// the agent participates in and a known resource type.
+    fn validate_subscribable_uri(
+        &self,
+        uri: &str,
+        id: RequestId,
+    ) -> Result<(), Box<JsonRpcResponse>> {
+        let (context_id, resource_type) = parse_resource_uri(uri).map_err(|msg| {
+            Box::new(JsonRpcResponse::error(
+                id.clone(),
+                JsonRpcError {
+                    code: protocol::RESOURCE_NOT_FOUND,
+                    message: msg,
+                    data: None,
+                },
+            ))
+        })?;
+
+        if !matches!(
+            resource_type,
+            RESOURCE_EVENTS | RESOURCE_MEMBERS | RESOURCE_TOOLS
+        ) {
+            return Err(Box::new(JsonRpcResponse::error(
+                id,
+                JsonRpcError {
+                    code: protocol::RESOURCE_NOT_FOUND,
+                    message: format!("unknown resource type: {resource_type}"),
+                    data: None,
+                },
+            )));
+        }
+
+        if !self.provider.active_context_ids().contains(&context_id) {
+            return Err(Box::new(JsonRpcResponse::error(
+                id,
+                JsonRpcError {
+                    code: protocol::RESOURCE_NOT_FOUND,
+                    message: format!("not a participant in context: {context_id}"),
+                    data: None,
+                },
+            )));
+        }
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Dynamic context update notifications
     // -----------------------------------------------------------------------
 
-    /// Creates a `notifications/tools/list_changed` notification.
+    /// Returns whether the given resource URI currently has an active
+    /// subscription.
+    #[must_use]
+    pub fn is_subscribed(&self, uri: &str) -> bool {
+        self.subscriptions.contains(uri)
+    }
+
+    /// Returns the number of active resource subscriptions.
+    #[must_use]
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    /// Drops every active resource subscription.
     ///
-    /// Callers should send this notification to connected MCP clients when:
-    /// - The agent joins or leaves a context.
-    /// - A tool is registered, updated, or removed in a context.
+    /// Called when the transport session ends so a reconnecting client starts
+    /// from a clean subscription set rather than inheriting the previous
+    /// session's registrations.
+    pub fn clear_subscriptions(&mut self) {
+        self.subscriptions.clear();
+    }
+
+    /// Creates a `notifications/tools/list_changed` notification.
     #[must_use]
     pub fn tools_list_changed_notification() -> JsonRpcNotification {
         JsonRpcNotification::new(protocol::METHOD_TOOLS_LIST_CHANGED, None)
+    }
+
+    /// Creates a `notifications/resources/updated` notification for `uri`.
+    #[must_use]
+    pub fn resource_updated_notification(uri: &str) -> JsonRpcNotification {
+        JsonRpcNotification::new(
+            protocol::METHOD_RESOURCES_UPDATED,
+            Some(serde_json::json!({ "uri": uri })),
+        )
+    }
+
+    /// Maps a runtime [`ContextEvent`] to the MCP notifications that must be
+    /// pushed to the connected client.
+    ///
+    /// Returns one `notifications/resources/updated` per *subscribed* resource
+    /// URI that the event invalidates, plus `notifications/tools/list_changed`
+    /// when the event changes the set of tools the agent can see (that
+    /// notification is capability-gated, not subscription-gated, so it is
+    /// emitted whenever the context is one this server serves).
+    ///
+    /// Events for contexts this server does not serve produce no notifications.
+    #[must_use]
+    pub fn notifications_for_event(
+        &self,
+        context_id: &str,
+        event: &ContextEvent,
+    ) -> Vec<JsonRpcNotification> {
+        let affected = affected_resources(event);
+        let mut out = Vec::new();
+
+        for (changed, suffix) in [
+            (affected.events, RESOURCE_EVENTS),
+            (affected.members, RESOURCE_MEMBERS),
+            (affected.tools, RESOURCE_TOOLS),
+        ] {
+            if !changed {
+                continue;
+            }
+            let uri = format!("{RESOURCE_SCHEME}{context_id}/{suffix}");
+            if self.subscriptions.contains(&uri) {
+                out.push(Self::resource_updated_notification(&uri));
+            }
+        }
+
+        if affected.tools
+            && self
+                .provider
+                .active_context_ids()
+                .iter()
+                .any(|c| c == context_id)
+        {
+            out.push(Self::tools_list_changed_notification());
+        }
+
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -835,6 +1040,107 @@ fn internal_error(id: RequestId, message: &str) -> JsonRpcResponse {
 ///
 /// Expected format: `scp://context_id/resource_type` where `resource_type` is
 /// one of `events`, `members`, `tools`.
+/// Which of a context's MCP resources a [`ContextEvent`] invalidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffectedResources {
+    /// `scp://{ctx}/events` -- the context event stream.
+    pub events: bool,
+    /// `scp://{ctx}/members` -- the member list and role assignments.
+    pub members: bool,
+    /// `scp://{ctx}/tools` -- the capability-filtered tool list.
+    pub tools: bool,
+}
+
+/// Classifies a [`ContextEvent`] by which MCP resources it invalidates.
+///
+/// **Bias: over-notify, never under-notify.** MCP clients respond to
+/// `notifications/resources/updated` by re-reading the resource, so a spurious
+/// notification costs one extra read, while a missed notification leaves the
+/// client permanently stale. Where a variant's effect on the member list or
+/// the capability-filtered tool list is ambiguous, it is classified as
+/// affecting them.
+///
+/// `events` is true for every variant: `scp://{ctx}/events` exposes the
+/// context event stream, which every event is by definition part of.
+///
+/// The match is exhaustive (no wildcard) so that adding a `ContextEvent`
+/// variant fails to compile until its resource impact is decided — the same
+/// discipline `strip_event_payload` uses in `scp-runtime`.
+#[must_use]
+pub const fn affected_resources(event: &ContextEvent) -> AffectedResources {
+    // Changes the member list / role assignments AND the agent's
+    // capability-filtered tool list.
+    let members_and_tools = AffectedResources {
+        events: true,
+        members: true,
+        tools: true,
+    };
+    // Changes the member list only (key/block-list state, not capabilities).
+    let members_only = AffectedResources {
+        events: true,
+        members: true,
+        tools: false,
+    };
+    // Data-plane / plumbing events: the event stream only.
+    let events_only = AffectedResources {
+        events: true,
+        members: false,
+        tools: false,
+    };
+
+    match event {
+        // -- Membership, capability and lifecycle changes ------------------
+        ContextEvent::MemberJoined { .. }
+        | ContextEvent::MemberLeft { .. }
+        | ContextEvent::ReadAccessRevoked { .. }
+        | ContextEvent::ReadAccessRestored { .. }
+        | ContextEvent::WriteAccessRevoked { .. }
+        | ContextEvent::WriteAccessRestored { .. }
+        | ContextEvent::CapabilitiesSuspended { .. }
+        | ContextEvent::GovernanceActionExecuted { .. }
+        | ContextEvent::CeilingChangeNotification { .. }
+        | ContextEvent::ConsequenceTriggered { .. }
+        | ContextEvent::ConsequenceEnforced { .. }
+        | ContextEvent::ContextMigrationStarted { .. }
+        | ContextEvent::ContextTombstoned { .. }
+        | ContextEvent::SystemClose { .. }
+        | ContextEvent::Expired
+        | ContextEvent::ExpiryFailed { .. } => members_and_tools,
+
+        // -- Member-state changes that do not alter the visible tool set ---
+        ContextEvent::MemberBlocked { .. }
+        | ContextEvent::MemberUnblocked { .. }
+        | ContextEvent::AuthorBlocked { .. }
+        | ContextEvent::AccessKeyRevoked { .. }
+        | ContextEvent::AccessKeyRestored { .. } => members_only,
+
+        // -- Event-stream-only ---------------------------------------------
+        ContextEvent::MessageSent { .. }
+        | ContextEvent::MessageReceived { .. }
+        | ContextEvent::ContentKeysRotated { .. }
+        | ContextEvent::EconomicPolicyChangeNotification { .. }
+        | ContextEvent::VoteWithdrawn { .. }
+        | ContextEvent::ProposalTimedOut { .. }
+        | ContextEvent::DeadlockDetected { .. }
+        | ContextEvent::AppBound { .. }
+        | ContextEvent::AppUnbound { .. }
+        | ContextEvent::DegradedMode { .. }
+        | ContextEvent::WelcomeGenerated { .. }
+        | ContextEvent::BufferOverflow { .. }
+        | ContextEvent::SequenceGapDetected { .. }
+        | ContextEvent::CheckpointCosignatureRequired { .. }
+        | ContextEvent::ContextMigrationProposed { .. }
+        | ContextEvent::ContextMigrationCancelled { .. }
+        | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::PaymentReceived { .. }
+        | ContextEvent::CommitBroadcastPending { .. }
+        | ContextEvent::CommitBroadcastSucceeded { .. }
+        | ContextEvent::CommitBroadcastFailed { .. }
+        | ContextEvent::EquivocationDetected { .. }
+        | ContextEvent::PseudonymAnnounced { .. } => events_only,
+    }
+}
+
 fn parse_resource_uri(uri: &str) -> Result<(String, &str), String> {
     let stripped = uri.strip_prefix(RESOURCE_SCHEME).ok_or_else(|| {
         format!("invalid resource URI: expected {RESOURCE_SCHEME} prefix, got {uri}")
@@ -975,10 +1281,6 @@ mod tests {
         fn context_events(&self, _context_id: &str) -> Value {
             self.events.clone()
         }
-
-        fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
-            Ok(())
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -1011,6 +1313,17 @@ mod tests {
         server
     }
 
+    /// An initialized server with a runtime event source wired, as a transport
+    /// would do when it holds a real `ContextEvent` receiver.
+    fn subscribing_server(provider: MockProvider) -> McpServer<MockProvider> {
+        let mut server = McpServer::new(provider);
+        server.enable_subscriptions();
+        let req = make_request(METHOD_INITIALIZE, Some(init_params()));
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_none());
+        server
+    }
+
     // -----------------------------------------------------------------------
     // MCP lifecycle tests
     // -----------------------------------------------------------------------
@@ -1031,8 +1344,10 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
+        // No event source wired, so the subscription capability is honestly
+        // advertised as absent.
         assert!(
-            result["capabilities"]["resources"]["subscribe"]
+            !result["capabilities"]["resources"]["subscribe"]
                 .as_bool()
                 .unwrap()
         );
@@ -1580,27 +1895,327 @@ mod tests {
     // resources/subscribe tests
     // -----------------------------------------------------------------------
 
+    /// Subscribes `server` to `uri`, asserting the request succeeded.
+    fn subscribe(server: &mut McpServer<MockProvider>, uri: &str) {
+        let req = make_request(
+            protocol::METHOD_RESOURCES_SUBSCRIBE,
+            Some(serde_json::json!({ "uri": uri })),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_none(), "subscribe to {uri} failed: {resp:?}");
+    }
+
+    fn member_joined() -> ContextEvent {
+        ContextEvent::MemberJoined {
+            member_did: scp_did::DID("did:dht:z6MkNewMember".to_owned()),
+            role_name: "member".to_owned(),
+        }
+    }
+
+    fn message_sent() -> ContextEvent {
+        ContextEvent::MessageSent {
+            sender_did: scp_did::DID("did:dht:z6MkSender".to_owned()),
+            sequence_number: 1,
+            payload: vec![],
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fail-closed: no event source wired
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn resources_subscribe_succeeds() {
+    fn unwired_server_advertises_subscribe_false() {
+        let server = initialized_server(MockProvider::default());
+        assert!(!server.subscriptions_enabled());
+    }
+
+    #[test]
+    fn unwired_server_rejects_subscribe_instead_of_silently_accepting() {
         let mut server = initialized_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_RESOURCES_SUBSCRIBE,
             Some(serde_json::json!({"uri": "scp://ctx_a/events"})),
         );
         let resp = server.handle_request(&req).unwrap();
-        assert!(resp.error.is_none());
-        assert!(server.subscriptions.contains("scp://ctx_a/events"));
+
+        let err = resp
+            .error
+            .expect("an unwired server must not report success for subscribe");
+        assert_eq!(err.code, protocol::METHOD_NOT_FOUND);
+        assert_eq!(server.subscription_count(), 0);
+    }
+
+    #[test]
+    fn unwired_server_rejects_unsubscribe() {
+        let mut server = initialized_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_RESOURCES_UNSUBSCRIBE,
+            Some(serde_json::json!({"uri": "scp://ctx_a/events"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        assert_eq!(resp.error.unwrap().code, protocol::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn wired_server_advertises_subscribe_true() {
+        let mut server = McpServer::new(MockProvider::default());
+        server.enable_subscriptions();
+        let req = make_request(METHOD_INITIALIZE, Some(init_params()));
+        let resp = server.handle_request(&req).unwrap();
+
+        assert!(
+            resp.result.unwrap()["capabilities"]["resources"]["subscribe"]
+                .as_bool()
+                .unwrap(),
+            "a server with a wired event source must advertise the capability"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resources/subscribe behaviour (event source wired)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resources_subscribe_succeeds() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+        assert!(server.is_subscribed("scp://ctx_a/events"));
+        assert_eq!(server.subscription_count(), 1);
     }
 
     #[test]
     fn resources_subscribe_rejects_invalid_uri() {
-        let mut server = initialized_server(MockProvider::default());
+        let mut server = subscribing_server(MockProvider::default());
         let req = make_request(
             protocol::METHOD_RESOURCES_SUBSCRIBE,
             Some(serde_json::json!({"uri": "invalid"})),
         );
         let resp = server.handle_request(&req).unwrap();
         assert!(resp.error.is_some());
+        assert_eq!(server.subscription_count(), 0);
+    }
+
+    #[test]
+    fn resources_subscribe_rejects_context_the_agent_is_not_in() {
+        let mut server = subscribing_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_RESOURCES_SUBSCRIBE,
+            Some(serde_json::json!({"uri": "scp://ctx_stranger/events"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        let err = resp.error.expect("must reject a non-participant context");
+        assert_eq!(err.code, protocol::RESOURCE_NOT_FOUND);
+        assert!(err.message.contains("not a participant"), "{}", err.message);
+        assert_eq!(server.subscription_count(), 0);
+    }
+
+    #[test]
+    fn resources_subscribe_rejects_unknown_resource_type() {
+        let mut server = subscribing_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_RESOURCES_SUBSCRIBE,
+            Some(serde_json::json!({"uri": "scp://ctx_a/secrets"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_some());
+        assert_eq!(server.subscription_count(), 0);
+    }
+
+    #[test]
+    fn resources_unsubscribe_removes_the_subscription() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+
+        let req = make_request(
+            protocol::METHOD_RESOURCES_UNSUBSCRIBE,
+            Some(serde_json::json!({"uri": "scp://ctx_a/events"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_none());
+        assert!(!server.is_subscribed("scp://ctx_a/events"));
+
+        // And no notification is produced for it any more.
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &message_sent())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resources_unsubscribe_is_idempotent() {
+        let mut server = subscribing_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_RESOURCES_UNSUBSCRIBE,
+            Some(serde_json::json!({"uri": "scp://ctx_a/events"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        assert!(
+            resp.error.is_none(),
+            "unsubscribing an unsubscribed URI must succeed"
+        );
+    }
+
+    #[test]
+    fn resources_unsubscribe_rejects_invalid_uri() {
+        let mut server = subscribing_server(MockProvider::default());
+        let req = make_request(
+            protocol::METHOD_RESOURCES_UNSUBSCRIBE,
+            Some(serde_json::json!({"uri": "nonsense"})),
+        );
+        let resp = server.handle_request(&req).unwrap();
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn clear_subscriptions_drops_everything() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+        subscribe(&mut server, "scp://ctx_b/members");
+        assert_eq!(server.subscription_count(), 2);
+
+        server.clear_subscriptions();
+
+        assert_eq!(server.subscription_count(), 0);
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &message_sent())
+                .is_empty()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Event -> notification mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscribed_event_stream_receives_resources_updated() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+
+        let notifs = server.notifications_for_event("ctx_a", &message_sent());
+
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(notifs[0].method, protocol::METHOD_RESOURCES_UPDATED);
+        assert_eq!(
+            notifs[0].params.as_ref().unwrap()["uri"],
+            "scp://ctx_a/events"
+        );
+    }
+
+    #[test]
+    fn unsubscribed_resource_produces_no_resources_updated() {
+        let server = subscribing_server(MockProvider::default());
+
+        // With nothing subscribed, an events-only change is entirely silent.
+        assert!(
+            server
+                .notifications_for_event("ctx_a", &message_sent())
+                .is_empty()
+        );
+
+        // A membership change still emits `tools/list_changed` (capability-
+        // gated, not subscription-gated) but no `resources/updated`, because
+        // no resource is subscribed.
+        let notifs = server.notifications_for_event("ctx_a", &member_joined());
+        assert!(
+            notifs
+                .iter()
+                .all(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED),
+            "no resources/updated may be emitted without a subscription: {notifs:?}"
+        );
+    }
+
+    #[test]
+    fn event_for_another_context_does_not_notify() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+
+        // Same event, different context — the URI does not match.
+        assert!(
+            server
+                .notifications_for_event("ctx_b", &message_sent())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn membership_event_updates_events_and_members_but_not_a_message() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+        subscribe(&mut server, "scp://ctx_a/members");
+
+        let uris = |notifs: &[JsonRpcNotification]| -> Vec<String> {
+            notifs
+                .iter()
+                .filter(|n| n.method == protocol::METHOD_RESOURCES_UPDATED)
+                .map(|n| {
+                    n.params.as_ref().unwrap()["uri"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        };
+
+        // MemberJoined invalidates both the event stream and the member list.
+        let joined = server.notifications_for_event("ctx_a", &member_joined());
+        assert_eq!(
+            uris(&joined),
+            vec!["scp://ctx_a/events", "scp://ctx_a/members"]
+        );
+
+        // A message only invalidates the event stream.
+        let sent = server.notifications_for_event("ctx_a", &message_sent());
+        assert_eq!(uris(&sent), vec!["scp://ctx_a/events"]);
+    }
+
+    #[test]
+    fn capability_changing_event_emits_tools_list_changed() {
+        let server = subscribing_server(MockProvider::default());
+        // No resource subscription needed: tools/list_changed is gated on the
+        // advertised capability, not on a subscription.
+        let notifs = server.notifications_for_event("ctx_a", &member_joined());
+        assert!(
+            notifs
+                .iter()
+                .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED),
+            "membership change must invalidate the capability-filtered tool list"
+        );
+
+        // A plain message does not change the tool set.
+        let sent = server.notifications_for_event("ctx_a", &message_sent());
+        assert!(
+            !sent
+                .iter()
+                .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED)
+        );
+    }
+
+    #[test]
+    fn tools_list_changed_not_emitted_for_unserved_context() {
+        let server = subscribing_server(MockProvider::default());
+        let notifs = server.notifications_for_event("ctx_not_served", &member_joined());
+        assert!(
+            notifs.is_empty(),
+            "an event for a context this server does not serve must be silent"
+        );
+    }
+
+    #[test]
+    fn affected_resources_classification() {
+        // Every event is part of the event stream.
+        assert!(affected_resources(&message_sent()).events);
+        assert!(affected_resources(&member_joined()).events);
+
+        // Membership changes hit members and the capability-filtered tools.
+        let joined = affected_resources(&member_joined());
+        assert!(joined.members && joined.tools);
+
+        // A message changes neither the member list nor the tool list.
+        let sent = affected_resources(&message_sent());
+        assert!(!sent.members && !sent.tools);
     }
 
     // -----------------------------------------------------------------------

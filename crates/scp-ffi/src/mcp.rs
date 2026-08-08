@@ -1193,12 +1193,6 @@ impl ContextProvider for FfiBridgeProvider {
         })
         .unwrap_or_else(|_| serde_json::json!({ "event_count": 0 }))
     }
-
-    fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
-        // Resource subscriptions are not yet wired to the transport layer.
-        // Accept the subscription silently.
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,91 +1354,64 @@ impl crate::scp::PyScp {
         // extend the instance's lifetime.
         let cancel_token = bi_arc.core.cancel_token();
 
+        // Resource subscriptions are backed by the supervisor's context event
+        // broadcast channel. Subscribe *before* spawning so no event emitted
+        // between here and the transport loop starting is missed.
+        //
+        // `subscribe_events()` returns `None` only for a supervisor built
+        // without the channel; production supervisors always enable it (see
+        // `crate::runtime::build_supervisor`). When it is `None` the transport
+        // advertises `resources.subscribe: false` and rejects
+        // `resources/subscribe` — the capability is honestly absent rather
+        // than accepted-and-never-delivered.
+        // Absence degrades only this capability: the server still serves
+        // `tools/*` and `resources/list|read`, and honestly advertises
+        // `resources.subscribe: false`. Serving is NOT failed outright — that
+        // would deny working functionality over an optional feature.
+        let context_events = match crate::runtime::supervisor(bi) {
+            Ok(supervisor) => supervisor.subscribe_events(),
+            Err(e) => {
+                tracing::warn!("MCP server: no supervisor attached ({e})");
+                None
+            }
+        };
+        if context_events.is_none() {
+            tracing::warn!(
+                "MCP server: no context event source — resource subscriptions \
+                 will be advertised as unsupported and rejected if requested"
+            );
+        }
+
         let task_handle = rt.spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
-                // Run the MCP server over stdio. The `run_stdio` function
-                // processes stdin/stdout until EOF. We also listen for the
-                // shutdown signal AND the bridge instance's cancel token
-                // so `emergency_cancel_tasks()` from the instance's
-                // `Drop` impl can terminate this task even when the
-                // caller never invoked `py_mcp_server_stop`.
-                tokio::select! {
-                    _ = shutdown_rx => {
-                        // Shutdown signal received -- exit cleanly.
-                    }
-                    () = cancel_token.cancelled() => {
-                        tracing::debug!(
-                            "MCP stdio server task exiting — bridge instance cancelled"
-                        );
-                    }
-                    () = async {
-                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-                        // The real `run_stdio` takes &mut McpServer by value.
-                        // We need to run it with our Arc<Mutex> server.
-                        // Since `run_stdio` processes stdin line by line, we
-                        // replicate its logic here using the shared server.
-                        let stdin = tokio::io::stdin();
-                        let mut stdout = tokio::io::stdout();
-                        let mut reader = tokio::io::BufReader::new(stdin);
-                        let mut line = String::new();
-
-                        loop {
-                            line.clear();
-                            match reader.read_line(&mut line).await {
-                                Ok(0) | Err(_) => break, // EOF or read error
-                                Ok(_) => {}
-                            }
-                            // Bound check after read — server-side stdin comes
-                            // from the local parent process, not a remote peer,
-                            // so the risk is lower. This guards against oversized
-                            // payloads from a misbehaving MCP client.
-                            if line.len() as u64 > MAX_LINE_BYTES {
-                                break;
-                            }
-
-                            let trimmed = line.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-
-                            // Parse and dispatch the request.
-                            let response = {
-                                let request: Result<scp_mcp::protocol::JsonRpcRequest, _> =
-                                    serde_json::from_str(trimmed);
-                                match request {
-                                    Ok(req) => {
-                                        server_clone
-                                            .lock()
-                                            .map_or(None, |mut srv| srv.handle_request(&req))
-                                    }
-                                    Err(e) => {
-                                        Some(scp_mcp::protocol::JsonRpcResponse::error(
-                                            scp_mcp::protocol::RequestId::Number(0),
-                                            scp_mcp::protocol::JsonRpcError {
-                                                code: scp_mcp::protocol::PARSE_ERROR,
-                                                message: format!("failed to parse: {e}"),
-                                                data: None,
-                                            },
-                                        ))
-                                    }
-                                }
-                            };
-
-                            if let Some(resp) = response
-                                && let Ok(json) = serde_json::to_string(&resp)
-                                && (stdout.write_all(json.as_bytes()).await.is_err()
-                                    || stdout.write_all(b"\n").await.is_err()
-                                    || stdout.flush().await.is_err())
-                            {
-                                tracing::warn!("MCP stdio server: stdout write failed, stopping");
-                                break;
+                    // Run the MCP server over stdio via the shared
+                    // `scp_mcp::stdio::run_stdio` loop. It owns stdout so the
+                    // response writer and the resource-subscription event pump
+                    // interleave as whole lines, and it parses JSON-RPC
+                    // notifications correctly (a bare `JsonRpcRequest` decode
+                    // rejects them — they carry no `id`).
+                    //
+                    // We also listen for the shutdown signal AND the bridge
+                    // instance's cancel token so `emergency_cancel_tasks()`
+                    // from the instance's `Drop` impl can terminate this task
+                    // even when the caller never invoked `py_mcp_server_stop`.
+                    tokio::select! {
+                        _ = shutdown_rx => {
+                            // Shutdown signal received -- exit cleanly.
+                        }
+                        () = cancel_token.cancelled() => {
+                            tracing::debug!(
+                                "MCP stdio server task exiting — bridge instance cancelled"
+                            );
+                        }
+                        result = scp_mcp::stdio::run_stdio(&server_clone, context_events) => {
+                            if let Err(e) = result {
+                                tracing::error!("MCP stdio server error: {e}");
                             }
                         }
-                    } => {}
+                    }
                 }
-            }
                 "sse" => {
                     // For SSE, run_sse takes ownership of the McpServer and
                     // binds to a configurable address. We create a dedicated
@@ -1485,7 +1452,9 @@ impl crate::scp::PyScp {
                         sse_shutdown_trigger.shutdown();
                     });
 
-                    let result = scp_mcp::sse::run_sse(sse_server, config, sse_shutdown).await;
+                    let result =
+                        scp_mcp::sse::run_sse(sse_server, config, sse_shutdown, context_events)
+                            .await;
                     if let Err(e) = result {
                         tracing::error!("MCP SSE server error: {e}");
                     }
@@ -3265,21 +3234,6 @@ mod tests {
         assert!(active.is_empty(), "should return empty set for empty input");
     }
 
-    #[test]
-    fn ffi_bridge_provider_subscribe_resource_accepts() {
-        let bi = __bi();
-        let provider = FfiBridgeProvider {
-            bi: Arc::downgrade(&bi),
-            agent_did: "did:dht:z6MkTest".to_owned(),
-            context_ids: vec![],
-            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-            agent_ucan_token: None,
-
-            agent_proof_tokens: None,
-        };
-        assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
-    }
-
     // -----------------------------------------------------------------------
     // Outlet handler registration and dispatch (SCP-212)
     // -----------------------------------------------------------------------
@@ -3848,9 +3802,6 @@ mod tests {
             vc.unwrap_err().contains("bridge instance has been dropped"),
             "error must mention the dropped bridge"
         );
-
-        // subscribe_resource is a no-op that does not touch `bi`; still Ok.
-        assert!(provider.subscribe_resource("scp://x").is_ok());
 
         // active_context_ids & agent_did don't touch the weak at all.
         assert_eq!(

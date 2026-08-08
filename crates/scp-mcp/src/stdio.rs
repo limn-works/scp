@@ -11,7 +11,11 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full design.
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::Arc;
+
+use scp_core::context::membership::ContextEvent;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::broadcast;
 
 use crate::protocol::{
     JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
@@ -101,25 +105,171 @@ fn parse_incoming(line: &str) -> Result<Incoming, Box<JsonRpcResponse>> {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Maximum bytes accepted for a single line on an MCP stdio transport.
+///
+/// 10 MiB is generous for JSON-RPC messages (typical MCP payloads are < 1 MiB)
+/// while preventing unbounded allocation from a misbehaving peer.
+pub const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Serializes writes to stdout so responses from the read loop and
+/// notifications from the event pump interleave as whole lines.
+#[derive(Clone)]
+struct StdioNotifier {
+    stdout: Arc<tokio::sync::Mutex<tokio::io::Stdout>>,
+}
+
+impl StdioNotifier {
+    /// Creates a notifier owning the process's stdout.
+    fn new() -> Self {
+        Self {
+            stdout: Arc::new(tokio::sync::Mutex::new(tokio::io::stdout())),
+        }
+    }
+
+    /// Writes a single line to stdout, flushing it.
+    async fn write_line(&self, json: &str) -> Result<(), std::io::Error> {
+        let mut stdout = self.stdout.lock().await;
+        stdout.write_all(json.as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await
+    }
+
+    /// Pushes a JSON-RPC notification to the client.
+    ///
+    /// Returns `false` if the notification could not be serialized or written
+    /// (e.g. the client closed stdout).
+    async fn notify(&self, notification: &JsonRpcNotification) -> bool {
+        let json = match serde_json::to_string(notification) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!("failed to serialize MCP notification: {e}");
+                return false;
+            }
+        };
+        match self.write_line(&json).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("MCP stdio notification write failed: {e}");
+                false
+            }
+        }
+    }
+}
+
 /// Runs the MCP server over stdio (stdin/stdout, line-delimited JSON).
 ///
-/// Reads JSON-RPC requests line-by-line from stdin, dispatches them to the
-/// server, and writes responses to stdout. Runs until stdin is closed (EOF).
+/// Reads JSON-RPC messages line-by-line from stdin, dispatches them to the
+/// server, and writes responses to stdout. Runs until stdin is closed (EOF)
+/// or a line exceeds [`MAX_LINE_BYTES`].
+///
+/// # Resource subscriptions
+///
+/// Pass `events` — a receiver from
+/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events)
+/// — to enable `resources/subscribe`. When `Some`, this function enables the
+/// subscription capability on `server` and runs a pump that turns each
+/// [`ContextEvent`] into `notifications/resources/updated` for the subscribed
+/// resources it invalidates.
+///
+/// When `None`, the server advertises `resources.subscribe: false` and
+/// rejects `resources/subscribe` with a typed error. The capability is never
+/// advertised without the machinery to honour it.
+///
+/// The server is shared behind a mutex so the pump can consult the same
+/// subscription registry as the read loop; the lock is only ever held for the
+/// synchronous duration of a single call, never across an await.
+///
+/// Per JSON-RPC 2.0, incoming *notifications* (messages without an `id`) never
+/// produce a response — this is why the transport parses into a request/
+/// notification sum type rather than deserializing every line as a request.
 ///
 /// # Errors
 ///
 /// Returns [`StdioError`] if an I/O error occurs on stdin or stdout.
-pub async fn run_stdio<P: ContextProvider>(server: &mut McpServer<P>) -> Result<(), StdioError> {
+pub async fn run_stdio<P: ContextProvider + 'static>(
+    server: &Arc<std::sync::Mutex<McpServer<P>>>,
+    events: Option<broadcast::Receiver<(String, ContextEvent)>>,
+) -> Result<(), StdioError> {
+    let notifier = StdioNotifier::new();
+
+    // Enabling the capability and starting the pump are the same step, so the
+    // advertisement can never outrun the delivery machinery.
+    let pump = events.map(|rx| {
+        if let Ok(mut srv) = server.lock() {
+            srv.enable_subscriptions();
+        } else {
+            tracing::error!("MCP server mutex poisoned enabling subscriptions");
+        }
+        tokio::spawn(pump_events(Arc::clone(server), rx, notifier.clone()))
+    });
+
+    let result = read_loop(server, &notifier).await;
+
+    if let Some(handle) = pump {
+        handle.abort();
+    }
+    result
+}
+
+/// Forwards runtime context events to the client as MCP notifications.
+async fn pump_events<P: ContextProvider>(
+    server: Arc<std::sync::Mutex<McpServer<P>>>,
+    mut events: broadcast::Receiver<(String, ContextEvent)>,
+    notifier: StdioNotifier,
+) {
+    loop {
+        let (context_id, event) = match events.recv().await {
+            Ok(v) => v,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                // The client may have missed a change. Over-notify rather
+                // than leave it stale: nothing here can reconstruct which
+                // resources the dropped events touched, so callers re-read.
+                tracing::warn!("MCP stdio event pump lagged, {skipped} events dropped");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+
+        let notifications = match server.lock() {
+            Ok(srv) => srv.notifications_for_event(&context_id, &event),
+            Err(e) => {
+                tracing::error!("MCP server mutex poisoned in event pump: {e}");
+                return;
+            }
+        };
+
+        for notification in &notifications {
+            if !notifier.notify(notification).await {
+                // stdout is gone; the session is over.
+                return;
+            }
+        }
+    }
+}
+
+/// Reads and dispatches client messages until EOF.
+async fn read_loop<P: ContextProvider>(
+    server: &Arc<std::sync::Mutex<McpServer<P>>>,
+    notifier: &StdioNotifier,
+) -> Result<(), StdioError> {
     let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
     let mut line = String::new();
 
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
+        let bytes_read = {
+            let mut bounded = (&mut reader).take(MAX_LINE_BYTES);
+            bounded.read_line(&mut line).await?
+        };
         if bytes_read == 0 {
             // EOF -- stdin closed, exit cleanly.
+            break;
+        }
+        // Exactly at the cap with no terminator means the line was truncated;
+        // rejecting beats acting on a partial message.
+        if bytes_read as u64 == MAX_LINE_BYTES && !line.ends_with('\n') {
+            tracing::warn!("MCP stdio: line exceeds {MAX_LINE_BYTES} byte limit, stopping");
             break;
         }
 
@@ -129,19 +279,18 @@ pub async fn run_stdio<P: ContextProvider>(server: &mut McpServer<P>) -> Result<
         }
 
         let response = match parse_incoming(trimmed) {
-            Ok(Incoming::Request(req)) => server.handle_request(&req),
+            Ok(Incoming::Request(req)) => dispatch(server, &req),
             Ok(Incoming::Notification(notif)) => {
-                // Notifications are handled by constructing a synthetic
-                // request. The `initialized` notification is the main case.
-                // We build a request with a dummy ID; handle_request returns
-                // None for notifications so the ID is never used.
+                // Notifications are dispatched through the same entry point
+                // using a synthetic ID; `handle_request` returns `None` for
+                // notification methods so the ID is never observable.
                 let synthetic = JsonRpcRequest {
                     jsonrpc: notif.jsonrpc,
                     method: notif.method,
                     params: notif.params,
                     id: RequestId::Number(0),
                 };
-                server.handle_request(&synthetic);
+                dispatch(server, &synthetic);
                 // Notifications never produce a response.
                 None
             }
@@ -156,13 +305,29 @@ pub async fn run_stdio<P: ContextProvider>(server: &mut McpServer<P>) -> Result<
                     continue;
                 }
             };
-            stdout.write_all(json.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+            notifier.write_line(&json).await?;
         }
     }
 
     Ok(())
+}
+
+/// Dispatches a request against the shared server.
+///
+/// A poisoned mutex means another thread panicked mid-dispatch; there is no
+/// safe state to answer from, so the message is dropped with a logged error
+/// rather than propagating the panic into the transport loop.
+fn dispatch<P: ContextProvider>(
+    server: &std::sync::Arc<std::sync::Mutex<McpServer<P>>>,
+    request: &JsonRpcRequest,
+) -> Option<JsonRpcResponse> {
+    match server.lock() {
+        Ok(mut srv) => srv.handle_request(request),
+        Err(e) => {
+            tracing::error!("MCP server mutex poisoned: {e}");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -285,9 +450,6 @@ mod tests {
         }
         fn context_events(&self, _context_id: &str) -> serde_json::Value {
             serde_json::json!([])
-        }
-        fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
-            Ok(())
         }
     }
 
