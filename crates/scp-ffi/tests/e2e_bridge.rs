@@ -1237,7 +1237,10 @@ fn event_log_checkpoint_by_did_generates_signed_checkpoint() {
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Append an unsigned event so the log is non-empty.
+        // Append an unsigned event to the BRIDGE-LOCAL tree. Since the #1933
+        // follow-up this tree is irrelevant to checkpointing — the commitment
+        // below is taken over the authoritative supervisor log, which already
+        // holds the context's `ContextCreated` leaf.
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
@@ -1253,15 +1256,219 @@ fn event_log_checkpoint_by_did_generates_signed_checkpoint() {
         })
         .unwrap();
 
+        let (auth_count, auth_root) = authoritative_commitment(scp.bridge_instance(), &ctx_id);
         let checkpoint = scp.event_log_checkpoint_by_did(&ctx_id, &did, 7).unwrap();
         assert_eq!(checkpoint.context_id, ctx_id);
         assert_eq!(checkpoint.sender_did, did);
-        assert_eq!(checkpoint.event_count, 1);
+        assert_eq!(checkpoint.event_count, auth_count);
+        assert_eq!(checkpoint.merkle_root, hex::encode(auth_root));
         assert_eq!(checkpoint.epoch, Some(7));
         // Ed25519 signature is 64 bytes -> 128 hex chars.
         assert_eq!(checkpoint.signature.len(), 128);
         assert_eq!(checkpoint.merkle_root.len(), 64);
     });
+}
+
+// ---------------------------------------------------------------------------
+// event_log_checkpoint — the SIGNED commitment covers the AUTHORITATIVE log
+// only (GitHub #1933 follow-up)
+//
+// A `ConsistencyCheckpoint` is signed, non-repudiable evidence: a peer that
+// sees the same `event_count` with a different `merkle_root` raises
+// `EquivocationDetected` against its signer (§9.9.3). Signing over the
+// caller-shapeable bridge-local tree let ANY member mint validly-signed
+// equivocation evidence against honest peers.
+// ---------------------------------------------------------------------------
+
+/// The `(leaf_count, merkle_root)` of the BRIDGE-LOCAL verification tree.
+fn bridge_local_commitment(bi: &PyBridgeInstance, context_id: &str) -> (u64, [u8; 32]) {
+    runtime::with_context(bi, context_id, |rt| {
+        Ok((
+            scp_event_log::tree::event_count(&rt.event_log),
+            scp_event_log::tree::root(&rt.event_log),
+        ))
+    })
+    .unwrap()
+}
+
+/// Rebuilds the core `ConsistencyCheckpoint` from the hex-encoded bridge
+/// record, so the signature can be checked against the fields the bridge
+/// actually reported to the caller.
+fn pycheckpoint_to_core(
+    cp: &_scp_core::event_log::PyCheckpoint,
+) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+    let merkle_root: [u8; 32] = hex::decode(&cp.merkle_root)
+        .expect("merkle_root is hex")
+        .try_into()
+        .expect("merkle_root is 32 bytes");
+    scp_event_log::checkpoint::ConsistencyCheckpoint {
+        context_id: cp.context_id.clone(),
+        sender_did: scp_did::DID(cp.sender_did.clone()),
+        event_count: cp.event_count,
+        merkle_root,
+        epoch: cp.epoch,
+        timestamp: cp.timestamp,
+        signature: hex::decode(&cp.signature).expect("signature is hex"),
+    }
+}
+
+/// The Ed25519 public key of a registered identity's active signing key.
+fn registered_verifying_key(bi: &PyBridgeInstance, did: &str) -> ed25519_dalek::VerifyingKey {
+    let rt = test_runtime();
+    runtime::with_identity(bi, did, |entry| {
+        let pk = rt
+            .block_on(scp_platform::traits::KeyCustody::public_key(
+                entry.custody.as_ref(),
+                &entry.identity.active_signing_key,
+            ))
+            .expect("active signing key resolves to a public key");
+        let bytes: [u8; 32] = pk.as_bytes().try_into().expect("Ed25519 key is 32 bytes");
+        Ok(ed25519_dalek::VerifyingKey::from_bytes(&bytes).expect("valid Ed25519 public key"))
+    })
+    .unwrap()
+}
+
+/// A caller who shapes the bridge-local tree must not be able to move the
+/// signed commitment one bit. Pre-fix this test fails: `event_count` and
+/// `merkle_root` were read straight off `ctx_rt.event_log`, so a member could
+/// drive them to arbitrary values with ordinary `provenance_attach` calls and
+/// obtain a validly-signed `ConsistencyCheckpoint` asserting them.
+#[test]
+fn event_log_checkpoint_commits_to_the_authoritative_log_not_the_bridge_local_tree() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+        let (auth_count, auth_root) = authoritative_commitment(scp.bridge_instance(), &ctx_id);
+
+        // Shape the bridge-local tree to a caller-chosen state: the
+        // authoritative prefix (so a naive "already in sync" branch would be
+        // satisfied) plus real caller-injected leaves.
+        let authoritative = authoritative_leaves(scp.bridge_instance(), &ctx_id);
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            for leaf in &authoritative {
+                rt.event_log.push_leaf_raw(*leaf);
+            }
+            Ok(())
+        })
+        .unwrap();
+        inject_local_leaf(&scp, py, &ctx_id, &did);
+        inject_local_leaf(&scp, py, &ctx_id, &did);
+
+        let (local_count, local_root) = bridge_local_commitment(scp.bridge_instance(), &ctx_id);
+        assert_ne!(
+            (local_count, local_root),
+            (auth_count, auth_root),
+            "precondition: the caller has shaped the bridge-local tree away from \
+             the authoritative one"
+        );
+
+        let checkpoint = scp.event_log_checkpoint_by_did(&ctx_id, &did, 3).unwrap();
+
+        assert_eq!(
+            checkpoint.event_count, auth_count,
+            "the signed event_count must be the authoritative log's"
+        );
+        assert_eq!(
+            checkpoint.merkle_root,
+            hex::encode(auth_root),
+            "the signed merkle_root must be the authoritative log's"
+        );
+        assert_ne!(
+            checkpoint.merkle_root,
+            hex::encode(local_root),
+            "a caller-shaped bridge-local root must never reach a signed field"
+        );
+
+        // The `event_log_checkpoint` entry point (identity's own DID) commits
+        // identically — both public surfaces share one implementation.
+        let same = scp.event_log_checkpoint(&ctx_id, &did, 3).unwrap();
+        assert_eq!(same.event_count, auth_count);
+        assert_eq!(same.merkle_root, hex::encode(auth_root));
+
+        // The signature really covers the fields it reports, so a peer that
+        // verifies it and then compares roots is comparing the signed values.
+        let cp = pycheckpoint_to_core(&checkpoint);
+        let vk = registered_verifying_key(scp.bridge_instance(), &did);
+        scp_event_log::checkpoint::verify_checkpoint_signature(&cp, &vk)
+            .expect("the checkpoint signature must verify over its own reported fields");
+    });
+}
+
+/// An UNKNOWN authoritative log must yield NO checkpoint. Pre-fix the bridge
+/// happily signed a commitment over whatever the bridge-local tree held.
+#[test]
+fn event_log_checkpoint_fails_closed_when_the_authoritative_log_is_unknown() {
+    Python::with_gil(|_py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+
+        // FFI state registered, but the context was never created through the
+        // supervisor — exactly the state left by `destroy_event_log` on actor
+        // shutdown or create-rollback.
+        let ctx_id = random_context_id();
+        runtime::register_context(scp.bridge_instance(), &ctx_id, &did, &[]).unwrap();
+        let ctx_bytes = scp_core::context::state::context_id_to_bytes(&ctx_id);
+        assert!(
+            runtime::supervisor(scp.bridge_instance())
+                .unwrap()
+                .event_log_entries(&ctx_bytes)
+                .unwrap()
+                .is_none(),
+            "precondition: the authoritative log is UNKNOWN for this context"
+        );
+
+        // A non-empty bridge-local tree the pre-fix code would have signed over.
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            rt.event_log.push_leaf_raw([0xABu8; 32]);
+            Ok(())
+        })
+        .unwrap();
+
+        let err = scp
+            .event_log_checkpoint_by_did(&ctx_id, &did, 0)
+            .expect_err("an unknown authoritative log must not be signed over");
+        assert!(
+            err.to_string().contains("SCP-CTX-2138"),
+            "expected the fail-closed authoritative-log code, got: {err}"
+        );
+    });
+}
+
+/// A shut-down or suspended instance is rejected the same way verification is.
+#[test]
+fn event_log_checkpoint_fails_closed_after_shutdown_and_when_suspended() {
+    for shutdown in [false, true] {
+        Python::with_gil(|py| {
+            let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+            runtime::init_context_manager_for_test(scp.bridge_instance());
+            let did = create_test_identity(scp.bridge_instance());
+            let ctx_id = create_test_context(scp.bridge_instance(), &did);
+
+            runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+                rt.event_log.push_leaf_raw([0xABu8; 32]);
+                Ok(())
+            })
+            .unwrap();
+
+            if shutdown {
+                scp.shutdown(py, 0).unwrap();
+            } else {
+                scp.suspend().unwrap();
+            }
+
+            let err = scp
+                .event_log_checkpoint_by_did(&ctx_id, &did, 0)
+                .expect_err("a not-ready instance must not sign a checkpoint");
+            assert!(
+                err.to_string().contains("SCP-CTX-2138"),
+                "shutdown={shutdown}: expected SCP-CTX-2138, got: {err}"
+            );
+        });
+    }
 }
 
 #[test]

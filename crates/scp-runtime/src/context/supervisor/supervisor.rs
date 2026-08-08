@@ -11518,6 +11518,55 @@ impl Supervisor {
         event_log.rebuild_event_log_for_proof(&context_id_bytes)
     }
 
+    /// Builds the unsigned §9.9.3 consistency checkpoint for `context_id` over
+    /// the AUTHORITATIVE event log, ready for the caller to sign.
+    ///
+    /// This is the checkpoint builder every FFI bridge uses. The bridges own
+    /// only the key plumbing (platform key custody, which the supervisor cannot
+    /// reach); WHICH log the commitment is taken over, and the derivation of the
+    /// signed fields from it, live here so the three bridges cannot drift.
+    ///
+    /// The `(event_count, merkle_root)` pair comes from ONE
+    /// [`Self::authoritative_event_log`] snapshot, and the canonical hash from
+    /// [`scp_event_log::checkpoint::UnsignedCheckpoint`] — the same single
+    /// derivation the runtime's own periodic checkpoint path uses.
+    ///
+    /// `epoch` is `Some(mls_epoch)` for MLS-encrypted contexts and `None` for
+    /// Broadcast contexts, which do not use MLS.
+    ///
+    /// # Security (GitHub #1933 follow-up)
+    ///
+    /// A checkpoint is signed, non-repudiable evidence: a peer that sees the
+    /// same `event_count` with a different `merkle_root` raises
+    /// [`ContextEvent::EquivocationDetected`](scp_protocol::context::membership::ContextEvent::EquivocationDetected)
+    /// against its signer (§9.9.3). The bridges previously signed a commitment
+    /// over their own bridge-local `EventLog` — a tree holding only bridge-local
+    /// records (UCAN revocations, outlet invocations, provenance, media
+    /// sessions) whose leaves a caller can shape at will through ordinary public
+    /// calls. Any member could therefore mint validly-signed equivocation
+    /// evidence against honest peers, and an honest member's checkpoint was
+    /// simply wrong about its own history. Routing through the authoritative log
+    /// closes both; an unreachable log FAILS CLOSED (no checkpoint is produced)
+    /// rather than falling back to any second tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if no event-log provider is
+    /// wired, or [`ContextError::EventLogFailed`] if no log exists for the
+    /// context or the replayed events fail hash-chain verification.
+    pub fn unsigned_authoritative_checkpoint(
+        &self,
+        context_id: &str,
+        sender_did: &DID,
+        epoch: Option<u64>,
+        timestamp: u64,
+    ) -> Result<scp_event_log::checkpoint::UnsignedCheckpoint, ContextError> {
+        let log = self.authoritative_event_log(context_id)?;
+        Ok(scp_event_log::checkpoint::UnsignedCheckpoint::over_log(
+            &log, context_id, sender_did, epoch, timestamp,
+        ))
+    }
+
     /// Computes the participation record (§7.3.2) for `subject_did` in
     /// `context_id` from the context's FULL event log.
     ///
