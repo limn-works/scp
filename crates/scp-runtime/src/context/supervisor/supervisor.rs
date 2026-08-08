@@ -11469,6 +11469,55 @@ impl Supervisor {
         event_log.event_log_entries(context_id_bytes)
     }
 
+    /// Returns the AUTHORITATIVE event log for `context_id` as a canonical
+    /// [`scp_event_log::EventLog`] snapshot.
+    ///
+    /// This is the one call every Merkle answer about a context is derived
+    /// from. It delegates to the provider's single proof seam
+    /// ([`ContextEventLogProvider::rebuild_event_log_for_proof`]), replaying
+    /// the supervisor's own canonical entries — the same source
+    /// [`Self::event_log_entries`] reads. The returned value is a transient,
+    /// caller-owned snapshot: proving does not read, create, or mutate any
+    /// second per-context tree.
+    ///
+    /// Callers MUST derive the inclusion proof, the absence proof AND the
+    /// `(leaf_count, root)` commitment they report from a SINGLE snapshot.
+    /// Two snapshots straddling a concurrent `append_event` describe different
+    /// trees, so a root taken from one and a leaf count from the other commit
+    /// to nothing a relying party can check.
+    ///
+    /// Synchronous for the same reason as [`Self::event_log_entries`]: the FFI
+    /// event-log probes that call it cannot `.await`.
+    ///
+    /// # Security (GitHub #1933)
+    ///
+    /// FAILS CLOSED when the provider reports no log for the context. `None`
+    /// means UNKNOWN — never initialised, or destroyed by `destroy_event_log`
+    /// (actor shutdown, create-rollback) — and never "empty"; an empty-but-live
+    /// log is `Ok(Some(vec![]))` and snapshots to a real zero-leaf tree.
+    /// Answering a Merkle query over an unknown log, or falling back to a
+    /// bridge-local tree, is a forgeable false negative: a caller could "prove"
+    /// an event absent that the authoritative log actually recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if no event-log provider is
+    /// wired, or [`ContextError::EventLogFailed`] if no log exists for the
+    /// context or the replayed events fail hash-chain verification.
+    pub fn authoritative_event_log(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_event_log::EventLog, ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::authoritative_event_log — event_log provider not configured"
+                    .to_owned(),
+            )
+        })?;
+        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        event_log.rebuild_event_log_for_proof(&context_id_bytes)
+    }
+
     /// Computes the participation record (§7.3.2) for `subject_did` in
     /// `context_id` from the context's FULL event log.
     ///

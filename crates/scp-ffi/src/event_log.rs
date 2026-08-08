@@ -526,11 +526,50 @@ fn parse_event_query_filter(
     Ok(query_filter)
 }
 
+/// Maps a runtime authoritative-log failure into the fail-closed bridge error.
+///
+/// GitHub #1933. Raised when the bridge cannot reach the context's
+/// AUTHORITATIVE event log at all — the instance is not ready (suspended or
+/// shut down), no supervisor / event-log provider is attached, or the provider
+/// reports NO LOG for the context (`Ok(None)`, which means UNKNOWN — a log
+/// destroyed on actor shutdown or create-rollback reads exactly the same as one
+/// that never existed; an empty-but-live log is `Ok(Some(vec![]))`).
+///
+/// Verification MUST NOT fall back to any bridge-local tree here: an absence
+/// proof over a non-authoritative or unknown log is a forgeable FALSE NEGATIVE.
+fn authoritative_log_unreachable(context_id: &str, detail: &impl std::fmt::Display) -> ScpPyError {
+    ScpPyError::ContextError {
+        message: format!(
+            "event log verification cannot reach the authoritative log for context \
+             '{context_id}': {detail}"
+        ),
+        code: codes::CTX_2138.to_owned(),
+    }
+}
+
 /// Verifies a claim against the context event log.
 ///
 /// Generates and verifies a Merkle proof for the given claim. Supports
 /// both inclusion proofs (proving an event IS in the log) and absence
 /// proofs (proving an event is NOT in the log).
+///
+/// # The proof is generated against the AUTHORITATIVE log
+///
+/// Both proof types are generated from ONE `Supervisor::authoritative_event_log`
+/// snapshot — the runtime's single proof seam, replayed from the supervisor's
+/// own canonical event log, the same source
+/// [`event_log_query`](PyScp::event_log_query) reads. This function NEVER reads
+/// or mutates the bridge-local `FfiBridgeState::event_log`, which is a separate
+/// tree holding only bridge-local records (UCAN revocations, outlet
+/// invocations, provenance, media sessions) and whose leaves a caller can
+/// influence. Proving over that tree produced forgeable absence AND inclusion
+/// results (GitHub #1933).
+///
+/// Because the proof and the reported `(leaf_count, root)` commitment come from
+/// that ONE snapshot, they describe the same tree state by construction — a
+/// relying party can pin the proof against the commitment beside it. Taking
+/// them from two snapshots would let a concurrent append separate them, and a
+/// root paired with another snapshot's leaf count commits to nothing.
 ///
 /// # Arguments
 ///
@@ -548,10 +587,14 @@ fn parse_event_query_filter(
 ///
 /// # Errors
 ///
-/// Raises `ContextError` if the context is not connected to the runtime
-/// or if the verification fails (empty log, invalid index, etc.).
+/// Raises `ContextError` with `SCP-CTX-2138` when the authoritative log is
+/// unreachable (instance not ready, no supervisor, or no log for the context —
+/// FAIL CLOSED, never a "verified" proof over a fallback tree), and
+/// `ContextError` when proof generation legitimately fails over a readable log
+/// (empty log, out-of-range leaf index, or an absence claim for an event that
+/// IS present).
 ///
-/// See ADR-013 §7.
+/// See ADR-013 §7 and ADR-011.
 #[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
 fn event_log_verify_impl(
     bi: &PyBridgeInstance,
@@ -572,6 +615,24 @@ fn event_log_verify_impl(
             ScpPyError::validation("claim must include 'type' field ('inclusion' or 'absence')")
         })?;
 
+    // #1933 fail-closed gate. `check_ready` rejects BOTH suspended and
+    // shut-down instances (`supervisor()` only rejects suspended, and merely
+    // warns after shutdown — while a shut-down context's authoritative log has
+    // typically been destroyed).
+    bi.core
+        .check_ready()
+        .map_err(|e| authoritative_log_unreachable(context_id, &e))?;
+    let supervisor = crate::runtime::supervisor(bi)
+        .map_err(|e| authoritative_log_unreachable(context_id, &e))?;
+
+    // The ONE authoritative snapshot every answer below is derived from. Its
+    // failure is the only "cannot answer" case (CTX-2138), which keeps it
+    // distinct from "the claim is false" (a proof error over a readable log).
+    let log = supervisor
+        .authoritative_event_log(context_id)
+        .map_err(|e| authoritative_log_unreachable(context_id, &e))?;
+    let leaf_count = scp_event_log::tree::event_count(&log);
+
     match claim_type {
         "inclusion" => {
             let leaf_index = claim_json
@@ -581,39 +642,33 @@ fn event_log_verify_impl(
                     ScpPyError::validation("inclusion claim must include 'leaf_index' (integer)")
                 })?;
 
-            // Generate and verify the inclusion proof via scp-core.
-            let proof_result = crate::runtime::with_context(bi, context_id, |rt| {
-                let proof = scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
-                    .map_err(|e| ScpPyError::context(format!("inclusion proof failed: {e}")))?;
-                let verified = scp_event_log::proof::verify_inclusion(&proof);
+            let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index)
+                .map_err(|e| ScpPyError::context(format!("inclusion proof failed: {e}")))?;
+            let verified = scp_event_log::proof::verify_inclusion(&proof);
 
-                let path_steps: Vec<serde_json::Value> = proof
-                    .path
-                    .iter()
-                    .map(|step| {
-                        let direction = match step.direction {
-                            scp_event_log::proof::Direction::Left => "left",
-                            scp_event_log::proof::Direction::Right => "right",
-                        };
-                        serde_json::json!({
-                            "sibling_hash": encode_hex(&step.sibling_hash),
-                            "direction": direction,
-                        })
+            let path_steps: Vec<serde_json::Value> = proof
+                .path
+                .iter()
+                .map(|step| {
+                    let direction = match step.direction {
+                        scp_event_log::proof::Direction::Left => "left",
+                        scp_event_log::proof::Direction::Right => "right",
+                    };
+                    serde_json::json!({
+                        "sibling_hash": encode_hex(&step.sibling_hash),
+                        "direction": direction,
                     })
-                    .collect();
+                })
+                .collect();
 
-                let details = serde_json::json!({
-                    "leaf_index": proof.leaf_index,
-                    "leaf_hash": encode_hex(&proof.leaf_hash),
-                    "root": encode_hex(&proof.root),
-                    "path": path_steps,
-                    "path_length": proof.path.len(),
-                });
-
-                Ok((verified, details))
-            })?;
-
-            let (verified, details_json) = proof_result;
+            let details_json = serde_json::json!({
+                "leaf_index": proof.leaf_index,
+                "leaf_hash": encode_hex(&proof.leaf_hash),
+                "root": encode_hex(&proof.root),
+                "path": path_steps,
+                "path_length": proof.path.len(),
+                "leaf_count": leaf_count,
+            });
             let details = json_to_py_dict(py, &details_json)?;
 
             Ok(PyProof {
@@ -634,47 +689,41 @@ fn event_log_verify_impl(
             let event_hash = decode_hex_hash(event_hash_hex)
                 .map_err(|e| ScpPyError::validation(format!("invalid event_hash: {e}")))?;
 
-            // Generate the absence proof via scp-core.
-            let proof_result =
-                crate::runtime::with_context(bi, context_id, |rt| {
-                    let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
-                        .map_err(|e| ScpPyError::context(format!("absence proof failed: {e}")))?;
+            let proof = scp_event_log::proof::prove_absence(&log, &event_hash)
+                .map_err(|e| ScpPyError::context(format!("absence proof failed: {e}")))?;
 
-                    let lower = proof.lower.as_ref().map(|lwp| {
-                        serde_json::json!({
-                            "leaf_hash": encode_hex(&lwp.leaf_hash),
-                            "leaf_index": lwp.leaf_index,
-                        })
-                    });
+            let lower = proof.lower.as_ref().map(|lwp| {
+                serde_json::json!({
+                    "leaf_hash": encode_hex(&lwp.leaf_hash),
+                    "leaf_index": lwp.leaf_index,
+                })
+            });
 
-                    let upper = proof.upper.as_ref().map(|uwp| {
-                        serde_json::json!({
-                            "leaf_hash": encode_hex(&uwp.leaf_hash),
-                            "leaf_index": uwp.leaf_index,
-                        })
-                    });
+            let upper = proof.upper.as_ref().map(|uwp| {
+                serde_json::json!({
+                    "leaf_hash": encode_hex(&uwp.leaf_hash),
+                    "leaf_index": uwp.leaf_index,
+                })
+            });
 
-                    // Verify the neighbor inclusion proofs.
-                    let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
-                        scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof)
-                    });
-                    let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
-                        scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof)
-                    });
-                    let verified = lower_verified && upper_verified;
+            // Verify the neighbor inclusion proofs.
+            let lower_verified = proof
+                .lower
+                .as_ref()
+                .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
+            let upper_verified = proof
+                .upper
+                .as_ref()
+                .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
+            let verified = lower_verified && upper_verified;
 
-                    let details = serde_json::json!({
-                        "query_hash": encode_hex(&proof.query_hash),
-                        "root": encode_hex(&proof.root),
-                        "leaf_count": proof.leaf_count,
-                        "lower": lower,
-                        "upper": upper,
-                    });
-
-                    Ok((verified, details))
-                })?;
-
-            let (verified, details_json) = proof_result;
+            let details_json = serde_json::json!({
+                "query_hash": encode_hex(&proof.query_hash),
+                "root": encode_hex(&proof.root),
+                "leaf_count": proof.leaf_count,
+                "lower": lower,
+                "upper": upper,
+            });
             let details = json_to_py_dict(py, &details_json)?;
 
             Ok(PyProof {

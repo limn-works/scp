@@ -568,8 +568,24 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// Reconstructs the canonical [`scp_event_log::EventLog`] for a context by
     /// replaying its events through the substrate.
     ///
-    /// Shared by the proof methods. Returns an error if no log exists for the
-    /// context or the replayed events break the hash chain.
+    /// This is the single proof seam. Every Merkle answer about a context —
+    /// inclusion, absence, consistency, and the `(leaf_count, root)` commitment
+    /// — is derived from ONE call to this method, so all of them describe the
+    /// same tree state by construction. There is no second tree to keep in
+    /// sync, and callers must not assemble one from separate replays: two
+    /// replays straddling a concurrent `append_event` describe different trees,
+    /// and a `root` paired with a `leaf_count` from the other snapshot is a
+    /// commitment that pins nothing.
+    ///
+    /// # Security (GitHub #1933)
+    ///
+    /// FAILS CLOSED when the provider reports no log. `event_log_entries`
+    /// returning `None` means UNKNOWN — a log that was never initialised, or
+    /// one destroyed by `destroy_event_log` (actor shutdown, create-rollback) —
+    /// never "empty". An empty-but-live log is `Ok(Some(vec![]))` and replays
+    /// to a real zero-leaf tree. Answering a Merkle query over an unknown log
+    /// would be a forgeable false negative: a caller could "prove" an event
+    /// absent that the authoritative log actually recorded.
     ///
     /// # Errors
     ///
