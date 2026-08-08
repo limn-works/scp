@@ -357,6 +357,48 @@ mod tests {
         assert_eq!(decoded.value(), &value[..]);
     }
 
+    // WRITE ↔ ADMISSION agreement (SCP-RELAYRES-004 write path vs
+    // SCP-RELAYRES-003 relay admission). The routing_id this publisher writes at
+    // MUST be exactly the one a validating relay re-derives when it decides
+    // whether to admit the frame, and the published bytes must satisfy that
+    // relay's binding + signature check. Both sides derive it through the single
+    // `scp_identity::republish::did_record_routing_id` helper; this test is the
+    // mechanical guard that they can never drift apart. A drift would reject
+    // every self-DID republish as `BindingMismatch` on every validating relay —
+    // a silent, total availability failure for DID resolution.
+    #[tokio::test]
+    async fn published_frame_is_admitted_by_relay_validation() {
+        use crate::relay::did_record_validation::{DidRecordClass, classify_did_record_frame};
+
+        let (vk, sk) = keypair(23);
+        let (record, _) = signed_record(&vk, &sk, 5);
+
+        let adapter = Arc::new(RecordingPublishAdapter::new());
+        let publisher = TransportRelayPublisher::new();
+        publisher.bind(RELAY, Arc::clone(&adapter) as Arc<dyn TransportAdapter>);
+
+        RelayPublisher::publish(&publisher, BLOB_TTL, &record)
+            .await
+            .expect("publish succeeds when a relay is bound");
+
+        let recorded = adapter.recorded();
+        assert_eq!(recorded.len(), 1, "exactly one publish_raw call");
+        let (got_rid, _, blob) = &recorded[0];
+
+        // Independent oracle (a third composition, via `did_dht_from_public_key`):
+        // the write address is the DID-domain routing_id of the frame's own key.
+        assert_eq!(got_rid.as_bytes(), &routing_id_of(&vk));
+
+        // And the relay's own admission check accepts that exact
+        // (routing_id, blob) pair — binding first, then the BEP44 signature.
+        assert_eq!(
+            classify_did_record_frame(got_rid.as_bytes(), blob),
+            DidRecordClass::Valid { seq: 5 },
+            "the WRITE path's routing_id must satisfy the relay's admission \
+             binding byte-for-byte"
+        );
+    }
+
     // AC 4 (multi-relay, §3.10.2): every bound relay receives the frame.
     #[tokio::test]
     async fn publishes_to_all_bound_relays() {
