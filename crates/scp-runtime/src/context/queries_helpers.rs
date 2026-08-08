@@ -859,11 +859,43 @@ fn verify_remote_checkpoint_authenticity(
 /// (cell/view) and the receive path (`deliver_checkpoint_message`, bare state)
 /// share one classify path while each applies the field writes itself.
 ///
+/// # Security (GitHub #1933 follow-up) — the judging side of the commitment
+///
+/// [`build_checkpoint`] is the side that SIGNS a `(event_count, merkle_root)`
+/// commitment; this is the side that JUDGES a peer's. Both need the same two
+/// properties, for the same reason:
+///
+/// - **ONE snapshot.** `local_count` and `local_root` come from a single
+///   [`ContextEventLogProvider::rebuild_event_log_for_proof`] call. Reading them
+///   through two separate provider calls let a concurrent `append_event` fall
+///   between them, so the local side of the comparison could describe a tree
+///   state that never existed — and the verdict it drives is an accusation.
+/// - **FAILS CLOSED.** An unreachable local log is an ERROR, never a
+///   comparison. The previous `unwrap_or([0u8; 32])` / `.ok().flatten()`
+///   defaults made a provider failure indistinguishable from a real empty log,
+///   and the fabricated pair was WRONG IN BOTH DIRECTIONS:
+///   - a remote checkpoint at `event_count == 0` compared equal-count against
+///     the fabricated `[0u8; 32]` (which is not even the empty-tree root —
+///     that is `SHA-256("")`, §25.8 Vector 15) and classified `Divergent`,
+///     raising [`ContextEvent::EquivocationDetected`] against an HONEST peer on
+///     the strength of a value invented by an error path; and
+///   - a remote checkpoint at any non-zero count compared against
+///     `local_count = 0` and was silently classified `Behind` — benign
+///     catch-up lag — so a GENUINE divergence went undetected.
+///
+/// A local log we cannot read must not produce a verdict about a peer's honesty
+/// in either direction. This also restores consistency with the gate one line
+/// above: [`verify_remote_checkpoint_authenticity`] already fails closed.
+///
 /// # Errors
 ///
 /// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a member.
 /// - [`ContextError::CryptoFailed`] if the public key cannot be resolved or the
 ///   Ed25519 signature verification fails.
+/// - [`ContextError::EventLogFailed`] if the LOCAL authoritative log is
+///   unreachable (never initialised, or destroyed on actor shutdown /
+///   create-rollback) or its replayed events break the hash chain — the
+///   comparison is refused rather than answered from a fabricated local state.
 fn classify_remote_checkpoint(
     sender_is_member: bool,
     deps: &ActorDeps,
@@ -880,16 +912,33 @@ fn classify_remote_checkpoint(
     verify_remote_checkpoint_authenticity(sender_is_member, deps, context_id, remote)?;
 
     let context_id_bytes = state::context_id_to_bytes(context_id);
-    let local_root = deps
+    // ONE snapshot — both sides of the local commitment describe the same tree
+    // state by construction, and an unreachable log refuses rather than
+    // fabricating one. See the Security section above.
+    let local = deps
         .event_log
-        .event_log_merkle_root(&context_id_bytes)
-        .unwrap_or([0u8; 32]);
-    let local_count = deps
-        .event_log
-        .event_log_entries(&context_id_bytes)
-        .ok()
-        .flatten()
-        .map_or(0, |e| e.len() as u64);
+        .rebuild_event_log_for_proof(&context_id_bytes)
+        .map_err(|e| {
+            // Logged here, at the point of refusal, so no caller can drop the
+            // remote checkpoint silently: "we could not check" must never look
+            // like "consistent".
+            tracing::error!(
+                context_id,
+                sender_did = %remote.sender_did,
+                remote_event_count = remote.event_count,
+                error = %e,
+                "refusing to classify a remote consistency checkpoint: the LOCAL \
+                 authoritative event log is unreachable, so no honest verdict about \
+                 this peer is available (§9.9.3)"
+            );
+            ContextError::EventLogFailed(format!(
+                "cannot classify remote checkpoint from {} for context {context_id}: \
+                 local authoritative event log unreachable: {e}",
+                remote.sender_did
+            ))
+        })?;
+    let local_root = scp_event_log::tree::root(&local);
+    let local_count = scp_event_log::tree::event_count(&local);
 
     // Note: `prove_consistency` is NOT used here because consistency
     // proofs prove that a smaller version of the SAME log is a prefix
@@ -965,6 +1014,11 @@ fn classify_remote_checkpoint(
 ///   member of the context.
 /// - [`ContextError::CryptoFailed`] if the public key cannot be
 ///   resolved or the Ed25519 signature verification fails.
+/// - [`ContextError::EventLogFailed`] if the LOCAL authoritative event log is
+///   unreachable — see [`classify_remote_checkpoint`]. NOTHING is mutated on
+///   that path: the error is raised before the divergence dedup set or the
+///   receive buffer are touched, so a refusal can never emit
+///   `EquivocationDetected` nor record a divergence that was never established.
 pub fn compare_remote_checkpoint(
     view: &mut ClassCMut,
     deps: &ActorDeps,
@@ -1832,5 +1886,339 @@ mod checkpoint_authoritative_source_tests {
             checkpoints.is_empty(),
             "nothing may be retained when nothing was signed"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_checkpoint_classification_tests {
+    //! The JUDGING side of the §9.9.3 commitment.
+    //!
+    //! [`classify_remote_checkpoint`] compares a peer's signed
+    //! `(event_count, merkle_root)` against the LOCAL log, and a `Divergent`
+    //! verdict raises [`ContextEvent::EquivocationDetected`] — an accusation of
+    //! dishonesty against that peer. It therefore needs exactly the properties
+    //! [`build_checkpoint`] needs on the signing side, and for a sharper reason:
+    //! the producer side fabricating a commitment misleads its peers, while the
+    //! judging side fabricating one FRAMES them.
+    //!
+    //! Before the #1933 follow-up the local side was read through two
+    //! independent, individually fail-open provider calls
+    //! (`event_log_merkle_root(...).unwrap_or([0u8; 32])` and
+    //! `event_log_entries(...).ok().flatten().map_or(0, ...)`). An unreachable
+    //! provider therefore produced `(0, [0u8; 32])` — a count and a root that
+    //! describe no tree, `[0u8; 32]` not even being the empty-tree root — and
+    //! the resulting verdict was wrong in BOTH directions: a remote checkpoint
+    //! at count 0 was accused of equivocating, and a remote checkpoint at any
+    //! other count was quietly filed as a benign catch-up state (`Behind`,
+    //! since the fabricated `local_count = 0` is below every real count),
+    //! missing a real divergence.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::sync::Arc;
+
+    use scp_did::DID;
+    use scp_protocol::context::ContextError;
+
+    use super::{classify_remote_checkpoint, compare_remote_checkpoint};
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::builder::ContextEventLogProvider;
+    use crate::context::providers::event_log::MerkleEventLogProvider;
+    use crate::context::supervisor::supervisor::Supervisor;
+
+    /// A 64-hex context id, so `context_id_to_bytes` is the identity decode.
+    const CTX_HEX: &str = "0909090909090909090909090909090909090909090909090909090909090909";
+
+    const SENDER: &str = "did:example:bob";
+
+    fn ctx_bytes() -> [u8; 32] {
+        crate::context::state::context_id_to_bytes(CTX_HEX)
+    }
+
+    /// A provider that reports NO LOG for the context — `Ok(None)` means
+    /// UNKNOWN (never initialised, or destroyed on actor shutdown /
+    /// create-rollback), never "empty". Its standalone `event_log_merkle_root`
+    /// cheerfully answers `[0u8; 32]`, which is precisely the pair the old
+    /// fail-open read fabricated.
+    struct UnreachableLogProvider;
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for UnreachableLogProvider {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            Ok(None)
+        }
+
+        fn event_log_merkle_root(&self, _id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
+            Ok([0u8; 32])
+        }
+    }
+
+    /// Seeds a readable provider with `n` chained lifecycle events.
+    async fn readable_provider(n: u64) -> MerkleEventLogProvider {
+        let provider = MerkleEventLogProvider::new();
+        let id = ctx_bytes();
+        provider.init_event_log(&id).await.unwrap();
+        for i in 0..n {
+            let event_type = if i == 0 {
+                scp_event_log::EventType::ContextCreated
+            } else {
+                scp_event_log::EventType::MemberJoined
+            };
+            provider
+                .append_event(
+                    &id,
+                    event_type,
+                    "did:example:actor",
+                    scp_event_log::EventPayload::default(),
+                    1_700_000_000 + i,
+                )
+                .await
+                .unwrap();
+        }
+        provider
+    }
+
+    /// Builds `ActorDeps` over `event_log`, with a key resolver that resolves
+    /// [`SENDER`] to `verifying_key` so the authenticity gate genuinely passes
+    /// and execution reaches the log read under test.
+    async fn deps_over(
+        event_log: Box<dyn ContextEventLogProvider>,
+        verifying_key: ed25519_dalek::VerifyingKey,
+    ) -> ActorDeps {
+        use scp_platform::in_memory::InMemoryStorage;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            "did:dht:z6MktestRemoteCheckpoint".to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(move |did: &DID, _: scp_did::SigningKeyId| {
+                (did.as_ref() == SENDER).then_some(verifying_key)
+            });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID("did:example:local".to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// A GENUINELY SIGNED remote checkpoint — the authenticity gate must pass so
+    /// the test exercises the local-log read, not the signature check.
+    fn signed_remote(
+        signing_key: &ed25519_dalek::SigningKey,
+        event_count: u64,
+        merkle_root: [u8; 32],
+    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        let unsigned = scp_event_log::checkpoint::UnsignedCheckpoint::over_commitment(
+            CTX_HEX,
+            &DID(SENDER.to_owned()),
+            event_count,
+            merkle_root,
+            Some(1),
+            1_700_000_100,
+        );
+        let signature = ed25519_dalek::Signer::sign(signing_key, unsigned.canonical_hash());
+        unsigned.into_signed(signature.to_bytes().to_vec())
+    }
+
+    fn state_with_sender_as_member() -> PerContextState {
+        let mut state = PerContextState::new_for_test_encrypted(
+            ctx_bytes(),
+            1_700_000_000,
+            DID("did:example:local".to_owned()),
+        );
+        state
+            .membership
+            .add_member(DID(SENDER.to_owned()), "member".to_owned(), Vec::new());
+        state
+    }
+
+    /// An UNREACHABLE local log must REFUSE to classify, in both directions.
+    ///
+    /// Fails against the pre-fix code: `event_count: 0` was answered
+    /// `Divergent` (an equivocation accusation built from `[0u8; 32]`), and
+    /// `event_count: 7` was answered `Behind { missing_events: 7 }` — a real
+    /// divergence filed as benign catch-up lag.
+    #[tokio::test]
+    async fn an_unreachable_local_log_refuses_to_judge_a_peer() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let deps = deps_over(
+            Box::new(UnreachableLogProvider),
+            signing_key.verifying_key(),
+        )
+        .await;
+
+        for (event_count, label) in [
+            (
+                0u64,
+                "zero count — the pre-fix FALSE-POSITIVE arm (Divergent)",
+            ),
+            (
+                7u64,
+                "non-zero count — the pre-fix FALSE-NEGATIVE arm (Behind)",
+            ),
+        ] {
+            let remote = signed_remote(&signing_key, event_count, [0xAB; 32]);
+            let err = classify_remote_checkpoint(true, &deps, CTX_HEX, &remote)
+                .expect_err(&format!("{label}: an unreachable local log must not judge"));
+            assert!(
+                matches!(err, ContextError::EventLogFailed(_)),
+                "{label}: expected EventLogFailed, got: {err}"
+            );
+        }
+    }
+
+    /// The refusal must not emit `EquivocationDetected` nor record a divergence
+    /// — a verdict that was never reached must leave no trace.
+    #[tokio::test]
+    async fn a_refusal_emits_no_equivocation_alert() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+        let deps = deps_over(
+            Box::new(UnreachableLogProvider),
+            signing_key.verifying_key(),
+        )
+        .await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        // Count 0 is the arm that USED to be answered `Divergent` and therefore
+        // emitted an alert against this (honest) peer.
+        let remote = signed_remote(&signing_key, 0, [0xAB; 32]);
+        let err = compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+            .expect_err("an unreachable local log must not judge");
+        assert!(matches!(err, ContextError::EventLogFailed(_)));
+
+        let mut view = cell.class_c_view();
+        assert!(
+            view.receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "a refusal to judge must emit NO EquivocationDetected — the peer was \
+             never shown to be dishonest"
+        );
+        assert!(
+            view.last_seen_remote_checkpoint_mut().is_empty(),
+            "a refusal must record no divergence in the dedup set"
+        );
+    }
+
+    /// Positive control: over a READABLE log the same shape still detects a
+    /// genuine divergence and emits the alert. Without this, the test above
+    /// could pass for the wrong reason (e.g. a membership or signature gate
+    /// rejecting first).
+    #[tokio::test]
+    async fn a_readable_log_still_detects_a_genuine_divergence() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let provider = readable_provider(3).await;
+        let local_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        let deps = deps_over(Box::new(provider), signing_key.verifying_key()).await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        // Equal count, DIFFERENT root — the §9.9.3 cryptographic equivocation
+        // test.
+        let remote = signed_remote(&signing_key, 3, [0xAB; 32]);
+        assert_ne!(local_root, [0xAB; 32]);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+                .expect("a readable local log yields a verdict");
+        assert!(
+            matches!(
+                comparison,
+                scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+            ),
+            "equal count + different root is Divergent (§9.9.3), got: {comparison:?}"
+        );
+        assert_eq!(
+            cell.class_c_view()
+                .receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .len(),
+            1,
+            "a genuine divergence over a readable log must still alert"
+        );
+    }
+
+    /// Positive control: over a READABLE log an agreeing peer is `Consistent`,
+    /// and the local side of that comparison is the REPLAYED snapshot's root —
+    /// so an empty-but-live log compares against `SHA-256("")`, never the
+    /// `[0u8; 32]` sentinel the old fallback fabricated.
+    #[tokio::test]
+    async fn an_empty_but_live_log_compares_against_the_real_zero_leaf_root() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let provider = readable_provider(0).await;
+        let empty_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        assert_ne!(
+            empty_root, [0u8; 32],
+            "the empty-tree root is SHA-256(\"\") (§25.8 Vector 15), not all zeros"
+        );
+        let deps = deps_over(Box::new(provider), signing_key.verifying_key()).await;
+
+        let agreeing = signed_remote(&signing_key, 0, empty_root);
+        let (comparison, divergence_root) =
+            classify_remote_checkpoint(true, &deps, CTX_HEX, &agreeing)
+                .expect("an empty-but-live log yields a verdict");
+        assert!(matches!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Consistent
+        ));
+        assert!(divergence_root.is_none());
+
+        // And a peer claiming the fabricated all-zero root at the same count is
+        // correctly Divergent — the sentinel is not a valid empty-log root.
+        let sentinel = signed_remote(&signing_key, 0, [0u8; 32]);
+        let (comparison, _) = classify_remote_checkpoint(true, &deps, CTX_HEX, &sentinel)
+            .expect("an empty-but-live log yields a verdict");
+        assert!(matches!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+        ));
     }
 }

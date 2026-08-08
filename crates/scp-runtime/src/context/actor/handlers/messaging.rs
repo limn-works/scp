@@ -1130,7 +1130,14 @@ async fn handle_build_local_checkpoint(
 /// `Result<CheckpointComparison, ContextError>` verbatim so the caller
 /// sees the `Behind` (consistency-proof catch-up seam, specified
 /// separately) / `Ahead` / `Consistent` / `Divergent`
-/// classification and any `MemberNotFound` / `CryptoFailed` error.
+/// classification and any `MemberNotFound` / `CryptoFailed` /
+/// `EventLogFailed` error.
+///
+/// An `EventLogFailed` here is a REFUSAL to judge — the LOCAL authoritative log
+/// was unreachable, so no honest verdict about the peer exists (#1933
+/// follow-up). It is forwarded as an error, never collapsed into a
+/// classification, and reports `Outcome::ok` (not `ok_mutated`) because
+/// `compare_remote_checkpoint` raises it before touching either Class-C field.
 fn handle_compare_remote_checkpoint(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
