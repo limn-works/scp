@@ -96,7 +96,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 
-use scp_identity::republish::did_record_routing_id;
+use scp_identity::did_record_routing_id;
 use scp_protocol::envelope::did_record::DidRecordV1;
 use scp_relay_client::code;
 
@@ -474,11 +474,18 @@ impl DidSlotRegistry {
     #[must_use]
     fn classify_stored_frame(blob: &[u8]) -> Option<([u8; 32], u64)> {
         let frame = DidRecordV1::decode(blob).ok()?;
-        // ONE source of truth for the DID→routing_id bytes: the same
-        // `did_record_routing_id` the WRITE path publishes at
-        // (`scp_identity::republish`). The relay's admission binding and the
-        // publisher's address MUST agree byte-for-byte forever, so neither side
-        // re-inlines the derivation (SCP-RELAYRES-004).
+        // The routing_id is DERIVED from the frame, so the binding check inside
+        // `classify_did_record_frame` below compares this value against itself
+        // and is tautological AT THIS SITE — deliberately: the question here is
+        // "are these bytes a self-consistent protected DID record?", which is
+        // answered by the BEP44 SIGNATURE alone. Binding is enforced where a
+        // WIRE routing_id exists to disagree with the frame: `gate_publish` /
+        // `gate_query` pass the caller-supplied routing_id, and those are the
+        // sites where a mismatch is rejected.
+        //
+        // Derivation goes through the one shared `did_key_routing_id` family
+        // (§3.10.2) so this classifier and the WRITE path address the same
+        // slot (SCP-RELAYRES-004).
         let routing_id = did_record_routing_id(&frame);
         match classify_did_record_frame(&routing_id, blob) {
             DidRecordClass::Valid { seq } => Some((routing_id, seq)),

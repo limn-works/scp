@@ -33,6 +33,7 @@ use crate::IdentityError;
 use crate::dht::verify_self_certification;
 use scp_dht::verify_bep44_signature;
 use scp_did::DidDocument;
+use scp_protocol::envelope::did_record::DidRecordV1;
 
 /// Domain separator for DID routing IDs.
 ///
@@ -58,6 +59,45 @@ pub fn did_routing_id(did: &str) -> [u8; 32] {
     hasher.update(DID_ROUTING_DOMAIN_SEPARATOR);
     hasher.update(did.as_bytes());
     hasher.finalize().into()
+}
+
+/// The DID `routing_id` an Ed25519 identity key binds to:
+/// `SHA-256("scp:did:" || did:dht(public_key))` (§3.10.2, §9.10.12).
+///
+/// # The one key→`routing_id` derivation in the system
+///
+/// Every production site that must turn a raw identity key into the DID
+/// `routing_id` it binds to calls **this** function; none re-inlines the
+/// `did_from_ed25519_public_key ∘ did_routing_id` composition. Today those
+/// sites are the relay WRITE path (`TransportRelayPublisher`), the relay
+/// ADMISSION check (`classify_did_record_frame` /
+/// `DidSlotRegistry::classify_stored_frame`, via [`did_record_routing_id`]),
+/// and `BRIDGE_REGISTER` authentication (`verify_bridge_registration`).
+///
+/// They MUST agree byte-for-byte forever: were the write address and the
+/// admission binding to drift, every self-DID republish would be rejected as a
+/// binding mismatch by every validating relay — a silent, total availability
+/// failure for DID resolution. One function makes that agreement structural
+/// rather than a convention independent copies could quietly violate. Tests
+/// deliberately keep their own independent recomposition as an oracle so a bug
+/// here cannot make both sides of an assertion vacuously agree; production code
+/// never does.
+#[must_use]
+pub fn did_key_routing_id(public_key: &[u8; 32]) -> [u8; 32] {
+    did_routing_id(&crate::did_from_ed25519_public_key(public_key))
+}
+
+/// The DID `routing_id` a DID-record frame MUST be published at, and resolved
+/// from — [`did_key_routing_id`] of the frame's **own** `public_key`.
+///
+/// Deriving the routing ID from the frame itself, rather than accepting it as an
+/// independent argument, makes a frame/`routing_id` mismatch unrepresentable: a
+/// frame can only ever be published at the single routing ID its `public_key`
+/// binds to. See [`did_key_routing_id`] for the agreement invariant this shares
+/// with the relay admission path.
+#[must_use]
+pub fn did_record_routing_id(record: &DidRecordV1) -> [u8; 32] {
+    did_key_routing_id(record.public_key())
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +344,52 @@ mod tests {
     #[test]
     fn domain_separator_value() {
         assert_eq!(DID_ROUTING_DOMAIN_SEPARATOR, b"scp:did:");
+    }
+
+    // ---- key/record routing-ID derivation (B7c/B7d) ----
+
+    /// `did_key_routing_id` equals the independently-recomposed
+    /// `did_routing_id ∘ did_from_ed25519_public_key`. The oracle is composed
+    /// here rather than delegated, so this cannot vacuously agree with itself.
+    #[test]
+    fn key_routing_id_matches_independent_recomposition() {
+        let public_key = [0x3Cu8; 32];
+        let expected = did_routing_id(&crate::did_from_ed25519_public_key(&public_key));
+        assert_eq!(did_key_routing_id(&public_key), expected);
+    }
+
+    /// A frame's routing ID is its own key's routing ID — the binding that makes
+    /// a frame/`routing_id` mismatch unrepresentable (§9.10.12).
+    #[test]
+    fn record_routing_id_is_its_own_key_routing_id() {
+        let public_key = [0x7Bu8; 32];
+        let record = scp_protocol::envelope::did_record::DidRecordV1::try_new(
+            public_key,
+            9,
+            [0x11; 64],
+            b"{}".to_vec(),
+        )
+        .expect("frame invariants hold");
+
+        assert_eq!(
+            did_record_routing_id(&record),
+            did_key_routing_id(&public_key)
+        );
+        // And to the independently recomposed oracle, for the full chain.
+        assert_eq!(
+            did_record_routing_id(&record),
+            did_routing_id(&crate::did_from_ed25519_public_key(&public_key)),
+        );
+    }
+
+    /// Distinct keys bind to distinct routing IDs (no cross-identity collision
+    /// at the slot-exclusivity layer).
+    #[test]
+    fn distinct_keys_bind_to_distinct_routing_ids() {
+        assert_ne!(
+            did_key_routing_id(&[1u8; 32]),
+            did_key_routing_id(&[2u8; 32])
+        );
     }
 
     // ---- InMemoryRelayQuerier Vec-contract tests ----
