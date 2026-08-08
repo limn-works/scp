@@ -25,3 +25,7 @@ artifact diverged) so future passes trace faster.
   `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type
   renames (Socket→RelaySink) leave stray doc refs; native reciprocal-announce is a legit
   recorded follow-up.
+- [SCP-OUT-031 PR-2b bridge render](outlet031-pr2b-bridge-render.md) — code landed clean;
+  the gaps were in the auditNote's own claims ("one shared projection" — UniFFI re-implements
+  it; "napi is cdylib-only" — it's `["cdylib","lib"]`; "all five non-Active states" — there
+  are seven). Verify every load-bearing auditNote sentence against the code.

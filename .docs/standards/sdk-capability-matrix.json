@@ -677,6 +677,20 @@
           "kotlin": true,
           "swift": true,
           "notes": "InvocationHandle control-plane method that requests stream cancellation (§5.4.5, SCP-OUT-038). Wrapped BEHIND the single public invoke() verb in all four SDKs; the bridge signs the OutletCancel internally at the runtime-derived cursor, and cancel() on a never-opened handle is a local no-op close: Python InvocationHandle.cancel() (bindings/python/scp_sdk/outlets.py, C11a reference), TypeScript InvocationHandle.cancel() (bindings/typescript/src/outlets.ts, wraps NAPI outlet_stream_cancel), Swift InvocationHandle.cancel() (bindings/swift/Sources/SCP/Outlets+Streaming.swift, wraps UniFFI outlet_stream_cancel), Kotlin InvocationHandle.cancel() (bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/OutletsStreaming.kt, wraps UniFFI outlet_stream_cancel). All dispatch to the outlet_stream_cancel bridge export (crates/scp-ffi/**/outlet_stream.rs)."
+        },
+        {
+          "name": "error_taxonomy_sealed_hierarchy",
+          "python": false,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "notes": "The §5.4.4 typed outlet-error taxonomy reaching the SDK as a sealed eight-class hierarchy (SCP-OUT-031). BRIDGE HALF LANDED (PR-2b): ContextError::Outlet(OutletErrorSurface) is rendered in FULL — class/code/slug/retry/detail/source_chain — by all three FFI bridges, each through its richest idiom. PyO3 raises the dedicated `OutletError` exception with the surface as positional args (message, code, slug, class, retry_json, detail_json_or_None, source_chain_json) (crates/scp-ffi/src/error.rs). napi-rs appends the surface as a base64 blob in a LAST-anchored `(outlet_error_b64=…)` suffix, leaving the `[{code}]` prefix dispatch of mapBridgeError intact (crates/scp-ffi/napi/src/error.rs). Those two share ONE projection (crates/scp-ffi/common/src/outlet_error.rs). UniFFI does NOT use that module and cannot: it adds ScpError::OutletSurface carrying an OutletErrorSurface interface whose accessors return native Swift enums / Kotlin sealed classes for OutletErrorClass / OutletRetryPolicy / OutletDetailBody / OutletContextHop (crates/scp-ffi/uniffi/src/bridge.rs) — typed values, not strings — so it projects the same protocol types through local mirrors via exhaustive match. What binds all three is not one renderer but one CORPUS (scp_ffi_common::outlet_error::corpus::parity_surfaces), asserted at every bridge, so the three reconstructions are equal by transitivity. SDK HALF NOT LANDED: no SDK yet reconstructs the sealed hierarchy from that render, so every cell stays false — PR-3 builds the eight Outlet*Error subclasses per binding and flips them. This row exists so the bridge/SDK split is legible rather than invisible.",
+          "exemptions": {
+            "python": "SCP-OUT-031 PR-2b is bridge-only: the PyO3 bridge raises `OutletError` with the full structured args, but scp_sdk does not yet rebuild the eight-class sealed hierarchy from them (PR-3)",
+            "typescript": "SCP-OUT-031 PR-2b is bridge-only: the napi bridge emits the canonical `(outlet_error=…)` surface JSON, but @limn-works/scp-ts does not yet rebuild the eight-class sealed hierarchy from it (PR-3)",
+            "kotlin": "SCP-OUT-031 PR-2b is bridge-only: the UniFFI bridge exposes ScpException.OutletSurface with typed sealed-class members, but scp-kt does not yet rebuild the eight-class sealed hierarchy from them (PR-3)",
+            "swift": "SCP-OUT-031 PR-2b is bridge-only: the UniFFI bridge exposes ScpError.outletSurface with typed enum members, but the SCP Swift package does not yet rebuild the eight-class sealed hierarchy from them (PR-3)"
+          }
         }
       ]
     },

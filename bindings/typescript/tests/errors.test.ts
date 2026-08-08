@@ -187,6 +187,74 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-OUTLET-6001");
   });
 
+  // SCP-OUT-031 PR-2b: the napi bridge appends the canonical §5.4.4 surface as
+  // a base64 `(outlet_error_b64=…)` suffix (`crates/scp-ffi/napi/src/error.rs`,
+  // `ScpNapiError::OutletSurface`). Two invariants are pinned here:
+  //
+  //  1. ADDITIVE — the `[{code}]` prefix still leads, so this classifier (which
+  //     is START-anchored) keeps routing the error unchanged. PR-3 adds the
+  //     sealed hierarchy that reads the suffix; until then the suffix must not
+  //     change classification.
+  //  2. LAST-ANCHORED and unforgeable — the payload is base64, whose alphabet
+  //     excludes `(` and space, so the delimiter cannot occur inside the body.
+  //     A decoy in `{message}` therefore always PRECEDES the genuine delimiter
+  //     and a last-anchored parse provably wins. (This is exactly why the blob
+  //     is base64 rather than raw JSON: `serde_json` does not escape
+  //     parentheses, so a JSON payload could carry the delimiter AFTER the real
+  //     one and defeat both a first- and a last-match parse.)
+  //
+  // The `u64` detail fields ride as decimal STRINGS because `JSON.parse`
+  // coerces numbers to doubles — see the `scp_ffi_common::outlet_error` docs.
+  const decodeOutletSuffix = (message: string): unknown => {
+    // Leading greedy `[\s\S]*` forces the LAST delimiter to win, matching the
+    // Rust `rfind` in `crates/scp-ffi/napi/src/error.rs`. `[\s\S]` rather than
+    // `.` because `{message}` may contain a newline.
+    const match = /^[\s\S]*\(outlet_error_b64=([A-Za-z0-9+/=]*)\)\s*$/.exec(message);
+    expect(match).not.toBeNull();
+    return JSON.parse(Buffer.from(match?.[1] ?? "", "base64").toString("utf8"));
+  };
+
+  it("keeps prefix dispatch when the PR-2b (outlet_error_b64=…) suffix is present", () => {
+    const surface = {
+      class: "authorization",
+      code: "SCP-OUTLET-6110",
+      slug: "authorization.denied",
+      retry: { policy: "never" },
+      detail: null,
+      source_chain: [],
+    };
+    const b64 = Buffer.from(JSON.stringify(surface), "utf8").toString("base64");
+    const raw =
+      "[SCP-OUTLET-6110] outlet error: [SCP-OUTLET-6110] authorization: authorization.denied " +
+      `(outlet_error_b64=${b64})`;
+    const err = mapBridgeError(new Error(raw));
+    expect(err).toBeInstanceOf(OutletError);
+    expect(err.code).toBe("SCP-OUTLET-6110");
+    expect(decodeOutletSuffix(err.message)).toEqual(surface);
+  });
+
+  it("recovers the genuine suffix past a decoy delimiter in the message body", () => {
+    const surface = {
+      class: "protocol",
+      code: "SCP-OUTLET-6100",
+      slug: "protocol.violation",
+      retry: { policy: "never" },
+      detail: { shape: "protocol", rule: "x (outlet_error_b64=AAAA) y" },
+      source_chain: [],
+    };
+    const b64 = Buffer.from(JSON.stringify(surface), "utf8").toString("base64");
+    // A decoy in the free-text half AND one inside the payload's own string
+    // field. The former precedes the real delimiter (last-anchoring skips it);
+    // the latter is inside the base64 body and is not a delimiter at all.
+    const raw =
+      "[SCP-OUTLET-6100] outlet error: decoy (outlet_error_b64=BBBB) still decoy " +
+      `(outlet_error_b64=${b64})`;
+    const err = mapBridgeError(new Error(raw));
+    expect(err).toBeInstanceOf(OutletError);
+    expect(err.code).toBe("SCP-OUTLET-6100");
+    expect(decodeOutletSuffix(err.message)).toEqual(surface);
+  });
+
   it("maps validation error codes to ValidationError", () => {
     const err = mapBridgeError(new Error("[SCP-VALID-7001] validation error: failed"));
     expect(err).toBeInstanceOf(ValidationError);

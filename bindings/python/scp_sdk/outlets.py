@@ -46,6 +46,7 @@ from scp_sdk.errors import (
     StreamGap,
     ValidationError,
     _coded_bridge_error,
+    _outlet_surface_from_bridge,
     _saga_terminal_from_bridge,
 )
 
@@ -77,6 +78,12 @@ def _translate_bridge_error(exc: Exception) -> Exception:
     receiving SDK class's generic default. An unbracketed bridge message carries
     no recoverable code, so the SDK class default applies.
     """
+    # The bridge's structured §5.4.4 outlet exception carries SEVEN positional
+    # args (SCP-OUT-031 PR-2b), so `str(exc)` is the tuple repr and the
+    # start-anchored regex below cannot see the code. Read it structurally.
+    outlet = _outlet_surface_from_bridge(exc)
+    if outlet is not None:
+        return outlet
     sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
     message = str(exc)
     match = _LEADING_BRIDGE_CODE.match(message)

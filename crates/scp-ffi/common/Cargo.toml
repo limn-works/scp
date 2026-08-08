@@ -69,7 +69,17 @@ scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite"
 async-trait = { workspace = true, optional = true }
 dashmap = { workspace = true }
 zeroize = { workspace = true }
+# `serde` backs the SCP-OUT-031 PR-2b outlet-error render (`outlet_error`): the
+# generic `Serialize` bound on the per-member projection, and the derive used by
+# the `testing`-gated corpus loader that deserializes the PR-1
+# `tests/conformance/vectors/outlet_error_fixtures.json` malformed-detail
+# vectors into `OutletErrorSurface`s.
+serde = { workspace = true }
 serde_json = { workspace = true }
+# base64 encodes the napi-rs outlet-error surface blob (SCP-OUT-031 PR-2b): its
+# alphabet excludes `(` and space, which is what makes the `(outlet_error_b64=…)`
+# message suffix self-delimiting rather than defeatable by a payload string.
+base64 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true, optional = true }

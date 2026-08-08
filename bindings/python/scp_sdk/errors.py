@@ -288,6 +288,45 @@ class SagaBusyError(OutletError):
         self.contended_context: str = contended_context
 
 
+def _outlet_surface_from_bridge(exc: BaseException) -> ScpError | None:
+    """Translate the bridge's structured ``OutletError`` into its SDK class.
+
+    The `PyO3` bridge raises ``OutletError`` with the whole §5.4.4 surface as
+    SEVEN positional args (SCP-OUT-031 PR-2b) —
+    ``(message, code, slug, class, retry_json, detail_json_or_None,
+    source_chain_json)``.
+
+    That arity is load-bearing here: CPython's ``BaseException.__str__``
+    returns ``str(args[0])`` for a single arg but ``repr(args)`` for two or
+    more, so ``str(exc)`` on this exception begins with ``(`` and the
+    start-anchored ``[SCP-CAT-NNNN]`` regexes in :func:`_coded_bridge_error`
+    and ``outlets._translate_bridge_error`` cannot match it. The code MUST
+    therefore be read STRUCTURALLY from ``args[1]``, and the human-readable
+    message from ``args[0]`` — never from ``str(exc)``. This mirrors
+    :func:`_saga_terminal_from_bridge`, which exists for exactly the same
+    reason.
+
+    PR-3 replaces the base :class:`OutletError` returned here with the matching
+    member of the eight-class sealed hierarchy, selected from ``args[3]``, and
+    attaches the typed ``retry`` / ``detail`` / ``source_chain``. Until then the
+    contract this function preserves is the pre-PR-2b one: an outlet failure
+    surfaces as :class:`OutletError` with an accurate ``.code`` and a clean
+    message.
+
+    Returns ``None`` if ``exc`` is not the bridge's structured outlet error, so
+    the caller falls through to its normal handling.
+    """
+    if type(exc).__name__ != "OutletError" or len(exc.args) < 7:
+        return None
+    raw_message = str(exc.args[0])
+    code = exc.args[1] if isinstance(exc.args[1], str) else None
+    # Strip the leading "[SCP-OUTLET-NNNN] " so ScpError.__str__ (which
+    # prepends f"[{code}] ") does not double-bracket.
+    match = _SCP_CODE_RE.search(raw_message)
+    message = raw_message[match.end() :].lstrip() if match is not None else raw_message
+    return OutletError(message, code=code)
+
+
 def _saga_terminal_from_bridge(exc: BaseException) -> ScpError | None:
     """Translate a bridge saga terminal exception into its SDK class.
 
@@ -384,6 +423,12 @@ def _coded_bridge_error(exc: Exception) -> ScpError:
     """
     if isinstance(exc, ScpError):
         return exc
+    # The structured outlet exception carries 7 positional args, so `str(exc)`
+    # is the tuple repr and the code is NOT parseable out of it — read it
+    # structurally instead (SCP-OUT-031 PR-2b).
+    outlet = _outlet_surface_from_bridge(exc)
+    if outlet is not None:
+        return outlet
     raw_msg = str(exc)
     match = _SCP_CODE_RE.search(raw_msg)
     code = match.group(1) if match is not None else None

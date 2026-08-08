@@ -5,6 +5,7 @@
 - [TS↔Python trust parity](ts-python-trust-parity.md) — four-layer trust + bridge-trust-tier + identity-lifecycle parity conventions; intentional divergences vs parity smells
 - [SDK coverage fail-closed + parity review](sdk_coverage_failclosed_parity_review.md) — fix/sdk-coverage-fail-closed-and-parity: identity-lifecycle+economyVerifyPaymentReceipts clean; MED discover_contexts TS/py signature split (singleton vs SCP-instance)
 - [SDK coverage fail-closed @57840faab](sdk_coverage_failclosed_parity_57840faab.md) — APPROVED; BridgeTrustLevel int Literal + discovery kind/layer Literals matched to Rust enums; PERM-3030 re-raise correct; ADR-051 provider agent-first; Python discover_contexts lacks TS variant validation
+- [SCP-OUT-031 PR-2b bridge render](outlet031_pr2b_bridge_render.md) — NEEDS REVISION; Outlet/OutletSurface two-arm split w/ ~100 unstructured producers holding (code,slug), 7 positional PyO3 args vs Saga's 3, Arc-Object to dodge result_large_err; `class` keyword + mirror-name + from_core-drift traps for PR-3
 - [SDK coverage fail-closed @341df72cc](sdk_coverage_failclosed_parity_341df72cc.md) — APPROVED; discovery TypedDicts now public + field-parity w/ TS; non-blocking nit total=False vs TS-required (DiscoveryResult/ResolutionPathDict should be total=True); PERM-3030 re-raise + BridgeTrustLevel verified; provider.rs comment-only; "ADR-053 PreRotationCustodyProvider" not in diff (renumber only)
 
 ## SCP SDK Standards Review (2026-02-22)

@@ -5253,6 +5253,7 @@ name = "scp-ffi-common"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "dashmap",
  "ed25519-dalek 2.2.0",
  "hex",
@@ -5269,6 +5270,7 @@ dependencies = [
  "scp-platform",
  "scp-protocol",
  "scp-transport",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",

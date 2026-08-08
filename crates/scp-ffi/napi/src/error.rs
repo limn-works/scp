@@ -95,12 +95,69 @@ pub enum ScpNapiError {
     },
 
     /// A outlet operation failed (registration, invocation, verification).
+    ///
+    /// The UNSTRUCTURED arm: an outlet-coded diagnostic that does not carry a
+    /// §5.4.4 taxonomy (the residual `PermissionDenied("SCP-OUTLET-…")`
+    /// settle-path carriers, registration/verification failures). An outlet
+    /// error that DOES carry the taxonomy uses [`Self::OutletSurface`].
     #[error("[{code}] outlet error: {message}")]
     Outlet {
         /// Human-readable error message.
         message: String,
         /// Stable error code (e.g. `SCP-OUTLET-6001`).
         code: String,
+    },
+
+    /// A §5.4.4 outlet error carrying its full structured taxonomy
+    /// (SCP-OUT-031 PR-2b).
+    ///
+    /// napi-rs cannot carry typed compound fields: every `ScpNapiError`
+    /// collapses to a `napi::Error` whose entire payload is a `Status` plus a
+    /// message string (see the `From<ScpNapiError> for napi::Error` impl
+    /// below). So the structured surface rides ONE blob in a machine-parseable
+    /// `(outlet_error_b64=…)` suffix — the same discipline the three saga
+    /// terminals use for their `(retry_after_ms=…)` / `(saga_id=…)` /
+    /// `(contended_context=…)` data.
+    ///
+    /// # Why base64, not raw JSON
+    ///
+    /// The saga suffixes are safe because their bodies are digits or validated
+    /// ids — neither can contain `)` or a space, so a decoy inside `{message}`
+    /// provably loses. A raw JSON body has no such guarantee: `serde_json`
+    /// escapes `"` and `\` but NOT parentheses, so a string field INSIDE the
+    /// payload can contain the delimiter — and being after the real one, it
+    /// defeats a last-match parse just as a decoy in `{message}` defeats a
+    /// first-match parse. Base64's alphabet (`A-Za-z0-9+/=`) contains neither
+    /// `(` nor a space, so the delimiter cannot occur inside the body at all
+    /// and a LAST-anchored parse is sound by construction. Both parsers — the
+    /// Rust `extract_surface_suffix` test helper and the TypeScript one — MUST
+    /// be last-anchored; `scp_ffi_common::outlet_error::parse_surface_b64` is
+    /// the canonical decoder.
+    ///
+    /// The decoded blob is `OutletErrorSurface` (`{class, code, slug, retry,
+    /// detail, source_chain}`), with the two `u64` detail fields as decimal
+    /// strings so JavaScript's `JSON.parse` cannot round them — see the
+    /// `scp_ffi_common::outlet_error` module docs. PR-3's TS hierarchy
+    /// reconstructs the exact typed error from it, never by re-parsing prose.
+    ///
+    /// ADDITIVE BY CONSTRUCTION: the `[{code}]` prefix is unchanged and still
+    /// leads the message, so the shared TS classifier `mapBridgeError`
+    /// (`bindings/typescript/src/errors.ts`), which dispatches on the
+    /// START-anchored `/^\[([A-Z]+-[A-Z]+-\d+)\]/`, keeps routing
+    /// `SCP-OUTLET-*` to `OutletError` exactly as before. The suffix is only
+    /// ever read by a classifier that already matched the prefix.
+    ///
+    /// `surface_b64` is produced by `scp_ffi_common::outlet_error`, shared with
+    /// the `PyO3` bridge, and `code` is copied STRUCTURALLY off the surface —
+    /// neither field is ever recovered by parsing the rendered string apart.
+    #[error("[{code}] outlet error: {message} (outlet_error_b64={surface_b64})")]
+    OutletSurface {
+        /// Human-readable detail (carries the `[SCP-OUTLET-…]` prefix).
+        message: String,
+        /// The §5.4.4 sub-block code (`6100`-`6199`).
+        code: String,
+        /// Base64 of the canonical `OutletErrorSurface` JSON.
+        surface_b64: String,
     },
 
     /// Input validation failed (malformed data, schema mismatch, constraint violation).
@@ -179,6 +236,28 @@ pub enum ScpNapiError {
 impl From<ScpNapiError> for napi::Error {
     fn from(e: ScpNapiError) -> Self {
         Self::new(Status::GenericFailure, e.to_string())
+    }
+}
+
+impl ScpNapiError {
+    /// Renders a structured §5.4.4 `OutletErrorSurface` onto the typed
+    /// [`Self::OutletSurface`] variant (SCP-OUT-031 PR-2b).
+    ///
+    /// The blob comes from
+    /// [`scp_ffi_common::outlet_error::render_surface_b64`] — shared with the
+    /// `PyO3` bridge and inverted by
+    /// [`scp_ffi_common::outlet_error::parse_surface_b64`]. `code` is read
+    /// STRUCTURALLY off the surface, never parsed out of the message.
+    #[must_use]
+    pub fn from_outlet_surface(
+        message: impl Into<String>,
+        surface: &scp_core::context::outlets::errors::OutletErrorSurface,
+    ) -> Self {
+        Self::OutletSurface {
+            message: message.into(),
+            code: surface.code.clone(),
+            surface_b64: scp_ffi_common::outlet_error::render_surface_b64(surface),
+        }
     }
 }
 
@@ -361,29 +440,29 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                     }
                 }
             }
-            // SCP-OUT-031 PR-2a: outlet invocation errors now arrive as the
-            // typed `ContextError::Outlet(surface)` (was flattened to
-            // `PermissionDenied(String)`). Route to the dedicated `Outlet`
-            // variant preserving at least the concrete §5.4.4 code — parity
-            // with the pre-PR-2a `SCP-OUTLET-` prefix routing above. The
-            // `Display` renders `[code] class: slug`.
-            //
-            // PR-2b: render the structured surface (class/detail/retry/
-            // source_chain) into a richer typed TS error here.
-            CE::Outlet(surface) => Self::Outlet {
-                message: format!("{e}"),
-                code: surface.code.clone(),
-            },
-            // SCP-OUT-031 PR-2a: the outlet reserve-gate context-not-active
-            // carrier. `Display` is the structured, STATE-FREE
-            // `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`
-            // — the raw lifecycle `current_state` is NEVER rendered here (this
-            // gate runs before authz, so an unauthorized caller must not learn
-            // the exact lifecycle state).
-            CE::OutletContextNotActive { .. } => Self::Outlet {
-                message: format!("{e}"),
-                code: scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
-            },
+            // SCP-OUT-031 PR-2b: outlet invocation errors arrive as the typed
+            // `ContextError::Outlet(surface)` carrying the §5.4.4
+            // class/code/slug/retry/detail/source_chain, and are rendered here
+            // in FULL onto `ScpNapiError::OutletSurface` — the canonical JSON
+            // suffix the TS SDK reconstructs from. (PR-2a preserved only
+            // `surface.code`.)
+            CE::Outlet(surface) => Self::from_outlet_surface(format!("{e}"), surface),
+            // SCP-OUT-031 PR-2a/2b: the outlet reserve-gate context-not-active
+            // carrier. SECURITY — this gate runs BEFORE authorization, so its
+            // error reaches an unauthenticated caller. The surface is
+            // SYNTHESIZED from the two §5.4.4 constants (`from_code` derives
+            // class + retry from the code registry); `current_state` is never
+            // read here, so the raw lifecycle state cannot leak into the
+            // message OR into the JSON suffix. The caller learns only "not
+            // active", never WHICH non-active state.
+            CE::OutletContextNotActive { .. } => Self::from_outlet_surface(
+                format!("{e}"),
+                &scp_core::context::outlets::errors::OutletErrorSurface::from_code(
+                    scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
+                    scp_core::context::outlets::error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+                    None,
+                ),
+            ),
             _ => Self::Context {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: codes::CTX_2001.to_owned(),
@@ -444,6 +523,29 @@ impl From<scp_core::context::promotion::PromotionError> for ScpNapiError {
             ),
             code: codes::CTX_2006.to_owned(),
         }
+    }
+}
+
+// Typed §5.4.4 `OutletError` WIRE ENVELOPE → the structured TS error
+// (SCP-OUT-031 PR-2b).
+//
+// The CROSS-CONTEXT render seam: `OutletErrorSurface::from_envelope` projects a
+// decoded §5.4.4 envelope onto the in-process surface (dropping the HMAC
+// `message`, `pad_nonce` and `registration_event_id` — wire-opacity fields a
+// cross-context receiver needs for catalog reverse-lookup, not the SDK) and it
+// renders through the SAME `from_outlet_surface` the runtime-side arm uses, so
+// a TS caller cannot tell (nor needs to tell) which side produced the error.
+//
+// HONEST STATUS: no runtime code CONSTRUCTS this envelope yet — SCP-OUT-029's
+// `wrap_cross_context_error` and the §5.4.4 wire decode are unimplemented, so
+// today's only producers are the conformance fixtures. This impl is the render
+// half of the seam, exercised by the fixture corpus, and delegates to
+// `from_envelope` rather than re-implementing the projection so there is
+// nothing to drift when the producer lands.
+impl From<scp_core::context::outlets::errors::OutletError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::errors::OutletError) -> Self {
+        let surface = scp_ffi_common::outlet_error::surface_from_untrusted_envelope(&e);
+        Self::from_outlet_surface(format!("{e}"), &surface)
     }
 }
 
@@ -691,6 +793,7 @@ pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError>
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use scp_core::context::outlets::errors::OutletErrorSurface;
     use scp_platform::PreRotationCustodyError;
 
     fn code_of(e: ScpNapiError) -> String {
@@ -813,32 +916,194 @@ mod tests {
         assert_eq!(context_code_of(err), codes::CTX_2001);
     }
 
-    /// SCP-OUT-031 PR-2a (SECURITY): the outlet reserve-gate context-not-active
-    /// carrier must surface as the STRUCTURED, state-free `SCP-OUTLET-6101`
-    /// outlet error — the raw lifecycle state MUST NOT leak to the FFI caller
-    /// (this gate runs before authz on the unary invoke path). Cross-bridge
-    /// parity with the `PyO3` + `UniFFI` bridges.
+    // ------------------------------------------------------------------
+    // SCP-OUT-031 PR-2b — the structured §5.4.4 surface render.
+    //
+    // napi-rs collapses every error to a message string, so these tests read
+    // the surface back out of the machine-parseable `(outlet_error=…)` suffix
+    // of the RENDERED string — exactly what the TypeScript SDK does. Nothing is
+    // inferred from prose.
+    // ------------------------------------------------------------------
+
+    /// The machine-parseable suffix delimiter. The leading space is part of it:
+    /// base64 cannot contain a space, so ` (outlet_error_b64=` cannot occur
+    /// inside the payload.
+    const SUFFIX_DELIMITER: &str = " (outlet_error_b64=";
+
+    /// Extracts the base64 surface blob out of a rendered napi error message the
+    /// way the TS SDK must: LAST-anchored on `(outlet_error_b64=`. Last-anchored
+    /// is sound here (and would NOT be with a raw-JSON body) because the base64
+    /// alphabet excludes `(` and space, so the delimiter cannot appear inside
+    /// the payload — a decoy can only precede the genuine one.
+    fn extract_surface_suffix(rendered: &str) -> &str {
+        let start = rendered
+            .rfind(SUFFIX_DELIMITER)
+            .unwrap_or_else(|| panic!("no (outlet_error_b64=…) suffix in: {rendered}"));
+        let body = &rendered[start + SUFFIX_DELIMITER.len()..];
+        body.strip_suffix(')')
+            .unwrap_or_else(|| panic!("suffix is not terminal in: {rendered}"))
+    }
+
+    /// Rebuilds an `OutletErrorSurface` from the rendered napi message — the
+    /// exact reconstruction PR-3's TypeScript hierarchy performs.
+    fn reconstruct_surface(err: &ScpNapiError) -> OutletErrorSurface {
+        let rendered = err.to_string();
+        // The `[{code}]` PREFIX must still lead, or the shared TS classifier
+        // `mapBridgeError` (start-anchored on `/^\[([A-Z]+-[A-Z]+-\d+)\]/`)
+        // would stop routing this to `OutletError`. The suffix is ADDITIVE.
+        assert!(
+            rendered.starts_with("[SCP-OUTLET-"),
+            "the `[{{code}}]` prefix dispatch must survive: {rendered}"
+        );
+        scp_ffi_common::outlet_error::parse_surface_b64(extract_surface_suffix(&rendered)).unwrap()
+    }
+
+    /// LIVE PATH: a real structured error crosses the actual
+    /// `From<ContextError>` impl and EVERY §5.4.4 member survives the collapse
+    /// to a string. Asserted against the corpus shared with the `PyO3` and
+    /// `UniFFI` bridges, so equality here plus equality there is cross-bridge
+    /// parity.
+    #[test]
+    fn outlet_surface_survives_the_context_error_from_impl() {
+        for entry in scp_ffi_common::outlet_error::corpus::parity_surfaces() {
+            let err: ScpNapiError =
+                scp_core::context::ContextError::Outlet(Box::new(entry.surface.clone())).into();
+            // Structural read of the variant field…
+            let ScpNapiError::OutletSurface { code, .. } = &err else {
+                panic!("expected ScpNapiError::OutletSurface, got {err:?}");
+            };
+            assert_eq!(code, &entry.surface.code, "{}", entry.name);
+            // …and the end-to-end read the TS SDK performs.
+            assert_eq!(reconstruct_surface(&err), entry.surface, "{}", entry.name);
+        }
+    }
+
+    /// LIVE PATH (cross-context): a real §5.4.4 WIRE ENVELOPE crosses the
+    /// `From<OutletError>` impl and renders to the same surface
+    /// `OutletErrorSurface::from_envelope` projects.
+    #[test]
+    fn typed_envelope_renders_through_from_envelope() {
+        for entry in scp_ffi_common::outlet_error::corpus::parity_surfaces() {
+            let envelope =
+                scp_ffi_common::outlet_error::corpus::envelope_from_surface(&entry.surface)
+                    .unwrap();
+            let expected = OutletErrorSurface::from_envelope(&envelope);
+            let err: ScpNapiError = envelope.into();
+            assert_eq!(reconstruct_surface(&err), expected, "{}", entry.name);
+            assert_eq!(reconstruct_surface(&err), entry.surface, "{}", entry.name);
+        }
+    }
+
+    /// AC10 groundwork: the PR-1 `malformed` fixtures cross the bridge with
+    /// their per-class detail mismatch INTACT, so the SDK can reject them.
+    #[test]
+    fn malformed_detail_mismatch_survives_the_bridge() {
+        for (name, surface) in
+            scp_ffi_common::outlet_error::corpus::malformed_detail_surfaces().unwrap()
+        {
+            let err: ScpNapiError =
+                scp_core::context::ContextError::Outlet(Box::new(surface.clone())).into();
+            let back = reconstruct_surface(&err);
+            assert_eq!(back, surface, "{name}");
+            assert_ne!(
+                back.detail.unwrap().kind(),
+                back.class.expected_detail(),
+                "{name}: the bridge normalized away the AC10 detail mismatch"
+            );
+        }
+    }
+
+    /// The napi error is ultimately a `napi::Error` whose ONLY payload is the
+    /// message string — assert the suffix survives that final collapse, since
+    /// that string is literally all the TypeScript SDK receives.
+    #[test]
+    fn surface_survives_the_collapse_to_napi_error() {
+        let surface = OutletErrorSurface::from_code(
+            scp_core::context::outlets::error_codes::CODE_TRANSPORT_FAULT,
+            scp_core::context::outlets::error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+            Some(
+                scp_core::context::outlets::errors::DetailBody::TransportRateLimit {
+                    retry_after_secs: 45,
+                },
+            ),
+        );
+        let napi_err: napi::Error =
+            ScpNapiError::from_outlet_surface("rate limited", &surface).into();
+        let rendered = &napi_err.reason;
+        assert!(rendered.starts_with("[SCP-OUTLET-"), "{rendered}");
+        let blob = extract_surface_suffix(rendered);
+        assert_eq!(
+            scp_ffi_common::outlet_error::parse_surface_b64(blob).unwrap(),
+            surface
+        );
+    }
+
+    /// The suffix framing is sound against a payload that embeds the delimiter:
+    /// base64 cannot contain `(` or a space, so a hostile `slug`/`detail` string
+    /// cannot forge or shadow the real suffix, and the LAST-anchored parse still
+    /// recovers the genuine blob. This is the property the raw-JSON framing
+    /// lacked.
+    #[test]
+    fn hostile_payload_cannot_break_the_suffix_framing() {
+        let hostile_message = "decoy (outlet_error_b64=AAAA) still decoy";
+        let surface = OutletErrorSurface::from_code(
+            scp_core::context::outlets::error_codes::CODE_PROTOCOL_VIOLATION,
+            scp_core::context::outlets::error_codes::SLUG_PROTOCOL_VIOLATION,
+            Some(scp_core::context::outlets::errors::DetailBody::Protocol {
+                // A detail string that embeds the delimiter — it lands INSIDE
+                // the base64 body, where it is unrecognizable as a delimiter.
+                rule: "x (outlet_error_b64=BBBB) y".to_owned(),
+            }),
+        );
+        let err = ScpNapiError::from_outlet_surface(hostile_message, &surface);
+        let rendered = err.to_string();
+        // Exactly one real delimiter, and it is the LAST occurrence.
+        assert_eq!(
+            rendered.rfind(SUFFIX_DELIMITER).unwrap() + SUFFIX_DELIMITER.len(),
+            rendered.len() - extract_surface_suffix(&rendered).len() - 1
+        );
+        assert_eq!(reconstruct_surface(&err), surface);
+    }
+
+    /// SCP-OUT-031 PR-2a/2b (SECURITY): the outlet reserve-gate
+    /// context-not-active carrier must surface as the STRUCTURED, state-free
+    /// `SCP-OUTLET-6101` outlet error — the raw lifecycle state MUST NOT leak to
+    /// the FFI caller (this gate runs before authz on the unary invoke path),
+    /// not in the message and (PR-2b) not in the JSON suffix either.
+    /// Cross-bridge parity with the `PyO3` + `UniFFI` bridges.
     #[test]
     fn outlet_context_not_active_surfaces_structured_state_free() {
-        let err: ScpNapiError = scp_core::context::ContextError::OutletContextNotActive {
-            current_state: scp_core::context::ContextState::Closing,
+        // EVERY non-Active state, derived from an exhaustive match so a new
+        // lifecycle variant cannot silently escape this leak test.
+        for state in scp_ffi_common::outlet_error::corpus::non_active_context_states() {
+            let state_name = format!("{state:?}");
+            let err: ScpNapiError = scp_core::context::ContextError::OutletContextNotActive {
+                current_state: state,
+            }
+            .into();
+            let ScpNapiError::OutletSurface { message, code, .. } = &err else {
+                panic!("expected ScpNapiError::OutletSurface, got {err:?}");
+            };
+            assert_eq!(
+                code,
+                scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+            );
+            assert!(
+                message.contains("protocol.context-closed-mid-stream"),
+                "{message}"
+            );
+            // The FULL rendered string is everything the caller sees.
+            let rendered = err.to_string();
+            assert!(
+                !rendered.contains(&state_name),
+                "raw lifecycle state {state_name} leaked to the FFI caller: {rendered}"
+            );
+            let back = reconstruct_surface(&err);
+            assert!(back.detail.is_none());
+            assert_eq!(
+                back.class,
+                scp_core::context::outlets::errors::OutletErrorClass::Protocol
+            );
         }
-        .into();
-        let (message, code) = match err {
-            ScpNapiError::Outlet { message, code } => (message, code),
-            other => panic!("expected ScpNapiError::Outlet, got {other:?}"),
-        };
-        assert_eq!(
-            code,
-            scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
-        );
-        assert!(
-            !message.contains("Closing"),
-            "raw lifecycle state must NOT leak to the FFI caller: {message}"
-        );
-        assert!(
-            message.contains("protocol.context-closed-mid-stream"),
-            "{message}"
-        );
     }
 }

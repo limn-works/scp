@@ -802,6 +802,42 @@
       "path": "crates/scp-ffi/uniffi/src/server.rs",
       "kind": "lifecycle",
       "reason": "Instance lifecycle (shutdown); not a parity operation."
+    },
+    {
+      "name": "error_class",
+      "path": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "kind": "getter",
+      "reason": "Getter for the \u00a75.4.4 root class on the ScpError::OutletSurface payload object. SCP-OUT-031 PR-2b. Not a parity operation: the surface is a UniFFI-only payload OBJECT because ScpError is the Err type of every uniffi export and an inline ~150-byte record trips clippy::result_large_err; the PyO3 bridge carries the same datum as a positional exception arg and the napi bridge as a field of its canonical JSON suffix, since neither binding has UniFFI's typed-associated-value error model. See .docs/standards/sdk-capability-matrix.json Outlets/error_taxonomy_sealed_hierarchy."
+    },
+    {
+      "name": "code",
+      "path": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "kind": "getter",
+      "reason": "Getter for the \u00a75.4.4 error code on the ScpError::OutletSurface payload object. SCP-OUT-031 PR-2b. Not a parity operation: the surface is a UniFFI-only payload OBJECT because ScpError is the Err type of every uniffi export and an inline ~150-byte record trips clippy::result_large_err; the PyO3 bridge carries the same datum as a positional exception arg and the napi bridge as a field of its canonical JSON suffix, since neither binding has UniFFI's typed-associated-value error model. See .docs/standards/sdk-capability-matrix.json Outlets/error_taxonomy_sealed_hierarchy."
+    },
+    {
+      "name": "slug",
+      "path": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "kind": "getter",
+      "reason": "Getter for the \u00a75.4.4 slug on the ScpError::OutletSurface payload object. SCP-OUT-031 PR-2b. Not a parity operation: the surface is a UniFFI-only payload OBJECT because ScpError is the Err type of every uniffi export and an inline ~150-byte record trips clippy::result_large_err; the PyO3 bridge carries the same datum as a positional exception arg and the napi bridge as a field of its canonical JSON suffix, since neither binding has UniFFI's typed-associated-value error model. See .docs/standards/sdk-capability-matrix.json Outlets/error_taxonomy_sealed_hierarchy."
+    },
+    {
+      "name": "retry",
+      "path": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "kind": "getter",
+      "reason": "Getter for the \u00a75.4.4 RetryPolicy on the ScpError::OutletSurface payload object. SCP-OUT-031 PR-2b. Not a parity operation: the surface is a UniFFI-only payload OBJECT because ScpError is the Err type of every uniffi export and an inline ~150-byte record trips clippy::result_large_err; the PyO3 bridge carries the same datum as a positional exception arg and the napi bridge as a field of its canonical JSON suffix, since neither binding has UniFFI's typed-associated-value error model. See .docs/standards/sdk-capability-matrix.json Outlets/error_taxonomy_sealed_hierarchy."
+    },
+    {
+      "name": "detail",
+      "path": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "kind": "getter",
+      "reason": "Getter for the \u00a75.4.4 typed DetailBody on the ScpError::OutletSurface payload object. SCP-OUT-031 PR-2b. Not a parity operation: the surface is a UniFFI-only payload OBJECT because ScpError is the Err type of every uniffi export and an inline ~150-byte record trips clippy::result_large_err; the PyO3 bridge carries the same datum as a positional exception arg and the napi bridge as a field of its canonical JSON suffix, since neither binding has UniFFI's typed-associated-value error model. See .docs/standards/sdk-capability-matrix.json Outlets/error_taxonomy_sealed_hierarchy."
+    },
+    {
+      "name": "source_chain",
+      "path": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "kind": "getter",
+      "reason": "Getter for the \u00a75.4.4 cross-context ContextHop trail on the ScpError::OutletSurface payload object. SCP-OUT-031 PR-2b. Not a parity operation: the surface is a UniFFI-only payload OBJECT because ScpError is the Err type of every uniffi export and an inline ~150-byte record trips clippy::result_large_err; the PyO3 bridge carries the same datum as a positional exception arg and the napi bridge as a field of its canonical JSON suffix, since neither binding has UniFFI's typed-associated-value error model. See .docs/standards/sdk-capability-matrix.json Outlets/error_taxonomy_sealed_hierarchy."
     }
   ],
   "napi": [

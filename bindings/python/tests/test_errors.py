@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 
 from scp_sdk.errors import (
+    _SCP_CODE_RE,
     ContextError,
     CryptoError,
     IdentityError,
@@ -31,7 +32,9 @@ from scp_sdk.errors import (
     TransportError,
     UcanPermissionError,
     ValidationError,
+    _coded_bridge_error,
 )
+from scp_sdk.outlets import _translate_bridge_error
 
 # ---------------------------------------------------------------------------
 # Pre-rotation custody typed codes — one literal per bridge variant.
@@ -135,3 +138,69 @@ class TestSiblingErrorClassCodePreservation:
         err = cls("failure", code)
         assert err.code == code
         assert isinstance(err, ScpError)
+
+
+class TestStructuredOutletBridgeError:
+    """The bridge's structured §5.4.4 ``OutletError`` (SCP-OUT-031 PR-2b).
+
+    The PyO3 bridge raises ``OutletError`` with SEVEN positional args. CPython
+    renders a multi-arg exception's ``str()`` as ``repr(args)``, so the
+    start-anchored ``[SCP-CAT-NNNN]`` regexes both SDK translators use cannot
+    see the code in the message text. These tests pin that the translators read
+    it STRUCTURALLY from ``args[1]`` instead — the regression the PR-2b arg-shape
+    change would otherwise have introduced (``.code is None`` plus a raw tuple
+    repr as the user-facing message).
+    """
+
+    @staticmethod
+    def _bridge_exc() -> Exception:
+        """A stand-in for the native ``_scp_core.OutletError``.
+
+        Dispatch is on the class NAME + arity, exactly as
+        :func:`_saga_terminal_from_bridge` does, so this needs no native
+        extension.
+        """
+        cls = type("OutletError", (Exception,), {})
+        return cls(
+            "[SCP-OUTLET-6110] outlet error: [SCP-OUTLET-6110] authorization: authorization.denied",
+            "SCP-OUTLET-6110",
+            "authorization.denied",
+            "authorization",
+            '{"policy":"never"}',
+            None,
+            "[]",
+        )
+
+    def test_str_is_a_tuple_repr(self) -> None:
+        """The hazard itself: ``str(exc)`` is NOT the message."""
+        rendered = str(self._bridge_exc())
+        assert rendered.startswith("(")
+        assert _SCP_CODE_RE.search(rendered) is None
+
+    def test_coded_bridge_error_recovers_the_code_structurally(self) -> None:
+        err = _coded_bridge_error(self._bridge_exc())
+        assert isinstance(err, OutletError)
+        assert err.code == "SCP-OUTLET-6110"
+        # The message is args[0] with the duplicated code prefix stripped —
+        # never the tuple repr.
+        assert not str(err).startswith("(")
+        assert "authorization.denied" in str(err)
+
+    def test_outlets_translator_recovers_the_code_structurally(self) -> None:
+        err = _translate_bridge_error(self._bridge_exc())
+        assert isinstance(err, OutletError)
+        assert err.code == "SCP-OUTLET-6110"
+
+    def test_non_outlet_bridge_errors_are_untouched(self) -> None:
+        """The structured reader must not capture unrelated bridge errors."""
+        cls = type("ContextError", (Exception,), {})
+        err = _coded_bridge_error(cls("[SCP-CTX-2001] context error: nope"))
+        assert isinstance(err, ContextError)
+        assert err.code == "SCP-CTX-2001"
+
+    def test_short_arg_outlet_error_falls_through(self) -> None:
+        """A single-arg ``OutletError`` still classifies by code prefix."""
+        cls = type("OutletError", (Exception,), {})
+        err = _coded_bridge_error(cls("[SCP-OUTLET-6001] outlet error: legacy"))
+        assert isinstance(err, OutletError)
+        assert err.code == "SCP-OUTLET-6001"

@@ -2,6 +2,9 @@
 
 ## SCP Codebase Security Patterns
 
+### SCP-OUT-031 PR-2b §5.4.4 bridge render (feat/outlet-031-pr2b-bridge-render) -- 2026-08
+- See `outlet-031-pr2b-bridge-render.md`. HIGH: napi `(outlet_error={json})` suffix framing NOT self-delimiting -- the delimiter can appear inside the JSON payload's own string fields, so BOTH the leftmost-greedy TS regex AND `rfind` last-occurrence parse break (verified experimentally). Fix = base64 the blob. MEDIUM x3: `From<OutletError>` renders an unvalidated foreign envelope verbatim (derived Deserialize bypasses `OutletError::new`; no MAX_TRAIL_PAD_DEPTH bound); ContextHop pseudonymization is doc-only; ExecutionPanic hash = unsalted SHA-256(outlet_id) = name-confirmation oracle. CLEAN: OutletContextNotActive state-freedom by construction at all 3 bridges; §5.4.4 oracle-collapse detail=None holds; RelayUrlKind enum preserved (never a raw URL).
+
 ### Event-Log Phase-2 Substrate Swap FINAL (16a2cd42b) -- 2026-06-20
 - See `eventlog-phase2-final-16a2cd42b.md`. ONE HIGH: bf9266777 made econ-policy/ceiling effective_at = proposal.created_at (PROPOSER-backdatable) + PERIOD; no clamp; breaks §19 commit-anchored 24h MUST; pre-Phase-2 used applying member's now() -> NEW regression. Rest CLEAN (merkle_root mirror removal neutral-or-stronger; committer-ts signed-bound).
 - FIX RE-VERIFIED (f234988bc) -- see `notification-window-backdating-fix-f234988bc.md`. Canonical import observed_at re-pin to local clock. Bypass CLOSED, no new regression. RESTORE-verbatim correct (self-respawn). WASM gov-leaf b"" parity + dedup contiguous-seq + convergent_consequence_timestamp move all clean. MERGE-GATING CONFIRMED.

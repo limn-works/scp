@@ -154,6 +154,15 @@ pub mod trust_store;
 #[cfg(feature = "resolvers")]
 pub mod saga_errors;
 
+// Canonical §5.4.4 `OutletErrorSurface` render shared by PyO3, napi-rs, and
+// UniFFI (SCP-OUT-031 PR-2b). The three bindings each surface the structured
+// outlet error through their own richest mechanism (typed exception args /
+// typed associated enum values / a machine-parseable JSON suffix), but the
+// CONTENT they project is produced here exactly once, so a reconstruction on
+// any SDK yields a byte-identical surface. Depends only on `scp-protocol`
+// (unconditional), so unlike `saga_errors` it needs no `resolvers` gate.
+pub mod outlet_error;
+
 // Shared broadcast key-distribution value-shape helpers (§5.14.2). The
 // Grant→sealed-JSON and sealed-JSON→raw-key seams are identical across PyO3,
 // napi-rs, and UniFFI; extracted here so the hand-populated author_did/context_id

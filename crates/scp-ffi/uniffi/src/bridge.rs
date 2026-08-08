@@ -1119,6 +1119,481 @@ impl KeyCustody for UniffiKeyCustody {
 }
 
 // ---------------------------------------------------------------------------
+// §5.4.4 outlet-error taxonomy — native UniFFI mirror types
+// (SCP-OUT-031 PR-2b)
+//
+// Swift gets real `enum`s with associated values; Kotlin gets real sealed
+// classes. No JSON, no string parsing on the consumer side.
+//
+// WHY MIRRORS, NOT DERIVES ON THE PROTOCOL TYPES: `OutletErrorClass`,
+// `RetryPolicy`, `DetailBody`, `RelayUrlKind` and `ContextHop` live in
+// `scp-protocol`, so `#[derive(uniffi::Enum)]` cannot be applied here (orphan
+// rule). This crate's ESTABLISHED pattern for that situation is a local mirror
+// type plus a `from_core` projection — see `CustodyMethod`, `ContextState`,
+// `MemoryScope`, `GovernanceModel` and `InviteMemberOutcome::from_core` below.
+// The alternatives were rejected: `#[uniffi::remote(Enum)]` requires the mirror
+// to be shape-IDENTICAL, which `DetailBody::ExecutionPanic` makes impossible
+// (`[u8; 32]` is not a UniFFI type — it must become `Vec<u8>`); and
+// `uniffi::custom_type!` maps a foreign type onto ONE builtin, collapsing these
+// sum types back into a string and defeating the whole point of PR-2b.
+// ---------------------------------------------------------------------------
+
+/// Root class of a §5.4.4 outlet error — the eight-way invariant that selects
+/// the SDK's sealed error subclass. Mirrors
+/// [`scp_core::context::outlets::errors::OutletErrorClass`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OutletErrorClass {
+    /// Registration / validation / classification violations (`6100..6109`).
+    Protocol,
+    /// UCAN, caveat, role, capability, amplification denials (`6110..6119`).
+    Authorization,
+    /// Schema, size, type, enum, range violations on input (`6120..6129`).
+    Input,
+    /// Timeout, panic, resource exhaustion, stream gaps (`6130..6139`).
+    Execution,
+    /// Output schema / size / redaction violations (`6140..6149`).
+    Output,
+    /// Budget, funds, adapter, pricing, escrow (`6150..6159`).
+    Economic,
+    /// Relay unavailable, bridge failure, rate limiting (`6160..6169`).
+    Transport,
+    /// Deregistration, suspension, ceiling, consequence (`6170..6179`).
+    Governance,
+}
+
+impl OutletErrorClass {
+    /// Projects the protocol enum onto this `UniFFI` mirror.
+    const fn from_core(class: scp_core::context::outlets::errors::OutletErrorClass) -> Self {
+        use scp_core::context::outlets::errors::OutletErrorClass as Core;
+        match class {
+            Core::Protocol => Self::Protocol,
+            Core::Authorization => Self::Authorization,
+            Core::Input => Self::Input,
+            Core::Execution => Self::Execution,
+            Core::Output => Self::Output,
+            Core::Economic => Self::Economic,
+            Core::Transport => Self::Transport,
+            Core::Governance => Self::Governance,
+        }
+    }
+}
+
+/// Retry guidance carried by a §5.4.4 outlet error. Mirrors
+/// [`scp_core::context::outlets::errors::RetryPolicy`].
+///
+/// Delays are `std::time::Duration` (a native `UniFFI` type: Swift
+/// `TimeInterval`, Kotlin `java.time.Duration`) — NOT milliseconds, so
+/// sub-millisecond precision survives the boundary intact.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum OutletRetryPolicy {
+    /// Permanent failure; do not retry.
+    Never,
+    /// Safe to retry immediately (idempotent operations).
+    Immediate,
+    /// Retry after a fixed delay.
+    After {
+        /// The fixed delay before the next attempt.
+        delay: std::time::Duration,
+    },
+    /// Exponential backoff within `[min, max]`.
+    WithBackoff {
+        /// Minimum delay before the first retry.
+        min: std::time::Duration,
+        /// Maximum delay (the curve saturates here).
+        max: std::time::Duration,
+    },
+}
+
+impl OutletRetryPolicy {
+    /// Projects the protocol enum onto this `UniFFI` mirror.
+    const fn from_core(retry: &scp_core::context::outlets::errors::RetryPolicy) -> Self {
+        use scp_core::context::outlets::errors::RetryPolicy as Core;
+        match retry {
+            Core::Never => Self::Never,
+            Core::Immediate => Self::Immediate,
+            Core::After { delay } => Self::After { delay: *delay },
+            Core::WithBackoff { min, max } => Self::WithBackoff {
+                min: *min,
+                max: *max,
+            },
+        }
+    }
+}
+
+/// Categorical tag for a relay URL surfaced in Transport-class detail — §5.4.4
+/// forbids surfacing the raw URL. Mirrors
+/// [`scp_core::context::outlets::errors::RelayUrlKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OutletRelayUrlKind {
+    /// Production `wss://` relay.
+    Wss,
+    /// Loopback `ws://` relay.
+    WsLoopback,
+    /// Relay URL kind not recognised.
+    Unknown,
+}
+
+impl OutletRelayUrlKind {
+    /// Projects the protocol enum onto this `UniFFI` mirror.
+    const fn from_core(kind: scp_core::context::outlets::errors::RelayUrlKind) -> Self {
+        use scp_core::context::outlets::errors::RelayUrlKind as Core;
+        match kind {
+            Core::Wss => Self::Wss,
+            Core::WsLoopback => Self::WsLoopback,
+            Core::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Typed per-class detail body of a §5.4.4 outlet error. Mirrors
+/// [`scp_core::context::outlets::errors::DetailBody`].
+///
+/// A CLOSED sum type — §5.4.4 forbids a free-form detail (it would be a covert
+/// channel). `ExecutionPanic.panic_location_hash` is the full 32-byte SHA-256
+/// of a stable panic-LOCATION identifier (never the panic message); it is
+/// `Vec<u8>` here only because `UniFFI` has no fixed-size array type, and the
+/// protocol side keeps the `[u8; 32]` width invariant.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum OutletDetailBody {
+    /// Protocol-class detail.
+    Protocol {
+        /// Name of the violated rule.
+        rule: String,
+    },
+    /// Authorization-class detail.
+    Authorization {
+        /// The denied capability URI.
+        capability: String,
+    },
+    /// Input/Output-class detail (§5.4.4 gives both classes one schema).
+    FieldViolation {
+        /// JSON Pointer into the offending payload.
+        field_path: String,
+        /// Violation tag (e.g. `"type"`, `"range"`).
+        violation: String,
+    },
+    /// Execution-class detail for timeouts.
+    ExecutionTimeout {
+        /// Elapsed milliseconds before the timeout fired.
+        elapsed_ms: u64,
+    },
+    /// Execution-class detail for handler panics.
+    ExecutionPanic {
+        /// SHA-256 (32 bytes) of a stable panic-location identifier.
+        panic_location_hash: Vec<u8>,
+    },
+    /// Economic-class detail for insufficient funds.
+    EconomicInsufficient {
+        /// Amount required, in the smallest unit of `currency`.
+        needed: u64,
+        /// ISO-4217 or registered SCP currency code.
+        currency: String,
+    },
+    /// Economic-class detail for payment-adapter failures.
+    EconomicAdapter {
+        /// The failing `PaymentAdapterId`.
+        adapter_id: String,
+    },
+    /// Transport-class detail for rate-limit hints.
+    TransportRateLimit {
+        /// Seconds until the next call would be accepted.
+        retry_after_secs: u32,
+    },
+    /// Transport-class detail for relay-availability errors.
+    TransportRelay {
+        /// The relay URL KIND — never the raw URL (§5.4.4).
+        relay_url_kind: OutletRelayUrlKind,
+    },
+    /// Governance-class detail.
+    Governance {
+        /// The governance action name.
+        action: String,
+    },
+}
+
+impl OutletDetailBody {
+    /// Projects the protocol enum onto this `UniFFI` mirror.
+    fn from_core(detail: &scp_core::context::outlets::errors::DetailBody) -> Self {
+        use scp_core::context::outlets::errors::DetailBody as Core;
+        match detail {
+            Core::Protocol { rule } => Self::Protocol { rule: rule.clone() },
+            Core::Authorization { capability } => Self::Authorization {
+                capability: capability.clone(),
+            },
+            Core::FieldViolation {
+                field_path,
+                violation,
+            } => Self::FieldViolation {
+                field_path: field_path.clone(),
+                violation: violation.clone(),
+            },
+            Core::ExecutionTimeout { elapsed_ms } => Self::ExecutionTimeout {
+                elapsed_ms: *elapsed_ms,
+            },
+            Core::ExecutionPanic {
+                panic_location_hash,
+            } => Self::ExecutionPanic {
+                panic_location_hash: panic_location_hash.to_vec(),
+            },
+            Core::EconomicInsufficient { needed, currency } => Self::EconomicInsufficient {
+                needed: *needed,
+                currency: currency.clone(),
+            },
+            Core::EconomicAdapter { adapter_id } => Self::EconomicAdapter {
+                adapter_id: adapter_id.clone(),
+            },
+            Core::TransportRateLimit { retry_after_secs } => Self::TransportRateLimit {
+                retry_after_secs: *retry_after_secs,
+            },
+            Core::TransportRelay { relay_url_kind } => Self::TransportRelay {
+                relay_url_kind: OutletRelayUrlKind::from_core(*relay_url_kind),
+            },
+            Core::Governance { action } => Self::Governance {
+                action: action.clone(),
+            },
+        }
+    }
+}
+
+/// One entry in a §5.4.4 cross-context error trail. Mirrors
+/// [`scp_core::context::outlets::errors::ContextHop`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct OutletContextHop {
+    /// Context id of this hop — pseudonymized for hops the receiver is not a
+    /// member of (§5.4.4 `source_chain` pseudonymization).
+    pub context_id: String,
+    /// Slot index in the padded trail (real and pad entries share encoding).
+    pub hop_index: u16,
+    /// The error code observed at this hop, before any outer wrapping.
+    pub wrapped_code: String,
+}
+
+impl OutletContextHop {
+    /// Projects the protocol struct onto this `UniFFI` mirror.
+    ///
+    /// Destructured EXHAUSTIVELY on purpose: the `PyO3` and napi renders go
+    /// through serde, so a field added to `ContextHop` upstream is carried
+    /// automatically — this mirror would silently drop it. Naming every field
+    /// makes an upstream addition a compile error here instead.
+    fn from_core(hop: &scp_core::context::outlets::errors::ContextHop) -> Self {
+        let scp_core::context::outlets::errors::ContextHop {
+            context_id,
+            hop_index,
+            wrapped_code,
+        } = hop;
+        Self {
+            context_id: context_id.clone(),
+            hop_index: *hop_index,
+            wrapped_code: wrapped_code.clone(),
+        }
+    }
+}
+
+/// The full structured §5.4.4 outlet-error taxonomy carried by
+/// [`ScpError::Outlet`] (SCP-OUT-031 PR-2b).
+///
+/// Mirrors [`scp_core::context::outlets::errors::OutletErrorSurface`]. Swift and
+/// Kotlin consumers `switch` / `when` on `class` and destructure `detail`
+/// natively — nothing here is a string that must be parsed.
+///
+/// Passed as an `Arc`-wrapped interface rather than a by-value record so
+/// `ScpError` — the `Err` type of every `#[uniffi::export]` function — stays
+/// pointer-sized in this arm (`clippy::result_large_err`; the by-value record
+/// is ~150 bytes). The accessors below are the value-typed read surface.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+pub struct OutletErrorSurface {
+    class: OutletErrorClass,
+    code: String,
+    slug: String,
+    retry: OutletRetryPolicy,
+    detail: Option<OutletDetailBody>,
+    source_chain: Vec<OutletContextHop>,
+}
+
+#[uniffi::export]
+impl OutletErrorSurface {
+    /// The §5.4.4 root class — selects the SDK's sealed error subclass.
+    #[must_use]
+    pub const fn error_class(&self) -> OutletErrorClass {
+        self.class
+    }
+
+    /// The §5.4.4 sub-block code (`6100`-`6199`).
+    #[must_use]
+    pub fn code(&self) -> String {
+        self.code.clone()
+    }
+
+    /// The registered §5.4.4 slug (`slug_to_class(slug) == error_class()`).
+    #[must_use]
+    pub fn slug(&self) -> String {
+        self.slug.clone()
+    }
+
+    /// Retry guidance — the caller can act on this without re-classifying.
+    #[must_use]
+    pub fn retry(&self) -> OutletRetryPolicy {
+        self.retry.clone()
+    }
+
+    /// Typed per-class detail, or `None` when the error carries none.
+    /// `None` is ABSENT detail — never a fabricated placeholder.
+    #[must_use]
+    pub fn detail(&self) -> Option<OutletDetailBody> {
+        self.detail.clone()
+    }
+
+    /// Cross-context hop trail, innermost→outermost. Empty for an error that
+    /// did not cross a context boundary.
+    #[must_use]
+    pub fn source_chain(&self) -> Vec<OutletContextHop> {
+        self.source_chain.clone()
+    }
+}
+
+impl OutletErrorSurface {
+    /// Projects the protocol surface onto this `UniFFI` mirror.
+    ///
+    /// Destructured EXHAUSTIVELY on purpose — see
+    /// [`OutletContextHop::from_core`]: a member added to `OutletErrorSurface`
+    /// upstream must be a compile error here, not a silent drop that only this
+    /// bridge suffers.
+    fn from_core(surface: &scp_core::context::outlets::errors::OutletErrorSurface) -> Self {
+        let scp_core::context::outlets::errors::OutletErrorSurface {
+            class,
+            code,
+            slug,
+            retry,
+            detail,
+            source_chain,
+        } = surface;
+        Self {
+            class: OutletErrorClass::from_core(*class),
+            code: code.clone(),
+            slug: slug.clone(),
+            retry: OutletRetryPolicy::from_core(retry),
+            detail: detail.as_ref().map(OutletDetailBody::from_core),
+            source_chain: source_chain
+                .iter()
+                .map(OutletContextHop::from_core)
+                .collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §5.4.4 mirror → protocol reconstruction (test-only).
+//
+// The mirrors are a one-way PROJECTION in production: Swift/Kotlin consume
+// them, nothing feeds them back into the protocol layer, so a shipped reverse
+// conversion would be dead code. The tests need it to prove the projection is
+// LOSSLESS — that a consumer can rebuild the exact `OutletErrorSurface`, which
+// is the whole PR-2b contract and the input PR-3's sealed hierarchy relies on.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+impl OutletErrorSurface {
+    /// Rebuilds the protocol surface from this `UniFFI` mirror.
+    fn to_core(&self) -> scp_core::context::outlets::errors::OutletErrorSurface {
+        use scp_core::context::outlets::errors as core_err;
+        scp_core::context::outlets::errors::OutletErrorSurface {
+            class: match self.class {
+                OutletErrorClass::Protocol => core_err::OutletErrorClass::Protocol,
+                OutletErrorClass::Authorization => core_err::OutletErrorClass::Authorization,
+                OutletErrorClass::Input => core_err::OutletErrorClass::Input,
+                OutletErrorClass::Execution => core_err::OutletErrorClass::Execution,
+                OutletErrorClass::Output => core_err::OutletErrorClass::Output,
+                OutletErrorClass::Economic => core_err::OutletErrorClass::Economic,
+                OutletErrorClass::Transport => core_err::OutletErrorClass::Transport,
+                OutletErrorClass::Governance => core_err::OutletErrorClass::Governance,
+            },
+            code: self.code.clone(),
+            slug: self.slug.clone(),
+            retry: match &self.retry {
+                OutletRetryPolicy::Never => core_err::RetryPolicy::Never,
+                OutletRetryPolicy::Immediate => core_err::RetryPolicy::Immediate,
+                OutletRetryPolicy::After { delay } => {
+                    core_err::RetryPolicy::After { delay: *delay }
+                }
+                OutletRetryPolicy::WithBackoff { min, max } => core_err::RetryPolicy::WithBackoff {
+                    min: *min,
+                    max: *max,
+                },
+            },
+            detail: self.detail.as_ref().map(OutletDetailBody::to_core),
+            source_chain: self
+                .source_chain
+                .iter()
+                .map(|h| core_err::ContextHop {
+                    context_id: h.context_id.clone(),
+                    hop_index: h.hop_index,
+                    wrapped_code: h.wrapped_code.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+impl OutletDetailBody {
+    /// Rebuilds the protocol detail body from this `UniFFI` mirror.
+    fn to_core(&self) -> scp_core::context::outlets::errors::DetailBody {
+        use scp_core::context::outlets::errors::{DetailBody as Core, RelayUrlKind};
+        match self {
+            Self::Protocol { rule } => Core::Protocol { rule: rule.clone() },
+            Self::Authorization { capability } => Core::Authorization {
+                capability: capability.clone(),
+            },
+            Self::FieldViolation {
+                field_path,
+                violation,
+            } => Core::FieldViolation {
+                field_path: field_path.clone(),
+                violation: violation.clone(),
+            },
+            Self::ExecutionTimeout { elapsed_ms } => Core::ExecutionTimeout {
+                elapsed_ms: *elapsed_ms,
+            },
+            Self::ExecutionPanic {
+                panic_location_hash,
+            } => Core::ExecutionPanic {
+                // The `[u8; 32]` width is a protocol invariant; the mirror only
+                // widens it to `Vec<u8>` because UniFFI has no fixed-size array
+                // type. A wrong width here would be a projection bug.
+                panic_location_hash: <[u8; 32]>::try_from(panic_location_hash.as_slice())
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "ExecutionPanic hash must stay 32 bytes, got {}",
+                            panic_location_hash.len()
+                        )
+                    }),
+            },
+            Self::EconomicInsufficient { needed, currency } => Core::EconomicInsufficient {
+                needed: *needed,
+                currency: currency.clone(),
+            },
+            Self::EconomicAdapter { adapter_id } => Core::EconomicAdapter {
+                adapter_id: adapter_id.clone(),
+            },
+            Self::TransportRateLimit { retry_after_secs } => Core::TransportRateLimit {
+                retry_after_secs: *retry_after_secs,
+            },
+            Self::TransportRelay { relay_url_kind } => Core::TransportRelay {
+                relay_url_kind: match relay_url_kind {
+                    OutletRelayUrlKind::Wss => RelayUrlKind::Wss,
+                    OutletRelayUrlKind::WsLoopback => RelayUrlKind::WsLoopback,
+                    OutletRelayUrlKind::Unknown => RelayUrlKind::Unknown,
+                },
+            },
+            Self::Governance { action } => Core::Governance {
+                action: action.clone(),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ScpError — unified error type (maps to Swift throws / Kotlin exceptions)
 //
 // Each variant carries `msg` (human-readable detail) and `code`
@@ -1157,8 +1632,33 @@ pub enum ScpError {
     Transport { msg: String, code: String },
 
     /// A outlet operation failed (registration, invocation, verification).
+    ///
+    /// The UNSTRUCTURED arm: an outlet-coded diagnostic that does not carry a
+    /// §5.4.4 taxonomy (the residual `PermissionDenied("SCP-OUTLET-…")`
+    /// settle-path carriers, registration/verification failures). An outlet
+    /// error that DOES carry the taxonomy uses [`Self::OutletSurface`].
     #[error("outlet error [{code}]: {msg}")]
     Outlet { msg: String, code: String },
+
+    /// A §5.4.4 outlet error carrying its full structured taxonomy
+    /// (SCP-OUT-031 PR-2b).
+    ///
+    /// Maps to Swift `ScpError.outletSurface(msg:code:surface:)` / Kotlin
+    /// `ScpException.OutletSurface`. `surface` exposes `errorClass()`,
+    /// `slug()`, `retry()`, `detail()` and `sourceChain()` as REAL Swift enums
+    /// / Kotlin sealed classes — the consumer `switch`es on them, it never
+    /// parses a string. PR-3's eight-class SDK hierarchy selects its subclass
+    /// from `surface.errorClass()`.
+    #[error("outlet error [{code}]: {msg}")]
+    OutletSurface {
+        /// Human-readable detail (carries the `[SCP-OUTLET-…]` prefix).
+        msg: String,
+        /// The §5.4.4 sub-block code (`6100`-`6199`) — also the first token
+        /// of `msg`, so a flattened log line still `grep`-disambiguates.
+        code: String,
+        /// The full typed §5.4.4 surface.
+        surface: std::sync::Arc<OutletErrorSurface>,
+    },
 
     /// Input validation failed (malformed data, schema mismatch, constraint violation).
     #[error("validation error [{code}]: {msg}")]
@@ -1227,9 +1727,49 @@ pub enum ScpError {
     },
 }
 
+impl ScpError {
+    /// Renders a structured §5.4.4 `OutletErrorSurface` onto the typed
+    /// [`Self::OutletSurface`] variant (SCP-OUT-031 PR-2b).
+    ///
+    /// `code` is read STRUCTURALLY off the surface — never parsed out of `msg`.
+    #[must_use]
+    pub fn from_outlet_surface(
+        msg: impl Into<String>,
+        surface: &scp_core::context::outlets::errors::OutletErrorSurface,
+    ) -> Self {
+        Self::OutletSurface {
+            msg: msg.into(),
+            code: surface.code.clone(),
+            surface: std::sync::Arc::new(OutletErrorSurface::from_core(surface)),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // From<scp-core error types> for ScpError
 // ---------------------------------------------------------------------------
+
+// Typed §5.4.4 `OutletError` WIRE ENVELOPE → the structured Swift/Kotlin error
+// (SCP-OUT-031 PR-2b).
+//
+// The CROSS-CONTEXT render seam: `OutletErrorSurface::from_envelope` projects a
+// decoded §5.4.4 envelope onto the in-process surface (dropping the HMAC
+// `message`, `pad_nonce` and `registration_event_id` — wire-opacity fields a
+// cross-context receiver needs for catalog reverse-lookup, not the SDK) and it
+// renders through the SAME `from_outlet_surface` the runtime-side arm uses.
+//
+// HONEST STATUS: no runtime code CONSTRUCTS this envelope yet — SCP-OUT-029's
+// `wrap_cross_context_error` and the §5.4.4 wire decode are unimplemented, so
+// today's only producers are the conformance fixtures. This impl is the render
+// half of the seam, exercised by the fixture corpus, and delegates to
+// `from_envelope` rather than re-implementing the projection so there is
+// nothing to drift when the producer lands.
+impl From<scp_core::context::outlets::errors::OutletError> for ScpError {
+    fn from(e: scp_core::context::outlets::errors::OutletError) -> Self {
+        let surface = scp_ffi_common::outlet_error::surface_from_untrusted_envelope(&e);
+        Self::from_outlet_surface(format!("{e}"), &surface)
+    }
+}
 
 impl From<scp_ffi_common::validate::ValidationError> for ScpError {
     fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
@@ -1427,29 +1967,28 @@ impl From<scp_core::context::ContextError> for ScpError {
                     }
                 }
             }
-            // SCP-OUT-031 PR-2a: outlet invocation errors now arrive as the
-            // typed `ContextError::Outlet(surface)` (was flattened to
-            // `PermissionDenied(String)`). Route to the dedicated `Outlet`
-            // variant preserving at least the concrete §5.4.4 code — parity
-            // with the pre-PR-2a `SCP-OUTLET-` prefix routing above. The
-            // `Display` renders `[code] class: slug`.
-            //
-            // PR-2b: render the structured surface (class/detail/retry/
-            // source_chain) into a richer typed Swift/Kotlin error here.
-            CE::Outlet(surface) => Self::Outlet {
-                msg: format!("{e}"),
-                code: surface.code.clone(),
-            },
-            // SCP-OUT-031 PR-2a: the outlet reserve-gate context-not-active
-            // carrier. `Display` is the structured, STATE-FREE
-            // `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`
-            // — the raw lifecycle `current_state` is NEVER rendered here (this
-            // gate runs before authz, so an unauthorized caller must not learn
-            // the exact lifecycle state).
-            CE::OutletContextNotActive { .. } => Self::Outlet {
-                msg: format!("{e}"),
-                code: scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
-            },
+            // SCP-OUT-031 PR-2b: outlet invocation errors arrive as the typed
+            // `ContextError::Outlet(surface)` carrying the §5.4.4
+            // class/code/slug/retry/detail/source_chain, and are rendered here
+            // in FULL onto `ScpError::OutletSurface` as native Swift enums /
+            // Kotlin sealed classes. (PR-2a preserved only `surface.code`.)
+            CE::Outlet(surface) => Self::from_outlet_surface(format!("{e}"), surface),
+            // SCP-OUT-031 PR-2a/2b: the outlet reserve-gate context-not-active
+            // carrier. SECURITY — this gate runs BEFORE authorization, so its
+            // error reaches an unauthenticated caller. The surface is
+            // SYNTHESIZED from the two §5.4.4 constants (`from_code` derives
+            // class + retry from the code registry); `current_state` is never
+            // read here, so the raw lifecycle state cannot leak into `msg`, the
+            // typed members, or anywhere else. The caller learns only "not
+            // active", never WHICH non-active state.
+            CE::OutletContextNotActive { .. } => Self::from_outlet_surface(
+                format!("{e}"),
+                &scp_core::context::outlets::errors::OutletErrorSurface::from_code(
+                    scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
+                    scp_core::context::outlets::error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+                    None,
+                ),
+            ),
             _ => Self::Context {
                 msg: format!("{e} — verify context state, membership, and permissions"),
                 code: codes::CTX_2001.to_owned(),
@@ -23070,30 +23609,203 @@ mod tests {
         assert_eq!(context_code_of(err), codes::CTX_2001);
     }
 
-    /// SCP-OUT-031 PR-2a (SECURITY): the outlet reserve-gate context-not-active
-    /// carrier must surface as the STRUCTURED, state-free `SCP-OUTLET-6101`
-    /// outlet error — the raw lifecycle state MUST NOT leak to the FFI caller
-    /// (this gate runs before authz on the unary invoke path). Cross-bridge
-    /// parity with the `PyO3` + `NAPI` bridges.
+    // ------------------------------------------------------------------
+    // SCP-OUT-031 PR-2b — the structured §5.4.4 surface render.
+    //
+    // Every assertion reads the TYPED associated values off
+    // `ScpError::OutletSurface` (the same Swift enums / Kotlin sealed classes
+    // a consumer destructures) and rebuilds an `OutletErrorSurface`. Nothing is
+    // re-derived from the prose message.
+    // ------------------------------------------------------------------
+
+    /// Rebuilds an `OutletErrorSurface` from the TYPED values the `UniFFI`
+    /// bridge actually carries. Panics if the error is not the structured arm.
+    fn reconstruct_surface(
+        err: &ScpError,
+    ) -> scp_core::context::outlets::errors::OutletErrorSurface {
+        let ScpError::OutletSurface { surface, .. } = err else {
+            panic!("expected ScpError::OutletSurface, got {err:?}");
+        };
+        surface.to_core()
+    }
+
+    /// LIVE PATH: a real structured error crosses the actual
+    /// `From<ContextError>` impl and EVERY §5.4.4 member survives as a typed
+    /// associated value. Asserted against the corpus shared with the `PyO3` and
+    /// napi-rs bridges, so equality here plus equality there is cross-bridge
+    /// parity.
+    #[test]
+    fn outlet_surface_survives_the_context_error_from_impl() {
+        for entry in scp_ffi_common::outlet_error::corpus::parity_surfaces() {
+            let err: ScpError =
+                scp_core::context::ContextError::Outlet(Box::new(entry.surface.clone())).into();
+            assert_eq!(reconstruct_surface(&err), entry.surface, "{}", entry.name);
+        }
+    }
+
+    /// INDEPENDENT ORACLE for the mirror projections.
+    ///
+    /// Every other mirror test composes `from_core` with the `#[cfg(test)]`
+    /// `to_core`, so a SYMMETRIC swap (`from_core: Wss => Unknown` paired with
+    /// `to_core: Unknown => Wss`) would round-trip green while production
+    /// Swift/Kotlin received the wrong tag. Pin `from_core` against the protocol
+    /// type's own serde wire vocabulary instead — an oracle the mirror pair
+    /// cannot influence. Covers the two closed enums whose variants are pure
+    /// discriminants (`OutletErrorClass` also has `as_wire`, its §5.4.4
+    /// vocabulary).
+    #[test]
+    fn mirror_enums_match_the_protocol_wire_vocabulary() {
+        use scp_core::context::outlets::errors::{OutletErrorClass as CoreClass, RelayUrlKind};
+
+        for (core, wire, mirror) in [
+            (RelayUrlKind::Wss, "\"wss\"", OutletRelayUrlKind::Wss),
+            (
+                RelayUrlKind::WsLoopback,
+                "\"ws-loopback\"",
+                OutletRelayUrlKind::WsLoopback,
+            ),
+            (
+                RelayUrlKind::Unknown,
+                "\"unknown\"",
+                OutletRelayUrlKind::Unknown,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&core).unwrap(), wire);
+            assert_eq!(OutletRelayUrlKind::from_core(core), mirror, "{wire}");
+        }
+
+        for (core, mirror) in [
+            (CoreClass::Protocol, OutletErrorClass::Protocol),
+            (CoreClass::Authorization, OutletErrorClass::Authorization),
+            (CoreClass::Input, OutletErrorClass::Input),
+            (CoreClass::Execution, OutletErrorClass::Execution),
+            (CoreClass::Output, OutletErrorClass::Output),
+            (CoreClass::Economic, OutletErrorClass::Economic),
+            (CoreClass::Transport, OutletErrorClass::Transport),
+            (CoreClass::Governance, OutletErrorClass::Governance),
+        ] {
+            // `as_wire` is the §5.4.4 vocabulary and is independent of the
+            // mirror; pairing the two pins the mapping from outside the pair.
+            assert_eq!(
+                serde_json::to_string(&core).unwrap(),
+                format!("\"{}\"", core.as_wire())
+            );
+            assert_eq!(
+                OutletErrorClass::from_core(core),
+                mirror,
+                "{}",
+                core.as_wire()
+            );
+        }
+    }
+
+    /// The exported accessors — the surface Swift/Kotlin actually call — return
+    /// the same typed values the reconstruction reads.
+    #[test]
+    fn exported_accessors_expose_the_typed_members() {
+        let core_surface = scp_core::context::outlets::errors::OutletErrorSurface::from_code(
+            scp_core::context::outlets::error_codes::CODE_TRANSPORT_FAULT,
+            scp_core::context::outlets::error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+            Some(
+                scp_core::context::outlets::errors::DetailBody::TransportRateLimit {
+                    retry_after_secs: 45,
+                },
+            ),
+        );
+        let err = ScpError::from_outlet_surface("rate limited", &core_surface);
+        let ScpError::OutletSurface { surface, code, .. } = &err else {
+            panic!("expected ScpError::OutletSurface, got {err:?}");
+        };
+        assert_eq!(code, &core_surface.code);
+        assert_eq!(surface.error_class(), OutletErrorClass::Transport);
+        assert_eq!(surface.code(), core_surface.code);
+        assert_eq!(surface.slug(), core_surface.slug);
+        assert_eq!(
+            surface.detail(),
+            Some(OutletDetailBody::TransportRateLimit {
+                retry_after_secs: 45
+            })
+        );
+        assert!(surface.source_chain().is_empty());
+        // `retry` is a native sum type, not a string — a Swift `switch` /
+        // Kotlin `when` destructures it directly.
+        assert_eq!(
+            surface.retry(),
+            OutletRetryPolicy::from_core(&core_surface.retry)
+        );
+    }
+
+    /// LIVE PATH (cross-context): a real §5.4.4 WIRE ENVELOPE crosses the
+    /// `From<OutletError>` impl and renders to the same surface
+    /// `OutletErrorSurface::from_envelope` projects.
+    #[test]
+    fn typed_envelope_renders_through_from_envelope() {
+        for entry in scp_ffi_common::outlet_error::corpus::parity_surfaces() {
+            let envelope =
+                scp_ffi_common::outlet_error::corpus::envelope_from_surface(&entry.surface)
+                    .unwrap();
+            let expected =
+                scp_core::context::outlets::errors::OutletErrorSurface::from_envelope(&envelope);
+            let err: ScpError = envelope.into();
+            assert_eq!(reconstruct_surface(&err), expected, "{}", entry.name);
+            assert_eq!(reconstruct_surface(&err), entry.surface, "{}", entry.name);
+        }
+    }
+
+    /// AC10 groundwork: the PR-1 `malformed` fixtures cross the bridge with
+    /// their per-class detail mismatch INTACT, so the SDK can reject them.
+    #[test]
+    fn malformed_detail_mismatch_survives_the_bridge() {
+        for (name, surface) in
+            scp_ffi_common::outlet_error::corpus::malformed_detail_surfaces().unwrap()
+        {
+            let err: ScpError =
+                scp_core::context::ContextError::Outlet(Box::new(surface.clone())).into();
+            let back = reconstruct_surface(&err);
+            assert_eq!(back, surface, "{name}");
+            assert_ne!(
+                back.detail.unwrap().kind(),
+                back.class.expected_detail(),
+                "{name}: the bridge normalized away the AC10 detail mismatch"
+            );
+        }
+    }
+
+    /// SCP-OUT-031 PR-2a/2b (SECURITY): the outlet reserve-gate
+    /// context-not-active carrier must surface as the STRUCTURED, state-free
+    /// `SCP-OUTLET-6101` outlet error — the raw lifecycle state MUST NOT leak to
+    /// the FFI caller (this gate runs before authz on the unary invoke path),
+    /// not in `msg` and (PR-2b) not in any typed member. Cross-bridge parity
+    /// with the `PyO3` + `NAPI` bridges.
     #[test]
     fn outlet_context_not_active_surfaces_structured_state_free() {
-        let err: ScpError = scp_core::context::ContextError::OutletContextNotActive {
-            current_state: scp_core::context::ContextState::Closing,
+        // EVERY non-Active state, derived from an exhaustive match so a new
+        // lifecycle variant cannot silently escape this leak test.
+        for state in scp_ffi_common::outlet_error::corpus::non_active_context_states() {
+            let state_name = format!("{state:?}");
+            let err: ScpError = scp_core::context::ContextError::OutletContextNotActive {
+                current_state: state,
+            }
+            .into();
+            let ScpError::OutletSurface { msg, code, surface } = &err else {
+                panic!("expected ScpError::OutletSurface, got {err:?}");
+            };
+            assert_eq!(
+                code,
+                scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+            );
+            assert!(msg.contains("protocol.context-closed-mid-stream"), "{msg}");
+            // Everything the caller can observe: the rendered error plus the
+            // Debug form of every typed member.
+            let visible = format!("{err}|{msg}|{surface:?}");
+            assert!(
+                !visible.contains(&state_name),
+                "raw lifecycle state {state_name} leaked to the FFI caller: {visible}"
+            );
+            assert_eq!(surface.error_class(), OutletErrorClass::Protocol);
+            assert!(surface.detail().is_none());
+            assert!(surface.source_chain().is_empty());
         }
-        .into();
-        let (msg, code) = match err {
-            ScpError::Outlet { msg, code } => (msg, code),
-            other => panic!("expected ScpError::Outlet, got {other:?}"),
-        };
-        assert_eq!(
-            code,
-            scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
-        );
-        assert!(
-            !msg.contains("Closing"),
-            "raw lifecycle state must NOT leak to the FFI caller: {msg}"
-        );
-        assert!(msg.contains("protocol.context-closed-mid-stream"), "{msg}");
     }
 
     // -----------------------------------------------------------------------

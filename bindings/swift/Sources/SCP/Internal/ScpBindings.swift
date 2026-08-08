@@ -566,6 +566,34 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDuration: FfiConverterRustBuffer {
+    typealias SwiftType = TimeInterval
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TimeInterval {
+        let seconds: UInt64 = try readInt(&buf)
+        let nanoseconds: UInt32 = try readInt(&buf)
+        return Double(seconds) + (Double(nanoseconds) / 1.0e9)
+    }
+
+    public static func write(_ value: TimeInterval, into buf: inout [UInt8]) {
+        if value.rounded(.down) > Double(Int64.max) {
+            fatalError("Duration overflow, exceeds max bounds supported by Uniffi")
+        }
+
+        if value < 0 {
+            fatalError("Invalid duration, must be non-negative")
+        }
+
+        let seconds = UInt64(value)
+        let nanoseconds = UInt32((value - Double(seconds)) * 1.0e9)
+        writeInt(&buf, seconds)
+        writeInt(&buf, nanoseconds)
+    }
+}
+
 
 
 
@@ -1707,6 +1735,239 @@ public func FfiConverterTypeNodeHandle_lower(_ value: NodeHandle) -> UnsafeMutab
 
 
 /**
+ * The full structured §5.4.4 outlet-error taxonomy carried by
+ * [`ScpError::Outlet`] (SCP-OUT-031 PR-2b).
+ *
+ * Mirrors [`scp_core::context::outlets::errors::OutletErrorSurface`]. Swift and
+ * Kotlin consumers `switch` / `when` on `class` and destructure `detail`
+ * natively — nothing here is a string that must be parsed.
+ *
+ * Passed as an `Arc`-wrapped interface rather than a by-value record so
+ * `ScpError` — the `Err` type of every `#[uniffi::export]` function — stays
+ * pointer-sized in this arm (`clippy::result_large_err`; the by-value record
+ * is ~150 bytes). The accessors below are the value-typed read surface.
+ */
+public protocol OutletErrorSurfaceProtocol: AnyObject, Sendable {
+    
+    /**
+     * The §5.4.4 sub-block code (`6100`-`6199`).
+     */
+    func code()  -> String
+    
+    /**
+     * Typed per-class detail, or `None` when the error carries none.
+     * `None` is ABSENT detail — never a fabricated placeholder.
+     */
+    func detail()  -> OutletDetailBody?
+    
+    /**
+     * The §5.4.4 root class — selects the SDK's sealed error subclass.
+     */
+    func errorClass()  -> OutletErrorClass
+    
+    /**
+     * Retry guidance — the caller can act on this without re-classifying.
+     */
+    func retry()  -> OutletRetryPolicy
+    
+    /**
+     * The registered §5.4.4 slug (`slug_to_class(slug) == error_class()`).
+     */
+    func slug()  -> String
+    
+    /**
+     * Cross-context hop trail, innermost→outermost. Empty for an error that
+     * did not cross a context boundary.
+     */
+    func sourceChain()  -> [OutletContextHop]
+    
+}
+/**
+ * The full structured §5.4.4 outlet-error taxonomy carried by
+ * [`ScpError::Outlet`] (SCP-OUT-031 PR-2b).
+ *
+ * Mirrors [`scp_core::context::outlets::errors::OutletErrorSurface`]. Swift and
+ * Kotlin consumers `switch` / `when` on `class` and destructure `detail`
+ * natively — nothing here is a string that must be parsed.
+ *
+ * Passed as an `Arc`-wrapped interface rather than a by-value record so
+ * `ScpError` — the `Err` type of every `#[uniffi::export]` function — stays
+ * pointer-sized in this arm (`clippy::result_large_err`; the by-value record
+ * is ~150 bytes). The accessors below are the value-typed read surface.
+ */
+open class OutletErrorSurface: OutletErrorSurfaceProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_scp_ffi_uniffi_fn_clone_outleterrorsurface(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_scp_ffi_uniffi_fn_free_outleterrorsurface(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * The §5.4.4 sub-block code (`6100`-`6199`).
+     */
+open func code() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_outleterrorsurface_code(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Typed per-class detail, or `None` when the error carries none.
+     * `None` is ABSENT detail — never a fabricated placeholder.
+     */
+open func detail() -> OutletDetailBody?  {
+    return try!  FfiConverterOptionTypeOutletDetailBody.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_outleterrorsurface_detail(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The §5.4.4 root class — selects the SDK's sealed error subclass.
+     */
+open func errorClass() -> OutletErrorClass  {
+    return try!  FfiConverterTypeOutletErrorClass_lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_outleterrorsurface_error_class(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Retry guidance — the caller can act on this without re-classifying.
+     */
+open func retry() -> OutletRetryPolicy  {
+    return try!  FfiConverterTypeOutletRetryPolicy_lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_outleterrorsurface_retry(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The registered §5.4.4 slug (`slug_to_class(slug) == error_class()`).
+     */
+open func slug() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_outleterrorsurface_slug(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Cross-context hop trail, innermost→outermost. Empty for an error that
+     * did not cross a context boundary.
+     */
+open func sourceChain() -> [OutletContextHop]  {
+    return try!  FfiConverterSequenceTypeOutletContextHop.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_outleterrorsurface_source_chain(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletErrorSurface: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = OutletErrorSurface
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> OutletErrorSurface {
+        return OutletErrorSurface(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: OutletErrorSurface) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletErrorSurface {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: OutletErrorSurface, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletErrorSurface_lift(_ pointer: UnsafeMutableRawPointer) throws -> OutletErrorSurface {
+    return try FfiConverterTypeOutletErrorSurface.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletErrorSurface_lower(_ value: OutletErrorSurface) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeOutletErrorSurface.lower(value)
+}
+
+
+
+
+
+
+/**
  * Opaque handle to a running SCP relay server.
  *
  * Created by `relay_start_in_memory` or `relay_start_local`. The relay
@@ -2656,9 +2917,18 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `identity_execute_recovery`.
      *
-     * Pure orchestration — takes no handles. Routes through `&self.inner`
-     * only to preserve API uniformity; the underlying recovery backend is
-     * a local stub pending SDK-layer wiring.
+     * # Fails closed (#2240)
+     *
+     * The §9.12 recovery WIRE (a real `RecoveryBackend` plus step-1 key
+     * rotation) is not yet built (custody / DID-method operations tracked as
+     * #2240 Part B, pending human sign-off). Until it is wired via the SDK
+     * layer this method **fails closed** with a typed `SCP-IDENT-1022` error
+     * ("recovery backend not configured — provide a real backend via SDK
+     * layer") — it NEVER returns a fabricated success (the former inline
+     * always-`Ok` backend returned `key_rotation_completed: true` while doing
+     * nothing, a nullifier forbidden by the builder tenets). Mirrors the
+     * sibling [`Self::identity_execute_custody_migration`] fail-closed
+     * behaviour.
      */
     func identityExecuteRecovery(did: String, tier: String, contextIds: [String]) throws  -> String
     
@@ -2874,6 +3144,27 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * is not per-instance; the opaque handle string is globally unique).
      */
     func mcpServerStop(handle: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `media_activate_session`.
+     *
+     * Transitions the session from `Initiating` to `Active` and appends a
+     * `MediaSessionStarted` leaf to the context event log (ADR-024 AC 8).
+     * The event log append is best-effort: if the context is not registered
+     * in the UCAN state registry a warning is emitted but the session state
+     * transition still succeeds.
+     */
+    func mediaActivateSession(sessionJson: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `media_end_session`.
+     *
+     * Ends the session and appends a `MediaSessionEnded` leaf to the context
+     * event log (ADR-024 AC 8). The event log append is best-effort: if the
+     * context is not registered a warning is emitted but the session teardown
+     * still succeeds.
+     */
+    func mediaEndSession(sessionJson: String, timestamp: UInt64) throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `migration_state`.
@@ -3154,6 +3445,65 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Returns `ScpError::Validation` if a byte argument is malformed.
      */
     func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, contextId: String, outletId: String, caveatsBinding: Data) async throws  -> Bool
+    
+    /**
+     * Opens a §5.4.5 / §6.2.4 CROSS-CONTEXT streaming outlet invocation as a
+     * saga (SCP-OUT-047), returning the durable `saga_id` PROMPTLY (the
+     * Commit-transition — NOT a block-until-terminal; the seal pumps
+     * off-mailbox). Drive the stream via `outletStreamingSagaPollNext` with the
+     * returned `saga_id`.
+     *
+     * The invocation UCAN is validated ONCE at open via the full 11-step
+     * ADR-016 pipeline against the TARGET context B (`target_handle`).
+     * `caller_did` is bound to this bridge instance's channel-authenticated
+     * principal (§6.2.4) and must be a member of `source_handle`'s context — a
+     * mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
+     * runs, so the receiver is never handed out.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::SagaAborted` (SCP-SAGA-13050) if the caller-principal
+     * binding fails; `ScpError::Permission` if authorization fails; a saga
+     * terminal error (`SagaAborted` / `SagaNeedsRepair` / `SagaBusy`) if the
+     * Prepare/Commit-transition is rejected; `ScpError::Validation` if an
+     * id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
+     */
+    func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanToken: String, proofTokens: [String]?, ucanProofId: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?) async throws  -> String
+    
+    /**
+     * Drains one chunk from a live cross-context streaming saga, awaiting until
+     * a chunk arrives or the stream closes. Returns the JSON-serialized
+     * `OutletStreamChunk` bytes (A's plaintext operator-signed frame), or `None`
+     * at the terminal (which evicts the saga stream).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` for an unknown/evicted `saga_id` (a DISTINCT
+     * error, NEVER `None`) or if chunk serialization fails.
+     */
+    func outletStreamingSagaPollNext(sagaId: String) async throws  -> Data?
+    
+    /**
+     * Key-bearing in-session reconnect/repair truncated-close for a cross-context
+     * streaming saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the
+     * TARGET context's Active Signing Key (resolved per-call from custody) and
+     * resolves the saga `Committed` WITHOUT re-opening the stream or re-invoking
+     * the executor. Recovers a seal that stalled / went `NeedsRepair` while THIS
+     * bridge process is still alive; the saga registry is per-instance and
+     * in-memory, so it does NOT survive a process/node restart (cross-restart
+     * recovery is a separate durable-journal operator path, §17.16).
+     * `caller_did` must be an identity hosted by this bridge instance (§6.2.4
+     * channel-auth) AND the invoker pinned at open (CRITICAL #1 — recovery is
+     * money-moving). On success the saga registry entry is evicted.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if `caller_did` is not hosted by this instance
+     * or the `saga_id` is unknown; `ScpError::Permission` with `SCP-PERM-3001`
+     * if `caller_did` is hosted but is not the pinned invoker; a saga terminal
+     * error (`SagaNeedsRepair`) if the seal cannot complete.
+     */
+    func outletStreamingSagaRecoverTruncatedClose(sagaId: String, callerDid: String) async throws 
     
     /**
      * Per-instance equivalent of the free-function `outlet_verify`.
@@ -5389,9 +5739,18 @@ open func identityExecuteCustodyMigration(did: String, target: String, contextId
     /**
      * Per-instance equivalent of the free-function `identity_execute_recovery`.
      *
-     * Pure orchestration — takes no handles. Routes through `&self.inner`
-     * only to preserve API uniformity; the underlying recovery backend is
-     * a local stub pending SDK-layer wiring.
+     * # Fails closed (#2240)
+     *
+     * The §9.12 recovery WIRE (a real `RecoveryBackend` plus step-1 key
+     * rotation) is not yet built (custody / DID-method operations tracked as
+     * #2240 Part B, pending human sign-off). Until it is wired via the SDK
+     * layer this method **fails closed** with a typed `SCP-IDENT-1022` error
+     * ("recovery backend not configured — provide a real backend via SDK
+     * layer") — it NEVER returns a fabricated success (the former inline
+     * always-`Ok` backend returned `key_rotation_completed: true` while doing
+     * nothing, a nullifier forbidden by the builder tenets). Mirrors the
+     * sibling [`Self::identity_execute_custody_migration`] fail-closed
+     * behaviour.
      */
 open func identityExecuteRecovery(did: String, tier: String, contextIds: [String])throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -5827,6 +6186,40 @@ open func mcpServerStop(handle: String)async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `media_activate_session`.
+     *
+     * Transitions the session from `Initiating` to `Active` and appends a
+     * `MediaSessionStarted` leaf to the context event log (ADR-024 AC 8).
+     * The event log append is best-effort: if the context is not registered
+     * in the UCAN state registry a warning is emitted but the session state
+     * transition still succeeds.
+     */
+open func mediaActivateSession(sessionJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_media_activate_session(self.uniffiClonePointer(),
+        FfiConverterString.lower(sessionJson),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `media_end_session`.
+     *
+     * Ends the session and appends a `MediaSessionEnded` leaf to the context
+     * event log (ADR-024 AC 8). The event log append is best-effort: if the
+     * context is not registered a warning is emitted but the session teardown
+     * still succeeds.
+     */
+open func mediaEndSession(sessionJson: String, timestamp: UInt64)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_media_end_session(self.uniffiClonePointer(),
+        FfiConverterString.lower(sessionJson),
+        FfiConverterUInt64.lower(timestamp),$0
+    )
+})
 }
     
     /**
@@ -6405,6 +6798,110 @@ open func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, c
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Opens a §5.4.5 / §6.2.4 CROSS-CONTEXT streaming outlet invocation as a
+     * saga (SCP-OUT-047), returning the durable `saga_id` PROMPTLY (the
+     * Commit-transition — NOT a block-until-terminal; the seal pumps
+     * off-mailbox). Drive the stream via `outletStreamingSagaPollNext` with the
+     * returned `saga_id`.
+     *
+     * The invocation UCAN is validated ONCE at open via the full 11-step
+     * ADR-016 pipeline against the TARGET context B (`target_handle`).
+     * `caller_did` is bound to this bridge instance's channel-authenticated
+     * principal (§6.2.4) and must be a member of `source_handle`'s context — a
+     * mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
+     * runs, so the receiver is never handed out.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::SagaAborted` (SCP-SAGA-13050) if the caller-principal
+     * binding fails; `ScpError::Permission` if authorization fails; a saga
+     * terminal error (`SagaAborted` / `SagaNeedsRepair` / `SagaBusy`) if the
+     * Prepare/Commit-transition is rejected; `ScpError::Validation` if an
+     * id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
+     */
+open func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanToken: String, proofTokens: [String]?, ucanProofId: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_streaming_saga_open(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(outletRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(ucanProofId),FfiConverterOptionUInt32.lower(timeoutMs),FfiConverterOptionUInt32.lower(estimatedChunkCount)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Drains one chunk from a live cross-context streaming saga, awaiting until
+     * a chunk arrives or the stream closes. Returns the JSON-serialized
+     * `OutletStreamChunk` bytes (A's plaintext operator-signed frame), or `None`
+     * at the terminal (which evicts the saga stream).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` for an unknown/evicted `saga_id` (a DISTINCT
+     * error, NEVER `None`) or if chunk serialization fails.
+     */
+open func outletStreamingSagaPollNext(sagaId: String)async throws  -> Data?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_streaming_saga_poll_next(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(sagaId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Key-bearing in-session reconnect/repair truncated-close for a cross-context
+     * streaming saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the
+     * TARGET context's Active Signing Key (resolved per-call from custody) and
+     * resolves the saga `Committed` WITHOUT re-opening the stream or re-invoking
+     * the executor. Recovers a seal that stalled / went `NeedsRepair` while THIS
+     * bridge process is still alive; the saga registry is per-instance and
+     * in-memory, so it does NOT survive a process/node restart (cross-restart
+     * recovery is a separate durable-journal operator path, §17.16).
+     * `caller_did` must be an identity hosted by this bridge instance (§6.2.4
+     * channel-auth) AND the invoker pinned at open (CRITICAL #1 — recovery is
+     * money-moving). On success the saga registry entry is evicted.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if `caller_did` is not hosted by this instance
+     * or the `saga_id` is unknown; `ScpError::Permission` with `SCP-PERM-3001`
+     * if `caller_did` is hosted but is not the pinned invoker; a saga terminal
+     * error (`SagaNeedsRepair`) if the seal cannot complete.
+     */
+open func outletStreamingSagaRecoverTruncatedClose(sagaId: String, callerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_streaming_saga_recover_truncated_close(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(sagaId),FfiConverterString.lower(callerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -10355,6 +10852,108 @@ public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
 
 
 /**
+ * One entry in a §5.4.4 cross-context error trail. Mirrors
+ * [`scp_core::context::outlets::errors::ContextHop`].
+ */
+public struct OutletContextHop {
+    /**
+     * Context id of this hop — pseudonymized for hops the receiver is not a
+     * member of (§5.4.4 `source_chain` pseudonymization).
+     */
+    public var contextId: String
+    /**
+     * Slot index in the padded trail (real and pad entries share encoding).
+     */
+    public var hopIndex: UInt16
+    /**
+     * The error code observed at this hop, before any outer wrapping.
+     */
+    public var wrappedCode: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Context id of this hop — pseudonymized for hops the receiver is not a
+         * member of (§5.4.4 `source_chain` pseudonymization).
+         */contextId: String, 
+        /**
+         * Slot index in the padded trail (real and pad entries share encoding).
+         */hopIndex: UInt16, 
+        /**
+         * The error code observed at this hop, before any outer wrapping.
+         */wrappedCode: String) {
+        self.contextId = contextId
+        self.hopIndex = hopIndex
+        self.wrappedCode = wrappedCode
+    }
+}
+
+#if compiler(>=6)
+extension OutletContextHop: Sendable {}
+#endif
+
+
+extension OutletContextHop: Equatable, Hashable {
+    public static func ==(lhs: OutletContextHop, rhs: OutletContextHop) -> Bool {
+        if lhs.contextId != rhs.contextId {
+            return false
+        }
+        if lhs.hopIndex != rhs.hopIndex {
+            return false
+        }
+        if lhs.wrappedCode != rhs.wrappedCode {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contextId)
+        hasher.combine(hopIndex)
+        hasher.combine(wrappedCode)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletContextHop: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletContextHop {
+        return
+            try OutletContextHop(
+                contextId: FfiConverterString.read(from: &buf), 
+                hopIndex: FfiConverterUInt16.read(from: &buf), 
+                wrappedCode: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutletContextHop, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.contextId, into: &buf)
+        FfiConverterUInt16.write(value.hopIndex, into: &buf)
+        FfiConverterString.write(value.wrappedCode, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletContextHop_lift(_ buf: RustBuffer) throws -> OutletContextHop {
+    return try FfiConverterTypeOutletContextHop.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletContextHop_lower(_ value: OutletContextHop) -> RustBuffer {
+    return FfiConverterTypeOutletContextHop.lower(value)
+}
+
+
+/**
  * Per-invocation cost metadata for an outlet (spec §5.4.1).
  */
 public struct OutletCostDefinition {
@@ -13397,6 +13996,381 @@ extension MemoryScope: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Typed per-class detail body of a §5.4.4 outlet error. Mirrors
+ * [`scp_core::context::outlets::errors::DetailBody`].
+ *
+ * A CLOSED sum type — §5.4.4 forbids a free-form detail (it would be a covert
+ * channel). `ExecutionPanic.panic_location_hash` is the full 32-byte SHA-256
+ * of a stable panic-LOCATION identifier (never the panic message); it is
+ * `Vec<u8>` here only because `UniFFI` has no fixed-size array type, and the
+ * protocol side keeps the `[u8; 32]` width invariant.
+ */
+
+public enum OutletDetailBody {
+    
+    /**
+     * Protocol-class detail.
+     */
+    case `protocol`(
+        /**
+         * Name of the violated rule.
+         */rule: String
+    )
+    /**
+     * Authorization-class detail.
+     */
+    case authorization(
+        /**
+         * The denied capability URI.
+         */capability: String
+    )
+    /**
+     * Input/Output-class detail (§5.4.4 gives both classes one schema).
+     */
+    case fieldViolation(
+        /**
+         * JSON Pointer into the offending payload.
+         */fieldPath: String, 
+        /**
+         * Violation tag (e.g. `"type"`, `"range"`).
+         */violation: String
+    )
+    /**
+     * Execution-class detail for timeouts.
+     */
+    case executionTimeout(
+        /**
+         * Elapsed milliseconds before the timeout fired.
+         */elapsedMs: UInt64
+    )
+    /**
+     * Execution-class detail for handler panics.
+     */
+    case executionPanic(
+        /**
+         * SHA-256 (32 bytes) of a stable panic-location identifier.
+         */panicLocationHash: Data
+    )
+    /**
+     * Economic-class detail for insufficient funds.
+     */
+    case economicInsufficient(
+        /**
+         * Amount required, in the smallest unit of `currency`.
+         */needed: UInt64, 
+        /**
+         * ISO-4217 or registered SCP currency code.
+         */currency: String
+    )
+    /**
+     * Economic-class detail for payment-adapter failures.
+     */
+    case economicAdapter(
+        /**
+         * The failing `PaymentAdapterId`.
+         */adapterId: String
+    )
+    /**
+     * Transport-class detail for rate-limit hints.
+     */
+    case transportRateLimit(
+        /**
+         * Seconds until the next call would be accepted.
+         */retryAfterSecs: UInt32
+    )
+    /**
+     * Transport-class detail for relay-availability errors.
+     */
+    case transportRelay(
+        /**
+         * The relay URL KIND — never the raw URL (§5.4.4).
+         */relayUrlKind: OutletRelayUrlKind
+    )
+    /**
+     * Governance-class detail.
+     */
+    case governance(
+        /**
+         * The governance action name.
+         */action: String
+    )
+}
+
+
+#if compiler(>=6)
+extension OutletDetailBody: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletDetailBody: FfiConverterRustBuffer {
+    typealias SwiftType = OutletDetailBody
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletDetailBody {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .`protocol`(rule: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .authorization(capability: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .fieldViolation(fieldPath: try FfiConverterString.read(from: &buf), violation: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .executionTimeout(elapsedMs: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 5: return .executionPanic(panicLocationHash: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 6: return .economicInsufficient(needed: try FfiConverterUInt64.read(from: &buf), currency: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 7: return .economicAdapter(adapterId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 8: return .transportRateLimit(retryAfterSecs: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 9: return .transportRelay(relayUrlKind: try FfiConverterTypeOutletRelayUrlKind.read(from: &buf)
+        )
+        
+        case 10: return .governance(action: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OutletDetailBody, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .`protocol`(rule):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(rule, into: &buf)
+            
+        
+        case let .authorization(capability):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(capability, into: &buf)
+            
+        
+        case let .fieldViolation(fieldPath,violation):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(fieldPath, into: &buf)
+            FfiConverterString.write(violation, into: &buf)
+            
+        
+        case let .executionTimeout(elapsedMs):
+            writeInt(&buf, Int32(4))
+            FfiConverterUInt64.write(elapsedMs, into: &buf)
+            
+        
+        case let .executionPanic(panicLocationHash):
+            writeInt(&buf, Int32(5))
+            FfiConverterData.write(panicLocationHash, into: &buf)
+            
+        
+        case let .economicInsufficient(needed,currency):
+            writeInt(&buf, Int32(6))
+            FfiConverterUInt64.write(needed, into: &buf)
+            FfiConverterString.write(currency, into: &buf)
+            
+        
+        case let .economicAdapter(adapterId):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(adapterId, into: &buf)
+            
+        
+        case let .transportRateLimit(retryAfterSecs):
+            writeInt(&buf, Int32(8))
+            FfiConverterUInt32.write(retryAfterSecs, into: &buf)
+            
+        
+        case let .transportRelay(relayUrlKind):
+            writeInt(&buf, Int32(9))
+            FfiConverterTypeOutletRelayUrlKind.write(relayUrlKind, into: &buf)
+            
+        
+        case let .governance(action):
+            writeInt(&buf, Int32(10))
+            FfiConverterString.write(action, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletDetailBody_lift(_ buf: RustBuffer) throws -> OutletDetailBody {
+    return try FfiConverterTypeOutletDetailBody.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletDetailBody_lower(_ value: OutletDetailBody) -> RustBuffer {
+    return FfiConverterTypeOutletDetailBody.lower(value)
+}
+
+
+extension OutletDetailBody: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Root class of a §5.4.4 outlet error — the eight-way invariant that selects
+ * the SDK's sealed error subclass. Mirrors
+ * [`scp_core::context::outlets::errors::OutletErrorClass`].
+ */
+
+public enum OutletErrorClass {
+    
+    /**
+     * Registration / validation / classification violations (`6100..6109`).
+     */
+    case `protocol`
+    /**
+     * UCAN, caveat, role, capability, amplification denials (`6110..6119`).
+     */
+    case authorization
+    /**
+     * Schema, size, type, enum, range violations on input (`6120..6129`).
+     */
+    case input
+    /**
+     * Timeout, panic, resource exhaustion, stream gaps (`6130..6139`).
+     */
+    case execution
+    /**
+     * Output schema / size / redaction violations (`6140..6149`).
+     */
+    case output
+    /**
+     * Budget, funds, adapter, pricing, escrow (`6150..6159`).
+     */
+    case economic
+    /**
+     * Relay unavailable, bridge failure, rate limiting (`6160..6169`).
+     */
+    case transport
+    /**
+     * Deregistration, suspension, ceiling, consequence (`6170..6179`).
+     */
+    case governance
+}
+
+
+#if compiler(>=6)
+extension OutletErrorClass: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletErrorClass: FfiConverterRustBuffer {
+    typealias SwiftType = OutletErrorClass
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletErrorClass {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .`protocol`
+        
+        case 2: return .authorization
+        
+        case 3: return .input
+        
+        case 4: return .execution
+        
+        case 5: return .output
+        
+        case 6: return .economic
+        
+        case 7: return .transport
+        
+        case 8: return .governance
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OutletErrorClass, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .`protocol`:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .authorization:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .input:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .execution:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .output:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .economic:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .transport:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .governance:
+            writeInt(&buf, Int32(8))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletErrorClass_lift(_ buf: RustBuffer) throws -> OutletErrorClass {
+    return try FfiConverterTypeOutletErrorClass.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletErrorClass_lower(_ value: OutletErrorClass) -> RustBuffer {
+    return FfiConverterTypeOutletErrorClass.lower(value)
+}
+
+
+extension OutletErrorClass: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Outlet semantic class (§5.4.2).
  *
  * `Query` is read-only and idempotent (UCAN stem `outlet_query:{id}`);
@@ -13481,6 +14455,217 @@ extension OutletKind: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Categorical tag for a relay URL surfaced in Transport-class detail — §5.4.4
+ * forbids surfacing the raw URL. Mirrors
+ * [`scp_core::context::outlets::errors::RelayUrlKind`].
+ */
+
+public enum OutletRelayUrlKind {
+    
+    /**
+     * Production `wss://` relay.
+     */
+    case wss
+    /**
+     * Loopback `ws://` relay.
+     */
+    case wsLoopback
+    /**
+     * Relay URL kind not recognised.
+     */
+    case unknown
+}
+
+
+#if compiler(>=6)
+extension OutletRelayUrlKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletRelayUrlKind: FfiConverterRustBuffer {
+    typealias SwiftType = OutletRelayUrlKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletRelayUrlKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .wss
+        
+        case 2: return .wsLoopback
+        
+        case 3: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OutletRelayUrlKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .wss:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .wsLoopback:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletRelayUrlKind_lift(_ buf: RustBuffer) throws -> OutletRelayUrlKind {
+    return try FfiConverterTypeOutletRelayUrlKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletRelayUrlKind_lower(_ value: OutletRelayUrlKind) -> RustBuffer {
+    return FfiConverterTypeOutletRelayUrlKind.lower(value)
+}
+
+
+extension OutletRelayUrlKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Retry guidance carried by a §5.4.4 outlet error. Mirrors
+ * [`scp_core::context::outlets::errors::RetryPolicy`].
+ *
+ * Delays are `std::time::Duration` (a native `UniFFI` type: Swift
+ * `TimeInterval`, Kotlin `java.time.Duration`) — NOT milliseconds, so
+ * sub-millisecond precision survives the boundary intact.
+ */
+
+public enum OutletRetryPolicy {
+    
+    /**
+     * Permanent failure; do not retry.
+     */
+    case never
+    /**
+     * Safe to retry immediately (idempotent operations).
+     */
+    case immediate
+    /**
+     * Retry after a fixed delay.
+     */
+    case after(
+        /**
+         * The fixed delay before the next attempt.
+         */delay: TimeInterval
+    )
+    /**
+     * Exponential backoff within `[min, max]`.
+     */
+    case withBackoff(
+        /**
+         * Minimum delay before the first retry.
+         */min: TimeInterval, 
+        /**
+         * Maximum delay (the curve saturates here).
+         */max: TimeInterval
+    )
+}
+
+
+#if compiler(>=6)
+extension OutletRetryPolicy: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletRetryPolicy: FfiConverterRustBuffer {
+    typealias SwiftType = OutletRetryPolicy
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletRetryPolicy {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .never
+        
+        case 2: return .immediate
+        
+        case 3: return .after(delay: try FfiConverterDuration.read(from: &buf)
+        )
+        
+        case 4: return .withBackoff(min: try FfiConverterDuration.read(from: &buf), max: try FfiConverterDuration.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OutletRetryPolicy, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .never:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .immediate:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .after(delay):
+            writeInt(&buf, Int32(3))
+            FfiConverterDuration.write(delay, into: &buf)
+            
+        
+        case let .withBackoff(min,max):
+            writeInt(&buf, Int32(4))
+            FfiConverterDuration.write(min, into: &buf)
+            FfiConverterDuration.write(max, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletRetryPolicy_lift(_ buf: RustBuffer) throws -> OutletRetryPolicy {
+    return try FfiConverterTypeOutletRetryPolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletRetryPolicy_lower(_ value: OutletRetryPolicy) -> RustBuffer {
+    return FfiConverterTypeOutletRetryPolicy.lower(value)
+}
+
+
+extension OutletRetryPolicy: Equatable, Hashable {}
+
+
+
+
+
+
 
 /**
  * Unified error type for the `UniFFI` bridge.
@@ -13522,8 +14707,36 @@ public enum ScpError: Swift.Error {
     )
     /**
      * A outlet operation failed (registration, invocation, verification).
+     *
+     * The UNSTRUCTURED arm: an outlet-coded diagnostic that does not carry a
+     * §5.4.4 taxonomy (the residual `PermissionDenied("SCP-OUTLET-…")`
+     * settle-path carriers, registration/verification failures). An outlet
+     * error that DOES carry the taxonomy uses [`Self::OutletSurface`].
      */
     case Outlet(msg: String, code: String
+    )
+    /**
+     * A §5.4.4 outlet error carrying its full structured taxonomy
+     * (SCP-OUT-031 PR-2b).
+     *
+     * Maps to Swift `ScpError.outletSurface(msg:code:surface:)` / Kotlin
+     * `ScpException.OutletSurface`. `surface` exposes `errorClass()`,
+     * `slug()`, `retry()`, `detail()` and `sourceChain()` as REAL Swift enums
+     * / Kotlin sealed classes — the consumer `switch`es on them, it never
+     * parses a string. PR-3's eight-class SDK hierarchy selects its subclass
+     * from `surface.errorClass()`.
+     */
+    case OutletSurface(
+        /**
+         * Human-readable detail (carries the `[SCP-OUTLET-…]` prefix).
+         */msg: String, 
+        /**
+         * The §5.4.4 sub-block code (`6100`-`6199`) — also the first token
+         * of `msg`, so a flattened log line still `grep`-disambiguates.
+         */code: String, 
+        /**
+         * The full typed §5.4.4 surface.
+         */surface: OutletErrorSurface
     )
     /**
      * Input validation failed (malformed data, schema mismatch, constraint violation).
@@ -13641,21 +14854,26 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
-        case 7: return .Validation(
+        case 7: return .OutletSurface(
+            msg: try FfiConverterString.read(from: &buf), 
+            code: try FfiConverterString.read(from: &buf), 
+            surface: try FfiConverterTypeOutletErrorSurface.read(from: &buf)
+            )
+        case 8: return .Validation(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
-        case 8: return .SagaAborted(
+        case 9: return .SagaAborted(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             retryAfterMs: try FfiConverterOptionUInt64.read(from: &buf)
             )
-        case 9: return .SagaNeedsRepair(
+        case 10: return .SagaNeedsRepair(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             sagaId: try FfiConverterString.read(from: &buf)
             )
-        case 10: return .SagaBusy(
+        case 11: return .SagaBusy(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             contendedContext: try FfiConverterString.read(from: &buf)
@@ -13708,28 +14926,35 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .Validation(msg,code):
+        case let .OutletSurface(msg,code,surface):
             writeInt(&buf, Int32(7))
+            FfiConverterString.write(msg, into: &buf)
+            FfiConverterString.write(code, into: &buf)
+            FfiConverterTypeOutletErrorSurface.write(surface, into: &buf)
+            
+        
+        case let .Validation(msg,code):
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             
         
         case let .SagaAborted(msg,code,retryAfterMs):
-            writeInt(&buf, Int32(8))
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterOptionUInt64.write(retryAfterMs, into: &buf)
             
         
         case let .SagaNeedsRepair(msg,code,sagaId):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterString.write(sagaId, into: &buf)
             
         
         case let .SagaBusy(msg,code,contendedContext):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(11))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterString.write(contendedContext, into: &buf)
@@ -13752,9 +14977,6 @@ public func FfiConverterTypeScpError_lift(_ buf: RustBuffer) throws -> ScpError 
 public func FfiConverterTypeScpError_lower(_ value: ScpError) -> RustBuffer {
     return FfiConverterTypeScpError.lower(value)
 }
-
-
-extension ScpError: Equatable, Hashable {}
 
 
 
@@ -15978,6 +17200,30 @@ fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeOutletDetailBody: FfiConverterRustBuffer {
+    typealias SwiftType = OutletDetailBody?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeOutletDetailBody.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeOutletDetailBody.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]?
 
@@ -16144,6 +17390,31 @@ fileprivate struct FfiConverterSequenceTypeMcpOutletInfo: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeMcpOutletInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeOutletContextHop: FfiConverterRustBuffer {
+    typealias SwiftType = [OutletContextHop]
+
+    public static func write(_ value: [OutletContextHop], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeOutletContextHop.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [OutletContextHop] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [OutletContextHop]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeOutletContextHop.read(from: &buf))
         }
         return seq
     }
@@ -16626,8 +17897,11 @@ public func evaluateProvenanceQuality(sourceContext: String?, sourceType: String
 /**
  * Resolves a DID to its document.
  *
- * DID resolution uses a fresh `DidDht::new()` and reads zero per-instance
- * state — it is a pure helper per ADR-048 §1.
+ * DID resolution builds the production DHT client fail-closed (via
+ * [`build_ffi_dht_client`]) and reads zero per-instance state — it is a pure
+ * helper per ADR-048 §1. The in-memory arm is reachable only under `testing`;
+ * a shipped build always resolves against the real Mainline Pkarr client
+ * (ADR-062 §Decision 1).
  */
 public func identityResolve(did: String)async throws  -> DidDocument  {
     return
@@ -17209,7 +18483,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_evaluate_provenance_quality() != 60373) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 39653) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 22292) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_device_attestation() != 44196) {
@@ -17344,7 +18618,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotation_event_json() != 64760) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotation_event_json() != 23136) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_verifying_key() != 19807) {
@@ -17381,6 +18655,24 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_shutdown() != 24736) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_outleterrorsurface_code() != 56995) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_outleterrorsurface_detail() != 47420) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_outleterrorsurface_error_class() != 37996) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_outleterrorsurface_retry() != 54672) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_outleterrorsurface_slug() != 51462) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_outleterrorsurface_source_chain() != 13625) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_is_shutdown() != 45597) {
@@ -17476,10 +18768,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 48267) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 46239) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 42668) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 46916) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 41503) {
@@ -17629,7 +18921,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_custody_migration() != 23068) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_recovery() != 41947) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_recovery() != 12015) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_link_attestations() != 36734) {
@@ -17692,6 +18984,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 46867) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_media_activate_session() != 3062) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_media_end_session() != 31083) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 34622) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -17750,6 +19048,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_verify_chunk_signature() != 15888) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_open() != 5447) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_poll_next() != 45714) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_recover_truncated_close() != 47469) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_verify() != 31142) {

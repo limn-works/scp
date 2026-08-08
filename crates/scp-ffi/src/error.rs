@@ -78,6 +78,49 @@ pyo3::create_exception!(
     "Input validation failed (malformed data, schema mismatch, constraint violation)."
 );
 
+// Structured §5.4.4 outlet error (SCP-OUT-031 PR-2b).
+//
+// `OutletError` is the dedicated exception for an outlet failure that arrives
+// with its full §5.4.4 taxonomy — the `ContextError::Outlet(OutletErrorSurface)`
+// arm. It is the BASE of the PR-3 eight-class sealed tree
+// (`OutletProtocolError`, `OutletAuthorizationError`, `OutletInputError`,
+// `OutletExecutionError`, `OutletOutputError`, `OutletEconomicError`,
+// `OutletTransportError`, `OutletGovernanceError` — one per
+// `OutletErrorClass`), which will subclass it and be selected by the `class`
+// arg below.
+//
+// The full surface rides POSITIONAL exception args, exactly like the three
+// saga terminals above — read structurally from `e.args`, NEVER re-parsed from
+// the message text:
+//
+//   args[0] — formatted message (`"[{code}] outlet error: …"`)
+//   args[1] — `code`, the §5.4.4 sub-block code (`6100`-`6199`) (`str`)
+//   args[2] — `slug`, the registered §5.4.4 slug (`str`)
+//   args[3] — `class`, the kebab-case wire discriminant (`str`: `"protocol"`,
+//             `"authorization"`, `"input"`, `"execution"`, `"output"`,
+//             `"economic"`, `"transport"`, `"governance"`)
+//   args[4] — `retry`, canonical serde JSON of `RetryPolicy` (`str`)
+//   args[5] — `detail`, canonical serde JSON of `DetailBody`, or `None` when
+//             the error carries no typed detail (`str | None`) — `None` means
+//             ABSENT, never "detail was JSON null"
+//   args[6] — `source_chain`, canonical serde JSON array of `ContextHop`
+//             (`str`; `"[]"` for a non-cross-context error)
+//
+// args 4-6 are STRUCTURED JSON, not prose, so PR-3 rebuilds the exact
+// `RetryPolicy` / `DetailBody` / hop trail rather than re-deriving them from a
+// sentence. The render is produced by `scp_ffi_common::outlet_error`, shared
+// with the napi-rs and UniFFI bridges so the three cannot drift.
+pyo3::create_exception!(
+    scp_sdk,
+    OutletError,
+    ScpError,
+    "A §5.4.4 outlet error carrying its full structured taxonomy. \
+     args = (message, code, slug, class, retry_json, detail_json_or_None, \
+     source_chain_json): `class` is the kebab-case §5.4.4 wire discriminant; \
+     `retry_json` / `detail_json_or_None` / `source_chain_json` are canonical \
+     serde JSON of RetryPolicy / DetailBody / list[ContextHop]."
+);
+
 // Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a) terminal errors.
 //
 // These three exceptions surface the typed
@@ -217,6 +260,19 @@ pub enum ScpPyError {
         /// The durable saga identifier — the operator-repair handle.
         saga_id: String,
     },
+    /// A §5.4.4 outlet error carrying its full structured taxonomy
+    /// (SCP-OUT-031 PR-2b).
+    ///
+    /// Maps to the Python `OutletError` exception (the base of PR-3's
+    /// eight-class sealed tree). Every member is held STRUCTURALLY in the
+    /// payload and handed to Python as a positional exception arg — the caller
+    /// never re-parses the message text. See the `create_exception!` doc above
+    /// for the arg positions.
+    ///
+    /// Boxed for the same reason `ContextError::Outlet` is: this is by far the
+    /// widest variant, and `ScpPyError` is the `Err` type of every bridge
+    /// function (`clippy::result_large_err`).
+    OutletSurface(Box<OutletSurfacePayload>),
     /// A §6.2.4 saga's participant context set overlapped an in-flight saga.
     ///
     /// Maps to the Python `SagaBusyError`. Carries the contended context id.
@@ -228,6 +284,31 @@ pub enum ScpPyError {
         /// The shared context id that forced serialization.
         contended_context: String,
     },
+}
+
+/// The boxed payload of [`ScpPyError::OutletSurface`] — the fully-rendered
+/// §5.4.4 outlet taxonomy (SCP-OUT-031 PR-2b).
+///
+/// Field-for-field the positional arg tuple handed to the Python `OutletError`
+/// exception; see the `create_exception!` doc above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutletSurfacePayload {
+    /// Human-readable detail (carries the `[SCP-OUTLET-…]` prefix).
+    pub message: String,
+    /// The §5.4.4 sub-block code (`6100`-`6199`).
+    pub code: String,
+    /// The registered §5.4.4 slug.
+    pub slug: String,
+    /// The kebab-case §5.4.4 class wire discriminant.
+    pub class_wire: String,
+    /// Canonical serde JSON of the `RetryPolicy`.
+    pub retry_json: String,
+    /// Canonical serde JSON of the `DetailBody`, or `None` when the error
+    /// carries no typed detail. `None` is ABSENT, never a JSON `null`.
+    pub detail_json: Option<String>,
+    /// Canonical serde JSON array of the `ContextHop` trail (`"[]"` when the
+    /// error did not cross a context boundary).
+    pub source_chain_json: String,
 }
 
 impl std::fmt::Display for ScpPyError {
@@ -250,6 +331,17 @@ impl std::fmt::Display for ScpPyError {
             }
             Self::ValidationError { message, code } => {
                 write!(f, "[{code}] validation error: {message}")
+            }
+            // SCP-OUT-031 PR-2b: the structured surface rides the exception
+            // args, so the message text stays the plain code-prefixed prose the
+            // SDK's `_coded_bridge_error` already classifies by code prefix.
+            Self::OutletSurface(p) => {
+                write!(
+                    f,
+                    "[{code}] outlet error: {message}",
+                    code = p.code,
+                    message = p.message
+                )
             }
             // Saga terminals embed the canonical SCP-SAGA-13xxx code so a
             // flattened log line still `grep`-disambiguates; the structured
@@ -338,6 +430,29 @@ impl ScpPyError {
             code: codes::VALID_7001.to_owned(),
         }
     }
+
+    /// Renders a structured §5.4.4 [`OutletErrorSurface`] onto the typed
+    /// [`Self::OutletSurface`] variant (SCP-OUT-031 PR-2b).
+    ///
+    /// The `class` / `retry` / `detail` / `source_chain` projection is produced
+    /// by [`scp_ffi_common::outlet_error::render_members`] — the SINGLE render
+    /// shared with the napi-rs and `UniFFI` bridges, so the three cannot drift.
+    #[must_use]
+    pub fn from_outlet_surface(
+        message: impl Into<String>,
+        surface: &scp_core::context::outlets::errors::OutletErrorSurface,
+    ) -> Self {
+        let rendered = scp_ffi_common::outlet_error::render_members(surface);
+        Self::OutletSurface(Box::new(OutletSurfacePayload {
+            message: message.into(),
+            code: surface.code.clone(),
+            slug: surface.slug.clone(),
+            class_wire: rendered.class_wire,
+            retry_json: rendered.retry_json,
+            detail_json: rendered.detail_json,
+            source_chain_json: rendered.source_chain_json,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +492,20 @@ impl From<ScpPyError> for PyErr {
                 contended_context,
                 ..
             } => SagaBusyError::new_err((formatted, code, contended_context)),
+            // SCP-OUT-031 PR-2b: the whole §5.4.4 surface rides positional
+            // exception args so a Python caller reads `class` / `retry` /
+            // `detail` / `source_chain` directly off `e.args` — never by
+            // re-parsing the message. `detail_json` maps `None` → Python `None`
+            // (ABSENT detail), distinct from a JSON `null` payload.
+            ScpPyError::OutletSurface(p) => OutletError::new_err((
+                formatted,
+                p.code,
+                p.slug,
+                p.class_wire,
+                p.retry_json,
+                p.detail_json,
+                p.source_chain_json,
+            )),
         }
     }
 }
@@ -581,30 +710,29 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: codes::CTX_2137.to_owned(),
             },
-            // SCP-OUT-031 PR-2a: outlet invocation errors now arrive as the
-            // typed `ContextError::Outlet(surface)` carrying the §5.4.4
-            // class/code/slug/retry/detail (was `PermissionDenied(String)`).
-            // Preserve at least the concrete outlet code — parity with the
-            // pre-PR-2a path, which re-parsed the `SCP-OUTLET-NNNN` prefix out
-            // of the message and routed it to `ContextError`. The `Display`
-            // renders the faithful `[code] class: slug`.
-            //
-            // PR-2b: render the structured surface here (class/detail/retry/
-            // source_chain) into a richer typed Python exception.
-            CE::Outlet(surface) => Self::ContextError {
-                message: format!("{e}"),
-                code: surface.code.clone(),
-            },
-            // SCP-OUT-031 PR-2a: the outlet reserve-gate context-not-active
-            // carrier. `Display` is the structured, STATE-FREE
-            // `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`
-            // — the raw lifecycle `current_state` is NEVER rendered here, so an
-            // unauthorized caller (this gate runs before authz) learns only that
-            // the context is not active, not which lifecycle state it is in.
-            CE::OutletContextNotActive { .. } => Self::ContextError {
-                message: format!("{e}"),
-                code: scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
-            },
+            // SCP-OUT-031 PR-2b: outlet invocation errors arrive as the typed
+            // `ContextError::Outlet(surface)` carrying the §5.4.4
+            // class/code/slug/retry/detail/source_chain, and are rendered here
+            // in FULL onto the dedicated `OutletError` Python exception with
+            // every member as a typed positional arg. (PR-2a preserved only
+            // `surface.code`; the rest was destroyed at this seam.)
+            CE::Outlet(surface) => Self::from_outlet_surface(format!("{e}"), surface),
+            // SCP-OUT-031 PR-2a/2b: the outlet reserve-gate context-not-active
+            // carrier. SECURITY — this gate runs BEFORE authorization, so its
+            // error reaches an unauthenticated caller. The surface is
+            // SYNTHESIZED from the two §5.4.4 constants (`from_code` derives
+            // class + retry from the code registry); `current_state` is never
+            // read here, so the raw lifecycle state cannot leak into the
+            // message, the args, or the JSON members. The caller learns only
+            // "not active", never WHICH non-active state.
+            CE::OutletContextNotActive { .. } => Self::from_outlet_surface(
+                format!("{e}"),
+                &scp_core::context::outlets::errors::OutletErrorSurface::from_code(
+                    scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
+                    scp_core::context::outlets::error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+                    None,
+                ),
+            ),
             _ => Self::ContextError {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: codes::CTX_2001.to_owned(),
@@ -678,6 +806,32 @@ impl From<scp_core::context::outlets::OutletError> for ScpPyError {
             ),
             code: codes::OUTLET_6001.to_owned(),
         }
+    }
+}
+
+// Typed §5.4.4 `OutletError` WIRE ENVELOPE → the structured Python exception
+// (SCP-OUT-031 PR-2b).
+//
+// This is the CROSS-CONTEXT render seam: where a receiver holds a decoded
+// §5.4.4 envelope (`class` / `code` / `slug` / `retry` / `detail` /
+// `source_chain` plus the three wire-opacity fields), `OutletErrorSurface::
+// from_envelope` projects it onto the in-process surface — dropping the HMAC
+// `message`, the `pad_nonce` and the `registration_event_id`, which a
+// cross-context receiver needs for catalog reverse-lookup but the in-process
+// SDK does not — and it renders identically to the runtime-side surface. One
+// render, one reconstruction contract, whichever side the error came from.
+//
+// HONEST STATUS: no runtime code CONSTRUCTS this envelope yet — SCP-OUT-029's
+// `wrap_cross_context_error` (which populates `source_chain` and pads the
+// trail) and the §5.4.4 wire decode are not implemented, so today the only
+// producers are the conformance fixtures. This impl is the render half of that
+// seam and is exercised by the fixture corpus; it is deliberately NOT a
+// re-implementation of the projection (it delegates to `from_envelope`), so
+// when the producer lands there is nothing to wire up and nothing to drift.
+impl From<scp_core::context::outlets::errors::OutletError> for ScpPyError {
+    fn from(e: scp_core::context::outlets::errors::OutletError) -> Self {
+        let surface = scp_ffi_common::outlet_error::surface_from_untrusted_envelope(&e);
+        Self::from_outlet_surface(format!("{e}"), &surface)
     }
 }
 
@@ -929,6 +1083,9 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TransportError", m.py().get_type::<TransportError>())?;
     m.add("UcanError", m.py().get_type::<UcanError>())?;
     m.add("ValidationError", m.py().get_type::<ValidationError>())?;
+    // SCP-OUT-031 PR-2b: the structured §5.4.4 outlet exception (base of PR-3's
+    // eight-class sealed tree).
+    m.add("OutletError", m.py().get_type::<OutletError>())?;
     m.add("SagaAbortedError", m.py().get_type::<SagaAbortedError>())?;
     m.add(
         "SagaNeedsRepairError",
@@ -942,6 +1099,7 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use scp_core::context::outlets::errors::OutletErrorSurface;
     use scp_platform::PreRotationCustodyError;
 
     fn code_of(e: ScpPyError) -> String {
@@ -1090,34 +1248,285 @@ mod tests {
         assert_eq!(context_code_of(err), codes::CTX_2137);
     }
 
-    /// SCP-OUT-031 PR-2a (SECURITY): the outlet reserve-gate context-not-active
-    /// carrier — which reaches the FFI caller VERBATIM on the unary invoke path,
-    /// BEFORE authorization — must surface as the STRUCTURED, state-free
-    /// `SCP-OUTLET-6101` Protocol-session surface. The raw lifecycle state
-    /// (`Closing` / `Expired` / …) MUST NOT appear in the message, else an
-    /// unauthorized caller learns the exact lifecycle state pre-authz.
+    // ------------------------------------------------------------------
+    // SCP-OUT-031 PR-2b — the structured §5.4.4 surface render.
+    //
+    // Every assertion below reads the surface STRUCTURALLY off the typed
+    // payload (`ScpPyError::OutletSurface`) and rebuilds an
+    // `OutletErrorSurface` from the canonical JSON members. Nothing is
+    // re-derived from the prose message.
+    // ------------------------------------------------------------------
+
+    /// Rebuilds an `OutletErrorSurface` from what the `PyO3` bridge actually
+    /// carries — the exact reconstruction PR-3's Python hierarchy performs off
+    /// `e.args`. Panics if the error is not the structured outlet arm.
+    fn reconstruct_surface(err: &ScpPyError) -> OutletErrorSurface {
+        let ScpPyError::OutletSurface(p) = err else {
+            panic!("expected ScpPyError::OutletSurface, got {err:?}");
+        };
+        OutletErrorSurface {
+            // The class arrives as its kebab wire string; the §5.4.4 wire
+            // vocabulary IS the serde representation, so this is a parse of the
+            // canonical form, not a hand-rolled lookup table.
+            class: serde_json::from_str(&format!("\"{}\"", p.class_wire)).unwrap(),
+            code: p.code.clone(),
+            slug: p.slug.clone(),
+            retry: serde_json::from_str(&p.retry_json).unwrap(),
+            detail: p
+                .detail_json
+                .as_ref()
+                .map(|d| serde_json::from_str(d).unwrap()),
+            source_chain: serde_json::from_str(&p.source_chain_json).unwrap(),
+        }
+    }
+
+    /// LIVE PATH: a real structured error crosses the actual
+    /// `From<ContextError>` impl and EVERY §5.4.4 member survives — class,
+    /// code, slug, retry, detail and the cross-context hop trail. Asserted
+    /// against the corpus shared with the napi-rs and `UniFFI` bridges, so
+    /// equality here plus equality there is cross-bridge parity.
+    #[test]
+    fn outlet_surface_survives_the_context_error_from_impl() {
+        for entry in scp_ffi_common::outlet_error::corpus::parity_surfaces() {
+            let err: ScpPyError =
+                scp_core::context::ContextError::Outlet(Box::new(entry.surface.clone())).into();
+            assert_eq!(reconstruct_surface(&err), entry.surface, "{}", entry.name);
+        }
+    }
+
+    /// LIVE PATH (cross-context): a real §5.4.4 WIRE ENVELOPE crosses the
+    /// `From<OutletError>` impl and renders to the same surface
+    /// `OutletErrorSurface::from_envelope` projects — the three wire-opacity
+    /// fields dropped, everything else intact.
+    #[test]
+    fn typed_envelope_renders_through_from_envelope() {
+        for entry in scp_ffi_common::outlet_error::corpus::parity_surfaces() {
+            let envelope =
+                scp_ffi_common::outlet_error::corpus::envelope_from_surface(&entry.surface)
+                    .unwrap();
+            let expected = OutletErrorSurface::from_envelope(&envelope);
+            let err: ScpPyError = envelope.into();
+            assert_eq!(reconstruct_surface(&err), expected, "{}", entry.name);
+            assert_eq!(reconstruct_surface(&err), entry.surface, "{}", entry.name);
+        }
+    }
+
+    /// AC10 groundwork: the PR-1 `malformed` fixtures cross the bridge with
+    /// their per-class detail mismatch INTACT. The bridge must not silently drop
+    /// or normalize the offending detail — the SDK needs both halves of the
+    /// mismatch to reject it.
+    #[test]
+    fn malformed_detail_mismatch_survives_the_bridge() {
+        for (name, surface) in
+            scp_ffi_common::outlet_error::corpus::malformed_detail_surfaces().unwrap()
+        {
+            let err: ScpPyError =
+                scp_core::context::ContextError::Outlet(Box::new(surface.clone())).into();
+            let back = reconstruct_surface(&err);
+            assert_eq!(back, surface, "{name}");
+            assert_ne!(
+                back.detail.unwrap().kind(),
+                back.class.expected_detail(),
+                "{name}: the bridge normalized away the AC10 detail mismatch"
+            );
+        }
+    }
+
+    /// SCP-OUT-031 PR-2a/2b (SECURITY): the outlet reserve-gate
+    /// context-not-active carrier — which reaches the FFI caller VERBATIM on the
+    /// unary invoke path, BEFORE authorization — must surface as the STRUCTURED,
+    /// state-free `SCP-OUTLET-6101` Protocol-session surface. The raw lifecycle
+    /// state (`Closing` / `Expired` / …) MUST NOT appear ANYWHERE the caller can
+    /// see: not in the message, and (PR-2b) not in any of the new structured
+    /// members either.
     #[test]
     fn outlet_context_not_active_surfaces_structured_state_free() {
-        let err: ScpPyError = scp_core::context::ContextError::OutletContextNotActive {
-            current_state: scp_core::context::ContextState::Closing,
+        // EVERY non-Active state, derived from an exhaustive match so a new
+        // lifecycle variant cannot silently escape this leak test.
+        for state in scp_ffi_common::outlet_error::corpus::non_active_context_states() {
+            let state_name = format!("{state:?}");
+            let err: ScpPyError = scp_core::context::ContextError::OutletContextNotActive {
+                current_state: state,
+            }
+            .into();
+            let ScpPyError::OutletSurface(p) = &err else {
+                panic!("expected ScpPyError::OutletSurface, got {err:?}");
+            };
+            assert_eq!(
+                p.code,
+                scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+            );
+            assert!(
+                p.message.contains("protocol.context-closed-mid-stream"),
+                "message must be the structured state-free surface: {}",
+                p.message
+            );
+            // Every caller-visible byte — the formatted message AND every
+            // structured member — must be free of the lifecycle state name.
+            let visible = format!(
+                "{err}|{}|{}|{}|{}|{}|{}",
+                p.message,
+                p.slug,
+                p.class_wire,
+                p.retry_json,
+                p.detail_json.clone().unwrap_or_default(),
+                p.source_chain_json,
+            );
+            assert!(
+                !visible.contains(&state_name),
+                "raw lifecycle state {state_name} leaked to the FFI caller: {visible}"
+            );
+            // The synthesized surface carries no detail — there is nothing
+            // state-derived to carry.
+            assert!(p.detail_json.is_none());
         }
-        .into();
-        let (message, code) = match err {
-            ScpPyError::ContextError { message, code } => (message, code),
-            other => panic!("expected ContextError, got {other:?}"),
-        };
-        assert_eq!(
-            code,
-            scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
-        );
-        assert!(
-            !message.contains("Closing"),
-            "raw lifecycle state must NOT leak to the FFI caller: {message}"
-        );
-        assert!(
-            message.contains("protocol.context-closed-mid-stream"),
-            "message must be the structured state-free surface: {message}"
-        );
+    }
+
+    /// The full structured surface rides POSITIONAL Python exception args on the
+    /// dedicated `OutletError` exception — args\[1..7\] — so PR-3's hierarchy
+    /// reads it directly and never re-parses the message text.
+    #[test]
+    fn outlet_surface_maps_to_python_exception_with_structured_args() {
+        Python::with_gil(|py| {
+            use scp_core::context::outlets::error_codes::{
+                CODE_TRANSPORT_FAULT, SLUG_TRANSPORT_RATE_LIMITED,
+            };
+            let surface = OutletErrorSurface {
+                class: scp_core::context::outlets::errors::OutletErrorClass::Transport,
+                code: CODE_TRANSPORT_FAULT.to_owned(),
+                slug: SLUG_TRANSPORT_RATE_LIMITED.to_owned(),
+                retry: scp_core::context::outlets::errors::RetryPolicy::After {
+                    delay: std::time::Duration::from_secs(45),
+                },
+                detail: Some(
+                    scp_core::context::outlets::errors::DetailBody::TransportRateLimit {
+                        retry_after_secs: 45,
+                    },
+                ),
+                source_chain: vec![scp_core::context::outlets::errors::ContextHop {
+                    context_id: "ctx-origin".to_owned(),
+                    hop_index: 0,
+                    wrapped_code: CODE_TRANSPORT_FAULT.to_owned(),
+                }],
+            };
+            let err: PyErr = ScpPyError::from_outlet_surface("rate limited", &surface).into();
+            assert!(err.is_instance_of::<OutletError>(py));
+            assert!(
+                err.is_instance_of::<ScpError>(py),
+                "OutletError must remain rooted at ScpError"
+            );
+            let args = err.value(py).getattr("args").unwrap();
+
+            let message: String = args.get_item(0).unwrap().extract().unwrap();
+            assert!(
+                message.starts_with(&format!("[{CODE_TRANSPORT_FAULT}] ")),
+                "{message}"
+            );
+            let code: String = args.get_item(1).unwrap().extract().unwrap();
+            assert_eq!(code, CODE_TRANSPORT_FAULT);
+            let slug: String = args.get_item(2).unwrap().extract().unwrap();
+            assert_eq!(slug, SLUG_TRANSPORT_RATE_LIMITED);
+            let class: String = args.get_item(3).unwrap().extract().unwrap();
+            assert_eq!(class, "transport");
+
+            // args[4..7] are canonical serde JSON — deserializing them yields
+            // the EXACT protocol values, which is the PR-3 contract.
+            let retry_json: String = args.get_item(4).unwrap().extract().unwrap();
+            assert_eq!(
+                serde_json::from_str::<scp_core::context::outlets::errors::RetryPolicy>(
+                    &retry_json
+                )
+                .unwrap(),
+                surface.retry
+            );
+            let detail_json: String = args.get_item(5).unwrap().extract().unwrap();
+            assert_eq!(
+                serde_json::from_str::<scp_core::context::outlets::errors::DetailBody>(
+                    &detail_json
+                )
+                .unwrap(),
+                surface.detail.clone().unwrap()
+            );
+            let chain_json: String = args.get_item(6).unwrap().extract().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Vec<scp_core::context::outlets::errors::ContextHop>>(
+                    &chain_json
+                )
+                .unwrap(),
+                surface.source_chain
+            );
+        });
+    }
+
+    /// An ABSENT detail maps to Python `None` at args\[5\] — the natural
+    /// projection of the protocol's `Option<DetailBody>`.
+    #[test]
+    fn absent_detail_maps_to_python_none() {
+        Python::with_gil(|py| {
+            let surface = OutletErrorSurface::from_code(
+                scp_core::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+                scp_core::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+                None,
+            );
+            let err: PyErr = ScpPyError::from_outlet_surface("denied", &surface).into();
+            let args = err.value(py).getattr("args").unwrap();
+            assert!(args.get_item(5).unwrap().is_none());
+        });
+    }
+
+    /// END-TO-END: a real `ContextError::Outlet` reaches Python as an
+    /// `OutletError` whose args carry the whole surface. The two halves —
+    /// `From<ContextError>` and `From<ScpPyError> for PyErr` — are each covered
+    /// above; this pins the CHAIN, which is what a Python caller actually sees.
+    #[test]
+    fn context_error_reaches_python_args_end_to_end() {
+        Python::with_gil(|py| {
+            for entry in scp_ffi_common::outlet_error::corpus::parity_surfaces() {
+                let err: PyErr = ScpPyError::from(scp_core::context::ContextError::Outlet(
+                    Box::new(entry.surface.clone()),
+                ))
+                .into();
+                assert!(err.is_instance_of::<OutletError>(py), "{}", entry.name);
+                let args = err.value(py).getattr("args").unwrap();
+                let code: String = args.get_item(1).unwrap().extract().unwrap();
+                let slug: String = args.get_item(2).unwrap().extract().unwrap();
+                let class: String = args.get_item(3).unwrap().extract().unwrap();
+                assert_eq!(code, entry.surface.code, "{}", entry.name);
+                assert_eq!(slug, entry.surface.slug, "{}", entry.name);
+                assert_eq!(class, entry.surface.class.as_wire(), "{}", entry.name);
+            }
+        });
+    }
+
+    /// CONTRACT PIN (a live-regression tripwire, not a nicety): `CPython`'s
+    /// `BaseException.__str__` returns `str(args[0])` for ONE arg but
+    /// `repr(args)` for two or more. Because this exception carries seven args,
+    /// `str(exc)` starts with `(` — so the Python SDK MUST read `args[1]` for
+    /// the code and MUST NOT parse it out of the message text (the
+    /// `_SCP_CODE_RE` / `_LEADING_BRIDGE_CODE` regexes are start-anchored on
+    /// `[`). `bindings/python/scp_sdk/errors.py::_outlet_surface_from_bridge`
+    /// is the reader; this test fails the moment the arg shape changes in a way
+    /// that would silently strand it.
+    #[test]
+    fn outlet_surface_str_is_a_tuple_repr_so_the_sdk_must_read_args() {
+        Python::with_gil(|py| {
+            let surface = OutletErrorSurface::from_code(
+                scp_core::context::outlets::error_codes::CODE_TRANSPORT_FAULT,
+                scp_core::context::outlets::error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+                None,
+            );
+            let err: PyErr = ScpPyError::from_outlet_surface("rate limited", &surface).into();
+            let rendered: String = err.value(py).str().unwrap().extract().unwrap();
+            assert!(
+                rendered.starts_with('('),
+                "multi-arg exception str() is the tuple repr — the Python SDK \
+                 MUST read args[1] for the code, never parse str(exc): {rendered}"
+            );
+            // args[0] alone IS the code-prefixed message the SDK re-reads.
+            let args = err.value(py).getattr("args").unwrap();
+            let message: String = args.get_item(0).unwrap().extract().unwrap();
+            assert!(message.starts_with("[SCP-OUTLET-"), "{message}");
+        });
     }
 
     // ------------------------------------------------------------------
