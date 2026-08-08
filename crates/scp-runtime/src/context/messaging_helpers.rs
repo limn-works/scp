@@ -1624,8 +1624,11 @@ pub async fn deliver_incoming(
 ///
 /// Returns [`ContextError::CryptoFailed`] if the payload is not a well-formed
 /// tagged checkpoint or the embedded sender does not match, and propagates the
-/// error from `compare_remote_checkpoint` (member-not-found or signature
-/// failure).
+/// error from `compare_remote_checkpoint` (member-not-found, signature failure,
+/// or an unreachable LOCAL authoritative event log). The last of those is a
+/// REFUSAL to judge, not a verdict: it surfaces to the receive path's error
+/// handling exactly like a signature failure does — it is never downgraded to
+/// `Consistent`, and it emits no `EquivocationDetected`.
 fn deliver_checkpoint_message(
     view: &mut ClassCMut,
     deps: &ActorDeps,
