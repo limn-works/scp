@@ -3671,7 +3671,9 @@ mod tests {
     // `apply_tier_change` — and assert the RUNNING arms follow it.
     // -----------------------------------------------------------------------
 
-    use crate::{DidPublisher, NodeDidPublisher, PublishedDidRecord, apply_tier_change};
+    use crate::{
+        DidPublisher, NodeDidDocument, NodeDidPublisher, PublishedDidRecord, apply_tier_change,
+    };
     use scp_did::DidDocument;
     use scp_identity::{DidMethod as _, ScpIdentity};
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
@@ -3783,11 +3785,12 @@ mod tests {
         // -- A NAT tier change: the node re-publishes with a new relay endpoint,
         //    producing a NEW (value, signature, seq). --
         let new_relay_url = "ws://203.0.113.42:8443/scp/v1";
-        let (_url, _doc) = apply_tier_change(
+        let node_document = NodeDidDocument::new(document);
+        let _url = apply_tier_change(
             &relay_url,
             new_relay_url,
             "test tier change",
-            &document,
+            &node_document,
             &publisher,
             &identity,
             None,

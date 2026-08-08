@@ -276,9 +276,15 @@ pub async fn health_handler(State(state): State<Arc<NodeState>>) -> impl IntoRes
 /// Returns an [`IdentityResponse`] with the node operator's DID string and
 /// full DID document.
 ///
+/// The document is read from the node's live `NodeDidDocument` slot per request,
+/// so after a NAT tier change (§10.12.1) this reports the document the node
+/// currently stands behind — carrying the NEW relay endpoint — rather than the
+/// build-time one. (No intra-doc link: the slot type is crate-private, like the
+/// `NodeState` field it lives on.)
+///
 /// See spec section 18.10.3.
 pub async fn identity_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
-    let document = serde_json::to_value(&state.did_document)
+    let document = serde_json::to_value(state.did_document.get())
         .unwrap_or_else(|_| serde_json::Value::String(state.did.clone()));
 
     (
@@ -629,7 +635,7 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_did::DidDocument {
+            did_document: crate::NodeDidDocument::new(scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:test123".to_owned(),
                 verification_method: vec![],
@@ -637,7 +643,7 @@ mod tests {
                 assertion_method: vec![],
                 also_known_as: vec![],
                 service: vec![],
-            },
+            }),
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,

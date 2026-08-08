@@ -219,11 +219,22 @@ impl RelayHandle {
 pub struct IdentityHandle {
     /// The SCP identity containing key handles and DID string.
     identity: ScpIdentity,
-    /// The published DID document.
-    document: DidDocument,
+    /// The node's live DID-document slot — shared with
+    /// [`http::NodeState::did_document`], never an independent copy, so a tier
+    /// change is visible here the instant it is applied. See
+    /// [`NodeDidDocument`].
+    document: NodeDidDocument,
 }
 
 impl IdentityHandle {
+    /// Binds an identity to the node's live DID-document slot.
+    ///
+    /// Takes the slot, never a `DidDocument`: a handle built from a document by
+    /// value would be a private copy that a NAT tier change leaves behind.
+    pub(crate) const fn new(identity: ScpIdentity, document: NodeDidDocument) -> Self {
+        Self { identity, document }
+    }
+
     /// Returns a reference to the underlying [`ScpIdentity`].
     #[must_use]
     pub const fn identity(&self) -> &ScpIdentity {
@@ -236,10 +247,16 @@ impl IdentityHandle {
         &self.identity.did
     }
 
-    /// Returns a reference to the published [`DidDocument`].
+    /// Returns the [`DidDocument`] the node currently stands behind.
+    ///
+    /// Read live from the node's document slot, so it reflects a NAT tier change
+    /// (§10.12.1) that re-pointed the `SCPRelay` service endpoint. Returned by
+    /// value rather than by reference precisely because it can change: a
+    /// `&DidDocument` would either pin the document for the borrow's lifetime or
+    /// hand back a build-time copy that goes stale on the next tier change.
     #[must_use]
-    pub const fn document(&self) -> &DidDocument {
-        &self.document
+    pub fn document(&self) -> DidDocument {
+        self.document.get()
     }
 }
 
@@ -2106,6 +2123,79 @@ impl TlsProvider for SelfSignedTlsProvider {
 // The node's DID-document publish seam (SCP-243, SCP-RELAYRES-004)
 // ---------------------------------------------------------------------------
 
+/// The node's live "DID document I currently stand behind" slot (§10.12.1).
+///
+/// # Why a shared slot and not a `DidDocument` field
+///
+/// The node's DID document is not immutable for the node's lifetime: the tier
+/// re-evaluation task (SCP-243) rewrites the `SCPRelay` service endpoint and
+/// re-publishes the document whenever the reachability tier changes
+/// ([`apply_tier_change`]). Every consumer that stored a `DidDocument` **by
+/// value** at build time therefore froze the pre-tier-change document and served
+/// a relay endpoint the node is no longer reachable at — the token-gated
+/// `GET /scp/dev/v1/identity` endpoint
+/// ([`identity_handler`](crate::dev_api::identity_handler)) and the public
+/// [`IdentityHandle::document`] accessor alike.
+///
+/// This is the same frozen-snapshot class as [`PublishedDidRecord`], one seam
+/// over, and it is fixed the same structural way: there is exactly ONE
+/// `DidDocument` in a running node, held here, and every reader holds a clone of
+/// *this slot* rather than a copy of its contents. A stale read is not something
+/// a caller has to avoid; it is unrepresentable.
+///
+/// # Not keyed off [`PublishedDidRecord`]
+///
+/// Deliberately a separate slot, not a projection of the published record. The
+/// document changes on a tier change even for a `DhtMode::Disabled` node, which
+/// publishes nothing at all — its [`PublishedDidRecord`] is `None` forever (the
+/// honest absent state), while its document still has to advance. Deriving the
+/// document from the published record would make a `Disabled` node's dev-API
+/// identity permanently stale, or force a synthesized record to paper over it.
+///
+/// # Only the update site writes it
+///
+/// [`set`](Self::set) is private to this module and its single caller is
+/// [`apply_tier_change`], which writes the slot in the same expression that
+/// produces the updated document — and does *not* return that document, so no
+/// call site can hold it, forward it, or forget to. There is no "remember to
+/// refresh the copy" step for a future path to miss.
+#[derive(Clone)]
+pub(crate) struct NodeDidDocument(Arc<tokio::sync::watch::Sender<DidDocument>>);
+
+impl NodeDidDocument {
+    /// A slot seeded with the document the node was built with.
+    pub(crate) fn new(document: DidDocument) -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(document)))
+    }
+
+    /// Records the document the node now stands behind.
+    ///
+    /// Private on purpose — see the type docs. `send_replace` (not `send`) so the
+    /// write never fails: this slot has readers rather than subscribers, and a
+    /// node whose `ApplicationNode` has been dropped while the tier task is still
+    /// unwinding must not lose the write to a "no receivers" error.
+    fn set(&self, document: DidDocument) {
+        self.0.send_replace(document);
+    }
+
+    /// The document the node currently stands behind.
+    ///
+    /// Cloned out rather than borrowed: a `watch` borrow guard held across an
+    /// `.await` would block every writer, and the callers here (an HTTP handler,
+    /// the tier task) are async.
+    pub(crate) fn get(&self) -> DidDocument {
+        self.0.borrow().clone()
+    }
+}
+
+impl std::fmt::Debug for NodeDidDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NodeDidDocument")
+            .field(&self.0.borrow().id)
+            .finish()
+    }
+}
+
 /// The node's live "signed BEP44 record I most recently published" slot
 /// (§3.10.5).
 ///
@@ -2555,11 +2645,27 @@ pub fn spawn_self_host_mapping_renewal(
     tokio::spawn(run_mapping_renewal_loop(mappers, port, cancel))
 }
 
-/// Handles a detected tier change: updates the DID document, re-publishes it
-/// through the node's publish seam, and emits the event only after the publish
-/// resolved. Returns the new URL and document on success.
+/// Handles a detected tier change: updates the node's DID document, re-publishes
+/// it through the node's publish seam, and emits the event only after the publish
+/// resolved. Returns the new URL on success.
 ///
-/// # Re-seeding the keep-alive is not this function's job
+/// # This is the node's ONLY DID-document update site
+///
+/// The updated document is not returned. It is written straight into the node's
+/// [`NodeDidDocument`] slot — the single `DidDocument` a running node holds — in
+/// the same expression that produced it. Every reader (the dev-API identity
+/// endpoint, [`IdentityHandle::document`], this function's own next invocation)
+/// reads that slot, so none of them can be looking at the pre-tier-change
+/// document. Returning it for the caller to store is exactly the frozen-snapshot
+/// defect: the caller's copy advances, every other copy does not.
+///
+/// The write lands on the success arm only, so a failed re-publish leaves the
+/// node standing behind the document it actually published. A
+/// `DhtMode::Disabled` node publishes nothing (`Ok(None)`) and is still a
+/// success: its reachability genuinely changed, so its document must advance
+/// even though no record exists to carry it.
+///
+/// # Re-seeding the keep-alive is not this function's job either
 ///
 /// Re-publishing produces a NEW `(value, signature, seq)`, and the running
 /// republish keep-alive must re-assert *that* record rather than the startup one.
@@ -2571,12 +2677,12 @@ async fn apply_tier_change(
     current_url: &str,
     new_relay_url: &str,
     trigger_reason: &str,
-    current_doc: &DidDocument,
+    document: &NodeDidDocument,
     publisher: &dyn DidPublisher,
     identity: &ScpIdentity,
     event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
-) -> Option<(String, DidDocument)> {
-    let mut updated_doc = current_doc.clone();
+) -> Option<String> {
+    let mut updated_doc = document.get();
     for svc in &mut updated_doc.service {
         if svc.service_type == "SCPRelay" && svc.service_endpoint == current_url {
             new_relay_url.clone_into(&mut svc.service_endpoint);
@@ -2584,6 +2690,12 @@ async fn apply_tier_change(
     }
     match publisher.publish(identity, &updated_doc).await {
         Ok(signed) => {
+            // The publish and the document update are ONE step. Splitting them
+            // (returning the document and trusting the caller to store it) is the
+            // frozen-snapshot defect this slot exists to make unrepresentable.
+            // Written before the event fires, so an observer woken by
+            // `TierChanged` that immediately reads the document sees the new one.
+            document.set(updated_doc);
             if let Some(entry) = signed {
                 tracing::info!(
                     new_url = %new_relay_url, did = %identity.did, sequence = entry.sequence,
@@ -2615,7 +2727,7 @@ async fn apply_tier_change(
                     })
                     .await;
             }
-            Some((new_relay_url.to_owned(), updated_doc))
+            Some(new_relay_url.to_owned())
         }
         Err(e) => {
             tracing::warn!(error = %e, "DID document republish failed after tier change");
@@ -2633,13 +2745,19 @@ async fn apply_tier_change(
 /// On each trigger, it calls `NatStrategy::select_tier()` and compares the
 /// result to the current tier. If the tier changed, it updates the DID
 /// document and republishes it, logging at INFO level.
+///
+/// `document` is the node's shared [`NodeDidDocument`] slot, not a copy: this
+/// task is the node's only DID-document writer, and every reader of the node's
+/// document (the dev-API identity endpoint, [`IdentityHandle::document`]) holds a
+/// clone of that same slot. The task keeps no `DidDocument` of its own, so there
+/// is nothing here that can drift from what the rest of the node serves.
 #[allow(clippy::too_many_arguments)]
 fn spawn_tier_reevaluation(
     nat_strategy: Arc<dyn NatStrategy>,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     publisher: Arc<dyn DidPublisher>,
     identity: ScpIdentity,
-    document: DidDocument,
+    document: NodeDidDocument,
     relay_port: u16,
     current_relay_url: String,
     event_tx: Option<tokio::sync::mpsc::Sender<NatTierChange>>,
@@ -2659,7 +2777,6 @@ fn spawn_tier_reevaluation(
         // closure captures it even though it is never read.
         let _done_tx = done_tx;
         let mut current_url = current_relay_url;
-        let mut current_doc = document;
         loop {
             let trigger_reason = tokio::select! {
                 () = tokio::time::sleep(reevaluation_interval) => {
@@ -2704,11 +2821,14 @@ fn spawn_tier_reevaluation(
                 tier = ?new_tier, reason = trigger_reason,
                 "reachability tier changed, updating DID document (§10.12.1)"
             );
-            if let Some((url, doc)) = apply_tier_change(
+            // The updated document goes straight into the shared slot; only the
+            // URL comes back, because only the URL is this loop's own state (it
+            // is what the next re-evaluation compares against).
+            if let Some(url) = apply_tier_change(
                 &current_url,
                 &new_relay_url,
                 trigger_reason,
-                &current_doc,
+                &document,
                 &*publisher,
                 &identity,
                 event_tx.as_ref(),
@@ -2716,7 +2836,6 @@ fn spawn_tier_reevaluation(
             .await
             {
                 current_url = url;
-                current_doc = doc;
             }
         }
     });
@@ -3288,6 +3407,12 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     .publish(&identity, &document)
     .await?;
 
+    // The node's single live DID document, shared by both readers below (see
+    // `NodeDidDocument`). Domain mode spawns NO tier re-evaluation
+    // (`tier_reeval: None`), so nothing writes this slot after construction —
+    // it is still a slot so a future update site cannot leave a reader behind.
+    let did_document = NodeDidDocument::new(document);
+
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
     // without restarting the server (spec section 18.6.3).
@@ -3325,10 +3450,9 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 
     // Build the production bridge auth lookup, hydrating from storage.
     // The audience URL is the HTTPS base URL for this node (spec 12.10.2).
-    let audience = format!("https://{domain}");
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
         Arc::clone(&storage),
-        audience,
+        format!("https://{domain}"),
     ));
     if let Err(e) = bridge_lookup.load_from_storage().await {
         tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
@@ -3355,7 +3479,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         projection_ucan_cache: std::sync::RwLock::new(projection::ProjectionUcanCache::new()),
         tls_config: Some(Arc::new(tls_server_config)),
         cert_resolver: Some(cert_resolver),
-        did_document: document.clone(),
+        did_document: did_document.clone(),
         connection_tracker,
         subscription_registry,
         acme_challenges,
@@ -3381,7 +3505,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
             bound_addr,
             shutdown_handle,
         },
-        identity: IdentityHandle { identity, document },
+        identity: IdentityHandle::new(identity, did_document),
         storage,
         state,
         tier_reeval: None,
@@ -3559,6 +3683,13 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     });
     publisher.publish(&identity, &document).await?;
 
+    // The node's single live DID document. The tier re-evaluation task below
+    // receives THIS slot (not a copy), and so do `NodeState` and the
+    // `IdentityHandle` — so a tier change that re-points the `SCPRelay` endpoint
+    // is visible to every reader the moment it is applied, with no copy left
+    // asserting the pre-change endpoint. See `NodeDidDocument`.
+    let did_document = NodeDidDocument::new(document);
+
     tracing::info!(
         tier = ?tier,
         relay_url = %relay_url,
@@ -3580,7 +3711,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
             network_detector,
             publisher,
             bg_identity,
-            document.clone(),
+            did_document.clone(),
             http_bind_addr.port(),
             relay_url.clone(),
             Some(tier_event_tx),
@@ -3618,7 +3749,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         projection_ucan_cache: std::sync::RwLock::new(projection::ProjectionUcanCache::new()),
         tls_config: None,
         cert_resolver: None,
-        did_document: document.clone(),
+        did_document: did_document.clone(),
         connection_tracker,
         subscription_registry,
         acme_challenges: None,
@@ -3645,7 +3776,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
             bound_addr,
             shutdown_handle,
         },
-        identity: IdentityHandle { identity, document },
+        identity: IdentityHandle::new(identity, did_document),
         storage,
         state,
         // `None` for both when the NAT probe was skipped: there is no
@@ -5806,7 +5937,7 @@ mod tests {
             None,
             Arc::clone(&publisher) as Arc<dyn DidPublisher>,
             identity,
-            document,
+            NodeDidDocument::new(document),
             32891,
             "ws://198.51.100.7:32891/scp/v1".to_owned(),
             Some(event_tx),
@@ -5894,7 +6025,7 @@ mod tests {
             Some(detector as Arc<dyn NetworkChangeDetector>),
             Arc::clone(&publisher) as Arc<dyn DidPublisher>,
             identity,
-            document,
+            NodeDidDocument::new(document),
             32891,
             "ws://198.51.100.7:32891/scp/v1".to_owned(),
             Some(event_tx),
@@ -5982,7 +6113,7 @@ mod tests {
             None,
             Arc::clone(&publisher) as Arc<dyn DidPublisher>,
             identity,
-            document,
+            NodeDidDocument::new(document),
             32891,
             "ws://198.51.100.7:32891/scp/v1".to_owned(),
             Some(event_tx),
@@ -6080,7 +6211,7 @@ mod tests {
             None,
             Arc::clone(&publisher) as Arc<dyn DidPublisher>,
             identity,
-            document,
+            NodeDidDocument::new(document),
             addr.port(),
             format!("ws://{addr}/scp/v1"),
             Some(event_tx),
@@ -6143,6 +6274,233 @@ mod tests {
         assert!(
             node.tier_change_rx.is_none(),
             "domain mode should NOT provide a tier change event channel"
+        );
+
+        node.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // The node's DID document is a LIVE slot, not a build-time snapshot
+    // (SCP-243 §10.12.1 / SCP-RELAYRES-004 — the frozen-snapshot class, one seam
+    // over from the republish arms: a stale read of NODE-LOCAL state).
+    //
+    // `apply_tier_change` re-points the document's `SCPRelay` endpoint on a NAT
+    // tier change. These tests drive a REAL tier change on a REAL node — real
+    // builder, real tier re-evaluation task, real publish seam — and assert the
+    // document the node SERVES carries the NEW endpoint, read back through the
+    // real `GET /scp/dev/v1/identity` handler and the public `IdentityHandle`
+    // accessor rather than by peeking at the field.
+    // -----------------------------------------------------------------------
+
+    /// The pre-tier-change relay endpoint these tests start at.
+    const TIER_CHANGE_OLD_URL: &str = "ws://198.51.100.7:32891/scp/v1";
+    /// The post-tier-change relay endpoint these tests expect to be served.
+    const TIER_CHANGE_NEW_URL: &str = "ws://203.0.113.42:8443/scp/v1";
+
+    /// Builds a no-domain `NodeConfig` whose NAT probe walks a STUN tier then a
+    /// `UPnP` tier (`TIER_CHANGE_OLD_URL` then `TIER_CHANGE_NEW_URL`), and whose
+    /// network-change detector is driven by the returned sender.
+    ///
+    /// The build path calls `select_tier` exactly once, so the first tier is the
+    /// node's startup tier and the sender triggers the re-evaluation that reaches
+    /// the second — a real tier change, without waiting out the 30-minute
+    /// production timer or reaching into the task.
+    fn tier_change_config(
+        dht: DhtMode,
+    ) -> (
+        NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage>,
+        tokio::sync::mpsc::Sender<()>,
+    ) {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        let (net_change_tx, net_change_rx) = tokio::sync::mpsc::channel(16);
+        let config = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht,
+            nat: NatSlot::Custom(Arc::new(SequenceNatStrategy::new(vec![
+                ReachabilityTier::Stun {
+                    external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+                },
+                ReachabilityTier::Upnp {
+                    external_addr: SocketAddr::from(([203, 0, 113, 42], 8443)),
+                },
+            ]))),
+            network_detector: Some(Arc::new(
+                scp_transport::nat::ChannelNetworkChangeDetector::new(net_change_rx),
+            )),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        };
+        (config, net_change_tx)
+    }
+
+    /// The `SCPRelay` endpoints in the document the node's token-gated
+    /// `GET /scp/dev/v1/identity` endpoint (spec §18.10.3) actually serves —
+    /// parsed out of the real handler's real JSON body, so this asserts what a
+    /// caller receives rather than what a field happens to hold.
+    async fn dev_api_relay_endpoints(state: &Arc<http::NodeState>) -> Vec<String> {
+        use axum::response::IntoResponse as _;
+
+        let response = crate::dev_api::identity_handler(axum::extract::State(Arc::clone(state)))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the dev API identity body is readable");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("the dev API identity response is JSON");
+        let document: DidDocument = serde_json::from_value(parsed["document"].clone())
+            .expect("the dev API serves a full DID document, not the DID-string fallback");
+        document.relay_service_urls()
+    }
+
+    /// Drives the node through one real tier change and returns once it has been
+    /// applied.
+    ///
+    /// The tier task writes the document slot BEFORE emitting `TierChanged`, so
+    /// awaiting the event is a happens-before edge for the document update — no
+    /// polling, no sleep.
+    async fn drive_tier_change<S: scp_platform::traits::Storage>(
+        node: &mut ApplicationNode<S>,
+        net_change_tx: &tokio::sync::mpsc::Sender<()>,
+    ) {
+        net_change_tx
+            .send(())
+            .await
+            .expect("the network-change detector is listening");
+        let event = tokio::time::timeout(
+            TEST_EVENT_TIMEOUT,
+            node.tier_change_rx()
+                .expect("a no-domain node streams tier changes")
+                .recv(),
+        )
+        .await
+        .expect("timed out waiting for the tier change")
+        .expect("the tier-change channel closed unexpectedly");
+        match event {
+            NatTierChange::TierChanged {
+                previous_relay_url,
+                new_relay_url,
+                ..
+            } => {
+                assert_eq!(previous_relay_url, TIER_CHANGE_OLD_URL);
+                assert_eq!(new_relay_url, TIER_CHANGE_NEW_URL);
+            }
+            other => panic!("expected TierChanged, got {other:?}"),
+        }
+    }
+
+    /// THE regression: a NAT tier change re-signs and re-publishes the node's DID
+    /// document with a NEW relay endpoint, and everything that serves that
+    /// document must serve THAT one.
+    ///
+    /// Against the pre-fix code this fails: `NodeState.did_document` was a
+    /// `DidDocument` captured at build time and never written again, so the
+    /// token-gated dev-API identity endpoint advertised the pre-tier-change relay
+    /// endpoint — an address the node is no longer reachable at — for the rest of
+    /// the node's life. `IdentityHandle::document` was the same frozen copy.
+    #[tokio::test]
+    async fn tier_change_updates_the_document_the_node_serves() {
+        let (config, net_change_tx) = tier_change_config(DhtMode::Production);
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("the no-domain node starts");
+
+        assert_eq!(
+            dev_api_relay_endpoints(&node.state).await,
+            vec![TIER_CHANGE_OLD_URL.to_owned()],
+            "the dev API starts on the build-time relay endpoint"
+        );
+        assert_eq!(
+            node.identity().document().relay_service_urls(),
+            vec![TIER_CHANGE_OLD_URL.to_owned()],
+            "so does the public identity handle"
+        );
+        let published_before = node
+            .published_did_record()
+            .expect("a publishing node signs a record at startup");
+
+        drive_tier_change(&mut node, &net_change_tx).await;
+
+        // The re-publish genuinely happened: a new signed record at a higher
+        // BEP44 sequence. Without this the document assertions below could pass
+        // on a change that was never published.
+        let published_after = node
+            .published_did_record()
+            .expect("the tier change re-published");
+        assert!(
+            published_after.sequence > published_before.sequence,
+            "the tier-change re-publish assigns a HIGHER sequence ({} -> {})",
+            published_before.sequence,
+            published_after.sequence
+        );
+        assert!(
+            String::from_utf8_lossy(&published_after.document_bytes).contains(TIER_CHANGE_NEW_URL),
+            "the re-published record carries the NEW relay endpoint"
+        );
+
+        assert_eq!(
+            dev_api_relay_endpoints(&node.state).await,
+            vec![TIER_CHANGE_NEW_URL.to_owned()],
+            "the dev API must serve the document the node NOW stands behind — a \
+             build-time copy here advertises an endpoint the node has moved off"
+        );
+        assert_eq!(
+            node.identity().document().relay_service_urls(),
+            vec![TIER_CHANGE_NEW_URL.to_owned()],
+            "the public identity handle reads the same live slot, so it cannot \
+             disagree with what the dev API serves"
+        );
+
+        node.shutdown();
+    }
+
+    /// The `DhtMode::Disabled` case: the node publishes NOTHING — its
+    /// `PublishedDidRecord` is `None` before and after — and its document must
+    /// STILL advance, because its reachability genuinely changed.
+    ///
+    /// This is why the document is its own slot rather than a projection of the
+    /// published record: keying it off `PublishedDidRecord` would leave a
+    /// not-discoverable-by-design node's dev-API identity permanently frozen at
+    /// the build-time endpoint, or force a synthesized record to paper over it.
+    #[tokio::test]
+    async fn tier_change_updates_the_document_on_a_disabled_node_that_publishes_nothing() {
+        let (config, net_change_tx) = tier_change_config(DhtMode::Disabled);
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("a DhtMode::Disabled node starts without publishing");
+
+        assert!(
+            node.published_did_record().is_none(),
+            "DhtMode::Disabled publishes nothing — the honest absent state"
+        );
+        assert_eq!(
+            dev_api_relay_endpoints(&node.state).await,
+            vec![TIER_CHANGE_OLD_URL.to_owned()],
+        );
+
+        drive_tier_change(&mut node, &net_change_tx).await;
+
+        assert!(
+            node.published_did_record().is_none(),
+            "the tier change must not make a non-publishing node publish"
+        );
+        assert_eq!(
+            dev_api_relay_endpoints(&node.state).await,
+            vec![TIER_CHANGE_NEW_URL.to_owned()],
+            "the document advances even though nothing was published — the node's \
+             reachability changed, and the dev API reports the node, not the DHT"
+        );
+        assert_eq!(
+            node.identity().document().relay_service_urls(),
+            vec![TIER_CHANGE_NEW_URL.to_owned()],
         );
 
         node.shutdown();
