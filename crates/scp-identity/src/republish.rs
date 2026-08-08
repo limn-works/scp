@@ -166,11 +166,26 @@ pub trait RelayPublisher: Send + Sync {
 /// Deriving the routing ID from the frame's own key — rather than accepting it
 /// as an independent argument — makes a frame/`routing_id` mismatch
 /// **unrepresentable**: a frame can only ever be published at the single routing
-/// ID its `public_key` binds to. That binding is exactly what a validating relay
-/// re-checks on PUBLISH (SCP-RELAYRES-003 `did_slot`, which derives it via the
-/// same [`did_from_ed25519_public_key`](crate::did_from_ed25519_public_key) +
-/// [`did_routing_id`]). The whole relay DID-record path is `did:dht`-specific
-/// (§9.10.12).
+/// ID its `public_key` binds to. The whole relay DID-record path is
+/// `did:dht`-specific (§9.10.12).
+///
+/// # The single source of truth for these bytes
+///
+/// This is the **one** derivation of the DID→`routing_id` bytes in the system.
+/// Both halves of the security control call it, and neither re-inlines it:
+///
+/// - the WRITE path — `TransportRelayPublisher` (SCP-RELAYRES-004) — to choose
+///   the PUBLISH address;
+/// - the relay ADMISSION check — `classify_did_record_frame` and
+///   `DidSlotRegistry::classify_stored_frame` (SCP-RELAYRES-003) — to re-derive
+///   the binding a candidate frame must satisfy.
+///
+/// The two MUST agree byte-for-byte forever: were they to drift, every self-DID
+/// republish would be rejected as a binding mismatch by every validating relay
+/// (a silent, total availability failure for DID resolution). Sharing one
+/// function makes that agreement structural rather than a convention that
+/// independent copies could quietly violate. Tests deliberately keep their own
+/// independent recomposition as an oracle; production code never does.
 #[must_use]
 pub fn did_record_routing_id(record: &DidRecordV1) -> [u8; 32] {
     did_routing_id(&crate::did_from_ed25519_public_key(record.public_key()))

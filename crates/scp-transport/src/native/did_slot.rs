@@ -96,7 +96,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 
-use scp_identity::{did_from_ed25519_public_key, did_routing_id};
+use scp_identity::republish::did_record_routing_id;
 use scp_protocol::envelope::did_record::DidRecordV1;
 use scp_relay_client::code;
 
@@ -474,7 +474,12 @@ impl DidSlotRegistry {
     #[must_use]
     fn classify_stored_frame(blob: &[u8]) -> Option<([u8; 32], u64)> {
         let frame = DidRecordV1::decode(blob).ok()?;
-        let routing_id = did_routing_id(&did_from_ed25519_public_key(frame.public_key()));
+        // ONE source of truth for the DID→routing_id bytes: the same
+        // `did_record_routing_id` the WRITE path publishes at
+        // (`scp_identity::republish`). The relay's admission binding and the
+        // publisher's address MUST agree byte-for-byte forever, so neither side
+        // re-inlines the derivation (SCP-RELAYRES-004).
+        let routing_id = did_record_routing_id(&frame);
         match classify_did_record_frame(&routing_id, blob) {
             DidRecordClass::Valid { seq } => Some((routing_id, seq)),
             _ => None,
@@ -855,6 +860,10 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
     use scp_dht::bep44_signable;
+    // Kept as a deliberate independent ORACLE: `genuine_frame` below recomposes
+    // the expected routing_id from a raw verifying key rather than calling the
+    // production `did_record_routing_id`, so a bug in that helper's composition
+    // cannot make these tests vacuously pass by being wrong on both sides.
     use scp_identity::{did_from_ed25519_public_key, did_routing_id};
     use scp_protocol::envelope::did_record::DidRecordV1;
     use sha2::{Digest, Sha256};

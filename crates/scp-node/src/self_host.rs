@@ -1522,6 +1522,32 @@ async fn self_did_republish_entry<D: DhtClient>(
 ///   infrastructure-not-yet-wired (disclosed here), not a deliberate user
 ///   disable.
 ///
+/// # Relay-arm activation is evaluated ONCE — re-drive this after binding
+///
+/// The `bound_relay_count()` test below runs exactly once, at serve startup,
+/// before any relay-client connection exists. There is no re-evaluation: the
+/// [`RepublishManager`] is constructed with the relay arm already enabled or
+/// already disabled and keeps that shape for the whole serve lifetime.
+///
+/// **Consequence for whoever wires the relay-client binding:** calling
+/// [`TransportRelayPublisher::bind`] on the shared publisher after this function
+/// has returned does *not* wake the relay arm. It stays dormant, silently,
+/// even though a live relay is now bound. Wiring the binding is therefore not
+/// complete until this activation is re-driven — either by calling
+/// `start_self_did_republishing` again once relays are bound (tearing down the
+/// manager it returned first), or by making the relay arm re-evaluate
+/// `bound_relay_count()` inside the running manager. Doing the bind alone ships
+/// a relay layer that looks wired and publishes nothing.
+///
+/// # Provenance for the pending bind
+///
+/// The unbound relay client is tracked by **#482** (relay-based DID resolution,
+/// Model B — `.docs/prds/relay-did-resolution.json`), which owns the relay
+/// resolution layer end to end. The gap is symmetric across both halves: the
+/// merged READ-path `TransportRelayQuerier` awaits the *same* binding, so one
+/// relay-client connection set (own + bootstrap relays, §18.5.1) lights up
+/// resolution and republishing together. No separate issue tracks it.
+///
 /// # Full dormancy — honest disclosure (do not read as active resilience)
 ///
 /// When the node has **no signed record to source** ([`self_did_republish_entry`]
@@ -1553,6 +1579,11 @@ async fn start_self_did_republishing<D: DhtClient + 'static>(
 
     // A record exists → the DHT keep-alive arm ALWAYS runs. The relay arm is
     // additive and runs only when a live relay is bound.
+    //
+    // ONE-SHOT: this test is evaluated exactly once, here. A later
+    // `TransportRelayPublisher::bind` does NOT wake a relay arm disabled below —
+    // whoever wires the relay client must re-drive this activation (see the
+    // "Relay-arm activation is evaluated ONCE" doc section above; #482).
     let mut config = RepublishConfig::default();
     if relay_publisher.bound_relay_count() > 0 {
         tracing::info!(
@@ -1565,12 +1596,16 @@ async fn start_self_did_republishing<D: DhtClient + 'static>(
         // avoids advertising an unserviceable task; no layer-disabled callback is
         // set, so no anti-segmentation opt-out warning fires (this is
         // infrastructure-not-yet-wired, disclosed here, not a user opt-out).
+        // This disable is permanent for this manager's lifetime — see ONE-SHOT
+        // above.
         config.disable_relay();
         tracing::info!(
             did = %did,
             "self-DID republishing active on the DHT (2h keep-alive) only; relay \
-             (6d) dormant — no relay transport bound (self-host relay-client \
-             wiring pending, mirrors the unbound READ-path TransportRelayQuerier)."
+             (6d) dormant for this manager's lifetime — no relay transport bound \
+             (self-host relay-client wiring pending under #482, mirrors the \
+             unbound READ-path TransportRelayQuerier). Binding a relay later does \
+             not wake this arm; re-drive start_self_did_republishing."
         );
     }
 
@@ -1669,11 +1704,12 @@ where
 
     // -- Self-DID republishing (SCP-RELAYRES-004, §3.10.2/§3.10.5/§3.10.6). The
     //    real TransportRelayPublisher (the `R` type parameter) is constructed
-    //    here; production has no relay-client to bind onto it yet (see
-    //    `start_self_did_republishing`), so the relay arm stays dormant while the
-    //    DHT keep-alive runs whenever a signed record exists. Driven below, once
-    //    the site is deployed and the public surface is open, so an early
-    //    build/deploy failure never leaves a republish task running. --
+    //    here; production has no relay-client to bind onto it yet (#482 — see
+    //    `start_self_did_republishing`, whose relay-arm activation is ONE-SHOT
+    //    and must be re-driven once that binding lands), so the relay arm stays
+    //    dormant while the DHT keep-alive runs whenever a signed record exists.
+    //    Driven below, once the site is deployed and the public surface is open,
+    //    so an early build/deploy failure never leaves a republish task running. --
     let relay_publisher = Arc::new(TransportRelayPublisher::new());
 
     let context_id = self_host_context_id(&node_did);
