@@ -27,6 +27,10 @@ subtle = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = "0.5"
+# Test-only: building `ContextEvent` fixtures needs the `DID` type. The
+# production surface of this crate carries DIDs as strings, so this stays a
+# dev-dependency.
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 
 [lints]
 workspace = true

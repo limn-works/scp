@@ -21,10 +21,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use napi_derive::napi;
+use scp_core::context::membership::ContextEvent;
 use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use scp_mcp::server::ContextProvider;
+use tokio::sync::broadcast;
 
 use crate::error::ScpNapiError;
 use crate::runtime::NapiBridgeInstance;
@@ -396,78 +398,38 @@ impl ContextProvider for McpNapiBridgeProvider {
     fn context_events(&self, _context_id: &str) -> serde_json::Value {
         serde_json::Value::Array(Vec::new())
     }
-
-    fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
-        Err("resource subscriptions require full relay integration".to_owned())
-    }
 }
 
 // ---------------------------------------------------------------------------
 // MCP stdio server loop
 // ---------------------------------------------------------------------------
 
+/// Runs the MCP server over stdio until the shutdown signal fires or stdin
+/// reaches EOF.
+///
+/// The read loop, the stdout writer, and the resource-subscription event pump
+/// all live in [`scp_mcp::stdio::run_stdio`]; this wrapper only owns the
+/// shutdown arm. Sharing that loop is what keeps JSON-RPC *notification*
+/// parsing correct (messages carrying no `id` never produce a response, and a
+/// bare `JsonRpcRequest` decode rejects them) and keeps stdout serialized
+/// between responses and subscription notifications.
+///
+/// `context_events` carries the honesty invariant: `Some` enables
+/// `resources/subscribe` and starts the delivery pump in the same step, `None`
+/// advertises `resources.subscribe: false` and rejects the request with a
+/// typed error. The capability is never advertised without the machinery.
 async fn run_mcp_stdio_server(
     server: Arc<Mutex<scp_mcp::server::McpServer<McpNapiBridgeProvider>>>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    context_events: Option<broadcast::Receiver<(String, ContextEvent)>>,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
     tokio::select! {
         _ = shutdown_rx => {}
-        () = async {
-            let stdin = tokio::io::stdin();
-            let mut stdout = tokio::io::stdout();
-            let mut reader = tokio::io::BufReader::new(stdin);
-            let mut line = String::new();
-
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                if line.len() as u64 > MAX_LINE_BYTES {
-                    break;
-                }
-
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let response = {
-                    let request: Result<scp_mcp::protocol::JsonRpcRequest, _> =
-                        serde_json::from_str(trimmed);
-                    match request {
-                        Ok(req) => {
-                            server
-                                .lock()
-                                .map_or(None, |mut srv| srv.handle_request(&req))
-                        }
-                        Err(e) => {
-                            Some(scp_mcp::protocol::JsonRpcResponse::error(
-                                scp_mcp::protocol::RequestId::Number(0),
-                                scp_mcp::protocol::JsonRpcError {
-                                    code: scp_mcp::protocol::PARSE_ERROR,
-                                    message: format!("failed to parse: {e}"),
-                                    data: None,
-                                },
-                            ))
-                        }
-                    }
-                };
-
-                if let Some(resp) = response
-                    && let Ok(json) = serde_json::to_string(&resp)
-                    && (stdout.write_all(json.as_bytes()).await.is_err()
-                        || stdout.write_all(b"\n").await.is_err()
-                        || stdout.flush().await.is_err())
-                {
-                    tracing::warn!("MCP stdio server: stdout write failed, stopping");
-                    break;
-                }
+        result = scp_mcp::stdio::run_stdio(&server, context_events) => {
+            if let Err(e) = result {
+                tracing::error!("MCP stdio server error: {e}");
             }
-        } => {}
+        }
     }
 }
 
@@ -512,10 +474,38 @@ pub(crate) async fn mcp_server_create_on(
     let server_clone = Arc::clone(&server);
     let transport_mode = config.transport.clone();
 
+    // Resource subscriptions are backed by the supervisor's context event
+    // broadcast channel. Subscribe *before* spawning so no event emitted
+    // between here and the transport loop starting is missed.
+    //
+    // `subscribe_events()` returns `None` only for a supervisor built without
+    // the channel; every NAPI supervisor path enables it (see
+    // `crate::runtime::build_supervisor_arc`). When it is `None` the transport
+    // advertises `resources.subscribe: false` and rejects
+    // `resources/subscribe` — the capability is honestly absent rather than
+    // accepted-and-never-delivered.
+    // Absence degrades only this capability: the server still serves `tools/*`
+    // and `resources/list|read`, and honestly advertises
+    // `resources.subscribe: false`. Serving is NOT failed outright — that
+    // would deny working functionality over an optional feature.
+    let context_events = match crate::runtime::supervisor(bi) {
+        Ok(supervisor) => supervisor.subscribe_events(),
+        Err(e) => {
+            tracing::warn!("MCP server: no supervisor attached ({e})");
+            None
+        }
+    };
+    if context_events.is_none() {
+        tracing::warn!(
+            "MCP server: no context event source — resource subscriptions \
+             will be advertised as unsupported and rejected if requested"
+        );
+    }
+
     let task_handle = crate::runtime().spawn(async move {
         match transport_mode.as_str() {
             "stdio" => {
-                run_mcp_stdio_server(server_clone, shutdown_rx).await;
+                run_mcp_stdio_server(server_clone, shutdown_rx, context_events).await;
             }
             "sse" => {
                 let provider = McpNapiBridgeProvider {
@@ -531,7 +521,9 @@ pub(crate) async fn mcp_server_create_on(
                     let _ = shutdown_rx.await;
                     sse_shutdown_trigger.shutdown();
                 });
-                let result = scp_mcp::sse::run_sse(sse_server, sse_config, sse_shutdown).await;
+                let result =
+                    scp_mcp::sse::run_sse(sse_server, sse_config, sse_shutdown, context_events)
+                        .await;
                 if let Err(e) = result {
                     tracing::error!("MCP SSE server error: {e}");
                 }
@@ -967,5 +959,196 @@ mod tests {
 
         let b_state = mcp_get_stdio_allowlist_on(&b).expect("snapshot b");
         assert!(!b_state.allowed.contains(&"custom-a".to_owned()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource subscriptions (#1341)
+    //
+    // `McpNapiBridgeProvider::subscribe_resource` is gone: the capability is
+    // no longer a provider concern. The transport owns it, and it is gated on
+    // holding a real `Supervisor` event receiver. These tests assert that
+    // honesty invariant from the NAPI side — advertisement and acceptance move
+    // together, and a wired bridge actually yields a receiver.
+    // -----------------------------------------------------------------------
+
+    use scp_mcp::protocol::{
+        JSONRPC_VERSION, METHOD_INITIALIZE, METHOD_NOT_FOUND, METHOD_RESOURCES_SUBSCRIBE,
+        METHOD_RESOURCES_UPDATED, RequestId,
+    };
+
+    const SUB_CTX: &str = "ctx-subscribe-napi";
+    const SUB_URI: &str = "scp://ctx-subscribe-napi/events";
+
+    /// Builds an `McpServer` over the real NAPI bridge provider — the exact
+    /// type `mcp_server_create_on` constructs.
+    fn napi_mcp_server() -> scp_mcp::server::McpServer<McpNapiBridgeProvider> {
+        scp_mcp::server::McpServer::new(McpNapiBridgeProvider {
+            agent_did: "did:test:napi-mcp-subscribe".to_owned(),
+            context_ids: vec![SUB_CTX.to_owned()],
+        })
+    }
+
+    fn mcp_request(method: &str, params: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: method.to_owned(),
+            params: Some(params),
+            id: RequestId::Number(1),
+        }
+    }
+
+    /// Completes the MCP handshake and returns the advertised
+    /// `capabilities.resources.subscribe` flag.
+    fn initialize_and_read_subscribe_flag(
+        server: &mut scp_mcp::server::McpServer<McpNapiBridgeProvider>,
+    ) -> bool {
+        let response = server
+            .handle_request(&mcp_request(
+                METHOD_INITIALIZE,
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "napi-test" },
+                }),
+            ))
+            .expect("initialize must produce a response");
+        let result = response.result.expect("initialize must succeed");
+        result["capabilities"]["resources"]["subscribe"]
+            .as_bool()
+            .expect("resources.subscribe must be advertised as a bool")
+    }
+
+    /// Negative half of #1341. With no event receiver wired — what
+    /// `run_stdio(.., None)` / `run_sse(.., None)` produce when
+    /// `Supervisor::subscribe_events()` yields `None` — the server must
+    /// advertise `resources.subscribe: false` AND reject
+    /// `resources/subscribe`. The replaced bridge behaviour advertised the
+    /// capability and then answered the call from the provider, so a client
+    /// could hold a subscription that would never fire.
+    #[test]
+    fn mcp_subscribe_rejected_when_no_event_source_wired_napi() {
+        let mut server = napi_mcp_server();
+        assert!(
+            !server.subscriptions_enabled(),
+            "a freshly constructed server must fail closed on subscriptions"
+        );
+        assert!(
+            !initialize_and_read_subscribe_flag(&mut server),
+            "an unwired server must advertise resources.subscribe: false"
+        );
+
+        let response = server
+            .handle_request(&mcp_request(
+                METHOD_RESOURCES_SUBSCRIBE,
+                serde_json::json!({ "uri": SUB_URI }),
+            ))
+            .expect("resources/subscribe must produce a response");
+        let error = response
+            .error
+            .expect("resources/subscribe must be rejected when no event source is wired");
+        assert_eq!(
+            error.code, METHOD_NOT_FOUND,
+            "rejection must be a typed method-not-found, got: {error:?}"
+        );
+        assert!(
+            !server.is_subscribed(SUB_URI),
+            "a rejected subscribe must not register a subscription"
+        );
+    }
+
+    /// Positive half of #1341. When `mcp_server_create_on` hands the transport
+    /// a live receiver, `run_stdio` / `run_sse` call `enable_subscriptions()`
+    /// (the call made directly here) in the same step that starts the pump.
+    /// The server then advertises the capability, accepts the subscription,
+    /// and `notifications_for_event` — the function the pump drives for each
+    /// received `ContextEvent` — emits a real
+    /// `notifications/resources/updated` for the subscribed URI.
+    #[test]
+    fn mcp_subscribe_delivers_notifications_when_event_source_wired_napi() {
+        let mut server = napi_mcp_server();
+        server.enable_subscriptions();
+        assert!(
+            initialize_and_read_subscribe_flag(&mut server),
+            "a wired server must advertise resources.subscribe: true"
+        );
+
+        let response = server
+            .handle_request(&mcp_request(
+                METHOD_RESOURCES_SUBSCRIBE,
+                serde_json::json!({ "uri": SUB_URI }),
+            ))
+            .expect("resources/subscribe must produce a response");
+        assert!(
+            response.error.is_none(),
+            "subscribe must succeed on a wired server, got: {:?}",
+            response.error
+        );
+        assert!(server.is_subscribed(SUB_URI));
+
+        // `ContextEvent::Expired` invalidates the events/members/tools
+        // resources, so the pump must push an update for the subscribed URI.
+        let notifications = server.notifications_for_event(SUB_CTX, &ContextEvent::Expired);
+        assert!(
+            notifications.iter().any(|n| {
+                n.method == METHOD_RESOURCES_UPDATED
+                    && n.params
+                        .as_ref()
+                        .and_then(|p| p.get("uri"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(SUB_URI)
+            }),
+            "a subscribed resource must receive notifications/resources/updated, got: {notifications:?}"
+        );
+    }
+
+    /// Wiring guard for #1341: `mcp_server_create_on` sources its receiver
+    /// from `Supervisor::subscribe_events()`. Every NAPI supervisor path
+    /// enables the broadcast channel (`build_supervisor_arc`), so that call
+    /// must yield `Some` — were it to regress to `None`, a fully-wired bridge
+    /// would silently downgrade to advertising `resources.subscribe: false`.
+    #[test]
+    fn supervisor_yields_context_event_receiver_for_mcp_napi() {
+        let bi = NapiBridgeInstance::new_napi();
+        crate::runtime::init_supervisor_for_test_on(&bi);
+
+        let supervisor =
+            crate::runtime::supervisor(&bi).expect("supervisor must be attached after init");
+        assert!(
+            supervisor.subscribe_events().is_some(),
+            "the NAPI supervisor must expose a context event receiver so MCP \
+             resource subscriptions are wired rather than advertised-and-dropped"
+        );
+    }
+
+    /// A missing `Supervisor` degrades ONLY the subscription capability — it
+    /// must not fail MCP serving outright.
+    ///
+    /// `tools/*` and `resources/list|read` are served from the FFI bridge
+    /// state, not the supervisor, so denying them over an unavailable optional
+    /// feature would be a regression. The honest outcome is
+    /// `resources.subscribe: false` plus a typed rejection of
+    /// `resources/subscribe` — never a silent accept.
+    #[test]
+    fn missing_supervisor_degrades_subscriptions_not_the_whole_server_napi() {
+        let bi = NapiBridgeInstance::new_napi();
+
+        // No supervisor attached: the event source resolves to `None` rather
+        // than propagating an error out of MCP serve.
+        assert!(
+            crate::runtime::supervisor(&bi).is_err(),
+            "precondition: this instance has no supervisor attached"
+        );
+
+        // The resolution `mcp_server_create_on` performs must yield `None`,
+        // NOT propagate the error — that is what keeps serving alive. The
+        // honest `subscribe: false` + typed rejection that follows from `None`
+        // is covered by `mcp_subscribe_rejected_when_no_event_source_wired_napi`.
+        let context_events = crate::runtime::supervisor(&bi)
+            .ok()
+            .and_then(|supervisor| supervisor.subscribe_events());
+        assert!(
+            context_events.is_none(),
+            "an unattached supervisor must degrade to no event source"
+        );
     }
 }

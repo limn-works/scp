@@ -5398,6 +5398,7 @@ dependencies = [
  "axum",
  "scp-clock",
  "scp-core",
+ "scp-did",
  "serde",
  "serde_json",
  "subtle",

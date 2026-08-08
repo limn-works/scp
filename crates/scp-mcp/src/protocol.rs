@@ -11,7 +11,8 @@
 //!   [`ToolsCallParams`], [`ToolsCallResult`], [`ToolDefinition`].
 //! - **MCP resource messages:** [`ResourcesListParams`],
 //!   [`ResourcesListResult`], [`ResourcesReadParams`],
-//!   [`ResourcesReadResult`], [`ResourcesSubscribeParams`].
+//!   [`ResourcesReadResult`], [`ResourcesSubscribeParams`],
+//!   [`ResourcesUnsubscribeParams`], [`ResourcesUpdatedParams`].
 //! - **Standard error codes** for JSON-RPC and MCP-specific errors.
 //!
 //! All types derive `Serialize` and `Deserialize` via `serde_json`.
@@ -222,6 +223,18 @@ pub const METHOD_RESOURCES_READ: &str = "resources/read";
 
 /// MCP method: `resources/subscribe` -- subscribe to resource updates.
 pub const METHOD_RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
+
+/// MCP method: `resources/unsubscribe` -- cancel a resource subscription.
+pub const METHOD_RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
+
+/// MCP notification: `notifications/resources/updated` -- a subscribed
+/// resource changed.
+///
+/// Sent by the server to clients that hold a subscription for the named URI
+/// (established via [`METHOD_RESOURCES_SUBSCRIBE`]). Carries only the `uri`;
+/// the client re-reads the resource with [`METHOD_RESOURCES_READ`] to obtain
+/// the new contents.
+pub const METHOD_RESOURCES_UPDATED: &str = "notifications/resources/updated";
 
 /// MCP notification: `notifications/tools/list_changed` -- tool list updated.
 pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
@@ -539,6 +552,20 @@ pub struct ResourcesReadResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourcesSubscribeParams {
     /// The URI of the resource to subscribe to.
+    pub uri: String,
+}
+
+/// Parameters for `resources/unsubscribe`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourcesUnsubscribeParams {
+    /// The URI of the resource to stop receiving updates for.
+    pub uri: String,
+}
+
+/// Parameters for the `notifications/resources/updated` notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourcesUpdatedParams {
+    /// The URI of the resource that changed.
     pub uri: String,
 }
 
