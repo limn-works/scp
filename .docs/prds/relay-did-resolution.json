@@ -1,6 +1,6 @@
 {
   "project": "Relay-Based DID Resolution (Model B) — issue #482",
-  "description": "Build the SCP relay-based DID resolution layer (Layer 1, §3.10.2), the primary layer of the dual-layer resolution architecture (§3.10) alongside the existing Mainline DHT fallback (Layer 2). This is issue #482 — a FEATURE, NOT ADR-062 dev-backend cleanup. ADR-062's Slice 11 (SCP-CAPINJECT-011) only severs the InMemoryRelayPublisher default type param; this PRD builds the actual capability. Model B (spec commit aa0722f2b): DID documents ride in a minimal fixed-layout DID-record relay frame (§9.10.12 `DidRecordV1`: version‖public_key‖seq‖signature‖value) carried as a RAW relay blob over the EXISTING PUBLISH/QUERY operations (ADR-004) — no new wire types. Trust is client-side: the resolver re-verifies every record's BEP44 signature against the key derived from the DID string itself (§9.6.1), never the frame-supplied public_key or the relay's acceptance. An SCP-native relay MAY OPTIONALLY validate each frame it stores (decode → DID→routing_id binding → BEP44 signature, cheapest-first) and keep a single highest-sequence slot per routing_id (slot-exclusivity), which delivers the §3.10.8 suppression resistance; foreign/non-validating transports store the frame opaquely and stay correct via client-side verification, the DHT, and multi-relay publishing. Five stories: 001 the DidRecordV1 frame primitive (scp-protocol, wasm-safe, byte-deterministic); 002 the READ path (transport publish_raw/query_raw + TransportRelayQuerier + completing/correcting the #2226 RealMultiRelayQuerier composer to highest-seq-valid selection without dropping the genuine blob); 003 relay-side validation + slot-exclusivity (with the companion ADR-004 storage-semantics update the spec mandates); 004 the WRITE path (real RelayPublisher + production RepublishManager wiring + the republish-loop signature/sequence-drop fix, republish.rs:703); 005 the publish→resolve round-trip + slot-exclusivity/flood regression tests. #2226 (RealMultiRelayQuerier composer) is already merged on main and RETAINED — #482 completes and corrects it, it does not delete it. Pre-rotation/create-ceremony production activation is a SEPARATE dependency (RFC #2130 / #1729) and is NOT required here. Forward-only DAG.",
+  "description": "Build the SCP relay-based DID resolution layer (Layer 1, §3.10.2), the primary layer of the dual-layer resolution architecture (§3.10) alongside the existing Mainline DHT fallback (Layer 2). This is issue #482 — a FEATURE, NOT ADR-062 dev-backend cleanup. ADR-062's Slice 11 (SCP-CAPINJECT-011) only severs the InMemoryRelayPublisher default type param; this PRD builds the actual capability. Model B (spec commit aa0722f2b): DID documents ride in a minimal fixed-layout DID-record relay frame (§9.10.12 `DidRecordV1`: version‖public_key‖seq‖signature‖value) carried as a RAW relay blob over the EXISTING PUBLISH/QUERY operations (ADR-004) — no new wire types. Trust is client-side: the resolver re-verifies every record's BEP44 signature against the key derived from the DID string itself (§9.6.1), never the frame-supplied public_key or the relay's acceptance. An SCP-native relay MAY OPTIONALLY validate each frame it stores (decode → DID→routing_id binding → BEP44 signature, cheapest-first) and keep a single highest-sequence slot per routing_id (slot-exclusivity), which delivers the §3.10.8 suppression resistance; foreign/non-validating transports store the frame opaquely and stay correct via client-side verification, the DHT, and multi-relay publishing. Eight stories: 001 the DidRecordV1 frame primitive (scp-protocol, wasm-safe, byte-deterministic); 002 the READ path (transport publish_raw/query_raw + TransportRelayQuerier + completing/correcting the #2226 RealMultiRelayQuerier composer to highest-seq-valid selection without dropping the genuine blob); 003 relay-side validation + slot-exclusivity (with the companion ADR-004 storage-semantics update the spec mandates); 004 the WRITE path (real RelayPublisher + production RepublishManager wiring + the republish-loop signature/sequence-drop fix, republish.rs:703); 005 the publish→resolve round-trip + slot-exclusivity/flood regression tests; 006 the RELAY-CLIENT BINDING — the seam BOTH halves were silently waiting on (the merged TransportRelayQuerier had zero production construction sites and the TransportRelayPublisher was constructed with nothing bound, so neither half was reachable in production; the shipped code justified this with a comment claiming \"#482 owns the relay-client binding end to end. No separate issue tracks it\", but #482 IS this PRD and no story covered it — phantom provenance, now corrected by 006); 007 the EXTERNAL/BOOTSTRAP relay set (NodeConfig has no relay-URL field and the §18.5.1 five-level chain in DefaultRelayResolver/FALLBACK_RELAYS has zero production callers); 008 the §3.10.5 step 3a relay PUBLISH at DID create/update, which no story in any PRD owned — 004 owns the republish cycle (step 4) only, and the BEP44 signed record is currently discarded by the signing step and read back off the DHT, which is why a DhtMode::Disabled node is fully dormant. Gate numbering is declaration order, not execution order: the DAG is 001 → 002 → {003, 004}, 004 → 006 → {007, 008}, {003, 008} → 005. #2226 (RealMultiRelayQuerier composer) is already merged on main and RETAINED — #482 completes and corrects it, it does not delete it. Pre-rotation/create-ceremony production activation is a SEPARATE dependency (RFC #2130 / #1729) and is NOT required here. Forward-only DAG.",
   "gates": [
     {
       "id": "gate-relayres-1",
@@ -36,6 +36,27 @@
       "stories": [
         "SCP-RELAYRES-005"
       ]
+    },
+    {
+      "id": "gate-relayres-6",
+      "name": "Relay-client binding (one connection set feeding both the READ and WRITE halves)",
+      "stories": [
+        "SCP-RELAYRES-006"
+      ]
+    },
+    {
+      "id": "gate-relayres-7",
+      "name": "External + bootstrap relay set (§18.5.1 priority chain, NodeConfig relay URLs)",
+      "stories": [
+        "SCP-RELAYRES-007"
+      ]
+    },
+    {
+      "id": "gate-relayres-8",
+      "name": "DID create/update relay PUBLISH (§3.10.5 step 3a, signed-record surfacing)",
+      "stories": [
+        "SCP-RELAYRES-008"
+      ]
     }
   ],
   "stories": [
@@ -45,7 +66,7 @@
       "gate": "gate-relayres-1",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/envelope/did_record.rs",
         "crates/scp-protocol/src/envelope/mod.rs"
@@ -82,7 +103,8 @@
       "details": {
         "phase": "2",
         "feature": "issue #482 — relay-based DID resolution (Model B)",
-        "model": "Model B (spec commit aa0722f2b)"
+        "model": "Model B (spec commit aa0722f2b)",
+        "merged": "3009a36f0 on origin/main — feat(scp-protocol): DidRecordV1 relay DID-record frame — deterministic encode/decode (SCP-RELAYRES-001) (#2241); crates/scp-protocol/src/envelope/did_record.rs present on origin/main"
       }
     },
     {
@@ -91,7 +113,7 @@
       "gate": "gate-relayres-2",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/traits.rs",
         "crates/scp-transport/src/native/adapter.rs",
@@ -138,7 +160,9 @@
       "details": {
         "phase": "2",
         "feature": "issue #482 — relay-based DID resolution (Model B)",
-        "builds_on": "#2226 RealMultiRelayQuerier composer (merged on main, RETAINED + corrected — not deleted)"
+        "builds_on": "#2226 RealMultiRelayQuerier composer (merged on main, RETAINED + corrected — not deleted)",
+        "merged": "a6fe8d390 on origin/main — feat(relay-res): READ path — raw-blob transport + TransportRelayQuerier + query-terminator fix (SCP-RELAYRES-002, #482) (#2254); crates/scp-transport/src/native/relay_querier.rs present on origin/main",
+        "shipped_without_production_caller": "HONEST RESIDUE: 002 shipped the TransportRelayQuerier TYPE with ZERO production construction sites — production DID resolution still runs NoOpRelayQuerier (crates/scp-node/src/self_host.rs build_shared_cache_key_resolver). The READ path is not reachable in production until the relay-client binding lands (SCP-RELAYRES-006). 002 is 'done' for the type + composer it defined, not for relay reachability."
       }
     },
     {
@@ -147,7 +171,7 @@
       "gate": "gate-relayres-3",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/did_record_validation.rs",
         "crates/scp-transport/src/relay/mod.rs",
@@ -196,7 +220,8 @@
       "details": {
         "phase": "2",
         "feature": "issue #482 — relay-based DID resolution (Model B)",
-        "companion": "ADR-004 storage-semantics update (slot-exclusive DID-domain routing_ids) — spec-mandated upstream dependency, done as step 1 of this story"
+        "companion": "ADR-004 storage-semantics update (slot-exclusive DID-domain routing_ids) — spec-mandated upstream dependency, done as step 1 of this story",
+        "merged": "3b2460f95 on origin/main — feat(relay-res): relay-side DID-record validation + slot-exclusivity (SCP-RELAYRES-003, #482) (#2270); crates/scp-transport/src/relay/did_record_validation.rs + the ADR-004 'DID-Record Slot-Exclusivity' subsection present on origin/main"
       }
     },
     {
@@ -205,20 +230,20 @@
       "gate": "gate-relayres-4",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/native/relay_publisher.rs",
         "crates/scp-transport/src/native/mod.rs",
         "crates/scp-identity/src/republish.rs",
         "crates/scp-node/src/self_host.rs"
       ],
-      "description": "The WRITE half of relay resolution (§3.10.5). No production RelayPublisher exists today — only the (now test-harness-only, per SCP-CAPINJECT-011) InMemoryRelayPublisher — and the relay-republish loop DROPS the signature and sequence: at republish.rs:703 it publishes bare `entry.document_bytes` rather than the DID-record frame, even though `RepublishEntry` already carries `public_key`, `signature`, and `sequence` (republish.rs:340). This story: (a) implement a real production `RelayPublisher` in scp-transport that wraps `(public_key, seq, signature, value=document_bytes)` into a `DidRecordV1` frame (SCP-RELAYRES-001) and PUBLISHes the frame bytes at the DID routing_id via the `publish_raw` transport path (SCP-RELAYRES-002) — the DID relay blob MUST be the DidRecordV1 frame, not the bare document bytes and not an OuterEnvelope (§9.10.12 publish contract); (b) FIX the relay-republish loop (republish.rs:703) to build and publish the full DidRecordV1 frame from the RepublishEntry's (public_key, signature, sequence, document_bytes), so signature and sequence are no longer dropped; (c) wire a PRODUCTION `RepublishManager` with the real RelayPublisher at the node/self-host construction site (crates/scp-node/src/self_host.rs), adding the relay republishing cycle (every 6 days, blob_ttl 7 days with a 1-day margin, §3.10.2/§3.10.5) alongside the existing 2-hour DHT cycle — so a node actually publishes its own DID document to relays. This is the story that makes DID records reach relays at all. The InMemoryRelayPublisher default was already severed + demoted to test-harness-only by SCP-CAPINJECT-011 (cross-PRD dependency); this story supplies the real R the severed API now requires. Publishing to both layers stays a MUST (§3.10.6 anti-segmentation) — the relay cycle is additive to the DHT cycle, not a replacement.",
+      "description": "The WRITE-path MACHINERY for relay resolution (§3.10.5) — NOT relay reachability. Read the scope boundary first: this story builds the publisher, fixes the republish loop, and constructs the production `RepublishManager`. It does NOT make DID records reach relays, because nothing in it establishes a relay-CLIENT connection to bind onto the publisher. That binding is SCP-RELAYRES-006, for which this story is a prerequisite and which delivers the end-to-end reachability. An earlier revision of this description claimed the story wired the manager \"so a node actually publishes its own DID document to relays\" and was \"the story that makes DID records reach relays at all\" — that claim was FALSE and is retracted: with zero bound relays every relay publish fails closed (`IdentityError::RelayPublishFailed`), and the shipped production `RepublishManager` gated its relay arm on a ONE-SHOT `bound_relay_count()` test evaluated at construction, before any relay client could exist — an arm that could never be true and could never be woken. This story: (a) implement a real production `RelayPublisher` in scp-transport that wraps `(public_key, seq, signature, value=document_bytes)` into a `DidRecordV1` frame (SCP-RELAYRES-001) and PUBLISHes the frame bytes at the DID routing_id via the `publish_raw` transport path (SCP-RELAYRES-002) — the DID relay blob MUST be the DidRecordV1 frame, not the bare document bytes and not an OuterEnvelope (§9.10.12 publish contract); (b) FIX the relay-republish loop (republish.rs:703) to build and publish the full DidRecordV1 frame from the RepublishEntry's (public_key, signature, sequence, document_bytes), so signature and sequence are no longer dropped; (c) wire a PRODUCTION `RepublishManager` with the real RelayPublisher at the node/self-host construction site (crates/scp-node/src/self_host.rs), adding the 6-day relay republish cycle (blob_ttl 7 days, 1-day margin, §3.10.2/§3.10.5) alongside the existing 2-hour DHT cycle, with the relay arm re-evaluating `TransportRelayPublisher::bound_relay_count()` on EVERY relay tick — never latched off at construction. Per-tick re-evaluation is the root-cause fix for the unreachable arm: the arm goes live the moment SCP-RELAYRES-006 binds a relay, with no manager reconstruction and no re-drive. Until then each 6-day tick logs an honest \"no relay bound\" and publishes nothing — an honest absent state, never a silent disable and never a phantom success. `RepublishConfig::disable_relay()` is reserved for a DELIBERATE user opt-out (§3.10.6, which requires a warning); an unwired layer is not one, so the production path MUST NOT call it. The InMemoryRelayPublisher default was already severed + demoted to test-harness-only by SCP-CAPINJECT-011 (cross-PRD dependency); this story supplies the real R the severed API now requires. Publishing to both layers stays a MUST (§3.10.6 anti-segmentation) — the relay cycle is additive to the DHT cycle, not a replacement. Relay PUBLISH at DID create/update (§3.10.5 step 3a) is SCP-RELAYRES-008, not this story: this story owns the REPUBLISH cycle only.",
       "acceptanceCriteria": [
         "Real production RelayPublisher in scp-transport: `grep -rn 'impl RelayPublisher for' crates/scp-transport/src` matches a real (non-InMemory, non-test) publisher that DidRecordV1-encodes `(public_key, seq, signature, value)` and calls `publish_raw` (grep both the DidRecordV1 encode and the publish_raw call); module registered in native/mod.rs.",
         "Republish loop publishes the full frame (signature/sequence no longer dropped): a test drives the relay-republish path with a recording publisher and asserts the published blob decodes via `DidRecordV1::decode` into the SAME (public_key, signature, seq) and value=document_bytes as the source `RepublishEntry` — proving republish.rs:703 no longer publishes bare `document_bytes`; `grep -n 'document_bytes' crates/scp-identity/src/republish.rs` shows the loop wraps it in a frame (the publish call no longer passes bare document_bytes as the blob).",
-        "Production RepublishManager wired with the real publisher + 6-day relay cycle: crates/scp-node/src/self_host.rs constructs a `RepublishManager` with the real scp-transport `RelayPublisher` (grep the construction naming the real publisher type as `R`), and the relay republish interval is the 6-day cycle (§3.10.2/§3.10.5) — a test asserts a node schedules relay republishing alongside the existing DHT cycle.",
-        "DID record reaches the relay as a frame: an integration test has a node publish its own DID document and asserts the blob stored at `did_routing_id` decodes as a valid DidRecordV1 whose (value, signature, seq) verifies against the node's DID-derived key (§9.10.12 publish contract; the blob is the frame, never bare bytes or an OuterEnvelope).",
-        "Both-layer publish preserved (§3.10.6): a test asserts the production RepublishManager publishes to BOTH the DHT (existing 2-hour cycle) and the relay (new 6-day cycle) — the relay cycle is additive, not a replacement (anti-segmentation invariant).",
+        "Production RepublishManager wired with the real publisher + 6-day relay cycle, relay arm NEVER latched off: crates/scp-node/src/self_host.rs constructs the `RepublishManager` naming the real scp-transport `TransportRelayPublisher` as its `R` type parameter (grep the construction), the relay republish interval is the 6-day cycle (518400s, §3.10.2/§3.10.5), and `grep -n 'disable_relay' crates/scp-node/src/self_host.rs` returns 0 matches — the production path never disables the relay arm. A test constructs the manager through the production `start_self_did_republishing` entry point with ZERO relays bound, then binds a relay on the SAME shared publisher instance afterwards, and asserts the NEXT relay tick publishes a DidRecordV1 frame — proving the arm re-evaluates `bound_relay_count()` per tick and a later bind wakes it without reconstruction (the one-shot latch is gone).",
+        "Zero bound relays fails closed and stays honest — never a phantom success, never a silent opt-out: a test drives a relay tick with no relay bound and asserts (i) the RelayPublisher returns `IdentityError::RelayPublishFailed` (no phantom Ok), (ii) the manager still has the relay arm ENABLED (`RepublishConfig::disable_relay()` was not applied by the production path), and (iii) no §3.10.6 layer-disabled opt-out warning is emitted (an unbound layer is not a user opt-out). End-to-end production reachability — a relay bound by PRODUCTION code with a frame landing in its blob store — is asserted by SCP-RELAYRES-006; this story structurally cannot satisfy it and does not claim to.",
+        "Both-layer publish preserved (§3.10.6): a test drives the production `start_self_did_republishing` with a signed record present and asserts BOTH arms are scheduled — the existing DHT 2-hour cycle AND the relay 6-day cycle — with neither arm disabled by the production path (the relay cycle is additive, not a replacement; anti-segmentation invariant).",
         "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
@@ -226,7 +251,8 @@
         "Create crates/scp-transport/src/native/relay_publisher.rs implementing a real `RelayPublisher` (impl the scp-identity `RelayPublisher` trait): DidRecordV1-wrap (public_key, seq, signature, value) and PUBLISH via publish_raw at the DID routing_id; register in native/mod.rs.",
         "Fix crates/scp-identity/src/republish.rs relay-republish loop (:703) to build a DidRecordV1 frame from the RepublishEntry (public_key, signature, sequence, document_bytes) and publish the frame bytes — stop publishing bare document_bytes.",
         "Wire a production RepublishManager<Dht, TransportRelayPublisher> at crates/scp-node/src/self_host.rs with the real relay publisher and the 6-day relay republish cycle alongside the 2-hour DHT cycle.",
-        "Write the real-publisher frame-encode, republish-loop full-frame, production-wiring, and both-layer-publish tests; run full CI + review roster."
+        "Make the relay arm re-evaluate `TransportRelayPublisher::bound_relay_count()` on every relay tick instead of once at construction; delete the one-shot `config.disable_relay()` branch and the \"Relay-arm activation is evaluated ONCE\" / \"Provenance for the pending bind\" doc blocks in `start_self_did_republishing` (the latter cites a non-existent story — the binding is now SCP-RELAYRES-006).",
+        "Write the real-publisher frame-encode, republish-loop full-frame, per-tick-reactivation, fail-closed-with-no-relay, and both-layer-scheduled tests; run full CI + review roster."
       ],
       "blockedBy": [
         "SCP-RELAYRES-002",
@@ -250,7 +276,9 @@
         "phase": "2",
         "feature": "issue #482 — relay-based DID resolution (Model B)",
         "cross_prd_dep": "SCP-CAPINJECT-011 severs+demotes the InMemoryRelayPublisher default; this story supplies the real publisher the severed API requires",
-        "pre_rotation_note": "pre-rotation / create-ceremony production activation (RFC #2130 / #1729) is a SEPARATE dependency, NOT required here"
+        "pre_rotation_note": "pre-rotation / create-ceremony production activation (RFC #2130 / #1729) is a SEPARATE dependency, NOT required here",
+        "does_not_deliver": "relay reachability. No relay-client connection is established by this story, so with zero bound relays every relay publish fails closed. SCP-RELAYRES-006 delivers the binding; SCP-RELAYRES-007 the external/bootstrap relay set; SCP-RELAYRES-008 the create/update relay leg.",
+        "retracted_claim": "The prior description's \"This is the story that makes DID records reach relays at all\" was phantom provenance and is retracted (the shipped code justified the dead relay arm with a comment claiming \"#482 owns the relay-client binding end to end. No separate issue tracks it\" — #482 IS this PRD, which had no such story until SCP-RELAYRES-006)."
       }
     },
     {
@@ -264,7 +292,7 @@
         "crates/scp-testing/tests/integration/relay_did_resolution.rs",
         "crates/scp-testing/tests/integration/mod.rs"
       ],
-      "description": "Integration coverage proving the READ + WRITE halves interoperate and the relay layer delivers the §3.10.8 suppression resilience it claims. Only both halves together restore that resilience (a real querier reading relays a real publisher actually populates), so this story exercises the full loop across a validating SCP-native relay. Tests: (1) RELAY-ONLY publish→resolve round-trip — publish a DID document ONLY to a relay (not the DHT) via the real RelayPublisher (SCP-RELAYRES-004) and resolve it back via the real TransportRelayQuerier + RealMultiRelayQuerier composer through the DualLayerResolver (SCP-RELAYRES-002), asserting the resolved document is byte-identical and verifies (§3.10.4/§3.10.5); (2) DUAL-LAYER suppression resilience — suppression on one layer is defeated by the other; with the record on a relay and the DHT, dropping either still resolves (§3.10.8); (3) FLOOD inert on a validating relay — junk frame (malformed/wrong-binding/bad-sig), valid-looking frame with stale/equal seq, non-frame opaque junk, and pre-seeded junk are ALL inert against the single highest-seq slot (SCP-RELAYRES-003), and the genuine record still resolves (§3.10.8 four flood variants); (4) DhtMode::Disabled node — a Disabled node (DHT arm off) publishes its OWN DID to a relay and resolves its own DID back via the relay, AND resolves a PEER's DID published to a relay (this completes the A2 self-DID + peer resolution path noted in SCP-CAPINJECT-001 / ADR-062 A2↔A4 sequencing, which relay resolution — this feature — brings online).",
+      "description": "Integration coverage proving the READ + WRITE halves interoperate and the relay layer delivers the §3.10.8 suppression resilience it claims. Only both halves together restore that resilience (a real querier reading relays a real publisher actually populates), so this story exercises the full loop across a validating SCP-native relay. Tests: (1) RELAY-ONLY publish→resolve round-trip — publish a DID document ONLY to a relay (not the DHT) via the real RelayPublisher (SCP-RELAYRES-004) and resolve it back via the real TransportRelayQuerier + RealMultiRelayQuerier composer through the DualLayerResolver (SCP-RELAYRES-002), asserting the resolved document is byte-identical and verifies (§3.10.4/§3.10.5); (2) DUAL-LAYER suppression resilience — suppression on one layer is defeated by the other; with the record on a relay and the DHT, dropping either still resolves (§3.10.8); (3) FLOOD inert on a validating relay — junk frame (malformed/wrong-binding/bad-sig), valid-looking frame with stale/equal seq, non-frame opaque junk, and pre-seeded junk are ALL inert against the single highest-seq slot (SCP-RELAYRES-003), and the genuine record still resolves (§3.10.8 four flood variants); (4) DhtMode::Disabled node — a Disabled node (DHT arm off) publishes its OWN DID to a relay and resolves its own DID back via the relay, AND resolves a PEER's DID published to a relay (this completes the A2 self-DID + peer resolution path noted in SCP-CAPINJECT-001 / ADR-062 A2↔A4 sequencing, which relay resolution — this feature — brings online). SEQUENCING (dependency correctness): tests (1)-(3) require a live relay reachable from PRODUCTION code, which is the relay-client binding (SCP-RELAYRES-006), not SCP-RELAYRES-004 — 004 ships the publisher with nothing bound to it. Tests (4)-(5) additionally require SCP-RELAYRES-008: today the BEP44 `(value, signature, seq)` triple is reconstructed by resolving the node's own record back OFF THE DHT (crates/scp-node/src/self_host.rs `self_did_republish_entry`), so a `DhtMode::Disabled` node has no triple at all and can neither relay-publish its own DID nor be resolved — 008 surfaces the signed record from the signing step and adds the §3.10.5 step 3a relay leg, which is what makes AC4/AC5 reachable. `blockedBy` therefore lists SCP-RELAYRES-003 and SCP-RELAYRES-008; 008 transitively covers 006, which transitively covers 004 and 002 (no transitive over-specification, no cycle).",
       "acceptanceCriteria": [
         "Relay-only publish→resolve round-trip: a test publishes a DID document to a relay ONLY (DHT not used) via the real RelayPublisher and resolves it back through the real querier + DualLayerResolver, asserting the resolved document + (value, signature, seq) is byte-identical to the published one and verifies against the DID-derived key (§3.10.4/§3.10.5).",
         "Dual-layer suppression resilience: a test with the record present on both a relay and the DHT asserts resolution still succeeds when the relay layer is suppressed (DHT serves it) and when the DHT layer is suppressed (relay serves it) — §3.10.8; and asserts that when BOTH layers hold nothing the resolver returns honest not-found Ok(None), never a fabricated document (§3.10.4).",
@@ -281,7 +309,7 @@
       ],
       "blockedBy": [
         "SCP-RELAYRES-003",
-        "SCP-RELAYRES-004"
+        "SCP-RELAYRES-008"
       ],
       "sources": [
         {
@@ -301,6 +329,181 @@
         "phase": "2",
         "feature": "issue #482 — relay-based DID resolution (Model B)",
         "completes": "SCP-CAPINJECT-001 A2 (DhtMode::Disabled self-DID + peer resolution via relay)"
+      }
+    },
+    {
+      "id": "SCP-RELAYRES-006",
+      "title": "Relay-client binding: share ONE live relay connection across the READ and WRITE halves — add the `Arc<dyn TransportAdapter>` blanket impl, bind the self-host node's own loopback relay onto both TransportRelayQuerier and TransportRelayPublisher, and replace NoOpRelayQuerier with the bound RealMultiRelayQuerier in the node's production DualLayerResolver",
+      "gate": "gate-relayres-6",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/traits.rs",
+        "crates/scp-node/src/self_host.rs"
+      ],
+      "description": "THE MISSING SEAM. Both halves of relay resolution ship a type that holds a late-bound `relay_url -> Arc<dyn TransportAdapter>` map, and NEITHER has a production `bind` caller: `TransportRelayQuerier` (SCP-RELAYRES-002, merged) has ZERO production construction sites of any kind — production DID resolution still runs `NoOpRelayQuerier` (crates/scp-node/src/self_host.rs `build_shared_cache_key_resolver`) — and `TransportRelayPublisher` (SCP-RELAYRES-004) is constructed on the serve path with nothing ever bound, so `bound_relay_count() == 0` forever and every relay publish fails closed. The two halves await the SAME thing: one relay-client connection set. No artifact owned that work — the shipped code justified the dead relay arm with a comment claiming \"#482 owns the relay-client binding end to end. No separate issue tracks it\", but #482 IS this PRD and this PRD had no such story. That is phantom provenance; THIS story is the artifact the code descends from. SCOPE — the node's OWN relay only (§18.5.2 agent-deployment case: \"The agent's relay is self-hosted — no external relay discovery needed\"). The self-host node already opens exactly one live relay-client connection to its own relay: `connect_loopback_supervisor` (crates/scp-node/src/self_host.rs) builds a `NativeRelayAdapter` for `ws://127.0.0.1:{relay_port}/scp/v1` and moves it BY VALUE into `RelayTransportProvider::new`, so no second reference survives to bind. That is the whole mechanical friction, and it is ~5 lines of trait plumbing: crates/scp-transport/src/traits.rs has a blanket `impl TransportAdapter for Box<dyn TransportAdapter>` but no `Arc` counterpart. Adding `impl TransportAdapter for Arc<dyn TransportAdapter>` (mechanical forwarding of the eight trait methods, mirroring the existing Box impl) lets ONE `Arc<dyn TransportAdapter>` be cloned into the supervisor's transport provider AND bound onto both the querier and the publisher — one socket, three consumers, no second connection. This story: (1) add the `Arc<dyn TransportAdapter>` blanket impl; (2) construct the loopback adapter once as `Arc<dyn TransportAdapter>` and bind it, under its relay URL, onto BOTH the shared `TransportRelayPublisher` (WRITE) and a `TransportRelayQuerier` (READ) — one bind site feeding both halves, because they are the same seam; (3) replace `NoOpRelayQuerier` in the node's production `DualLayerResolver` with `RealMultiRelayQuerier<TransportRelayQuerier>` over the bound querier, and pass the bound relay URL as the resolver's bootstrap-relay list (it is currently `Vec::new()`, so the relay layer is never consulted even in principle); (4) order the bind BEFORE `start_self_did_republishing` so the relay arm (per-tick `bound_relay_count()` re-evaluation, SCP-RELAYRES-004) is live from the first cycle. SCOPE BOUNDARY — stated explicitly: the EXTERNAL/bootstrap relay set is NOT this story. `NodeConfig` (crates/scp-node/src/config.rs) has no relay-URL field at all today (`bind_addr` is the relay SERVER's listen address, not a client relay set), and `DefaultRelayResolver` + `FALLBACK_RELAYS` (crates/scp-transport/src/config.rs) are written and unit-tested and re-exported from crates/scp-transport/src/lib.rs, but `DefaultRelayResolver` is never constructed outside its own unit tests — the whole §18.5.1 five-level chain is dead code. Adding the config surface and driving that chain is SCP-RELAYRES-007, a distinct story because it changes the public `NodeConfig` construction surface (ADR-052) and spans four files with a different concern. This story binds the ONE relay the node already runs and already connects to.",
+      "acceptanceCriteria": [
+        "`Arc` blanket impl exists and forwards every method: `grep -n 'impl TransportAdapter for Arc<dyn TransportAdapter>' crates/scp-transport/src/traits.rs` matches, and the impl forwards all eight trait methods (`send`, `subscribe`, `unsubscribe`, `query`, `delete`, `publish_raw`, `query_raw`, `record_heartbeat_received`) — a test builds an `Arc<dyn TransportAdapter>` over a recording adapter, clones it, calls each of the eight methods through a clone, and asserts every call is observed exactly once by the single underlying recorder.",
+        "One connection, three consumers: a test drives the production self-host serve path and asserts the `Arc<dyn TransportAdapter>` bound onto the `TransportRelayQuerier`, the one bound onto the `TransportRelayPublisher`, and the one handed to `RelayTransportProvider::new` are `Arc::ptr_eq` with the single adapter returned by the loopback connect — one relay socket, not two or three.",
+        "Production bind actually happens: after the production self-host serve path has started, a test asserts `TransportRelayPublisher::bound_relay_count() == 1` and the `TransportRelayQuerier` has a binding for exactly the loopback relay URL `ws://127.0.0.1:{relay_port}/scp/v1` (the port read from the node's bound relay address, never hardcoded).",
+        "`NoOpRelayQuerier` is gone from the node: `grep -rn 'NoOpRelayQuerier' crates/scp-node/src` returns 0 matches, `build_shared_cache_key_resolver` constructs the `DualLayerResolver` over `RealMultiRelayQuerier<TransportRelayQuerier>` (grep the type at the construction), and the resolver's bootstrap-relay argument at that site is the bound relay URL vec, not `Vec::new()` (a test asserts the constructed resolver's relay URL list is non-empty).",
+        "READ path reachable in production (closes the zero-production-caller gap SCP-RELAYRES-002 left): a test PUBLISHes a valid `DidRecordV1` frame for a DID at `did_routing_id(did)` into the node's own relay blob store, then asserts the node's production `DualLayerResolver` resolves that DID with `ResolutionSource::ScpRelay { relay_url }` equal to the bound loopback URL — not `MainlineDht` and not `Cache`.",
+        "WRITE path reachable in production (the end-to-end assertion SCP-RELAYRES-004 structurally could not make): a test drives the production serve path for a node that has a signed record, and asserts the relay arm's first tick lands a blob at `did_routing_id(node_did)` in the node's own relay blob store which `DidRecordV1::decode`s and whose `(value, signature, seq)` BEP44-verifies against the node's DID-derived key (§9.10.12 publish contract).",
+        "Bind precedes republish start: a test asserts `bound_relay_count() > 0` at the moment `start_self_did_republishing` is entered on the production path (the manager never observes a zero-relay publisher), and that no code re-drives or reconstructs the manager to activate the relay arm.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Add `impl TransportAdapter for Arc<dyn TransportAdapter>` to crates/scp-transport/src/traits.rs, forwarding all eight trait methods, mirroring the existing `Box<dyn TransportAdapter>` blanket impl and its doc comment.",
+        "In crates/scp-node/src/self_host.rs, build the loopback `NativeRelayAdapter` once as an `Arc<dyn TransportAdapter>`, clone it into `RelayTransportProvider::new`, and bind it under the loopback relay URL onto BOTH the shared `TransportRelayPublisher` and a new shared `TransportRelayQuerier`.",
+        "Replace `NoOpRelayQuerier` in `build_shared_cache_key_resolver` with `RealMultiRelayQuerier<TransportRelayQuerier>` over the bound querier, and pass the bound relay URL vec as the `DualLayerResolver` bootstrap-relay argument in place of `Vec::new()`.",
+        "Order the bind before `start_self_did_republishing` on the serve path so the per-tick relay arm (SCP-RELAYRES-004) is live from the first cycle; delete any remaining prose in self_host.rs that describes the binding as untracked or as future work.",
+        "Write the Arc-forwarding, single-socket (`Arc::ptr_eq`), bind-happened, relay-resolution, relay-publish, and bind-ordering tests; run full CI + review roster."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay DID-Record Frame"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.5.2 Agent Deployment Case"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "closes": "the zero-production-caller gap left by SCP-RELAYRES-002 (TransportRelayQuerier, merged with no construction site) and SCP-RELAYRES-004 (TransportRelayPublisher, constructed with nothing bound)",
+        "phantom_provenance_corrected": "self_host.rs claimed \"#482 owns the relay-client binding end to end. No separate issue tracks it\" — #482 is this PRD and had no such story. This story is that artifact.",
+        "scope_boundary": "external/bootstrap relay set is SCP-RELAYRES-007 (NodeConfig has no relay-URL field; DefaultRelayResolver/FALLBACK_RELAYS have zero production callers)",
+        "also_supersedes": "reachability.json SCP-239/SCP-240 (both marked done) whose relay-selection acceptance criteria — \"RepublishManager publishes to identity's own relays AND bootstrap relays\", \"Queries sent to identity's known relays first, then bootstrap relays\" — were never met: no relay-client connection set has ever existed."
+      }
+    },
+    {
+      "id": "SCP-RELAYRES-007",
+      "title": "External and bootstrap relay set: add the NodeConfig relay-URL field, drive the §18.5.1 five-level bootstrap priority chain through the currently-dead DefaultRelayResolver, and bind every resolved relay onto the shared publisher + querier",
+      "gate": "gate-relayres-7",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/self_host.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-transport/src/config.rs"
+      ],
+      "description": "SCP-RELAYRES-006 binds the ONE relay the self-host node runs itself (§18.5.2). This story adds the relays it does NOT run: the identity's own external relays and the bootstrap/fallback set, which is what §3.10.2 \"Multi-relay\" requires (\"Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for availability and suppression resistance\") and what §3.10.4 step 3a queries (\"identity's published relays if known, else bootstrap relays from §18.5.1\"). Two independent gaps make the §18.5.1 chain dead today: (1) `NodeConfig` (crates/scp-node/src/config.rs) has NO relay-URL field — `bind_addr` is the relay SERVER's listen address, not a client relay set — so §18.5.1 level 1 (\"Explicit configuration. Relay URLs provided directly in TransportConfig at SDK initialization\") is unreachable from the node surface; (2) `DefaultRelayResolver` and `FALLBACK_RELAYS` (crates/scp-transport/src/config.rs) implement all five levels and are unit-tested, and `DefaultRelayResolver`/`ResolveRelays` are re-exported from crates/scp-transport/src/lib.rs — but the resolver is never CONSTRUCTED outside its own unit tests, so no shipped code path ever runs the chain. This story: (a) add an explicit `relay_urls: Vec<String>` field to `NodeConfig`, defaulted to empty by `NodeConfig::defaults` and threaded END-TO-END — explicitly NOT the carried-but-dropped shape `dht_gateways` currently has (that field is documented as \"carried but not yet threaded end-to-end\" and dropped in `split_config`; repeating it here would ship a config knob that silently does nothing); (b) drive `DefaultRelayResolver` from the node with level 1 = the new field and levels 2-5 wired to their real providers, logging the §18.5.1 warning when the chain falls through to the hardcoded fallback list; (c) open one `NativeRelayAdapter` connection per resolved relay URL and bind each onto the SAME shared `TransportRelayPublisher` and `TransportRelayQuerier` instances SCP-RELAYRES-006 established — one connection set feeding both halves, additively with the loopback binding; (d) pass the full resolved set (loopback + external + bootstrap) as the `DualLayerResolver`'s bootstrap-relay list. A relay that fails to connect is skipped and logged, never bound and never fatal (§3.10.8 \"Relay unresponsive, slow, or withholding\": a single bad relay must not block resolution or startup). Scope boundary: WHEN a DID record is published (create/update vs the republish cycle) is SCP-RELAYRES-004 (republish) and SCP-RELAYRES-008 (create/update); this story owns WHICH relays receive it.",
+      "acceptanceCriteria": [
+        "`NodeConfig` gains an explicit relay-URL field: `grep -n 'pub relay_urls' crates/scp-node/src/config.rs` matches a `Vec<String>` field, `NodeConfig::defaults` initialises it to an empty vec (grep the initialiser), and the field is threaded end-to-end — a test builds a node with `relay_urls: vec![reachable_url]` and asserts that URL is bound on BOTH the shared publisher and the shared querier after start (it is not dropped in `split_config` the way `dht_gateways` is).",
+        "§18.5.1 chain has a production caller: `grep -rn 'DefaultRelayResolver' crates/scp-node/src` matches at least one non-test line; a test asserts level 1 (explicit `relay_urls`) short-circuits levels 2-5 (no DID-document, `.well-known`, or peer lookup is performed when explicit URLs are supplied).",
+        "Level-5 fallback warns: a test with no explicit URLs and no level 2-4 provider result asserts the resolver returns the `FALLBACK_RELAYS` entries AND emits the §18.5.1 fallback warning (\"The SDK SHOULD warn when falling back to default relays\").",
+        "Every resolved relay is bound, not just the first: a test with three reachable resolved relay URLs asserts `TransportRelayPublisher::bound_relay_count() == 3` and all three URLs are bound on the querier, and that a single `RelayPublisher::publish` reaches all three (§3.10.2 \"Multi-relay\", multi-relay publishing for suppression resistance).",
+        "Resolver queries the resolved set, not just the loopback: the node's `DualLayerResolver` is constructed with the full resolved relay URL set — a test where a DID's record exists ONLY on an external relay asserts it resolves with `ResolutionSource::ScpRelay { relay_url }` equal to that external relay's URL (§3.10.4 step 3a).",
+        "A failing relay is skipped, never phantom-bound, never fatal: a test with one reachable and one unreachable relay URL asserts the node still starts, `bound_relay_count() == 1`, the unreachable URL has NO binding on either the publisher or the querier, and the connect failure is logged (§3.10.8 — one bad relay cannot block a result from another).",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Add `pub relay_urls: Vec<String>` to `NodeConfig` (crates/scp-node/src/config.rs), initialise it to an empty vec in `NodeConfig::defaults`, and thread it through `split_config` and the node build path end-to-end — do not repeat the carried-but-dropped `dht_gateways` shape.",
+        "Construct and drive `DefaultRelayResolver` (crates/scp-transport/src/config.rs) from the node: level 1 from the new `relay_urls`, levels 2-4 from the node's DID resolver / `.well-known` fetcher / peer provider, level 5 the hardcoded fallback with the §18.5.1 warning.",
+        "Open one `NativeRelayAdapter` connection per resolved relay URL and bind each onto the SAME shared `TransportRelayPublisher` and `TransportRelayQuerier` instances from SCP-RELAYRES-006 (additive to the loopback binding); skip and log any URL that fails to connect.",
+        "Pass the full resolved relay URL set (loopback + external + bootstrap) as the `DualLayerResolver` bootstrap-relay argument in crates/scp-node/src/self_host.rs.",
+        "Write the config-threading, level-1-short-circuit, level-5-warning, multi-bind, external-relay-resolution, and unreachable-relay tests; run full CI + review roster."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-006"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.5 Relay Bootstrap"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.5.1 Bootstrap Priority Order"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.4 Resolution Protocol"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "revives_dead_code": "DefaultRelayResolver + FALLBACK_RELAYS (crates/scp-transport/src/config.rs) — written, unit-tested and re-exported from scp-transport's lib.rs, but never constructed outside their own unit tests before this story",
+        "anti_pattern_to_avoid": "NodeConfig.dht_gateways is carried but dropped in split_config; relay_urls MUST be threaded end-to-end, not shape-complete-only"
+      }
+    },
+    {
+      "id": "SCP-RELAYRES-008",
+      "title": "§3.10.5 step 3a: publish the DID document to relays at every DID create/update — surface the BEP44 signed record as an output of the signing step so both legs receive one identical triple, and gate the relay leg independently of DhtMode (§3.10.6)",
+      "gate": "gate-relayres-8",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/self_host.rs"
+      ],
+      "description": "§3.10.5 makes the two publish legs PARALLEL and both a MUST: step 3a wraps `(public_key, seq, signature, value)` in a DID-record frame (§9.10.12) and PUBLISHes it to SCP relays with `blob_ttl: 604800`; step 3b is `DhtClient.publish`. §3.10.6 states the rule outright — \"Publishing to both layers is a MUST, not a SHOULD.\" Only the DHT leg exists today: `publish_did_document_for_mode` (crates/scp-node/src/lib.rs) calls `DidMethod::publish` and nothing else. No story in this PRD or any other owns step 3a — SCP-RELAYRES-004 owns the REPUBLISH cycle (§3.10.5 step 4), not the create/update publish. The root cause is that the signed record is discarded: `DidDht::publish_document` (crates/scp-identity/src/dht.rs) computes `value`, increments `seq`, signs `bep44_signable(value, seq)`, extracts `public_key`, hands all four to `DhtClient::publish`, and returns `Result<(), IdentityError>` — so no caller can build the `DidRecordV1` frame the relay leg needs. Two consequences follow: (i) there is no relay PUBLISH at create/update at all; (ii) `self_did_republish_entry` (crates/scp-node/src/self_host.rs) has to reconstruct the triple by resolving the node's own record back OFF THE DHT, which means a `DhtMode::Disabled` node — the fail-closed default — has no triple at all and its entire republish manager stays dormant. That is the structural reason SCP-RELAYRES-005 AC4 (\"a DhtMode::Disabled node publishes its OWN DID to a relay and resolves it back\") cannot pass, and it is the same \"relay resolution brings the Disabled node online\" claim ADR-062's A2↔A4 sequencing note makes. This story: (a) surface the signed record — `DidMethod::publish` returns the signed BEP44 record (`public_key`, `seq`, `signature`, `value`) instead of `()`, so the triple is an OUTPUT of signing and is never re-derived from a storage read-back; (b) split the layer gating — signing becomes unconditional, the DHT leg stays gated on `DhtMode`, and the relay leg is gated ONLY on the relay layer's own enablement, because §3.10.6 treats the two layers as independently gated (a `DhtMode::Disabled` node MUST still relay-publish); (c) drive both legs in parallel from the ONE signed record — wrap it in a `DidRecordV1` (SCP-RELAYRES-001) and PUBLISH via the shared `TransportRelayPublisher` (SCP-RELAYRES-004) bound by SCP-RELAYRES-006, `blob_ttl: 604800`; (d) re-source `self_did_republish_entry` from the signed record instead of the DHT read-back. The frame is transport framing and NEVER enters the signed bytes (§3.10.5, §9.10.12 \"Framing is outside the signed authority\"), so both layers receive byte-identical `(value, signature, seq)`. Scope boundary: WHICH relays receive the publish is SCP-RELAYRES-006 (the node's own relay) and SCP-RELAYRES-007 (external + bootstrap); this story owns WHEN (every create/update) and WHAT (the frame built from the one signed record).",
+      "acceptanceCriteria": [
+        "The signed BEP44 record is an OUTPUT of signing, not a storage read-back: `DidMethod::publish` returns a signed-record type carrying `public_key`, `seq`, `signature`, and `value` — `grep -n 'fn publish' -A 6 crates/scp-identity/src/lib.rs` shows the new return type on the trait method, and a test asserts the returned `(value, signature, seq)` BEP44-verifies against the key derived from the DID string (§9.6.1).",
+        "Relay leg exists at create/update and is driven from the SAME signing as the DHT leg: a test drives a DID create through the production node publish path with a bound relay and asserts (i) a blob at `did_routing_id(did)` on that relay `DidRecordV1::decode`s, (ii) its `blob_ttl` is 604800, and (iii) its `(value, signature, seq)` is byte-identical to what the DHT leg received — one signing, two layers (§3.10.5 \"Both layers receive identical document bytes and identical BEP44 signatures\").",
+        "The relay leg is NOT gated on `DhtMode`: a test with `DhtMode::Disabled` asserts the DHT publish is skipped AND the relay PUBLISH still happens (§3.10.6 — the layers are independently gated); the `DhtMode::Disabled` arm no longer short-circuits the whole publish function (a test asserts a Disabled node's create yields a decodable frame on its bound relay).",
+        "No misnomer left behind: the publish entry point is renamed to name both layers — `grep -rn 'publish_did_document_for_mode' crates/` returns 0 matches and the replacement name does not imply DHT-only gating.",
+        "`self_did_republish_entry` no longer reconstructs the triple from a DHT read-back: `grep -n 'dht_client.resolve' crates/scp-node/src/self_host.rs` returns 0 matches, and a test asserts a `DhtMode::Disabled` node still produces a `RepublishEntry` (sourced from the signed record) so its `RepublishManager` is NOT dormant — the relay 6-day arm runs on a Disabled node.",
+        "No implicit layer opt-out: a test asserts an explicit `RepublishConfig::disable_relay()` emits the §3.10.6 warning (\"DID resolution layer disabled. This identity may not be resolvable by all peers.\"), and that no production code path disables either layer implicitly (`grep -rn 'disable_relay\\|disable_dht' crates/scp-node/src` matches only test code).",
+        "Every `impl DidMethod` is updated with a real value, no stubs: `cargo build --workspace` succeeds, and `grep -rn 'todo!\\|unimplemented!' crates/scp-identity/src crates/scp-node/src` returns 0 matches — each implementation (including `NoOpDidMethod` and every test double) returns a real signed record or a typed error, never a fabricated one.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Change `DidMethod::publish` (crates/scp-identity/src/lib.rs) to return the signed BEP44 record (`public_key`, `seq`, `signature`, `value`); update `DidDht::publish_document` (crates/scp-identity/src/dht.rs) to return the record it already computes instead of discarding it, and update every `impl DidMethod` in the workspace.",
+        "Split the gating in the node publish path (crates/scp-node/src/lib.rs): sign unconditionally, keep the DHT leg gated on `DhtMode`, gate the relay leg only on the relay layer's own enablement, and rename the entry point so it names both layers.",
+        "Add the §3.10.5 step 3a relay leg: wrap the signed record in a `DidRecordV1` and PUBLISH it via the shared `TransportRelayPublisher` with `blob_ttl: 604800`, in parallel with the DHT leg.",
+        "Re-source `self_did_republish_entry` (crates/scp-node/src/self_host.rs) from the signed record returned by the publish path instead of `dht_client.resolve`, so a `DhtMode::Disabled` node has a `RepublishEntry`.",
+        "Confirm the SDK capability matrix needs no new cell (this is a behaviour correction on an existing identity-publish surface, not a new operation) and record that check; write the signed-record, both-legs-one-signing, Disabled-still-relay-publishes, rename, no-DHT-read-back, and no-implicit-opt-out tests; run full CI + review roster."
+      ],
+      "blockedBy": [
+        "SCP-RELAYRES-006"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.5 Publishing Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.6 Anti-Segmentation Invariant"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay DID-Record Frame"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "feature": "issue #482 — relay-based DID resolution (Model B)",
+        "closes": "the §3.10.5 step 3a gap — no story in any PRD owned the create/update relay PUBLISH; SCP-RELAYRES-004 owns the republish cycle (step 4) only",
+        "unblocks": "SCP-RELAYRES-005 AC4/AC5 (a DhtMode::Disabled node relay-publishes and resolves its own + a peer's DID) and the ADR-062 A2↔A4 sequencing note"
       }
     }
   ]
