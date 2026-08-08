@@ -2541,7 +2541,7 @@ impl PerContextState {
     ///
     /// [`ContextError::InvalidState`] if the live capability ceiling no longer
     /// covers the genesis ceiling a Welcome-joiner would install — see
-    /// [`check_genesis_ceiling_covered_by_live`](crate::context::state::check_genesis_ceiling_covered_by_live)
+    /// [`check_genesis_ceiling_still_current`](crate::context::state::check_genesis_ceiling_still_current)
     /// (#2028);
     /// [`ContextError::CryptoFailed`] on a mode/group mismatch, a malformed
     /// `KeyPackage`, no `KeyPackage` in production, or any MLS / serialization
@@ -2558,8 +2558,8 @@ impl PerContextState {
         // both the real MLS add and the no-crypto `testing` return, and ahead of
         // every mutation (reject-before-mutate: no member is added, no epoch
         // advances, nothing is persisted).
-        crate::context::state::check_genesis_ceiling_covered_by_live(
-            &self.handle.params().ceiling,
+        crate::context::state::check_genesis_ceiling_still_current(
+            self.handle.params(),
             self.role_state.ceiling(),
             "add_member",
         )?;

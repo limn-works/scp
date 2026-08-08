@@ -1238,7 +1238,8 @@ pub async fn execute_restore_access(
 ///
 /// [`ContextError::InvalidState`] is passed through UNCHANGED: that is the
 /// #2028 fail-closed ceiling-currency refusal
-/// (`PerContextState::check_genesis_ceiling_covered_by_live`), which is a
+/// ([`check_genesis_ceiling_still_current`](crate::context::state::check_genesis_ceiling_still_current)),
+/// which is a
 /// context-state verdict rather than a membership/MLS fault. Flattening it into
 /// a stringly `MembershipFailed` would erase the variant — and with it the
 /// distinct FFI error code and the caller's ability to tell "this context can no
@@ -2677,6 +2678,28 @@ pub async fn execute_reset_member(
             return Err(ContextError::MemberNotFound(did.to_string()));
         }
     }
+
+    // #2028 authority-currency gate, hoisted AHEAD of the remove+add pair.
+    //
+    // `PerContextState::add_member` runs this same predicate as the sound
+    // in-actor chokepoint, but here it would fire from INSIDE the
+    // `commit_class_s_keep` closure below — after `remove_member` has already
+    // mutated the actor-owned MLS group. On a closure `Err`, `commit_class_s_keep`
+    // neither persists nor rolls back (it is the keep-on-failure combinator, and
+    // its `f` errs before any persist), so the refusal would leave the in-memory
+    // remove applied: the member is gone from the group but never re-added. Nor
+    // would `commit_class_s_restore` help — its snapshot covers ONLY the Class-S
+    // sub-structs, and the MLS group + membership are not among them, so the
+    // remove would survive that rollback too.
+    //
+    // Refusing here instead makes reset reject-before-mutate, matching the same
+    // reversible-front-door rationale as `Supervisor::invite_member`. Both share
+    // ONE predicate with the in-actor chokepoint, so they cannot drift.
+    crate::context::state::check_genesis_ceiling_still_current(
+        cell.handle.params(),
+        cell.role_state.ceiling(),
+        "reset_member",
+    )?;
 
     // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the MLS group is actor-owned, so the

@@ -3397,14 +3397,19 @@ async fn governed_ceiling_lowering_refuses_the_welcome_seam_fail_closed() {
     };
     // `member:invite` is in the GENESIS ceiling but is NOT one of the built-in
     // `member` role's desired capabilities ({messages:read, messages:write,
-    // outlet_query:*, outlet_call:*} — `roles::builtin_member`). That matters:
-    // dropping a capability the `member` role DOES want would incidentally trip
-    // the adder's own `system_assign_role` ceiling check (role definitions are
-    // not reconciled when `set_ceiling` lowers the ceiling), masking the real
-    // defect behind an unrelated error. Dropping `member:invite` leaves the
-    // adder's role assignment perfectly happy — so PRE-FIX the invite SUCCEEDS
-    // and seals a bundle whose genesis ceiling still grants `member:invite`,
-    // which is exactly the fail-OPEN downgrade this test pins closed.
+    // outlet_query:*, outlet_call:*} — `roles::builtin_member`), which the
+    // precondition below asserts mechanically rather than by narration.
+    //
+    // That is what makes it the right capability to drop: the built-in `member`
+    // role neither holds it before the lowering nor loses it after, so the
+    // adder's own `system_assign_role` ceiling check is unaffected either way and
+    // cannot mask the real defect behind an unrelated role-assignment error.
+    // Dropping a capability the `member` role DOES want would couple this test to
+    // exactly that hazard.
+    //
+    // With the adder's role assignment untouched, PRE-FIX the invite genuinely
+    // SUCCEEDS and seals a bundle whose genesis ceiling still grants
+    // `member:invite` — the fail-OPEN downgrade this test pins closed.
     assert!(
         governed_params.ceiling.contains(&Capability::MemberInvite),
         "fixture precondition: the genesis ceiling grants member:invite"
@@ -3669,5 +3674,216 @@ async fn welcome_joiner_installs_the_bundle_ceiling_verbatim() {
         CapabilityCeiling::new(params.ceiling.iter().cloned()),
         "the joiner installs the BUNDLE's (genesis) ceiling verbatim — nothing on the \
          join path reconciles it against the context's live policy (#2028)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M10 — #2028: the IN-ACTOR chokepoint is load-bearing on its own.
+// ---------------------------------------------------------------------------
+
+/// `Supervisor::invite_member` refuses at the front door, so every test that
+/// drives it exercises ONLY that gate — delete
+/// `PerContextState::add_member`'s copy and those tests still pass. This test
+/// covers the in-actor chokepoint directly.
+///
+/// `GovernanceAction::AddMember` is a first-class, exported governance action:
+/// `propose_governance_action` reaches `execute_add_member` →
+/// `PerContextState::add_member` WITHOUT passing through `invite_member` at all,
+/// so the in-actor gate is the only thing standing between a lowered live
+/// ceiling and a minted Welcome on this path. (The same is true, more starkly,
+/// under a voting governance model: `invite_member` refuses those contexts
+/// outright, so a governed add is the ONLY way to admit a member and the
+/// in-actor gate is their sole protection.)
+///
+/// Delete the gate in `PerContextState::add_member` and this test FAILS: the
+/// governed add succeeds and mints a Welcome carrying the stale genesis ceiling.
+#[tokio::test]
+async fn governed_ceiling_lowering_refuses_the_in_actor_add_member_chokepoint() {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    let ctx_id = ctx_hex(0xe4);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    let governed_params = ContextParams {
+        ceiling_policy: CeilingPolicy::Governed,
+        ..joiner_params()
+    };
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            governed_params.clone(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the Governed-ceiling context");
+
+    // Drop `member:invite` — deliberately a capability the built-in `member`
+    // role does not want, so the refusal below cannot be an incidental
+    // role-assignment ceiling error (same rationale as the M8 fixture).
+    let lowered: Vec<Capability> = governed_params
+        .ceiling
+        .iter()
+        .filter(|cap| **cap != Capability::MemberInvite)
+        .cloned()
+        .collect();
+    lower_ceiling_through_governance(&alice_sup, &ctx_id, &alice, lowered).await;
+
+    // The GOVERNANCE add path — `invite_member` is not involved, so its
+    // front-door gate cannot be what refuses here.
+    let err = alice_sup
+        .propose_governance_action(
+            &ctx_id,
+            &alice,
+            GovernanceAction::AddMember {
+                did: bob.clone(),
+                role: "member".to_owned(),
+            },
+            &alice_signing_key(),
+        )
+        .await
+        .expect_err(
+            "a governed AddMember after a ceiling LOWERING must be refused by the in-actor \
+             chokepoint — the Welcome would install the wider genesis ceiling (#2028)",
+        );
+
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidState(_)),
+        "the in-actor refusal must reach the caller as a typed InvalidState (not flattened \
+         into MembershipFailed by the governance add seam), got {err:?}"
+    );
+    let crate::context::ContextError::InvalidState(message) = &err else {
+        return;
+    };
+    assert!(
+        message.contains("add_member"),
+        "the refusal must identify the IN-ACTOR chokepoint as its site (not invite_member), \
+         got: {message}"
+    );
+    assert!(
+        message.contains("member:invite") && message.contains("2028"),
+        "the refusal must name the stale genesis capability and cite #2028, got: {message}"
+    );
+
+    // Reject-before-mutate: the gate runs ahead of the MLS add and ahead of the
+    // no-crypto `testing` return, so no member is added and no epoch advances.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "the refused governed add adds NO member"
+    );
+    assert!(
+        !alice_sup.is_member(&ctx_id, &bob).await,
+        "bob must not be a member of the context"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M11 — #2028: a legitimate `{resource}:*` WIDENING must not brick joins.
+// ---------------------------------------------------------------------------
+
+/// The gate's coverage relation must match the one the AUTHORIZATION layer
+/// enforces, not the narrower `CapabilityCeiling::contains`.
+///
+/// `contains` implements implicit coverage only for the built-in outlet
+/// wildcards; for `Capability::Custom` it is exact set membership. But
+/// `CapabilityUri::is_within_ceiling` — the predicate that actually authorizes a
+/// UCAN invocation — honours an explicit `{resource}:*` entry as covering every
+/// action on that resource, and `{resource}:*` is a first-class specced ceiling
+/// entry (§5.3.1.1 shape 3).
+///
+/// So a governed WIDENING from `data:read` to `data:*` leaves the live ceiling
+/// genuinely covering genesis. Judged by bare `contains` it does not, and the
+/// gate would mark `data:read` stale and refuse EVERY subsequent join —
+/// permanently, because `params.ceiling` is immutable and nothing can ever
+/// re-narrow the live ceiling back to an exact match. That is a legitimate
+/// governance operation bricking the context, not a fail-closed refusal.
+#[tokio::test]
+async fn custom_resource_wildcard_widening_still_admits_a_welcome_join() {
+    let ctx_id = ctx_hex(0xe5);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    // Genesis grants the CONCRETE custom capability.
+    let concrete = Capability::Custom("data:read".to_owned());
+    let wildcard = Capability::Custom("data:*".to_owned());
+    let mut genesis_ceiling = joiner_params().ceiling;
+    genesis_ceiling.push(concrete.clone());
+    let governed_params = ContextParams {
+        ceiling_policy: CeilingPolicy::Governed,
+        ceiling: genesis_ceiling.clone(),
+        ..joiner_params()
+    };
+
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            governed_params.clone(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the Governed-ceiling context");
+
+    // WIDEN: replace the concrete entry with the resource wildcard that subsumes
+    // it. Every other genesis entry is preserved, so `data:read` is the ONLY
+    // entry whose coverage now depends on the wildcard rule.
+    let widened: Vec<Capability> = genesis_ceiling
+        .iter()
+        .map(|cap| {
+            if *cap == concrete {
+                wildcard.clone()
+            } else {
+                cap.clone()
+            }
+        })
+        .collect();
+    lower_ceiling_through_governance(&alice_sup, &ctx_id, &alice, widened).await;
+
+    let live_ceiling = alice_sup
+        .get_role_state(&ctx_id)
+        .await
+        .expect("the role-state query must not fault")
+        .expect("the live context has role state")
+        .ceiling()
+        .clone();
+    assert!(
+        live_ceiling.contains(&wildcard),
+        "precondition: the widening applied — the live ceiling carries data:*"
+    );
+    assert!(
+        !live_ceiling.contains(&concrete),
+        "precondition: the live ceiling no longer carries the CONCRETE data:read, so this \
+         case is decided purely by the {{resource}}:* coverage rule"
+    );
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let outcome = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect(
+            "a `{resource}:*` widening still covers the concrete genesis entry under the \
+             relation the authorization layer enforces, so the invite must proceed",
+        );
+    assert!(
+        matches!(outcome, InviteMemberOutcome::Sealed { .. }),
+        "the invite seals a bundle as usual"
+    );
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(2),
+        "bob is added"
     );
 }

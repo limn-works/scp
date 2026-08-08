@@ -37,6 +37,7 @@ use scp_protocol::context::membership::{
     ContextEvent, MembershipState, ReceiveBuffer, RedactedBytes,
 };
 use scp_protocol::context::outlets::interface::OutletInterface;
+use scp_protocol::context::params::CeilingPolicy;
 use scp_protocol::context::params::GovernanceModel;
 use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{Capability, ContextRoleState};
@@ -2116,7 +2117,9 @@ pub(crate) fn restore_governance_engine_from_snapshot(
 
 /// Fail-closed gate for the Welcome-join authority seam (#2028): refuses to
 /// mint a Welcome once the LIVE capability ceiling has stopped covering the
-/// GENESIS ceiling a joiner would install.
+/// GENESIS ceiling a joiner would install — and refuses just as hard when the
+/// genesis value it was handed cannot be this context's own (see
+/// [Non-vacuity](#non-vacuity-the-genesis-value-must-really-be-this-contexts-genesis)).
 ///
 /// # Why this gate exists
 ///
@@ -2172,41 +2175,150 @@ pub(crate) fn restore_governance_engine_from_snapshot(
 /// ceiling still COVERS every genesis entry. A pure WIDENING still admits joins
 /// — the joiner then installs the narrower genesis set, which grants no
 /// authority the context withholds (that residual staleness is #2028's scope,
-/// not a fail-open). Coverage is decided by `CapabilityCeiling::contains`, the
-/// same predicate UCAN validation and role definition use, so this gate can
-/// never be laxer than the ceiling check it protects; where `contains` has no
-/// implicit coverage rule (a custom `{resource}:*` wildcard subsuming a concrete
-/// entry) it errs CLOSED, refusing a join it could in principle have admitted.
+/// not a fail-open). Coverage is decided by [`ceiling_covers`], which implements
+/// the SAME relation the authorization layer enforces (see that function).
+///
+/// # Non-vacuity (the genesis value must really be this context's genesis)
+///
+/// The gate is only as good as the `genesis_params` it is handed: a
+/// RECONSTRUCTED [`ContextParams`] (e.g. a `ContextParams::default()` built at a
+/// dispatch boundary rather than read from the context's own snapshot) carries an
+/// EMPTY ceiling, which every live ceiling trivially covers — the gate would
+/// silently enforce nothing while still appearing present in the code. That is
+/// exactly the false-guarantee shape the fail-closed tenet forbids, so the
+/// primary defence is structural: every call site sources these params from the
+/// context's authoritative handle, and the restore path builds that handle from
+/// the PERSISTED snapshot (never from a caller-supplied value).
+///
+/// This function adds a second, independent detector for the same class. Under
+/// [`CeilingPolicy::Immutable`] the ceiling CANNOT change after creation —
+/// `ModifyCeiling` is refused outright unless the policy is
+/// [`CeilingPolicy::Governed`] (spec §5.3.2, enforced in
+/// `governance_helpers::execute_modify_ceiling`) — so for an `Immutable` context
+/// the live ceiling and the genesis ceiling are equal BY CONSTRUCTION. A live
+/// entry the genesis ceiling does not cover therefore proves the `genesis_params`
+/// are not this context's real genesis params, and the gate refuses rather than
+/// returning a vacuous `Ok`.
+///
+/// The check is deliberately scoped to `Immutable`: under `Governed` a widening
+/// (including a widening away from an empty genesis ceiling) is a legitimate,
+/// specced operation, so the same asymmetry there is real evolution rather than
+/// evidence of a fabricated handle. Note that a reconstructed
+/// `ContextParams::default()` carries `ceiling_policy: Immutable` — the
+/// `#[default]` variant — so the detector fires on precisely the fabricated-params
+/// case even when the real context is `Governed`.
 ///
 /// # Errors
 ///
-/// [`ContextError::InvalidState`] naming the genesis capabilities the live
-/// ceiling no longer covers.
-pub(crate) fn check_genesis_ceiling_covered_by_live(
-    genesis_ceiling: &[Capability],
+/// [`ContextError::InvalidState`] naming either the genesis capabilities the live
+/// ceiling no longer covers, or the live capabilities that prove the supplied
+/// genesis params are not this context's own.
+pub(crate) fn check_genesis_ceiling_still_current(
+    genesis_params: &ContextParams,
     live_ceiling: &scp_protocol::context::roles::CapabilityCeiling,
     site: &str,
 ) -> Result<(), ContextError> {
-    let mut stale: Vec<String> = genesis_ceiling
-        .iter()
-        .filter(|genesis_cap| !live_ceiling.contains(genesis_cap))
-        .map(Capability::ucan_capability_name)
-        .collect();
-    if stale.is_empty() {
+    // 1. The fail-OPEN direction: would the joiner install authority the context
+    //    no longer grants?
+    let stale = sorted_uncovered(genesis_params.ceiling.iter(), |cap| {
+        ceiling_covers(live_ceiling, cap)
+    });
+    if !stale.is_empty() {
+        return Err(ContextError::InvalidState(format!(
+            "{site} refused: the live capability ceiling no longer covers the genesis ceiling a \
+             Welcome-joiner would install (spec §5.3.2 lowered it; the invitation bundle and the \
+             MLS-committed 0xFF02 extension both carry the GENESIS ceiling, and no authenticated \
+             post-genesis catch-up exists at join — see #2028). Admitting a member now would \
+             grant them [{}], which this context no longer permits. Refusing fail-closed.",
+            stale.join(", ")
+        )));
+    }
+
+    // 2. Non-vacuity detector — see the doc comment. Under `Immutable` the two
+    //    ceilings are equal by construction, so any live entry the genesis
+    //    ceiling does not cover means the genesis value handed to this gate is
+    //    not this context's own.
+    if genesis_params.ceiling_policy != CeilingPolicy::Immutable {
         return Ok(());
     }
-    // Deterministic, deduplicated message: the genesis ceiling is a `Vec` and
-    // may repeat an entry.
-    stale.sort_unstable();
-    stale.dedup();
+    let genesis_ceiling = scp_protocol::context::roles::CapabilityCeiling::new(
+        genesis_params.ceiling.iter().cloned(),
+    );
+    let unexplained = sorted_uncovered(live_ceiling.iter(), |cap| {
+        ceiling_covers(&genesis_ceiling, cap)
+    });
+    if unexplained.is_empty() {
+        return Ok(());
+    }
     Err(ContextError::InvalidState(format!(
-        "{site} refused: the live capability ceiling no longer covers the genesis ceiling a \
-         Welcome-joiner would install (spec §5.3.2 lowered it; the invitation bundle and the \
-         MLS-committed 0xFF02 extension both carry the GENESIS ceiling, and no authenticated \
-         post-genesis catch-up exists at join — see #2028). Admitting a member now would grant \
-         them [{}], which this context no longer permits. Refusing fail-closed.",
-        stale.join(", ")
+        "{site} refused: this context declares CeilingPolicy::Immutable, under which the live \
+         ceiling cannot diverge from the genesis ceiling (spec §5.3.2 — ModifyCeiling requires \
+         CeilingPolicy::Governed), yet the live ceiling carries [{}] which the supplied genesis \
+         ceiling does not cover. The genesis parameters passed to this check are therefore not \
+         this context's own — a reconstructed/default ContextParams would make the #2028 \
+         authority-currency check vacuous, so it is refused fail-closed instead.",
+        unexplained.join(", ")
     )))
+}
+
+/// Collects the deterministic, deduplicated UCAN names of every capability in
+/// `caps` that `covered` rejects.
+///
+/// Shared by both directions of [`check_genesis_ceiling_still_current`] so the
+/// two messages can never drift in formatting or dedup behaviour. Dedup matters
+/// because the genesis ceiling is a `Vec` and may repeat an entry.
+fn sorted_uncovered<'a>(
+    caps: impl Iterator<Item = &'a Capability>,
+    covered: impl Fn(&Capability) -> bool,
+) -> Vec<String> {
+    let mut out: Vec<String> = caps
+        .filter(|cap| !covered(cap))
+        .map(Capability::ucan_capability_name)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The ceiling-coverage relation this gate compares against — the same relation
+/// the AUTHORIZATION layer actually enforces.
+///
+/// [`CapabilityCeiling::contains`](scp_protocol::context::roles::CapabilityCeiling::contains)
+/// implements implicit coverage only for the built-in outlet wildcards
+/// (`OutletQueryAll` ⊇ `OutletQuery(id)`, `OutletCallAll` ⊇ `OutletCall(id)`);
+/// for [`Capability::Custom`] it is exact set membership. The authorization layer
+/// is broader: `CapabilityUri::is_within_ceiling` accepts an explicit
+/// `{resource}:*` entry as covering every action on that resource, and
+/// `{resource}:*` is a first-class specced ceiling entry (§5.3.1.1 shape 3).
+///
+/// Using bare `contains` here would therefore NOT be a conservative
+/// simplification — it would be a live defect. A legitimate governed WIDENING
+/// from `Custom("data:read")` to `Custom("data:*")` leaves the live ceiling
+/// genuinely covering genesis, yet bare `contains` marks `data:read` stale and
+/// refuses EVERY subsequent join — permanently, because `params.ceiling` is
+/// immutable and nothing can ever re-narrow the live ceiling back to an exact
+/// match. Matching `is_within_ceiling` keeps the gate sound in the direction that
+/// matters (a joiner installing `data:read` gains nothing a live `data:*` does not
+/// already grant) without bricking the context.
+///
+/// The wildcard arm can only ever match a genuinely custom resource family: the
+/// §5.3.1.1 "no built-in-resource wildcard shadow" rule (enforced in
+/// `validate_custom_ceiling_entry`) rejects any `Custom("{builtin}:*")` entry, so
+/// no synthesized wildcard can silently subsume a built-in capability family.
+fn ceiling_covers(
+    ceiling: &scp_protocol::context::roles::CapabilityCeiling,
+    capability: &Capability,
+) -> bool {
+    if ceiling.contains(capability) {
+        return true;
+    }
+    // `{resource}:*` coverage. A wildcard entry is covered only by itself, which
+    // the exact test above already decided — so only concrete actions reach here.
+    let (resource, action) = capability.ucan_resource_action();
+    if action == "*" {
+        return false;
+    }
+    ceiling.contains(&Capability::Custom(format!("{resource}:*")))
 }
 
 /// Validates governance model parameters at context creation time.
@@ -2615,5 +2727,133 @@ mod canonical_context_id_tests {
             context_id_to_bytes(&long),
             scp_protocol::context::context_id_bytes(&long)
         );
+    }
+}
+
+#[cfg(test)]
+mod genesis_ceiling_currency_tests {
+    //! #2028 — unit coverage for [`check_genesis_ceiling_still_current`]'s two
+    //! independent refusal reasons and the boundaries between them.
+
+    #![allow(clippy::expect_used)]
+
+    use super::check_genesis_ceiling_still_current;
+    use scp_protocol::context::ContextParams;
+    use scp_protocol::context::params::CeilingPolicy;
+    use scp_protocol::context::roles::{Capability, CapabilityCeiling};
+
+    fn params(ceiling: Vec<Capability>, policy: CeilingPolicy) -> ContextParams {
+        ContextParams {
+            ceiling,
+            ceiling_policy: policy,
+            ..ContextParams::default()
+        }
+    }
+
+    /// The primary invariant: a LOWERING that drops a genesis entry is refused,
+    /// and the message names the dropped capability.
+    #[test]
+    fn lowering_that_drops_a_genesis_entry_is_refused() {
+        let genesis = params(
+            vec![Capability::MessagesRead, Capability::MemberInvite],
+            CeilingPolicy::Governed,
+        );
+        let live = CapabilityCeiling::new([Capability::MessagesRead]);
+        let err = check_genesis_ceiling_still_current(&genesis, &live, "site")
+            .expect_err("a dropped genesis entry must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("member:invite"), "got: {msg}");
+        assert!(msg.contains("2028"), "got: {msg}");
+    }
+
+    /// A `{resource}:*` live entry covers the concrete genesis entry it subsumes
+    /// — the relation `CapabilityUri::is_within_ceiling` enforces. Bare
+    /// `CapabilityCeiling::contains` would refuse this and brick every future
+    /// join (see `ceiling_covers`).
+    #[test]
+    fn custom_resource_wildcard_covers_a_concrete_genesis_entry() {
+        let genesis = params(
+            vec![Capability::Custom("data:read".to_owned())],
+            CeilingPolicy::Governed,
+        );
+        let live = CapabilityCeiling::new([Capability::Custom("data:*".to_owned())]);
+        assert!(
+            !live.contains(&Capability::Custom("data:read".to_owned())),
+            "precondition: bare `contains` does NOT see this coverage",
+        );
+        check_genesis_ceiling_still_current(&genesis, &live, "site")
+            .expect("a {resource}:* live entry covers the concrete genesis entry");
+    }
+
+    /// The wildcard rule is one-directional: a live CONCRETE entry does not
+    /// cover a genesis WILDCARD (that would be a real fail-open — the joiner
+    /// would install `data:*` while the context grants only `data:read`).
+    #[test]
+    fn concrete_live_entry_does_not_cover_a_genesis_wildcard() {
+        let genesis = params(
+            vec![Capability::Custom("data:*".to_owned())],
+            CeilingPolicy::Governed,
+        );
+        let live = CapabilityCeiling::new([Capability::Custom("data:read".to_owned())]);
+        let err = check_genesis_ceiling_still_current(&genesis, &live, "site")
+            .expect_err("narrowing a wildcard to a concrete action is a LOWERING");
+        assert!(err.to_string().contains("data:*"), "got: {err}");
+    }
+
+    /// The non-vacuity detector. `ContextParams::default()` — the value every
+    /// FFI bridge used to hand the restore path — carries an EMPTY ceiling, and
+    /// an empty genesis set is trivially covered by ANY live ceiling. The
+    /// primary check alone would therefore return a vacuous `Ok`, leaving a gate
+    /// that is present in the source but enforces nothing.
+    ///
+    /// `ContextParams::default()` also carries `ceiling_policy: Immutable` (the
+    /// `#[default]` variant), under which the live ceiling CANNOT diverge from
+    /// genesis (§5.3.2 — `ModifyCeiling` requires `Governed`). A non-empty live
+    /// ceiling therefore proves these are not the context's real params.
+    #[test]
+    fn reconstructed_default_params_are_refused_not_vacuously_accepted() {
+        let fabricated = ContextParams::default();
+        assert!(
+            fabricated.ceiling.is_empty() && fabricated.ceiling_policy == CeilingPolicy::Immutable,
+            "precondition: the default params are the exact fabricated shape this guards",
+        );
+        let live = CapabilityCeiling::new([Capability::MessagesRead, Capability::MemberInvite]);
+
+        let err = check_genesis_ceiling_still_current(&fabricated, &live, "site")
+            .expect_err("a reconstructed/default ContextParams must NOT pass vacuously");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Immutable") && msg.contains("not this context's own"),
+            "the refusal must name the non-vacuity reason, got: {msg}",
+        );
+        assert!(
+            msg.contains("messages:read") && msg.contains("member:invite"),
+            "the refusal must name the unexplained live entries, got: {msg}",
+        );
+    }
+
+    /// The detector is scoped to `Immutable` on purpose: under `Governed` a
+    /// WIDENING — including a widening away from an empty genesis ceiling — is a
+    /// legitimate, specced operation (§5.3.2), so the same asymmetry there is
+    /// real evolution rather than evidence of a fabricated handle. Refusing it
+    /// would brick a legitimate governance action.
+    #[test]
+    fn governed_widening_from_an_empty_genesis_ceiling_is_permitted() {
+        let genesis = params(Vec::new(), CeilingPolicy::Governed);
+        let live = CapabilityCeiling::new([Capability::MessagesRead]);
+        check_genesis_ceiling_still_current(&genesis, &live, "site")
+            .expect("a governed widening from an empty ceiling is legitimate");
+    }
+
+    /// An `Immutable` context whose live ceiling equals genesis passes both
+    /// directions — the ordinary, overwhelmingly common case must not be
+    /// disturbed by the detector.
+    #[test]
+    fn immutable_context_with_matching_ceilings_passes() {
+        let caps = vec![Capability::MessagesRead, Capability::MessagesWrite];
+        let genesis = params(caps.clone(), CeilingPolicy::Immutable);
+        let live = CapabilityCeiling::new(caps);
+        check_genesis_ceiling_still_current(&genesis, &live, "site")
+            .expect("live == genesis under Immutable is the normal case");
     }
 }

@@ -13137,8 +13137,8 @@ impl Supervisor {
                  fail-closed rather than sealing a bundle whose authority may be stale"
             ))
         })?;
-        crate::context::state::check_genesis_ceiling_covered_by_live(
-            &params.ceiling,
+        crate::context::state::check_genesis_ceiling_still_current(
+            &params,
             live_role_state.ceiling(),
             "invite_member",
         )?;
