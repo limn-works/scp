@@ -28,7 +28,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scp_clock::Clock;
 use scp_ffi_common::error_codes as codes;
-use scp_platform::traits::Storage;
 
 use crate::error::ScpPyError;
 use crate::runtime::PyBridgeInstance;
@@ -201,9 +200,27 @@ impl PyCheckpoint {
 
 /// Queries the context event log on a specific bridge instance.
 ///
-/// Returns actual event data from the `ProtocolRepository` when available,
-/// falling back to a `LogSummary` metadata event when storage is not
-/// initialized or no event payloads have been persisted.
+/// # The answer comes from the AUTHORITATIVE log only
+///
+/// Every event returned is a leaf of the supervisor's canonical event log — the
+/// same source [`event_log_verify`](PyScp::event_log_verify) proves against and
+/// [`event_log_checkpoint`](PyScp::event_log_checkpoint) commits to. There is no
+/// bridge-local fallback.
+///
+/// This function used to end
+/// `supervisor(bi).ok().and_then(|m| m.event_log_entries(..).ok().flatten())`
+/// and, on ANY failure or on an empty result, fall through to the bridge-local
+/// `FfiBridgeState::event_log` — publishing THAT tree's root as `merkle_root`
+/// in a synthesized `LogSummary` event, under the same field name the
+/// authoritative answers use. Two consequences (GitHub #1933): a consumer
+/// pinning a verify proof against a queried root could accept a root a caller
+/// had shaped through `provenance_attach` / outlet calls; and
+/// `entries.is_empty() -> fall through` collapsed the empty-but-live vs unknown
+/// distinction, so query and verify returned contradictory answers about the
+/// same context.
+///
+/// Now: an empty-but-live log returns an EMPTY list, and an unreachable or
+/// unknown log FAILS CLOSED with `SCP-CTX-2138`.
 ///
 /// # Arguments
 ///
@@ -219,43 +236,44 @@ impl PyCheckpoint {
 ///
 /// # Returns
 ///
-/// A list of [`PyEvent`] objects. Returns deserialized real events when
-/// event payloads have been persisted via `ProtocolRepository`, or a single
-/// `LogSummary` event with Merkle root and event count as fallback.
+/// A list of [`PyEvent`] objects, empty when the log is live but holds no
+/// matching events.
 ///
 /// # Errors
 ///
-/// Raises `ContextError` if the context is not connected to the runtime
-/// or if the query fails.
+/// Raises `ContextError` with `SCP-CTX-2138` when the authoritative log is
+/// unreachable (instance not ready, no supervisor, or no log for the context).
 ///
 /// See ADR-013 §7: `py_event_log_query(handle, filter) -> list[PyEvent]`.
-/// Queries the shared `ContextManager`'s event log provider and maps the
-/// resulting entries into [`PyEvent`]s using the same shape NAPI emits from
-/// its `MerkleEventLogProvider` path.
-///
-/// Returns `Ok(Some(events))` when the manager is initialized AND has
-/// entries for the context, `Ok(None)` when the caller should fall back to
-/// the bridge-local per-context `EventLog` (e.g. UCAN revocation writes,
-/// tests that bypass the manager).
-fn query_manager_entries(
+fn event_log_query_impl(
     bi: &PyBridgeInstance,
     py: Python<'_>,
     context_id: &str,
-    query_filter: &scp_core::store::event_log::EventQueryFilter,
-) -> PyResult<Option<Vec<PyEvent>>> {
+    filter: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Vec<PyEvent>> {
+    validate::validate_context_id(context_id)?;
+    let query_filter = parse_event_query_filter(filter)?;
+
+    // Same fail-closed gate as `event_log_verify` / `event_log_checkpoint`.
+    bi.core
+        .check_ready()
+        .map_err(|e| authoritative_log_unreachable("query", context_id, &e))?;
+    let supervisor = crate::runtime::supervisor(bi)
+        .map_err(|e| authoritative_log_unreachable("query", context_id, &e))?;
+
     // ADR-056: resolve the context-id string to its 32-byte digest via the
     // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
     // double-hashes a real 64-hex id and queries the wrong event-log key).
     let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(context_id);
-    let Some(entries) = crate::runtime::supervisor(bi)
-        .ok()
-        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
-    else {
-        return Ok(None);
-    };
-    if entries.is_empty() {
-        return Ok(None);
-    }
+    let entries = supervisor
+        .event_log_entries(&ctx_id_bytes)
+        .map_err(|e| authoritative_log_unreachable("query", context_id, &e))?
+        // `None` means UNKNOWN — never initialised, or destroyed on actor
+        // shutdown / create-rollback. An empty-but-live log is
+        // `Ok(Some(vec![]))` and returns an empty list below.
+        .ok_or_else(|| {
+            authoritative_log_unreachable("query", context_id, &"no event log for this context")
+        })?;
 
     // Canonical filter — pinned across PyO3/NAPI/UniFFI by
     // `scp_ffi_common::event_log::filter_manager_entries` so the three
@@ -298,188 +316,7 @@ fn query_manager_entries(
             sequence: seq,
         });
     }
-    Ok(Some(py_events))
-}
-
-/// See GitHub issue #303.
-fn event_log_query_impl(
-    bi: &PyBridgeInstance,
-    py: Python<'_>,
-    context_id: &str,
-    filter: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Vec<PyEvent>> {
-    validate::validate_context_id(context_id)?;
-
-    // Parse filter parameters from the Python dict (needed for both the
-    // ContextManager-entries path and the storage fallback).
-    let query_filter = parse_event_query_filter(filter)?;
-
-    // First, try the ContextManager's event log provider — this is the
-    // authoritative source populated by `builder_create_context`
-    // (`ContextCreated` at step 7) and subsequent manager operations.
-    // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/UniFFI —
-    // pinned by the cross-bridge parity harness's `OP_EVENT_LOG_APPEND`
-    // and `OP_EVENT_LOG_FILTERED` (ADR-046).
-    if let Some(events) = query_manager_entries(bi, py, context_id, &query_filter)? {
-        return Ok(events);
-    }
-
-    // Fallback: look up this bridge's per-context event log from the runtime
-    // registry. This path is used by legacy tests and callers that write
-    // directly to the per-context `EventLog` (e.g. UCAN revocation).
-    let (event_count, merkle_root_hex) = crate::runtime::with_context(bi, context_id, |rt| {
-        let count = scp_event_log::tree::event_count(&rt.event_log);
-        let root = scp_event_log::tree::root(&rt.event_log);
-        Ok((count, encode_hex(&root)))
-    })?;
-
-    // If the log is empty, return an empty list.
-    if event_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Attempt to load real events from storage if available.
-    // Uses the Storage trait directly because the global storage is
-    // Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository requires
-    // an owned Storage impl. The key convention matches ProtocolRepository's
-    // event_data key format (GitHub issue #303).
-    if let Some(events) = query_storage_fallback(bi, py, context_id, &query_filter, event_count)? {
-        return Ok(events);
-    }
-
-    // Fallback: Build a summary event with log metadata when ProtocolRepository
-    // is unavailable or contains no event payloads for this context.
-    let payload_json = serde_json::json!({
-        "event_count": event_count,
-        "merkle_root": merkle_root_hex,
-    });
-    let payload = json_to_py_dict(py, &payload_json)?;
-
-    let summary_event = PyEvent {
-        event_type: "LogSummary".to_owned(),
-        actor_did: String::new(),
-        #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
-        timestamp: scp_clock::SystemClock.now_secs() as f64,
-        payload,
-        sequence: event_count.saturating_sub(1),
-    };
-
-    let events = vec![summary_event];
-
-    // Apply limit if specified.
-    if let Some(lim) = query_filter.limit {
-        Ok(events.into_iter().take(lim).collect())
-    } else {
-        Ok(events)
-    }
-}
-
-/// Loads real events from this bridge's per-context storage when the manager
-/// path returned nothing.
-///
-/// Returns `Ok(Some(events))` when storage held matching events, `Ok(None)`
-/// when storage is unavailable or held none (so the caller falls through to the
-/// summary event). Mirrors the manager path's payload projection: each event's
-/// bridge-facing fields (e.g. `target_did`, `subject_did`) are decoded through
-/// the single shared [`scp_event_log::payload::project_payload`] decoder.
-///
-/// Uses the `Storage` trait directly because the global storage is
-/// `Arc<EncryptingAdapter<InMemoryStorage>>` and `ProtocolRepository` requires
-/// an owned `Storage` impl. The key convention matches `ProtocolRepository`'s
-/// `event_data` key format.
-fn query_storage_fallback(
-    bi: &PyBridgeInstance,
-    py: Python<'_>,
-    context_id: &str,
-    query_filter: &scp_core::store::event_log::EventQueryFilter,
-    event_count: u64,
-) -> PyResult<Option<Vec<PyEvent>>> {
-    let Ok(storage) = crate::runtime::get_storage(bi) else {
-        return Ok(None);
-    };
-    let rt = crate::runtime()?;
-    let prefix = format!("context/{context_id}/event_data/");
-    let Ok(keys) = rt.block_on(storage.list_keys(&prefix)) else {
-        return Ok(None);
-    };
-
-    let seq_start = query_filter.sequence_start.unwrap_or(0);
-    let seq_end = query_filter.sequence_end.unwrap_or(event_count);
-    let start_suffix = format!("{seq_start:020}");
-    let end_suffix = format!("{seq_end:020}");
-
-    let mut py_events = Vec::new();
-    for key in &keys {
-        let Some(seq_str) = key.strip_prefix(&prefix) else {
-            continue;
-        };
-        if seq_str >= end_suffix.as_str() {
-            break;
-        }
-        if seq_str < start_suffix.as_str() {
-            continue;
-        }
-        if let Ok(Some(data)) = rt.block_on(storage.retrieve(key))
-            && let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data)
-        {
-            // Apply additional filters.
-            if let Some(ref et) = query_filter.event_type
-                && format!("{:?}", event.event_type) != *et
-            {
-                continue;
-            }
-            if let Some(ref actor) = query_filter.actor_did
-                && event.actor_did.0 != *actor
-            {
-                continue;
-            }
-            if let Some(ts_start) = query_filter.timestamp_start
-                && event.timestamp < ts_start
-            {
-                continue;
-            }
-            if let Some(ts_end) = query_filter.timestamp_end
-                && event.timestamp >= ts_end
-            {
-                continue;
-            }
-
-            // Project the typed payload's bridge-facing fields (`target_did`,
-            // `subject_did`) through the single shared helper, agreeing with
-            // the manager-path projection. Each key is omitted when the
-            // projection yields `None`.
-            let mut payload_json = serde_json::json!({
-                "data": serde_json::to_value(&event.payload.data).unwrap_or_default(),
-            });
-            scp_ffi_common::event_log::inject_projection(
-                &mut payload_json,
-                &event.event_type,
-                &event.payload,
-            );
-            let payload = json_to_py_dict(py, &payload_json)?;
-
-            #[allow(clippy::cast_precision_loss)]
-            py_events.push(PyEvent {
-                event_type: format!("{:?}", event.event_type),
-                actor_did: event.actor_did.0.clone(),
-                timestamp: event.timestamp as f64,
-                payload,
-                sequence: event.sequence,
-            });
-
-            if let Some(limit) = query_filter.limit
-                && py_events.len() >= limit
-            {
-                break;
-            }
-        }
-    }
-
-    if py_events.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(py_events))
-    }
+    Ok(py_events)
 }
 
 /// Parses an `EventQueryFilter` from an optional Python dict.

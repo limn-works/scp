@@ -684,8 +684,18 @@ export async function evaluateTrust(
   const capabilityValidation = await evaluateLayer1(scp, handle, capabilityTokens, subjectDid);
 
   // Layer 2: query behavioral record from the event log.
+  //
+  // NOT wrapped in a catch. This used to swallow ANY `[SCP-CTX-NNNN]` from
+  // `eventLogQuery` into `behavioralRecord: null`, on the theory that a context
+  // error there meant "the subject has no event-log history yet". That is no
+  // longer a state the bridge signals with an error: since GitHub #1933 an
+  // empty-but-live authoritative log returns an EMPTY LIST, and the only
+  // context error the query raises is `SCP-CTX-2138` — the authoritative log is
+  // UNREACHABLE or UNKNOWN. Swallowing that would turn a fail-closed refusal
+  // into a confident "this subject has no behavioural history", i.e. a trust
+  // evaluation built on absence that was never established. It propagates.
   let behavioralRecord: BehavioralRecord | null = null;
-  try {
+  {
     // `scp.eventLogQuery` returns the raw NAPI event objects, which carry an
     // `eventType` field (the only field this layer reads). The filter JSON
     // uses snake_case `actor_did`, the key the bridge's filter parser expects.
@@ -712,23 +722,6 @@ export async function evaluateTrust(
       roleHistory: [],
       endorsementAccuracy: undefined,
     };
-  } catch (error) {
-    // A missing/empty behavioral record is non-fatal: the subject simply has
-    // no event-log history yet. Mirrors the Python port, which catches only
-    // `ContextError` here — any other error is a genuine fault that propagates.
-    //
-    // The NAPI bridge emits context errors with the `[SCP-CTX-NNNN]` prefix
-    // via thiserror Display (`error.rs`). `scp.eventLogQuery` calls the NAPI
-    // bridge directly; `mapBridgeError` re-types the error by its prefix,
-    // preserving the original message verbatim. The prefix is at message
-    // position 0 by the bridge's wire format contract — not injected by
-    // `mapBridgeError`. We classify on the prefix (rather than `instanceof`)
-    // to mirror the Python port's exception-type dispatch and stay robust to
-    // the exact subclass.
-    const msg = error instanceof Error ? error.message : String(error);
-    if (!/^\[SCP-CTX-\d+\]/.test(msg)) {
-      throw error;
-    }
   }
 
   return {

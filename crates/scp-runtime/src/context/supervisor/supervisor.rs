@@ -14672,6 +14672,55 @@ impl Supervisor {
         })?
     }
 
+    /// Appends one typed event to the context's AUTHORITATIVE event log —
+    /// test-only.
+    ///
+    /// Drives the REAL event-log provider (`append_event`), the same call the
+    /// runtime's own lifecycle/governance paths make; it is a seam for
+    /// *reaching* the authoritative log from a test, not a substitute for it.
+    /// Bridge tests need it because the FFI event-log surfaces read the
+    /// authoritative log exclusively (GitHub #1933), while a leaf of a specific
+    /// type — a `GovernanceActionExecuted` carrying a `target_did`, say — is
+    /// otherwise only produced by a full governance round-trip that the bridge
+    /// test harness cannot drive (the governance key resolver only resolves
+    /// DID-document-published identities, and in-memory test identities are
+    /// never published).
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no event-log provider is wired.
+    /// - [`ContextError::EventLogFailed`] if the append fails (no log for the
+    ///   context, serialization, persistence, or backstop rejection).
+    #[cfg(feature = "testing")]
+    pub async fn test_append_event(
+        &self,
+        context_id: &str,
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::test_append_event — event_log provider not configured".to_owned(),
+            )
+        })?;
+        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        event_log
+            .append_event(
+                &context_id_bytes,
+                event_type,
+                actor_did,
+                payload,
+                timestamp_secs,
+            )
+            .await
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
     /// Answers a §9.16.2 sender-key PULL request on the OWNED actor crypto state
     /// via the actor mailbox — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
     ///

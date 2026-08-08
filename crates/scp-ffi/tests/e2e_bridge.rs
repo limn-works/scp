@@ -578,59 +578,74 @@ fn event_log_query_with_filter() {
     });
 }
 
+/// Appends one typed event to the AUTHORITATIVE supervisor log for `ctx_id`.
+///
+/// The projection tests below need a leaf of a SPECIFIC type
+/// (`GovernanceActionExecuted` with a `target_did`, `RoleAssigned` with a
+/// `subject_did`). Since #1933 `event_log_query` reads the authoritative log
+/// exclusively, and a full governance round-trip is not drivable from this
+/// harness (the governance key resolver only resolves DID-document-published
+/// identities; in-memory test identities are never published), so the event is
+/// appended through the runtime's real provider via the `testing`-gated
+/// `Supervisor::test_append_event`.
+fn append_authoritative_event(
+    bi: &PyBridgeInstance,
+    ctx_id: &str,
+    event_type: scp_event_log::EventType,
+    actor_did: &str,
+    payload: scp_event_log::EventPayload,
+) {
+    let supervisor = runtime::supervisor(bi)
+        .expect("supervisor attached")
+        .clone();
+    let ctx = ctx_id.to_owned();
+    let actor = actor_did.to_owned();
+    test_runtime()
+        .block_on(async move {
+            supervisor
+                .test_append_event(&ctx, event_type, &actor, payload, 1_700_000_000)
+                .await
+        })
+        .expect("authoritative append succeeds");
+}
+
 #[test]
-fn event_log_query_projects_governance_target_did_from_storage() {
-    // Drives the storage-fallback path of `event_log_query`: register FFI state
-    // WITHOUT a supervisor `create_context` (so the manager path returns None),
-    // append one event to the per-context log so `event_count > 0`, then write a
-    // `GovernanceActionExecuted` event to storage. The query must project the
-    // event's `target_did` into `payload_json` via the shared `project_payload`
-    // decoder, agreeing byte-for-byte with the other three bridges.
-    use scp_platform::Storage as _;
+fn event_log_query_projects_governance_target_did() {
+    // The query must project a `GovernanceActionExecuted` leaf's `target_did`
+    // into `payload` via the shared `project_payload` decoder, agreeing
+    // byte-for-byte with the other three bridges. Driven over the
+    // AUTHORITATIVE log — since #1933 there is no bridge-local fallback to
+    // project from.
     Python::with_gil(|py| {
-        setup();
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
         let did = create_test_identity(bi);
-        let ctx_id = random_context_id();
-        // FFI state only — no supervisor entry, so the manager path is empty.
-        runtime::register_context(bi, &ctx_id, &did, &[]).unwrap();
+        let ctx_id = create_test_context(bi, &did);
 
         let target_did = "did:key:target-member";
-        let governance_event = scp_event_log::Event {
-            event_type: scp_event_log::EventType::GovernanceActionExecuted,
-            actor_did: scp_did::DID(did),
-            timestamp: 1_700_000_000,
-            sequence: 0,
-            payload: scp_event_log::payload::encode_payload(
+        append_authoritative_event(
+            bi,
+            &ctx_id,
+            scp_event_log::EventType::GovernanceActionExecuted,
+            &did,
+            scp_event_log::payload::encode_payload(
                 &scp_event_log::payload::GovernanceActionExecutedPayload {
                     target_did: target_did.to_owned(),
                     action_type: "RemoveMember".to_owned(),
                 },
             )
             .unwrap(),
-            prev_hash: [0u8; 32],
-            signature: vec![],
-        };
+        );
 
-        // Per-context log must be non-empty so the fallback does not early-return.
-        runtime::with_context(bi, &ctx_id, |rt| {
-            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &governance_event)
-                .unwrap();
-            Ok(())
-        })
-        .unwrap();
-
-        // Persist the full typed event under the ProtocolRepository key format.
-        let storage = runtime::get_storage(bi).unwrap();
-        let key = format!("context/{ctx_id}/event_data/{:020}", 0u64);
-        let bytes = rmp_serde::to_vec(&governance_event).unwrap();
-        test_runtime()
-            .block_on(storage.store(&key, &bytes))
+        let filter = PyDict::new(py);
+        filter
+            .set_item("event_type", "GovernanceActionExecuted")
             .unwrap();
-
-        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
-        assert_eq!(events.len(), 1, "the stored governance event is returned");
+        let events = scp
+            .event_log_query(py, &ctx_id, Some(&filter.as_borrowed()))
+            .unwrap();
+        assert_eq!(events.len(), 1, "the governance leaf is returned");
 
         let payload = events[0].payload.bind(py);
         let projected: String = payload
@@ -646,62 +661,37 @@ fn event_log_query_projects_governance_target_did_from_storage() {
 }
 
 #[test]
-fn event_log_query_projects_role_assigned_subject_did_from_storage() {
-    // Drives the storage-fallback path of `event_log_query`: register FFI state
-    // WITHOUT a supervisor `create_context` (so the manager path returns None),
-    // append one `RoleAssigned` event to the per-context log so `event_count > 0`,
-    // then write the same event to storage. The query must project the event's
-    // `subject_did` (the affected member, NOT the governance actor) into
-    // `payload_json` via the shared `project_payload` decoder, agreeing
-    // byte-for-byte with the other three bridges.
-    use scp_platform::Storage as _;
+fn event_log_query_projects_role_assigned_subject_did() {
+    // The query must project a `RoleAssigned` leaf's `subject_did` (the
+    // affected member, NOT the governance actor) via the shared
+    // `project_payload` decoder, and must NOT surface a `target_did` key.
+    // Driven over the AUTHORITATIVE log.
     Python::with_gil(|py| {
-        setup();
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
         let did = create_test_identity(bi);
-        let ctx_id = random_context_id();
-        // FFI state only — no supervisor entry, so the manager path is empty.
-        runtime::register_context(bi, &ctx_id, &did, &[]).unwrap();
+        let ctx_id = create_test_context(bi, &did);
 
         let subject_did = "did:key:subject-member";
-        let role_event = scp_event_log::Event {
-            event_type: scp_event_log::EventType::RoleAssigned,
-            actor_did: scp_did::DID(did),
-            timestamp: 1_700_000_000,
-            sequence: 0,
-            payload: scp_event_log::payload::encode_payload(
-                &scp_event_log::payload::RoleAssignedPayload {
-                    subject_did: subject_did.to_owned(),
-                    role: "moderator".to_owned(),
-                },
-            )
+        append_authoritative_event(
+            bi,
+            &ctx_id,
+            scp_event_log::EventType::RoleAssigned,
+            &did,
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
+                subject_did: subject_did.to_owned(),
+                role: "moderator".to_owned(),
+            })
             .unwrap(),
-            prev_hash: [0u8; 32],
-            signature: vec![],
-        };
-
-        // Per-context log must be non-empty so the fallback does not early-return.
-        runtime::with_context(bi, &ctx_id, |rt| {
-            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &role_event).unwrap();
-            Ok(())
-        })
-        .unwrap();
-
-        // Persist the full typed event under the ProtocolRepository key format.
-        let storage = runtime::get_storage(bi).unwrap();
-        let key = format!("context/{ctx_id}/event_data/{:020}", 0u64);
-        let bytes = rmp_serde::to_vec(&role_event).unwrap();
-        test_runtime()
-            .block_on(storage.store(&key, &bytes))
-            .unwrap();
-
-        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
-        assert_eq!(
-            events.len(),
-            1,
-            "the stored role-assigned event is returned"
         );
+
+        let filter = PyDict::new(py);
+        filter.set_item("event_type", "RoleAssigned").unwrap();
+        let events = scp
+            .event_log_query(py, &ctx_id, Some(&filter.as_borrowed()))
+            .unwrap();
+        assert_eq!(events.len(), 1, "the role-assigned leaf is returned");
 
         let payload = events[0].payload.bind(py);
         let projected: String = payload
@@ -718,6 +708,38 @@ fn event_log_query_projects_role_assigned_subject_did_from_storage() {
         assert!(
             payload.get_item("target_did").is_err(),
             "RoleAssigned leaf carries a subject, not a target"
+        );
+    });
+}
+
+/// #1933 — an UNKNOWN authoritative log must FAIL CLOSED, not fall through to
+/// the bridge-local tree and publish its root as `merkle_root` in a synthesized
+/// `LogSummary` event.
+#[test]
+fn event_log_query_fails_closed_when_the_authoritative_log_is_unknown() {
+    Python::with_gil(|py| {
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let bi = scp.bridge_instance();
+        runtime::init_context_manager_for_test(bi);
+        let did = create_test_identity(bi);
+
+        // FFI state only — the supervisor holds no log for this context.
+        let ctx_id = random_context_id();
+        runtime::register_context(bi, &ctx_id, &did, &[]).unwrap();
+        // A non-empty bridge-local tree the pre-fix fallback would have
+        // summarized, publishing its root under the authoritative field name.
+        runtime::with_context(bi, &ctx_id, |rt| {
+            rt.event_log.push_leaf_raw([0xABu8; 32]);
+            Ok(())
+        })
+        .unwrap();
+
+        let err = scp
+            .event_log_query(py, &ctx_id, None)
+            .expect_err("an unknown authoritative log must fail closed");
+        assert!(
+            err.to_string().contains("SCP-CTX-2138"),
+            "expected the fail-closed authoritative-log code, got: {err}"
         );
     });
 }
