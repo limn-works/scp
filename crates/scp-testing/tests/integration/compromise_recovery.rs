@@ -13,9 +13,9 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use scp_core::identity::recovery::{
     CompromiseRecoveryOrchestrator, CompromiseTier, ContactNotification, ContextRecoveryState,
-    KeyRotationOutcome, PskRotationParams, RecoveryBackend, RecoveryError, RecoveryResult,
-    RecoveryStepError, active_key_rotation_outcome, agent_key_rotation_outcome,
-    identity_key_rotation_outcome,
+    KeyRotationOutcome, PskRotationParams, RecoveryBackend, RecoveryError, RecoveryProgress,
+    RecoveryResult, RecoveryStepError, RecoveryStepErrorCode, StepOutcome,
+    active_key_rotation_outcome, agent_key_rotation_outcome, identity_key_rotation_outcome,
 };
 use scp_did::DID;
 
@@ -25,6 +25,20 @@ use scp_did::DID;
 
 fn did(s: &str) -> DID {
     DID::from(s)
+}
+
+/// Converts a mock's boolean success knob into the tri-state step result the
+/// trait returns.
+fn step_result(step: u8, ok: bool) -> Result<(), RecoveryStepError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(RecoveryStepError {
+            step,
+            code: RecoveryStepErrorCode::Unspecified,
+            description: format!("mock backend configured to fail step {step}"),
+        })
+    }
 }
 
 /// Mock `RecoveryBackend` that succeeds by default. Individual steps can be
@@ -93,12 +107,12 @@ impl RecoveryBackend for MockBackend {
         _tier: CompromiseTier,
         _key_rotation: &KeyRotationOutcome,
         _contacts: &HashSet<DID>,
-    ) -> bool {
-        self.notify_contacts_result
+    ) -> Result<(), RecoveryStepError> {
+        step_result(5, self.notify_contacts_result)
     }
 
-    async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
-        self.rotate_psk_result
+    async fn rotate_psk(&self, _params: &PskRotationParams) -> Result<(), RecoveryStepError> {
+        step_result(6, self.rotate_psk_result)
     }
 }
 
@@ -138,8 +152,12 @@ async fn compromise_tier_agent() {
     assert!(result.new_did.is_none());
     assert_eq!(result.completed_contexts.len(), 2);
     assert!(result.failed_contexts.is_empty());
-    // Agent tier: PSK unaffected → private_state_reencrypted is true.
-    assert!(result.private_state_reencrypted);
+    // Agent tier: the PSK is unaffected, so step 6 genuinely does NOT run.
+    // NotApplicable is not success — the old `bool` conflated the two.
+    assert!(matches!(
+        result.private_state_reencryption,
+        StepOutcome::NotApplicable(_)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -180,8 +198,8 @@ async fn compromise_tier_active_signing() {
     assert_eq!(result.tier, CompromiseTier::ActiveSigning);
     assert!(result.new_did.is_none());
     assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-    assert!(result.contacts_notified);
-    assert!(result.private_state_reencrypted);
+    assert!(result.contact_notification.succeeded());
+    assert!(result.private_state_reencryption.succeeded());
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +241,8 @@ async fn compromise_tier_identity_key() {
     assert_eq!(result.tier, CompromiseTier::IdentityKey);
     assert_eq!(result.new_did, Some(alice_new));
     assert!(result.key_rotation_completed);
-    assert!(result.contacts_notified);
-    assert!(result.private_state_reencrypted);
+    assert!(result.contact_notification.succeeded());
+    assert!(result.private_state_reencryption.succeeded());
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +386,7 @@ async fn context_recovery_state_failure() {
         requires_rejoin: false,
         error: Some(RecoveryStepError {
             step: 3,
+            code: RecoveryStepErrorCode::UcanRevocationUnwired,
             description: "UCAN revocation timeout".to_owned(),
         }),
     };
@@ -428,6 +447,7 @@ async fn recovery_result_completed_vs_failed() {
             "ctx-fail".to_owned(),
             RecoveryStepError {
                 step: 2,
+                code: RecoveryStepErrorCode::Unspecified,
                 description: "MLS group unavailable".to_owned(),
             },
         )),
@@ -476,6 +496,7 @@ async fn recovery_result_with_rejoin_context() {
             "ctx-rejoin".to_owned(),
             RecoveryStepError {
                 step: 2,
+                code: RecoveryStepErrorCode::RequiresRejoin,
                 description: "member requires rejoin".to_owned(),
             },
         )),
@@ -552,9 +573,9 @@ async fn psk_rotation_params() {
         )
         .await
         .unwrap();
-    assert!(!result.private_state_reencrypted);
+    assert!(!result.private_state_reencryption.succeeded());
 
-    // With PSK params → private_state_reencrypted is true.
+    // With PSK params → step 6 runs and succeeds.
     let result_with = orch
         .execute_recovery(
             CompromiseTier::ActiveSigning,
@@ -566,7 +587,7 @@ async fn psk_rotation_params() {
         )
         .await
         .unwrap();
-    assert!(result_with.private_state_reencrypted);
+    assert!(result_with.private_state_reencryption.succeeded());
 }
 
 // ---------------------------------------------------------------------------
@@ -599,19 +620,55 @@ async fn recovery_error_variants() {
     assert!(e5.to_string().contains("keychain locked"));
 
     // AllContextsFailed (total per-context failure → fail-closed, #2240).
+    let progress = RecoveryProgress {
+        contexts_through_per_context_steps: Vec::new(),
+        failed_contexts: vec![(
+            "ctx-1".to_owned(),
+            RecoveryStepError {
+                step: 3,
+                code: RecoveryStepErrorCode::UcanRevocationUnwired,
+                description: "UCAN revocation is not wired for recovery".to_owned(),
+            },
+        )],
+        pending_rejoin: Vec::new(),
+        key_package_rotation: StepOutcome::Succeeded,
+        contact_notification: StepOutcome::NotApplicable("no known contacts".to_owned()),
+        private_state_reencryption: StepOutcome::NotApplicable("agent tier".to_owned()),
+    };
     let e6 = RecoveryError::AllContextsFailed {
         attempted: 3,
-        failed_contexts: Vec::new(),
-        key_packages_rotated: false,
-        contacts_notified: false,
-        private_state_reencrypted: false,
+        progress: progress.clone(),
     };
     assert!(e6.to_string().contains("all 3 context"));
     assert!(e6.to_string().contains("zero contexts recovered"));
+    // The honest per-step reason must survive into the Display.
+    assert!(e6.to_string().contains("UCAN revocation is not wired"));
+    // A step that did not run must NOT read as having succeeded.
+    assert!(e6.to_string().contains("did not run"));
+
+    // KeyPackageRotationFailed (identity-scoped → fatal regardless of context
+    // count, §9.12 "Step scope").
+    let e7 = RecoveryError::KeyPackageRotationFailed {
+        step_error: RecoveryStepError {
+            step: 4,
+            code: RecoveryStepErrorCode::KeyPackageRotationUnwired,
+            description: "KeyPackage rotation is not wired".to_owned(),
+        },
+        progress,
+    };
+    assert!(
+        e7.to_string()
+            .contains("step 4 (KeyPackage rotation) failed")
+    );
+    assert!(
+        e7.to_string()
+            .contains("no context can be reported as recovered")
+    );
 
     // RecoveryStepError Display.
     let step_err = RecoveryStepError {
         step: 4,
+        code: RecoveryStepErrorCode::KeyPackageRotationUnwired,
         description: "KeyPackage publish timeout".to_owned(),
     };
     assert_eq!(step_err.to_string(), "step 4: KeyPackage publish timeout");
@@ -663,7 +720,7 @@ async fn recovery_with_contact_notification_failure() {
 
     // Per-context steps succeed, but contact notification failed.
     assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-    assert!(!result.contacts_notified);
+    assert!(!result.contact_notification.succeeded());
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +755,7 @@ async fn recovery_with_psk_rotation_failure() {
         .await
         .unwrap();
 
-    assert!(!result.private_state_reencrypted);
+    assert!(!result.private_state_reencryption.succeeded());
 }
 
 // ---------------------------------------------------------------------------
@@ -716,14 +773,14 @@ async fn recovery_result_serialization() {
             "ctx-2".to_owned(),
             RecoveryStepError {
                 step: 2,
+                code: RecoveryStepErrorCode::Unspecified,
                 description: "MLS update failed".to_owned(),
             },
         )],
         pending_rejoin: vec!["ctx-3".to_owned()],
         key_rotation_completed: true,
-        key_packages_rotated: true,
-        contacts_notified: true,
-        private_state_reencrypted: true,
+        contact_notification: StepOutcome::Succeeded,
+        private_state_reencryption: StepOutcome::Succeeded,
         initiated_at: 1000,
         completed_at: 2000,
     };
@@ -735,7 +792,6 @@ async fn recovery_result_serialization() {
     assert_eq!(parsed.completed_contexts, vec!["ctx-1"]);
     assert_eq!(parsed.failed_contexts.len(), 1);
     assert_eq!(parsed.pending_rejoin, vec!["ctx-3"]);
-    assert!(parsed.key_packages_rotated);
     assert_eq!(parsed.initiated_at, 1000);
     assert_eq!(parsed.completed_at, 2000);
 
@@ -774,6 +830,11 @@ async fn recovery_with_no_contexts() {
     assert!(result.failed_contexts.is_empty());
     assert!(result.pending_rejoin.is_empty());
     assert!(result.key_rotation_completed);
-    assert!(result.contacts_notified);
+    // No contacts to notify: step 5 does not run, so NotApplicable — not
+    // success. (The old `bool` reported `true` here for a step that never ran.)
+    assert!(matches!(
+        result.contact_notification,
+        StepOutcome::NotApplicable(_)
+    ));
     assert!(result.completed_at >= result.initiated_at);
 }

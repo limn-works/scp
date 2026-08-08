@@ -17546,12 +17546,15 @@ impl Scp {
 
         // FAIL CLOSED (#2240): there is no configured recovery backend at the
         // FFI layer, and step 1 (real key rotation) cannot be performed here.
-        // Unlike custody migration — whose orchestrator surfaces its
-        // NotConfigured backend's first `Err` as a fatal error —
-        // `CompromiseRecoveryOrchestrator::execute_recovery` isolates
-        // per-context failures (§9.12) and never returns a fatal "backend
-        // absent" error, so recovery must fail closed at the bridge boundary
-        // before any `KeyRotationOutcome` / `RecoveryResult` is fabricated.
+        // `CompromiseRecoveryOrchestrator::execute_recovery` takes both a
+        // `KeyRotationOutcome` from a completed step 1 and a `RecoveryBackend`
+        // to drive steps 2-6; this bridge can supply neither, so it fails
+        // closed at the boundary rather than fabricate either one. (The
+        // orchestrator also fails closed on the paths it can see —
+        // `KeyRotationFailed` on a missing step 1, `KeyPackageRotationFailed`
+        // on the identity-scoped step 4, `AllContextsFailed` on a total
+        // per-context failure — but that is defence in depth, not this gate's
+        // justification.)
         Err(ScpError::Identity {
             msg: "recovery backend not configured — provide a real backend via SDK layer"
                 .to_owned(),

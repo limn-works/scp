@@ -4070,10 +4070,11 @@ impl Supervisor {
             // lazily respawns the target context's actor from its persisted
             // snapshot and dispatches the notification to that actor's mailbox,
             // where the actor-shape `recovery_send_notification` handler seals
-            // through the authoritative owned `ContextCryptoState`. The one
-            // surviving real (64-hex) member-context producer is the step-2
-            // epoch-advance notification (`mls_update`, seq 0); it respawns and
-            // seals via the mailbox. The synthetic `identity-private-state`
+            // through the authoritative owned `ContextCryptoState`. TWO real
+            // (64-hex) member-context producers survive — the step-2
+            // epoch-advance notification (`mls_update`, seq 0) and the step-5
+            // contact fan-out (seq 4); both respawn and seal via the mailbox.
+            // The synthetic `identity-private-state`
             // pseudo-context (PSK rotation §9.12 step 6) is non-64-hex with no
             // snapshot and no production MLS group, so it returns the same "no
             // MLS group" error the retired provider seal produced (best-effort
@@ -4122,18 +4123,37 @@ impl Supervisor {
     ///
     /// Two shapes reach here at recovery time (ADR-049 lazy-spawn):
     ///
-    /// - Real (64-hex) member contexts that simply have no spawned actor — now
-    ///   only the step-2 epoch-advance notification
-    ///   ([`mls_update`](crate::identity::recovery), seq 0). These respawn from
-    ///   their persisted Active snapshot and seal via the mailbox.
+    /// - Real (64-hex) member contexts that simply have no spawned actor. TWO
+    ///   producers emit these, both traced to their call sites:
     ///
-    ///   Note this producer is itself gated: it is emitted only after
-    ///   `RecoveryAdvanceEpoch` has already succeeded for the context, which
-    ///   requires a registered actor. So the window this fallback covers is
-    ///   narrow — a deregistration between the epoch advance and the
-    ///   notification (crash/respawn). In practice `restore_on_startup` eagerly
-    ///   spawns an actor for every persisted Active context, so live recovery
-    ///   flows normally reach the mailbox directly.
+    ///   1. **Step 2, seq 0** — the epoch-advance notification from
+    ///      `ProductionRecoveryBackend::mls_update`
+    ///      (`identity/recovery.rs`, `dispatch_recovery_send_notification(..,
+    ///      0)`). Emitted only after `RecoveryAdvanceEpoch` has already
+    ///      succeeded for that context.
+    ///   2. **Step 5, seq 4** — the contact fan-out from
+    ///      `ProductionRecoveryBackend::notify_contacts`, which dispatches
+    ///      `RecoveryNotifyContact`; that variant carries no `context_id`, so
+    ///      [`Self::trust_recovery_command_context_id`] returns `None` and it
+    ///      always routes to [`Self::recovery_notify_contact`], which picks a
+    ///      shared context and re-dispatches a `RecoverySendNotification` with
+    ///      `sequence: 4`. (Its actor-shape twin,
+    ///      [`trust_recovery_helpers::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact),
+    ///      emits the same seq 4 via
+    ///      [`SupervisorHandle::dispatch_recovery_send_notification`](crate::context::supervisor::handle::SupervisorHandle::dispatch_recovery_send_notification).)
+    ///
+    ///   Unlike seq 0, seq 4 is **not** gated on a prior successful step for
+    ///   that context: step 5 is identity-scoped cleanup and runs even when
+    ///   every per-context step failed. What both share is that their context
+    ///   id names a *registered* actor at selection time — seq 0 because
+    ///   `RecoveryAdvanceEpoch` requires one, seq 4 because
+    ///   [`Self::recovery_notify_contact`] scans [`Self::actor_ids`]. So this
+    ///   fallback is reached only when the actor deregisters between selection
+    ///   and dispatch (`dispatch_trust_recovery_command`'s [`Self::lookup`]
+    ///   returning `None`). Both respawn from their persisted Active snapshot
+    ///   and seal via the mailbox. That window is narrow in practice:
+    ///   [`Self::restore_on_startup`] runs [`Self::restore_all_contexts`],
+    ///   which rehydrates an actor for every persisted `Active` context.
     ///
     ///   The former `revoke_ucans` (seq 1) and `rotate_key_packages` (seq 2)
     ///   producers are gone: both steps fail closed and dispatch nothing
@@ -22174,10 +22194,12 @@ mod tests {
     /// [`context_id_bytes`](scp_protocol::context::context_id_bytes) primitive.
     ///
     /// This direct path is reached for ANY unregistered context — including
-    /// REAL 64-hex member contexts whose actor is not spawned at recovery time
-    /// (the surviving producer being the step-2 epoch-advance
-    /// compromise-recovery notification, seq 0, when the actor deregisters
-    /// between the epoch advance and the send). For a real id, the chokepoint
+    /// REAL 64-hex member contexts whose actor is not spawned at recovery time.
+    /// Two producers emit such ids: the step-2 epoch-advance notification
+    /// (seq 0) and the step-5 contact fan-out (seq 4); either reaches here when
+    /// the actor deregisters between context selection and the send (see
+    /// `Supervisor::recovery_send_notification_direct` for the traced
+    /// enumeration). For a real id, the chokepoint
     /// DECODES the 64-hex string
     /// to its 32-byte digest, whereas the raw primitive would double-hash it
     /// (`SHA-256(hex(digest))`) and key a slot no member listens on — the
