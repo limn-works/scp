@@ -1967,15 +1967,16 @@ pub struct RecoverySendNotificationPayload {
     pub payload: Vec<u8>,
     /// Recovery-step sequence number (see spec §9.12).
     ///
-    /// Live producers: `0` = MLS epoch advance (step 2), `3` = PSK rotation
-    /// (step 6), `4` = contact notification (step 5).
+    /// Live producers: `0` = MLS epoch advance (step 2), `4` = contact
+    /// notification (step 5).
     ///
-    /// `1` (UCAN revocation, step 3) and `2` (`KeyPackage` rotation, step 4)
-    /// are **unallocated**: both steps fail closed in
+    /// `1` (UCAN revocation, step 3), `2` (`KeyPackage` rotation, step 4) and
+    /// `3` (PSK rotation, step 6) are **unallocated**: all three steps fail
+    /// closed in
     /// [`ProductionRecoveryBackend`](crate::identity::recovery::ProductionRecoveryBackend)
-    /// and dispatch nothing (#2069, #2240 Part B item 2). They are reserved
-    /// rather than reused, so a future wiring of either step keeps its
-    /// historical sequence.
+    /// and dispatch nothing (#2069, #2240 Part B item 2, #2240 Part B). They
+    /// are reserved rather than reused, so a future wiring of any of them keeps
+    /// its historical sequence.
     pub sequence: u64,
     /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
     /// the private key zeroes on drop.

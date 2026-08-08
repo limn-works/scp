@@ -12,6 +12,8 @@
 //!    item 2 / #1083 finding 6.)
 //! 5. **Contact notification** — key-change alerts to all known contacts.
 //! 6. **Identity private state re-encryption** — PSK rotation, device removal.
+//!    ([`ProductionRecoveryBackend`] fails this step closed — see #2240 Part
+//!    B.)
 //!
 //! Step ordering is enforced by dependency: 1→2→3→4→(5,6 unordered).
 //!
@@ -110,8 +112,27 @@ pub enum RecoveryStepErrorCode {
     /// and #1083 finding 6.
     KeyPackageRotationUnwired,
 
+    /// Step 6: nothing installs a rotated PSK, so there is no way to re-encrypt
+    /// identity private state under a new one. See
+    /// [`ProductionRecoveryBackend::rotate_psk`] and #2240 Part B.
+    ///
+    /// **Permanent, like the two codes above** — a retry re-runs the whole
+    /// non-idempotent sequence (see
+    /// [`CompromiseRecoveryOrchestrator::execute_recovery`]) and reaches the
+    /// same absent installer. This is why it is not
+    /// [`Self::DispatchFailed`]: that code is documented as transient, and
+    /// stamping a permanent structural gap with it steers automation into an
+    /// unbounded loop of irreversible side effects.
+    PskDistributionUnwired,
+
     /// The backend could not reach the runtime (mailbox, actor or transport
     /// failure). Transient — retrying the affected context may succeed.
+    ///
+    /// Reserved for genuine mailbox / actor / transport faults. A step that is
+    /// structurally unable to do its work carries one of the `*Unwired` codes
+    /// above instead — a permanent condition reported as transient invites the
+    /// retry loop described on
+    /// [`CompromiseRecoveryOrchestrator::execute_recovery`].
     DispatchFailed,
 
     /// A backend-specific failure with no dedicated code.
@@ -761,11 +782,19 @@ pub trait RecoveryBackend {
     /// only for the tiers where the PSK is affected (the orchestrator reports
     /// [`StepOutcome::NotApplicable`] without calling for the `Agent` tier).
     ///
+    /// This is the **contract a backend must satisfy**, not a description of
+    /// what ships: [`ProductionRecoveryBackend::rotate_psk`] cannot satisfy it
+    /// today and fails closed (#2240 Part B). An `Ok(())` from this method is a
+    /// claim that identity private state (§3.7) is now encrypted under a PSK
+    /// that every eligible enrolled device — and no excluded one — can open;
+    /// only return it when that is true. Emitting wrapped PSKs that nothing
+    /// installs is not sufficient.
+    ///
     /// # Errors
     ///
     /// Returns [`RecoveryStepError`] with `step: 6` if the PSK could not be
     /// rotated or distributed. Non-fatal: the orchestrator records it and
-    /// continues.
+    /// continues (§9.12 "Steps 5 and 6 are non-fatal").
     async fn rotate_psk(&self, params: &PskRotationParams) -> Result<(), RecoveryStepError>;
 }
 
@@ -831,18 +860,17 @@ impl CompromiseRecoveryOrchestrator {
     /// steps that already succeeded**:
     ///
     /// * step 2 issues another MLS epoch advance (a real commit) in every
-    ///   context that got that far;
-    /// * step 5 re-notifies every contact;
-    /// * step 6 mints a **fresh random PSK** per call and zeroizes it without
-    ///   retaining it, so each retry emits a distinct PSK-rotation event that
-    ///   the originator cannot subsequently open.
+    ///   context that got that far; and
+    /// * step 5 re-notifies every contact.
     ///
-    /// This matters because with the shipped [`ProductionRecoveryBackend`] and
-    /// at least one context, this method currently ALWAYS returns `Err` (steps
-    /// 3 and 4 fail closed — #2069, #2240 Part B item 2), so a caller that
-    /// retries on error will loop on those side effects. Callers must treat a
-    /// failure as terminal and inspect
-    /// [`RecoveryProgress`] to decide what, if anything, to re-drive.
+    /// This matters because with the shipped [`ProductionRecoveryBackend`] this
+    /// method currently ALWAYS returns `Err` (steps 3, 4 and 6 fail closed —
+    /// #2069, #2240 Part B item 2, #2240 Part B), so a caller that retries on
+    /// error will loop on those side effects forever. Callers must treat a
+    /// failure as terminal and inspect [`RecoveryProgress`] to decide what, if
+    /// anything, to re-drive. The `*Unwired` [`RecoveryStepErrorCode`] variants
+    /// exist so this is machine-decidable: only
+    /// [`RecoveryStepErrorCode::DispatchFailed`] is retryable.
     ///
     /// Steps execute in dependency order: 1→2→3→4→(5,6 parallel).
     ///
@@ -1237,55 +1265,6 @@ pub fn identity_key_rotation_outcome(
 }
 
 // ---------------------------------------------------------------------------
-// PSK wrapping helper (RFC 9180 HPKE, §3.7.2)
-// ---------------------------------------------------------------------------
-
-/// HPKE `info` domain separator for PSK distribution (§3.7.2).
-const PSK_HPKE_INFO_PREFIX: &[u8] = b"scp-private-state-v1";
-
-/// Purpose string for PSK rotation re-wraps (§3.7.2, spec edit S5).
-const PSK_PURPOSE_ROTATE: &[u8] = b"psk-rotate";
-
-/// Wire length of a wrapped PSK: HPKE `enc` (32) || `ct` (48) = 80 bytes.
-const WRAPPED_PSK_LEN: usize = 32 + 48;
-
-/// Builds the §3.7.2 PSK HPKE `info`:
-/// `"scp-private-state-v1" || BE32(len(did)) || did || purpose`.
-///
-/// `did` carries a 4-byte big-endian length prefix (§9.5.1); `purpose` is a
-/// fixed-version UTF-8 string with no length prefix. The `aad` is empty — the
-/// `info` binds the DID and a fresh HPKE context is used per device, so there
-/// is no cross-recipient substitution surface.
-fn build_psk_hpke_info(did: &str, purpose: &[u8]) -> Vec<u8> {
-    let did_bytes = did.as_bytes();
-    let mut info =
-        Vec::with_capacity(PSK_HPKE_INFO_PREFIX.len() + 4 + did_bytes.len() + purpose.len());
-    info.extend_from_slice(PSK_HPKE_INFO_PREFIX);
-    #[allow(clippy::cast_possible_truncation)] // DID length << u32::MAX
-    let did_len = did_bytes.len() as u32;
-    info.extend_from_slice(&did_len.to_be_bytes());
-    info.extend_from_slice(did_bytes);
-    info.extend_from_slice(purpose);
-    info
-}
-
-/// Wraps a 32-byte PSK for a single device via RFC 9180 HPKE Base mode
-/// (§3.7.2). AES-128-GCM (the X25519 KEM is the ~128-bit floor; §9.5).
-///
-/// Returns `Some(wrapped)` where `wrapped` is `enc(32) || ct(48)` = 80 bytes,
-/// or `None` if HPKE sealing fails. The `info` binds the identity `did` and
-/// the `purpose` string (`"psk-rotate"` for rotation re-wraps); `aad` is empty.
-fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Option<Vec<u8>> {
-    let info = build_psk_hpke_info(did, PSK_PURPOSE_ROTATE);
-    let (enc, ct) = scp_protocol::crypto::hpke::seal(device_pk, &info, &[], psk).ok()?;
-
-    let mut wrapped = Vec::with_capacity(WRAPPED_PSK_LEN);
-    wrapped.extend_from_slice(&enc);
-    wrapped.extend_from_slice(&ct);
-    Some(wrapped)
-}
-
-// ---------------------------------------------------------------------------
 // ProductionRecoveryBackend — real implementation of RecoveryBackend
 // ---------------------------------------------------------------------------
 
@@ -1327,7 +1306,7 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Optio
 /// | `revoke_ucans`       | *none — fails closed (#2069); seq 1 is unallocated*      |
 /// | `rotate_key_packages`| *none — fails closed (#2240 Part B item 2); seq 2 is unallocated* |
 /// | `notify_contacts`    | `RecoveryNotifyContact` → `RecoverySendNotification` (seq 4, cross-context fan-out) |
-/// | `rotate_psk`         | `RecoverySendNotification` (seq 3)                       |
+/// | `rotate_psk`         | *none — fails closed (#2240 Part B); seq 3 is unallocated* |
 ///
 /// See spec §9.12 and the [`CompromiseRecoveryOrchestrator`] for step
 /// ordering and failure isolation semantics.
@@ -1439,9 +1418,10 @@ impl ProductionRecoveryBackend {
     ///
     /// Wraps the shared payload construction (context, sender DID,
     /// sequence, signing key) used by every recovery step that sends a
-    /// notification to an already-known context. That is now steps 2 (seq 0)
-    /// and 6 (seq 3) only: steps 3 and 4 fail closed before dispatching, so
-    /// seq 1 and seq 2 are unallocated (#2069, #2240 Part B item 2). Step 5
+    /// notification to an already-known context. That is now step 2 (seq 0)
+    /// only: steps 3, 4 and 6 fail closed before dispatching, so seq 1, seq 2
+    /// and seq 3 are unallocated (#2069, #2240 Part B item 2, #2240 Part B).
+    /// Step 5
     /// does NOT route through here — its context is not known up front, so
     /// [`RecoveryBackend::notify_contacts`] dispatches `RecoveryNotifyContact` and the
     /// supervisor's fan-out builds the seq-4 `RecoverySendNotification` after
@@ -1872,121 +1852,80 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         }
     }
 
+    /// Step 6 — **not wired; always fails closed** (#2240 Part B).
+    ///
+    /// This step previously minted a real 32-byte PSK from `OsRng`, HPKE-wrapped
+    /// it per enrolled device (§3.7.2), dispatched
+    /// `{"event":"recovery:psk_rotation","wrapped_psks":[..]}` to the literal
+    /// context id `"identity-private-state"`, and returned `Ok(())`. Nothing
+    /// re-encrypted any private state, and the step reported success for a
+    /// security action that did not happen — the same nullifier class as
+    /// [`Self::revoke_ucans`] (#2069) and [`Self::rotate_key_packages`]
+    /// (#2240 Part B item 2).
+    ///
+    /// # Why it is unwired — traced, not inferred
+    ///
+    /// 1. **Nothing installs a delivered wrap.** `wrapped_psks`, `unwrap_psk`
+    ///    and `install_psk` had exactly three occurrences across `crates/` and
+    ///    `bindings/`, all inside the deleted `rotate_psk` body itself. There is
+    ///    no receive-side handler for the `recovery:psk_rotation` event, no
+    ///    private-state re-encryption driven by it, and no custody install — so
+    ///    a wrap that arrived at a device installed nothing.
+    /// 2. **The originator could not use the PSK either.** The plaintext was
+    ///    held in `Zeroizing` and dropped at end of scope without being
+    ///    retained anywhere, so a "successful" rotation produced a key *nobody*
+    ///    could subsequently open the re-encrypted state with — including the
+    ///    recovering identity.
+    ///
+    /// # The production failure was an accident, not a design
+    ///
+    /// The old body only ever errored because
+    /// `recovery_send_notification_direct` rejects context ids that are not 64
+    /// lowercase hex characters, and that path is reached only when no actor is
+    /// registered for the id. But `Supervisor::create_context` takes a
+    /// caller-supplied id and the FFI `validate_context_id` accepts
+    /// alphanumerics, hyphens and underscores up to 256 characters — so
+    /// `"identity-private-state"` is a perfectly legal id that any local caller
+    /// could register, flipping step 6 to `Ok(())`. The fail-closed guarantee
+    /// must not rest on an id-shape coincidence, so it is stated directly here.
+    ///
+    /// # What a correct implementation would have to do
+    ///
+    /// Beyond building the receive-side installer and retaining the PSK for the
+    /// originator, the send **must not** be keyed on a global literal namespace
+    /// string. Identity private state is addressed by the per-identity routing
+    /// id
+    /// <code>[derive_private_state_routing_id](scp_protocol::identity::private_state::derive_private_state_routing_id)(identity_key_material, did)</code>
+    /// (§3.7, H12) — an HKDF output that is unlinkable to the DID without the
+    /// identity key material. A single global namespace shared by every
+    /// identity is exactly what makes the collision above possible, and it
+    /// would also hand relays the correlation the routing-id derivation exists
+    /// to deny. The wrap format itself is specified in §3.7.2 (RFC 9180 HPKE
+    /// Base, `info = "scp-private-state-v1" || BE32(len(did)) || did ||
+    /// "psk-rotate"`, wire `enc(32) || ct(48)`); the deleted helper is not
+    /// preserved here because an unused send-side wrapper makes an absent
+    /// capability look present.
+    ///
+    /// # Errors
+    ///
+    /// Always returns a step-6 [`RecoveryStepError`] coded
+    /// [`RecoveryStepErrorCode::PskDistributionUnwired`].
     async fn rotate_psk(&self, params: &PskRotationParams) -> Result<(), RecoveryStepError> {
-        // Step 6: Rotate the PSK and re-encrypt identity private state.
-        //
-        // Generate a fresh 32-byte PSK, then wrap it for each enrolled
-        // device's X25519 public key (excluding the compromised device if
-        // specified) using X25519 ECDH + HKDF + AES-256-GCM (HPKE mode
-        // Base, matching the sender key wrapping pattern in §9.16.2).
-        // The wrapped PSKs are distributed as a recovery notification.
-
-        use rand::RngCore as _;
-        use zeroize::Zeroizing;
-
-        // Filter out the compromised device, if any.
-        let eligible_devices: Vec<&[u8]> = params
-            .enrolled_device_pubkeys
-            .iter()
-            .filter(|pk| {
-                params
-                    .compromised_device_pubkey
-                    .as_ref()
-                    .is_none_or(|cpk| pk.as_slice() != cpk.as_slice())
-            })
-            .map(Vec::as_slice)
-            .collect();
-
-        // Must have at least one eligible device to distribute the new PSK.
-        if eligible_devices.is_empty() {
-            return Err(RecoveryStepError {
-                step: 6,
-                code: RecoveryStepErrorCode::Unspecified,
-                description: "no eligible enrolled device remains to receive the rotated PSK                               (every enrolled device was excluded as compromised)"
-                    .to_owned(),
-            });
-        }
-
-        // Generate a fresh PSK (32 bytes of random data). Held in `Zeroizing`
-        // so the plaintext PSK is wiped on drop regardless of which return
-        // path is taken (including the early `device_pk.len() != 32` reject
-        // below), preserving forward secrecy of the rotated key.
-        let mut new_psk = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(new_psk.as_mut());
-
-        // For each eligible device, wrap the new PSK via RFC 9180 HPKE Base
-        // mode (§3.7.2): DHKEM(X25519, HKDF-SHA256) Encap to the device key,
-        // AES-128-GCM seal under info "scp-private-state-v1" || len(did) ||
-        // did || "psk-rotate". Output is enc(32) || ct(48) = 80 bytes; the
-        // AEAD nonce is internal per RFC 9180. Only the holder of the device's
-        // X25519 private key can complete Decap and unwrap the PSK.
-        let mut wrapped_psks: Vec<Vec<u8>> = Vec::with_capacity(eligible_devices.len());
-        for device_pk in &eligible_devices {
-            // Device public key must be exactly 32 bytes (X25519).
-            if device_pk.len() != 32 {
-                return Err(RecoveryStepError {
-                    step: 6,
-                    code: RecoveryStepErrorCode::Unspecified,
-                    description: format!(
-                        "enrolled device public key is {} bytes, expected 32 (X25519)",
-                        device_pk.len()
-                    ),
-                });
-            }
-            let mut pk_bytes = [0u8; 32];
-            pk_bytes.copy_from_slice(device_pk);
-            match wrap_psk_for_device(&new_psk, &pk_bytes, &params.did) {
-                // `&new_psk` deref-coerces `&Zeroizing<[u8; 32]>` to `&[u8; 32]`.
-                Some(wrapped) => wrapped_psks.push(wrapped),
-                None => {
-                    return Err(RecoveryStepError {
-                        step: 6,
-                        code: RecoveryStepErrorCode::Unspecified,
-                        description: "HPKE wrap of the rotated PSK failed for an enrolled device"
-                            .to_owned(),
-                    });
-                }
-            }
-        }
-
-        // The plaintext PSK is wiped automatically when `new_psk` (a
-        // `Zeroizing<[u8; 32]>`) is dropped at end of scope — no explicit
-        // call needed, and every early return is now covered too.
-
-        // Distribute the wrapped PSKs as a recovery notification via the
-        // context manager. Each entry in the serialized payload corresponds
-        // to one eligible device's wrapped PSK (§3.7 private state events).
-        let psk_event = serde_json::json!({
-            "event": "recovery:psk_rotation",
-            "wrapped_psks": wrapped_psks.iter().map(hex::encode).collect::<Vec<_>>(),
-        });
-        let payload = match serde_json::to_vec(&psk_event) {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(RecoveryStepError {
-                    step: 6,
-                    code: RecoveryStepErrorCode::Unspecified,
-                    description: format!("failed to serialize the PSK rotation event: {e}"),
-                });
-            }
-        };
-
-        // Send via recovery notification. We use a synthetic context ID
-        // derived from "identity-private-state" since PSK rotation is
-        // identity-scoped, not context-scoped.
-        let result = self
-            .dispatch_recovery_send_notification(
-                "identity-private-state",
-                "system",
-                &payload,
-                3, // sequence 3: PSK rotation notification
-            )
-            .await
-            .map_err(Self::dispatch_step_error);
-
-        result.map_err(|mut e| {
-            e.step = 6;
-            e
+        // FAIL CLOSED (#2240 Part B): no receive-side installer exists, so a
+        // delivered wrap would install nothing, and the originator never
+        // retained the PSK either. Report the absence explicitly rather than
+        // relying on the 64-hex id-shape rejection that made the old
+        // notification-only body fail by accident.
+        Err(RecoveryStepError {
+            step: 6,
+            code: RecoveryStepErrorCode::PskDistributionUnwired,
+            description: format!(
+                "PSK rotation is not wired for identity `{did}` — no receive-side installer \
+                 exists, so identity private state (§3.7) was NOT re-encrypted and a compromised \
+                 enrolled device retains access to it. Failing closed rather than reporting a \
+                 rotation that did not happen (#2240 Part B)",
+                did = params.did,
+            ),
         })
     }
 }
@@ -3007,30 +2946,6 @@ mod tests {
         }
     }
 
-    /// Stands up a live registered context actor for the identity-scoped
-    /// recovery pseudo-context so PSK-rotation notifications can seal.
-    ///
-    /// PSK rotation (spec §9.12 step 6) seals its recovery notification
-    /// against a synthetic `identity-private-state` context. Pre-PR-7 the
-    /// per-context MLS crypto was provider-resident, so seeding an MLS group
-    /// directly on the supervisor's shared `NodeMlsFactory` sufficed for
-    /// [`NodeMlsFactory::seal`] to succeed. ADR-049 PR-7
-    /// (SCP-CRYPTOMOVE-001) moved that crypto state onto the per-context
-    /// actor by a one-way take, and `dispatch_recovery_send_notification`
-    /// routes through [`Supervisor::dispatch_trust_recovery_command`], which
-    /// mailbox-dispatches to a registered actor when one exists (and only
-    /// falls through to the non-64-hex-rejecting supervisor-direct path when
-    /// none is). So the notification now seals through the actor's OWNED
-    /// `ContextCryptoState` — which requires a registered actor for the id,
-    /// created here exactly as `create_context` does for any context. This is
-    /// the actor-model equivalent of the retired provider-group seed.
-    async fn seed_identity_private_state_group(
-        manager: &Arc<crate::context::supervisor::Supervisor>,
-    ) {
-        let owner = did("did:dht:zRecoveryIdentityPrivateStateOwner");
-        setup_context(manager, "identity-private-state", &owner).await;
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_mls_update_succeeds() {
         let manager = test_context_manager();
@@ -3327,10 +3242,14 @@ mod tests {
         assert!(!result.private_state_reencryption.succeeded());
     }
 
+    /// #2240 Part B: nothing installs a rotated PSK, so the production backend
+    /// MUST fail closed — even with a healthy supervisor and a perfectly valid
+    /// device set, where the old notification-only implementation returned
+    /// `Ok(())`. This is the regression guard against the nullifier coming
+    /// back.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_rotate_psk_succeeds() {
+    async fn production_backend_rotate_psk_fails_closed() {
         let manager = test_context_manager();
-        seed_identity_private_state_group(&manager).await;
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
@@ -3339,45 +3258,95 @@ mod tests {
             compromised_device_pubkey: None,
         };
 
-        let result = backend.rotate_psk(&params).await;
-        assert!(result.is_ok(), "rotate_psk should succeed");
-    }
+        let err = backend
+            .rotate_psk(&params)
+            .await
+            .expect_err("rotate_psk must fail closed until an installer exists");
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_rotate_psk_excludes_compromised_device() {
-        let manager = test_context_manager();
-        seed_identity_private_state_group(&manager).await;
-        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
-
-        let params = PskRotationParams {
-            did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]],
-            compromised_device_pubkey: Some(vec![2u8; 32]),
-        };
-
-        let result = backend.rotate_psk(&params).await;
+        // Assert on STRUCTURE, not prose (see the step-3 / step-4 guards).
+        assert_eq!(err.step, 6, "must be attributed to §9.12 step 6");
+        assert_eq!(
+            err.code,
+            RecoveryStepErrorCode::PskDistributionUnwired,
+            "must be classified as an unwired capability, not a transient \
+             dispatch failure — a retry re-runs the whole non-idempotent \
+             sequence and reaches the same absent installer"
+        );
+        // The identity is machine-checkable content, not prose: naming the
+        // wrong one misdirects remediation.
         assert!(
-            result.is_ok(),
-            "rotate_psk should succeed with compromised device excluded"
+            err.description.contains(&params.did),
+            "error must name the identity whose private state was NOT \
+             re-encrypted: {}",
+            err.description
         );
     }
 
+    /// The step-6 failure is *capability absence*, not the accidental
+    /// consequence of an id-shape rejection.
+    ///
+    /// The old body only errored because `recovery_send_notification_direct`
+    /// rejects non-64-hex context ids, and only reached that path when no actor
+    /// was registered for `"identity-private-state"` — a legal id any local
+    /// caller could register, which flipped step 6 to `Ok(())`. This pins that
+    /// the error is now a constant of the `PskRotationParams` alone:
+    /// byte-identical across an empty supervisor and one with a live actor
+    /// registered under exactly that id, and unaffected by the device set that
+    /// the deleted body branched on.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_rotate_psk_fails_no_eligible_devices() {
-        let manager = test_context_manager();
-        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
-
-        // All devices compromised.
+    async fn production_backend_rotate_psk_fails_closed_regardless_of_supervisor_state() {
         let params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
+            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+            compromised_device_pubkey: None,
+        };
+
+        // An empty supervisor: no contexts, no actors, nothing to dispatch to.
+        let empty_backend =
+            ProductionRecoveryBackend::new(test_context_manager(), test_signing_key());
+        let empty_err = empty_backend
+            .rotate_psk(&params)
+            .await
+            .expect_err("rotate_psk must fail closed");
+
+        // A supervisor with a LIVE registered actor for the very id the old
+        // body sent to — the configuration that used to make step 6 succeed.
+        let manager = test_context_manager();
+        setup_context(
+            &manager,
+            "identity-private-state",
+            &did("did:dht:zRecoveryIdentityPrivateStateOwner"),
+        )
+        .await;
+        let seeded_backend = ProductionRecoveryBackend::new(manager, test_signing_key());
+        let seeded_err = seeded_backend
+            .rotate_psk(&params)
+            .await
+            .expect_err("a registered `identity-private-state` actor must NOT make step 6 succeed");
+
+        assert_eq!(
+            empty_err, seeded_err,
+            "step 6 must not depend on supervisor state — it never consults it"
+        );
+        assert_eq!(
+            empty_err.code,
+            RecoveryStepErrorCode::PskDistributionUnwired
+        );
+
+        // ...and not on the device set either: the deleted body branched on
+        // "no eligible device remains" before doing anything else.
+        let all_compromised = PskRotationParams {
+            did: params.did.clone(),
             enrolled_device_pubkeys: vec![vec![1u8; 32]],
             compromised_device_pubkey: Some(vec![1u8; 32]),
         };
-
-        let result = backend.rotate_psk(&params).await;
-        assert!(
-            result.is_err(),
-            "rotate_psk should fail with no eligible devices"
+        assert_eq!(
+            seeded_backend
+                .rotate_psk(&all_compromised)
+                .await
+                .expect_err("rotate_psk must fail closed"),
+            empty_err,
+            "the failure must not depend on the enrolled-device set"
         );
     }
 
@@ -3491,12 +3460,12 @@ mod tests {
         );
     }
 
-    /// `ActiveSigning` tier: same fail-closed contract on steps 3 (#2069) and
-    /// 4 (#2240 Part B item 2). The tier plumbing (PSK params,
-    /// identity-private-state group seeding) is still exercised up to the
-    /// point recovery fails closed.
+    /// `ActiveSigning` tier: same fail-closed contract on steps 3 (#2069), 4
+    /// (#2240 Part B item 2) and 6 (#2240 Part B). The tier plumbing (PSK
+    /// params) is still exercised up to the point recovery fails closed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_full_recovery_active_signing_tier_fails_closed_on_steps_3_and_4() {
+    async fn production_backend_full_recovery_active_signing_tier_fails_closed_on_steps_3_4_and_6()
+    {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let bob = did("did:dht:bob");
@@ -3505,9 +3474,6 @@ mod tests {
         // Set up a context with alice and bob as members so contact
         // notification can find a shared context.
         setup_context_with_members(&manager, context_id, &alice, &[&bob]).await;
-        // ActiveSigning recovery rotates the PSK, which seals against the
-        // synthetic identity-private-state context — seed its MLS group.
-        seed_identity_private_state_group(&manager).await;
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
@@ -3551,17 +3517,22 @@ mod tests {
         // would not have fired and 5/6 WOULD have run.
         //
         // NOTE ON SCOPE: this asserts the ORCHESTRATOR reaches step 6 and
-        // reports its outcome. It deliberately does NOT assert that production
-        // PSK delivery works — here it only succeeds because
-        // `seed_identity_private_state_group` seeded the synthetic
-        // `identity-private-state` MLS group, which is test-only
-        // (`supervisor.rs` documents the production path as a best-effort
-        // no-op). The load-bearing claim is reachability, not delivery.
+        // reports its outcome — REACHABILITY, not success. The earlier version
+        // asserted `.succeeded()`, which was only ever reachable because a test
+        // helper registered a synthetic `identity-private-state` actor: it
+        // certified a `Succeeded` outcome production never produces. The
+        // production backend fails step 6 closed (#2240 Part B), so the honest
+        // reachability signal is a step-6 `Failed` carrying that code — a step
+        // the orchestrator never called would report `NotApplicable` instead.
         assert!(
-            progress.private_state_reencryption.succeeded(),
-            "step 6 must be REACHED and reported on the fail-closed path (test-only \
-             seeded group makes it succeed here; production delivery is a separate, \
-             tracked question)"
+            matches!(
+                progress.private_state_reencryption,
+                StepOutcome::Failed(ref e)
+                    if e.step == 6 && e.code == RecoveryStepErrorCode::PskDistributionUnwired
+            ),
+            "step 6 must be REACHED and its fail-closed outcome reported on the \
+             fail-closed path, got {:?}",
+            progress.private_state_reencryption
         );
         assert!(
             progress.contact_notification.succeeded(),
@@ -3715,13 +3686,13 @@ mod tests {
         );
     }
 
-    /// `IdentityKey` tier: same fail-closed contract on steps 3 (#2069) and 4
-    /// (#2240 Part B item 2). The most severe tier is exactly the one that must
+    /// `IdentityKey` tier: same fail-closed contract on steps 3 (#2069), 4
+    /// (#2240 Part B item 2) and 6 (#2240 Part B). The most severe tier is exactly the one that must
     /// not report a phantom revocation of the compromised identity key's
     /// outstanding tokens, nor a phantom withdrawal of its published
     /// `KeyPackages`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn production_backend_full_recovery_identity_key_tier_fails_closed_on_steps_3_and_4() {
+    async fn production_backend_full_recovery_identity_key_tier_fails_closed_on_steps_3_4_and_6() {
         let manager = test_context_manager();
         let alice = did("did:dht:alice");
         let bob = did("did:dht:bob");
@@ -3731,9 +3702,6 @@ mod tests {
         // Set up a context with alice, bob, and carol as members so
         // contact notification can find shared contexts.
         setup_context_with_members(&manager, context_id, &alice, &[&bob, &carol]).await;
-        // IdentityKey recovery rotates the PSK, which seals against the
-        // synthetic identity-private-state context — seed its MLS group.
-        seed_identity_private_state_group(&manager).await;
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
@@ -3764,17 +3732,22 @@ mod tests {
         assert_eq!(progress.failed_contexts[0].1.step, 3);
 
         // M1: the identity-scoped steps are REACHED on the fail-closed path, so
-        // the setup above (shared members for step 5, seeded
-        // identity-private-state group for step 6) is live rather than dead.
-        // As in the ActiveSigning tier test, step 6 only *succeeds* here because
-        // that group is seeded — test-only. The claim is reachability.
+        // the setup above (shared members for step 5) is live rather than dead.
+        // As in the ActiveSigning tier test the claim is reachability: step 6
+        // fails closed in production, so its reached-and-reported signal is a
+        // step-6 `Failed`, never `NotApplicable`.
         assert!(
             progress.contact_notification.succeeded(),
             "step 5 must be reached"
         );
         assert!(
-            progress.private_state_reencryption.succeeded(),
-            "step 6 must be reached"
+            matches!(
+                progress.private_state_reencryption,
+                StepOutcome::Failed(ref e)
+                    if e.step == 6 && e.code == RecoveryStepErrorCode::PskDistributionUnwired
+            ),
+            "step 6 must be reached and its fail-closed outcome reported, got {:?}",
+            progress.private_state_reencryption
         );
 
         // The identity-migration outcome the tier helper builds is untouched by
@@ -4141,139 +4114,6 @@ mod tests {
         assert!(
             rendered.contains("step 2: 1 context(s)"),
             "every distinct step must be represented: {rendered}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // wrap_psk_for_device unit tests (RFC 9180, §3.7.2)
-    //
-    // These verify the PRODUCTION wrap path (`wrap_psk_for_device`, called by
-    // `rotate_psk`). The device-side open counterpart is exercised here by
-    // calling `scp_protocol::crypto::hpke::open` directly against the wrapped
-    // wire (`enc(32) || ct(48)`), reconstructing the §3.7.2 `info` via the
-    // shared `build_psk_hpke_info` helper that the production wrap also uses.
-    // Opening through `hpke::open` keeps every negative ciphertext-level: a
-    // real AEAD verification failure, not a builder-string comparison.
-    // -----------------------------------------------------------------------
-
-    /// Device-side open of a wrapped PSK, mirroring what a device that receives
-    /// a `PskRotated` / `DeviceWrappedPsk` entry does: split `enc(32) || ct(48)`,
-    /// rebuild the §3.7.2 `info`, and HPKE-open with the device X25519 secret.
-    ///
-    /// Returns `None` on wrong wire length, invalid `enc`, or any HPKE/AEAD
-    /// failure (wrong device key, wrong `did`, tampered ciphertext) — exactly
-    /// the failure surface the negatives below assert against.
-    fn open_wrapped_psk(wrapped: &[u8], device_sk: &[u8; 32], did: &str) -> Option<[u8; 32]> {
-        if wrapped.len() != super::WRAPPED_PSK_LEN {
-            return None;
-        }
-        let enc: [u8; 32] = wrapped[..32].try_into().ok()?;
-        let ct = &wrapped[32..];
-
-        // Reconstruct the §3.7.2 info via the SAME helper the production wrap
-        // uses, so the test cannot drift from the wrap's info construction.
-        let info = super::build_psk_hpke_info(did, super::PSK_PURPOSE_ROTATE);
-        let plaintext = zeroize::Zeroizing::new(
-            scp_protocol::crypto::hpke::open(device_sk, &enc, &info, &[], ct).ok()?,
-        );
-        plaintext.as_slice().try_into().ok()
-    }
-
-    #[test]
-    fn psk_wrapping_is_80_bytes_with_fresh_enc() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let device_public = X25519Pub::from(&device_secret);
-        let psk = [0xABu8; 32];
-        let did = "did:dht:zPskTest";
-
-        let wrapped1 =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap 1 failed");
-        let wrapped2 =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap 2 failed");
-
-        // Wire layout: enc(32) || ct(48) = 80 bytes. No external nonce.
-        assert_eq!(wrapped1.len(), 80);
-        assert_eq!(wrapped2.len(), 80);
-
-        // Each wrap uses a fresh ephemeral keypair → the encapsulated key
-        // (`enc`, bytes 0..32) differs every time, even for the same PSK and
-        // device. This is what makes each HPKE context single-use.
-        assert_ne!(
-            &wrapped1[..32],
-            &wrapped2[..32],
-            "enc must be fresh per wrap"
-        );
-    }
-
-    #[test]
-    fn psk_wrapping_roundtrip() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let device_public = X25519Pub::from(&device_secret);
-        let psk = [0x42u8; 32];
-        let did = "did:dht:zPskTest";
-
-        // Production wrap → device-side open via hpke::open must recover the PSK.
-        let wrapped =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap failed");
-
-        let recovered =
-            open_wrapped_psk(&wrapped, &device_secret.to_bytes(), did).expect("open failed");
-        assert_eq!(recovered, psk, "roundtrip mismatch");
-    }
-
-    #[test]
-    fn psk_opening_rejects_wrong_did() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let device_public = X25519Pub::from(&device_secret);
-        let psk = [0x42u8; 32];
-
-        let wrapped = super::wrap_psk_for_device(&psk, device_public.as_bytes(), "did:dht:zAlice")
-            .expect("wrap failed");
-
-        // A different DID changes the HPKE info → AEAD open fails.
-        assert!(
-            open_wrapped_psk(&wrapped, &device_secret.to_bytes(), "did:dht:zBob").is_none(),
-            "wrong DID must fail to open"
-        );
-    }
-
-    #[test]
-    fn psk_opening_rejects_wrong_device_and_tamper() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let device_public = X25519Pub::from(&device_secret);
-        let wrong_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let psk = [0x42u8; 32];
-        let did = "did:dht:zPskTest";
-
-        let wrapped =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap failed");
-
-        // Wrong device key.
-        assert!(
-            open_wrapped_psk(&wrapped, &wrong_secret.to_bytes(), did).is_none(),
-            "wrong device key must fail"
-        );
-
-        // Tampered ciphertext.
-        let mut tampered = wrapped.clone();
-        tampered[40] ^= 0x01;
-        assert!(
-            open_wrapped_psk(&tampered, &device_secret.to_bytes(), did).is_none(),
-            "tampered ciphertext must fail"
-        );
-
-        // Wrong length.
-        assert!(
-            open_wrapped_psk(&wrapped[..79], &device_secret.to_bytes(), did).is_none(),
-            "wrong length must fail"
         );
     }
 }

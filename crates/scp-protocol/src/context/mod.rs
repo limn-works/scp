@@ -73,9 +73,9 @@ pub use templates::{TemplateError, template_params, validate_against_template};
 ///
 /// This is the **raw routing / synthetic-label primitive ONLY**. It is the
 /// correct outlet for hashing non-context labels — broadcast routing ids and
-/// synthetic pseudo-contexts (e.g. the `"identity-private-state"` recovery
-/// label) that are never a real canonical context id. SHA-256 gives a fixed
-/// output size, uniform distribution, and no input-length leakage.
+/// synthetic pseudo-context labels that are never a real canonical context id.
+/// SHA-256 gives a fixed output size, uniform distribution, and no
+/// input-length leakage.
 ///
 /// # CRITICAL: do NOT use this to key a real context.
 /// Per ADR-056 a context's canonical identity IS its 32-byte digest, and the

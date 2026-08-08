@@ -3989,14 +3989,12 @@ impl Supervisor {
     /// [`ContextError::ContextNotRegistered`] on the reply oneshot
     /// (mirrors the gutted `dispatch_lifecycle_direct` per-context arms).
     ///
-    /// `RecoverySendNotification` is the exception: identity-scoped
-    /// recovery steps (notably PSK rotation, §9.12 step 6) deliberately
-    /// target a synthetic `identity-private-state` pseudo-context that is
-    /// never registered as an actor. Its arm seals and sends through the
-    /// supervisor-shared providers via
-    /// [`Self::recovery_send_notification_direct`] (epoch 0), rather than
-    /// erroring — this is a supported operation, not an unknown-context
-    /// fault.
+    /// `RecoverySendNotification` is the exception: its context may
+    /// deregister between selection and dispatch (§9.12 steps 2 and 5 both
+    /// name a registered actor at selection time), so its arm respawns from
+    /// the persisted snapshot and seals via
+    /// [`Self::recovery_send_notification_direct`] rather than erroring —
+    /// this is a supported operation, not an unknown-context fault.
     #[allow(clippy::too_many_lines)] // flat match over every trust-recovery variant
     async fn dispatch_trust_recovery_direct(
         self: &Arc<Self>,
@@ -4074,12 +4072,10 @@ impl Supervisor {
             // (64-hex) member-context producers survive — the step-2
             // epoch-advance notification (`mls_update`, seq 0) and the step-5
             // contact fan-out (seq 4); both respawn and seal via the mailbox.
-            // The synthetic `identity-private-state`
-            // pseudo-context (PSK rotation §9.12 step 6) is non-64-hex with no
-            // snapshot and no production MLS group, so it returns the same "no
-            // MLS group" error the retired provider seal produced (best-effort
-            // no-op). See `recovery_send_notification_direct` for the full
-            // contract.
+            // They are the ONLY producers: seq 1/2/3 (steps 3, 4, 6) all fail
+            // closed and dispatch nothing, so no non-64-hex id reaches this
+            // path in production. See `recovery_send_notification_direct` for
+            // the full contract.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
                 let signing_key = payload.signing_key.to_signing_key();
                 let send_result = self
@@ -4155,26 +4151,28 @@ impl Supervisor {
     ///   [`Self::restore_on_startup`] runs [`Self::restore_all_contexts`],
     ///   which rehydrates an actor for every persisted `Active` context.
     ///
-    ///   The former `revoke_ucans` (seq 1) and `rotate_key_packages` (seq 2)
-    ///   producers are gone: both steps fail closed and dispatch nothing
-    ///   (#2069, #2240 Part B item 2).
-    /// - The synthetic `identity-private-state` pseudo-context (PSK rotation
-    ///   §9.12 step 6), which is never a real (64-hex) context id, never a
-    ///   registered actor, and has no persisted snapshot. In production it has
-    ///   no MLS group (`seed_identity_private_state_group` is test-only), so the
-    ///   retired provider seal ALSO failed "no MLS group" and was swallowed
-    ///   (`rotate_psk` returns false — a best-effort no-op). This method
-    ///   preserves that exact contract: it returns the same "no MLS group"
-    ///   [`ContextError::CryptoFailed`] for any non-64-hex id WITHOUT attempting
-    ///   a snapshot respawn that cannot exist (which would emit a spurious
-    ///   "state is lost" error and consume the crash budget on every rotation).
-    ///   Whether production PSK delivery SHOULD work is a pre-existing question,
-    ///   tracked separately — not changed here.
+    ///   The former `revoke_ucans` (seq 1), `rotate_key_packages` (seq 2) and
+    ///   `rotate_psk` (seq 3) producers are gone: all three steps fail closed
+    ///   and dispatch nothing (#2069, #2240 Part B item 2, #2240 Part B).
+    ///
+    /// **There is therefore no production producer of a non-64-hex context id
+    /// on this path.** Seq 3 used to supply one — the synthetic
+    /// `identity-private-state` pseudo-context — and the non-64-hex arm below
+    /// existed to preserve that send's best-effort no-op contract. With step 6
+    /// failing closed, the arm is no longer a contract-preservation measure but
+    /// a plain input guard: an id the ADR-056 chokepoint cannot decode names no
+    /// snapshot, so respawning it is impossible and attempting it would emit a
+    /// spurious "state is lost" error and consume the crash-window budget. It
+    /// returns [`ContextError::CryptoFailed`] rather than respawning. Note that
+    /// the guard was never the *reason* step 6 failed in production — relying on
+    /// it for that was an accident, which is why
+    /// [`ProductionRecoveryBackend::rotate_psk`](crate::identity::recovery::ProductionRecoveryBackend)
+    /// now states the absence directly instead.
     ///
     /// # Errors
     ///
     /// - [`ContextError::CryptoFailed`] ("no MLS group for this context") for a
-    ///   non-64-hex synthetic id — the preserved best-effort no-op contract.
+    ///   non-64-hex id — no production caller produces one; see above.
     /// - [`ContextError::ActorCrashed`] if a real context cannot be respawned
     ///   (genuinely lost snapshot) or the respawned actor vanishes before
     ///   dispatch — fail-closed and retryable.
@@ -4223,18 +4221,15 @@ impl Supervisor {
             // (nonce-safe: the actor drives the persist-before-ack send sequence).
             //
             // Only a REAL (64-hex) context id — decodable by the ADR-056 chokepoint
-            // `context_id_to_bytes` — can be respawned. The synthetic
-            // `identity-private-state` pseudo-context (PSK rotation §9.12 step 6) is
-            // never a registered actor and has NO persisted snapshot, and in
-            // production has no MLS group at all (`seed_identity_private_state_group`
-            // is test-only), so the retired provider seal ALSO failed with "no MLS
-            // group" and was swallowed (`rotate_psk` returned false — a best-effort
-            // no-op). Preserve that exact contract: return the same "no MLS group"
-            // error for any non-real context id rather than respawning a snapshot
-            // that cannot exist (which would emit a spurious "state is lost" error
-            // and pollute the crash-window budget on every PSK rotation). The
-            // 64-hex-lowercase predicate mirrors `context_id_to_bytes`'s canonical
-            // branch (ADR-056).
+            // `context_id_to_bytes` — can be respawned. No production caller reaches
+            // this arm any more: the only non-64-hex producer was the synthetic
+            // `identity-private-state` pseudo-context of §9.12 step 6, whose send was
+            // deleted when `rotate_psk` was made to fail closed (#2240 Part B). The
+            // guard stays as an input guard, not a contract-preservation measure: an
+            // undecodable id names no snapshot, so respawning it is impossible and
+            // attempting it would emit a spurious "state is lost" error and pollute
+            // the crash-window budget. The 64-hex-lowercase predicate mirrors
+            // `context_id_to_bytes`'s canonical branch (ADR-056).
             let is_real_context_id = context_id.len() == 64
                 && context_id
                     .bytes()
