@@ -4610,7 +4610,10 @@ fn mcp_handle_id(prefix: &str) -> String {
 
 /// Maximum bytes per line from MCP transport (10 MiB). Prevents OOM from
 /// unbounded line reads by a malicious or broken peer.
-const MCP_MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
+///
+/// Imported from `scp-mcp` rather than redeclared so the client and server
+/// halves of the same line protocol cannot drift to different limits.
+use scp_mcp::stdio::MAX_LINE_BYTES as MCP_MAX_LINE_BYTES;
 
 /// Transport wrapper that delegates to either stdio or SSE.
 pub(crate) enum McpUniFFITransportWrapper {
@@ -4877,11 +4880,86 @@ impl McpUniFfiBridgeProvider {
             "bridge instance has been dropped — MCP provider cannot service request".to_owned()
         })
     }
+
+    /// Reads a context's role state through the ADR-049 query shim.
+    ///
+    /// Shared by `active_context_ids`, `agent_role` and
+    /// `validate_resource_access` so all three answer from one source rather
+    /// than three near-identical `block_in_place` blocks.
+    fn role_state_of(
+        bi: &crate::runtime::UniffiBridgeInstance,
+        context_id: &str,
+    ) -> Option<scp_core::context::roles::ContextRoleState> {
+        use scp_core::context::actor::commands::QueriesCommand;
+        let sup = bi.context_manager_expect().ok()?.clone();
+        let context_id = context_id.to_owned();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = QueriesCommand::GetRoleState {
+                    context_id,
+                    reply: tx,
+                };
+                sup.dispatch_query(cmd).await.ok()?;
+                rx.await.ok()?.ok()?
+            })
+        })
+    }
 }
 
 impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<scp_mcp::namespace::ContextId> {
-        self.context_ids.clone()
+        // Configured ∩ live: a context the agent has left is no longer served,
+        // so its tools and resources drop out of `tools/list` and
+        // `resources/list` without restarting the server (ADR-015 AC7).
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        self.context_ids
+            .iter()
+            .filter(|id| {
+                Self::role_state_of(&bi, id).is_some_and(|rs| rs.members.contains(&self.agent_did))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn validate_resource_access(
+        &self,
+        context_id: &str,
+        resource: scp_mcp::server::ResourceKind,
+    ) -> Result<(), String> {
+        use scp_core::context::roles::Capability;
+        use scp_mcp::server::ResourceKind;
+
+        let bi = self.upgrade_bi()?;
+        let role_state = Self::role_state_of(&bi, context_id).ok_or_else(|| {
+            format!("context '{context_id}' has no role state on this bridge instance")
+        })?;
+
+        // `Events` and `Members` require `messages:read`: per spec §5.3.1's
+        // role table an `observer` — whose sole capability is `messages:read` —
+        // "can see all content and membership", so that grant is exactly the
+        // authority to read the event stream and the roster.
+        //
+        // `Tools` carries no separate grant because its contents are the
+        // capability-filtered tool list; an agent with no tool capabilities
+        // reads `[]` rather than being denied.
+        let permitted = match resource {
+            ResourceKind::Events | ResourceKind::Members => {
+                role_state.member_has_capability(&self.agent_did, &Capability::MessagesRead)
+            }
+            ResourceKind::Tools => role_state.members.contains(&self.agent_did),
+        };
+        if permitted {
+            Ok(())
+        } else {
+            Err(format!(
+                "agent lacks messages:read in context '{context_id}' — required to read \
+                 scp://{context_id}/{}",
+                resource.uri_suffix()
+            ))
+        }
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
@@ -4889,21 +4967,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // role state via the ADR-049 query shim
         // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
         // Returns None if the bridge instance has been dropped (#1549 round-2).
-        use scp_core::context::actor::commands::QueriesCommand;
         let bi = self.upgrade_bi().ok()?;
-        let sup = bi.context_manager_expect().ok()?.clone();
-        let role_state = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = QueriesCommand::GetRoleState {
-                    context_id: context_id.to_owned(),
-                    reply: tx,
-                };
-                sup.dispatch_query(cmd).await.ok()?;
-                rx.await.ok()?.ok().flatten()
-            })
-        })?;
-        role_state
+        Self::role_state_of(&bi, context_id)?
             .assignments
             .get(&self.agent_did)
             .map(|assignment| assignment.role_name.clone())
@@ -5378,9 +5443,7 @@ async fn run_mcp_stdio_server_uniffi(
     server: Arc<std::sync::Mutex<scp_mcp::server::McpServer<McpUniFfiBridgeProvider>>>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     cancel_token: tokio_util::sync::CancellationToken,
-    context_events: Option<
-        tokio::sync::broadcast::Receiver<(String, scp_core::context::membership::ContextEvent)>,
-    >,
+    pump: Option<scp_mcp::server::ContextEventPump>,
 ) {
     // Wire both `shutdown_rx` (mcp_server_stop) AND the bridge instance's
     // `cancel_token` (emergency_cancel_tasks from Drop) so either signal
@@ -5398,7 +5461,7 @@ async fn run_mcp_stdio_server_uniffi(
         () = cancel_token.cancelled() => {
             tracing::debug!("MCP stdio server task exiting — bridge instance cancelled");
         }
-        result = scp_mcp::stdio::run_stdio(&server, context_events) => {
+        result = scp_mcp::stdio::run_stdio(&server, pump) => {
             if let Err(e) = result {
                 tracing::error!("MCP stdio server error: {e}");
             }
@@ -16107,21 +16170,9 @@ impl Scp {
             agent_ucan_token: config.ucan_token.clone(),
             agent_proof_tokens: config.proof_tokens.clone(),
         };
-        let server = scp_mcp::server::McpServer::new(provider);
-        let server = Arc::new(std::sync::Mutex::new(server));
-
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let server_clone = Arc::clone(&server);
         let transport_mode = config.transport;
-        let sse_identity_did = config.identity_did;
-        let sse_context_ids = config.context_ids;
-        let sse_ucan_token = config.ucan_token;
-        let sse_proof_tokens = config.proof_tokens;
-        // `sse_bi` is a `Weak` reference so the SSE server task cannot
-        // pin `UniffiBridgeInstance` alive. Same rationale as `provider.bi`.
-        let sse_bi: std::sync::Weak<crate::runtime::UniffiBridgeInstance> =
-            Arc::downgrade(&self.inner);
         // Capture the cancel token so the server task exits when the
         // instance is dropped, even if the caller never calls
         // `mcp_server_stop`. Cloning a `CancellationToken` does not
@@ -16156,27 +16207,27 @@ impl Scp {
             );
         }
 
+        // One call decides both halves: the server that advertises
+        // `resources.subscribe` and the pump that honours it. There is no
+        // setter that could desynchronize them, and only one server is built
+        // per serve call — two servers over one event source would each
+        // advertise subscriptions while only one had the pump.
+        let (server, pump) =
+            scp_mcp::server::McpServer::with_optional_event_source(provider, context_events);
+
         let task_handle = runtime().spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
                     run_mcp_stdio_server_uniffi(
-                        server_clone,
+                        Arc::new(std::sync::Mutex::new(server)),
                         shutdown_rx,
                         cancel_token,
-                        context_events,
+                        pump,
                     )
                     .await;
                 }
                 "sse" => {
-                    let provider = McpUniFfiBridgeProvider {
-                        bi: sse_bi,
-                        agent_did: sse_identity_did,
-                        context_ids: sse_context_ids,
-                        outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
-                        agent_ucan_token: sse_ucan_token,
-                        agent_proof_tokens: sse_proof_tokens,
-                    };
-                    let sse_server = scp_mcp::server::McpServer::new(provider);
+                    // `run_sse` takes ownership of the `McpServer` directly.
                     let sse_config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
                         [127, 0, 0, 1],
                         0,
@@ -16195,8 +16246,7 @@ impl Scp {
                         sse_shutdown_trigger.shutdown();
                     });
                     let result =
-                        scp_mcp::sse::run_sse(sse_server, sse_config, sse_shutdown, context_events)
-                            .await;
+                        scp_mcp::sse::run_sse(server, sse_config, sse_shutdown, pump).await;
                     if let Err(e) = result {
                         tracing::error!("MCP SSE server error: {e}");
                     }
@@ -22945,11 +22995,34 @@ mod tests {
         );
     }
 
+    /// Creates a live, supervisor-backed context whose creator is
+    /// `did:dht:z6MkSubscriber` — the DID `uniffi_mcp_server` serves.
+    ///
+    /// The provider reads participation and `messages:read` from real
+    /// Supervisor role state, so a bare instance would serve nothing.
+    async fn live_context(bi: &Arc<crate::runtime::UniffiBridgeInstance>, context_id: &str) {
+        bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
+        let supervisor = bi
+            .context_manager_or_error()
+            .expect("supervisor must be attached")
+            .clone();
+        supervisor
+            .create_context(
+                context_id.to_owned(),
+                scp_core::context::ContextParams::default(),
+                scp_did::DID("did:dht:z6MkSubscriber".to_owned()),
+                None,
+            )
+            .await
+            .expect("context creation must succeed");
+    }
+
     /// Fail closed: with no event source wired, `resources/subscribe` is
     /// rejected with a typed error instead of being silently accepted.
-    #[test]
-    fn uniffi_mcp_server_rejects_subscribe_until_event_source_is_wired() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uniffi_mcp_server_rejects_subscribe_until_event_source_is_wired() {
         let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        live_context(&bi, "ctx-sub").await;
         let mut server = uniffi_mcp_server(&bi, vec!["ctx-sub".to_owned()]);
 
         assert!(
@@ -22981,13 +23054,25 @@ mod tests {
     /// Once the transport wires the supervisor's event receiver (what
     /// `run_stdio` / `run_sse` do with the `Some` receiver), the subscription
     /// is accepted AND runtime events produce real notifications.
-    #[test]
-    fn uniffi_mcp_server_honours_subscribe_once_event_source_is_wired() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uniffi_mcp_server_honours_subscribe_once_event_source_is_wired() {
         let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
-        let mut server = uniffi_mcp_server(&bi, vec!["ctx-sub".to_owned()]);
+        live_context(&bi, "ctx-sub").await;
 
-        // Exactly what the transport does when it holds a real receiver.
-        server.enable_subscriptions();
+        // `with_event_source` is the ONLY constructor that sets the flag, and
+        // it hands back the pump in the same call — the advertisement and the
+        // delivery machinery cannot be set independently.
+        let (mut server, _pump) = scp_mcp::server::McpServer::with_event_source(
+            McpUniFfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: "did:dht:z6MkSubscriber".to_owned(),
+                context_ids: vec!["ctx-sub".to_owned()],
+                outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+                agent_ucan_token: None,
+                agent_proof_tokens: None,
+            },
+            tokio::sync::broadcast::channel(16).1,
+        );
 
         assert!(
             advertised_subscribe(&mut server),

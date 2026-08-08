@@ -60,9 +60,13 @@ use crate::validate;
 // ---------------------------------------------------------------------------
 
 /// Maximum bytes to read for a single line from an MCP transport.
-/// 10 MiB is generous for JSON-RPC messages (typical MCP responses are < 1 MiB)
-/// while still preventing unbounded allocation from a malicious peer.
-const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
+///
+/// Re-exported from [`scp_mcp::stdio::MAX_LINE_BYTES`] rather than redeclared:
+/// the client transport here and the server transport in `scp-mcp` frame the
+/// same JSON-RPC line protocol, so a peer that is within the limit on one side
+/// must be within it on the other. Three independent copies of the constant
+/// could drift into exactly that asymmetry.
+use scp_mcp::stdio::MAX_LINE_BYTES;
 
 /// Read a line from `reader` into `buf`, bounded to [`MAX_LINE_BYTES`].
 ///
@@ -655,7 +659,22 @@ impl FfiBridgeProvider {
 
 impl ContextProvider for FfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<String> {
-        self.context_ids.clone()
+        // Configured ∩ live: a context the agent has left is no longer served,
+        // so its tools and resources drop out of `tools/list` and
+        // `resources/list` without restarting the server (ADR-015 AC7).
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        self.context_ids
+            .iter()
+            .filter(|id| {
+                crate::runtime::with_context(&bi, id, |rt| {
+                    Ok(rt.role_state.members.contains(&self.agent_did))
+                })
+                .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
@@ -1148,6 +1167,48 @@ impl ContextProvider for FfiBridgeProvider {
         Ok(output)
     }
 
+    fn validate_resource_access(
+        &self,
+        context_id: &str,
+        resource: scp_mcp::server::ResourceKind,
+    ) -> Result<(), String> {
+        use scp_core::context::roles::Capability;
+        use scp_mcp::server::ResourceKind;
+
+        let bi = self.upgrade_bi()?;
+        crate::runtime::with_context(&bi, context_id, |rt| {
+            // `Events` and `Members` require `messages:read`: per spec §5.3.1's
+            // role table an `observer` — whose sole capability is
+            // `messages:read` — "can see all content and membership", so that
+            // grant is exactly the authority to read the event stream and the
+            // roster.
+            //
+            // `Tools` carries no separate grant because its contents are the
+            // capability-filtered tool list; an agent with no tool capabilities
+            // reads `[]` rather than being denied. This is deliberately NOT a
+            // `validate_capability("resource:tools")` call — that name resolves
+            // to `Capability::Custom("resource:tools")`, which appears in no
+            // ceiling and no role catalogue, so gating on it denied every
+            // client on every bridge unconditionally.
+            let permitted = match resource {
+                ResourceKind::Events | ResourceKind::Members => rt
+                    .role_state
+                    .member_has_capability(&self.agent_did, &Capability::MessagesRead),
+                ResourceKind::Tools => rt.role_state.members.contains(&self.agent_did),
+            };
+            if permitted {
+                Ok(())
+            } else {
+                Err(ScpPyError::context(format!(
+                    "agent lacks messages:read in context '{context_id}' — required to read \
+                     scp://{context_id}/{}",
+                    resource.uri_suffix()
+                )))
+            }
+        })
+        .map_err(|e| format!("{e}"))
+    }
+
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
         // Returns empty if the bridge has been dropped — matches the
         // "unknown context" fallback semantics of this trait method.
@@ -1209,12 +1270,6 @@ pub(crate) struct McpServerState {
     transport: String,
     /// Whether the server has been stopped.
     stopped: bool,
-    /// The real MCP server, wrapped in Arc<Mutex> for thread-safe access
-    /// from the transport task and bridge functions. Never read directly —
-    /// kept alive as an ownership anchor (the transport task closure holds
-    /// a clone of this Arc).
-    #[allow(dead_code)] // Ownership anchor — dropping this Arc would stop the server.
-    server: Arc<Mutex<McpServer<FfiBridgeProvider>>>,
     /// Shutdown signal sender. Dropping this signals the transport task to stop.
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Handle to the tokio task running the transport. Used by `server_wait`.
@@ -1328,26 +1383,17 @@ impl crate::scp::PyScp {
             agent_did: identity_did.to_owned(),
             context_ids: context_ids.clone(),
             outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-            agent_ucan_token: ucan_token.clone(),
+            agent_ucan_token: ucan_token,
 
             agent_proof_tokens: None,
         };
-        let server = McpServer::new(provider);
-        let server = Arc::new(Mutex::new(server));
 
         // Create a shutdown channel.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Start the transport task on the tokio runtime.
         let rt = crate::runtime()?;
-        let server_clone = Arc::clone(&server);
         let transport_mode = transport.to_owned();
-        let sse_agent_did = identity_did.to_owned();
-        let sse_context_ids = context_ids.clone();
-        let sse_ucan_token = ucan_token;
-        // `sse_bi` is a `Weak` reference so the SSE server task cannot
-        // pin `PyBridgeInstance` alive. Same rationale as `provider.bi`.
-        let sse_bi: std::sync::Weak<crate::runtime::PyBridgeInstance> = Arc::downgrade(&bi_arc);
         // Capture the cancel token so the server task exits when the
         // instance is dropped, even if the caller never calls
         // `py_mcp_server_stop`. Cloning a `CancellationToken` does not
@@ -1382,9 +1428,17 @@ impl crate::scp::PyScp {
             );
         }
 
+        // One call decides both halves: the server that advertises
+        // `resources.subscribe` and the pump that honours it. There is no
+        // setter that could desynchronize them, and only one server is built
+        // per serve call — two servers over one event source would each
+        // advertise subscriptions while only one had the pump.
+        let (server, pump) = McpServer::with_optional_event_source(provider, context_events);
+
         let task_handle = rt.spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
+                    let server = Arc::new(Mutex::new(server));
                     // Run the MCP server over stdio via the shared
                     // `scp_mcp::stdio::run_stdio` loop. It owns stdout so the
                     // response writer and the resource-subscription event pump
@@ -1405,7 +1459,7 @@ impl crate::scp::PyScp {
                                 "MCP stdio server task exiting — bridge instance cancelled"
                             );
                         }
-                        result = scp_mcp::stdio::run_stdio(&server_clone, context_events) => {
+                        result = scp_mcp::stdio::run_stdio(&server, pump) => {
                             if let Err(e) = result {
                                 tracing::error!("MCP stdio server error: {e}");
                             }
@@ -1413,21 +1467,8 @@ impl crate::scp::PyScp {
                     }
                 }
                 "sse" => {
-                    // For SSE, run_sse takes ownership of the McpServer and
-                    // binds to a configurable address. We create a dedicated
-                    // server instance using the captured identity and context
-                    // IDs (avoids re-extracting from the mutex which would
-                    // create a stale-data race window).
-                    let provider = FfiBridgeProvider {
-                        bi: sse_bi,
-                        agent_did: sse_agent_did,
-                        context_ids: sse_context_ids,
-                        outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-                        agent_ucan_token: sse_ucan_token,
-
-                        agent_proof_tokens: None,
-                    };
-                    let sse_server = McpServer::new(provider);
+                    // `run_sse` takes ownership of the `McpServer` directly —
+                    // no mutex wrapper, since the SSE transport owns it.
                     let config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
                         [127, 0, 0, 1],
                         0,
@@ -1452,9 +1493,7 @@ impl crate::scp::PyScp {
                         sse_shutdown_trigger.shutdown();
                     });
 
-                    let result =
-                        scp_mcp::sse::run_sse(sse_server, config, sse_shutdown, context_events)
-                            .await;
+                    let result = scp_mcp::sse::run_sse(server, config, sse_shutdown, pump).await;
                     if let Err(e) = result {
                         tracing::error!("MCP SSE server error: {e}");
                     }
@@ -1470,7 +1509,6 @@ impl crate::scp::PyScp {
             context_ids,
             transport: transport.to_owned(),
             stopped: false,
-            server,
             shutdown_tx: Some(shutdown_tx),
             task_handle: Some(task_handle),
         };
@@ -2547,19 +2585,27 @@ mod tests {
         // Hold the Arc alive for the duration of the test so the Weak
         // inside the provider upgrades successfully (#1549 round-2).
         let bi = __bi();
+        let creator = "did:dht:z6MkTest";
+        let live_a = setup_test_context(&bi, creator, false);
+        let live_b = setup_test_context(&bi, creator, false);
+
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
-            agent_did: "did:dht:z6MkTest".to_owned(),
-            context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
+            agent_did: creator.to_owned(),
+            // A third id the agent does not participate in: configuring a
+            // context is not the same as being a member of it.
+            context_ids: vec![live_a.clone(), live_b.clone(), "ctx-not-joined".to_owned()],
             outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
             agent_ucan_token: None,
 
             agent_proof_tokens: None,
         };
-        assert_eq!(
-            provider.active_context_ids(),
-            vec!["ctx-1".to_owned(), "ctx-2".to_owned()]
-        );
+
+        // ADR-015 AC7: the served set is configured ∩ live participation, so a
+        // context the agent is not (or is no longer) a member of drops out
+        // without restarting the server. A static snapshot of the configured
+        // list could never satisfy that.
+        assert_eq!(provider.active_context_ids(), vec![live_a, live_b]);
     }
 
     #[test]
@@ -3628,8 +3674,9 @@ mod tests {
 
             agent_proof_tokens: None,
         };
-        let server = McpServer::new(provider);
-        let server = Arc::new(Mutex::new(server));
+        // The registry entry no longer holds the server (the transport task
+        // owns it), so the provider is only built here to prove construction.
+        drop(McpServer::new(provider));
         let handle = generate_handle_id("mcp-server");
 
         server_registry_of(&bi).insert(
@@ -3639,7 +3686,6 @@ mod tests {
                 context_ids: vec![ctx_id.clone()],
                 transport: "stdio".to_owned(),
                 stopped: true, // Already stopped.
-                server,
                 shutdown_tx: None,
                 task_handle: None,
             },
@@ -3678,8 +3724,9 @@ mod tests {
 
             agent_proof_tokens: None,
         };
-        let server = McpServer::new(provider);
-        let server = Arc::new(Mutex::new(server));
+        // The registry entry no longer holds the server (the transport task
+        // owns it), so the provider is only built here to prove construction.
+        drop(McpServer::new(provider));
         let handle = generate_handle_id("mcp-server");
 
         server_registry_of(&bi).insert(
@@ -3689,7 +3736,6 @@ mod tests {
                 context_ids: vec![ctx_id.clone()],
                 transport: "stdio".to_owned(),
                 stopped: false, // Still running.
-                server,
                 shutdown_tx: None,
                 task_handle: None,
             },
@@ -3803,11 +3849,16 @@ mod tests {
             "error must mention the dropped bridge"
         );
 
-        // active_context_ids & agent_did don't touch the weak at all.
-        assert_eq!(
-            provider.active_context_ids(),
-            vec!["ctx-dropped".to_owned()]
+        // active_context_ids: empty. It now resolves live participation
+        // through the bridge, so a dropped instance means nothing is served —
+        // which is the fail-closed answer: serving a context whose membership
+        // can no longer be checked would be worse than serving none.
+        assert!(
+            provider.active_context_ids().is_empty(),
+            "a dropped bridge must serve no contexts"
         );
+
+        // agent_did is provider-local and does not touch the weak at all.
         assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
     }
 }

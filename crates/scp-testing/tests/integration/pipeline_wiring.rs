@@ -2939,55 +2939,43 @@ fn b3_webhook_dispatch_wired() {
 /// `notifications/resources/updated` — a false guarantee on a shipped path,
 /// plus a three-way divergence between bridges.
 ///
-/// The fix makes the advertisement *derived* rather than asserted: the
-/// capability flag and the delivery pump are switched on by the same argument
-/// (`Option<broadcast::Receiver<(String, ContextEvent)>>`) handed to the
-/// transport. These assertions guard the two halves that make that sound.
+/// # Why this is no longer a source-text gate
+///
+/// The first fix derived the advertisement from a `subscriptions_enabled` bool
+/// that a public `enable_subscriptions()` setter could flip on any server, so
+/// three `str::contains` assertions stood in for the invariant: that the flag
+/// was never hard-coded, that the provider seam stayed deleted, and that both
+/// transports called the setter next to the pump. Those were a weaker,
+/// source-text restatement of a property the type system can hold outright,
+/// which `CLAUDE.md` names as an anti-pattern ("Enforce mechanically … the type
+/// system — not documentation") and which the ast-gate lesson calls
+/// non-convergent.
+///
+/// `McpServer::with_event_source` now returns `(McpServer, ContextEventPump)`
+/// and is the *only* thing that sets the flag; `enable_subscriptions` is gone.
+/// A server that advertises the capability and a pump that delivers it are one
+/// value produced by one call, so:
+///
+/// - the advertisement cannot be hard-coded — no literal reaches the field;
+/// - it cannot be enabled without a receiver — there is no other constructor
+///   that sets it;
+/// - the pump cannot be forgotten — `ContextEventPump` is `#[must_use]` and a
+///   transport is the only thing that can consume it.
+///
+/// The three string-search assertions were therefore REMOVED as redundant with
+/// a strictly stronger compile-time guarantee (the one legitimate reason to
+/// remove an enforcement assertion). What remains below is the part the type
+/// system genuinely cannot see: that each bridge *sources* its receiver from
+/// the Supervisor and hands it to a transport, rather than passing `None` and
+/// honestly-but-uselessly advertising nothing.
 #[test]
 fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
-    // (a) The capability is never hard-coded true — it must be read from the
-    //     `subscriptions_enabled` flag, which only `enable_subscriptions()`
-    //     sets, and which only a transport holding a receiver calls.
-    let server_src = include_str!("../../../../crates/scp-mcp/src/server.rs");
-    assert!(
-        server_src.contains("subscribe: self.subscriptions_enabled"),
-        "McpServer must advertise resources.subscribe from the wired-event-source \
-         flag, never a hard-coded `true` (that was the #1341 false guarantee)"
-    );
-    assert!(
-        !server_src.contains("ResourceServerCapability { subscribe: true }"),
-        "resources.subscribe must not be hard-coded true — it must track whether \
-         a ContextEvent source is actually wired"
-    );
-
-    // (b) The provider seam that let each bridge answer `subscribe` differently
-    //     is gone. Subscription state lives solely in `McpServer`, so the three
-    //     bridges cannot diverge on it again.
-    assert!(
-        !server_src.contains("fn subscribe_resource"),
-        "ContextProvider::subscribe_resource must stay deleted — it was the seam \
-         that let PyO3/UniFFI silently accept and NAPI reject the same request"
-    );
-
-    // (c) Both transports must accept the event source and turn it into
-    //     `notifications/resources/updated`.
-    let sse_src = include_str!("../../../../crates/scp-mcp/src/sse.rs");
-    let stdio_src = include_str!("../../../../crates/scp-mcp/src/stdio.rs");
-    for (name, src) in [("sse", sse_src), ("stdio", stdio_src)] {
-        assert!(
-            src.contains("enable_subscriptions") && src.contains("pump_events"),
-            "the {name} transport must enable the capability and run the event \
-             pump from the same receiver argument"
-        );
-    }
-    assert!(
-        server_src.contains("fn notifications_for_event"),
-        "McpServer must map ContextEvents to notifications for subscribed URIs"
-    );
-
-    // (d) Every bridge must source that receiver from the Supervisor and hand
-    //     it to the transport. The original bug was fixed on one bridge at a
-    //     time before; these per-bridge matches guard against that drift.
+    // Every bridge must obtain the Supervisor receiver and construct its
+    // server through the constructor that pairs the flag with the pump. A
+    // bridge that called `McpServer::new` would compile and serve, but would
+    // advertise `resources.subscribe: false` forever — a silent capability
+    // regression the type system cannot catch because both constructors are
+    // legitimate.
     let pyo3_mcp_src = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
     let napi_mcp_src = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
     let uniffi_mcp_src = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
@@ -3001,15 +2989,61 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
             "{bridge} MCP serve must obtain the Supervisor ContextEvent receiver"
         );
         assert!(
-            src.contains("run_sse(sse_server, sse_config, sse_shutdown, context_events)")
-                || src.contains("run_sse(sse_server, config, sse_shutdown, context_events)"),
-            "{bridge} must pass the event receiver to run_sse so SSE clients \
-             actually receive resources/updated"
+            src.contains("with_optional_event_source"),
+            "{bridge} MCP serve must build its McpServer through the constructor \
+             that pairs the advertised capability with the pump that honours it — \
+             McpServer::new would silently downgrade to resources.subscribe: false"
         );
+    }
+}
+
+/// Resource authorization must run the SAME predicate for `resources/read` and
+/// `resources/subscribe`, and every bridge must answer it from real state.
+///
+/// Two defects motivated this. First, `resources/subscribe` skipped the
+/// authorization tier `resources/read` enforced, so a client could hold a live
+/// subscription to a resource it could not read and learn from notification
+/// timing that denied state was changing. Second, the tier `resources/read` DID
+/// enforce named a `resource:{kind}` capability that appears in no ceiling, no
+/// role catalogue and no UCAN stem — `Capability::new` resolves it to a
+/// `Custom` value no context grants — so it denied every client on every bridge
+/// unconditionally, making the whole resource surface dead while
+/// `resources/list` kept advertising it.
+///
+/// `ContextProvider::validate_resource_access` is a required trait method with
+/// no default, so a bridge cannot forget to answer it, and it takes the typed
+/// `ResourceKind` rather than a string, so no `resource:`-prefixed name can be
+/// synthesized again. This test pins the part the types cannot see: that each
+/// bridge answers from context role state rather than a stand-in.
+#[test]
+fn mcp_resource_access_is_answered_from_real_role_state() {
+    let server_src = include_str!("../../../../crates/scp-mcp/src/server.rs");
+    assert!(
+        !server_src.contains("format!(\"resource:{"),
+        "the phantom `resource:{{kind}}` capability name must stay deleted — it \
+         resolves to a Custom capability no ceiling grants, so gating on it \
+         denies every client on every bridge"
+    );
+
+    for (bridge, src) in [
+        (
+            "PyO3",
+            include_str!("../../../../crates/scp-ffi/src/mcp.rs"),
+        ),
+        (
+            "NAPI",
+            include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs"),
+        ),
+        (
+            "UniFFI",
+            include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
+        ),
+    ] {
         assert!(
-            src.contains("run_stdio(&server, context_events)")
-                || src.contains("run_stdio(&server_clone, context_events)"),
-            "{bridge} must pass the event receiver to the shared run_stdio loop"
+            src.contains("Capability::MessagesRead"),
+            "{bridge} must authorize the events/members resources against the real \
+             capability catalogue (spec §5.3.1: `messages:read` is what lets an \
+             observer see content and membership), not a synthesized name"
         );
     }
 }
