@@ -47,6 +47,7 @@ use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
 use scp_transport::native::TransportRelayPublisher;
+use tokio::sync::watch;
 
 use crate::config::{DhtMode, IdentitySource, NatSlot, Node, NodeConfig, Reach, TlsMode};
 use crate::{ApplicationNode, PublicSurface, projection};
@@ -1425,9 +1426,10 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
 
 /// Constructs the production [`RepublishManager`] (the real `scp-transport`
 /// [`TransportRelayPublisher`] is the `R` type parameter, paired with the node's
-/// DHT client) and drives the self-host node's own DID-document republishing —
-/// or leaves it **fully dormant** when the node published no signed record.
-/// Returns the running manager for teardown, or `None` when dormant.
+/// DHT client) and drives the self-host node's own DID-document republishing from
+/// a **live view** of the node's published record — or leaves it **fully dormant**
+/// (manager present, zero arms) while the node has published nothing.
+/// Returns the running cycle for teardown.
 ///
 /// # Both layers, always enabled (§3.10.6 anti-segmentation)
 ///
@@ -1453,12 +1455,25 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
 ///
 /// # Full dormancy — honest disclosure (do not read as active resilience)
 ///
-/// When the node published **no signed record** (`entry` is `None`) there is
-/// nothing to keep alive on either layer, so the whole manager stays dormant.
-/// `DhtMode::Disabled` — the fail-closed default — publishes nothing, so this is
-/// its state. The `None` is produced by the publish path itself
-/// (`publish_did_document_for_mode`), so the log below is literally true:
-/// it fires when, and only when, nothing was published.
+/// While the node has published **no signed record** (the slot holds `None`)
+/// there is nothing to keep alive on either layer, so no arm is scheduled and the
+/// manager sits at zero tasks. `DhtMode::Disabled` — the fail-closed default —
+/// publishes nothing, so that is its permanent state. The `None` is produced by
+/// the publish seam itself, so the log below is literally true: it fires when, and
+/// only when, nothing has been published.
+///
+/// # Re-seeding: a live view, not a snapshot
+///
+/// The cycle takes a [`watch::Receiver`](tokio::sync::watch::Receiver) over the
+/// node's published-record slot, never a `RepublishEntry` by value. Every publish
+/// this node performs writes that slot (see `PublishedDidRecord`), and the
+/// re-seed observer re-points both arms at the new record. A NAT tier change
+/// re-publishes the document with a NEW `(value, signature, seq)`; against a
+/// held snapshot the DHT arm would keep re-putting a superseded `seq` (which
+/// BEP44 nodes reject, so the *current* record stops being kept alive and
+/// expires) and the relay arm would keep pushing a superseded frame (which a
+/// validating relay rejects, miscounted as a publish failure and eventually
+/// reported as `RelayPublishDegraded` while the relay is in fact correct).
 /// Emits the §3.10.6 mandated warning when a DID-resolution layer is disabled.
 ///
 /// A named function rather than an inline closure so the wiring is a *value*:
@@ -1483,29 +1498,9 @@ fn self_host_republish_config() -> RepublishConfig {
 async fn start_self_did_republishing<D: DhtClient + 'static>(
     dht_client: Arc<D>,
     relay_publisher: Arc<TransportRelayPublisher>,
-    entry: Option<RepublishEntry>,
-) -> Option<Arc<RepublishManager<D, TransportRelayPublisher>>> {
-    // Prerequisite for ANY republishing: a signed record. None → fully dormant;
-    // there is no DHT record to keep alive and nothing to publish to relays.
-    let Some(entry) = entry else {
-        tracing::info!(
-            "self-DID republishing dormant: this node published no signed record, \
-             so there is no DID record to keep alive on either layer \
-             (DhtMode::Disabled no-publish default)"
-        );
-        return None;
-    };
-
-    let did = entry.did();
-
+    mut records: watch::Receiver<Option<RepublishEntry>>,
+) -> SelfDidRepublishing<D> {
     let config = self_host_republish_config();
-
-    tracing::info!(
-        did = %did,
-        "self-DID republishing active on BOTH layers: DHT (2h keep-alive) + \
-         relay (6d) (§3.10.6 anti-segmentation). The relay arm publishes on \
-         every cycle and fails closed until a relay is bound."
-    );
 
     // Both degraded callbacks are wired: the DHT keep-alive is this node's only
     // resolvability guarantee, so a keep-alive that has been failing for six
@@ -1539,8 +1534,135 @@ async fn start_self_did_republishing<D: DhtClient + 'static>(
             },
         )),
     );
+
+    // Seed synchronously from the CURRENT slot value before returning, so a
+    // caller that inspects the manager right after this call (and the teardown
+    // path) sees the arms that the node's startup publish already justified —
+    // rather than racing the observer task's first poll.
+    //
+    // `borrow_and_update` (not `borrow`) marks EXACTLY the version just read as
+    // seen, so a publish racing this line is either included in `current` or
+    // still pending for the observer's first `changed()`. Reading and marking as
+    // two steps would drop a publish that landed between them.
+    let current = records.borrow_and_update().clone();
+    seed_republish_arms(&manager, current).await;
+
+    let reseed_task = tokio::spawn(reseed_republish_arms(Arc::clone(&manager), records));
+
+    SelfDidRepublishing {
+        manager,
+        reseed_task,
+    }
+}
+
+/// The running self-DID republish cycle: the [`RepublishManager`] plus the
+/// observer that keeps it pointed at the node's CURRENT signed record.
+///
+/// Held for the serve lifetime and torn down via [`stop`](Self::stop).
+struct SelfDidRepublishing<D: DhtClient> {
+    manager: Arc<RepublishManager<D, TransportRelayPublisher>>,
+    /// The re-seed observer. Aborted BEFORE the manager is stopped — see
+    /// [`stop`](Self::stop).
+    reseed_task: tokio::task::JoinHandle<()>,
+}
+
+impl<D: DhtClient + 'static> SelfDidRepublishing<D> {
+    /// Stops the cycle: no arm survives, and none can be started afterwards.
+    ///
+    /// Ordering is load-bearing. The observer is aborted FIRST: stopping the
+    /// manager first would leave a window in which an in-flight `changed()`
+    /// wake-up re-starts both arms *after* `stop_all`, leaking two tasks past
+    /// shutdown.
+    async fn stop(self) {
+        self.reseed_task.abort();
+        self.manager.stop_all().await;
+    }
+}
+
+/// Points both republish arms at `entry`, replacing whatever they were asserting.
+///
+/// # Why a full stop-then-start rather than a bespoke `reseed` method
+///
+/// "Make these arms publish this entry" is exactly what
+/// [`RepublishManager::start_republishing`] already means — it aborts and
+/// replaces the tasks under the entry's derived DID. A separate `reseed` method
+/// would be a second spelling of one operation, and the two would have to be kept
+/// in agreement forever. Replacing the tasks is also the only *possible*
+/// semantics: each arm captured its `RepublishEntry` by value when it was
+/// spawned, so nothing short of a new task can make it publish new bytes.
+///
+/// The preceding [`stop_all`](RepublishManager::stop_all) closes the one gap in
+/// `start_republishing`'s replace: it replaces only the arms keyed under THIS
+/// entry's DID. This manager hosts exactly one identity — the node's own — so any
+/// arm under a different key is by definition asserting a record this node no
+/// longer stands behind, and would keep doing so forever. Stopping everything
+/// first makes "one entry, one pair of arms" unconditional rather than an
+/// invariant argued from the node's identity never changing. The two calls are
+/// serial on a single observer task, and `start_republishing` publishes
+/// immediately, so the replacement window carries no tick.
+async fn seed_republish_arms<D: DhtClient + 'static>(
+    manager: &RepublishManager<D, TransportRelayPublisher>,
+    entry: Option<RepublishEntry>,
+) {
+    let Some(entry) = entry else {
+        // Nothing published (yet): no DHT record to keep alive and nothing to
+        // publish to relays. Not an error — the `DhtMode::Disabled` default.
+        tracing::info!(
+            "self-DID republishing dormant: this node has published no signed \
+             record, so there is no DID record to keep alive on either layer \
+             (DhtMode::Disabled no-publish default)"
+        );
+        return;
+    };
+
+    tracing::info!(
+        did = %entry.did(),
+        sequence = entry.sequence,
+        "self-DID republishing active on BOTH layers: DHT (2h keep-alive) + \
+         relay (6d) (§3.10.6 anti-segmentation). The relay arm publishes on \
+         every cycle and fails closed until a relay is bound."
+    );
+    manager.stop_all().await;
     manager.start_republishing(entry).await;
-    Some(manager)
+}
+
+/// Re-seeds the republish arms from the node's published-record slot for as long
+/// as the node lives.
+///
+/// This is what makes re-seeding structural: the observer watches the slot that
+/// the publish seam writes, so ANY re-publish — the NAT tier change today, and
+/// any publish path added later — re-points the arms at the record it produced.
+/// No call site has to remember to re-seed, because no call site is involved.
+///
+/// # Racing an in-flight tick
+///
+/// A re-seed can land while an arm is mid-publish. Each arm is aborted and its
+/// replacement inserted under the manager's task-map lock, so the two can neither
+/// interleave nor both survive. Aborting mid-publish drops that request; the
+/// replacement task publishes immediately with a HIGHER sequence, which
+/// supersedes the dropped one on both layers. Losing the stale in-flight put is
+/// the desired outcome — it was asserting a record the node has already replaced.
+async fn reseed_republish_arms<D: DhtClient + 'static>(
+    manager: Arc<RepublishManager<D, TransportRelayPublisher>>,
+    mut records: watch::Receiver<Option<RepublishEntry>>,
+) {
+    // The version present at construction was read with `borrow_and_update` by
+    // `start_self_did_republishing` and is therefore already marked seen, so the
+    // first `changed()` waits for the next *publish* rather than replaying it.
+    loop {
+        if records.changed().await.is_err() {
+            // Every sender is gone: the node has been dropped, so nothing more
+            // will ever be published. The arms keep asserting the last record
+            // until teardown aborts them.
+            tracing::debug!(
+                "self-DID re-seed observer stopping: the node's published-record \
+                 slot was dropped"
+            );
+            return;
+        }
+        let entry = records.borrow_and_update().clone();
+        seed_republish_arms(manager.as_ref(), entry).await;
+    }
 }
 
 /// The DHT-mode-independent inputs threaded from [`host_site_until`] into the
@@ -1632,14 +1754,15 @@ where
 
     // -- Self-DID republishing (SCP-RELAYRES-004, §3.10.2/§3.10.5/§3.10.6). The
     //    real TransportRelayPublisher (the `R` type parameter) is constructed
-    //    here and both layers are always enabled. The republish entry is the
-    //    signed record the node's OWN publish produced (`None` when it published
-    //    nothing) — never re-derived by resolving the node's record back off the
-    //    network. Driven below, once the site is deployed and the public surface
-    //    is open, so an early build/deploy failure never leaves a republish task
-    //    running. --
+    //    here and both layers are always enabled. The republish source is a LIVE
+    //    VIEW of the node's published-record slot — the signed records the node's
+    //    OWN publishes produce, never re-derived by resolving the node's record
+    //    back off the network, and never a snapshot that a later re-publish (a
+    //    NAT tier change) would silently supersede. Driven below, once the site
+    //    is deployed and the public surface is open, so an early build/deploy
+    //    failure never leaves a republish task running. --
     let relay_publisher = Arc::new(TransportRelayPublisher::new());
-    let republish_entry = node.published_did_record().cloned();
+    let published_records = node.subscribe_published_did_record();
 
     let context_id = self_host_context_id(&node_did);
 
@@ -1715,14 +1838,15 @@ where
 
     // -- Drive self-DID republishing now the node is up and the surface is open.
     //    Runs the DHT keep-alive whenever a signed record exists, plus the relay
-    //    arm once a relay is bound; fully dormant with no record. The honest
-    //    disclosure of why production is currently dormant lives in
-    //    `start_self_did_republishing`. The returned manager (if any) is held for
-    //    the serve lifetime and torn down after shutdown. --
-    let republish_manager = start_self_did_republishing(
+    //    arm once a relay is bound; dormant (zero arms) while nothing has been
+    //    published, and re-seeded automatically on every subsequent publish. The
+    //    honest disclosure of why production may be dormant lives in
+    //    `start_self_did_republishing`. The returned cycle is held for the serve
+    //    lifetime and torn down after shutdown. --
+    let republish = start_self_did_republishing(
         Arc::clone(&dht_client),
         Arc::clone(&relay_publisher),
-        republish_entry,
+        published_records,
     )
     .await;
 
@@ -1740,11 +1864,10 @@ where
     })
     .await;
 
-    // Tear down self-DID republishing (aborts any running arms). A dormant node
-    // (no record) has no manager and nothing to stop.
-    if let Some(manager) = republish_manager {
-        manager.stop_all().await;
-    }
+    // Tear down self-DID republishing: the re-seed observer first, then any
+    // running arms (see `SelfDidRepublishing::stop`). A dormant node has no arms
+    // to abort, so this is a no-op for it.
+    republish.stop().await;
 
     tracing::info!("host_site stopped");
     Ok(())
@@ -3023,10 +3146,10 @@ mod tests {
     }
 
     /// The signed BEP44 record a self-host node's own publish produces — the
-    /// SHAPE `publish_did_document_for_mode` now hands to
-    /// `start_self_did_republishing`. Built directly from the signing inputs
-    /// (no DHT involved), because that is the point: sourcing the republish
-    /// entry no longer requires any storage or network read.
+    /// SHAPE the publish seam files into the node's `PublishedDidRecord` slot,
+    /// which `start_self_did_republishing` observes. Built directly from the
+    /// signing inputs (no DHT involved), because that is the point: sourcing the
+    /// republish entry no longer requires any storage or network read.
     fn self_host_signed_record() -> RepublishEntry {
         use ed25519_dalek::{Signer, SigningKey};
 
@@ -3254,6 +3377,22 @@ mod tests {
         }
     }
 
+    /// A published-record slot pre-seeded with `entry`.
+    ///
+    /// Returns the sender alongside the receiver: the sender must outlive the
+    /// cycle under test, because dropping every sender is the signal that the
+    /// node is gone and stops the re-seed observer.
+    fn record_slot(
+        entry: Option<RepublishEntry>,
+    ) -> (
+        watch::Sender<Option<RepublishEntry>>,
+        watch::Receiver<Option<RepublishEntry>>,
+    ) {
+        let tx = watch::Sender::new(entry);
+        let rx = tx.subscribe();
+        (tx, rx)
+    }
+
     /// Binds a recording relay adapter onto `publisher` and returns the adapter
     /// so the test can inspect what the relay layer received.
     fn bind_recording_relay(publisher: &TransportRelayPublisher) -> Arc<RecordingRelayAdapter> {
@@ -3275,23 +3414,22 @@ mod tests {
 
         let publisher = Arc::new(TransportRelayPublisher::new());
         let _adapter = bind_recording_relay(publisher.as_ref());
-        let manager =
-            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), Some(entry))
-                .await
-                .expect("a node with a signed record activates republishing");
+        let (_slot, records) = record_slot(Some(entry));
+        let republish =
+            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), records).await;
 
         assert_eq!(
-            manager.active_count().await,
+            republish.manager.active_count().await,
             1,
             "the DHT (2h) republish cycle is scheduled"
         );
         assert_eq!(
-            manager.active_relay_count().await,
+            republish.manager.active_relay_count().await,
             1,
             "the relay (6d) republish cycle is scheduled ALONGSIDE the DHT cycle (§3.10.6)"
         );
 
-        manager.stop_all().await;
+        republish.stop().await;
     }
 
     /// AC 5: the production `RepublishManager` publishes to BOTH layers — the DHT
@@ -3307,12 +3445,11 @@ mod tests {
         let publisher = Arc::new(TransportRelayPublisher::new());
         let adapter = bind_recording_relay(publisher.as_ref());
 
-        let manager =
-            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), Some(entry))
-                .await
-                .expect("started with a signed record");
+        let (_slot, records) = record_slot(Some(entry));
+        let republish =
+            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), records).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        manager.stop_all().await;
+        republish.stop().await;
 
         // DHT layer: the record is present (the DHT arm publishes it too).
         assert!(
@@ -3342,12 +3479,11 @@ mod tests {
         let publisher = Arc::new(TransportRelayPublisher::new());
         let adapter = bind_recording_relay(publisher.as_ref());
 
-        let manager =
-            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), Some(entry))
-                .await
-                .expect("started with a signed record");
+        let (_slot, records) = record_slot(Some(entry));
+        let republish =
+            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), records).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        manager.stop_all().await;
+        republish.stop().await;
 
         let recorded = adapter.recorded();
         assert!(!recorded.is_empty(), "relay received the node's DID record");
@@ -3405,13 +3541,12 @@ mod tests {
 
         // ZERO relays bound at construction.
         let publisher = Arc::new(TransportRelayPublisher::new());
-        let manager =
-            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), Some(entry))
-                .await
-                .expect("a signed record activates republishing");
+        let (_slot, records) = record_slot(Some(entry));
+        let republish =
+            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), records).await;
 
         assert_eq!(
-            manager.active_relay_count().await,
+            republish.manager.active_relay_count().await,
             1,
             "the relay arm is scheduled even with no relay bound — it fails closed \
              per tick rather than being latched off at construction"
@@ -3442,7 +3577,7 @@ mod tests {
         );
         assert_relay_blob_is_node_frame(&recorded[0], &did);
 
-        manager.stop_all().await;
+        republish.stop().await;
     }
 
     /// B2 (CRITICAL): republishing no longer depends on reading the node's own
@@ -3472,35 +3607,540 @@ mod tests {
 
         let publisher = Arc::new(TransportRelayPublisher::new());
         let _adapter = bind_recording_relay(publisher.as_ref());
-        let manager =
-            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), Some(entry))
-                .await
-                .expect("republishing starts from the SIGNED RECORD, not a read-back");
+        let (_slot, records) = record_slot(Some(entry));
+        let republish =
+            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), records).await;
 
-        assert_eq!(manager.active_count().await, 1, "DHT keep-alive scheduled");
-        assert_eq!(manager.active_relay_count().await, 1, "relay arm scheduled");
+        assert_eq!(
+            republish.manager.active_count().await,
+            1,
+            "DHT keep-alive scheduled"
+        );
+        assert_eq!(
+            republish.manager.active_relay_count().await,
+            1,
+            "relay arm scheduled"
+        );
 
-        manager.stop_all().await;
+        republish.stop().await;
     }
 
-    /// No signed record → FULLY dormant: no manager, no DHT task, no relay task.
-    /// The honest absent state, never a fabricated entry. `None` now means "this
-    /// node published nothing" (the `DhtMode::Disabled` default), which is what
-    /// the dormancy log claims — before, it also covered "the network read
-    /// failed", making that log a lie.
+    /// No signed record → FULLY dormant: zero DHT tasks, zero relay tasks.
+    /// The honest absent state, never a fabricated entry. `None` means "this node
+    /// published nothing" (the `DhtMode::Disabled` default), which is what the
+    /// dormancy log claims — before, it also covered "the network read failed",
+    /// making that log a lie.
     #[tokio::test]
     async fn self_did_republishing_fully_dormant_without_published_record() {
         let dht = Arc::new(InMemoryDhtClient::new());
         let publisher = Arc::new(TransportRelayPublisher::new());
-        let _adapter = bind_recording_relay(publisher.as_ref());
+        let adapter = bind_recording_relay(publisher.as_ref());
 
-        let manager =
-            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), None).await;
+        let (_slot, records) = record_slot(None);
+        let republish =
+            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), records).await;
 
-        assert!(
-            manager.is_none(),
-            "nothing published → fully dormant (no manager, no entry fabricated)"
+        assert_eq!(
+            republish.manager.active_count().await,
+            0,
+            "nothing published → no DHT keep-alive arm (no entry fabricated)"
         );
+        assert_eq!(
+            republish.manager.active_relay_count().await,
+            0,
+            "nothing published → no relay arm"
+        );
+
+        // Dormancy is real, not just an empty task map: nothing reaches a relay.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            adapter.recorded().is_empty(),
+            "a dormant cycle publishes nothing to any layer"
+        );
+
+        republish.stop().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-seeding the running republish arms on a re-publish
+    // (SCP-RELAYRES-004 — the frozen-snapshot class, tier-change seam)
+    //
+    // `apply_tier_change` re-publishes the node's DID document on a NAT tier
+    // change, producing a NEW (value, signature, seq). These tests drive the REAL
+    // seam — a signing `DidDht`, the real `NodeDidPublisher`, the real
+    // `apply_tier_change` — and assert the RUNNING arms follow it.
+    // -----------------------------------------------------------------------
+
+    use crate::{DidPublisher, NodeDidPublisher, PublishedDidRecord, apply_tier_change};
+    use scp_did::DidDocument;
+    use scp_identity::{DidMethod as _, ScpIdentity};
+    use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
+
+    /// The concrete signing `DidDht` used by the re-seed tests: a real BEP44
+    /// signer over an in-memory DHT, with the real monotonic sequence counter.
+    type SigningDidDht = DidDht<InMemoryDhtClient, SystemClock>;
+
+    /// A real identity + relay-carrying DID document + the signing method that
+    /// created them.
+    ///
+    /// Nothing here is synthesized: the records these tests compare are produced
+    /// by the same `DidDht::publish_document` signing pass production uses, so a
+    /// re-seed that carried the wrong bytes could not pass.
+    async fn signing_identity() -> (Arc<SigningDidDht>, ScpIdentity, DidDocument, String) {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let sign_fn = SigningDidDht::make_sign_fn(Arc::clone(&custody));
+        let did_method = Arc::new(DidDht::with_client_and_signer(
+            Arc::new(InMemoryDhtClient::new()),
+            Arc::new(DidCache::new()),
+            sign_fn,
+        ));
+        let (identity, mut document, _pre_rotation) = did_method
+            .create(custody.as_ref(), &InMemoryPreRotationCustody::new())
+            .await
+            .expect("test identity is created");
+        let relay_url = "ws://198.51.100.7:32891/scp/v1".to_owned();
+        crate::push_relay_service(&mut document, &relay_url);
+        (did_method, identity, document, relay_url)
+    }
+
+    /// The node's publish seam over `did_method`, in a publishing `DhtMode`.
+    fn publish_seam(
+        did_method: &Arc<SigningDidDht>,
+        records: &PublishedDidRecord,
+    ) -> NodeDidPublisher<SigningDidDht> {
+        NodeDidPublisher {
+            inner: Arc::clone(did_method),
+            dht_mode: DhtMode::Memory,
+            records: records.clone(),
+        }
+    }
+
+    /// Polls `cond` across task hops until it holds, or panics with `label`.
+    ///
+    /// The re-seed path crosses several tasks (publish → slot → observer →
+    /// manager → arm), so a fixed number of yields would be a guess. Bounded, so
+    /// a genuine failure to re-seed fails the test rather than hanging.
+    async fn settle_until<F>(label: &str, mut cond: F)
+    where
+        F: AsyncFnMut() -> bool,
+    {
+        for _ in 0..2_000u32 {
+            if cond().await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("timed out waiting for {label}");
+    }
+
+    /// THE regression: a NAT tier change re-publishes the DID document with a NEW
+    /// `(value, signature, seq)`, and the ALREADY-RUNNING republish arms must
+    /// re-assert THAT record — on both layers.
+    ///
+    /// Against the pre-fix code this fails: `start_self_did_republishing` took the
+    /// startup `RepublishEntry` BY VALUE, so nothing re-seeded the manager. The
+    /// DHT arm kept re-putting the superseded `seq` (rejected by BEP44 nodes, so
+    /// the *current* record stops being kept alive and expires) and the relay arm
+    /// kept pushing the superseded frame (rejected by a validating relay, then
+    /// miscounted as a publish failure).
+    #[tokio::test(start_paused = true)]
+    async fn tier_change_reseeds_the_running_republish_arms() {
+        let (did_method, identity, document, relay_url) = signing_identity().await;
+        let records = PublishedDidRecord::new();
+        let publisher = publish_seam(&did_method, &records);
+
+        // Startup publish: the seam files the signed record into the slot.
+        publisher
+            .publish(&identity, &document)
+            .await
+            .expect("startup publish succeeds");
+        let first = records
+            .get()
+            .expect("the startup publish records its entry");
+
+        // The keep-alive layers. These are used ONLY by the republish arms (the
+        // DID method has its own DHT client), so whatever lands here is exactly
+        // what the arms asserted — never leakage from the publish itself.
+        let keep_alive_dht = Arc::new(InMemoryDhtClient::new());
+        let relay = Arc::new(TransportRelayPublisher::new());
+        let adapter = bind_recording_relay(relay.as_ref());
+
+        let republish = start_self_did_republishing(
+            Arc::clone(&keep_alive_dht),
+            Arc::clone(&relay),
+            records.subscribe(),
+        )
+        .await;
+
+        assert_arms_assert_record(
+            &keep_alive_dht,
+            &adapter,
+            &first,
+            "the record the startup publish signed",
+        )
+        .await;
+
+        // -- A NAT tier change: the node re-publishes with a new relay endpoint,
+        //    producing a NEW (value, signature, seq). --
+        let new_relay_url = "ws://203.0.113.42:8443/scp/v1";
+        let (_url, _doc) = apply_tier_change(
+            &relay_url,
+            new_relay_url,
+            "test tier change",
+            &document,
+            &publisher,
+            &identity,
+            None,
+        )
+        .await
+        .expect("the tier-change re-publish succeeds");
+
+        let second = records
+            .get()
+            .expect("the tier-change publish records its entry");
+        assert!(
+            second.sequence > first.sequence,
+            "the re-publish assigns a HIGHER BEP44 sequence ({} -> {})",
+            first.sequence,
+            second.sequence
+        );
+        assert_ne!(
+            second.signature, first.signature,
+            "the re-publish signs different bytes, so the signature differs"
+        );
+        assert!(
+            String::from_utf8_lossy(&second.document_bytes).contains(new_relay_url),
+            "the re-published document carries the NEW relay endpoint"
+        );
+
+        // -- The running arms must now assert the NEW record, unprompted. --
+        assert_arms_assert_record(
+            &keep_alive_dht,
+            &adapter,
+            &second,
+            "the record the TIER-CHANGE re-publish signed",
+        )
+        .await;
+
+        republish.stop().await;
+    }
+
+    /// Asserts BOTH republish arms are asserting exactly `entry`: the DHT
+    /// keep-alive holds its `(value, signature, seq)` and the relay has received a
+    /// frame carrying them.
+    ///
+    /// Waits for each arm rather than assuming a fixed number of task hops, and
+    /// compares full bytes rather than only the sequence — a stale arm republishing
+    /// the previous document would otherwise pass on a coincidental sequence match.
+    async fn assert_arms_assert_record(
+        keep_alive_dht: &InMemoryDhtClient,
+        adapter: &RecordingRelayAdapter,
+        entry: &RepublishEntry,
+        label: &str,
+    ) {
+        use scp_dht::DhtClient as _;
+
+        settle_until(&format!("the DHT arm to assert {label}"), async || {
+            keep_alive_dht
+                .resolve(&entry.public_key)
+                .await
+                .expect("resolve ok")
+                .is_some_and(|record| record.seq == entry.sequence)
+        })
+        .await;
+        let kept_alive = keep_alive_dht
+            .resolve(&entry.public_key)
+            .await
+            .expect("resolve ok")
+            .expect("record present");
+        assert_eq!(
+            kept_alive.value, entry.document_bytes,
+            "the DHT keep-alive puts the document bytes of {label}"
+        );
+        assert_eq!(
+            kept_alive.signature, entry.signature,
+            "the DHT keep-alive puts the signature of {label}"
+        );
+
+        settle_until(&format!("the relay arm to assert {label}"), async || {
+            adapter.recorded().iter().any(|recorded| {
+                scp_core::envelope::did_record::DidRecordV1::decode(&recorded.2)
+                    .is_ok_and(|frame| frame.seq() == entry.sequence)
+            })
+        })
+        .await;
+        let frame = adapter
+            .recorded()
+            .into_iter()
+            .filter_map(|recorded| {
+                scp_core::envelope::did_record::DidRecordV1::decode(&recorded.2).ok()
+            })
+            .find(|frame| frame.seq() == entry.sequence)
+            .expect("the relay arm published a frame at this sequence");
+        assert_eq!(
+            frame.value(),
+            entry.document_bytes.as_slice(),
+            "the relay frame carries the document bytes of {label} — a SUPERSEDED \
+             frame is what a validating relay rejects as DID_RECORD_REJECTED, which \
+             the loop then miscounts as a publish failure"
+        );
+        assert_eq!(
+            frame.signature(),
+            &entry.signature,
+            "the relay frame carries the signature of {label}"
+        );
+    }
+
+    /// Re-seeding replaces the arms 1:1: N re-seeds leave exactly one DHT arm and
+    /// one relay arm, no leaked tokio tasks, and exactly ONE publish per interval
+    /// (N leaked arms would produce N).
+    #[tokio::test(start_paused = true)]
+    async fn reseeding_neither_leaks_nor_double_spawns_tasks() {
+        const RESEEDS: u32 = 5;
+
+        let (did_method, identity, document, _relay_url) = signing_identity().await;
+        let records = PublishedDidRecord::new();
+        let publisher = publish_seam(&did_method, &records);
+        publisher
+            .publish(&identity, &document)
+            .await
+            .expect("startup publish succeeds");
+
+        let counting_dht = Arc::new(CountingDhtClient::default());
+        let relay = Arc::new(TransportRelayPublisher::new());
+        let _adapter = bind_recording_relay(relay.as_ref());
+        let republish = start_self_did_republishing(
+            Arc::clone(&counting_dht),
+            Arc::clone(&relay),
+            records.subscribe(),
+        )
+        .await;
+        settle_until("the initial DHT arm to publish", async || {
+            counting_dht.count() >= 1
+        })
+        .await;
+
+        let alive_before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        for n in 0..RESEEDS {
+            let expected = counting_dht.count() + 1;
+            publisher
+                .publish(&identity, &document)
+                .await
+                .expect("re-publish succeeds");
+            // Each re-seed publishes immediately on the replacement arm.
+            settle_until("the re-seeded DHT arm to publish", async || {
+                counting_dht.count() >= expected
+            })
+            .await;
+
+            assert_eq!(
+                republish.manager.active_count().await,
+                1,
+                "re-seed {n} must REPLACE the DHT arm, never add a second one"
+            );
+            assert_eq!(
+                republish.manager.active_relay_count().await,
+                1,
+                "re-seed {n} must REPLACE the relay arm, never add a second one"
+            );
+        }
+
+        // Aborted arms are reaped as the runtime drops them; settle before
+        // comparing so a lagging reap is not read as a leak.
+        settle_until("aborted arms to be reaped", async || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+                <= alive_before
+        })
+        .await;
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            alive_before,
+            "{RESEEDS} re-seeds must leave the live task count unchanged"
+        );
+
+        // Behavioural proof, independent of the task map: advance one full DHT
+        // republish interval. One arm → exactly one publish. N leaked arms would
+        // each fire in the same window.
+        let before_window = counting_dht.count();
+        tokio::time::advance(Duration::from_secs(
+            scp_identity::republish::REPUBLISH_INTERVAL_SECS + 1,
+        ))
+        .await;
+        settle_until("the surviving arm's next tick", async || {
+            counting_dht.count() > before_window
+        })
+        .await;
+        assert_eq!(
+            counting_dht.count() - before_window,
+            1,
+            "exactly ONE arm survives {RESEEDS} re-seeds, so exactly one publish \
+             lands per republish interval"
+        );
+
+        republish.stop().await;
+    }
+
+    /// A re-seed that lands while an arm is MID-PUBLISH is safe: the in-flight
+    /// tick is replaced, not duplicated, and the stale record it was asserting
+    /// never completes.
+    #[tokio::test(start_paused = true)]
+    async fn reseed_racing_an_in_flight_tick_replaces_it_safely() {
+        let (did_method, identity, document, _relay_url) = signing_identity().await;
+        let records = PublishedDidRecord::new();
+        let publisher = publish_seam(&did_method, &records);
+        publisher
+            .publish(&identity, &document)
+            .await
+            .expect("startup publish succeeds");
+        let first = records.get().expect("startup record");
+
+        // A DHT client whose publish PARKS until the test releases it — the arm
+        // is genuinely mid-tick when the re-seed arrives.
+        let gated = Arc::new(GatedDhtClient::default());
+        let relay = Arc::new(TransportRelayPublisher::new());
+        let _adapter = bind_recording_relay(relay.as_ref());
+        let republish = start_self_did_republishing(
+            Arc::clone(&gated),
+            Arc::clone(&relay),
+            records.subscribe(),
+        )
+        .await;
+
+        settle_until("the first tick to enter publish", async || {
+            gated.started() == vec![first.sequence]
+        })
+        .await;
+        assert!(
+            gated.completed().is_empty(),
+            "the first tick is parked INSIDE publish — that is the race window"
+        );
+
+        // Re-seed while the tick is parked.
+        publisher
+            .publish(&identity, &document)
+            .await
+            .expect("re-publish succeeds");
+        let second = records.get().expect("re-published record");
+        settle_until("the replacement tick to enter publish", async || {
+            gated.started() == vec![first.sequence, second.sequence]
+        })
+        .await;
+
+        // Release both parked publishes. Only the replacement can complete: the
+        // superseded one was dropped mid-await by the replace, which is the
+        // desired outcome — it was asserting a record the node has replaced.
+        gated.release();
+        settle_until("the replacement tick to complete", async || {
+            !gated.completed().is_empty()
+        })
+        .await;
+        assert_eq!(
+            gated.completed(),
+            vec![second.sequence],
+            "only the re-seeded tick completes; the superseded in-flight put is \
+             dropped, never resurrected"
+        );
+        assert_eq!(
+            republish.manager.active_count().await,
+            1,
+            "the race leaves exactly one DHT arm"
+        );
+
+        republish.stop().await;
+    }
+
+    /// Records every `publish` sequence so a test can count arm ticks.
+    #[derive(Default)]
+    struct CountingDhtClient {
+        publishes: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl CountingDhtClient {
+        fn count(&self) -> usize {
+            self.publishes.lock().expect("publishes lock").len()
+        }
+    }
+
+    impl scp_dht::DhtClient for CountingDhtClient {
+        fn publish(
+            &self,
+            _public_key: &[u8; 32],
+            _signature: &[u8; 64],
+            _value: &[u8],
+            seq: u64,
+        ) -> impl std::future::Future<Output = Result<(), scp_dht::DhtError>> + Send {
+            self.publishes.lock().expect("publishes lock").push(seq);
+            async { Ok(()) }
+        }
+
+        /// Never used: these doubles exist to observe what the arms PUBLISH.
+        /// An honest `Ok(None)` (nothing stored), never a fabricated record.
+        async fn resolve(
+            &self,
+            _public_key: &[u8; 32],
+        ) -> Result<Option<scp_dht::DhtRecord>, scp_dht::DhtError> {
+            Ok(None)
+        }
+    }
+
+    /// A DHT client whose `publish` parks until [`release`](Self::release), so a
+    /// test can hold an arm mid-tick and re-seed underneath it.
+    #[derive(Default)]
+    struct GatedDhtClient {
+        started: std::sync::Mutex<Vec<u64>>,
+        completed: std::sync::Mutex<Vec<u64>>,
+        gate: tokio::sync::Notify,
+        open: std::sync::atomic::AtomicBool,
+    }
+
+    impl GatedDhtClient {
+        fn started(&self) -> Vec<u64> {
+            self.started.lock().expect("started lock").clone()
+        }
+
+        fn completed(&self) -> Vec<u64> {
+            self.completed.lock().expect("completed lock").clone()
+        }
+
+        fn release(&self) {
+            self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.gate.notify_waiters();
+        }
+    }
+
+    impl scp_dht::DhtClient for GatedDhtClient {
+        fn publish(
+            &self,
+            _public_key: &[u8; 32],
+            _signature: &[u8; 64],
+            _value: &[u8],
+            seq: u64,
+        ) -> impl std::future::Future<Output = Result<(), scp_dht::DhtError>> + Send {
+            self.started.lock().expect("started lock").push(seq);
+            async move {
+                while !self.open.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.gate.notified().await;
+                }
+                self.completed.lock().expect("completed lock").push(seq);
+                Ok(())
+            }
+        }
+
+        /// Never used: these doubles exist to observe what the arms PUBLISH.
+        /// An honest `Ok(None)` (nothing stored), never a fabricated record.
+        async fn resolve(
+            &self,
+            _public_key: &[u8; 32],
+        ) -> Result<Option<scp_dht::DhtRecord>, scp_dht::DhtError> {
+            Ok(None)
+        }
     }
 
     /// B3 / §3.10.6: the production self-host `RepublishConfig` wires the

@@ -681,7 +681,24 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
     /// - **Relay** (if enabled and publisher configured): immediate publish,
     ///   then every 6 days.
     ///
-    /// If the DID is already being republished, existing tasks are replaced.
+    /// # This is also the re-seed operation
+    ///
+    /// If the DID is already being republished, its existing tasks are aborted
+    /// and replaced — so calling this again with a NEWLY-SIGNED entry is how a
+    /// caller re-points a running cycle at the current record after a
+    /// re-publish (a DID document is re-published on, e.g., a NAT tier change,
+    /// which assigns a new `(value, signature, seq)`).
+    ///
+    /// There is deliberately no separate `reseed`/`update_entry` method: each
+    /// running loop captured its [`RepublishEntry`] by value when it was spawned,
+    /// so replacing the task is the only way to change what it publishes — a
+    /// second method would be a second spelling of this one.
+    ///
+    /// The abort and the insert happen under the same task-map lock, so a
+    /// re-seed cannot double-spawn, and the old and new tasks cannot both
+    /// survive. A re-seed landing while a loop is mid-publish drops that
+    /// in-flight request; the replacement publishes immediately with a higher
+    /// sequence, which supersedes it on both layers.
     pub async fn start_republishing(&self, entry: RepublishEntry) {
         // The task-map key is the entry's DERIVED DID (`RepublishEntry` stores
         // no `did` field — see its docs), computed once so both arms key the
