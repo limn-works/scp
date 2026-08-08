@@ -50,7 +50,15 @@ pub use dht::{
 };
 pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
-pub use resolution::{InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, did_routing_id};
+// The three DID→`routing_id` derivations are re-exported SYMMETRICALLY: they
+// are one family (`did_routing_id` ∘ key ∘ frame, see `resolution`), and
+// root-exporting only some of them would push consumers back to module paths
+// for the rest — the drift that let a production site re-inline the
+// composition.
+pub use resolution::{
+    InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, did_key_routing_id,
+    did_record_routing_id, did_routing_id,
+};
 pub use resolver::{
     DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
     NoOpHealer, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
@@ -232,6 +240,18 @@ pub enum IdentityError {
     /// Publishing a DID document to an SCP relay failed.
     #[error("relay publish failed: {0}")]
     RelayPublishFailed(String),
+
+    /// A BEP44 record could not be wrapped into a `DidRecordV1` relay frame
+    /// (§9.10.12) — the document bytes are empty or exceed the maximum frame
+    /// `value` length.
+    ///
+    /// Distinct from [`RelayPublishFailed`](Self::RelayPublishFailed) because
+    /// framing happens BEFORE any layer is contacted: nothing was published, and
+    /// nothing about a relay went wrong. Collapsing the two would misattribute a
+    /// local well-formedness fault to a remote layer, sending operators to look
+    /// at relay health for a bug in their own document.
+    #[error("DID-record framing failed: {0}")]
+    DidRecordFramingFailed(String),
 
     /// Querying an SCP relay for a DID document failed.
     #[error("relay query failed: {0}")]
@@ -465,18 +485,36 @@ pub trait DidMethod: Send + Sync {
     /// See ADR-003 acceptance criterion 5.
     fn verify(&self, did_string: &str, public_key: &[u8]) -> bool;
 
-    /// Publishes a DID document to the underlying DID infrastructure.
+    /// Publishes a DID document to the underlying DID infrastructure and
+    /// returns the **signed BEP44 record it just produced**.
     ///
     /// For `did:dht`, this publishes to the Mainline DHT as a BEP44 signed
     /// mutable item. See ADR-003 acceptance criterion 2.
     ///
-    /// **Note:** This method is defined in the trait for completeness but is
-    /// implemented in story SCP-007, not SCP-006.
+    /// # The signed record is an output of signing, never a read-back
+    ///
+    /// Signing already computes `(public_key, seq, signature, value)`;
+    /// returning it means every downstream consumer — the relay layer
+    /// (§3.10.5), the republish cycle (§3.10.5 step 4) — receives the
+    /// byte-identical triple the publisher signed. Discarding it forced callers
+    /// to reconstruct the triple by resolving the record back off the network,
+    /// which (a) makes a node's own republishing depend on a remote read
+    /// succeeding, (b) pins whatever a responder returns with no check against
+    /// the locally-known sequence, and (c) freezes at the first read so an
+    /// in-lifetime rotation is never re-seeded. The record is returned so that
+    /// re-derivation is unnecessary and, structurally, not a thing a caller can
+    /// be tempted into.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IdentityError`] if signing or the underlying publish fails.
+    /// An implementation that cannot publish MUST return a typed error — never
+    /// a fabricated record.
     fn publish(
         &self,
         identity: &ScpIdentity,
         document: &DidDocument,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send;
+    ) -> impl Future<Output = Result<republish::RepublishEntry, IdentityError>> + Send;
 
     /// Resolves a DID string to its DID document via the underlying infrastructure.
     ///
