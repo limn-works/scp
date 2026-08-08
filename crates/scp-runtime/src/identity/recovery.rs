@@ -249,6 +249,50 @@ pub struct RecoveryResult {
     pub completed_at: u64,
 }
 
+impl RecoveryResult {
+    /// Returns `true` only when every §9.12 step that applied to this recovery
+    /// actually completed.
+    ///
+    /// **`is_ok()` is not completion.** `Ok(RecoveryResult)` means only that no
+    /// *fatal* condition fired: step 1 ran, step 4 succeeded, and at least one
+    /// context made progress. A populated [`Self::failed_contexts`], a context
+    /// awaiting an ADR-029 rejoin, a failed step 6, or a contact that was never
+    /// told to re-run §9.11 KCV all ride along on the `Ok` path — by design,
+    /// since §9.12 makes steps 5 and 6 non-fatal and per-context failures
+    /// isolated. That is exactly the success-shape-for-work-that-did-not-happen
+    /// this type otherwise exists to eliminate, one level up, so the predicate
+    /// is provided rather than left for each caller to re-derive (and get
+    /// wrong).
+    ///
+    /// Requires:
+    ///
+    /// * step 1 rotated the key ([`Self::key_rotation_completed`]);
+    /// * no context failed a per-context step, and none is pending an ADR-029
+    ///   Tier-3 rejoin (together these imply every context completed);
+    /// * step 5 did not fail **and left no unreachable contact** — a contact
+    ///   that was not reached still trusts the compromised key
+    ///   ([`ContactNotificationOutcome::fully_delivered`], or
+    ///   `NotApplicable` when the identity has no contacts); and
+    /// * step 6 did not fail (`NotApplicable` counts — the `Agent` tier
+    ///   genuinely does not touch the PSK).
+    ///
+    /// Step 4 is not tested: it gates the whole recovery, so holding a
+    /// `RecoveryResult` at all implies it succeeded (§9.12 "Step scope").
+    ///
+    /// "Did not fail" rather than "succeeded" is deliberate for steps 5 and 6:
+    /// a [`StepOutcome::NotApplicable`] step had no work to do, which does not
+    /// make the recovery incomplete.
+    #[must_use]
+    pub fn fully_recovered(&self) -> bool {
+        self.key_rotation_completed
+            && self.failed_contexts.is_empty()
+            && self.pending_rejoin.is_empty()
+            && !self.contact_notification.failed()
+            && self.contact_notification.unreachable().is_empty()
+            && !self.private_state_reencryption.failed()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RecoveryError — orchestrator-level error
 // ---------------------------------------------------------------------------
@@ -3505,6 +3549,138 @@ mod tests {
         .await
         .expect("steps 2-4 succeed with the mock")
         .contact_notification
+    }
+
+    /// `is_ok()` is not completion: every one of these `Ok` recoveries left
+    /// real §9.12 work undone, and `fully_recovered()` is what says so.
+    #[tokio::test]
+    async fn fully_recovered_is_false_for_every_incomplete_ok_recovery() {
+        let alice = did("did:dht:alice");
+        let bob = did("did:dht:bob");
+        let key_rotation = agent_key_rotation_outcome(&alice, 1000);
+        let contexts = vec!["ctx-1".to_owned(), "ctx-2".to_owned()];
+        let contacts = HashSet::from([bob.clone()]);
+
+        // Baseline: nothing left undone.
+        let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), contexts.clone());
+        let clean = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                Some(&key_rotation),
+                &contacts,
+                None,
+                &MockRecoveryBackend::new(),
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("the default mock completes every step");
+        assert!(clean.fully_recovered());
+
+        // A per-context step-2 failure. One context still completed, so this
+        // stays on the `Ok` path.
+        let partial = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                Some(&key_rotation),
+                &contacts,
+                None,
+                &MockRecoveryBackend {
+                    mls_update_error: Some((
+                        "ctx-2".to_owned(),
+                        RecoveryStepError {
+                            step: 2,
+                            code: RecoveryStepErrorCode::Unspecified,
+                            description: "MLS update failed".to_owned(),
+                        },
+                    )),
+                    ..MockRecoveryBackend::new()
+                },
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("one context completed, so this is not a total failure");
+        // The `expect` above already proves `is_ok()` — which is the point.
+        assert_eq!(partial.completed_contexts, vec!["ctx-1"]);
+        assert!(
+            !partial.fully_recovered(),
+            "a failed context is not full recovery"
+        );
+
+        // A contact that was never told to re-run §9.11 KCV — step 5 reports
+        // best-effort success, and that is precisely the case `is_ok()` hides.
+        let unreached = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                Some(&key_rotation),
+                &contacts,
+                None,
+                &MockRecoveryBackend {
+                    notify_contacts_unreachable: HashSet::from([bob]),
+                    ..MockRecoveryBackend::new()
+                },
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("step 5 is non-fatal");
+        assert!(
+            !unreached.fully_recovered(),
+            "an unreachable contact is not full recovery"
+        );
+
+        // A failed step 6 — non-fatal, but the PSK was not rotated.
+        let psk_params = PskRotationParams {
+            did: "did:dht:zRecoveryTestIdentity".to_owned(),
+            enrolled_device_pubkeys: vec![vec![1u8; 32]],
+            compromised_device_pubkey: None,
+        };
+        let psk_failed = orch
+            .execute_recovery(
+                CompromiseTier::ActiveSigning,
+                Some(&active_key_rotation_outcome(&alice, 1000)),
+                &contacts,
+                Some(&psk_params),
+                &MockRecoveryBackend {
+                    rotate_psk_result: false,
+                    ..MockRecoveryBackend::new()
+                },
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("step 6 is non-fatal");
+        assert!(
+            !psk_failed.fully_recovered(),
+            "a failed PSK rotation is not full recovery"
+        );
+    }
+
+    /// `NotApplicable` steps do NOT make a recovery incomplete: the `Agent`
+    /// tier genuinely does not touch the PSK, and an identity with no contacts
+    /// has nobody to notify. This is why `fully_recovered()` tests
+    /// "did not fail" for steps 5 and 6 rather than "succeeded".
+    #[tokio::test]
+    async fn fully_recovered_treats_not_applicable_steps_as_complete() {
+        let alice = did("did:dht:alice");
+        let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec!["ctx-1".to_owned()]);
+        let key_rotation = agent_key_rotation_outcome(&alice, 1000);
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                Some(&key_rotation),
+                &HashSet::new(),
+                None,
+                &MockRecoveryBackend::new(),
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("the default mock completes every applicable step");
+
+        assert!(!result.contact_notification.reached_any());
+        assert!(!result.private_state_reencryption.succeeded());
+        assert!(
+            result.fully_recovered(),
+            "steps that did not apply must not count against completion"
+        );
     }
 
     /// THE FINDING: with 3 contacts and 1 reachable, "step 5 succeeded" told an
