@@ -239,6 +239,10 @@ pub const METHOD_RESOURCES_UPDATED: &str = "notifications/resources/updated";
 /// MCP notification: `notifications/tools/list_changed` -- tool list updated.
 pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
 
+/// MCP notification: `notifications/resources/list_changed` -- the set of
+/// resources the server exposes changed (a context was joined or left).
+pub const METHOD_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
+
 // ---------------------------------------------------------------------------
 // MCP lifecycle messages
 // ---------------------------------------------------------------------------
@@ -342,6 +346,10 @@ pub struct ResourceServerCapability {
     /// Whether the server supports resource subscriptions.
     #[serde(default)]
     pub subscribe: bool,
+
+    /// Whether the server may send `notifications/resources/list_changed`.
+    #[serde(default, rename = "listChanged")]
+    pub list_changed: bool,
 }
 
 /// Information about the MCP server.
@@ -750,7 +758,10 @@ mod tests {
             protocol_version: "2024-11-05".to_owned(),
             capabilities: ServerCapabilities {
                 tools: Some(ToolServerCapability { list_changed: true }),
-                resources: Some(ResourceServerCapability { subscribe: true }),
+                resources: Some(ResourceServerCapability {
+                    subscribe: true,
+                    list_changed: true,
+                }),
             },
             server_info: ServerInfo {
                 name: "scp-mcp".to_owned(),
