@@ -2415,7 +2415,7 @@ async fn create_and_broadcast_checkpoint_if_due(
         let mut view = cell.class_c_view();
         let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
         let mls_epoch = view.epoch_mut().mls_epoch;
-        crate::context::queries_helpers::create_checkpoint_if_due_view(
+        match crate::context::queries_helpers::create_checkpoint_if_due_view(
             &mut view,
             context_id,
             broadcast_context_is_none,
@@ -2424,7 +2424,27 @@ async fn create_and_broadcast_checkpoint_if_due(
             sk,
             now,
             &*deps.event_log,
-        )
+        ) {
+            Ok(due) => due,
+            // FAIL CLOSED (#1933 follow-up): a checkpoint over an unreachable
+            // authoritative log must not be signed at all. Signing a fabricated
+            // `(0, [0u8; 32])` commitment would make honest peers raise
+            // `EquivocationDetected` against this member. The counters were left
+            // untouched, so the checkpoint stays due and is retried on the next
+            // send; the application send itself is unaffected (a checkpoint is
+            // an independent consistency-monitoring artifact, not part of the
+            // message's delivery guarantee).
+            Err(e) => {
+                tracing::error!(
+                    context_id,
+                    error = %e,
+                    "cannot build a consistency checkpoint over an unreachable \
+                     authoritative event log — refusing to sign a fabricated \
+                     commitment; still due, will retry (§9.9.3)"
+                );
+                return;
+            }
+        }
     };
     // ADR-049 PR-7: `send_checkpoint` now takes `&mut ClassSCell` (Send) and seals
     // on the actor crypto view; `cell` is free here (the `due_checkpoint` view
