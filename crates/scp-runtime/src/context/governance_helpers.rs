@@ -1262,10 +1262,10 @@ pub async fn execute_add_member(
     // command envelope by the invitation-sealing caller
     // ([`crate::context::supervisor::Supervisor::invite_member`]) and threaded
     // through the governance dispatch to here. `Some(..)` on the real
-    // invitation path; `None` on the paths that never carried a real add
-    // (the generic FFI `AddMember` arm and `execute_reset_member` — issue
-    // #2029), where production `add_member` errors and `cfg(test)`/`testing`
-    // returns an empty `AddMemberOutput` (preserving the non-crypto pipeline).
+    // invitation path; `None` on the generic FFI `AddMember` arm, which never
+    // carried a real add (issue #2029) — there production `add_member` errors
+    // and `cfg(test)`/`testing` returns an empty `AddMemberOutput` (preserving
+    // the non-crypto pipeline).
     key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
@@ -2654,6 +2654,16 @@ pub async fn execute_reset_member(
     context_id: &str,
     did: &DID,
     _reason: &str,
+    // The RESET TARGET's fresh TLS-serialized MLS `KeyPackage`, threaded from the
+    // actor command envelope exactly as `execute_add_member`'s is (issue #2029
+    // prescribes this shape: the KeyPackage rides the in-process envelope, NEVER
+    // the signed/logged `GovernanceAction` wire type). Reset is remove + re-add of
+    // the SAME member, and an MLS `KeyPackage` is single-use, so the re-add needs a
+    // FRESH one from the target — the one consumed at their original add cannot be
+    // replayed. No public entrypoint supplies it for a reset yet (`invite_member`
+    // is the sole envelope populator and it builds an `AddMember`), so in
+    // production this is `None` today and the guard below refuses fail-closed.
+    target_key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): reset now takes the whole `ClassSCell`
@@ -2679,27 +2689,84 @@ pub async fn execute_reset_member(
         }
     }
 
-    // #2028 authority-currency gate, hoisted AHEAD of the remove+add pair.
+    // ---- Reject-before-mutate preflight -----------------------------------
     //
-    // `PerContextState::add_member` runs this same predicate as the sound
-    // in-actor chokepoint, but here it would fire from INSIDE the
-    // `commit_class_s_keep` closure below — after `remove_member` has already
-    // mutated the actor-owned MLS group. On a closure `Err`, `commit_class_s_keep`
-    // neither persists nor rolls back (it is the keep-on-failure combinator, and
-    // its `f` errs before any persist), so the refusal would leave the in-memory
-    // remove applied: the member is gone from the group but never re-added. Nor
-    // would `commit_class_s_restore` help — its snapshot covers ONLY the Class-S
-    // sub-structs, and the MLS group + membership are not among them, so the
-    // remove would survive that rollback too.
+    // EVERY reason the remove+add pair below can refuse must be decided HERE,
+    // ahead of the pair. The pair runs inside ONE `commit_class_s_keep` closure:
+    // `remove_member` mutates the actor-owned MLS group, then `add_member` may
+    // err. On a closure `Err`, `commit_class_s_keep` neither persists nor rolls
+    // back (it is the keep-on-failure combinator, and its `f` errs before any
+    // persist), so a late refusal leaves the in-memory remove applied — the
+    // member is gone from the MLS group but never re-added, while
+    // `MembershipState` still lists them and `role_state` still holds their
+    // assignment. The caller is told the operation failed; the next coalesce
+    // window persists the divergence durably. `commit_class_s_restore` is NOT a
+    // way out: its snapshot covers ONLY the Class-S sub-structs (the MLS group
+    // and membership are not among them), and it restores on PERSIST failure,
+    // never on a closure `Err`.
     //
-    // Refusing here instead makes reset reject-before-mutate, matching the same
-    // reversible-front-door rationale as `Supervisor::invite_member`. Both share
-    // ONE predicate with the in-actor chokepoint, so they cannot drift.
+    // Both preflight checks below mirror a refusal `PerContextState::add_member`
+    // would otherwise raise from inside the closure, so they share that method's
+    // predicates rather than restating them.
+
+    // 1. #2028 authority-currency gate. `PerContextState::add_member` runs this
+    //    same predicate as the sound in-actor chokepoint; hoisting it here
+    //    matches the reversible-front-door rationale of
+    //    `Supervisor::invite_member`. All three share ONE predicate, so they
+    //    cannot drift.
     crate::context::state::check_genesis_ceiling_still_current(
         cell.handle.params(),
         cell.role_state.ceiling(),
         "reset_member",
     )?;
+
+    // 2. KeyPackage availability (#2029). `PerContextState::add_member` requires
+    //    real `KeyPackage` bytes in production and errors without them — which,
+    //    raised from inside the closure, is precisely the strand described above
+    //    and would fire on EVERY production reset. Decide it here instead.
+    //
+    //    When `Some`, bind the KeyPackage to the reset target BEFORE the pair,
+    //    verbatim with `execute_add_member`'s validate-and-bind: the KP's MLS
+    //    credential DID MUST equal `did`, or a reset could re-add the group slot
+    //    under one DID using a KeyPackage minted for a different identity. The
+    //    single `validate_key_package` call runs the full signature /
+    //    hardened-clock lifetime / ciphersuite validation once and returns the
+    //    authenticated `credential_did` from that same validated leaf.
+    //
+    //    When `None`, refuse fail-closed. Under `cfg(test)`/`testing` the
+    //    no-crypto pipeline (empty `AddMemberOutput`) is preserved so the
+    //    non-MLS reset pipeline — membership, role state, event log, sender-key
+    //    rotation — stays exercised, exactly as `execute_add_member` does.
+    //    This guard is SATISFIED (not deleted) once #2029 lands a public
+    //    entrypoint that carries the target's fresh KeyPackage onto the envelope.
+    match target_key_package {
+        Some(bytes) => {
+            let validated = deps
+                .mls
+                .validate_key_package(bytes, deps.clock.as_ref())
+                .await
+                .map_err(|e| ContextError::InvalidKeyPackage(e.to_string()))?;
+            if validated.credential_did.as_str() != did.as_ref() {
+                return Err(ContextError::InvalidKeyPackage(
+                    "reset_member: key package credential DID does not match the reset target"
+                        .to_string(),
+                ));
+            }
+        }
+        None => {
+            if !cfg!(any(test, feature = "testing")) {
+                return Err(ContextError::InvalidKeyPackage(format!(
+                    "reset_member refused: resetting '{did}' is remove + re-add of the same \
+                     member, and the re-add needs a FRESH MLS KeyPackage from the target (the \
+                     one consumed at their original add is single-use). \
+                     GovernanceAction::ResetMember carries no KeyPackage and no entrypoint \
+                     supplies one on the actor command envelope yet (#2029), so the reset is \
+                     refused BEFORE the MLS remove rather than stranding the member removed \
+                     from the group but still listed in membership."
+                )));
+            }
+        }
+    }
 
     // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the MLS group is actor-owned, so the
@@ -2722,7 +2789,7 @@ pub async fn execute_reset_member(
                 .remove_member(&local_did, did.as_ref())
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             let add_output = s
-                .add_member(did.as_ref(), None, deps.clock.as_ref())
+                .add_member(did.as_ref(), target_key_package, deps.clock.as_ref())
                 .map_err(relabel_add_member_error)?;
             Ok((remove_output, add_output))
         })
@@ -4605,6 +4672,10 @@ pub async fn dispatch_content_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
+    // Forwarded verbatim from [`dispatch_context_governance_action`] — see the
+    // parameter doc there. Consumed by the one Welcome-producing arm routed to
+    // this dispatcher (`ResetMember`'s re-add); ignored by every other action.
+    key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let CommitMeta {
@@ -4680,6 +4751,12 @@ pub async fn dispatch_content_governance_action(
                 context_id,
                 did,
                 reason,
+                // The reset target's fresh KeyPackage, from the same envelope
+                // slot `AddMember` reads (#2029). Always `None` in production
+                // today — no entrypoint populates it for a reset — so
+                // `execute_reset_member` refuses fail-closed BEFORE the MLS
+                // remove instead of stranding a half-applied reset.
+                key_package,
                 CommitMeta {
                     pid,
                     actor_did,
@@ -4805,10 +4882,14 @@ pub async fn dispatch_context_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
-    // The invitee's MLS `KeyPackage`, threaded from the propose/execute entry
-    // for the `AddMember` action only (the invitation path carries it on the
-    // command envelope). `None` for every other action and for the paths that
-    // never carried a real add (issue #2029).
+    // The MLS `KeyPackage` of the member this action admits into the group,
+    // threaded from the propose/execute entry on the in-process command envelope
+    // (never on the signed/logged `GovernanceAction` wire type). Consumed by the
+    // two arms that produce a Welcome — `AddMember` (the invitee's) and
+    // `ResetMember` (the reset target's fresh one) — and ignored by every other
+    // action. Only `Supervisor::invite_member` populates it today, and only for
+    // `AddMember`; the reset arm therefore sees `None` and refuses fail-closed
+    // (issue #2029).
     key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<GovernanceActionResult, ContextError> {
@@ -5033,6 +5114,7 @@ pub async fn dispatch_context_governance_action(
                 deps,
                 context_id,
                 action,
+                key_package,
                 CommitMeta {
                     pid,
                     actor_did,

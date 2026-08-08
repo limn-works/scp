@@ -3887,3 +3887,155 @@ async fn custom_resource_wildcard_widening_still_admits_a_welcome_join() {
         "bob is added"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test M13 — #2029: `ResetMember` decides every refusal BEFORE the MLS remove,
+//            so a failed reset can never strand the target.
+// ---------------------------------------------------------------------------
+
+/// `execute_reset_member` is an MLS remove + re-add of the SAME member inside ONE
+/// `commit_class_s_keep` closure. That combinator neither persists nor rolls back
+/// on a closure `Err` (it is the keep-on-failure shape, and `f` errs before any
+/// persist), and its Class-S sibling `commit_class_s_restore` snapshots only the
+/// Class-S sub-structs — never the MLS group or `MembershipState`. So ANY refusal
+/// raised from INSIDE the closure, after `remove_member` has run, leaves the
+/// target gone from the MLS group while `MembershipState` and `role_state` still
+/// list them, reports `MembershipFailed` (i.e. "nothing happened") to the caller,
+/// and lets the next coalesce-window persist write that divergence durably.
+///
+/// Every reason the pair can refuse is therefore decided in a preflight ahead of
+/// it. This test drives the `KeyPackage` half of that preflight (the #2028
+/// ceiling half is covered by
+/// [`governed_ceiling_lowering_refuses_the_welcome_seam_fail_closed`]): the reset
+/// is proposed carrying a `KeyPackage` whose MLS credential DID is a DIFFERENT
+/// identity than the reset target.
+///
+/// Move the preflight after the remove+add pair — or delete it — and this test
+/// FAILS. `PerContextState::add_member` performs no credential-DID binding of its
+/// own, so the foreign `KeyPackage` is added to the group under the target's DID
+/// and the reset reports SUCCESS.
+#[tokio::test]
+async fn reset_member_with_a_mismatched_key_package_rejects_before_the_mls_remove() {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    let ctx_id = ctx_hex(0xe6);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let mallory = DID::from(MALLORY_DID);
+
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the encrypted SingleAdmin context");
+
+    // Bob joins for real (reserve → creator-add → Welcome), so the reset below
+    // operates on a member who genuinely occupies an MLS leaf.
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, bob_kp) = reserve_bob_kp(&bob_sup, &bob).await;
+    alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            bob_kp,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect("alice invites bob");
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(2),
+        "precondition: bob is a member before the reset"
+    );
+    let bob_role_before = alice_sup
+        .member_role(&ctx_id, bob.as_ref())
+        .await
+        .expect("precondition: bob holds a role assignment before the reset");
+
+    // A `KeyPackage` minted for MALLORY, not for the reset target. The
+    // key-package actor builds its credential from the identity its store is
+    // keyed by, so this KP's MLS credential DID is `MALLORY_DID`.
+    alice_sup
+        .set_wrapping_keys(
+            mallory.clone(),
+            BOB_WRAP.to_vec(),
+            Zeroizing::new(BOB_WRAP.to_vec()),
+        )
+        .await
+        .expect("set mallory's wrapping key");
+    let mallory_store = alice_sup
+        .key_package_store_for(&mallory)
+        .await
+        .expect("mallory's key-package store spawns");
+    mallory_store
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("replenish barrier");
+    let foreign_kp = mallory_store
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled KPs")
+        .into_iter()
+        .next()
+        .expect("the auto-replenished pool holds at least one KP")
+        .1;
+
+    let err = alice_sup
+        .propose_governance_action_checked_carrying_key_package(
+            &ctx_id,
+            &alice,
+            GovernanceAction::ResetMember {
+                did: bob.clone(),
+                reason: "suspected key compromise".to_owned(),
+            },
+            &alice_signing_key(),
+            Some(foreign_kp),
+        )
+        .await
+        .expect_err(
+            "a reset carrying a KeyPackage minted for a DIFFERENT identity must be refused — \
+             re-adding it would seat a foreign credential in the target's place",
+        );
+
+    // `check-handler-no-panic.sh` scans this file's source text and cannot see
+    // that it is a `#[cfg(test)]` module, so a bare `panic!` here would be flagged
+    // as a production actor panic. The assert carries the same diagnostic; the
+    // `else { return }` arm is the asserted-unreachable branch.
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidKeyPackage(_)),
+        "the refusal must be the preflight's own typed InvalidKeyPackage — a \
+         MembershipFailed/CryptoFailed here means the refusal came from inside the \
+         remove+add closure, i.e. AFTER the MLS remove, got {err:?}"
+    );
+    let crate::context::ContextError::InvalidKeyPackage(message) = &err else {
+        return;
+    };
+    assert!(
+        message.contains("reset target"),
+        "the refusal must name the credential-DID binding it enforced, got: {message}"
+    );
+
+    // Reject-before-mutate: the target is untouched on every surface the reset
+    // would have mutated.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(2),
+        "the refused reset must leave membership exactly as it was"
+    );
+    assert!(
+        alice_sup.is_member(&ctx_id, &bob).await,
+        "bob must still be a member"
+    );
+    assert_eq!(
+        alice_sup.member_role(&ctx_id, bob.as_ref()).await,
+        Some(bob_role_before),
+        "bob's role assignment must be untouched"
+    );
+}

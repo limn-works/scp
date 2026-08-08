@@ -1243,15 +1243,18 @@ pub struct ProposeGovernanceActionPayload {
     /// so the private key zeroes on drop (mirrors the messaging path's
     /// command-level zeroize contract).
     pub signing_key: SigningKeyBytes,
-    /// The invitee's TLS-serialized MLS `KeyPackage` for an `AddMember`
-    /// auto-execute. Carried here — on the in-process actor command envelope,
-    /// NOT on the signed/logged
+    /// The TLS-serialized MLS `KeyPackage` of the member a Welcome-producing
+    /// action admits: the invitee's for an `AddMember` auto-execute, or the reset
+    /// target's fresh one for a `ResetMember` re-add. Carried here — on the
+    /// in-process actor command envelope, NOT on the signed/logged
     /// [`GovernanceAction`](scp_protocol::context::governance::GovernanceAction)
     /// wire type — by [`Supervisor::invite_member`](crate::context::supervisor::Supervisor::invite_member),
     /// which threads it to `execute_add_member` so the governance add performs a
     /// REAL MLS add (§5.12.3). `None` for every other proposal (the generic FFI
-    /// governance path). The `KeyPackage` is the invitee's PUBLIC credential (no
-    /// private key material).
+    /// governance path, and every `ResetMember` today — no entrypoint sources a
+    /// reset target's KeyPackage yet, so `execute_reset_member` refuses
+    /// fail-closed, issue #2029). The `KeyPackage` is always the member's PUBLIC
+    /// credential (no private key material).
     pub key_package: Option<Vec<u8>>,
 }
 

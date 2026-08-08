@@ -14983,7 +14983,12 @@ impl Supervisor {
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the handler.
-    async fn propose_governance_action_checked_carrying_key_package(
+    // `pub(super)` — visible only inside `crate::context::supervisor` (its
+    // production caller `invite_member` lives in this file; the #2029
+    // reset-preflight regression lives in the sibling `spawn_from_welcome_tests`
+    // module). The envelope `KeyPackage` seam stays inside the supervisor module:
+    // actors hold a `SupervisorHandle`, which exposes nothing of this.
+    pub(super) async fn propose_governance_action_checked_carrying_key_package(
         &self,
         context_id: &str,
         proposer_did: &DID,
