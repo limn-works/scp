@@ -5364,86 +5364,49 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         })
         .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
     }
-
-    fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
-        // Resource subscriptions are not yet wired to the transport layer.
-        // Accept the subscription silently (matching PyO3 behavior).
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
 // MCP stdio server loop
 // ---------------------------------------------------------------------------
 
+/// Runs the MCP stdio transport for this bridge instance until shutdown.
+///
+/// `context_events` is the supervisor's `ContextEvent` receiver. When `Some`,
+/// [`scp_mcp::stdio::run_stdio`] enables `resources/subscribe` on `server` and
+/// pumps each event into `notifications/resources/updated`. When `None` the
+/// server advertises `resources.subscribe: false` and rejects
+/// `resources/subscribe` with a typed error — the capability is honestly
+/// absent rather than accepted-and-never-delivered (#1341).
 async fn run_mcp_stdio_server_uniffi(
     server: Arc<std::sync::Mutex<scp_mcp::server::McpServer<McpUniFfiBridgeProvider>>>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     cancel_token: tokio_util::sync::CancellationToken,
+    context_events: Option<
+        tokio::sync::broadcast::Receiver<(String, scp_core::context::membership::ContextEvent)>,
+    >,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
     // Wire both `shutdown_rx` (mcp_server_stop) AND the bridge instance's
     // `cancel_token` (emergency_cancel_tasks from Drop) so either signal
     // terminates this task. Without the `cancel_token` arm, a caller that
     // drops `SCP` without calling `mcp_server_stop` would leave this task
     // running indefinitely (#1549 round-2).
+    //
+    // The read loop itself is `scp_mcp::stdio::run_stdio`, shared with the
+    // PyO3 bridge: it owns stdout so response writes and subscription
+    // notifications interleave as whole lines, and it parses JSON-RPC
+    // *notifications* correctly (a bare `JsonRpcRequest` decode rejects them —
+    // they carry no `id`), which the previous hand-rolled copy did not.
     tokio::select! {
         _ = shutdown_rx => {}
         () = cancel_token.cancelled() => {
             tracing::debug!("MCP stdio server task exiting — bridge instance cancelled");
         }
-        () = async {
-            let stdin = tokio::io::stdin();
-            let mut stdout = tokio::io::stdout();
-            let mut reader = tokio::io::BufReader::new(stdin);
-            let mut line = String::new();
-
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
-                if line.len() as u64 > MCP_MAX_LINE_BYTES {
-                    break;
-                }
-
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let response = {
-                    let request: Result<scp_mcp::protocol::JsonRpcRequest, _> =
-                        serde_json::from_str(trimmed);
-                    match request {
-                        Ok(req) => {
-                            server
-                                .lock()
-                                .map_or(None, |mut srv| srv.handle_request(&req))
-                        }
-                        Err(e) => {
-                            Some(scp_mcp::protocol::JsonRpcResponse::error(
-                                scp_mcp::protocol::RequestId::Number(0),
-                                scp_mcp::protocol::JsonRpcError {
-                                    code: scp_mcp::protocol::PARSE_ERROR,
-                                    message: format!("failed to parse: {e}"),
-                                    data: None,
-                                },
-                            ))
-                        }
-                    }
-                };
-
-                if let Some(resp) = response
-                    && let Ok(json) = serde_json::to_string(&resp) {
-                        let _ = stdout.write_all(json.as_bytes()).await;
-                        let _ = stdout.write_all(b"\n").await;
-                        let _ = stdout.flush().await;
-                    }
+        result = scp_mcp::stdio::run_stdio(&server, context_events) => {
+            if let Err(e) = result {
+                tracing::error!("MCP stdio server error: {e}");
             }
-        } => {}
+        }
     }
 }
 
@@ -16194,10 +16157,44 @@ impl Scp {
         // extend the instance's lifetime.
         let cancel_token = self.inner.core.cancel_token();
 
+        // Resource subscriptions are backed by the supervisor's context event
+        // broadcast channel. Subscribe *before* spawning so no event emitted
+        // between here and the transport loop starting is missed.
+        //
+        // `subscribe_events()` returns `None` only for a supervisor built
+        // without the channel; production supervisors always enable it (see
+        // `crate::runtime::build_supervisor`). When it is `None` the transport
+        // advertises `resources.subscribe: false` and rejects
+        // `resources/subscribe` — the capability is honestly absent rather
+        // than accepted-and-never-delivered.
+        // Absence degrades only this capability: the server still serves
+        // `tools/*` and `resources/list|read`, and honestly advertises
+        // `resources.subscribe: false`. Serving is NOT failed outright — that
+        // would deny working functionality over an optional feature.
+        let context_events = match self.inner.context_manager_or_error() {
+            Ok(supervisor) => supervisor.subscribe_events(),
+            Err(e) => {
+                tracing::warn!("MCP server: no supervisor attached ({e})");
+                None
+            }
+        };
+        if context_events.is_none() {
+            tracing::warn!(
+                "MCP server: no context event source — resource subscriptions \
+                 will be advertised as unsupported and rejected if requested"
+            );
+        }
+
         let task_handle = runtime().spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
-                    run_mcp_stdio_server_uniffi(server_clone, shutdown_rx, cancel_token).await;
+                    run_mcp_stdio_server_uniffi(
+                        server_clone,
+                        shutdown_rx,
+                        cancel_token,
+                        context_events,
+                    )
+                    .await;
                 }
                 "sse" => {
                     let provider = McpUniFfiBridgeProvider {
@@ -16226,7 +16223,9 @@ impl Scp {
                         }
                         sse_shutdown_trigger.shutdown();
                     });
-                    let result = scp_mcp::sse::run_sse(sse_server, sse_config, sse_shutdown).await;
+                    let result =
+                        scp_mcp::sse::run_sse(sse_server, sse_config, sse_shutdown, context_events)
+                            .await;
                     if let Err(e) = result {
                         tracing::error!("MCP SSE server error: {e}");
                     }
@@ -22883,15 +22882,174 @@ mod tests {
         // (it short-circuits before the bridge upgrade).
         assert!(provider.validate_capability("ctx-dropped", "t").is_err());
 
-        // subscribe_resource is a no-op — still Ok.
-        assert!(provider.subscribe_resource("scp://x").is_ok());
-
         // active_context_ids & agent_did don't touch the Weak at all.
         assert_eq!(
             provider.active_context_ids(),
             vec!["ctx-dropped".to_owned()]
         );
         assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
+    }
+
+    // -----------------------------------------------------------------------
+    // MCP resource subscriptions (#1341)
+    //
+    // `ContextProvider::subscribe_resource` used to be a bridge-local no-op
+    // that returned `Ok(())` while the server advertised
+    // `resources.subscribe: true` — a false guarantee. It is gone; these tests
+    // cover the behaviour that replaced it.
+    // -----------------------------------------------------------------------
+
+    /// Builds an `McpServer` over the real `UniFFI` MCP provider serving
+    /// `context_ids`. The caller owns `bi`, so the `Weak` stays live.
+    fn uniffi_mcp_server(
+        bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+        context_ids: Vec<String>,
+    ) -> scp_mcp::server::McpServer<McpUniFfiBridgeProvider> {
+        scp_mcp::server::McpServer::new(McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(bi),
+            agent_did: "did:dht:z6MkSubscriber".to_owned(),
+            context_ids,
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        })
+    }
+
+    fn mcp_request(method: &str, params: serde_json::Value) -> scp_mcp::protocol::JsonRpcRequest {
+        scp_mcp::protocol::JsonRpcRequest {
+            jsonrpc: scp_mcp::protocol::JSONRPC_VERSION.to_owned(),
+            method: method.to_owned(),
+            params: Some(params),
+            id: scp_mcp::protocol::RequestId::Number(1),
+        }
+    }
+
+    /// Runs the `initialize` handshake and returns the advertised
+    /// `capabilities.resources.subscribe` flag.
+    fn advertised_subscribe(
+        server: &mut scp_mcp::server::McpServer<McpUniFfiBridgeProvider>,
+    ) -> bool {
+        let resp = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_INITIALIZE,
+                serde_json::json!({
+                    // The server echoes its own protocol version and does not
+                    // validate the client's, so any well-formed value works.
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "uniffi-test-client" }
+                }),
+            ))
+            .expect("initialize must produce a response");
+        assert!(resp.error.is_none(), "initialize failed: {resp:?}");
+        resp.result.expect("initialize result")["capabilities"]["resources"]["subscribe"]
+            .as_bool()
+            .expect("resources.subscribe must be a bool")
+    }
+
+    fn message_sent_event() -> scp_core::context::membership::ContextEvent {
+        scp_core::context::membership::ContextEvent::MessageSent {
+            sender_did: scp_did::DID("did:dht:z6MkSender".to_owned()),
+            sequence_number: 1,
+            payload: Vec::new(),
+        }
+    }
+
+    /// `mcp_server_create` sources subscription events from
+    /// `supervisor.subscribe_events()`. If that degrades to `None`, every
+    /// `UniFFI` MCP server silently advertises `resources.subscribe: false`.
+    #[test]
+    fn uniffi_supervisor_yields_a_context_event_receiver_for_mcp() {
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
+
+        let supervisor = bi
+            .context_manager_or_error()
+            .expect("supervisor must be attached after init_context_manager_with_did");
+
+        assert!(
+            supervisor.subscribe_events().is_some(),
+            "the UniFFI supervisor must expose a context event channel — without \
+             it the MCP transport can only advertise resources.subscribe=false"
+        );
+    }
+
+    /// Fail closed: with no event source wired, `resources/subscribe` is
+    /// rejected with a typed error instead of being silently accepted.
+    #[test]
+    fn uniffi_mcp_server_rejects_subscribe_until_event_source_is_wired() {
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        let mut server = uniffi_mcp_server(&bi, vec!["ctx-sub".to_owned()]);
+
+        assert!(
+            !advertised_subscribe(&mut server),
+            "an unwired server must advertise resources.subscribe=false"
+        );
+
+        let resp = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_RESOURCES_SUBSCRIBE,
+                serde_json::json!({ "uri": "scp://ctx-sub/events" }),
+            ))
+            .expect("subscribe must produce a response");
+
+        let err = resp
+            .error
+            .expect("an unwired server must not report success for subscribe");
+        assert_eq!(err.code, scp_mcp::protocol::METHOD_NOT_FOUND);
+        assert_eq!(server.subscription_count(), 0);
+
+        // Nothing is delivered either — the capability is absent, not partial.
+        assert!(
+            server
+                .notifications_for_event("ctx-sub", &message_sent_event())
+                .is_empty()
+        );
+    }
+
+    /// Once the transport wires the supervisor's event receiver (what
+    /// `run_stdio` / `run_sse` do with the `Some` receiver), the subscription
+    /// is accepted AND runtime events produce real notifications.
+    #[test]
+    fn uniffi_mcp_server_honours_subscribe_once_event_source_is_wired() {
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        let mut server = uniffi_mcp_server(&bi, vec!["ctx-sub".to_owned()]);
+
+        // Exactly what the transport does when it holds a real receiver.
+        server.enable_subscriptions();
+
+        assert!(
+            advertised_subscribe(&mut server),
+            "a wired server must advertise resources.subscribe=true"
+        );
+
+        let resp = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_RESOURCES_SUBSCRIBE,
+                serde_json::json!({ "uri": "scp://ctx-sub/events" }),
+            ))
+            .expect("subscribe must produce a response");
+        assert!(resp.error.is_none(), "wired subscribe failed: {resp:?}");
+        assert!(server.is_subscribed("scp://ctx-sub/events"));
+
+        // The delivery the old no-op never made.
+        let notifications = server.notifications_for_event("ctx-sub", &message_sent_event());
+        assert_eq!(notifications.len(), 1, "expected one: {notifications:?}");
+        assert_eq!(
+            notifications[0].method,
+            scp_mcp::protocol::METHOD_RESOURCES_UPDATED
+        );
+        assert_eq!(
+            notifications[0].params.as_ref().expect("params")["uri"],
+            "scp://ctx-sub/events"
+        );
+
+        // A context this server does not serve produces nothing.
+        assert!(
+            server
+                .notifications_for_event("ctx-unserved", &message_sent_event())
+                .is_empty()
+        );
     }
 
     /// Suppression task must not hold a strong `Arc<UniffiBridgeInstance>`
