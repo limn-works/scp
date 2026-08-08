@@ -155,6 +155,15 @@ pub struct RecoveryStepError {
 
     /// Human-readable description of the failure. Prose for operators — its
     /// wording is not a stable contract and MUST NOT be matched against.
+    ///
+    /// **Keep it to what an operator must act on**: what did not happen, what
+    /// is consequently still exposed, and the tracking issue. This is a `pub`
+    /// API value that travels to logs, error surfaces and support channels —
+    /// the traced call graph of an unwired capability (which symbols have zero
+    /// production callers, which enforcement sets have no write path, which
+    /// artifact cannot be retracted) belongs in the rustdoc of the method that
+    /// raises it, where it is already recorded, not in a shipped string that
+    /// reads as an exploitation map.
     pub description: String,
 }
 
@@ -1596,18 +1605,11 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             step: 3,
             code: RecoveryStepErrorCode::UcanRevocationUnwired,
             description: format!(
-                "UCAN revocation is not wired for recovery — both revocation gates match \
-                 exact SHA-256 token CIDs (`compute_revocation_cid`): the runtime-side \
-                 `governance.revoked_spending_ucan_cids` (via `ContextRevocationChecker`) \
-                 and the FFI-layer per-context `RevocationList` (via \
-                 `BridgeRevocationChecker`). Recovery cannot enumerate the tokens issued \
-                 by the compromised key scope(s) [{scopes}] in context `{context_id}`, so \
-                 it cannot drive the per-CID path that does exist (`ucan_revoke`), and the \
-                 runtime-side set has no write path at all. Those tokens therefore remain \
-                 valid at both gates unless revoked individually by a caller holding them. \
+                "UCAN revocation is not wired for recovery — the tokens issued by the \
+                 compromised key scope(s) [{scopes}] in context `{context_id}` remain \
+                 valid and must be revoked individually by a caller holding them. \
                  Failing closed rather than reporting a revocation that did not happen \
-                 (see #2069; the enumeration + receive-side merge wire is blocked on the \
-                 §9.12 revocation-model decisions in #2240 Part B item 1)",
+                 (#2069)",
                 scopes = key_rotation.rotated_key_scopes.join(", "),
             ),
         })
@@ -1724,24 +1726,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             code: RecoveryStepErrorCode::KeyPackageRotationUnwired,
             description: format!(
                 "KeyPackage rotation is not wired for the compromised identity `{did}` — the \
-                 KeyPackage-attestation lifecycle does not exist end to end: no attestation is \
-                 minted (`generate_key_package_inner` never attaches the 0xFF03 extension), no \
-                 Add path verifies one (`verify_add_attestation` has zero production callers), \
-                 and nothing in production drives `KeyPackageCommand::Publish`. CONSEQUENCE: \
-                 step 1's key rotation, which §9.7.3/§9.12 designate as the primary revocation \
-                 lever bounded by MAX_ATTESTATION_KEY_RESOLUTION_STALENESS ({staleness}s), \
-                 currently revokes NOTHING operationally — that bound is spec intent, not yet \
-                 in force, so do not treat this exposure as already time-bounded. Because \
-                 publication is undriven there is no published KeyPackage to retract; the \
-                 unretractable artifact is the KeyPackage public bytes already handed to \
-                 inviters out-of-band via `reserve_key_package`, which no relay delete would \
-                 reach. Failing closed rather than reporting a rotation that did not happen \
-                 (see #2240 Part B item 2 and #1083 finding 6). Step 2's MLS epoch advance is \
-                 irrelevant here: it protects existing groups, not key material offered for \
-                 future additions",
+                 KeyPackage-attestation lifecycle does not exist end to end, so nothing was \
+                 retracted or re-issued and step 1's key rotation revokes nothing \
+                 operationally. Do NOT treat this exposure as already time-bounded. Failing \
+                 closed rather than reporting a rotation that did not happen (#2240 Part B \
+                 item 2, #1083 finding 6)",
                 did = key_rotation.did_before.as_ref(),
-                staleness =
-                    scp_mls::keypackage_attestation::MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
             ),
         })
     }
