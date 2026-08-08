@@ -92,7 +92,7 @@ use arc_swap::ArcSwap;
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::governance::KeyResolver;
-use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::membership::ContextEventEnvelope;
 
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::persistence::ContextPersistence;
@@ -183,7 +183,7 @@ pub struct ActorDeps {
     ///
     /// Lagging receivers lose events (bounded channel) — delivery is
     /// best-effort.
-    pub event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    pub event_tx: Option<tokio::sync::broadcast::Sender<ContextEventEnvelope>>,
     /// DID → Ed25519 verifying-key resolver used by governance vote
     /// verification (spec §5.9, ADR-031) and UCAN proof validation.
     /// Formerly `ContextManager::key_resolver` (typealias

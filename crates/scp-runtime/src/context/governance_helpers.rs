@@ -31,7 +31,7 @@ use scp_protocol::context::governance::{
     AccessScope, GovernanceAction, GovernanceContext, GovernanceEvent, GovernanceProposal,
     ProposalId, ProposalStatus, PruningPolicy,
 };
-use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
+use scp_protocol::context::membership::{ContextEvent, ContextEventEnvelope, ReceiveBuffer};
 use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
@@ -3825,8 +3825,14 @@ pub fn execute_propose_context_migration<'a>(
 
         // Broadcast the migration events that were buffered above.
         if let Some(tx) = deps.event_tx.as_ref() {
-            let _ = tx.send((context_id.to_owned(), strip_event_payload(&proposed_event)));
-            let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
+            let _ = tx.send(ContextEventEnvelope::new(
+                context_id.to_owned(),
+                strip_event_payload(&proposed_event),
+            ));
+            let _ = tx.send(ContextEventEnvelope::new(
+                context_id.to_owned(),
+                strip_event_payload(&started_event),
+            ));
         }
 
         crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id)

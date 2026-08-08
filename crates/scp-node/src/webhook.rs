@@ -723,7 +723,7 @@ pub fn map_context_event(
 /// `dispatch_event` owns all of its own error handling and retries and never
 /// panics, so a dispatch task cannot escape a panic.
 pub fn spawn_event_consumer(
-    mut rx: tokio::sync::broadcast::Receiver<(String, scp_core::context::membership::ContextEvent)>,
+    mut rx: tokio::sync::broadcast::Receiver<scp_core::context::membership::ContextEventEnvelope>,
     dispatcher: Arc<WebhookDispatcher>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -741,7 +741,7 @@ pub fn spawn_event_consumer(
             while inflight.try_join_next().is_some() {}
 
             match rx.recv().await {
-                Ok((context_id, event)) => {
+                Ok(scp_core::context::membership::ContextEventEnvelope { context_id, event }) => {
                     // `event_type` is a `&'static str`, so it moves into the
                     // dispatch task without allocation.
                     let (event_type, payload) = map_context_event(&event);
