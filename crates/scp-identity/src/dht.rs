@@ -817,10 +817,16 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         Ok(())
     }
 
-    /// Publishes a DID document to the DHT with the given signing function.
+    /// Publishes a DID document to the DHT with the given signing function and
+    /// returns the signed BEP44 record it produced.
     ///
     /// This is the internal publish implementation used by both
     /// `DidMethod::publish` and the `RepublishManager`.
+    ///
+    /// The returned [`RepublishEntry`](crate::republish::RepublishEntry) is the
+    /// `(public_key, seq, signature, value)` computed by THIS signing pass — see
+    /// [`DidMethod::publish`](crate::DidMethod::publish) for why it is an output
+    /// rather than something a caller reconstructs from a read-back.
     ///
     /// # Errors
     ///
@@ -831,7 +837,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         &self,
         identity: &ScpIdentity,
         document: &DidDocument,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<crate::republish::RepublishEntry, IdentityError> {
         let sign_fn = self.sign_fn.as_ref().ok_or_else(|| {
             IdentityError::DhtPublishFailed(
                 "no signing function configured; use DidDht::with_client_and_signer".to_owned(),
@@ -872,7 +878,14 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             store.store(&identity.did, seq).await?;
         }
 
-        Ok(())
+        // Hand back the record this pass signed, so no caller has to re-derive
+        // it from a network read-back (see `DidMethod::publish`).
+        Ok(crate::republish::RepublishEntry {
+            public_key,
+            document_bytes: value.to_vec(),
+            signature,
+            sequence: seq,
+        })
     }
 
     /// Publishes a DID document to the DHT with optional relay URLs.
@@ -1742,7 +1755,13 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let mut updated_old_doc = old_document.clone();
         updated_old_doc.set_also_known_as(new_did);
         updated_old_doc.retire_operational_keys_for_migration();
-        self.publish_document(old_identity, &updated_old_doc).await
+        // The migration redirect's signed record is not needed here: the caller
+        // is wrapping publish failure into a `MigrationPartialState`, and the
+        // OLD DID's republish cycle is torn down by migration, not restarted.
+        // Discarded explicitly so the drop is a decision, not an oversight.
+        self.publish_document(old_identity, &updated_old_doc)
+            .await
+            .map(|_signed_record| ())
     }
 
     /// Finish a [`Self::migrate_identity`] call that returned
@@ -2124,7 +2143,7 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
         &self,
         identity: &ScpIdentity,
         document: &DidDocument,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+    ) -> impl Future<Output = Result<crate::republish::RepublishEntry, IdentityError>> + Send {
         // Delegate to the internal method that uses the stored signing function.
         self.publish_document(identity, document)
     }

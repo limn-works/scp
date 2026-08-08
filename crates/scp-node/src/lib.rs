@@ -296,6 +296,13 @@ pub struct ApplicationNode<S: Storage> {
     /// Set by [`serve_background`](Self::serve_background) after successful bind.
     /// Wrapped in `Arc` so the spawned background task can clear it on exit.
     serving_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>>,
+    /// The signed BEP44 record this node published at startup, if it published
+    /// one (§3.10.5). `None` for a `DhtMode::Disabled` node — the honest absent
+    /// state: nothing was published, so there is nothing to keep alive.
+    ///
+    /// This is the record produced by THIS node's signing pass, not a read-back
+    /// (see `DidMethod::publish`). Republishing is sourced from it.
+    published_did_record: Option<scp_identity::republish::RepublishEntry>,
 }
 
 impl<S: Storage + std::fmt::Debug> std::fmt::Debug for ApplicationNode<S> {
@@ -321,6 +328,21 @@ impl<S: Storage> ApplicationNode<S> {
     #[must_use]
     pub fn domain(&self) -> Option<&str> {
         self.domain.as_deref()
+    }
+
+    /// The signed BEP44 DID record this node published at startup, if any
+    /// (§3.10.5).
+    ///
+    /// `None` when the node published nothing — the `DhtMode::Disabled`
+    /// fail-safe default. That absence is protocol-supported and detectable;
+    /// callers MUST NOT synthesize a record in its place.
+    ///
+    /// The value is the output of this node's own signing pass, so a caller
+    /// (e.g. the self-host republish cycle) never has to reconstruct the
+    /// `(value, signature, seq)` triple by reading it back off the network.
+    #[must_use]
+    pub const fn published_did_record(&self) -> Option<&scp_identity::republish::RepublishEntry> {
+        self.published_did_record.as_ref()
     }
 
     /// Returns a reference to the relay handle.
@@ -2112,7 +2134,15 @@ impl<D: DidMethod + 'static> DidPublisher for DidMethodPublisher<D> {
         document: &'a DidDocument,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + 'a>>
     {
-        Box::pin(self.inner.publish(identity, document))
+        // The tier-change republish does not consume the signed record: it is
+        // an object-safe boxed surface whose only caller re-publishes on relay
+        // URL change. Discarded explicitly so the drop is a decision.
+        Box::pin(async move {
+            self.inner
+                .publish(identity, document)
+                .await
+                .map(|_signed_record| ())
+        })
     }
 }
 
@@ -3113,7 +3143,8 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // (and the test-only `Memory`) publish FATALLY, exactly as this path did
     // before. `Domain + Disabled` is never rejected: erroring on the fail-safe
     // direction would itself violate M2.
-    publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
+    let published_did_record =
+        publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3202,6 +3233,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     });
 
     Ok(ApplicationNode {
+        published_did_record,
         domain: Some(domain),
         relay: RelayHandle {
             bound_addr,
@@ -3271,12 +3303,21 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 /// `D`'s client would error on publish (e.g.
 /// [`DisabledDhtClient`](scp_dht::DisabledDhtClient), ADR-062 §Decision 1), no
 /// publish is attempted, so a `Disabled` node always starts.
+///
+/// # Return value: the signed record, or an honest absence
+///
+/// Returns `Some(entry)` carrying the BEP44 `(public_key, seq, signature,
+/// value)` this publish signed, and `None` for `DhtMode::Disabled` — where the
+/// absence is the literal truth that nothing was published, not a lookup miss.
+/// Downstream (the self-host republish cycle) consumes the record directly, so
+/// the triple is never reconstructed by resolving the node's own record back off
+/// the network.
 async fn publish_did_document_for_mode<D: DidMethod + 'static>(
     dht_mode: DhtMode,
     did_method: &D,
     identity: &ScpIdentity,
     document: &DidDocument,
-) -> Result<(), NodeError> {
+) -> Result<Option<scp_identity::republish::RepublishEntry>, NodeError> {
     match dht_mode {
         DhtMode::Disabled => {
             tracing::info!(
@@ -3284,7 +3325,7 @@ async fn publish_did_document_for_mode<D: DidMethod + 'static>(
                 "DhtMode::Disabled — node is intentionally not DHT-published \
                  (not discoverable by design; no address disclosed)"
             );
-            Ok(())
+            Ok(None)
         }
         // Production publishes to the global Mainline DHT; Memory (test-harness-
         // only) publishes to its in-memory client. Both treat a publish failure
@@ -3295,10 +3336,12 @@ async fn publish_did_document_for_mode<D: DidMethod + 'static>(
         DhtMode::Memory => did_method
             .publish(identity, document)
             .await
+            .map(Some)
             .map_err(NodeError::from),
         DhtMode::Production => did_method
             .publish(identity, document)
             .await
+            .map(Some)
             .map_err(NodeError::from),
     }
 }
@@ -3355,7 +3398,8 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     //    a publishing node (`Production` / test-only `Memory`) so a genuine
     //    startup publish failure fails the node closed rather than advertising a
     //    false discoverability guarantee.
-    publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
+    let published_did_record =
+        publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
 
     tracing::info!(
         tier = ?tier,
@@ -3440,6 +3484,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     });
 
     Ok(ApplicationNode {
+        published_did_record,
         domain: None,
         relay: RelayHandle {
             bound_addr,
@@ -3600,7 +3645,10 @@ impl DidMethod for NoOpDidMethod {
         &self,
         _identity: &ScpIdentity,
         _document: &DidDocument,
-    ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+    ) -> impl std::future::Future<
+        Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+    > + Send {
+        // Fails closed with a typed error — never a fabricated signed record.
         std::future::ready(Err(IdentityError::DhtPublishFailed(
             "NoOpDidMethod: not configured".to_owned(),
         )))
@@ -3943,7 +3991,9 @@ mod tests {
                 &self,
                 identity: &ScpIdentity,
                 document: &DidDocument,
-            ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+            ) -> impl std::future::Future<
+                Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+            > + Send {
                 self.publish_count.fetch_add(1, Ordering::SeqCst);
                 self.inner.publish(identity, document)
             }
@@ -4078,7 +4128,9 @@ mod tests {
                 &self,
                 identity: &ScpIdentity,
                 document: &DidDocument,
-            ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+            ) -> impl std::future::Future<
+                Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+            > + Send {
                 // Probe the relay bind address to see if it's listening.
                 let addr = self.bind_addr;
                 let flag = Arc::clone(&self.relay_was_listening_at_publish);
@@ -4338,7 +4390,9 @@ mod tests {
             &self,
             _identity: &ScpIdentity,
             _document: &DidDocument,
-        ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl std::future::Future<
+            Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+        > + Send {
             self.publish_attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::future::ready(Err(IdentityError::DhtPublishFailed(
@@ -4448,6 +4502,70 @@ mod tests {
             node.relay().bound_addr().port(),
             0,
             "relay should be bound to a real port"
+        );
+        // B2: the absence is HONEST — the node published nothing, so it carries
+        // no signed record. Nothing is fabricated in its place, and the
+        // downstream republish cycle reads exactly this to stay dormant.
+        assert!(
+            node.published_did_record().is_none(),
+            "a Disabled node published nothing, so it holds no signed record"
+        );
+    }
+
+    /// B2: a node that DOES publish carries the signed BEP44 record its own
+    /// publish produced — so nothing downstream has to reconstruct the
+    /// `(value, signature, seq)` triple by reading it back off the network.
+    ///
+    /// The returned record is checked against the node's DID-derived key, so a
+    /// fabricated or mismatched record cannot pass.
+    #[tokio::test]
+    async fn publishing_node_carries_its_own_signed_record() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        // A resolvable NAT tier so the build reaches the publish step.
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 9], 32893)),
+        };
+        let config = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Memory,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        };
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("a publishing node starts");
+
+        let record = node
+            .published_did_record()
+            .expect("a publishing node carries the record it signed");
+
+        // The record is genuinely this node's: its key derives the node's DID,
+        // and its (value, seq) BEP44-verify under that key.
+        assert_eq!(
+            record.did(),
+            node.identity().did(),
+            "the record's key derives THIS node's DID"
+        );
+        scp_dht::verify_bep44_signature(
+            &record.public_key,
+            &record.signature,
+            &record.document_bytes,
+            record.sequence,
+        )
+        .expect("the carried record BEP44-verifies against the node's own key");
+        assert!(
+            record.sequence >= 1,
+            "a published record carries the sequence its publish assigned"
         );
     }
 
@@ -4738,7 +4856,9 @@ mod tests {
                 &self,
                 identity: &ScpIdentity,
                 document: &DidDocument,
-            ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+            ) -> impl std::future::Future<
+                Output = Result<scp_identity::republish::RepublishEntry, IdentityError>,
+            > + Send {
                 self.publish_count.fetch_add(1, Ordering::SeqCst);
                 self.inner.publish(identity, document)
             }
