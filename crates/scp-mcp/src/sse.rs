@@ -56,12 +56,12 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
-use scp_core::context::membership::ContextEvent;
+use scp_core::context::membership::ContextEventEnvelope;
 
 use crate::protocol::{
     JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PARSE_ERROR, RequestId,
 };
-use crate::server::{ContextProvider, McpServer};
+use crate::server::{ContextEventPump, ContextProvider, McpServer};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -268,11 +268,6 @@ impl McpNotifier {
         }
     }
 
-    /// Returns the number of currently connected SSE clients.
-    fn client_count(&self) -> usize {
-        self.tx.receiver_count()
-    }
-
     /// Reserves the next event ID in the shared sequence.
     fn next_id(&self) -> u64 {
         self.next_event_id.fetch_add(1, Ordering::SeqCst)
@@ -287,33 +282,25 @@ pub(crate) struct AppState<P: ContextProvider> {
     notifier: McpNotifier,
     /// Retry interval in milliseconds sent to SSE clients.
     retry_ms: u64,
+    /// Admits exactly one live SSE session at a time.
+    ///
+    /// An [`McpServer`] *is* one MCP session: it holds one `initialized` flag,
+    /// one set of negotiated client capabilities, and one resource-subscription
+    /// registry. Serving two concurrent clients from it would silently share
+    /// all three — client B would inherit A's handshake, receive A's JSON-RPC
+    /// responses off the shared broadcast, see updates for A's subscriptions,
+    /// and cancel them with its own `resources/unsubscribe`.
+    ///
+    /// Rather than pretend to multiplex, the endpoint is structurally
+    /// single-session: the second concurrent `GET /sse` is refused with
+    /// `409 Conflict`. The permit is released when the first client's stream is
+    /// dropped, at which point the session state is reset for the next client.
+    session_slot: Arc<tokio::sync::Semaphore>,
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-/// Creates an axum [`Router`] for the SSE transport.
-///
-/// The router exposes:
-/// - `GET /sse` -- SSE stream for server-to-client messages.
-/// - `POST /message` -- Client-to-server JSON-RPC requests.
-///
-/// The returned router can be served with `axum::serve` or composed into a
-/// larger application.
-///
-/// # Resource subscriptions
-///
-/// See [`run_sse`] for the meaning of `events`. Must be called from within a
-/// tokio runtime when `events` is `Some`, because the event pump is spawned
-/// as a background task.
-pub fn sse_router<P: ContextProvider + 'static>(
-    server: McpServer<P>,
-    config: &SseConfig,
-    events: Option<broadcast::Receiver<(String, ContextEvent)>>,
-) -> Router {
-    router_with_pump(server, config, events).0
-}
 
 /// Builds the router and, when an event source is supplied, the pump task
 /// driving it.
@@ -322,25 +309,23 @@ pub fn sse_router<P: ContextProvider + 'static>(
 /// stopped when the server stops. Without that, the pump would outlive the
 /// server it feeds and keep the whole [`AppState`] alive until the runtime's
 /// broadcast sender is dropped.
+///
+/// This is deliberately crate-private: every caller must own that handle, and a
+/// public wrapper that discarded it (as the former `sse_router` did) would leak
+/// the pump by construction. [`run_sse`] is the supported entry point.
 fn router_with_pump<P: ContextProvider + 'static>(
     server: McpServer<P>,
     config: &SseConfig,
-    events: Option<broadcast::Receiver<(String, ContextEvent)>>,
+    pump: Option<ContextEventPump>,
 ) -> (Router, Option<tokio::task::JoinHandle<()>>) {
-    let mut server = server;
-    // Enabling the capability and starting the pump are the same step, so the
-    // advertisement can never outrun the delivery machinery.
-    if events.is_some() {
-        server.enable_subscriptions();
-    }
-
     let state = Arc::new(AppState {
         server: Mutex::new(server),
         notifier: McpNotifier::new(config),
         retry_ms: config.retry_ms,
+        session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
     });
 
-    let pump = events.map(|rx| tokio::spawn(pump_events(Arc::clone(&state), rx)));
+    let pump = pump.map(|pump| tokio::spawn(pump_events(Arc::clone(&state), pump.into_receiver())));
 
     let router = Router::new()
         .route("/sse", get(sse_handler::<P>))
@@ -394,16 +379,23 @@ async fn bearer_auth_middleware(
 ///
 /// # Resource subscriptions
 ///
-/// Pass `events` — a receiver from
-/// [`Supervisor::subscribe_events`](scp_core::context::supervisor::Supervisor::subscribe_events)
-/// — to enable `resources/subscribe`. When `Some`, the server advertises
-/// `resources.subscribe: true` and a pump turns each [`ContextEvent`] into
+/// `pump` is the [`ContextEventPump`] that
+/// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source)
+/// returned alongside `server`. Passing it means the server advertises
+/// `resources.subscribe: true` and the pump turns each [`ContextEvent`] into
 /// `notifications/resources/updated` for the subscribed resources it
 /// invalidates.
 ///
-/// When `None`, the server advertises `resources.subscribe: false` and
-/// rejects `resources/subscribe` with a typed error. The capability is never
-/// advertised without the machinery to honour it.
+/// `None` is only constructible for a server built with
+/// [`McpServer::new`](crate::server::McpServer::new), which advertises
+/// `resources.subscribe: false` and rejects `resources/subscribe` with a typed
+/// error. The capability cannot be advertised without the machinery to honour
+/// it, because the same call produces both.
+///
+/// # Sessions
+///
+/// The endpoint serves one MCP session at a time; a second concurrent
+/// `GET /sse` is refused with `409 Conflict`. See [`AppState::session_slot`].
 ///
 /// # Errors
 ///
@@ -412,9 +404,9 @@ pub async fn run_sse<P: ContextProvider + 'static>(
     server: McpServer<P>,
     config: SseConfig,
     shutdown: ShutdownHandle,
-    events: Option<broadcast::Receiver<(String, ContextEvent)>>,
+    pump: Option<ContextEventPump>,
 ) -> Result<(), SseError> {
-    let (router, pump) = router_with_pump(server, &config, events);
+    let (router, pump) = router_with_pump(server, &config, pump);
 
     let listener = match tokio::net::TcpListener::bind(config.bind_addr).await {
         Ok(l) => l,
@@ -474,7 +466,19 @@ fn parse_last_event_id(headers: &HeaderMap) -> Option<u64> {
 async fn sse_handler<P: ContextProvider + 'static>(
     State(state): State<Arc<AppState<P>>>,
     headers: HeaderMap,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+) -> axum::response::Response {
+    // One session at a time. Without this the second client would inherit the
+    // first client's completed handshake and resource subscriptions, and would
+    // receive the first client's JSON-RPC responses off the shared broadcast.
+    let Ok(permit) = Arc::clone(&state.session_slot).try_acquire_owned() else {
+        tracing::warn!("MCP SSE: refusing a second concurrent session");
+        return (
+            StatusCode::CONFLICT,
+            "an MCP session is already active on this endpoint",
+        )
+            .into_response();
+    };
+
     let last_event_id = parse_last_event_id(&headers);
 
     let endpoint_event = Event::default()
@@ -515,22 +519,26 @@ async fn sse_handler<P: ContextProvider + 'static>(
     let stream = initial.chain(replay).chain(message_stream);
 
     // Hold a session guard for the lifetime of the stream. When the client
-    // disconnects the stream is dropped, dropping the guard, which clears the
-    // resource subscriptions once no clients remain — a reconnecting client
-    // must re-subscribe rather than inherit a previous session's registry.
+    // disconnects the stream is dropped, dropping the guard, which resets the
+    // session (handshake state + resource subscriptions) and frees the session
+    // slot — the next client must re-handshake and re-subscribe rather than
+    // inherit the previous session's registry.
     let guard = SessionGuard {
         state: Arc::clone(&state),
+        _permit: permit,
     };
     let stream = stream.map(move |event| {
         let _keep_alive = &guard;
         event
     });
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::default()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    )
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::default()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 /// POST endpoint handler. Receives JSON-RPC requests from the client.
@@ -538,10 +546,21 @@ async fn sse_handler<P: ContextProvider + 'static>(
 /// Dispatches the request to the MCP server and sends the response via the
 /// SSE broadcast channel. Returns `202 Accepted` to the HTTP client since
 /// the actual response is delivered via SSE.
+///
+/// Requires a live session (`GET /sse`): the response goes out on the SSE
+/// stream and into the replay buffer, so accepting a request with no session
+/// attached would leave that response waiting for whichever client connects
+/// next — a different client reading an answer it never asked for.
 async fn message_handler<P: ContextProvider + 'static>(
     State(state): State<Arc<AppState<P>>>,
     body: String,
 ) -> impl IntoResponse {
+    // The permit is held by `SessionGuard` for the lifetime of the SSE stream,
+    // so a full slot means no client is attached.
+    if state.session_slot.available_permits() > 0 {
+        return StatusCode::CONFLICT;
+    }
+
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return StatusCode::BAD_REQUEST;
@@ -583,10 +602,10 @@ async fn message_handler<P: ContextProvider + 'static>(
 /// Forwards runtime context events to connected clients as MCP notifications.
 async fn pump_events<P: ContextProvider + 'static>(
     state: Arc<AppState<P>>,
-    mut events: broadcast::Receiver<(String, ContextEvent)>,
+    mut events: broadcast::Receiver<ContextEventEnvelope>,
 ) {
     loop {
-        let (context_id, event) = match events.recv().await {
+        let ContextEventEnvelope { context_id, event } = match events.recv().await {
             Ok(v) => v,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 // Clients may have missed a change. Nothing here can
@@ -613,16 +632,22 @@ async fn pump_events<P: ContextProvider + 'static>(
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
-/// Clears resource subscriptions when the last SSE client disconnects.
+/// Resets the MCP session when the SSE client disconnects.
 ///
 /// Held alive by the SSE response stream; dropped when the client goes away.
+/// Dropping it releases the single-session permit (the `_permit` field) so the
+/// next client can connect, and resets the server's per-session state so that
+/// client cannot inherit the previous one's handshake or subscriptions.
 struct SessionGuard<P: ContextProvider + 'static> {
     state: Arc<AppState<P>>,
+    /// The single-session permit. Released on drop, in field order *after*
+    /// the reset is scheduled below.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl<P: ContextProvider + 'static> Drop for SessionGuard<P> {
     fn drop(&mut self) {
-        // `Drop` is synchronous and clearing needs the async server mutex, so
+        // `Drop` is synchronous and the reset needs the async server mutex, so
         // hand the work to the runtime. Outside a runtime (e.g. a test that
         // drops the stream after the runtime ends) there is nothing to clean
         // up, so skipping is correct rather than a lost update.
@@ -631,11 +656,7 @@ impl<P: ContextProvider + 'static> Drop for SessionGuard<P> {
         };
         let state = Arc::clone(&self.state);
         handle.spawn(async move {
-            // Another client may still be attached; only the last one out
-            // clears the shared subscription registry.
-            if state.notifier.client_count() == 0 {
-                state.server.lock().await.clear_subscriptions();
-            }
+            state.server.lock().await.reset_session();
         });
     }
 }
@@ -710,6 +731,7 @@ mod tests {
     use super::*;
     use crate::protocol::{METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
     use crate::server::{ContextOutletInfo, MemberInfo};
+    use scp_core::context::membership::ContextEvent;
 
     // -- Mock provider (same shape as stdio tests) ----------------------------
 
@@ -751,6 +773,13 @@ mod tests {
         ) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({"status": "ok"}))
         }
+        fn validate_resource_access(
+            &self,
+            _context_id: &str,
+            _resource: crate::server::ResourceKind,
+        ) -> Result<(), String> {
+            Ok(())
+        }
         fn context_members(&self, _context_id: &str) -> Vec<MemberInfo> {
             Vec::new()
         }
@@ -767,12 +796,23 @@ mod tests {
         config
     }
 
+    /// Shared state with the single-session slot ALREADY CLAIMED, standing in
+    /// for a live `GET /sse` client. `message_handler` refuses requests with no
+    /// session attached, since their responses would otherwise sit in the
+    /// replay buffer waiting for whoever connects next.
     fn test_state() -> Arc<AppState<MockProvider>> {
-        Arc::new(AppState {
+        let state = Arc::new(AppState {
             server: Mutex::new(McpServer::new(MockProvider::default())),
             notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
-        })
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        state
+            .session_slot
+            .try_acquire()
+            .expect("fresh state must have a free session slot")
+            .forget();
+        state
     }
 
     // -- parse_sse_incoming ---------------------------------------------------
@@ -810,10 +850,11 @@ mod tests {
     // -- Router integration tests ---------------------------------------------
 
     #[tokio::test]
-    async fn sse_router_builds_successfully() {
+    async fn router_builds_successfully() {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        let _router = sse_router(server, &config, None);
+        let (_router, pump) = router_with_pump(server, &config, None);
+        assert!(pump.is_none(), "no event source means no pump");
     }
 
     #[tokio::test]
@@ -964,9 +1005,11 @@ mod tests {
 
     /// Builds an initialized server with a wired event source, subscribed to
     /// `uri`.
-    fn subscribed_server(uri: &str) -> McpServer<MockProvider> {
-        let mut server = McpServer::new(MockProvider::default());
-        server.enable_subscriptions();
+    fn subscribed_server(
+        uri: &str,
+        rx: broadcast::Receiver<ContextEventEnvelope>,
+    ) -> (McpServer<MockProvider>, ContextEventPump) {
+        let (mut server, pump) = McpServer::with_event_source(MockProvider::default(), rx);
 
         let init = JsonRpcRequest {
             jsonrpc: crate::protocol::JSONRPC_VERSION.to_owned(),
@@ -988,7 +1031,7 @@ mod tests {
         };
         assert!(server.handle_request(&sub).unwrap().error.is_none());
 
-        server
+        (server, pump)
     }
 
     /// Drives the full delivery chain that `resources/subscribe` promises:
@@ -1000,25 +1043,26 @@ mod tests {
     /// nothing (issue #1341).
     #[tokio::test]
     async fn subscribe_then_event_delivers_resources_updated() {
-        let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+        let (event_tx, event_rx) = broadcast::channel::<ContextEventEnvelope>(16);
 
         // A client initializes and subscribes to the context's event stream.
-        let server = subscribed_server("scp://ctx_a/events");
+        let (server, pump_source) = subscribed_server("scp://ctx_a/events", event_rx);
 
         let state = Arc::new(AppState {
             server: Mutex::new(server),
             notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         // A client attaches to the SSE stream.
         let mut client = state.notifier.tx.subscribe();
 
-        let pump = tokio::spawn(pump_events(Arc::clone(&state), event_rx));
+        let pump = tokio::spawn(pump_events(Arc::clone(&state), pump_source.into_receiver()));
 
         // The runtime emits a context event.
         event_tx
-            .send((
+            .send(ContextEventEnvelope::new(
                 "ctx_a".to_owned(),
                 ContextEvent::ContentKeysRotated { reason: None },
             ))
@@ -1039,21 +1083,21 @@ mod tests {
     /// The same chain must stay silent for a resource nobody subscribed to.
     #[tokio::test]
     async fn event_without_subscription_delivers_nothing() {
-        let (event_tx, event_rx) = broadcast::channel::<(String, ContextEvent)>(16);
+        let (event_tx, event_rx) = broadcast::channel::<ContextEventEnvelope>(16);
 
-        let mut server = McpServer::new(MockProvider::default());
-        server.enable_subscriptions();
+        let (server, pump_source) = McpServer::with_event_source(MockProvider::default(), event_rx);
         let state = Arc::new(AppState {
             server: Mutex::new(server),
             notifier: McpNotifier::new(&test_config()),
             retry_ms: DEFAULT_RETRY_MS,
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         let mut client = state.notifier.tx.subscribe();
-        let pump = tokio::spawn(pump_events(Arc::clone(&state), event_rx));
+        let pump = tokio::spawn(pump_events(Arc::clone(&state), pump_source.into_receiver()));
 
         event_tx
-            .send((
+            .send(ContextEventEnvelope::new(
                 "ctx_a".to_owned(),
                 ContextEvent::ContentKeysRotated { reason: None },
             ))
@@ -1202,19 +1246,21 @@ mod tests {
     // -- Auth middleware -------------------------------------------------------
 
     #[tokio::test]
-    async fn sse_router_with_auth_builds_successfully() {
+    async fn router_with_auth_builds_successfully() {
         let server = McpServer::new(MockProvider::default());
         let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
         config.auth_token = Some("secret-token".to_owned());
-        let _router = sse_router(server, &config, None);
+        let (_router, pump) = router_with_pump(server, &config, None);
+        assert!(pump.is_none(), "no event source means no pump");
     }
 
     #[tokio::test]
-    async fn sse_router_without_auth_builds_successfully() {
+    async fn router_without_auth_builds_successfully() {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
         assert!(config.auth_token.is_none());
-        let _router = sse_router(server, &config, None);
+        let (_router, pump) = router_with_pump(server, &config, None);
+        assert!(pump.is_none(), "no event source means no pump");
     }
 
     #[test]
@@ -1231,14 +1277,67 @@ mod tests {
         let server = McpServer::new(MockProvider::default());
         let mut config = SseConfig::new("127.0.0.1:0".parse().unwrap());
         config.auth_token = Some("test-secret".to_owned());
-        sse_router(server, &config, None)
+        router_with_pump(server, &config, None).0
     }
 
     /// Helper: build an unauthenticated router (`auth_token` = None).
     fn noauth_router() -> Router {
         let server = McpServer::new(MockProvider::default());
         let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
-        sse_router(server, &config, None)
+        router_with_pump(server, &config, None).0
+    }
+
+    // -- Single-session admission --------------------------------------------
+
+    /// An `McpServer` *is* one MCP session — one `initialized` flag, one
+    /// negotiated capability set, one subscription registry — and every
+    /// server→client message goes out on one shared broadcast. Admitting a
+    /// second concurrent client would silently share all of that: B would
+    /// inherit A's handshake, receive A's JSON-RPC responses, see updates for
+    /// A's subscriptions, and cancel them with its own `resources/unsubscribe`.
+    ///
+    /// The endpoint therefore refuses the second session rather than
+    /// pretending to multiplex.
+    #[tokio::test]
+    async fn second_concurrent_sse_session_is_refused() {
+        use tower::ServiceExt;
+
+        let router = noauth_router();
+
+        // First client attaches and holds its stream open.
+        let first = router
+            .clone()
+            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // Second concurrent client is refused while the first is live.
+        let second = router
+            .clone()
+            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "a second concurrent MCP session must be refused, not silently shared"
+        );
+
+        // Once the first stream is dropped the slot frees for the next client.
+        drop(first);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let third = router
+            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            third.status(),
+            StatusCode::OK,
+            "the session slot must be released when the client disconnects"
+        );
     }
 
     /// Helper: send a request through the router and return the status code.
@@ -1281,7 +1380,9 @@ mod tests {
             .unwrap();
 
         let status = request_status(router, req).await;
-        assert_eq!(status, StatusCode::ACCEPTED);
+        // Authentication passed (not 401); the request is then refused because
+        // no SSE session is attached to deliver the response on.
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -1418,7 +1519,9 @@ mod tests {
             .unwrap();
 
         let status = request_status(router, req).await;
-        assert_eq!(status, StatusCode::ACCEPTED);
+        // No auth configured, so the request reaches the handler and is refused
+        // only because no SSE session is attached.
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
