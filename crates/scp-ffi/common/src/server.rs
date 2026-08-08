@@ -645,10 +645,9 @@ impl RunningNode {
     #[must_use]
     pub fn wire_context_events(
         &self,
-        events: tokio::sync::broadcast::Receiver<(
-            String,
-            scp_core::context::membership::ContextEvent,
-        )>,
+        events: tokio::sync::broadcast::Receiver<
+            scp_core::context::membership::ContextEventEnvelope,
+        >,
     ) -> tokio::task::JoinHandle<()> {
         match self {
             Self::InMemory(n) => n.wire_context_events(events),

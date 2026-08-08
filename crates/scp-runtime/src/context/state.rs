@@ -34,7 +34,7 @@ use scp_protocol::context::governance::{
     unanimity::UnanimityEngine,
 };
 use scp_protocol::context::membership::{
-    ContextEvent, MembershipState, ReceiveBuffer, RedactedBytes,
+    ContextEvent, ContextEventEnvelope, MembershipState, ReceiveBuffer, RedactedBytes,
 };
 use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::GovernanceModel;
@@ -1768,7 +1768,7 @@ pub(crate) fn emit_event_into(
     receive_buffer: &mut ReceiveBuffer,
     event: ContextEvent,
     context_id: &str,
-    tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    tx: Option<&tokio::sync::broadcast::Sender<ContextEventEnvelope>>,
 ) {
     if matches!(event, ContextEvent::WelcomeGenerated { .. }) {
         receive_buffer.push(event);
@@ -1778,7 +1778,7 @@ pub(crate) fn emit_event_into(
     receive_buffer.push(event.clone());
     if let Some(tx) = tx {
         let sanitized = strip_event_payload(&event);
-        let _ = tx.send((context_id.to_owned(), sanitized));
+        let _ = tx.send(ContextEventEnvelope::new(context_id.to_owned(), sanitized));
     }
 }
 

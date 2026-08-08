@@ -881,6 +881,38 @@ impl ContextEvent {
 }
 
 // ---------------------------------------------------------------------------
+// ContextEventEnvelope
+// ---------------------------------------------------------------------------
+
+/// A [`ContextEvent`] paired with the context that produced it.
+///
+/// This is the item type of the runtime's event fan-out channel (see
+/// `Supervisor::subscribe_events`). It exists so that channel is not typed as a
+/// bare `(String, ContextEvent)` tuple: the transport pumps, the webhook
+/// dispatcher and the MCP server all destructure it *by field name*, so the
+/// context identifier can never be silently transposed with another `String`
+/// at a send site, and every consumer reads the same vocabulary.
+///
+/// Events placed on the channel are payload-stripped at the source (see
+/// `strip_event_payload` in `scp-runtime`) — subscribers observe metadata only,
+/// never decrypted content.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ContextEventEnvelope {
+    /// The context the event was produced in.
+    pub context_id: String,
+    /// The payload-stripped event.
+    pub event: ContextEvent,
+}
+
+impl ContextEventEnvelope {
+    /// Pairs `event` with the `context_id` that produced it.
+    #[must_use]
+    pub const fn new(context_id: String, event: ContextEvent) -> Self {
+        Self { context_id, event }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ReceiveBuffer
 // ---------------------------------------------------------------------------
 
