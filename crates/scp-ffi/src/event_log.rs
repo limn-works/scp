@@ -87,27 +87,48 @@ impl PyEvent {
 // PyProof
 // ---------------------------------------------------------------------------
 
-/// A verification proof from the event log, exposed to Python.
+/// A Merkle proof from the event log, exposed to Python.
 ///
-/// Returned by `PyScp::event_log_verify`. Contains the verification result,
-/// the type of proof (inclusion or absence), and proof details as a
-/// JSON-compatible Python object.
+/// Returned by `PyScp::event_log_verify`. Carries the proof type and the proof
+/// material as a JSON-compatible Python object.
+///
+/// # There is no `verified` field
+///
+/// This type used to carry `verified: bool`. It was a constant `True` on every
+/// success path: the bridge generated the proof and then "verified" that same
+/// proof against the same snapshot, so the check was tautological and only
+/// `Ok`-vs-raise ever carried information. A boolean named `verified` that no
+/// independent verifier computed is a false guarantee, so it is gone —
+/// `event_log_verify` raising IS the negative answer.
+///
+/// Real verification is done by the recipient from [`details`](Self::details),
+/// which carries the full Merkle material for both proof types: the leaf hash,
+/// the sibling path with per-step direction, and the root the path reaches. An
+/// absence answer carries the same complete material for BOTH bracketing
+/// neighbours.
+///
+/// # What an `"absence"` answer does and does not establish
+///
+/// The neighbour material above lets a recipient check that both bracketing
+/// leaves really are in the tree the reported `root` commits to, and that the
+/// queried hash sorts strictly between them. It does NOT establish that the two
+/// neighbours are ADJACENT in sorted order: the log's Merkle root commits to
+/// append order, and the sorted index the neighbours are drawn from is local
+/// state the root does not cover. Treat an `"absence"` answer as the log's own
+/// assertion plus checkable neighbour-inclusion, not as a self-contained
+/// negative proof.
 ///
 /// See ADR-011 (Merkle proofs) and ADR-013 §7 (bridge layer).
 #[pyclass(name = "Proof")]
 #[derive(Debug)]
 pub struct PyProof {
-    /// `True` if the claim was verified successfully.
-    #[pyo3(get)]
-    pub verified: bool,
-
     /// The proof type: `"inclusion"` or `"absence"`.
     #[pyo3(get)]
     pub proof_type: String,
 
-    /// Proof details as a JSON-compatible Python object. Contains the
-    /// Merkle path (for inclusion proofs) or sorted neighbors (for
-    /// absence proofs).
+    /// Proof material as a JSON-compatible Python object: the Merkle path
+    /// (for inclusion proofs) or the two sorted neighbours with their own
+    /// inclusion proofs (for absence proofs).
     #[pyo3(get)]
     pub details: PyObject,
 }
@@ -115,10 +136,7 @@ pub struct PyProof {
 #[pymethods]
 impl PyProof {
     fn __repr__(&self) -> String {
-        format!(
-            "Proof(verified={}, proof_type={:?})",
-            self.verified, self.proof_type
-        )
+        format!("Proof(proof_type={:?})", self.proof_type)
     }
 }
 
@@ -653,35 +671,14 @@ fn event_log_verify_impl(
 
             let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index)
                 .map_err(|e| ScpPyError::context(format!("inclusion proof failed: {e}")))?;
-            let verified = scp_event_log::proof::verify_inclusion(&proof);
 
-            let path_steps: Vec<serde_json::Value> = proof
-                .path
-                .iter()
-                .map(|step| {
-                    let direction = match step.direction {
-                        scp_event_log::proof::Direction::Left => "left",
-                        scp_event_log::proof::Direction::Right => "right",
-                    };
-                    serde_json::json!({
-                        "sibling_hash": encode_hex(&step.sibling_hash),
-                        "direction": direction,
-                    })
-                })
-                .collect();
-
-            let details_json = serde_json::json!({
-                "leaf_index": proof.leaf_index,
-                "leaf_hash": encode_hex(&proof.leaf_hash),
-                "root": encode_hex(&proof.root),
-                "path": path_steps,
-                "path_length": proof.path.len(),
-                "leaf_count": leaf_count,
-            });
+            let mut details_json = scp_ffi_common::event_log::inclusion_proof_json(&proof);
+            if let Some(obj) = details_json.as_object_mut() {
+                obj.insert("leaf_count".to_owned(), leaf_count.into());
+            }
             let details = json_to_py_dict(py, &details_json)?;
 
             Ok(PyProof {
-                verified,
                 proof_type: "inclusion".to_owned(),
                 details,
             })
@@ -701,42 +698,22 @@ fn event_log_verify_impl(
             let proof = scp_event_log::proof::prove_absence(&log, &event_hash)
                 .map_err(|e| ScpPyError::context(format!("absence proof failed: {e}")))?;
 
-            let lower = proof.lower.as_ref().map(|lwp| {
-                serde_json::json!({
-                    "leaf_hash": encode_hex(&lwp.leaf_hash),
-                    "leaf_index": lwp.leaf_index,
-                })
-            });
-
-            let upper = proof.upper.as_ref().map(|uwp| {
-                serde_json::json!({
-                    "leaf_hash": encode_hex(&uwp.leaf_hash),
-                    "leaf_index": uwp.leaf_index,
-                })
-            });
-
-            // Verify the neighbor inclusion proofs.
-            let lower_verified = proof
-                .lower
-                .as_ref()
-                .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
-            let upper_verified = proof
-                .upper
-                .as_ref()
-                .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
-            let verified = lower_verified && upper_verified;
-
+            // Both bracketing neighbours ship their FULL inclusion proofs
+            // (sibling path + root), so the neighbour-inclusion half of the
+            // claim is checkable off-box against the reported `root`. Shipping
+            // only `leaf_hash` + `leaf_index` — as this arm used to — left the
+            // recipient nothing to check while the response still carried a
+            // producer-set `verified` flag.
             let details_json = serde_json::json!({
                 "query_hash": encode_hex(&proof.query_hash),
                 "root": encode_hex(&proof.root),
                 "leaf_count": proof.leaf_count,
-                "lower": lower,
-                "upper": upper,
+                "lower": scp_ffi_common::event_log::absence_neighbor_json(proof.lower.as_ref()),
+                "upper": scp_ffi_common::event_log::absence_neighbor_json(proof.upper.as_ref()),
             });
             let details = json_to_py_dict(py, &details_json)?;
 
             Ok(PyProof {
-                verified,
                 proof_type: "absence".to_owned(),
                 details,
             })

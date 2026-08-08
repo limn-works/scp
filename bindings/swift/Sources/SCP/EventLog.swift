@@ -115,9 +115,16 @@ public nonisolated struct EventLog: Sendable {
 
     /// Generates a Merkle inclusion proof for the event at the given index.
     ///
+    /// Throwing IS the negative answer: a leaf index the authoritative log
+    /// cannot prove raises rather than returning an unproven ``Proof``. The
+    /// returned ``Proof/detailsJson`` carries the full Merkle material — leaf
+    /// hash, sibling path with per-step direction, and the root the path
+    /// reaches — for a recipient to re-verify independently.
+    ///
     /// - Parameter leafIndex: The index of the event to prove inclusion for.
-    /// - Returns: A ``Proof`` with the Merkle path and verification status.
-    /// - Throws: ``ScpError/Context(msg:code:)`` if proof generation fails.
+    /// - Returns: A ``Proof`` carrying the Merkle path.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if proof generation fails, or
+    ///   `SCP-CTX-2138` if the authoritative event log is unreachable.
     public func proveInclusion(leafIndex: UInt64) async throws -> Proof {
         guard let contextHandle = handle.contextHandle else {
             throw ScpError.Context(
@@ -129,13 +136,13 @@ public nonisolated struct EventLog: Sendable {
         return try await scp.eventLogVerify(handle: contextHandle, claimJson: claimJson)
     }
 
-    /// Verifies a Merkle inclusion proof.
-    ///
-    /// - Parameter proof: The proof to verify.
-    /// - Returns: `true` if the proof is valid.
-    public static func verifyInclusion(_ proof: Proof) -> Bool {
-        proof.verified
-    }
+    // `verifyInclusion(_ proof: Proof) -> Bool` used to live here, returning
+    // `proof.verified`. It verified nothing: `verified` was a producer-set
+    // constant `true` on every success path, so a "verifier" that read it back
+    // was a false guarantee wearing a verification name. It is deleted along
+    // with the field. Use `proveInclusion` throwing as the negative answer, and
+    // re-derive the root from `Proof.detailsJson` when independent verification
+    // is required.
 }
 
 // MARK: - Event Log Checkpoint (free function)

@@ -1221,11 +1221,10 @@ export function createNativeBridge(scp: SCP): Bridge {
         native.eventLogVerify as (
           h: BridgeContextHandle,
           c: string,
-        ) => Promise<{ verified: boolean; proofType: string; detailsJson: string }>
+        ) => Promise<{ proofType: string; detailsJson: string }>
       )(handle, claimJson);
       // NAPI returns detailsJson as a JSON string; parse into the details object.
       return {
-        verified: raw.verified,
         proofType: raw.proofType as "inclusion" | "absence",
         details: safeJsonParse(raw.detailsJson, "eventLogVerify") as Readonly<
           Record<string, unknown>

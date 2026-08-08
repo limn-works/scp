@@ -1306,8 +1306,11 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       );
 
       const proof = await napi.eventLogVerify(ctx, { type: "inclusion", leafIndex: 0 });
-      expect(proof.verified).toBe(true);
       expect(proof.proofType).toBe("inclusion");
+      // Success IS the positive answer — a rejected claim throws. What the
+      // caller can actually check is the shipped Merkle material.
+      expect(typeof proof.details.root).toBe("string");
+      expect(Array.isArray(proof.details.path)).toBe(true);
     });
 
     test("creates a checkpoint (via DID registry lookup)", async () => {

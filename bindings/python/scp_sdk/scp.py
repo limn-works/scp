@@ -2180,7 +2180,6 @@ class SCP:
 
         raw = await asyncio.to_thread(self._native.event_log_verify, context_id, claim)
         return Proof(
-            verified=raw.verified,
             proof_type=raw.proof_type,
             details=raw.details,
         )

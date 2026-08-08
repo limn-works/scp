@@ -151,21 +151,39 @@ class Event:
 
 @dataclass
 class Proof:
-    """A verification proof from the event log.
+    """A Merkle proof from the event log.
 
-    Contains the verification result, the type of proof (inclusion or
-    absence), and proof details.
+    Carries the proof type and the proof material. Mirrors ``PyProof`` from
+    ``_scp_core``.
 
-    Mirrors ``PyProof`` from ``_scp_core``.
+    **There is no ``verified`` field.** This type used to carry
+    ``verified: bool``. It was a constant ``True`` on every success path: the
+    bridge generated the proof and then "verified" that same proof against the
+    same snapshot, so the check was tautological and only success-vs-raise ever
+    carried information. A boolean named ``verified`` that no independent
+    verifier computed is a false guarantee, so it is gone —
+    :meth:`~scp_sdk.scp.SCP.event_log_verify` raising IS the negative answer.
+
+    Real verification is done by the recipient from :attr:`details`, which
+    carries the full Merkle material for both proof types: the leaf hash, the
+    sibling path with per-step direction, and the root the path reaches. An
+    absence answer carries the same complete material for BOTH bracketing
+    neighbours (under ``details["lower"]["inclusion_proof"]`` and
+    ``details["upper"]["inclusion_proof"]``).
+
+    An ``"absence"`` answer lets a recipient check that both bracketing leaves
+    really are in the tree the reported ``root`` commits to, and that the
+    queried hash sorts strictly between them. It does NOT establish that the two
+    neighbours are *adjacent* in sorted order: the log's Merkle root commits to
+    append order, and the sorted index the neighbours are drawn from is local
+    state the root does not cover.
     """
-
-    #: ``True`` if the claim was verified successfully.
-    verified: bool
 
     #: The proof type: ``"inclusion"`` or ``"absence"``.
     proof_type: str
 
-    #: Proof details (Merkle path for inclusion, sorted neighbors for absence).
+    #: Proof material: the Merkle path (inclusion) or the two sorted neighbours
+    #: with their own inclusion proofs (absence).
     details: Any
 
 
