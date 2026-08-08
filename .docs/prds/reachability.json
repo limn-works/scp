@@ -6,7 +6,7 @@
       "id": "gate-reachability-1",
       "name": "NAT Traversal + Transport",
       "priority": "P1",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SCP-232",
         "SCP-233",
@@ -20,7 +20,7 @@
       "id": "gate-reachability-2",
       "name": "DID Resolution Layers",
       "priority": "P1",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SCP-238",
         "SCP-239",
@@ -33,7 +33,7 @@
       "id": "gate-reachability-3",
       "name": "Reachability Hardening",
       "priority": "P2",
-      "status": "done",
+      "status": "in-progress",
       "stories": [
         "SCP-242",
         "SCP-243",
@@ -50,7 +50,7 @@
       "gate": "gate-reachability-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/nat/mod.rs",
         "crates/scp-transport/src/nat/stun.rs",
@@ -58,13 +58,13 @@
       ],
       "description": "Implement STUN binding requests (RFC 8489) in scp-transport to determine NAT type and external address on startup. NAT type classification (full-cone, address-restricted, port-restricted, symmetric) drives reachability tier selection (§10.12.1). STUN probing is performed against known SCP relays that serve as STUN endpoints. The result determines whether hole punching (Tier 2) is viable or bridge fallback (Tier 3) is required. 25-second keepalive maintains NAT mapping for non-symmetric NATs.",
       "acceptanceCriteria": [
-        "STUN binding request sent to at least one STUN-capable relay on startup",
+        "A STUN Binding request is sent on startup to at least one STUN-capable SCP relay: the endpoint set fed to NatProber is sourced from the §18.5.1 relay bootstrap set rather than hardcoded third-party STUN IPs, and at least one such endpoint is a relay running the SCP STUN service (SCP-237)",
         "NAT type classified as one of: full-cone, address-restricted, port-restricted, symmetric",
         "External IP and port extracted from STUN binding response",
-        "25-second keepalive packets sent to maintain NAT mapping when NAT is non-symmetric",
+        "25-second keepalive packets are actually sent to maintain the NAT mapping when NAT is non-symmetric: run_keepalive_loop (or NatKeepalive::send) has at least one non-test caller — the tier-selection path spawns it after selecting ReachabilityTier::Stun",
         "Symmetric NAT detection triggers fallback signal (no hole punch attempted)",
         "Unit test: mock STUN server returns known binding response, NAT type is correctly classified",
-        "Unit test: keepalive timer fires at 25-second interval"
+        "Unit test drives the PRODUCT keepalive loop (run_keepalive_loop) under tokio::time::pause() and asserts a mock server receives a second keepalive packet exactly one 25-second interval after the first — constructing a separate tokio::time::interval inside the test does not satisfy this"
       ],
       "actionItems": [
         "Add nat module to scp-transport with stun and types submodules",
@@ -87,9 +87,29 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-transport"
+        "crate": "scp-transport",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". AC1 is a false done in the relay-reachability class; AC4/AC7 are a false done of the dead-code + gamed-test kind. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_unmet": [
+          {
+            "criterion": "AC1 — STUN request sent to a STUN-capable RELAY",
+            "evidence": "build_stun_endpoints (crates/scp-node/src/lib.rs:1756-1783) returns DEFAULT_STUN_ENDPOINTS (lib.rs:1674-1677) = hardcoded 74.125.250.129:19302 / 64.233.163.127:19302 (Google STUN). No SCP relay can serve STUN (SCP-237 AC1/AC4 unmet) and there is no bootstrap relay set to draw one from (DefaultRelayResolver / FALLBACK_RELAYS, crates/scp-transport/src/config.rs, have zero non-test construction sites).",
+            "owner": "Relay STUN service: SCP-237. Bootstrap relay set: SCP-RELAYRES-007 (.docs/prds/relay-did-resolution.json) — external + bootstrap relay set: NodeConfig relay-URL field and the §18.5.1 five-level priority chain"
+          },
+          {
+            "criterion": "AC4 — 25-second keepalive maintains the NAT mapping",
+            "evidence": "run_keepalive_loop (crates/scp-transport/src/nat/stun.rs:421) and NatKeepalive (stun.rs:364) have ZERO callers outside stun.rs's own tests and the re-exports at crates/scp-transport/src/nat/mod.rs:43-44 and crates/scp-transport/src/lib.rs:82. DefaultNatStrategy::select_tier returns ReachabilityTier::Stun (crates/scp-node/src/lib.rs:1901-1921) without spawning any keepalive task.",
+            "owner": "SCP-232 (this story)"
+          },
+          {
+            "criterion": "AC7 — unit test that the keepalive timer fires at 25s",
+            "evidence": "keepalive_fires_at_25_second_interval (crates/scp-transport/src/nat/stun.rs:672) never invokes run_keepalive_loop: at stun.rs:688 it constructs its OWN tokio::time::interval(KEEPALIVE_INTERVAL), advances time, and asserts elapsed >= KEEPALIVE_INTERVAL — it tests tokio, not the product. The product loop at stun.rs:421-441 is untested.",
+            "owner": "SCP-232 (this story)"
+          }
+        ],
+        "flagged_ac_precision_gap": "AC2 (\"NAT type classified as one of: full-cone, address-restricted, port-restricted, symmetric\") is literally satisfied — all four variants exist at crates/scp-transport/src/nat/types.rs:26-36 — but no classification path can ever produce FullCone or PortRestricted: classify_from_multiple_responses (crates/scp-transport/src/nat/mod.rs:503-534) yields only Symmetric or AddressRestricted, and the single-STUN path hardcodes AddressRestricted (nat/mod.rs:270). NatType::FullCone / NatType::PortRestricted appear only inside types.rs's test module. Recorded rather than rewritten: tightening the criterion to demand all four classifications would ADD scope beyond what §10.12.1 was storied for, which is a decision for the human, not this audit."
       },
-      "result": "STUN NAT type probing implemented: NatProber, NatType enum, RFC 8489 codec, 25s keepalive, 32 tests"
+      "result": "PARTIAL. NatProber, the NatType enum, the RFC 8489 codec and multi-STUN classification are real and production-driven (crates/scp-node/src/lib.rs:3321 -> :1881). NOT met: the probe targets hardcoded Google STUN IPs (lib.rs:1674-1677), not a STUN-capable SCP relay (no relay serves STUN — SCP-237 — and no bootstrap relay set exists); the 25s keepalive loop is never spawned (run_keepalive_loop, crates/scp-transport/src/nat/stun.rs:421, has zero callers), so the NAT mapping being advertised in the DID document is left to expire; and the keepalive test does not drive the product loop."
     },
     {
       "id": "SCP-233",
@@ -97,7 +117,7 @@
       "gate": "gate-reachability-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/nat/upnp.rs",
         "crates/scp-transport/src/nat/mod.rs"
@@ -108,7 +128,7 @@
         "NAT-PMP/PCP port mapping attempted if UPnP-IGD fails or is unavailable",
         "External IP and port extracted from successful mapping response",
         "Lease renewal scheduled at 50% of the mapping TTL",
-        "Mapping loss detected and triggers NatTierChange event",
+        "Mapping loss is detected and emits NatTierChange::MappingLost on the loop the node actually runs: the production renewal loop (run_mapping_renewal_loop) emits the event when renewal and re-acquisition both fail — satisfying this only in PortMappingManager::spawn_renewal_loop, which has no production construction site, does not count",
         "Fallthrough to Tier 2 (STUN) when both UPnP and NAT-PMP fail",
         "Unit test: mock UPnP gateway returns mapping, external address is correct",
         "Unit test: lease renewal fires at 50% TTL"
@@ -131,9 +151,19 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-transport"
+        "crate": "scp-transport",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". AC5 is unmet: the tier-change event the story promises is emitted only by a type that is never constructed in production.",
+        "criteria_unmet": [
+          {
+            "criterion": "AC5 — mapping loss triggers a NatTierChange event",
+            "evidence": "NatTierChange::MappingLost is sent at exactly one place, crates/scp-transport/src/nat/upnp.rs:431-437, inside PortMappingManager::spawn_renewal_loop. Every PortMappingManager::new is at upnp.rs:1035+, after #[cfg(test)] at upnp.rs:907; outside upnp.rs the type appears only in the two re-exports (crates/scp-transport/src/lib.rs:83, nat/mod.rs:48) and a NOTE comment (crates/scp-node/src/lib.rs:3016). The loop the node actually spawns, run_mapping_renewal_loop (crates/scp-node/src/lib.rs:2322), logs a warning and backs off (lib.rs:2367-2374) with no channel and no event.",
+            "owner": "SCP-233 (this story)"
+          }
+        ],
+        "build_configuration_note": "AC1-AC3 are satisfied only under the non-default `upnp` cargo feature (crates/scp-node/Cargo.toml:120; there is no `default` feature list, and `upnp` appears nowhere in .github/, scripts/ or Dockerfile). Without it, the mapper vec is empty and try_tier1_upnp returns None immediately (crates/scp-node/src/lib.rs:1804-1806), so Tier 1 is inert in the shipped artifact. Recorded, not scored as an unmet AC: an opt-in cargo feature for an opt-in router capability is a legitimate build choice, not a nullifier — but it is a fact the story's `done` marking was hiding."
       },
-      "result": "UPnP/NAT-PMP port mapping implemented: PortMapper trait, PortMappingManager with fallback, 50% TTL renewal, NatTierChange events, 10 tests"
+      "result": "PARTIAL. PortMapper trait, UPnP-IGD and NAT-PMP/PCP implementations, 50%-TTL renewal (production loop: mapping_renewal_interval, crates/scp-node/src/lib.rs:2273; run_mapping_renewal_loop, lib.rs:2322, spawned at crates/scp-node/src/self_host.rs:1683) and STUN fallthrough all landed. NOT met: NatTierChange::MappingLost is emitted only from PortMappingManager::spawn_renewal_loop (crates/scp-transport/src/nat/upnp.rs:431-437), which has zero production construction sites; the production loop only logs and backs off (lib.rs:2367-2374)."
     },
     {
       "id": "SCP-234",
@@ -176,7 +206,9 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-transport"
+        "crate": "scp-transport",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_retained_done": "All 7 acceptance criteria verified met on origin/main @ d1ebc5ab9, including a genuine end-to-end ws:// delivery test (ws_relay_connect_sourced_validation_scp234, crates/scp-testing/tests/integration/encrypted_relay_roundtrip.rs:565, which asserts the received envelope's routing_id AND encrypted_blob). validate_relay_url has real production callers (crates/scp-transport/src/native/adapter.rs:174-181 via crates/scp-node/src/self_host.rs:611-620 and the three FFI transport modules)."
       },
       "result": "ws:// transport validation: RelayUrlSource enum, validate_relay_url enforcing §10.12.6 rules, 15 tests"
     },
@@ -186,23 +218,23 @@
       "gate": "gate-reachability-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-node/src/lib.rs"
       ],
       "description": "Add .no_domain() to ApplicationNodeBuilder (§10.12.8). When set: skip ACME TLS provisioning, probe NAT type via STUN, attempt UPnP (Tier 1), fallback to STUN address (Tier 2), register with bridge (Tier 3), publish DID document with ws:// relay URL, do NOT serve .well-known/scp. Also adds .stun_server() and .bridge_relay() builder methods for override configuration. This is the zero-config deployment path for self-hosted relays behind residential NAT.",
       "acceptanceCriteria": [
-        ".no_domain() method exists on ApplicationNodeBuilder and sets zero-config NAT-traversed mode",
-        ".stun_server(url) method exists and overrides the default STUN endpoint",
-        ".bridge_relay(url) method exists and overrides the default bridge relay",
-        "When .no_domain() is set, ACME TLS provisioning is skipped entirely",
-        "When .no_domain() is set, .well-known/scp is NOT served",
-        "When .no_domain() is set, NAT type is probed via STUN on build()",
-        "When .no_domain() is set, DID document is published with ws:// relay URL",
-        "When .domain() is set and succeeds, wss:// is used (existing behavior, no regression)",
-        "When .domain() is set and fails (DNS/ACME), automatic fallthrough to Tiers 1-3",
-        "Unit test: .no_domain() build skips TLS and publishes ws:// URL",
-        "Unit test: .domain() fallthrough on ACME failure probes NAT"
+        "Zero-config NAT-traversed mode is selectable from the CURRENT node configuration surface: Reach::NatTraversal exists on NodeConfig.reach and routes Node::start to build_node_no_domain (the .no_domain() builder method was removed with ApplicationNodeBuilder in ADR-052 Phase B-P3a)",
+        "The default STUN endpoint is overridable from the current node configuration surface: NatSlot::Tuned { stun_server } is threaded end-to-end to build_stun_endpoints",
+        "The Tier 3 bridge relay is overridable AND has a real default to override: NatSlot::Tuned { bridge_relay } is threaded to the Tier-3 branch, and when it is unset the tier-selection path resolves a bridge relay from the §18.5.1 bootstrap set instead of erroring with \"no bridge relay configured\"",
+        "When the reach is Reach::NatTraversal, ACME TLS provisioning is skipped entirely",
+        "When the reach is NAT-traversed, .well-known/scp is NOT served: an HTTP GET of /.well-known/scp against the started node's router returns 404 — asserting node.domain().is_none() does not satisfy this",
+        "When the reach is Reach::NatTraversal, NAT type is probed via STUN during Node::start",
+        "In NAT-traversed mode the DID document carrying the ws:// relay service endpoint is published per §3.10.5 step 3 to BOTH layers — a relay PUBLISH at did_routing_id AND a DHT publish — not the DHT arm alone",
+        "When the reach is Reach::Domain and TLS provisioning succeeds, wss:// is used (existing behavior, no regression)",
+        "When the reach is Reach::Domain and TLS provisioning fails (DNS/ACME), automatic fallthrough to Tiers 1-3",
+        "Unit test: a Reach::NatTraversal build skips TLS and publishes a ws:// relay URL",
+        "Unit test: Reach::Domain fallthrough on ACME failure probes NAT"
       ],
       "actionItems": [
         "Add no_domain(), stun_server(), bridge_relay() methods to ApplicationNodeBuilder",
@@ -226,9 +258,29 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-node"
+        "crate": "scp-node",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". Three unmet criteria, one of them (AC7) in the relay-reachability class and one (AC5) backed by a tautological test. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_unmet": [
+          {
+            "criterion": "AC3 — a default bridge relay exists to override",
+            "evidence": "DefaultNatStrategy.bridge_relay (crates/scp-node/src/lib.rs:1700) is None at both production construction sites (crates/scp-node/src/config.rs:670, crates/scp-node/src/self_host.rs:2180); NatSlot::Tuned is constructed only in a test (crates/scp-node/src/config.rs:1787). Tier 3 therefore always ends at crates/scp-node/src/lib.rs:1933-1936 with \"all reachability tiers failed: NAT is symmetric and no bridge relay configured\".",
+            "owner": "SCP-RELAYRES-007 (.docs/prds/relay-did-resolution.json) — external + bootstrap relay set: NodeConfig relay-URL field and the §18.5.1 five-level priority chain (the §18.5.1 set a default bridge relay must come from)"
+          },
+          {
+            "criterion": "AC5 — .well-known/scp is NOT served in NAT-traversed mode",
+            "evidence": "build_scp_router_with_surface merges http::well_known_router unconditionally for both PublicSurface::Full and PublicSurface::SelfHost (crates/scp-node/src/lib.rs:552, 565, 574). The test no_domain_does_not_serve_well_known (lib.rs:4527-4547) issues no HTTP request; it asserts node.domain().is_none() and its own comment concedes \"The well_known_router still works as an axum router\".",
+            "owner": "SCP-235 (this story)"
+          },
+          {
+            "criterion": "AC7 — the DID document is published to both layers per §3.10.5",
+            "evidence": "publish_did_document_for_mode (crates/scp-node/src/lib.rs:3333) reaches only DidMethod::publish (lib.rs:3274-3277), i.e. the Mainline DHT via pkarr. No relay-publication arm is wired anywhere (RepublishManager has zero construction sites; the only RelayPublisher impl is testing-gated). Additionally, under the production default DhtMode::Disabled (crates/scp-node/src/config.rs:453) the DHT publish is skipped too (lib.rs:3256-3263), so on a default build the ws:// URL is constructed and stored but reaches no layer at all.",
+            "owner": "SCP-RELAYRES-004 (.docs/prds/relay-did-resolution.json) — relay WRITE path: real production RelayPublisher, production RepublishManager wiring, and the republish-loop signature/sequence-drop fix (relay PUBLISH) and SCP-RELAYRES-006 (.docs/prds/relay-did-resolution.json) — relay-client binding: binds ONE live relay connection onto both TransportRelayQuerier and TransportRelayPublisher and replaces NoOpRelayQuerier (the relay to publish to)"
+          }
+        ],
+        "criteria_reworded": "AC1-AC3 named .no_domain() / .stun_server() / .bridge_relay() on ApplicationNodeBuilder, a type that no longer exists anywhere in crates/ (deleted in ADR-052 Phase B-P3a, PR #1815; see .docs/guides/self-hosting-a-website-on-scp.md:393). As written they were permanently unsatisfiable and un-checkable, so they were repointed at the surviving configuration surface (Reach::NatTraversal, NatSlot::Tuned) without weakening what they demand. AC5 and AC7 were reworded to be observable rather than inferential. No criterion was deleted. Every remaining criterion that named .no_domain() / .domain() / .acme_email() was repointed at the surviving configuration surface (Reach::NatTraversal, Reach::Domain, TlsMode::Acme) for the same reason: a criterion that names a deleted symbol cannot be checked. Semantics unchanged."
       },
-      "result": "Implemented .no_domain() ApplicationNode builder mode with NatProber, PortMappingManager, and bridge relay integration. Commit 1a0e3b0."
+      "result": "PARTIAL. NAT-traversed mode, NAT probing on build, the ws:// relay URL, the ACME-failure fallthrough and the wss:// domain path are all real and production-wired (crates/scp-node/src/config.rs:840-869, crates/scp-node/src/lib.rs:3318-3333). NOT met: the well-known route is merged unconditionally for BOTH public surfaces (crates/scp-node/src/lib.rs:552-575) and its \"proof\" test asserts only node.domain().is_none() (lib.rs:4527-4547); the DID document is published to the DHT only, never to a relay; and there is no default bridge relay to override. The .no_domain()/.stun_server()/.bridge_relay() builder methods named by the original criteria no longer exist (ADR-052 Phase B-P3a)."
     },
     {
       "id": "SCP-236",
@@ -236,7 +288,7 @@
       "gate": "gate-reachability-1",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/relay/bridge.rs",
         "crates/scp-transport/src/relay/operations.rs",
@@ -246,12 +298,12 @@
       "description": "Implement the BRIDGE operation (§10.12.4) as Tier 3 fallback for symmetric NAT (~15% of home routers). A willing SCP relay acts as a transparent bridge, proxying blobs bidirectionally to the target self-hosted relay. The bridge does NOT inspect, modify, or cache proxied blobs. Bridge relays see the same metadata as any relay (§9.9.1). Any SCP relay MAY offer bridge service via supports_bridge configuration. Phase 3 component.",
       "acceptanceCriteria": [
         "BRIDGE operation defined with target_routing_id and target_relay_hint fields",
-        "Bridge relay opens connection to target self-hosted relay and proxies blobs bidirectionally",
+        "Bridge relay opens connection to target self-hosted relay and proxies blobs bidirectionally, AND the self-hosted relay dials the bridge and sends ClientMessage::BridgeRegister from non-test code — a test asserts BOTH directions of the proxy (peer to target and target to peer)",
         "Bridge does not inspect, modify, or cache proxied blobs (transparent pipe)",
-        "Bridge relay exposes supports_bridge configuration flag",
-        "Bridge is substitutable: SDK discovers alternative bridge on failure",
+        "Bridge relay exposes a supports_bridge configuration flag reachable from an operator surface: RelayConfig.bridge is settable from scp-node's relay config or scp-relay's CLI/env, and BridgeRole::Enabled has at least one non-test assignment",
+        "Bridge is substitutable: on bridge failure the self-hosted relay selects an alternative bridge from a candidate bridge-relay SET (not a single Option<String>) and re-registers — a non-test implementation of candidate selection exists (e.g. a non-test caller of parse_bridge_target), and the candidate source is the §18.5.1 relay set",
         "Unit test: BRIDGE request proxies blobs between client and target relay",
-        "Unit test: bridge failure triggers discovery of alternative bridge relay",
+        "Unit test with TWO bridge relays: the first bridge fails, the SDK selects the second and re-registers, asserted by the second bridge observing a BRIDGE_REGISTER",
         "Integration test: end-to-end message delivery through bridge relay"
       ],
       "actionItems": [
@@ -273,9 +325,38 @@
       ],
       "details": {
         "phase": 3,
-        "crate": "scp-transport"
+        "crate": "scp-transport",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". False done in the relay-set class: bridge substitutability presupposes a candidate bridge-relay set, which does not exist. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_unmet": [
+          {
+            "criterion": "AC2 (register half) — the self-hosted relay never dials a bridge",
+            "evidence": "No production code sends ClientMessage::BridgeRegister. Every non-test occurrence only MATCHES the variant for ref-id extraction (crates/scp-transport/src/native/client.rs:1301, udp/listener.rs:882,1166, quic/listener.rs:714) or rejects it (webtransport/session.rs:377). The only sends are test helpers (native/server.rs:3483, udp/listener.rs:2000). The Tier-3 path in crates/scp-node/src/lib.rs:1927-1931 merely returns ReachabilityTier::Bridge { bridge_url } and publishes that URL; it never connects or registers.",
+            "owner": "SCP-236 (this story — residual client half)"
+          },
+          {
+            "criterion": "AC4 — supports_bridge reachable from an operator surface",
+            "evidence": "RelayConfig.bridge exists (crates/scp-transport/src/native/server.rs:175, BridgeRole at :77-85) and defaults to Disabled (:206), but BridgeRole::Enabled is assigned only at server.rs:3455 and :3549, both after #[cfg(test)] at server.rs:1851. crates/scp-node/src/config.rs builds RelayConfig with ..RelayConfig::default() and never sets `bridge` (its only bridge-* references are bridge_secret, an unrelated HTTP bridge). crates/scp-relay/src/main.rs contains zero occurrences of \"bridge\".",
+            "owner": "SCP-236 (this story) for the config field; the §18.5.1 relay set it must draw candidates from is SCP-RELAYRES-007 (.docs/prds/relay-did-resolution.json) — external + bootstrap relay set: NodeConfig relay-URL field and the §18.5.1 five-level priority chain"
+          },
+          {
+            "criterion": "AC5 — bridge substitutability / alternative-bridge discovery",
+            "evidence": "No implementation exists. parse_bridge_target (crates/scp-transport/src/relay/bridge.rs:530) and is_bridge_url (:548) — the DID-document-to-bridge-candidate decoders — have zero callers outside their own unit tests. The candidate source is a single operator-supplied Option<String> (DefaultNatStrategy.bridge_relay, crates/scp-node/src/lib.rs:1700), never a set, and it is None at both production construction sites (crates/scp-node/src/config.rs:670, crates/scp-node/src/self_host.rs:2180), so Tier 3 always fails at crates/scp-node/src/lib.rs:1933-1936 (\"no bridge relay configured\") rather than trying another bridge. The only trace of the behaviour is a doc comment at crates/scp-transport/src/relay/bridge.rs:44-45.",
+            "owner": "SCP-RELAYRES-007 (.docs/prds/relay-did-resolution.json) — external + bootstrap relay set: NodeConfig relay-URL field and the §18.5.1 five-level priority chain supplies the candidate set; selection/failover logic remains SCP-236's own residual scope."
+          },
+          {
+            "criterion": "AC7 — unit test that bridge failure triggers discovery of an alternative bridge",
+            "evidence": "No such test exists; there is no test anywhere in the repo involving two bridge relays. The nearest, bridge_deregisters_on_disconnect (crates/scp-transport/src/native/server.rs:3670), asserts only that the bridge forgets a registration.",
+            "owner": "SCP-236 (this story)"
+          }
+        ],
+        "criteria_met": [
+          "AC1 BRIDGE op fields — target_routing_id (crates/scp-relay-client/src/protocol.rs:315), target_relay_hint (:298).",
+          "AC3 transparent pipe — crates/scp-transport/src/native/server.rs:1809-1812 (payload forwarded verbatim, no storage write); asserted at server.rs:3639.",
+          "AC6/AC8 forwarding test — bridge_data_forwarded_to_registered_relay (crates/scp-transport/src/native/server.rs:3600) drives a real RelayServer over real WebSockets. Caveat: it lives in the crate's #[cfg(test)] mod tests rather than crates/scp-testing/tests/integration/, the \"self-hosted relay\" is a raw WS client rather than a RelayServer, and only the peer-to-target direction is asserted."
+        ]
       },
-      "result": "Implemented BRIDGE relay operation with bidirectional blob proxying, supports_bridge config, and bridge discovery/failover (88e4aaa). Wired BridgeRegistry into RelayServer: handle_bridge_register with Ed25519 auth, handle_bridge_data with transparent forwarding, connection cleanup on disconnect, 6 integration tests. Closes #271."
+      "result": "PARTIAL. The bridge SIDE is real: BRIDGE wire ops (target_routing_id, target_relay_hint), BridgeRegistry, transparent forwarding with connection cleanup, Ed25519 auth (SCP-247), and a WebSocket-level forwarding test (crates/scp-transport/src/native/server.rs:3600 bridge_data_forwarded_to_registered_relay). NOT implemented: bridge discovery/failover (the prior claim of \"bridge discovery/failover (88e4aaa)\" was false — the only trace is prose at crates/scp-transport/src/relay/bridge.rs:44-45), the client half that sends BRIDGE_REGISTER, and any operator surface that can set BridgeRole::Enabled."
     },
     {
       "id": "SCP-237",
@@ -283,17 +364,17 @@
       "gate": "gate-reachability-1",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/relay/stun_service.rs",
         "crates/scp-transport/src/relay/mod.rs"
       ],
       "description": "Any SCP relay MAY serve as a STUN endpoint (§10.12.3). STUN service is lightweight, stateless, and uses a single UDP socket. Bootstrap relays (§18.5) MUST include at least one STUN-capable relay. Self-hosted relays MAY also offer STUN, creating a self-reinforcing network where more relays means more STUN servers available for NAT probing. Phase 3 component.",
       "acceptanceCriteria": [
-        "Relay exposes optional STUN service on a configurable UDP port",
+        "Relay exposes optional STUN service on a configurable UDP port: StunService has at least one non-test construction site and its UDP socket is bound and run/run_on_socket spawned from the relay's start path (RelayServer::start and/or scp-relay's main)",
         "STUN service handles RFC 8489 Binding requests and returns XOR-MAPPED-ADDRESS",
         "STUN service is stateless (no per-client state maintained)",
-        "STUN service is configurable: enable/disable via relay config",
+        "STUN service is configurable: enable/disable via relay config — StunServiceConfig (or its enabled/port fields) is a field of RelayConfig and is settable from an operator surface (scp-node's relay config or scp-relay's CLI/env), so enabled: true is reachable",
         "Unit test: STUN Binding request to relay returns correct XOR-MAPPED-ADDRESS",
         "Unit test: STUN service disabled when config flag is false"
       ],
@@ -313,9 +394,30 @@
       ],
       "details": {
         "phase": 3,
-        "crate": "scp-transport"
+        "crate": "scp-transport",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". False done in the relay-reachability class: this story's premise — that SCP relays serve STUN, and that \"Bootstrap relays (§18.5) MUST include at least one STUN-capable relay\" — is unrealisable, because no relay can enable the service and no bootstrap relay set exists. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_unmet": [
+          {
+            "criterion": "AC1 — relay exposes the STUN service on a UDP port",
+            "evidence": "`grep -rn 'StunService' crates --include='*.rs'` matches ONLY crates/scp-transport/src/relay/stun_service.rs. Every StunService::new is at stun_service.rs:522+, after #[cfg(test)] at stun_service.rs:402; run (:151) and run_on_socket (:191) have no non-test callers. `grep -in stun crates/scp-transport/src/native/server.rs` returns zero hits, as does crates/scp-relay/.",
+            "owner": "SCP-237 (this story — relay-server wiring)"
+          },
+          {
+            "criterion": "AC4 — enable/disable via relay config",
+            "evidence": "StunServiceConfig exists (crates/scp-transport/src/relay/stun_service.rs:87-97, default enabled: false at :99-107) but is not a field of RelayConfig (full field list crates/scp-transport/src/native/server.rs:125-184) nor of NodeConfig (crates/scp-node/src/config.rs:331-414), and crates/scp-relay/src/main.rs reads no STUN setting. No reachable surface can set enabled: true.",
+            "owner": "SCP-237 (this story — config surface)"
+          }
+        ],
+        "criteria_met": [
+          "AC2 RFC 8489 Binding + XOR-MAPPED-ADDRESS — handle_packet (crates/scp-transport/src/relay/stun_service.rs:211-223), parse_binding_request (:244). Correct, but reachable only through run/run_on_socket, which nothing calls.",
+          "AC3 stateless — struct StunService holds only its config (stun_service.rs:119-121); handle_packet takes &self and stores nothing.",
+          "AC5 unit test — stun_binding_request_returns_correct_xor_mapped_address (stun_service.rs:516), a real UDP round trip.",
+          "AC6 unit test — stun_service_disabled_returns_error (stun_service.rs:572), stun_service_disabled_on_socket_returns_error (:587), default_config_is_disabled (:671)."
+        ],
+        "downstream_note": "SCP-232 AC1 (\"STUN binding request sent to at least one STUN-capable relay on startup\") depends on this story: because no relay serves STUN, the node probes hardcoded third-party Google STUN IPs instead."
       },
-      "result": "STUN service on relays: StunService with RFC 8489 Binding handler, XOR-MAPPED-ADDRESS, configurable, 15 tests"
+      "result": "PARTIAL. StunService implements the RFC 8489 Binding handler correctly and statelessly, with real-UDP unit tests. It is not wired: StunService has zero references anywhere outside its own file, StunServiceConfig is not a field of RelayConfig, and neither scp-relay nor scp-node exposes a STUN setting — so no relay can ever serve STUN and enabled: true is unreachable."
     },
     {
       "id": "SCP-238",
@@ -323,7 +425,7 @@
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-identity/src/resolution.rs"
       ],
@@ -334,7 +436,7 @@
         "Function is pure: no I/O, no state, deterministic output for same input",
         "Unit test: known DID string produces expected routing ID (golden test vector)",
         "Unit test: different DID strings produce different routing IDs (no collision)",
-        "Unit test: routing ID does not collide with context routing ID derivation for same input bytes"
+        "Unit test: routing ID does not collide with the CONTEXT routing ID derivation for the same input bytes — the test compares did_routing_id(x) against scp_protocol::context::context_routing_id(x) (SHA-256(\"scp:context-routing:\" || x)). The existing no_collision_with_broadcast_routing_id test compares against the BROADCAST derivation (plain SHA-256(x)) and does not satisfy this."
       ],
       "actionItems": [
         "Add resolution submodule to scp-core/src/identity/",
@@ -351,9 +453,18 @@
       ],
       "details": {
         "phase": "1-patch",
-        "crate": "scp-core"
+        "crate": "scp-core",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". Narrow correction: the derivation itself is complete and correct — only the last AC's named test is missing. No file in the repo references both did_routing_id and context_routing_id (`grep -rl did_routing_id crates --include='*.rs' | xargs grep -l context_routing_id` is empty), and resolution.rs contains no reference to the context derivation. The property holds by construction (distinct domain separators: \"scp:did:\" vs \"scp:context-routing:\", crates/scp-protocol/src/context/mod.rs:123-131), but prd.md requires every AC met before \"done\".",
+        "criteria_unmet": [
+          {
+            "criterion": "AC6 — no collision with the context routing ID derivation",
+            "evidence": "crates/scp-identity/src/resolution.rs:291-301 (no_collision_with_broadcast_routing_id) compares against SHA-256(input) — the BROADCAST derivation (§5.14, crates/scp-protocol/src/context/mod.rs:133+) — not the context derivation at crates/scp-protocol/src/context/mod.rs:123-131.",
+            "owner": "SCP-238 (this story — a single missing unit test)"
+          }
+        ]
       },
-      "result": "did_routing_id derivation: SHA-256(scp:did: || did_string) per §3.10.2, golden test vector, collision resistance tests"
+      "result": "did_routing_id derivation complete and correct: SHA-256(\"scp:did:\" || did_string) per §3.10.2 (crates/scp-identity/src/resolution.rs:56-61), golden test vector (resolution.rs:258), determinism (resolution.rs:270), distinctness (resolution.rs:279) and a broadcast-collision test (resolution.rs:291). The context-routing-ID collision test the final AC names does not exist."
     },
     {
       "id": "SCP-239",
@@ -361,7 +472,7 @@
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-identity/src/resolution.rs",
         "crates/scp-identity/src/republish.rs"
@@ -370,13 +481,14 @@
       "acceptanceCriteria": [
         "DID document PUBLISH uses routing_id = did_routing_id(did_string)",
         "DID document PUBLISH uses blob_ttl = 604800 (7 days)",
-        "DID document blob contains BEP44-signed DID document bytes",
+        "The relay PUBLISH blob is the DID-record frame (§9.10.12) carrying (public_key, seq, signature, value): a test decodes the published blob with DidRecordV1::decode and BEP44-verifies (value, signature, seq) against the DID-derived key. relay_republish_loop MUST NOT publish bare entry.document_bytes — doing so drops entry.signature and entry.sequence, which RepublishEntry already carries.",
         "RepublishManager schedules relay republishing on a 6-day cycle",
         "RepublishManager publishes to identity's own relays AND bootstrap relays",
-        "DHT publishing continues unchanged (anti-segmentation invariant: both layers MUST be published to)",
-        "Disabling either publishing layer requires explicit opt-out with a warning log",
+        "DHT publishing continues unchanged: the 2-hour dht_republish_loop still runs on every cycle (no regression)",
+        "Anti-segmentation invariant (§3.10.6): a production RepublishManager is constructed on the node's serve path and publishes to BOTH layers on every cycle — `grep -rn 'RepublishManager' crates --include='*.rs'` matches at least one non-test construction site, and a test asserts a started node lands a DID record in its own relay's blob store AND in the DHT.",
+        "Disabling either publishing layer requires explicit opt-out AND emits the §3.10.6 warning unconditionally: RepublishConfig::disable_dht() and disable_relay() each log LAYER_DISABLED_WARNING via tracing::warn! on a default-constructed RepublishConfig, not only when an optional callback has been installed — a test asserts the warning is emitted with no callback configured.",
         "Unit test: PUBLISH operation sent with correct routing_id and blob_ttl",
-        "Unit test: republish timer fires at 6-day interval"
+        "Unit test drives relay_republish_loop under tokio::time::pause() and asserts a second PUBLISH occurs only after the derived 6-day interval (518400s) has elapsed — asserting the interval constant alone does not satisfy this."
       ],
       "actionItems": [
         "Add relay-based DID document publishing to RepublishManager",
@@ -400,9 +512,47 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-core"
+        "crate": "scp-core",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". This was a false done: 4 of 10 acceptance criteria are unmet and two of them were never satisfiable. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_met": [
+          "AC1 routing_id — relay_republish_loop computes did_routing_id(&entry.did) (crates/scp-identity/src/republish.rs:719); test relay_publish_uses_correct_routing_id_and_ttl (republish.rs:960).",
+          "AC2 blob_ttl — RELAY_BLOB_TTL_SECS = 604_800 (republish.rs:56) is the RepublishConfig default (republish.rs:268); test relay_publish_default_blob_ttl_is_seven_days (republish.rs:1012).",
+          "AC4 6-day cycle — RELAY_REPUBLISH_INTERVAL_SECS = 518_400 (republish.rs:51), derive_republish_interval (republish.rs:65), plumbed into the loop at republish.rs:582; test relay_default_republish_interval_is_six_days (republish.rs:1020).",
+          "AC6 DHT loop unchanged — dht_republish_loop (republish.rs:661) with the 2-hour REPUBLISH_INTERVAL_SECS (republish.rs:42), started at republish.rs:557.",
+          "AC9 PUBLISH-parameters unit test — relay_publish_uses_correct_routing_id_and_ttl (republish.rs:960)."
+        ],
+        "criteria_unmet": [
+          {
+            "criterion": "AC3 — relay blob must be the DidRecordV1 frame carrying (public_key, seq, signature, value)",
+            "evidence": "crates/scp-identity/src/republish.rs:724 publishes bare &entry.document_bytes; entry.signature ([u8;64], republish.rs:362) and entry.sequence (republish.rs:364) are dropped. The test at republish.rs:996 asserts only that the recorded blob equals the bytes it handed in, so it cannot detect the drop.",
+            "owner": "SCP-RELAYRES-004 (.docs/prds/relay-did-resolution.json) — relay WRITE path: real production RelayPublisher, production RepublishManager wiring, and the republish-loop signature/sequence-drop fix; frame primitive: SCP-RELAYRES-001 (.docs/prds/relay-did-resolution.json) — the DidRecordV1 DID-record relay frame (§9.10.12)"
+          },
+          {
+            "criterion": "AC5 — publishes to identity's own relays AND bootstrap relays",
+            "evidence": "Never satisfiable: no relay-client connection set has ever existed. The RelayPublisher trait (republish.rs:105) has exactly one impl, InMemoryRelayPublisher, gated #[cfg(any(test, feature=\"testing\"))] (republish.rs:166,200), plus AlwaysFailRelayPublisher inside mod tests (republish.rs:1253). Nothing in the trait or its callers distinguishes \"own\" from \"bootstrap\" relays, and no bootstrap relay set exists.",
+            "owner": "SCP-RELAYRES-006 (.docs/prds/relay-did-resolution.json) — relay-client binding: binds ONE live relay connection onto both TransportRelayQuerier and TransportRelayPublisher and replaces NoOpRelayQuerier; bootstrap/external half: SCP-RELAYRES-007 (.docs/prds/relay-did-resolution.json) — external + bootstrap relay set: NodeConfig relay-URL field and the §18.5.1 five-level priority chain"
+          },
+          {
+            "criterion": "AC7 — anti-segmentation: both layers published to on every cycle by a production RepublishManager",
+            "evidence": "`grep -rn 'RepublishManager' crates --include='*.rs'` matches only the definition in crates/scp-identity/src/republish.rs, the re-export at crates/scp-identity/src/lib.rs:52, and two doc comments (crates/scp-identity/src/dht.rs:823, crates/scp-runtime/src/identity/custody_migration.rs:322). Every construction is inside republish.rs's own #[cfg(test)] mod tests (885, 907, 925, 942, 966, 1055, 1087, 1122, 1276). Independently corroborated by .docs/prds/adr062-capability-injection.json (SCP-CAPINJECT-011 description).",
+            "owner": "SCP-RELAYRES-004 (.docs/prds/relay-did-resolution.json) — relay WRITE path: real production RelayPublisher, production RepublishManager wiring, and the republish-loop signature/sequence-drop fix"
+          },
+          {
+            "criterion": "AC8 — disabling a layer must log the §3.10.6 warning",
+            "evidence": "RepublishConfig::layer_disabled_callback is Option and defaults to None (crates/scp-identity/src/republish.rs:267). disable_dht (:295-300) and disable_relay (:307-312) emit LAYER_DISABLED_WARNING only `if let Some(ref cb)`, so the default path logs nothing; there is no tracing::warn!. RepublishConfig has zero references anywhere outside republish.rs, so no production path can install a callback. Spec §3.10.6: \"the SDK MUST log a warning when either is disabled\".",
+            "owner": "SCP-239 (this story — remaining work is local to scp-identity)"
+          },
+          {
+            "criterion": "AC10 — unit test that the relay republish timer fires at the 6-day interval",
+            "evidence": "relay_default_republish_interval_is_six_days (crates/scp-identity/src/republish.rs:1020) asserts the constant and the config getter; it never drives relay_republish_loop and never advances time. No test in the crate advances a paused clock across the relay interval.",
+            "owner": "SCP-239 (this story — remaining work is local to scp-identity)"
+          }
+        ],
+        "criteria_reworded": "AC3, AC7(now AC8) and AC9(now AC10) were reworded to be mechanically checkable without weakening what they demand; the former compound criterion \"DHT publishing continues unchanged (anti-segmentation invariant: both layers MUST be published to)\" was split into two criteria per prd.md §Acceptance Criteria \"1:1 mapping from source requirements\". No criterion was deleted.",
+        "blocked_by_note": "blockedBy is deliberately NOT extended to SCP-RELAYRES-006/007: those two stories are not yet on main (.docs/prds/relay-did-resolution.json holds 001-005 there; 006/007 land with issue #482), and scripts/validate-prd.py check 5 rejects a blockedBy reference to a story that does not exist in any PRD file. Add the forward-only edge in the same change that lands 006/007."
       },
-      "result": "Extended RepublishManager with relay-based DID document publishing. 6-day cycle, own+bootstrap relays, anti-segmentation guard. Commit b5ce707."
+      "result": "PARTIAL. Relay routing_id/TTL/6-day-cycle derivation landed on RepublishManager (commit b5ce707), but the relay PUBLISH itself has never run in production: RepublishManager has zero construction sites outside its own unit tests, the only RelayPublisher impl is the #[cfg(any(test, feature=\"testing\"))] InMemoryRelayPublisher, the loop publishes bare document_bytes (dropping signature and sequence), and the anti-segmentation warning is a callback that is None by default. The prior claim of \"own+bootstrap relays, anti-segmentation guard\" was false."
     },
     {
       "id": "SCP-240",
@@ -410,18 +560,19 @@
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-identity/src/resolution.rs"
       ],
       "description": "Implement relay-based DID document resolution using existing QUERY operation (§3.10.4). Resolver computes did_routing_id, queries known SCP relays (identity's relays if known, else bootstrap relays), verifies BEP44 signature against the public key encoded in the DID string, and checks seq >= last_known_seq. This is the relay layer of the dual-layer resolution protocol. Cache results per §9.10.7 (24h active, 7d inactive).",
       "acceptanceCriteria": [
-        "QUERY operation sent with routing_id = did_routing_id(did_string) and limit = 1",
-        "Response blob parsed as BEP44-signed DID document",
+        "QUERY operation sent with routing_id = did_routing_id(did_string)",
+        "QUERY operation sent with limit = N (N = 16, MAX_CANDIDATES_PER_RELAY) per §3.10.2: limit = 1 is superseded because it cannot sift co-located candidates on a non-validating or foreign relay.",
+        "Response blob decoded as a DID-record frame (§9.10.12) into (value, signature, seq); a blob that fails to decode is discarded, never partially parsed (§3.10.4)",
         "BEP44 signature verified against public key extracted from DID string (z-base-32 decode)",
         "Sequence number checked: reject if seq < last_known_seq for this DID",
         "Resolved DID document cached with 24h active / 7d inactive TTL",
-        "Queries sent to identity's known relays first, then bootstrap relays",
+        "Relay selection follows §3.10.4 step 3a — the identity's published relays (from a previously cached DID document) if known, else bootstrap relays from §18.5.1 — AND the relay set is non-empty on the shipped path: the production DualLayerResolver is constructed with a real MultiRelayQuerier over a bound relay client and a non-empty relay URL list (not NoOpRelayQuerier + Vec::new()). A test asserts a DID whose record exists only on a relay resolves with ResolutionSource::ScpRelay { relay_url }.",
         "Unit test: valid BEP44-signed document is accepted and cached",
         "Unit test: document with invalid signature is rejected",
         "Unit test: document with lower sequence number than cached is rejected"
@@ -449,9 +600,29 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-core"
+        "crate": "scp-core",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". This was a false done: the relay-selection criterion was never satisfiable. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_met": [
+          "AC1 routing_id — RealMultiRelayQuerier::query computes did_routing_id (crates/scp-identity/src/relay_querier.rs:157).",
+          "AC2 limit — TransportRelayQuerier issues query_raw with limit = MAX_CANDIDATES_PER_RELAY = 16 (crates/scp-transport/src/native/relay_querier.rs:140-143; constant at crates/scp-identity/src/relay_querier.rs:55). Note this MET the reworded criterion; it does NOT meet the original \"limit = 1\", which the spec has since superseded.",
+          "AC3 frame decode + discard-on-failure — relay_querier.rs:149-172 (DidRecordV1::decode, undecodable blob discarded).",
+          "AC4 BEP44 verify against the DID-derived key — verify_relay_record (crates/scp-identity/src/resolution.rs:152) via extract_public_key; the frame's own public_key is explicitly discarded (crates/scp-transport/src/native/relay_querier.rs:151-160).",
+          "AC5 seq rollback rejection — crates/scp-identity/src/resolver.rs:497-525; tests stale_seq_rejected_after_cache_expiry (resolver.rs:1472) and fresh_seq_accepted_after_cache_expiry (resolver.rs:1524).",
+          "AC6 24h/7d caching — ACTIVE_REFRESH_SECS / INACTIVE_REFRESH_SECS (crates/scp-identity/src/cache.rs:23,26); tests active_entry_expires_after_24_hours (cache.rs:352) and active_entry_survives_within_24_hours (cache.rs:368).",
+          "AC8-AC10 the three unit tests — crates/scp-identity/src/resolver.rs:1011, and the invalid-signature / stale-seq cases at relay_querier.rs and resolver.rs:1472."
+        ],
+        "criteria_unmet": [
+          {
+            "criterion": "AC7 — queries actually sent to the identity's known relays, else bootstrap relays",
+            "evidence": "The selection branch exists and is correct (crates/scp-identity/src/resolver.rs:453-456: cache.cached_relay_urls(&did).unwrap_or(bootstrap_relays)), but it is fed an empty list and a no-op querier on every shipped path. TransportRelayQuerier::bind (crates/scp-transport/src/native/relay_querier.rs:92) has zero callers; RealMultiRelayQuerier is constructed only inside #[cfg(test)] blocks; all four production DualLayerResolver sites pass NoOpRelayQuerier (async { Ok(None) }, crates/scp-identity/src/resolver.rs:286-294) and Vec::new(). crates/scp-identity/src/resolution.rs:184-186 states it plainly: \"Until 011b lands, NoOpRelayQuerier continues to ship as the production stand-in.\"",
+            "owner": "SCP-RELAYRES-006 (.docs/prds/relay-did-resolution.json) — relay-client binding: binds ONE live relay connection onto both TransportRelayQuerier and TransportRelayPublisher and replaces NoOpRelayQuerier; external/bootstrap relay set: SCP-RELAYRES-007 (.docs/prds/relay-did-resolution.json) — external + bootstrap relay set: NodeConfig relay-URL field and the §18.5.1 five-level priority chain"
+          }
+        ],
+        "criteria_reworded": "The original AC1 was compound AND contradicted its own upstream: it demanded \"limit = 1\", which spec §3.10.2 now supersedes (\"limit: N (N = 16) dominates limit: 1\"). Per the artifact-flow invariant the spec governs, so it was split into two criteria and the limit was corrected to N = 16. AC2 was sharpened to §3.10.4 step 4a's frame-decode wording, and AC6 (now AC7) was reworded so it can distinguish \"the selection branch exists\" from \"a QUERY reaches a relay\". No criterion was deleted.",
+        "blocked_by_note": "blockedBy is deliberately NOT extended to SCP-RELAYRES-006/007: those two stories are not yet on main (.docs/prds/relay-did-resolution.json holds 001-005 there; 006/007 land with issue #482), and scripts/validate-prd.py check 5 rejects a blockedBy reference to a story that does not exist in any PRD file. Add the forward-only edge in the same change that lands 006/007."
       },
-      "result": "Implemented DID relay QUERY resolution with BEP44 signature verification, seq number tracking, and caching (24h/7d TTL). Commit e9a37ac."
+      "result": "PARTIAL. Frame decode, BEP44 verification against the DID-derived key, highest-seq-valid selection, rollback rejection and 24h/7d caching all landed (commit e9a37ac, plus SCP-RELAYRES-002's TransportRelayQuerier), and the §3.10.4 step-3a selection branch exists in DualLayerResolver. But no QUERY has ever reached a relay: TransportRelayQuerier has zero production construction sites and every shipped DualLayerResolver is built with NoOpRelayQuerier over an empty relay URL list, so ResolutionSource::ScpRelay is unreachable in any shipped build."
     },
     {
       "id": "SCP-241",
@@ -502,7 +673,11 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-core"
+        "crate": "scp-core",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_retained_done": "All 12 acceptance criteria verified met on origin/main @ d1ebc5ab9 — tokio::join! at crates/scp-identity/src/resolver.rs:482 with per-layer LAYER_TIMEOUT (resolver.rs:219,462,473); highest-seq-wins with relay preferred on tie (resolver.rs:554-592); rollback rejection (resolver.rs:497-525); and all four named unit tests present (resolver.rs:1011, 1060, 1092+1142, 1192+1222). Status left at \"done\": no AC is unmet, and demoting a story whose every criterion is met would be as dishonest as the false dones this pass corrects.",
+        "production_reachability_caveat": "The capability the TITLE promises is single-layer in every shipped build. All four production DualLayerResolver construction sites pass NoOpRelayQuerier (async { Ok(None) }) and bootstrap_relays = Vec::new(), so every production resolution lands in the (None, Some(dht_rec)) arm of pick_winner_and_detect_divergence (resolver.rs:589) and ResolutionSource::ScpRelay is UNREACHABLE in production. This is an acceptance-criteria GAP, not an unmet criterion: SCP-241's AC set never demanded a production-reachable relay arm. That demand now lives in SCP-240 AC7 (corrected in this same pass) and is owned by SCP-RELAYRES-006 (.docs/prds/relay-did-resolution.json) — relay-client binding: binds ONE live relay connection onto both TransportRelayQuerier and TransportRelayPublisher and replaces NoOpRelayQuerier.",
+        "dependency_note": "Dependency note: this story is \"done\" while its blockedBy dependency SCP-240 is now \"in-progress\". That is accurate, not an inconsistency — the 2026-08-08 false-done audit demoted SCP-240 for acceptance criteria this story never consumed; every criterion this story depends on was delivered and is verified met."
       },
       "result": "Implemented DidResolver trait, DualLayerResolver with parallel relay+DHT resolution, ResolvedDidDocument, ResolutionSource. 14 tests. Commit ec59a72."
     },
@@ -512,7 +687,7 @@
       "gate": "gate-reachability-3",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-transport/src/nat/mod.rs"
@@ -523,7 +698,7 @@
         "After Tier 2 STUN hole punch, a self-test probe verifies external reachability before publishing",
         "Self-test failure on Tier 1 triggers fallthrough to Tier 2 (§10.12.2 step 4)",
         "Self-test failure on Tier 2 triggers fallthrough to Tier 3 (§10.12.3)",
-        "Self-test uses a known relay as intermediary to probe the external address",
+        "The self-test uses a known SCP relay as the intermediary that probes the external address (§10.12.2 step 4 / §10.12.3): the probe target is drawn from the identity's own relays or the §18.5.1 bootstrap set, not a third-party STUN server",
         "Unit test: self-test success proceeds with address publication",
         "Unit test: self-test failure triggers fallthrough to next tier"
       ],
@@ -550,9 +725,19 @@
       ],
       "details": {
         "phase": 3,
-        "crate": "scp-node"
+        "crate": "scp-node",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". AC5 is a false done in the relay-reachability class: the story requires a relay intermediary and none exists. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_unmet": [
+          {
+            "criterion": "AC5 — self-test uses a known relay as intermediary",
+            "evidence": "crates/scp-node/src/lib.rs:1867-1871 constructs DefaultReachabilityProbe::new(endpoints[0].addr, None), i.e. the first DEFAULT_STUN_ENDPOINTS entry (lib.rs:1674-1677) = 74.125.250.129:19302 (Google). DefaultReachabilityProbe (crates/scp-transport/src/nat/mod.rs:380-422) sends a STUN Binding request and compares mapped_addr; it never contacts a relay. There is no relay set to draw an intermediary from.",
+            "owner": "SCP-RELAYRES-007 (.docs/prds/relay-did-resolution.json) — external + bootstrap relay set: NodeConfig relay-URL field and the §18.5.1 five-level priority chain"
+          }
+        ],
+        "flagged_defect_not_scored": "Flagged for follow-up, NOT rewritten into an AC because doing so would add scope beyond what this story was written for: the Tier-1 self-test compares a UPnP TCP mapping's external address (crates/scp-transport/src/nat/upnp.rs:638, PortMappingProtocol::TCP, on the requested port) against the STUN-reflected UDP address of an unrelated ephemeral socket bound at 0.0.0.0:0 (crates/scp-node/src/lib.rs:1875), so DefaultReachabilityProbe's equality check (crates/scp-transport/src/nat/mod.rs:394) can never succeed for Tier 1. The Tier-2 self-test re-probes the SAME socket whose reflected address it is validating, so it compares the address to itself. Every self-test test uses MockReachabilityProbe (crates/scp-node/src/lib.rs:4869-4897), which is why neither is visible in CI."
       },
-      "result": "ReachabilityProbe trait + DefaultReachabilityProbe implemented. Self-test integrated in DefaultNatStrategy::select_tier() for Tier 1 (after UPnP mapping) and Tier 2 (after STUN discovery). Failure triggers fallthrough to next tier. Tests: upnp_selftest_failure_falls_through_to_tier2, upnp_selftest_success_returns_tier1, upnp_mapping_failure_skips_tier1."
+      "result": "PARTIAL. ReachabilityProbe trait, DefaultReachabilityProbe and the self-test call sites in DefaultNatStrategy::select_tier (Tier 1 at crates/scp-node/src/lib.rs:1818-1821, Tier 2 at lib.rs:1910-1913) with fallthrough on failure all landed. NOT met: the intermediary is a third-party Google STUN endpoint (lib.rs:1867-1871 uses endpoints[0].addr), not a known relay. The three test names this story previously claimed (upnp_selftest_failure_falls_through_to_tier2, upnp_selftest_success_returns_tier1, upnp_mapping_failure_skips_tier1) do not exist; the real tests are default_nat_strategy_upnp_self_test_success_returns_tier1 (lib.rs:5031), default_nat_strategy_upnp_self_test_failure_falls_through_to_bridge (lib.rs:4994) and default_nat_strategy_stun_self_test_failure_falls_through_to_bridge (lib.rs:5131)."
     },
     {
       "id": "SCP-243",
@@ -560,7 +745,7 @@
       "gate": "gate-reachability-3",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-transport/src/nat/mod.rs"
@@ -568,9 +753,9 @@
       "description": "The SDK must re-evaluate the reachability tier periodically (recommended: every 30 minutes per §10.12.1) and on network change events. Tier changes trigger DID document updates with the new relay address. Currently the tier is selected once at startup and never re-evaluated. This story adds the periodic re-evaluation loop.",
       "acceptanceCriteria": [
         "A background task re-evaluates the reachability tier every 30 minutes",
-        "Tier change triggers DID document update with the new relay address",
+        "Tier change triggers a DID document update with the new relay address on BOTH resolution layers (§3.10.5 step 3 / §3.10.6): apply_tier_change republishes through the same both-layer path as the initial publish, not the DHT arm alone",
         "Tier change is logged at INFO level (§10.12.1)",
-        "Network change events (IP change, interface up/down) trigger immediate re-evaluation",
+        "Network change events (IP change, interface up/down) trigger immediate re-evaluation on a shipped path: a platform network-change detector is constructed and installed into NodeConfig.network_detector by the node build path — it is None at every production construction site today, and ChannelNetworkChangeDetector is a manually-fed test seam, not platform detection",
         "Unit test: tier change after 30 minutes triggers DID document republish",
         "Unit test: network event triggers immediate re-evaluation"
       ],
@@ -592,9 +777,23 @@
       ],
       "details": {
         "phase": 3,
-        "crate": "scp-node"
+        "crate": "scp-node",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". AC2 is a false done in the relay-publication class; AC4 is a false done of the never-installed-capability kind. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_unmet": [
+          {
+            "criterion": "AC2 — tier change republishes the DID document to both layers",
+            "evidence": "apply_tier_change (crates/scp-node/src/lib.rs:2400-2438) rewrites the SCPRelay service_endpoint (:2410-2414) and calls publisher.publish (:2415) -> DidMethodPublisher (:2083-2092) -> the real DidMethod, i.e. the DHT only. No relay PUBLISH exists to call. It also bypasses publish_did_document_for_mode, so a DhtMode::Disabled node logs a republish failure (:2434) on every tier change instead of skipping.",
+            "owner": "SCP-RELAYRES-004 (.docs/prds/relay-did-resolution.json) — relay WRITE path: real production RelayPublisher, production RepublishManager wiring, and the republish-loop signature/sequence-drop fix (relay PUBLISH) and SCP-RELAYRES-006 (.docs/prds/relay-did-resolution.json) — relay-client binding: binds ONE live relay connection onto both TransportRelayQuerier and TransportRelayPublisher and replaces NoOpRelayQuerier (the relay to publish to)"
+          },
+          {
+            "criterion": "AC4 — network change events trigger immediate re-evaluation",
+            "evidence": "The consumer is wired (crates/scp-node/src/lib.rs:2481-2494) but nothing supplies a detector: NodeConfig.network_detector (crates/scp-node/src/config.rs:401) is initialised to None (config.rs:464) and `grep -rn 'network_detector: Some' crates --include='*.rs'` returns nothing. The only ChannelNetworkChangeDetector construction in the workspace is a test (crates/scp-node/src/lib.rs:5546), and it is a manually-fed channel, not the platform-specific IP-change / interface-up-down detection the action item calls for. With None the select arm is std::future::pending() (lib.rs:2484) and never fires.",
+            "owner": "SCP-243 (this story)"
+          }
+        ]
       },
-      "result": "TierReEvalHandle with 30-min background loop, tier_change_rx channel for DID republish trigger. NetworkChangeDetector trait + ChannelNetworkChangeDetector for immediate re-eval on network events. Platform-injectable via ApplicationNodeBuilder::network_detector(). Tests: tier_reeval_handle_notifies_on_tier_change, network_change_triggers_immediate_reeval."
+      "result": "PARTIAL. The 30-minute re-evaluation loop, INFO-level tier-change logging and the republish-on-tier-change producer are real and production-wired (TIER_REEVALUATION_INTERVAL crates/scp-node/src/lib.rs:2099; spawn_tier_reevaluation lib.rs:2450, spawned at lib.rs:3351-3365; apply_tier_change lib.rs:2400-2438). NOT met: apply_tier_change republishes to the DHT only, never to a relay, and no platform network-change detector exists — NodeConfig.network_detector (config.rs:401) is None at every production site (config.rs:464) so the immediate-re-eval select arm is std::future::pending() (lib.rs:2484). The two test names this story previously claimed (tier_reeval_handle_notifies_on_tier_change, network_change_triggers_immediate_reeval) do not exist; the real tests are tier_change_after_30_minutes_triggers_did_republish (lib.rs:5442) and network_event_triggers_immediate_reevaluation (lib.rs:5529)."
     },
     {
       "id": "SCP-244",
@@ -637,9 +836,12 @@
       ],
       "details": {
         "phase": 3,
-        "crate": "scp-transport"
+        "crate": "scp-transport",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_retained_done": "All 6 acceptance criteria verified met on origin/main @ d1ebc5ab9. Only the fabricated test names in `result` were corrected.",
+        "dependency_note": "Dependency note: this story is \"done\" while its blockedBy dependency SCP-232 is now \"in-progress\". That is accurate, not an inconsistency — the 2026-08-08 false-done audit demoted SCP-232 for acceptance criteria this story never consumed; every criterion this story depends on was delivered and is verified met."
       },
-      "result": "Multi-STUN divergence detection: NatProber queries all configured endpoints, compares external addresses. Diverging addresses → symmetric NAT classification. Single-endpoint fallback uses port-mapping heuristics. Tests: two_stun_same_addr_non_symmetric, two_stun_different_addr_symmetric."
+      "result": "Multi-STUN divergence detection: NatProber queries every configured endpoint (crates/scp-transport/src/nat/mod.rs:200-229) and compares external addresses; divergence classifies the NAT as symmetric (nat/mod.rs:514-526), agreement as non-symmetric (:529-533), and a single responding endpoint falls back to port-mapping heuristics (:259-273). Two endpoints are configured on the production path (DEFAULT_STUN_ENDPOINTS, crates/scp-node/src/lib.rs:1674-1677). Tests: probe_two_servers_same_addr_classified_non_symmetric (nat/mod.rs:713), probe_two_servers_different_addr_classified_symmetric (:766), multi_stun_all_same_is_non_symmetric (:606), multi_stun_any_divergent_is_symmetric (:620), probe_second_endpoint_fails_uses_single_stun_fallback (:963). (The previously claimed names two_stun_same_addr_non_symmetric / two_stun_different_addr_symmetric do not exist.)"
     },
     {
       "id": "SCP-245",
@@ -647,15 +849,15 @@
       "gate": "gate-reachability-2",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-identity/src/resolver.rs",
         "crates/scp-identity/src/republish.rs"
       ],
       "description": "Per §3.10.7, when both resolution layers return valid documents with different sequence numbers, the resolver SHOULD re-publish the fresher document to the layer that returned the stale one (protocol-level healing). Currently DualLayerResolver picks the highest seq but does not trigger a republish to the stale layer. This story implements the healing mechanism: when the relay returns seq=1 and DHT returns seq=5, the resolver queues a republish of the seq=5 document to the relay layer.",
       "acceptanceCriteria": [
-        "When relay returns a lower seq than DHT, the DHT document is republished to relay layer",
-        "When DHT returns a lower seq than relay, the relay document is republished to DHT layer",
+        "When relay returns a lower seq than DHT, the DHT document is republished to the relay layer through the PRODUCTION healing path: DualLayerHealingPublisher::new has at least one non-test caller, a production DualLayerResolver is constructed via with_healing (not ::new, which hardcodes healing_publisher: None), and a test asserts the relay layer receives the fresher record.",
+        "When DHT returns a lower seq than relay, the relay document is republished to the DHT layer through the same production healing path.",
         "Healing is asynchronous (does not block the resolve call)",
         "Healing is best-effort (failure is logged, not propagated)",
         "Unit test: seq divergence triggers healing republish to stale layer",
@@ -678,9 +880,24 @@
       ],
       "details": {
         "phase": 3,
-        "crate": "scp-core"
+        "crate": "scp-core",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". False done: the two behavioural criteria can never fire in a shipped build, for three independent reasons. No relay-client connection set has ever existed in this codebase. TransportRelayPublisher does not exist on main at all; TransportRelayQuerier (crates/scp-transport/src/native/relay_querier.rs) has zero production construction sites (every ::new() is at line 313+, after #[cfg(test)] at line 179); every shipped DualLayerResolver is built with NoOpRelayQuerier and bootstrap_relays = Vec::new() (crates/scp-node/src/self_host.rs:1410-1416, crates/scp-ffi/src/identity.rs:142-151, crates/scp-ffi/napi/src/identity.rs:196-221, crates/scp-ffi/uniffi/src/bridge.rs:9470-9475); NodeConfig (crates/scp-node/src/config.rs:331-414) has no relay-URL field; and DefaultRelayResolver / FALLBACK_RELAYS (crates/scp-transport/src/config.rs) are never constructed outside their own unit tests (#[cfg(test)] at config.rs:369, all nine construction sites at 445+).",
+        "criteria_unmet": [
+          {
+            "criterion": "AC1/AC2 — the fresher document is republished to the stale layer",
+            "evidence": "Blocked three ways. (1) maybe_trigger_healing returns immediately at crates/scp-identity/src/resolver.rs:607-609 because healing_publisher is None at every production site (DualLayerResolver::new hardcodes it, resolver.rs:383; with_healing at resolver.rs:398 has exactly one caller, the #[cfg(test)] helper make_resolver_with_healing at resolver.rs:1643). (2) HealingInfo is only produced in the (Some(relay_rec), Some(dht_rec)) arm (resolver.rs:560-578); the production relay arm is always None, so healing_info is structurally always None. (3) DualLayerHealingPublisher<D, R> has no inhabitable R in a shipped build — the only RelayPublisher impl is InMemoryRelayPublisher, gated #[cfg(any(test, feature=\"testing\"))]. DualLayerHealingPublisher::new is never called anywhere, including in tests: the only references are the decl (resolver.rs:303), the impl blocks (resolver.rs:308,324) and the re-export (crates/scp-identity/src/lib.rs:55).",
+            "owner": "Relay half: SCP-RELAYRES-006 (.docs/prds/relay-did-resolution.json) — relay-client binding: binds ONE live relay connection onto both TransportRelayQuerier and TransportRelayPublisher and replaces NoOpRelayQuerier and SCP-RELAYRES-004 (.docs/prds/relay-did-resolution.json) — relay WRITE path: real production RelayPublisher, production RepublishManager wiring, and the republish-loop signature/sequence-drop fix. Wiring a production healing publisher onto the node's DualLayerResolver remains SCP-245's own residual scope."
+          }
+        ],
+        "criteria_met": [
+          "AC3 async — tokio::spawn at crates/scp-identity/src/resolver.rs:625, after the result is computed and cached.",
+          "AC4 best-effort — resolver.rs:626-646 (warn!, error dropped, panic monitor).",
+          "AC5/AC6 unit tests — healing_triggered_when_relay_stale_dht_fresher (resolver.rs:1653), healing_triggered_when_dht_stale_relay_fresher (resolver.rs:1718), healing_failure_does_not_affect_resolve_result (resolver.rs:1880), plus negative controls at resolver.rs:1788, 1838, 1945. NOTE: the test names this story's previous `result` claimed (seq_divergence_triggers_healing, healing_failure_logged_not_propagated) do not exist in the repo."
+        ],
+        "blocked_by_note": "blockedBy is deliberately NOT extended to SCP-RELAYRES-006/007: those two stories are not yet on main (.docs/prds/relay-did-resolution.json holds 001-005 there; 006/007 land with issue #482), and scripts/validate-prd.py check 5 rejects a blockedBy reference to a story that does not exist in any PRD file. Add the forward-only edge in the same change that lands 006/007."
       },
-      "result": "DualLayerHealingPublisher trait + DualLayerResolver integration. When seq numbers diverge between relay and DHT, fresher document is asynchronously republished to stale layer via tokio::spawn. HealingPublisher trait enables mock injection. NoOpHealer for tests. Tests: seq_divergence_triggers_healing, healing_failure_logged_not_propagated."
+      "result": "PARTIAL. DualLayerHealingPublisher, the HealingPublisher trait, divergence detection and async best-effort dispatch all landed and are unit-tested with an in-test double (InMemoryHealingPublisher, crates/scp-identity/src/resolver.rs:1578). The production healing path was never wired: DualLayerHealingPublisher::new (resolver.rs:311) has ZERO callers anywhere in the repo, with_healing (resolver.rs:398) has zero non-test callers, and healing_publisher is None at every production construction site (resolver.rs:383). The action item \"Wire RepublishManager or a dedicated healing publisher\" was never done."
     },
     {
       "id": "SCP-246",
@@ -688,19 +905,19 @@
       "gate": "gate-reachability-3",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/src/tls.rs"
       ],
       "description": "The AcmeProvider module exists in scp-node/src/tls.rs but is never called from the domain build path in ApplicationNodeBuilder.build(). When .domain() is set, the builder should invoke AcmeProvider to provision a TLS certificate via Let's Encrypt before starting the relay listener. Currently the code has a comment noting ACME is not yet integrated (§10.12.8 ADR-032 AC 7). This story wires the existing module into the build path.",
       "acceptanceCriteria": [
-        "When .domain() is set, AcmeProvider is invoked during build() to provision TLS",
+        "When the reach is Reach::Domain and tls is TlsMode::Acme, AcmeProvider is invoked during Node::start to provision TLS",
         "ACME challenge success results in wss:// relay URL in DID document",
-        "ACME challenge failure triggers fallthrough to no_domain behavior (§10.12.8)",
-        "AcmeProvider uses the email from .acme_email() builder method",
-        "Unit test: ACME success produces wss:// relay URL",
-        "Unit test: ACME failure falls through to NAT traversal tiers"
+        "ACME challenge failure triggers fallthrough to the Reach::NatTraversal path (§10.12.8)",
+        "The ACME contact email is supplied from a reachable operator surface: TlsMode::Acme { email } is threaded to AcmeProvider::with_email AND the shipped scp-node binary can set it (CLI flag or env var) — both production ACME arms in main.rs currently hardcode email: None (the .acme_email() builder method was removed with ApplicationNodeBuilder in ADR-052 Phase B-P3a)",
+        "Unit test: ACME success produces a wss:// relay URL",
+        "Unit test: ACME failure falls through to the NAT traversal tiers"
       ],
       "actionItems": [
         "Import AcmeProvider in scp-node/src/lib.rs",
@@ -720,9 +937,19 @@
       ],
       "details": {
         "phase": 3,
-        "crate": "scp-node"
+        "crate": "scp-node",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_correction": "Was marked \"done\"; corrected to \"in-progress\". Not a relay-reachability defect — the ACME wiring itself is real — but AC4 named a deleted builder method and, once repointed at the surviving surface, is unmet: no shipped configuration path can set the contact email.",
+        "criteria_unmet": [
+          {
+            "criterion": "AC4 — ACME contact email comes from a reachable operator surface",
+            "evidence": "The threading exists (TlsMode::Acme { email } crates/scp-node/src/config.rs:912-915 -> resolve_tls config.rs:968-973 -> acme.with_email crates/scp-node/src/lib.rs:2882-2884 -> the mailto: contact at crates/scp-node/src/tls.rs:420-430), but the shipped binary hardcodes email: None on both ACME arms (crates/scp-node/src/main.rs:975 and :981) with no CLI flag or env var to override it. `grep -rn 'TlsMode::Acme' crates --include='*.rs'` finds an email: Some(..) only in a doc example (config.rs:319).",
+            "owner": "SCP-246 (this story)"
+          }
+        ],
+        "criteria_reworded": "AC4 named .acme_email() on ApplicationNodeBuilder, a type deleted in ADR-052 Phase B-P3a, so it was permanently un-checkable. Repointed at TlsMode::Acme { email } plus the operator surface that must reach it. No criterion was deleted. Every remaining criterion that named .no_domain() / .domain() / .acme_email() was repointed at the surviving configuration surface (Reach::NatTraversal, Reach::Domain, TlsMode::Acme) for the same reason: a criterion that names a deleted symbol cannot be checked. Semantics unchanged."
       },
-      "result": "AcmeProvider fully wired into domain build path: resolve_tls() constructs AcmeProvider with acme_email, TlsProvider trait enables mock injection, success produces wss:// relay URL, failure falls through to build_no_domain_inner via NAT tiers. Stale scaffold comment updated to reference SCP-246. Tests: SucceedingTlsProvider/FailingTlsProvider mocks, domain_build_uses_wss_no_regression, domain_fallthrough_on_acme_failure_probes_nat (111 unit + 8 integration tests pass)"
+      "result": "PARTIAL. AcmeProvider is genuinely production-wired: resolve_tls (crates/scp-node/src/lib.rs:2874-2887) constructs it, build_node_domain (crates/scp-node/src/config.rs:968-976) calls provision_with_challenge_listener (lib.rs:2966-2995) which runs the real port-80 HTTP-01 listener and the real instant_acme flow (crates/scp-node/src/tls.rs:416+), success yields wss:// (lib.rs:3076-3082) and failure falls through to the NAT tiers (config.rs:1016-1056). NOT met: no reachable operator surface supplies the ACME contact email — both production arms pass email: None (crates/scp-node/src/main.rs:975, :981). The test name this story previously claimed (domain_build_uses_wss_no_regression) does not exist; the wss:// assertion lives in build_with_generate_identity_creates_new_did (lib.rs:3824, asserted at :3837)."
     },
     {
       "id": "SCP-247",
@@ -764,9 +991,12 @@
       ],
       "details": {
         "phase": 3,
-        "crate": "scp-transport"
+        "crate": "scp-transport",
+        "verified_at": "origin/main @ d1ebc5ab9 (2026-08-08)",
+        "status_retained_done": "All 8 acceptance criteria verified met on origin/main @ d1ebc5ab9; verification is on the real server handling path with no unauthenticated register overload. Only the fabricated test names in `result` were corrected. Caveat recorded, not scored: the hardening only engages when RelayConfig.bridge is BridgeRole::Enabled, which no shipped binary sets (see SCP-236 AC4).",
+        "dependency_note": "Dependency note: this story is \"done\" while its blockedBy dependency SCP-236 is now \"in-progress\". That is accurate, not an inconsistency — the 2026-08-08 false-done audit demoted SCP-236 for acceptance criteria this story never consumed; every criterion this story depends on was delivered and is verified met."
       },
-      "result": "Ed25519 signature verification for BRIDGE_REGISTER: domain-separated payload SCP-BRIDGE-REGISTER-V1: || routing_id || timestamp, 60s replay window, routing ID ownership validation via did_routing_id derivation. Tests: valid_signature_accepted, invalid_signature_rejected, expired_timestamp_rejected."
+      "result": "Ed25519 signature verification for BRIDGE_REGISTER: domain-separated payload \"SCP-BRIDGE-REGISTER-V1:\" || routing_id || be_u64(timestamp) (crates/scp-transport/src/relay/bridge.rs:143-149), two-sided 60s replay window (bridge.rs:86, :218-224), routing-ID ownership via did_routing_id (bridge.rs:238-246). Verification runs as step 1 of BridgeRegistry::register (bridge.rs:334-347), the sole insertion point, called from handle_bridge_register (crates/scp-transport/src/native/server.rs:1682) before any state mutation. Tests: registry_register_valid_signature_succeeds (bridge.rs:782), registry_register_invalid_signature_fails (:795), registry_register_expired_timestamp_fails (:816), plus the wire-level bridge_register_with_invalid_signature_rejected (server.rs:3708). (The previously claimed names valid_signature_accepted / invalid_signature_rejected / expired_timestamp_rejected do not exist.)"
     }
   ]
 }
