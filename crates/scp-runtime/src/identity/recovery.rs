@@ -224,16 +224,15 @@ pub struct RecoveryResult {
     /// Whether step 1 (key rotation on trusted device) succeeded.
     pub key_rotation_completed: bool,
 
-    /// Outcome of step 5 (contact notification).
+    /// Outcome of step 5 (contact notification), naming which contacts were
+    /// reached and which were not.
     ///
-    /// Tri-state rather than `bool`: [`StepOutcome::NotApplicable`] (no known
-    /// contacts) is NOT success. Note that
-    /// [`StepOutcome::Succeeded`] here still means only that **at least one**
-    /// contact was reached — step 5 is best-effort per §9.12, which requires no
-    /// delivery confirmation. Per-contact reporting would need
-    /// [`RecoveryBackend::notify_contacts`] to return the reached/unreachable
-    /// DID sets.
-    pub contact_notification: StepOutcome,
+    /// [`ContactNotificationOutcome::Delivered`] means at least one contact was
+    /// reached — the §9.12 best-effort bar — and carries the ones that were
+    /// not, each of which still holds a §9.11 KCV binding to the compromised
+    /// key. Use [`ContactNotificationOutcome::fully_delivered`], not
+    /// "did not fail", to decide whether that window is closed.
+    pub contact_notification: ContactNotificationOutcome,
 
     /// Outcome of step 6 (identity private-state re-encryption).
     ///
@@ -359,10 +358,14 @@ pub enum RecoveryError {
 }
 
 // ---------------------------------------------------------------------------
-// StepOutcome — tri-state result of an identity-scoped cleanup step (5, 6)
+// StepOutcome — tri-state result of an identity-scoped cleanup step (6)
 // ---------------------------------------------------------------------------
 
-/// Outcome of an identity-scoped cleanup step (5 or 6).
+/// Outcome of an identity-scoped cleanup step.
+///
+/// Used for step 6. Step 5 has its own richer
+/// [`ContactNotificationOutcome`], because "the step succeeded" is not an
+/// adequate report when only some contacts were reached.
 ///
 /// Replaces the `bool` these steps used to report, which could not distinguish
 /// "succeeded" from "there was nothing to do" from "did not apply to this
@@ -395,6 +398,147 @@ impl StepOutcome {
     #[must_use]
     pub const fn succeeded(&self) -> bool {
         matches!(self, Self::Succeeded)
+    }
+
+    /// Returns `true` when the step ran and failed.
+    ///
+    /// The complement of neither [`Self::succeeded`] nor "did nothing":
+    /// `!succeeded()` is true for [`NotApplicable`](Self::NotApplicable) too.
+    /// [`RecoveryResult::fully_recovered`] needs "nothing went wrong", which is
+    /// `!failed()`, not `succeeded()`.
+    #[must_use]
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ContactNotificationOutcome — step 5's per-contact outcome
+// ---------------------------------------------------------------------------
+
+/// Outcome of §9.12 step 5 (contact notification), naming **which** contacts
+/// were reached and which were not.
+///
+/// A plain "succeeded" is not an adequate report for this step. Step 5 is
+/// best-effort — §9.12 requires no delivery confirmation — so reaching one of
+/// 50 contacts is `Ok` and does not block recovery. But the 49 that were not
+/// reached still hold a §9.11 Key Continuity Verification binding to the
+/// compromised key and have not been told to re-verify: that is precisely the
+/// impersonation window recovery exists to close, and an operator who sees only
+/// "step 5 succeeded" never learns to chase them. §9.12's best-effort rule
+/// governs whether recovery *blocks*, not whether the caller is *told*.
+///
+/// The unreachable set is **derived by the orchestrator**, as
+/// `contacts - reached`, rather than reported by the backend. A backend that
+/// under-reports what it reached therefore over-reports what is unreachable —
+/// fail-safe — instead of silently shrinking the set an operator must chase.
+/// Both lists are sorted so the report is stable across runs (the contact set
+/// is a `HashSet`, whose iteration order is not).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContactNotificationOutcome {
+    /// The step did not run: the identity has no known contacts. This is NOT
+    /// success. The string states why.
+    NotApplicable(String),
+
+    /// The step ran and reached at least one contact.
+    ///
+    /// `unreachable` may still be non-empty — see the type-level note. It is
+    /// disjoint from `reached` by construction.
+    Delivered {
+        /// Contacts the key-change notification reached, sorted.
+        reached: Vec<DID>,
+        /// Contacts it did not reach, sorted. Each still holds a §9.11 KCV
+        /// binding to the compromised key.
+        unreachable: Vec<DID>,
+    },
+
+    /// The step ran and reached nobody.
+    ///
+    /// Non-fatal (step 5 is cleanup), but every contact is unreachable.
+    Failed {
+        /// The step-5 error from the backend.
+        error: RecoveryStepError,
+        /// Every contact, sorted — none was reached.
+        unreachable: Vec<DID>,
+    },
+}
+
+impl ContactNotificationOutcome {
+    /// Returns `true` only when the step ran and reached **every** contact.
+    ///
+    /// This — not [`Self::reached_any`] — is the predicate for "no contact is
+    /// still trusting the compromised key".
+    #[must_use]
+    pub const fn fully_delivered(&self) -> bool {
+        matches!(self, Self::Delivered { unreachable, .. } if unreachable.is_empty())
+    }
+
+    /// Returns `true` when the step ran and reached at least one contact.
+    ///
+    /// This is the §9.12 best-effort success bar — it does NOT mean every
+    /// contact was told. Use [`Self::fully_delivered`] for that.
+    #[must_use]
+    pub const fn reached_any(&self) -> bool {
+        matches!(self, Self::Delivered { .. })
+    }
+
+    /// Returns `true` when the step ran and reached nobody.
+    #[must_use]
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+
+    /// The contacts that were NOT told to re-run §9.11 key-continuity
+    /// verification. Empty for [`Self::NotApplicable`] (there were none).
+    #[must_use]
+    pub fn unreachable(&self) -> &[DID] {
+        match self {
+            Self::NotApplicable(_) => &[],
+            Self::Delivered { unreachable, .. } | Self::Failed { unreachable, .. } => unreachable,
+        }
+    }
+
+    /// The contacts that were reached. Empty unless [`Self::Delivered`].
+    #[must_use]
+    pub fn reached(&self) -> &[DID] {
+        match self {
+            Self::NotApplicable(_) | Self::Failed { .. } => &[],
+            Self::Delivered { reached, .. } => reached,
+        }
+    }
+}
+
+impl std::fmt::Display for ContactNotificationOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotApplicable(why) => write!(f, "did not run ({why})"),
+            Self::Delivered {
+                reached,
+                unreachable,
+            } if unreachable.is_empty() => {
+                write!(f, "ran, reached all {} contact(s)", reached.len())
+            }
+            Self::Delivered {
+                reached,
+                unreachable,
+            } => write!(
+                f,
+                "ran, reached {} contact(s) but {} were NOT told to re-run §9.11 KCV (e.g. `{}`)",
+                reached.len(),
+                unreachable.len(),
+                // Bounded output: one representative rather than the full list,
+                // which grows with the contact set. The complete list stays on
+                // the value.
+                unreachable
+                    .first()
+                    .map_or("<none>", |contact| contact.as_ref()),
+            ),
+            Self::Failed { error, unreachable } => write!(
+                f,
+                "ran, FAILED: {error}; none of {} contact(s) was told to re-run §9.11 KCV",
+                unreachable.len()
+            ),
+        }
     }
 }
 
@@ -444,8 +588,9 @@ pub struct RecoveryProgress {
     /// Outcome of the identity-scoped step 4 (`KeyPackage` rotation).
     pub key_package_rotation: StepOutcome,
 
-    /// Outcome of step 5 (contact notification).
-    pub contact_notification: StepOutcome,
+    /// Outcome of step 5 (contact notification), including the contacts that
+    /// were NOT reached.
+    pub contact_notification: ContactNotificationOutcome,
 
     /// Outcome of step 6 (identity private-state re-encryption).
     pub private_state_reencryption: StepOutcome,
@@ -634,6 +779,22 @@ pub struct ContactNotification {
     pub kcv_reverification_required: bool,
 }
 
+/// What a [`RecoveryBackend::notify_contacts`] call actually achieved.
+///
+/// A backend reports only what it **did** — the contacts it reached. The
+/// orchestrator derives the unreachable set as `contacts - reached` and reports
+/// both on [`ContactNotificationOutcome`], so a backend cannot shrink the set
+/// of contacts an operator must chase by omitting entries: an omission reads as
+/// unreachable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactsReached {
+    /// The DIDs the key-change notification was successfully sent to.
+    ///
+    /// Order and duplicates do not matter — the orchestrator canonicalises.
+    /// A DID not present in the call's `contacts` argument is ignored.
+    pub dids: Vec<DID>,
+}
+
 // ---------------------------------------------------------------------------
 // PskRotationParams — step 6 parameters
 // ---------------------------------------------------------------------------
@@ -767,22 +928,31 @@ pub trait RecoveryBackend {
     /// Contacts who completed Key Continuity Verification (§9.11) are alerted
     /// that re-verification is needed. Identity-scoped: called once per
     /// recovery, with a non-empty contact set (the orchestrator reports
-    /// [`StepOutcome::NotApplicable`] without calling when there are none).
+    /// [`ContactNotificationOutcome::NotApplicable`] without calling when there
+    /// are none).
     ///
     /// Best-effort per §9.12 — the protocol requires no delivery confirmation,
-    /// so reaching at least one contact is `Ok(())`.
+    /// so reaching at least one contact is `Ok`. **Return the DIDs actually
+    /// reached**, not a bare success: §9.12's best-effort rule governs whether
+    /// recovery blocks, not whether the caller is told which contacts still
+    /// trust the compromised key. Every contact omitted from
+    /// [`ContactsReached::dids`] is reported unreachable, so under-reporting is
+    /// fail-safe and over-reporting is a lie.
     ///
     /// # Errors
     ///
     /// Returns [`RecoveryStepError`] with `step: 5` if no contact could be
-    /// reached. Non-fatal: the orchestrator records it and continues.
+    /// reached. Non-fatal: the orchestrator records it and continues. Returning
+    /// `Ok` with an empty [`ContactsReached::dids`] means the same thing and is
+    /// normalised to the same failed outcome — prefer the explicit `Err`, which
+    /// can explain why.
     async fn notify_contacts(
         &self,
         did: &DID,
         tier: CompromiseTier,
         key_rotation: &KeyRotationOutcome,
         contacts: &HashSet<DID>,
-    ) -> Result<(), RecoveryStepError>;
+    ) -> Result<ContactsReached, RecoveryStepError>;
 
     /// Step 6: Rotate the PSK and re-encrypt identity private state.
     ///
@@ -1166,17 +1336,62 @@ impl CompromiseRecoveryOrchestrator {
         contact_dids: &HashSet<DID>,
         psk_params: Option<&PskRotationParams>,
         backend: &dyn RecoveryBackend,
-    ) -> (StepOutcome, StepOutcome) {
+    ) -> (ContactNotificationOutcome, StepOutcome) {
         // Step 5: Contact notification.
         let contact_notification = if contact_dids.is_empty() {
-            StepOutcome::NotApplicable("no known contacts to notify".to_owned())
+            ContactNotificationOutcome::NotApplicable("no known contacts to notify".to_owned())
         } else {
+            // Every contact, sorted — the fallback "nobody was reached" set and
+            // the base the unreachable set is derived from. Sorted because
+            // `contact_dids` is a `HashSet`, whose iteration order would make
+            // the report unstable across runs.
+            let mut all_contacts: Vec<DID> = contact_dids.iter().cloned().collect();
+            all_contacts.sort();
+
             match backend
                 .notify_contacts(&self.did, tier, key_rotation, contact_dids)
                 .await
             {
-                Ok(()) => StepOutcome::Succeeded,
-                Err(e) => StepOutcome::Failed(e),
+                Ok(reached) => {
+                    // DERIVE the unreachable set rather than trusting a backend
+                    // to report it: a backend that under-reports what it
+                    // reached then over-reports what is unreachable (fail-safe),
+                    // and cannot silently shrink the set an operator must chase.
+                    // Entries the backend names that were never in `contacts`
+                    // are ignored by the same construction.
+                    let reached_set: HashSet<&DID> = reached.dids.iter().collect();
+                    let (reached, unreachable): (Vec<DID>, Vec<DID>) = all_contacts
+                        .into_iter()
+                        .partition(|contact| reached_set.contains(contact));
+
+                    if reached.is_empty() {
+                        // `Ok` with nothing reached is the same event as `Err`:
+                        // normalise it so a caller branching on the outcome
+                        // cannot see an empty "delivered".
+                        ContactNotificationOutcome::Failed {
+                            error: RecoveryStepError {
+                                step: 5,
+                                code: RecoveryStepErrorCode::DispatchFailed,
+                                description: format!(
+                                    "the backend reported success for step 5 but named no \
+                                     reached contact, so none of the {} contact(s) was told \
+                                     to re-run §9.11 key-continuity verification",
+                                    unreachable.len()
+                                ),
+                            },
+                            unreachable,
+                        }
+                    } else {
+                        ContactNotificationOutcome::Delivered {
+                            reached,
+                            unreachable,
+                        }
+                    }
+                }
+                Err(error) => ContactNotificationOutcome::Failed {
+                    error,
+                    unreachable: all_contacts,
+                },
             }
         };
 
@@ -1742,7 +1957,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         tier: CompromiseTier,
         key_rotation: &KeyRotationOutcome,
         contacts: &HashSet<DID>,
-    ) -> Result<(), RecoveryStepError> {
+    ) -> Result<ContactsReached, RecoveryStepError> {
         // Step 5: Send key-change notification to contacts.
         //
         // Build a ContactNotification and serialize it, then attempt to
@@ -1781,9 +1996,14 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // to find contexts where both the recovering DID and the contact are
         // members, then send the notification payload through those contexts.
         //
-        // Even partial delivery counts as success since contacts will
-        // re-verify on next interaction (§9.11).
-        let mut any_sent = false;
+        // Partial delivery does not block recovery (§9.12 step 5 is
+        // best-effort), but it is NOT reported as unqualified success: the
+        // contacts actually reached are recorded here, and the orchestrator
+        // derives the unreachable set from them so an operator learns exactly
+        // who still holds a §9.11 KCV binding to the compromised key.
+        let mut reached = ContactsReached {
+            dids: Vec::with_capacity(contacts.len()),
+        };
 
         // Retrieve all context IDs known to the orchestrator by looking up
         // contexts where the recovering DID is a member. The orchestrator
@@ -1817,19 +2037,18 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                 .map_err(Self::dispatch_step_error);
 
             if send_result.is_ok() {
-                any_sent = true;
+                reached.dids.push(contact.clone());
             }
             // Best-effort: failure for one contact doesn't block others.
         }
 
         // Contact notification is best-effort per spec §9.12 — the protocol
         // does not require delivery confirmation — so reaching at least one
-        // contact is success. The orchestrator never calls this with an empty
-        // contact set (it reports `StepOutcome::NotApplicable` instead), so
-        // "nothing was sent" here always means every contact was unreachable.
-        if any_sent {
-            Ok(())
-        } else {
+        // contact is `Ok`, carrying exactly who was reached. The orchestrator
+        // never calls this with an empty contact set (it reports
+        // `ContactNotificationOutcome::NotApplicable` instead), so "nothing was
+        // sent" here always means every contact was unreachable.
+        if reached.dids.is_empty() {
             Err(RecoveryStepError {
                 step: 5,
                 code: RecoveryStepErrorCode::DispatchFailed,
@@ -1839,6 +2058,8 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                     contacts.len()
                 ),
             })
+        } else {
+            Ok(reached)
         }
     }
 
@@ -1967,8 +2188,12 @@ mod tests {
         /// If set, `rotate_key_packages` returns this error. Not keyed by
         /// context: step 4 is identity-scoped and runs once per recovery.
         rotate_key_packages_error: Option<RecoveryStepError>,
-        /// Whether `notify_contacts` succeeds.
+        /// Whether `notify_contacts` reaches anybody at all. `false` makes it
+        /// return the step-5 error.
         notify_contacts_result: bool,
+        /// Contacts `notify_contacts` reports as NOT reached. Only meaningful
+        /// when `notify_contacts_result` is `true`; models partial delivery.
+        notify_contacts_unreachable: HashSet<DID>,
         /// Whether `rotate_psk` succeeds.
         rotate_psk_result: bool,
     }
@@ -1980,6 +2205,7 @@ mod tests {
                 revoke_ucans_error: None,
                 rotate_key_packages_error: None,
                 notify_contacts_result: true,
+                notify_contacts_unreachable: HashSet::new(),
                 rotate_psk_result: true,
             }
         }
@@ -2027,9 +2253,16 @@ mod tests {
             _did: &DID,
             _tier: CompromiseTier,
             _key_rotation: &KeyRotationOutcome,
-            _contacts: &HashSet<DID>,
-        ) -> Result<(), RecoveryStepError> {
-            step_result(5, self.notify_contacts_result)
+            contacts: &HashSet<DID>,
+        ) -> Result<ContactsReached, RecoveryStepError> {
+            step_result(5, self.notify_contacts_result)?;
+            Ok(ContactsReached {
+                dids: contacts
+                    .iter()
+                    .filter(|contact| !self.notify_contacts_unreachable.contains(*contact))
+                    .cloned()
+                    .collect(),
+            })
         }
 
         async fn rotate_psk(&self, _params: &PskRotationParams) -> Result<(), RecoveryStepError> {
@@ -2254,7 +2487,7 @@ mod tests {
         // here, which read as "cleanup succeeded" when nothing executed.
         assert!(matches!(
             result.contact_notification,
-            StepOutcome::NotApplicable(_)
+            ContactNotificationOutcome::NotApplicable(_)
         ));
         assert!(matches!(
             result.private_state_reencryption,
@@ -2291,7 +2524,11 @@ mod tests {
 
         assert_eq!(result.tier, CompromiseTier::ActiveSigning);
         assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-        assert!(result.contact_notification.succeeded());
+        assert!(
+            result.contact_notification.fully_delivered(),
+            "every contact was reachable in this mock, so step 5 must report \
+             full delivery — not merely `reached_any`"
+        );
         assert!(result.private_state_reencryption.succeeded());
     }
 
@@ -2633,7 +2870,10 @@ mod tests {
             )],
             pending_rejoin: vec!["ctx-3".to_owned()],
             key_rotation_completed: true,
-            contact_notification: StepOutcome::Succeeded,
+            contact_notification: ContactNotificationOutcome::Delivered {
+                reached: vec![did("did:dht:bob")],
+                unreachable: vec![did("did:dht:carol")],
+            },
             private_state_reencryption: StepOutcome::Succeeded,
             initiated_at: 1000,
             completed_at: 2000,
@@ -3213,13 +3453,17 @@ mod tests {
             .expect("all steps succeed with the default mock");
 
         assert!(
-            matches!(result.contact_notification, StepOutcome::NotApplicable(_)),
+            matches!(
+                result.contact_notification,
+                ContactNotificationOutcome::NotApplicable(_)
+            ),
             "no contacts must report NotApplicable, got {:?}",
             result.contact_notification
         );
         assert!(
-            !result.contact_notification.succeeded(),
-            "NotApplicable must NOT read as success"
+            !result.contact_notification.reached_any()
+                && !result.contact_notification.fully_delivered(),
+            "NotApplicable must NOT read as success under either predicate"
         );
         assert!(
             matches!(
@@ -3230,6 +3474,190 @@ mod tests {
             result.private_state_reencryption
         );
         assert!(!result.private_state_reencryption.succeeded());
+    }
+
+    /// Runs an `Agent`-tier recovery with the given contacts and mock knobs,
+    /// returning step 5's outcome. Step 4 succeeds by default, so this stays on
+    /// the `Ok` path and reads the outcome off `RecoveryResult`.
+    #[allow(clippy::future_not_send)] // backend trait object is not Sync by design
+    async fn step_5_outcome(
+        contacts: &HashSet<DID>,
+        unreachable: HashSet<DID>,
+        reaches_anybody: bool,
+    ) -> ContactNotificationOutcome {
+        let alice = did("did:dht:alice");
+        let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec!["ctx-1".to_owned()]);
+        let key_rotation = agent_key_rotation_outcome(&alice, 1000);
+        let backend = MockRecoveryBackend {
+            notify_contacts_result: reaches_anybody,
+            notify_contacts_unreachable: unreachable,
+            ..MockRecoveryBackend::new()
+        };
+
+        orch.execute_recovery(
+            CompromiseTier::Agent,
+            Some(&key_rotation),
+            contacts,
+            None,
+            &backend,
+            &scp_clock::SystemClock,
+        )
+        .await
+        .expect("steps 2-4 succeed with the mock")
+        .contact_notification
+    }
+
+    /// THE FINDING: with 3 contacts and 1 reachable, "step 5 succeeded" told an
+    /// operator nothing about the 2 who still hold a §9.11 KCV binding to the
+    /// compromised key — precisely the impersonation window recovery exists to
+    /// close. §9.12's best-effort rule governs whether recovery *blocks*, not
+    /// whether the caller is *told*.
+    #[tokio::test]
+    async fn step_5_partial_delivery_names_the_unreachable_contacts() {
+        let bob = did("did:dht:bob");
+        let carol = did("did:dht:carol");
+        let dave = did("did:dht:dave");
+        let contacts = HashSet::from([bob.clone(), carol.clone(), dave.clone()]);
+
+        let outcome = step_5_outcome(
+            &contacts,
+            HashSet::from([carol.clone(), dave.clone()]),
+            true,
+        )
+        .await;
+
+        // Best-effort success — recovery is NOT blocked...
+        assert!(outcome.reached_any(), "reaching one contact is still `Ok`");
+        // ...but it is NOT full delivery, and the gap is enumerable.
+        assert!(
+            !outcome.fully_delivered(),
+            "2 of 3 contacts were never told to re-verify"
+        );
+        assert_eq!(outcome.reached(), &[bob]);
+        // Sorted, so the report is stable across runs even though the contact
+        // set is a `HashSet`.
+        assert_eq!(outcome.unreachable(), &[carol, dave]);
+
+        // The operator-facing rendering must not read as unqualified success.
+        let rendered = outcome.to_string();
+        assert!(
+            rendered.contains("2 were NOT told"),
+            "the Display must surface the gap: {rendered}"
+        );
+    }
+
+    /// A backend that reaches nobody reports every contact unreachable — the
+    /// orchestrator supplies the set, so the report cannot be empty just
+    /// because the failing backend had nothing to say.
+    #[tokio::test]
+    async fn step_5_total_failure_reports_every_contact_unreachable() {
+        let bob = did("did:dht:bob");
+        let carol = did("did:dht:carol");
+        let contacts = HashSet::from([bob.clone(), carol.clone()]);
+
+        let outcome = step_5_outcome(&contacts, HashSet::new(), false).await;
+
+        assert!(outcome.failed());
+        assert!(!outcome.reached_any() && !outcome.fully_delivered());
+        assert!(outcome.reached().is_empty());
+        assert_eq!(outcome.unreachable(), &[bob, carol]);
+    }
+
+    /// A backend that returns `Ok` while naming no reached contact is claiming
+    /// the same thing as an `Err` — an empty "delivered" must not be
+    /// representable in the outcome a caller branches on.
+    #[tokio::test]
+    async fn step_5_ok_with_no_reached_contact_is_normalised_to_failed() {
+        let bob = did("did:dht:bob");
+        let carol = did("did:dht:carol");
+        let contacts = HashSet::from([bob.clone(), carol.clone()]);
+
+        // `reaches_anybody: true` → the mock returns `Ok`, but every contact is
+        // filtered out of the reached set.
+        let outcome = step_5_outcome(&contacts, contacts.clone(), true).await;
+
+        assert!(
+            outcome.failed(),
+            "an `Ok` naming nobody must normalise to Failed, got {outcome:?}"
+        );
+        assert_eq!(outcome.unreachable(), &[bob, carol]);
+    }
+
+    /// A backend naming a DID that was never a contact cannot inflate the
+    /// reached set: the outcome is derived from the caller's contact set.
+    #[tokio::test]
+    async fn step_5_ignores_reached_dids_that_were_never_contacts() {
+        struct LiarBackend;
+
+        #[async_trait(?Send)]
+        impl RecoveryBackend for LiarBackend {
+            async fn mls_update(
+                &self,
+                _context_id: &str,
+                _key_rotation: &KeyRotationOutcome,
+            ) -> Result<(), RecoveryStepError> {
+                Ok(())
+            }
+            async fn revoke_ucans(
+                &self,
+                _context_id: &str,
+                _key_rotation: &KeyRotationOutcome,
+            ) -> Result<(), RecoveryStepError> {
+                Ok(())
+            }
+            async fn rotate_key_packages(
+                &self,
+                _key_rotation: &KeyRotationOutcome,
+            ) -> Result<(), RecoveryStepError> {
+                Ok(())
+            }
+            async fn notify_contacts(
+                &self,
+                _did: &DID,
+                _tier: CompromiseTier,
+                _key_rotation: &KeyRotationOutcome,
+                _contacts: &HashSet<DID>,
+            ) -> Result<ContactsReached, RecoveryStepError> {
+                // Names a stranger and omits the real contact.
+                Ok(ContactsReached {
+                    dids: vec![did("did:dht:stranger")],
+                })
+            }
+            async fn rotate_psk(
+                &self,
+                _params: &PskRotationParams,
+            ) -> Result<(), RecoveryStepError> {
+                Ok(())
+            }
+        }
+
+        let bob = did("did:dht:bob");
+        let contacts = HashSet::from([bob.clone()]);
+        let alice = did("did:dht:alice");
+        let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec!["ctx-1".to_owned()]);
+        let key_rotation = agent_key_rotation_outcome(&alice, 1000);
+        let outcome = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                Some(&key_rotation),
+                &contacts,
+                None,
+                &LiarBackend,
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("steps 2-4 succeed")
+            .contact_notification;
+
+        assert!(
+            outcome.failed(),
+            "the stranger must not count as a reached contact, got {outcome:?}"
+        );
+        assert_eq!(
+            outcome.unreachable(),
+            &[bob],
+            "the real contact must still be reported unreachable"
+        );
     }
 
     /// #2240 Part B: nothing installs a rotated PSK, so the production backend
@@ -3444,9 +3872,14 @@ mod tests {
             "step 4 is unwired"
         );
         assert!(
-            progress.contact_notification.succeeded(),
+            progress.contact_notification.fully_delivered(),
             "step 5 must still run when every context fails — a stale contact \
              that never learns to re-run §9.11 KCV is the harm this prevents"
+        );
+        assert_eq!(
+            progress.contact_notification.reached(),
+            &[did("did:dht:bob")],
+            "the reached contact must be named, not just counted"
         );
     }
 
@@ -3525,7 +3958,7 @@ mod tests {
             progress.private_state_reencryption
         );
         assert!(
-            progress.contact_notification.succeeded(),
+            progress.contact_notification.fully_delivered(),
             "step 5 must be reached even when every context failed"
         );
 
@@ -3615,10 +4048,12 @@ mod tests {
                 _did: &DID,
                 _tier: CompromiseTier,
                 _key_rotation: &KeyRotationOutcome,
-                _contacts: &HashSet<DID>,
-            ) -> Result<(), RecoveryStepError> {
+                contacts: &HashSet<DID>,
+            ) -> Result<ContactsReached, RecoveryStepError> {
                 self.record(5);
-                Ok(())
+                Ok(ContactsReached {
+                    dids: contacts.iter().cloned().collect(),
+                })
             }
 
             async fn rotate_psk(
@@ -3727,7 +4162,7 @@ mod tests {
         // fails closed in production, so its reached-and-reported signal is a
         // step-6 `Failed`, never `NotApplicable`.
         assert!(
-            progress.contact_notification.succeeded(),
+            progress.contact_notification.fully_delivered(),
             "step 5 must be reached"
         );
         assert!(

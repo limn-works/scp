@@ -12,10 +12,11 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use scp_core::identity::recovery::{
-    CompromiseRecoveryOrchestrator, CompromiseTier, ContactNotification, ContextRecoveryState,
-    KeyRotationOutcome, PskRotationParams, RecoveryBackend, RecoveryError, RecoveryProgress,
-    RecoveryResult, RecoveryStepError, RecoveryStepErrorCode, StepOutcome,
-    active_key_rotation_outcome, agent_key_rotation_outcome, identity_key_rotation_outcome,
+    CompromiseRecoveryOrchestrator, CompromiseTier, ContactNotification,
+    ContactNotificationOutcome, ContactsReached, ContextRecoveryState, KeyRotationOutcome,
+    PskRotationParams, RecoveryBackend, RecoveryError, RecoveryProgress, RecoveryResult,
+    RecoveryStepError, RecoveryStepErrorCode, StepOutcome, active_key_rotation_outcome,
+    agent_key_rotation_outcome, identity_key_rotation_outcome,
 };
 use scp_did::DID;
 
@@ -48,7 +49,11 @@ struct MockBackend {
     revoke_ucans_error: Option<(String, RecoveryStepError)>,
     /// Not keyed by context: step 4 is identity-scoped and runs once.
     rotate_key_packages_error: Option<RecoveryStepError>,
+    /// Whether `notify_contacts` reaches anybody at all.
     notify_contacts_result: bool,
+    /// Contacts `notify_contacts` reports as NOT reached — models partial
+    /// delivery. Only meaningful when `notify_contacts_result` is `true`.
+    notify_contacts_unreachable: &'static [&'static str],
     rotate_psk_result: bool,
 }
 
@@ -59,6 +64,7 @@ impl MockBackend {
             revoke_ucans_error: None,
             rotate_key_packages_error: None,
             notify_contacts_result: true,
+            notify_contacts_unreachable: &[],
             rotate_psk_result: true,
         }
     }
@@ -106,9 +112,16 @@ impl RecoveryBackend for MockBackend {
         _did: &DID,
         _tier: CompromiseTier,
         _key_rotation: &KeyRotationOutcome,
-        _contacts: &HashSet<DID>,
-    ) -> Result<(), RecoveryStepError> {
-        step_result(5, self.notify_contacts_result)
+        contacts: &HashSet<DID>,
+    ) -> Result<ContactsReached, RecoveryStepError> {
+        step_result(5, self.notify_contacts_result)?;
+        Ok(ContactsReached {
+            dids: contacts
+                .iter()
+                .filter(|contact| !self.notify_contacts_unreachable.contains(&contact.as_ref()))
+                .cloned()
+                .collect(),
+        })
     }
 
     async fn rotate_psk(&self, _params: &PskRotationParams) -> Result<(), RecoveryStepError> {
@@ -198,7 +211,7 @@ async fn compromise_tier_active_signing() {
     assert_eq!(result.tier, CompromiseTier::ActiveSigning);
     assert!(result.new_did.is_none());
     assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-    assert!(result.contact_notification.succeeded());
+    assert!(result.contact_notification.fully_delivered());
     assert!(result.private_state_reencryption.succeeded());
 }
 
@@ -241,7 +254,7 @@ async fn compromise_tier_identity_key() {
     assert_eq!(result.tier, CompromiseTier::IdentityKey);
     assert_eq!(result.new_did, Some(alice_new));
     assert!(result.key_rotation_completed);
-    assert!(result.contact_notification.succeeded());
+    assert!(result.contact_notification.fully_delivered());
     assert!(result.private_state_reencryption.succeeded());
 }
 
@@ -632,7 +645,9 @@ async fn recovery_error_variants() {
         )],
         pending_rejoin: Vec::new(),
         key_package_rotation: StepOutcome::Succeeded,
-        contact_notification: StepOutcome::NotApplicable("no known contacts".to_owned()),
+        contact_notification: ContactNotificationOutcome::NotApplicable(
+            "no known contacts".to_owned(),
+        ),
         private_state_reencryption: StepOutcome::NotApplicable("agent tier".to_owned()),
     };
     let e6 = RecoveryError::AllContextsFailed {
@@ -718,9 +733,56 @@ async fn recovery_with_contact_notification_failure() {
         .await
         .unwrap();
 
-    // Per-context steps succeed, but contact notification failed.
+    // Per-context steps succeed, but contact notification failed — and the
+    // outcome names every contact that was left holding a §9.11 KCV binding to
+    // the compromised key, not just "it failed".
     assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-    assert!(!result.contact_notification.succeeded());
+    assert!(result.contact_notification.failed());
+    assert!(!result.contact_notification.reached_any());
+    assert_eq!(
+        result.contact_notification.unreachable(),
+        &[did("did:dht:bob")]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12b. recovery_with_partial_contact_notification — best-effort success still
+//      names the contacts that were NOT told to re-verify (§9.12 step 5).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recovery_with_partial_contact_notification() {
+    let alice = did("did:dht:alice");
+    let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec!["ctx-1".to_owned()]);
+    let kr = agent_key_rotation_outcome(&alice, 8100);
+    let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
+
+    let backend = MockBackend {
+        notify_contacts_unreachable: &["did:dht:carol"],
+        ..MockBackend::new()
+    };
+
+    let result = orch
+        .execute_recovery(
+            CompromiseTier::Agent,
+            Some(&kr),
+            &contacts,
+            None,
+            &backend,
+            &scp_clock::SystemClock,
+        )
+        .await
+        .unwrap();
+
+    // Best-effort `Ok` — recovery is not blocked...
+    assert!(result.contact_notification.reached_any());
+    // ...but carol was never told, and the caller can see exactly that.
+    assert!(!result.contact_notification.fully_delivered());
+    assert_eq!(result.contact_notification.reached(), &[did("did:dht:bob")]);
+    assert_eq!(
+        result.contact_notification.unreachable(),
+        &[did("did:dht:carol")]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -779,7 +841,10 @@ async fn recovery_result_serialization() {
         )],
         pending_rejoin: vec!["ctx-3".to_owned()],
         key_rotation_completed: true,
-        contact_notification: StepOutcome::Succeeded,
+        contact_notification: ContactNotificationOutcome::Delivered {
+            reached: vec![did("did:dht:bob")],
+            unreachable: vec![did("did:dht:carol")],
+        },
         private_state_reencryption: StepOutcome::Succeeded,
         initiated_at: 1000,
         completed_at: 2000,
@@ -834,7 +899,7 @@ async fn recovery_with_no_contexts() {
     // success. (The old `bool` reported `true` here for a step that never ran.)
     assert!(matches!(
         result.contact_notification,
-        StepOutcome::NotApplicable(_)
+        ContactNotificationOutcome::NotApplicable(_)
     ));
     assert!(result.completed_at >= result.initiated_at);
 }
