@@ -4793,19 +4793,19 @@ impl crate::scp::PyScp {
         let context_id_owned = context_id.to_owned();
 
         rt.block_on(async move {
-            // Route through the ADR-049 commit-9 lifecycle shim. The handler
-            // reconstructs an ephemeral ContextHandle and delegates to the
-            // manager's restore_context, which loads its own snapshot from
-            // persistence — the ContextParams we supply here is only used to
-            // initialise the ephemeral handle wrapper (default is acceptable
-            // because restore_context overwrites all memory-scope-sensitive
-            // state from the loaded snapshot anyway).
+            // Route through the ADR-049 lifecycle dispatch surface. The context
+            // id is the only input: `restore_context` loads the persisted
+            // snapshot and builds the context's `ContextHandle` — and therefore
+            // its authority envelope (ceiling, ceiling policy, governance, mode,
+            // roles, outlets, TTL, memory scope) — from that snapshot. The bridge
+            // has no `ContextParams` to contribute and must not invent one; a
+            // default here previously overwrote the restored context's real
+            // params and made the #2028 ceiling gate vacuous post-restore.
             use scp_core::context::actor::commands::{LifecycleCommand, RestoreContextPayload};
             let (tx, rx) = tokio::sync::oneshot::channel();
             let cmd = LifecycleCommand::RestoreContext {
                 payload: Box::new(RestoreContextPayload {
                     context_id: context_id_owned,
-                    params: scp_core::context::ContextParams::default(),
                 }),
                 reply: tx,
             };

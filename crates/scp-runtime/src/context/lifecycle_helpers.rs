@@ -2901,18 +2901,39 @@ async fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
 /// snapshot is read from persistence exactly ONCE per respawn instead of twice.
 /// Process-restart and the `RestoreContext` dispatch arm pass `None`.
 ///
+/// # The handle is built HERE, from the snapshot
+///
+/// This function owns construction of the restored [`ContextHandle`] — it is not
+/// a parameter. The handle's [`ContextParams`] ARE the context's authority
+/// envelope (mode, governance model, capability ceiling, ceiling policy, roles,
+/// outlets, TTL, memory scope), they are installed verbatim on the rehydrated
+/// `PerContextState`, and the next snapshot write persists them back. The only
+/// correct source for them is the snapshot being restored, which this function
+/// already loads — so accepting them from a caller would create a second source
+/// for a value the snapshot owns, and every caller that lacked the real params
+/// would have to invent them. (It did: all three FFI bridges passed
+/// `ContextParams::default()`, silently replacing the real params with defaults
+/// and making the #2028 Welcome-seam authority gate vacuous after any restore.
+/// See [`RestoreContextPayload`](crate::context::actor::commands::RestoreContextPayload).)
+///
+/// The handle is also driven to [`ContextState::Active`] here, for the same
+/// reason: a freshly-constructed handle starts in `Creating`, and every caller
+/// previously had to remember to transition it. Owning both steps in one place
+/// means a new call site cannot get either wrong.
+///
 /// # Errors
 ///
 /// Returns [`ContextError::PersistenceFailed`] if no persisted state
 /// exists. Returns [`ContextError::MembershipFailed`] if the context
-/// cannot be inserted (already registered).
+/// cannot be inserted (already registered). Returns
+/// [`ContextError::InvalidTransition`] if the restored snapshot's state does not
+/// admit a transition to `Active`.
 #[tracing::instrument(skip_all, fields(context_id))]
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)] // Bootstrap entry — see `create_context` rationale.
 pub async fn restore_context(
     deps: &ActorDeps,
     context_id: &str,
-    handle: &ContextHandle,
     preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
 ) -> Result<(), ContextError> {
     use crate::context::governance::timeout::DeadlockDetectionState;
@@ -2928,6 +2949,22 @@ pub async fn restore_context(
 
     let (mut ctx_snapshot, broadcast_ctx) =
         load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
+
+    // The context's authoritative handle, built from the PERSISTED params — the
+    // single source of truth for this context's authority envelope (see the
+    // "handle is built HERE" section on this function). Nothing about the handle
+    // comes from the caller: the id is the one whose snapshot we just loaded, and
+    // the params are the ones that snapshot carries.
+    //
+    // Driven to `Active` immediately: a fresh `ContextHandle` starts in
+    // `Creating`, the rehydrated state below hardcodes `lifecycle_state: Open`,
+    // and the per-context builder installs this handle verbatim — so leaving it
+    // in `Creating` would rehydrate a context whose handle state contradicts its
+    // own snapshot. Callers no longer perform this transition.
+    let handle = ContextHandle::new(context_id.to_owned(), ctx_snapshot.context_params.clone());
+    handle.transition_to(&scp_protocol::context::ContextState::Active)?;
+    let handle = &handle;
+
     restore_event_log_best_effort(deps, context_id).await;
 
     validate_consequence_rules_for_import(
@@ -3526,10 +3563,11 @@ pub async fn restore_all_contexts(
             continue;
         }
 
-        let handle =
-            crate::context::ContextHandle::new(ctx_id.clone(), ctx_snapshot.context_params.clone());
-
-        match supervisor.restore_context(ctx_id, &handle).await {
+        // The snapshot is loaded here only for the `state != Active`
+        // anti-resurrection precondition; `restore_context` loads its own copy
+        // and builds the context handle from it, so nothing about the restored
+        // context's identity or params is passed across from this loop.
+        match supervisor.restore_context(ctx_id).await {
             Ok(()) => restored.push(ctx_id.clone()),
             Err(e) => {
                 tracing::warn!(
@@ -3777,6 +3815,7 @@ mod restore_reconcile_tests {
     use scp_protocol::context::params::{ContextMode, ContextParams};
     use scp_protocol::context::{ContextError, builder::ContextCreationError};
 
+    use crate::context::actor::commands::LifecycleCommand;
     use crate::context::actor::state::ContextRouting;
     use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
     use crate::context::persistence::ContextPersistence;
@@ -3967,10 +4006,6 @@ mod restore_reconcile_tests {
         ctx_id: &str,
         is_broadcast: bool,
     ) -> (ContextSnapshot, Option<BroadcastContextSnapshot>) {
-        let capture = Arc::new(CapturingPersistence::default());
-        // Box the same Arc-backed capture so we can both write (via supervisor)
-        // and read (via this handle) the harvested snapshot.
-        let supervisor = build_supervisor(Box::new(SharedCapture(Arc::clone(&capture))));
         let params = if is_broadcast {
             ContextParams {
                 mode: ContextMode::Broadcast,
@@ -3984,6 +4019,22 @@ mod restore_reconcile_tests {
                 ..ContextParams::default()
             }
         };
+        harvest_snapshot_with(ctx_id, params).await
+    }
+
+    /// [`harvest_snapshot`] with caller-chosen [`ContextParams`] — used by the
+    /// restore-params test, which needs a genuinely non-default authority
+    /// envelope to distinguish "restored from the snapshot" from "reconstructed
+    /// from a default".
+    async fn harvest_snapshot_with(
+        ctx_id: &str,
+        params: ContextParams,
+    ) -> (ContextSnapshot, Option<BroadcastContextSnapshot>) {
+        let capture = Arc::new(CapturingPersistence::default());
+        // Box the same Arc-backed capture so we can both write (via supervisor)
+        // and read (via this handle) the harvested snapshot.
+        let supervisor = build_supervisor(Box::new(SharedCapture(Arc::clone(&capture))));
+        let is_broadcast = params.mode == ContextMode::Broadcast;
         let pseudonym = if is_broadcast { None } else { Some([7u8; 32]) };
         supervisor
             .create_context(
@@ -4029,8 +4080,110 @@ mod restore_reconcile_tests {
             .build_actor_deps(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
             .await
             .expect("build_actor_deps");
-        let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
-        lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle, None).await
+        lifecycle_helpers::restore_context(&deps, restore_ctx_id, None).await
+    }
+
+    /// #2028 — restore installs the PERSISTED `ContextParams`, never a
+    /// caller-supplied default.
+    ///
+    /// The restored [`ContextHandle`]'s params ARE the context's authority
+    /// envelope: `PerContextState.handle` is installed from them verbatim, the
+    /// TTL re-arm reads `handle.params().ttl`, the snapshot writer persists
+    /// `handle.params().clone()` back to storage, and the #2028 Welcome-seam
+    /// gate compares `handle.params().ceiling` against the live ceiling.
+    ///
+    /// Every FFI bridge dispatches `LifecycleCommand::RestoreContext` with only
+    /// a context id; it holds no `ContextParams`. When the payload still carried
+    /// a `params` field the bridges filled it with `ContextParams::default()`,
+    /// so ANY restore through any SDK silently replaced the context's real
+    /// ceiling, ceiling policy, governance model, mode, roles, outlets and TTL
+    /// with defaults — and then PERSISTED those defaults over the real ones. The
+    /// empty default ceiling additionally made the #2028 gate vacuous (an empty
+    /// genesis set is trivially covered by any live ceiling), so the gate stayed
+    /// present in the source while enforcing nothing: a false guarantee.
+    ///
+    /// This test drives the exact dispatch surface the bridges use and pins that
+    /// the restored context reports the SNAPSHOT's params. Against the pre-fix
+    /// code every assertion below fails — the restored context reported
+    /// `ContextParams::default()`.
+    #[tokio::test]
+    async fn restore_installs_the_persisted_params_not_a_caller_default() {
+        use scp_protocol::context::params::{CeilingPolicy, MemoryScope};
+        use scp_protocol::context::roles::Capability;
+
+        let ctx_id = "restore-installs-persisted-params-not-default";
+
+        // A deliberately NON-default authority envelope: every field below
+        // differs from `ContextParams::default()`, so a reconstructed default
+        // cannot masquerade as a faithful restore on any of them.
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::MemberInvite,
+            ],
+            ceiling_policy: CeilingPolicy::Governed,
+            memory_scope: MemoryScope::Full,
+            ..ContextParams::default()
+        };
+        assert_ne!(
+            params.ceiling,
+            ContextParams::default().ceiling,
+            "fixture precondition: the ceiling must differ from the default"
+        );
+
+        let (snapshot, _) = harvest_snapshot_with(ctx_id, params.clone()).await;
+        assert_eq!(
+            snapshot.context_params.ceiling, params.ceiling,
+            "precondition: the harvested snapshot carries the real ceiling"
+        );
+
+        let supervisor = build_supervisor(Box::new(ServingPersistence { snapshot }));
+
+        // The EXACT command shape all three FFI bridges dispatch — context id
+        // only. There is no `params` field to get wrong any more; the point of
+        // the test is that the restored context still ends up with the real ones.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        supervisor
+            .dispatch_lifecycle_command(LifecycleCommand::RestoreContext {
+                payload: Box::new(crate::context::actor::commands::RestoreContextPayload {
+                    context_id: ctx_id.to_owned(),
+                }),
+                reply: tx,
+            })
+            .await
+            .expect("dispatch RestoreContext");
+        rx.await
+            .expect("restore reply")
+            .expect("restore succeeds against the harvested snapshot");
+
+        let restored = supervisor
+            .context_params(ctx_id)
+            .await
+            .expect("the restored context is registered and reports its params");
+
+        assert_eq!(
+            restored.ceiling, params.ceiling,
+            "the restored context must carry the PERSISTED capability ceiling — a default \
+             (empty) ceiling would make the #2028 Welcome-seam gate vacuous on every \
+             post-restore path"
+        );
+        assert_eq!(
+            restored.ceiling_policy,
+            CeilingPolicy::Governed,
+            "the restored context must carry the PERSISTED ceiling policy"
+        );
+        assert_eq!(
+            restored.memory_scope,
+            MemoryScope::Full,
+            "the restored context must carry the PERSISTED memory scope"
+        );
+        assert_eq!(
+            restored.mode,
+            ContextMode::Encrypted,
+            "the restored context must carry the PERSISTED mode"
+        );
     }
 
     /// Case 1: reconstructed mode ENCRYPTED (no broadcast state) but the

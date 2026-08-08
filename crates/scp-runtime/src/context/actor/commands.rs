@@ -838,19 +838,38 @@ pub struct CloseContextPayload {
     pub initiator_did: scp_did::DID,
 }
 
-/// Payload for [`LifecycleCommand::RestoreContext`]. Boxed inside the
-/// variant for the same reason as [`CreateContextPayload`] —
-/// `ContextParams` is ~1KB.
+/// Payload for [`LifecycleCommand::RestoreContext`].
+///
+/// # Why this payload carries no `ContextParams`
+///
+/// Restore REHYDRATES a context that already exists durably, so its
+/// [`ContextParams`](scp_protocol::context::params::ContextParams) are already
+/// owned by the persisted `ContextSnapshot` that
+/// [`restore_context`](crate::context::lifecycle_helpers::restore_context)
+/// loads. A `params` field here would be a second, caller-supplied source for a
+/// value the snapshot already holds — and every FFI bridge filled it with
+/// `ContextParams::default()`, because no bridge has (or should need) the real
+/// params at dispatch time.
+///
+/// That default was not inert. The dispatch arm built the context's
+/// authoritative [`ContextHandle`](crate::context::ContextHandle) from it, the
+/// handle was installed verbatim on the rehydrated `PerContextState`, and the
+/// next snapshot write persisted those defaults OVER the real params — silently
+/// discarding the context's mode, governance model, roles, outlets, TTL and
+/// capability ceiling. An empty default ceiling also made the #2028 Welcome-seam
+/// authority gate
+/// ([`check_genesis_ceiling_still_current`](crate::context::state::check_genesis_ceiling_still_current))
+/// vacuous on every post-restore path: a gate that is present in the code but
+/// enforces nothing is a false guarantee, which the fail-closed tenet forbids
+/// more strongly than an honestly-absent capability.
+///
+/// The payload therefore carries ONLY the identifier. The snapshot is the single
+/// source of truth for the restored params, and the handle is built from it
+/// inside `restore_context` where the snapshot is already in hand.
 pub struct RestoreContextPayload {
-    /// Context identifier string.
+    /// Context identifier string. The sole input: the params come from the
+    /// persisted snapshot this id resolves to.
     pub context_id: String,
-    /// Context params — used to rebuild an ephemeral
-    /// [`ContextHandle`](crate::context::ContextHandle) on the handler
-    /// side. The legacy method takes the handle by reference; the
-    /// command carries the underlying params so the dispatch layer can
-    /// reconstruct the handle without lifetime juggling across the
-    /// mailbox.
-    pub params: scp_protocol::context::params::ContextParams,
 }
 
 /// See [`ContextCommand::Lifecycle`]. Real variants land in commit 9 of

@@ -12066,15 +12066,19 @@ impl Scp {
         runtime()
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
-                // The actor loads its own persisted snapshot (including the
-                // correct ContextParams / memory_scope) inside the
-                // RestoreContext handler — the bridge no longer pre-loads it.
+                // The context id is the only input: `restore_context` loads the
+                // persisted snapshot and builds the context's `ContextHandle` —
+                // and therefore its authority envelope (ceiling, ceiling policy,
+                // governance, mode, roles, outlets, TTL, memory scope) — from
+                // that snapshot. The bridge has no `ContextParams` to contribute
+                // and must not invent one; a default here previously overwrote
+                // the restored context's real params and made the #2028 ceiling
+                // gate vacuous post-restore.
                 use scp_core::context::actor::commands::{LifecycleCommand, RestoreContextPayload};
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let cmd = LifecycleCommand::RestoreContext {
                     payload: Box::new(RestoreContextPayload {
                         context_id: ctx_id.clone(),
-                        params: scp_core::context::ContextParams::default(),
                     }),
                     reply: tx,
                 };

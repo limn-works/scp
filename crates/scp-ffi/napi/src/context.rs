@@ -4527,11 +4527,13 @@ pub(crate) async fn context_add_checkpoint_cosignature_on(
 
 /// Per-bridge-instance implementation of [`context_restore`].
 ///
-/// Routed through the ADR-049 lifecycle dispatch surface. The handler
-/// loads the persisted snapshot itself and reconstructs an ephemeral
-/// `ContextHandle` from it — the `ContextParams` supplied here are only
-/// used to initialise the ephemeral wrapper; the handler overwrites all
-/// memory-scope-sensitive state from the loaded snapshot.
+/// Routed through the ADR-049 lifecycle dispatch surface. The context id is the
+/// only input: the handler loads the persisted snapshot and builds the context's
+/// `ContextHandle` — and therefore its authority envelope (ceiling, ceiling
+/// policy, governance, mode, roles, outlets, TTL, memory scope) — from that
+/// snapshot. The bridge has no `ContextParams` to contribute and must not invent
+/// one; a default here previously overwrote the restored context's real params
+/// and made the #2028 ceiling gate vacuous post-restore.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) async fn context_restore_on(
     bi: &NapiBridgeInstance,
@@ -4541,10 +4543,7 @@ pub(crate) async fn context_restore_on(
     let sup = crate::runtime::supervisor(bi)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = LifecycleCommand::RestoreContext {
-        payload: Box::new(RestoreContextPayload {
-            context_id,
-            params: scp_core::context::ContextParams::default(),
-        }),
+        payload: Box::new(RestoreContextPayload { context_id }),
         reply: tx,
     };
     sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {

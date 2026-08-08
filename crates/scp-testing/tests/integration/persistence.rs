@@ -1057,9 +1057,10 @@ async fn context_manager_broadcast_restore_roundtrip() {
         mock_key_resolver(),
     ));
 
-    let handle2 = ContextHandle::new(ctx_id.to_owned(), params);
-    handle2.transition_to(&ContextState::Active).unwrap();
-    manager2.restore_context(ctx_id, &handle2).await.unwrap();
+    // Restore takes the context id alone: the params and the rebuilt handle come
+    // from the persisted snapshot, so a caller cannot substitute a different
+    // authority envelope (see `RestoreContextPayload`).
+    manager2.restore_context(ctx_id).await.unwrap();
 
     // Verify membership survived restart.
     assert!(

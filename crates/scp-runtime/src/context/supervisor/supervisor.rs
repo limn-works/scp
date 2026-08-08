@@ -3381,14 +3381,15 @@ impl Supervisor {
                 // Serialize this bootstrap-spawn against every other same-id
                 // bootstrap (see `bootstrap_spawn_lock`).
                 let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-                let handle = crate::context::ContextHandle::new(p.context_id.clone(), p.params);
-                if let Err(e) = handle
-                    .transition_to(&scp_protocol::context::ContextState::Active)
-                {
-                    let sketch = standing_outcome_error_sketch(&e);
-                    let _ = reply.send(Err(e));
-                    return Outcome::err(sketch);
-                }
+                // No handle is built here: `restore_context` constructs the
+                // context's authoritative `ContextHandle` from the PERSISTED
+                // snapshot it loads, and drives it to `Active` itself. This arm
+                // has no access to the real `ContextParams` (the FFI bridges that
+                // dispatch this command do not carry them), and inventing a
+                // default here is exactly the bug the payload's doc comment
+                // records — it overwrote the restored context's authority
+                // envelope with defaults and made the #2028 ceiling gate vacuous.
+                //
                 // ADR-049 Phase 2A finalization: the restore payload
                 // carries no identity (it rehydrates a persisted snapshot
                 // rather than joining), and `restore_context` never
@@ -3415,7 +3416,6 @@ impl Supervisor {
                 let fut = Box::pin(crate::context::lifecycle_helpers::restore_context(
                     &deps,
                     &p.context_id,
-                    &handle,
                     None, // process-restart / dispatch arm: load the snapshot here
                 ));
                 let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
@@ -4955,21 +4955,12 @@ impl Supervisor {
         owning_did: &DID,
         snapshot: &crate::context::state::ContextSnapshot,
     ) -> Result<(), ContextError> {
-        let handle =
-            crate::context::ContextHandle::new(ctx_id.to_owned(), snapshot.context_params.clone());
-        // Drive the handle to `Active` BEFORE restore — `restore_context`
-        // assumes a live handle and never transitions it itself, so a fresh
-        // `ContextHandle` (which starts `Creating`) would otherwise leave the
-        // respawned context stuck in `Creating`. This mirrors the
-        // `RestoreContext` direct dispatch arm, which transitions to `Active`
-        // before calling `restore_context`. On a transition failure, count it
-        // as a failed respawn.
-        if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
-            self.record_respawn_failure(ctx_id).await;
-            return Err(ContextError::ActorCrashed(format!(
-                "{ctx_id} (could not activate respawned context handle: {e})"
-            )));
-        }
+        // No handle is built or activated here: `restore_context` owns both, and
+        // builds the handle from the persisted snapshot's `context_params` — the
+        // same value this function used to read, now sourced once inside the
+        // primitive so no call site can supply a different one. A handle-
+        // activation failure now surfaces as the restore's own error and is
+        // counted against the respawn budget by the `Ok(Err(_))` arm below.
         let deps = match self.build_actor_deps(owning_did).await {
             Ok(deps) => deps,
             Err(e) => {
@@ -5005,7 +4996,6 @@ impl Supervisor {
         let restore_fut = Box::pin(crate::context::lifecycle_helpers::restore_context(
             &deps,
             ctx_id,
-            &handle,
             Some(snapshot.clone()),
         ));
         match tokio::time::timeout(Self::LIFECYCLE_TIMEOUT, restore_fut).await {
@@ -10329,35 +10319,23 @@ impl Supervisor {
     /// the actor mailbox.
     ///
     /// Builds a [`LifecycleCommand::RestoreContext`] with an embedded
-    /// reply oneshot. Note: `context_id` and `handle.context_id()` must
-    /// agree (the legacy helper carries both for historical reasons);
-    /// the command payload uses `handle.context_id()`, and a caller-
-    /// supplied `context_id` argument that does not match is ignored.
+    /// reply oneshot.
+    ///
+    /// The context id is the ONLY input. Restore rehydrates a context that
+    /// already exists durably, so its
+    /// [`ContextParams`](scp_protocol::context::params::ContextParams) — and the
+    /// [`ContextHandle`](crate::context::ContextHandle) built from them — come
+    /// from the persisted snapshot this id resolves to, not from the caller. See
+    /// [`RestoreContextPayload`](crate::context::actor::commands::RestoreContextPayload)
+    /// for why a caller-supplied handle was removed.
     ///
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the handler.
-    pub async fn restore_context(
-        self: &Arc<Self>,
-        context_id: &str,
-        handle: &crate::context::ContextHandle,
-    ) -> Result<(), ContextError> {
-        // The legacy method takes both `context_id` and `handle`
-        // because the original helper signature predates `ContextHandle`
-        // exposing its own `context_id()` accessor. The boxed payload
-        // here is built from the handle (the authoritative source); the
-        // separate `context_id` parameter is retained on the signature
-        // for caller compatibility and silently overridden when the two
-        // disagree.
-        debug_assert_eq!(
-            context_id,
-            handle.context_id(),
-            "Supervisor::restore_context — context_id argument must match handle.context_id()"
-        );
+    pub async fn restore_context(self: &Arc<Self>, context_id: &str) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let payload = Box::new(crate::context::actor::commands::RestoreContextPayload {
-            context_id: handle.context_id().to_owned(),
-            params: handle.params().clone(),
+            context_id: context_id.to_owned(),
         });
         let cmd = LifecycleCommand::RestoreContext { payload, reply: tx };
         self.dispatch_lifecycle_command(cmd).await?;
