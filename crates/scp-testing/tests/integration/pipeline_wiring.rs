@@ -2926,6 +2926,95 @@ fn b3_webhook_dispatch_wired() {
 }
 
 // ===========================================================================
+// MCP resource subscriptions — advertised capability must be backed (#1341)
+// ===========================================================================
+
+/// `resources/subscribe` MUST be backed by a real runtime event source on
+/// every bridge.
+///
+/// The original defect: `McpServer` hard-coded `ResourceServerCapability {
+/// subscribe: true }` at `initialize` while `ContextProvider::subscribe_resource`
+/// returned `Ok(())` and did nothing on PyO3/UniFFI (NAPI returned `Err`). A
+/// client received a successful subscription and then never received a single
+/// `notifications/resources/updated` — a false guarantee on a shipped path,
+/// plus a three-way divergence between bridges.
+///
+/// The fix makes the advertisement *derived* rather than asserted: the
+/// capability flag and the delivery pump are switched on by the same argument
+/// (`Option<broadcast::Receiver<(String, ContextEvent)>>`) handed to the
+/// transport. These assertions guard the two halves that make that sound.
+#[test]
+fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
+    // (a) The capability is never hard-coded true — it must be read from the
+    //     `subscriptions_enabled` flag, which only `enable_subscriptions()`
+    //     sets, and which only a transport holding a receiver calls.
+    let server_src = include_str!("../../../../crates/scp-mcp/src/server.rs");
+    assert!(
+        server_src.contains("subscribe: self.subscriptions_enabled"),
+        "McpServer must advertise resources.subscribe from the wired-event-source \
+         flag, never a hard-coded `true` (that was the #1341 false guarantee)"
+    );
+    assert!(
+        !server_src.contains("ResourceServerCapability { subscribe: true }"),
+        "resources.subscribe must not be hard-coded true — it must track whether \
+         a ContextEvent source is actually wired"
+    );
+
+    // (b) The provider seam that let each bridge answer `subscribe` differently
+    //     is gone. Subscription state lives solely in `McpServer`, so the three
+    //     bridges cannot diverge on it again.
+    assert!(
+        !server_src.contains("fn subscribe_resource"),
+        "ContextProvider::subscribe_resource must stay deleted — it was the seam \
+         that let PyO3/UniFFI silently accept and NAPI reject the same request"
+    );
+
+    // (c) Both transports must accept the event source and turn it into
+    //     `notifications/resources/updated`.
+    let sse_src = include_str!("../../../../crates/scp-mcp/src/sse.rs");
+    let stdio_src = include_str!("../../../../crates/scp-mcp/src/stdio.rs");
+    for (name, src) in [("sse", sse_src), ("stdio", stdio_src)] {
+        assert!(
+            src.contains("enable_subscriptions") && src.contains("pump_events"),
+            "the {name} transport must enable the capability and run the event \
+             pump from the same receiver argument"
+        );
+    }
+    assert!(
+        server_src.contains("fn notifications_for_event"),
+        "McpServer must map ContextEvents to notifications for subscribed URIs"
+    );
+
+    // (d) Every bridge must source that receiver from the Supervisor and hand
+    //     it to the transport. The original bug was fixed on one bridge at a
+    //     time before; these per-bridge matches guard against that drift.
+    let pyo3_mcp_src = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
+    let napi_mcp_src = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
+    let uniffi_mcp_src = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
+    for (bridge, src) in [
+        ("PyO3", pyo3_mcp_src),
+        ("NAPI", napi_mcp_src),
+        ("UniFFI", uniffi_mcp_src),
+    ] {
+        assert!(
+            src.contains("subscribe_events()"),
+            "{bridge} MCP serve must obtain the Supervisor ContextEvent receiver"
+        );
+        assert!(
+            src.contains("run_sse(sse_server, sse_config, sse_shutdown, context_events)")
+                || src.contains("run_sse(sse_server, config, sse_shutdown, context_events)"),
+            "{bridge} must pass the event receiver to run_sse so SSE clients \
+             actually receive resources/updated"
+        );
+        assert!(
+            src.contains("run_stdio(&server, context_events)")
+                || src.contains("run_stdio(&server_clone, context_events)"),
+            "{bridge} must pass the event receiver to the shared run_stdio loop"
+        );
+    }
+}
+
+// ===========================================================================
 // Durable saga journal — production supervisor construction (§17.16 / ADR-049)
 // ===========================================================================
 
