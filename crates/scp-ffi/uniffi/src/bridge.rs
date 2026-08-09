@@ -13348,14 +13348,14 @@ impl Scp {
             .spawn(async move {
                 validate_outlet_name(&definition.name)?;
 
+                // SCP-OUT-031 PR-2a: STATE-FREE message. Retained (no runtime
+                // gate covers this operation) but must not render the observed
+                // lifecycle state to a caller this operation has not yet
+                // authorized.
                 let state = handle.state.lock().await;
-
                 if !matches!(*state, ContextState::Active) {
                     return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot register outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
+                        msg: "cannot register outlet: context must be active".to_owned(),
                         code: codes::OUTLET_6003.to_owned(),
                     });
                 }
@@ -13397,13 +13397,16 @@ impl Scp {
                 let test_vectors: Vec<scp_core::context::outlets::OutletTestVector> =
                     match definition.test_vectors_json.as_deref() {
                         None => Vec::new(),
-                        Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
-                            msg: format!("invalid test_vectors_json: {e}"),
-                            code: codes::VALID_7037.to_owned(),
-                        })?,
+                        Some(json) => {
+                            serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                                msg: format!("invalid test_vectors_json: {e}"),
+                                code: codes::VALID_7037.to_owned(),
+                            })?
+                        }
                     };
 
-                let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref() {
+                let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref()
+                {
                     None => [0u8; 32],
                     Some(bytes) => scp_ffi_common::validate::expect_fixed_bytes::<32>(
                         bytes,
@@ -13415,18 +13418,23 @@ impl Scp {
                     })?,
                 };
 
-                let outlet_id = format!("outlet-{}", definition.name.replace(' ', "-").to_lowercase());
+                let outlet_id = format!(
+                    "outlet-{}",
+                    definition.name.replace(' ', "-").to_lowercase()
+                );
 
-                let cost = definition.cost.map(|c| scp_core::context::outlets::OutletCost {
-                    // ADR-060: `OutletCost.amount` is the `Amount` newtype. UniFFI
-                    // carries it as a native `u64` (Swift `UInt64` / Kotlin
-                    // `ULong`), which represents the full smallest-unit range
-                    // exactly.
-                    amount: scp_core::economy::Amount(c.amount),
-                    currency: c.currency,
-                    payee: c.payee.into(),
-                    cost_formula: c.cost_formula,
-                });
+                let cost = definition
+                    .cost
+                    .map(|c| scp_core::context::outlets::OutletCost {
+                        // ADR-060: `OutletCost.amount` is the `Amount` newtype. UniFFI
+                        // carries it as a native `u64` (Swift `UInt64` / Kotlin
+                        // `ULong`), which represents the full smallest-unit range
+                        // exactly.
+                        amount: scp_core::economy::Amount(c.amount),
+                        currency: c.currency,
+                        payee: c.payee.into(),
+                        cost_formula: c.cost_formula,
+                    });
 
                 let core_registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: outlet_id.clone(),
@@ -13527,18 +13535,25 @@ impl Scp {
                     validate_ucan_token(jwt)?;
                 }
 
-                let state = handle.state.lock().await;
-
-                if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
-                        code: codes::OUTLET_6005.to_owned(),
-                    });
-                }
-                drop(state);
+                // SCP-OUT-031 PR-2a: NO bridge-local lifecycle pre-guard here.
+                // The former `handle.state` check ran BEFORE
+                // `validate_outlet_ucan_uniffi` below and interpolated the raw
+                // lifecycle state into its prose, handing an unauthorized caller
+                // the exact `Closing` / `Expired` / `MigratingOut` /
+                // `Tombstoned` / `Poisoned` state — the very leak PR-2a closed
+                // in the runtime, bypassed at this bridge.
+                //
+                // The single authoritative seam is the runtime's
+                // `ensure_context_active` (`scp-runtime` `outlets_helpers.rs`),
+                // the FIRST predicate of `reserve_outlet_economy`, which
+                // `Supervisor::invoke_outlet_with_economy` (called
+                // unconditionally below) runs as Phase 1 before any bookkeeping.
+                // It reads the AUTHORITATIVE `ContextHandle::state()` (an
+                // `ArcSwap` load, not this bridge's lagging cache) and returns
+                // the typed `ContextError::OutletContextNotActive`, whose
+                // `Display` is the structured, state-free `[SCP-OUTLET-6101]
+                // protocol: protocol.context-closed-mid-stream`. Matches the
+                // PyO3 reference bridge, which has never carried such a guard.
 
                 // SCP-OUT-014: select the split capability stem from the
                 // outlet's registered kind — `outlet_query:{id}` for Query
@@ -13597,9 +13612,7 @@ impl Scp {
                 let invocation_ucan_token =
                     scp_core::crypto::ucan::validate::parse_ucan(&ucan_token).map_err(|e| {
                         ScpError::Permission {
-                            msg: format!(
-                                "invalid invocation UCAN for outlet '{outlet_id}': {e}"
-                            ),
+                            msg: format!("invalid invocation UCAN for outlet '{outlet_id}': {e}"),
                             code: codes::PERM_3001.to_owned(),
                         }
                     })?;
@@ -13674,7 +13687,9 @@ impl Scp {
                             },
                             |h| {
                                 h(input).map_err(|e| {
-                                    format!("outlet handler for '{outlet_id_for_executor}' failed: {e}")
+                                    format!(
+                                        "outlet handler for '{outlet_id_for_executor}' failed: {e}"
+                                    )
                                 })
                             },
                         )
@@ -13683,7 +13698,8 @@ impl Scp {
 
                 let manager = bi.context_manager_expect()?;
                 let invoker_did_typed: scp_did::DID = identity.did.clone().into();
-                let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
+                let outlet_id_typed =
+                    scp_core::context::outlets::OutletId::from(outlet_id.as_str());
                 let outcome = manager
                     .invoke_outlet_with_economy(
                         &context_id,
@@ -13730,14 +13746,14 @@ impl Scp {
             .map_err(ScpError::from)?;
         runtime()
             .spawn(async move {
+                // SCP-OUT-031 PR-2a: STATE-FREE message. Retained (no runtime
+                // gate covers this operation) but must not render the observed
+                // lifecycle state to a caller this operation has not yet
+                // authorized.
                 let state = handle.state.lock().await;
-
                 if !matches!(*state, ContextState::Active) {
                     return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot verify outlet in context in {:?} state — context must be active",
-                            *state
-                        ),
+                        msg: "cannot verify outlet: context must be active".to_owned(),
                         code: codes::OUTLET_6007.to_owned(),
                     });
                 }
@@ -13789,13 +13805,15 @@ impl Scp {
         runtime()
             .spawn(async move {
                 // Validate source context is active.
+                //
+                // SCP-OUT-031 PR-2a: STATE-FREE messages. Both run BEFORE the
+                // UCAN authorization below, so an unauthorized caller reaches
+                // them. Retained — no runtime gate covers this path.
                 let source_state = source_handle.state.lock().await;
                 if !matches!(*source_state, ContextState::Active) {
                     return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke cross-context outlet: source context in {:?} state",
-                            *source_state
-                        ),
+                        msg: "cannot invoke cross-context outlet: source context must be active"
+                            .to_owned(),
                         code: codes::OUTLET_6010.to_owned(),
                     });
                 }
@@ -13805,10 +13823,8 @@ impl Scp {
                 let target_state = target_handle.state.lock().await;
                 if !matches!(*target_state, ContextState::Active) {
                     return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke cross-context outlet: target context in {:?} state",
-                            *target_state
-                        ),
+                        msg: "cannot invoke cross-context outlet: target context must be active"
+                            .to_owned(),
                         code: codes::OUTLET_6011.to_owned(),
                     });
                 }
@@ -14194,13 +14210,13 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
+                // SCP-OUT-031 PR-2a: STATE-FREE message. Retained (no runtime gate
+                // covers this operation) but must not render the observed lifecycle
+                // state to a caller this operation has not yet authorized.
                 let state = handle.state.lock().await;
                 if !matches!(*state, ContextState::Active) {
                     return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot create session in context in {:?} state — context must be active",
-                            *state
-                        ),
+                        msg: "cannot create session: context must be active".to_owned(),
                         code: codes::OUTLET_6014.to_owned(),
                     });
                 }
@@ -14274,13 +14290,13 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
+                // SCP-OUT-031 PR-2a: STATE-FREE message. Retained (no runtime gate
+                // covers this operation) but must not render the observed lifecycle
+                // state to a caller this operation has not yet authorized.
                 let state = handle.state.lock().await;
                 if !matches!(*state, ContextState::Active) {
                     return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot invoke session in context in {:?} state — context must be active",
-                            *state
-                        ),
+                        msg: "cannot invoke session: context must be active".to_owned(),
                         code: codes::OUTLET_6017.to_owned(),
                     });
                 }
@@ -14458,13 +14474,13 @@ impl Scp {
             .spawn(async move {
                 validate_outlet_id(&outlet_id)?;
 
+                // SCP-OUT-031 PR-2a: STATE-FREE message. Retained (no runtime gate
+                // covers this operation) but must not render the observed lifecycle
+                // state to a caller this operation has not yet authorized.
                 let state = handle.state.lock().await;
                 if !matches!(*state, ContextState::Active) {
                     return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot expose outlet interface in context in {:?} state — context must be active",
-                            *state
-                        ),
+                        msg: "cannot expose outlet interface: context must be active".to_owned(),
                         code: codes::OUTLET_6030.to_owned(),
                     });
                 }
@@ -14544,13 +14560,13 @@ impl Scp {
             .map_err(ScpError::from)?;
         runtime()
             .spawn(async move {
+                // SCP-OUT-031 PR-2a: STATE-FREE message. Retained (no runtime gate
+                // covers this operation) but must not render the observed lifecycle
+                // state to a caller this operation has not yet authorized.
                 let state = handle.state.lock().await;
                 if !matches!(*state, ContextState::Active) {
                     return Err(ScpError::Outlet {
-                        msg: format!(
-                            "cannot accept outlet interface in context in {:?} state — context must be active",
-                            *state
-                        ),
+                        msg: "cannot accept outlet interface: context must be active".to_owned(),
                         code: codes::OUTLET_6032.to_owned(),
                     });
                 }
@@ -23104,25 +23120,29 @@ mod tests {
     /// outlet error — the raw lifecycle state MUST NOT leak to the FFI caller
     /// (this gate runs before authz on the unary invoke path). Cross-bridge
     /// parity with the `PyO3` + `NAPI` bridges.
+    ///
+    /// Driven over the EXHAUSTIVE non-`Active` corpus
+    /// ([`scp_ffi_common::outlet_error::corpus`]) rather than one sampled state,
+    /// so adding a `ContextState` variant is a COMPILE error in the corpus's
+    /// `is_active` match — not a silently-unasserted leak here.
     #[test]
     fn outlet_context_not_active_surfaces_structured_state_free() {
-        let err: ScpError = scp_core::context::ContextError::OutletContextNotActive {
-            current_state: scp_core::context::ContextState::Closing,
+        use scp_ffi_common::outlet_error::corpus;
+
+        for current_state in corpus::non_active_context_states() {
+            let err: ScpError =
+                scp_core::context::ContextError::OutletContextNotActive { current_state }.into();
+            let (msg, code) = match err {
+                ScpError::Outlet { msg, code } => (msg, code),
+                other => panic!("expected ScpError::Outlet, got {other:?}"),
+            };
+            assert_eq!(
+                code,
+                scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+            );
+            corpus::assert_no_lifecycle_state_leak(&msg, "UniFFI From<ContextError> render");
+            assert!(msg.contains("protocol.context-closed-mid-stream"), "{msg}");
         }
-        .into();
-        let (msg, code) = match err {
-            ScpError::Outlet { msg, code } => (msg, code),
-            other => panic!("expected ScpError::Outlet, got {other:?}"),
-        };
-        assert_eq!(
-            code,
-            scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
-        );
-        assert!(
-            !msg.contains("Closing"),
-            "raw lifecycle state must NOT leak to the FFI caller: {msg}"
-        );
-        assert!(msg.contains("protocol.context-closed-mid-stream"), "{msg}");
     }
 
     // -----------------------------------------------------------------------
@@ -25676,6 +25696,185 @@ mod tests {
                 }
                 other => panic!("expected SagaAborted (axis a), got {other:?}"),
             }
+        }
+    }
+
+    /// SCP-OUT-031 PR-2a (SECURITY): the unary `outlet_invoke` pre-authorization
+    /// lifecycle-state leak.
+    ///
+    /// Before this fix `Scp::outlet_invoke` carried a bridge-local
+    /// `handle.state` guard that ran BEFORE `validate_outlet_ucan_uniffi` and
+    /// interpolated the raw lifecycle state into `SCP-OUTLET-6005` prose. A
+    /// context member holding a handle but NO `outlet_call:*` capability could
+    /// therefore read the exact state with a garbage UCAN — bypassing the
+    /// hardened runtime carrier PR-2a introduced. Mirrors the NAPI bridge's
+    /// `invoke_lifecycle_leak_tests`.
+    #[cfg(feature = "testing")]
+    mod invoke_lifecycle_leak_tests {
+        use super::*;
+        use scp_ffi_common::outlet_error::corpus;
+
+        /// Single-admin params whose ceiling carries `context:close`, so the
+        /// test can drive the context to a REAL non-active lifecycle state
+        /// through the actual bridge close path.
+        fn closeable_params() -> ContextParams {
+            ContextParams {
+                mode: ContextMode::Encrypted,
+                ceiling: vec![
+                    "context:close".to_owned(),
+                    "outlet:register".to_owned(),
+                    "outlet:call:*".to_owned(),
+                    "messages:read".to_owned(),
+                    "messages:write".to_owned(),
+                ],
+                ceiling_policy: CeilingPolicy::Immutable,
+                governance: GovernanceModel::SingleAdmin,
+                memory_scope: MemoryScope::Ephemeral,
+                ttl_seconds: 0,
+                promotable: false,
+                min_protocol_version: 0,
+                max_chain_depth: None,
+                max_nesting_depth: None,
+                session_cap: None,
+                economic_policy: None,
+                consequence_rules_json: None,
+                consequence_config_json: None,
+            }
+        }
+
+        /// (LEAK) An UNAUTHORIZED caller — a valid handle, a garbage UCAN, no
+        /// `outlet_call:*` capability — invoking an outlet on a REAL non-active
+        /// context must be rejected WITHOUT the caller-visible error naming the
+        /// lifecycle state, and must NOT come back through the deleted
+        /// bridge-local `SCP-OUTLET-6005` lifecycle guard.
+        ///
+        /// Also the authorization-hole regression guard: removing the bridge
+        /// guard must not make an unauthorized invocation succeed.
+        ///
+        /// The context is driven non-active through the REAL `context_close`
+        /// export, which is what flips the cached handle state the deleted guard
+        /// read. That cached state is asserted non-active first, so this test
+        /// can never pass vacuously against a still-`Active` cache.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn unauthorized_invoke_on_non_active_context_leaks_no_lifecycle_state() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+
+            let identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let handle = scp
+                .context_create(Arc::clone(&identity), closeable_params())
+                .await
+                .expect("context_create should succeed");
+
+            scp.context_close(Arc::clone(&handle), Arc::clone(&identity))
+                .await
+                .expect("context_close should succeed");
+
+            // Precondition: the cached state — the value the DELETED guard read
+            // and interpolated — is non-active. Without this the leak is
+            // unreachable and this test would prove nothing.
+            assert_ne!(
+                handle.state().expect("cached state"),
+                "active",
+                "the cached handle state must be non-active, else the deleted \
+                 guard would never have fired"
+            );
+
+            let err = scp
+                .outlet_invoke(
+                    Arc::clone(&handle),
+                    "outlet-leak-probe".to_owned(),
+                    r#"{"a":"x"}"#.to_owned(),
+                    Arc::clone(&identity),
+                    // Structurally valid but cryptographically worthless: this
+                    // caller holds NO `outlet_call:*` capability.
+                    Some("eyJhbGciOiJFZERTQSJ9.eyJ0ZXN0Ijp0cnVlfQ.not-a-real-signature".to_owned()),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("an unauthorized invoke must still be rejected");
+
+            let msg = format!("{err}");
+            corpus::assert_no_lifecycle_state_leak(
+                &msg,
+                "uniffi outlet_invoke, unauthorized caller, non-active context",
+            );
+            assert!(
+                !msg.contains(codes::OUTLET_6005),
+                "the deleted bridge-local lifecycle pre-guard must not resurface: {msg}"
+            );
+        }
+
+        /// (SURFACE) The runtime carrier the deleted bridge guard used to
+        /// preempt is reachable and state-free: driving the same REAL non-active
+        /// context through `Supervisor::invoke_outlet_with_economy` — the exact
+        /// call `outlet_invoke` makes after authorization — yields
+        /// `ContextError::OutletContextNotActive`, which this bridge renders as
+        /// the structured, state-free
+        /// `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn runtime_gate_surfaces_state_free_6101_on_live_non_active_context() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+
+            let identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let owner_did = identity.did.clone();
+            let handle = scp
+                .context_create(Arc::clone(&identity), closeable_params())
+                .await
+                .expect("context_create should succeed");
+            let context_id = handle.context_id.clone();
+
+            scp.context_close(Arc::clone(&handle), Arc::clone(&identity))
+                .await
+                .expect("context_close should succeed");
+
+            let supervisor = bi.context_manager_or_error().expect("supervisor");
+            // The reserve gate is the FIRST predicate, before any registry
+            // access, so an empty registry is sufficient to reach it.
+            let registry = scp_core::context::outlets::OutletRegistry::new();
+            let outlet_id = scp_core::context::outlets::OutletId::from("state-free-probe");
+            let invoker: scp_did::DID = owner_did.into();
+
+            let err = supervisor
+                .invoke_outlet_with_economy(
+                    &context_id,
+                    &registry,
+                    &outlet_id,
+                    serde_json::json!({"a": "x"}),
+                    &invoker,
+                    None,
+                    None,
+                    None,
+                    |input| async move { Ok(input) },
+                )
+                .await
+                .expect_err("a non-active context must be rejected by the runtime reserve gate");
+
+            assert!(
+                matches!(
+                    err,
+                    scp_core::context::ContextError::OutletContextNotActive { .. }
+                ),
+                "expected the typed OutletContextNotActive carrier, got: {err:?}"
+            );
+
+            let (msg, code) = match ScpError::from(err) {
+                ScpError::Outlet { msg, code } => (msg, code),
+                other => panic!("expected ScpError::Outlet, got {other:?}"),
+            };
+            assert_eq!(
+                code,
+                scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+            );
+            assert!(msg.contains("protocol.context-closed-mid-stream"), "{msg}");
+            corpus::assert_no_lifecycle_state_leak(&msg, "uniffi live runtime-gate render");
         }
     }
 }

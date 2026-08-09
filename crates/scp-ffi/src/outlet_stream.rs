@@ -1225,13 +1225,16 @@ fn outlet_streaming_saga_open_impl(
     // non-active context is rejected before any escrow debit or receiver hand-out.
     // Codes match NAPI/UniFFI: `OUTLET_6010` (caller axis) / `OUTLET_6011`
     // (target axis). A missing actor (`None`) is treated as non-active.
+    //
+    // SCP-OUT-031 PR-2a: STATE-FREE messages. These read the AUTHORITATIVE
+    // supervisor state and run BEFORE the caller-principal binding, so the
+    // pre-fix prose handed an unauthenticated caller the live lifecycle state.
+    // The guards are retained; only the interpolation is removed.
     let caller_state = rt.block_on(supervisor.read_context_state(caller_context_id));
     if !matches!(caller_state, Some(scp_core::context::ContextState::Active)) {
         return Err(ScpPyError::ContextError {
-            message: format!(
-                "cannot start cross-context streaming saga: caller context in \
-                 {caller_state:?} state"
-            ),
+            message: "cannot start cross-context streaming saga: caller context must be active"
+                .to_owned(),
             code: scp_ffi_common::error_codes::OUTLET_6010.to_owned(),
         }
         .into());
@@ -1239,10 +1242,8 @@ fn outlet_streaming_saga_open_impl(
     let target_state = rt.block_on(supervisor.read_context_state(target_context_id));
     if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
         return Err(ScpPyError::ContextError {
-            message: format!(
-                "cannot start cross-context streaming saga: target context in \
-                 {target_state:?} state"
-            ),
+            message: "cannot start cross-context streaming saga: target context must be active"
+                .to_owned(),
             code: scp_ffi_common::error_codes::OUTLET_6011.to_owned(),
         }
         .into());

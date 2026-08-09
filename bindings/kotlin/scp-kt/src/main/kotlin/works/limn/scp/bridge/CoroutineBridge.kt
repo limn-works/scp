@@ -806,9 +806,11 @@ interface OutletBindings {
      * @param proofTokens Optional list of encoded parent UCAN tokens
      *   for delegation chain traversal (ADR-016 step 3).
      * @return JSON-encoded outlet output.
-     * @throws BridgeException with `SCP-OUTLET-6005` if the context is not
-     *   active, with `SCP-OUTLET-6002` if invocation fails, or with
-     *   `SCP-PERM-3001` if UCAN authorization fails.
+     * @throws BridgeException with `SCP-OUTLET-6101` if the context is not
+     *   active (SCP-OUT-031 PR-2a: the state-free
+     *   `protocol.context-closed-mid-stream` surface — the exact lifecycle
+     *   state is deliberately not disclosed), with `SCP-OUTLET-6002` if
+     *   invocation fails, or with `SCP-PERM-3001` if UCAN authorization fails.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     fun outletInvoke(

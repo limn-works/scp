@@ -1115,6 +1115,10 @@ mod xctx_streaming_saga_tests {
             msg.contains(codes::OUTLET_6010),
             "expected caller-axis SCP-OUTLET-6010, got: {msg}"
         );
+        scp_ffi_common::outlet_error::corpus::assert_no_lifecycle_state_leak(
+            &msg,
+            "SCP-OUT-031: streaming-saga caller-axis lifecycle rejection",
+        );
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),
             "a rejected non-active open must NOT start a saga / hand out a receiver"
@@ -1161,6 +1165,10 @@ mod xctx_streaming_saga_tests {
         assert!(
             msg.contains(codes::OUTLET_6011),
             "expected target-axis SCP-OUTLET-6011, got: {msg}"
+        );
+        scp_ffi_common::outlet_error::corpus::assert_no_lifecycle_state_leak(
+            &msg,
+            "SCP-OUT-031: streaming-saga target-axis lifecycle rejection",
         );
         assert!(
             bi.outlet_streaming_saga_registry.is_empty(),

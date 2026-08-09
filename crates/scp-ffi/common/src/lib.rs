@@ -218,6 +218,12 @@ pub mod petname_helpers;
 #[cfg(feature = "testing")]
 pub mod test_helpers;
 
+// Shared outlet-error test corpora (SCP-OUT-031): the exhaustive non-`Active`
+// `ContextState` corpus every bridge uses to prove its outlet lifecycle
+// rejection is state-free. Test-only, so it is behind `testing`.
+#[cfg(feature = "testing")]
+pub mod outlet_error;
+
 // Shared relay/node startup code for FFI bridges that need to spawn servers.
 // Requires scp-transport, scp-node, scp-platform, tokio.
 #[cfg(feature = "server")]

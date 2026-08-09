@@ -1175,14 +1175,18 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     // validation, the caller-principal binding, and the saga drive, so a
     // non-active context is rejected before any receiver is handed out.
     // Codes: OUTLET_6010 (caller axis) / OUTLET_6011 (target axis).
+    //
+    // SCP-OUT-031 PR-2a: STATE-FREE messages. These read the AUTHORITATIVE
+    // supervisor state and run BEFORE the caller-principal binding, so the
+    // pre-fix prose handed an unauthenticated caller the live lifecycle state —
+    // strictly more than the (lagging) public `state` getter discloses. The
+    // guards are retained; only the interpolation is removed.
     let supervisor = crate::runtime::supervisor(bi)?;
     let source_state = supervisor.read_context_state(&caller_context_id).await;
     if !matches!(source_state, Some(scp_core::context::ContextState::Active)) {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context streaming saga: caller context in \
-                 {source_state:?} state"
-            ),
+            message: "cannot start cross-context streaming saga: caller context must be active"
+                .to_owned(),
             code: codes::OUTLET_6010.to_owned(),
         }
         .into());
@@ -1190,10 +1194,8 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     let target_state = supervisor.read_context_state(&target_context_id).await;
     if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context streaming saga: target context in \
-                 {target_state:?} state"
-            ),
+            message: "cannot start cross-context streaming saga: target context must be active"
+                .to_owned(),
             code: codes::OUTLET_6011.to_owned(),
         }
         .into());

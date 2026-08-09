@@ -818,27 +818,31 @@ mod tests {
     /// outlet error — the raw lifecycle state MUST NOT leak to the FFI caller
     /// (this gate runs before authz on the unary invoke path). Cross-bridge
     /// parity with the `PyO3` + `UniFFI` bridges.
+    ///
+    /// Driven over the EXHAUSTIVE non-`Active` corpus
+    /// ([`scp_ffi_common::outlet_error::corpus`]) rather than one sampled state,
+    /// so adding a `ContextState` variant is a COMPILE error in the corpus's
+    /// `is_active` match — not a silently-unasserted leak here.
     #[test]
     fn outlet_context_not_active_surfaces_structured_state_free() {
-        let err: ScpNapiError = scp_core::context::ContextError::OutletContextNotActive {
-            current_state: scp_core::context::ContextState::Closing,
+        use scp_ffi_common::outlet_error::corpus;
+
+        for current_state in corpus::non_active_context_states() {
+            let err: ScpNapiError =
+                scp_core::context::ContextError::OutletContextNotActive { current_state }.into();
+            let (message, code) = match err {
+                ScpNapiError::Outlet { message, code } => (message, code),
+                other => panic!("expected ScpNapiError::Outlet, got {other:?}"),
+            };
+            assert_eq!(
+                code,
+                scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+            );
+            corpus::assert_no_lifecycle_state_leak(&message, "napi From<ContextError> render");
+            assert!(
+                message.contains("protocol.context-closed-mid-stream"),
+                "{message}"
+            );
         }
-        .into();
-        let (message, code) = match err {
-            ScpNapiError::Outlet { message, code } => (message, code),
-            other => panic!("expected ScpNapiError::Outlet, got {other:?}"),
-        };
-        assert_eq!(
-            code,
-            scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
-        );
-        assert!(
-            !message.contains("Closing"),
-            "raw lifecycle state must NOT leak to the FFI caller: {message}"
-        );
-        assert!(
-            message.contains("protocol.context-closed-mid-stream"),
-            "{message}"
-        );
     }
 }

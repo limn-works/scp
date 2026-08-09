@@ -255,12 +255,15 @@ pub(crate) async fn outlet_register_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_outlet_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
+    // SCP-OUT-031 PR-2a: STATE-FREE message. This guard is retained (unlike
+    // `outlet_invoke`'s, which the runtime's `ensure_context_active` replaces)
+    // because no runtime gate covers this operation — but it must not render the
+    // observed lifecycle state, which would disclose it to a caller this
+    // operation has not yet authorized.
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot register outlet in context in {state_str:?} state — context must be active"
-            ),
+            message: "cannot register outlet: context must be active".to_owned(),
             code: codes::OUTLET_6003.to_owned(),
         }
         .into());
@@ -361,17 +364,22 @@ pub(crate) async fn outlet_invoke_on(
         validate_ucan_token(jwt).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     }
 
-    let state_str = handle.state()?;
-    if state_str != "active" {
-        return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot invoke outlet in context in {state_str:?} state — context must be active"
-            ),
-            code: codes::OUTLET_6005.to_owned(),
-        }
-        .into());
-    }
-
+    // SCP-OUT-031 PR-2a: NO bridge-local lifecycle pre-guard here. The former
+    // `handle.state() != "active"` check ran BEFORE `validate_ucan_for_outlet`
+    // below and interpolated the raw lifecycle state into its prose, handing an
+    // unauthorized caller the exact `Closing` / `Expired` / `MigratingOut` /
+    // `Tombstoned` / `Poisoned` state — the very leak PR-2a closed in the
+    // runtime, bypassed at this bridge.
+    //
+    // The single authoritative seam is the runtime's `ensure_context_active`
+    // (`scp-runtime` `outlets_helpers.rs`), the FIRST predicate of
+    // `reserve_outlet_economy`, which `Supervisor::invoke_outlet_with_economy`
+    // (called unconditionally below) runs as Phase 1 before any bookkeeping. It
+    // reads the AUTHORITATIVE `ContextHandle::state()` (an `ArcSwap` load, not
+    // this bridge's lagging cache) and returns the typed
+    // `ContextError::OutletContextNotActive`, whose `Display` is the structured,
+    // state-free `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`.
+    // Matches the PyO3 reference bridge, which has never carried such a guard.
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
 
@@ -533,12 +541,15 @@ pub(crate) async fn outlet_verify_on(
     outlet_id: String,
 ) -> napi::Result<NapiOutletVerificationResult> {
     crate::napi_check_handle!(&bi.core, handle);
+    // SCP-OUT-031 PR-2a: STATE-FREE message. This guard is retained (unlike
+    // `outlet_invoke`'s, which the runtime's `ensure_context_active` replaces)
+    // because no runtime gate covers this operation — but it must not render the
+    // observed lifecycle state, which would disclose it to a caller this
+    // operation has not yet authorized.
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot verify outlet in context in {state_str:?} state — context must be active"
-            ),
+            message: "cannot verify outlet: context must be active".to_owned(),
             code: codes::OUTLET_6007.to_owned(),
         }
         .into());
@@ -608,12 +619,17 @@ pub(crate) async fn outlet_invoke_cross_context_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
     // Validate both contexts are active.
+    //
+    // SCP-OUT-031 PR-2a: STATE-FREE messages. Both checks run BEFORE
+    // `validate_ucan_for_outlet` below, so an unauthorized caller reaches them;
+    // rendering the observed lifecycle state here would leak it pre-authz. The
+    // guards themselves are retained — no runtime gate covers this path (the
+    // runtime's `ensure_context_active` guards only the three economy-reserve
+    // paths), so deleting them would open a hole rather than close a leak.
     let source_state = source_handle.state()?;
     if source_state != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot invoke cross-context outlet: source context in {source_state:?} state"
-            ),
+            message: "cannot invoke cross-context outlet: source context must be active".to_owned(),
             code: codes::OUTLET_6010.to_owned(),
         }
         .into());
@@ -622,9 +638,7 @@ pub(crate) async fn outlet_invoke_cross_context_on(
     let target_state = target_handle.state()?;
     if target_state != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot invoke cross-context outlet: target context in {target_state:?} state"
-            ),
+            message: "cannot invoke cross-context outlet: target context must be active".to_owned(),
             code: codes::OUTLET_6011.to_owned(),
         }
         .into());
@@ -972,12 +986,13 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
 
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
 
+    // SCP-OUT-031 PR-2a: STATE-FREE messages. Both run BEFORE
+    // `enforce_caller_principal_binding` below, so an unauthenticated caller
+    // reaches them. Guards retained — no runtime gate covers this path.
     let source_state = source_handle.state()?;
     if source_state != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context saga: caller context in {source_state:?} state"
-            ),
+            message: "cannot start cross-context saga: caller context must be active".to_owned(),
             code: codes::OUTLET_6010.to_owned(),
         }
         .into());
@@ -985,9 +1000,7 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
     let target_state = target_handle.state()?;
     if target_state != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot start cross-context saga: target context in {target_state:?} state"
-            ),
+            message: "cannot start cross-context saga: target context must be active".to_owned(),
             code: codes::OUTLET_6011.to_owned(),
         }
         .into());
@@ -1125,12 +1138,15 @@ pub(crate) async fn outlet_session_create_on(
     ttl_seconds: Option<u32>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
+    // SCP-OUT-031 PR-2a: STATE-FREE message. This guard is retained (unlike
+    // `outlet_invoke`'s, which the runtime's `ensure_context_active` replaces)
+    // because no runtime gate covers this operation — but it must not render the
+    // observed lifecycle state, which would disclose it to a caller this
+    // operation has not yet authorized.
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot create session in context in {state_str:?} state — context must be active"
-            ),
+            message: "cannot create session: context must be active".to_owned(),
             code: codes::OUTLET_6014.to_owned(),
         }
         .into());
@@ -1192,12 +1208,15 @@ pub(crate) async fn outlet_session_invoke_on(
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
+    // SCP-OUT-031 PR-2a: STATE-FREE message. This guard is retained (unlike
+    // `outlet_invoke`'s, which the runtime's `ensure_context_active` replaces)
+    // because no runtime gate covers this operation — but it must not render the
+    // observed lifecycle state, which would disclose it to a caller this
+    // operation has not yet authorized.
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot invoke session in context in {state_str:?} state — context must be active"
-            ),
+            message: "cannot invoke session: context must be active".to_owned(),
             code: codes::OUTLET_6017.to_owned(),
         }
         .into());
@@ -1360,12 +1379,15 @@ pub(crate) async fn outlet_interface_expose_on(
     scp_ffi_common::validate::validate_context_id(&target_context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
+    // SCP-OUT-031 PR-2a: STATE-FREE message. This guard is retained (unlike
+    // `outlet_invoke`'s, which the runtime's `ensure_context_active` replaces)
+    // because no runtime gate covers this operation — but it must not render the
+    // observed lifecycle state, which would disclose it to a caller this
+    // operation has not yet authorized.
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot expose outlet interface in context in {state_str:?} state — context must be active"
-            ),
+            message: "cannot expose outlet interface: context must be active".to_owned(),
             code: codes::OUTLET_6030.to_owned(),
         }
         .into());
@@ -1425,12 +1447,15 @@ pub(crate) async fn outlet_interface_accept_on(
     interface_json: String,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
+    // SCP-OUT-031 PR-2a: STATE-FREE message. This guard is retained (unlike
+    // `outlet_invoke`'s, which the runtime's `ensure_context_active` replaces)
+    // because no runtime gate covers this operation — but it must not render the
+    // observed lifecycle state, which would disclose it to a caller this
+    // operation has not yet authorized.
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
-            message: format!(
-                "cannot accept outlet interface in context in {state_str:?} state — context must be active"
-            ),
+            message: "cannot accept outlet interface: context must be active".to_owned(),
             code: codes::OUTLET_6032.to_owned(),
         }
         .into());
@@ -2594,6 +2619,232 @@ mod tests {
                 msg.contains("is not an identity hosted by this bridge instance"),
                 "message must be the BRIDGE axis-(a) hosted-here rejection, got: {msg}"
             );
+        }
+    }
+
+    /// SCP-OUT-031 PR-2a (SECURITY): the unary `outlet_invoke` pre-authorization
+    /// lifecycle-state leak.
+    ///
+    /// Before this fix `outlet_invoke_on` carried a bridge-local
+    /// `handle.state() != "active"` guard that ran BEFORE
+    /// `validate_ucan_for_outlet` and interpolated the raw lifecycle state into
+    /// `SCP-OUTLET-6005` prose. A context member holding a handle but NO
+    /// `outlet_call:*` capability could therefore read the exact state
+    /// (`Closing` / `Expired` / `MigratingOut` / …) with a garbage UCAN —
+    /// bypassing the hardened runtime carrier PR-2a introduced.
+    ///
+    /// Gated on `testing` for the same reason as `xctx_saga_tests`: the whole
+    /// submodule is gated so a future test added here cannot silently
+    /// reintroduce a no-feature `never used` warning.
+    #[cfg(feature = "testing")]
+    mod invoke_lifecycle_leak_tests {
+        use super::*;
+        use scp_ffi_common::outlet_error::corpus;
+
+        /// Creates a single-admin context whose creator holds `context:close`,
+        /// so the test can drive it to a REAL non-active lifecycle state through
+        /// the actual supervisor close path (not a fabricated FFI cache value).
+        async fn create_closeable_context(
+            bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
+            owner_identity: &crate::identity::NapiIdentity,
+        ) -> crate::context::NapiContextHandle {
+            let params = serde_json::json!({
+                "ceiling": [
+                    "context:close",
+                    "outlet:register",
+                    "outlet:call:*",
+                    "messages:read",
+                    "messages:write"
+                ],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            crate::context::context_create_on(bi, owner_identity, params)
+                .await
+                .expect("context_create should succeed")
+        }
+
+        /// Drives `context_id` to a real non-active lifecycle state through the
+        /// REAL supervisor close path, so `read_context_state` (the source the
+        /// runtime gate reads) reports non-`Active`.
+        async fn drive_context_closed(
+            bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
+            context_id: &str,
+            initiator_did: &str,
+        ) {
+            use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+
+            let supervisor = crate::runtime::supervisor(bi)
+                .expect("supervisor should be attached")
+                .clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            supervisor
+                .dispatch_lifecycle_command(LifecycleCommand::CloseContext {
+                    payload: Box::new(CloseContextPayload {
+                        context_id: context_id.to_owned(),
+                        params: scp_core::context::ContextParams::default(),
+                        initiator_did: scp_did::DID(initiator_did.to_owned()),
+                    }),
+                    reply: tx,
+                })
+                .await
+                .expect("close dispatch should succeed");
+            rx.await
+                .expect("close reply channel should not drop")
+                .expect("close should succeed");
+        }
+
+        /// (LEAK) An UNAUTHORIZED caller — a valid handle, a garbage UCAN, no
+        /// `outlet_call:*` capability — invoking an outlet on a REAL non-active
+        /// context must be rejected WITHOUT the caller-visible error naming the
+        /// lifecycle state, and must NOT come back through the deleted
+        /// bridge-local `SCP-OUTLET-6005` lifecycle guard.
+        ///
+        /// This is simultaneously the authorization-hole regression guard:
+        /// deleting the bridge guard must not make an unauthorized invocation
+        /// *succeed* — the call still fails.
+        ///
+        /// The context is driven non-active through the REAL bridge close
+        /// sequence (`context_close_on` → `context_finalize_close_on`), which is
+        /// what flips the FFI-cached handle state the deleted guard read. Both
+        /// the cached AND the authoritative state are asserted non-active first,
+        /// so this test can never pass vacuously against a still-`"active"`
+        /// cache (the failure mode that would leave the leak unreachable).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn unauthorized_invoke_on_non_active_context_leaks_no_lifecycle_state() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+
+            let owner_identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let owner_did = owner_identity.inner.did.clone();
+
+            let handle = create_closeable_context(&bi, &owner_identity).await;
+            let context_id = handle.context_id();
+            crate::context::context_close_on(&bi, &handle, owner_did.clone())
+                .await
+                .expect("context_close should succeed");
+            crate::context::context_finalize_close_on(&bi, &handle)
+                .await
+                .expect("finalize_close should succeed");
+
+            // Precondition 1: the FFI-cached state — the value the DELETED guard
+            // read and interpolated — is non-active. Without this the leak is
+            // unreachable and this test would prove nothing.
+            assert_ne!(
+                handle.state().expect("cached state"),
+                "active",
+                "the FFI-cached handle state must be non-active, else the deleted \
+                 guard would never have fired"
+            );
+            // Precondition 2: the authoritative supervisor state agrees.
+            assert_ne!(
+                crate::runtime::supervisor(&bi)
+                    .expect("supervisor")
+                    .read_context_state(&context_id)
+                    .await,
+                Some(scp_core::context::ContextState::Active),
+                "the context must be authoritatively non-active before the invoke"
+            );
+
+            let err = outlet_invoke_on(
+                &bi,
+                &handle,
+                scp_ffi_common::outlet_id::generate_outlet_id("leak-probe"),
+                r#"{"a":"x"}"#.to_owned(),
+                owner_did,
+                // Structurally valid but cryptographically worthless: this caller
+                // holds NO `outlet_call:*` capability.
+                "eyJhbGciOiJFZERTQSJ9.eyJ0ZXN0Ijp0cnVlfQ.not-a-real-signature".to_owned(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("an unauthorized invoke must still be rejected");
+
+            let msg = format!("{err}");
+            corpus::assert_no_lifecycle_state_leak(
+                &msg,
+                "napi outlet_invoke, unauthorized caller, non-active context",
+            );
+            assert!(
+                !msg.contains(codes::OUTLET_6005),
+                "the deleted bridge-local lifecycle pre-guard must not resurface: {msg}"
+            );
+        }
+
+        /// (SURFACE) The runtime carrier the deleted bridge guard used to
+        /// preempt is reachable and state-free: driving the same REAL non-active
+        /// context through `Supervisor::invoke_outlet_with_economy` — the exact
+        /// call `outlet_invoke_on` makes after authorization — yields
+        /// `ContextError::OutletContextNotActive`, which this bridge renders as
+        /// the structured, state-free
+        /// `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`.
+        ///
+        /// Together with the test above (nothing state-derived precedes
+        /// authorization) this closes the chain the bridge guard used to break.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn runtime_gate_surfaces_state_free_6101_on_live_non_active_context() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+
+            let owner_identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let owner_did = owner_identity.inner.did.clone();
+
+            let handle = create_closeable_context(&bi, &owner_identity).await;
+            let context_id = handle.context_id();
+            drive_context_closed(&bi, &context_id, &owner_did).await;
+
+            let supervisor = crate::runtime::supervisor(&bi).expect("supervisor");
+            // The reserve gate is the FIRST predicate, before any registry
+            // access, so an empty registry is sufficient to reach it.
+            let registry = scp_core::context::outlets::OutletRegistry::new();
+            let outlet_id = scp_core::context::outlets::OutletId::from("state-free-probe");
+            let invoker: scp_did::DID = owner_did.into();
+
+            let err = supervisor
+                .invoke_outlet_with_economy(
+                    &context_id,
+                    &registry,
+                    &outlet_id,
+                    serde_json::json!({"a": "x"}),
+                    &invoker,
+                    None,
+                    None,
+                    None,
+                    |input| async move { Ok(input) },
+                )
+                .await
+                .expect_err("a non-active context must be rejected by the runtime reserve gate");
+
+            assert!(
+                matches!(
+                    err,
+                    scp_core::context::ContextError::OutletContextNotActive { .. }
+                ),
+                "expected the typed OutletContextNotActive carrier, got: {err:?}"
+            );
+
+            let bridge_err = ScpNapiError::from(err);
+            let (message, code) = match bridge_err {
+                ScpNapiError::Outlet { message, code } => (message, code),
+                other => panic!("expected ScpNapiError::Outlet, got {other:?}"),
+            };
+            assert_eq!(
+                code,
+                scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+            );
+            assert!(
+                message.contains("protocol.context-closed-mid-stream"),
+                "{message}"
+            );
+            corpus::assert_no_lifecycle_state_leak(&message, "napi live runtime-gate render");
         }
     }
 }
