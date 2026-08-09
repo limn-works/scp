@@ -260,6 +260,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 
 .docs/               # Project knowledge (root instance + per-feature local instances)
 ├── architecture.md  # Engineering blueprint — phases, SDK strategy, crate layout
+├── dropped-work-ledger.md # Verified-but-unrouted findings that survive context compaction — read before auditing; delete an entry when its work lands
 ├── sketch.md        # API surface sketches — pseudocode for all operations
 ├── adrs/            # Architecture Decision Records (phase-1 through phase-6)
 ├── lessons/         # Evergreen learnings, grouped by topic
