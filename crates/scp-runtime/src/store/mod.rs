@@ -179,6 +179,40 @@ impl<S: EncryptedStorage> ProtocolRepository<S> {
     /// For testing with unencrypted backends (`InMemoryStorage`), use
     /// `new_for_testing` (requires the
     /// `allow_unencrypted_storage` feature).
+    ///
+    /// # Structural seal test (ADR-052 §AC-9)
+    ///
+    /// The bound is not merely documented — it is asserted mechanically. A
+    /// plaintext backend (`FilesystemStorage`, key-per-file, no encryption)
+    /// **must not compile** against this constructor. `EncryptedStorage` is
+    /// sealed in `scp-platform`, so no downstream crate can vote itself in:
+    ///
+    /// ```compile_fail,E0277
+    /// use scp_platform::filesystem::FilesystemStorage;
+    /// use scp_runtime::store::ProtocolRepository;
+    ///
+    /// // E0277: the trait bound `FilesystemStorage: EncryptedStorage`
+    /// // is not satisfied.
+    /// fn unsealed(storage: FilesystemStorage) {
+    ///     let _repo = ProtocolRepository::new(storage);
+    /// }
+    /// ```
+    ///
+    /// The **same** call over the same backend wrapped in `EncryptingAdapter`
+    /// does compile. This pairing is what makes the assertion above sound: it
+    /// proves the failure is attributable to the missing `EncryptedStorage`
+    /// impl, not to a typo or an unrelated error that happens to share the
+    /// code:
+    ///
+    /// ```
+    /// use scp_platform::encrypting_adapter::EncryptingAdapter;
+    /// use scp_platform::filesystem::FilesystemStorage;
+    /// use scp_runtime::store::ProtocolRepository;
+    ///
+    /// fn sealed(storage: EncryptingAdapter<FilesystemStorage>) {
+    ///     let _repo = ProtocolRepository::new(storage);
+    /// }
+    /// ```
     #[must_use]
     pub const fn new(storage: S) -> Self {
         Self { storage }
