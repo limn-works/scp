@@ -1151,6 +1151,59 @@ impl Node {
     /// seal). For testing with unencrypted backends, use
     /// [`Node::start_for_testing`].
     ///
+    /// # Structural seal test (ADR-052 §AC-9)
+    ///
+    /// ADR-052 rejected demoting the seal to a runtime check, promising instead
+    /// that the bound is "additionally backed by a structural test that the
+    /// unencrypted path is unreachable from the production constructor." These
+    /// two doctests are that test.
+    ///
+    /// A plaintext backend (`FilesystemStorage` — key-per-file, no encryption)
+    /// **must not compile** against this constructor. `EncryptedStorage` is
+    /// sealed inside `scp-platform`, so no downstream crate can vote a
+    /// plaintext backend in:
+    ///
+    /// ```compile_fail,E0277
+    /// use scp_identity::DidMethod;
+    /// use scp_node::{Node, NodeConfig};
+    /// use scp_platform::filesystem::FilesystemStorage;
+    /// use scp_platform::traits::KeyCustody;
+    ///
+    /// // E0277: the trait bound `FilesystemStorage: EncryptedStorage`
+    /// // is not satisfied.
+    /// fn unsealed<K: KeyCustody + 'static, D: DidMethod + 'static>(
+    ///     config: NodeConfig<K, D, FilesystemStorage>,
+    /// ) {
+    ///     let _fut = Node::start(config);
+    /// }
+    /// ```
+    ///
+    /// The **same** call over the **same** backend wrapped in
+    /// `EncryptingAdapter` does compile. This pairing is what makes the
+    /// assertion above sound: a bare `compile_fail` passes for *any* error, so
+    /// the positive control proves the failure is attributable to the storage
+    /// type rather than to a typo or an unrelated breakage:
+    ///
+    /// ```
+    /// use scp_identity::DidMethod;
+    /// use scp_node::{Node, NodeConfig};
+    /// use scp_platform::encrypting_adapter::EncryptingAdapter;
+    /// use scp_platform::filesystem::FilesystemStorage;
+    /// use scp_platform::traits::KeyCustody;
+    ///
+    /// fn sealed<K: KeyCustody + 'static, D: DidMethod + 'static>(
+    ///     config: NodeConfig<K, D, EncryptingAdapter<FilesystemStorage>>,
+    /// ) {
+    ///     let _fut = Node::start(config);
+    /// }
+    /// ```
+    ///
+    /// These run in CI's `Rust / doc` job (`cargo test --workspace --doc`).
+    /// `cargo nextest` does not execute doctests; the compiling half of the
+    /// pair is additionally covered by
+    /// `crates/scp-node/tests/encrypted_storage_seal.rs`, which every test lane
+    /// builds.
+    ///
     /// # Errors
     ///
     /// Returns [`NodeError::InvalidConfig`] for contradictory configs (e.g.

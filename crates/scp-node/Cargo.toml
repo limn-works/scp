@@ -89,7 +89,12 @@ scp-relay-client = { path = "../scp-relay-client" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }
-scp-platform = { path = "../scp-platform", features = ["testing"] }
+# `filesystem` backs the ADR-052 §AC-9 `EncryptedStorage` seal assertions:
+# `FilesystemStorage` is the plaintext backend that `Node::start`'s
+# `compile_fail,E0277` doctest proves cannot reach the production constructor,
+# and whose `EncryptingAdapter`-wrapped form is the positive control in
+# `tests/encrypted_storage_seal.rs`.
+scp-platform = { path = "../scp-platform", features = ["testing", "filesystem"] }
 # The node's tests (config.rs, lib.rs, self_host.rs) and `ApplicationNode::dev`
 # construct `InMemoryDhtClient` (now gated behind `scp-dht/testing`); activate it
 # for this crate's own test build. `production-dht` still comes from the normal
