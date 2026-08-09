@@ -98,6 +98,16 @@ fn quic_listening(state: &NodeState) -> bool {
 /// Shared between the Axum handler (HTTP/1.1 + HTTP/2) and the HTTP/3
 /// request handler to guarantee identical responses across transports.
 pub async fn build_well_known_scp(state: &NodeState) -> WellKnownScp {
+    // Read the node's live relay-URL slot ONCE for the whole document. Every
+    // address in this response — the top-level `relay` field and the `relay=`
+    // parameter of every `scp://context/…` invite URI — is the node's single
+    // current address, so a NAT tier change landing mid-build cannot produce a
+    // document that advertises two different endpoints. Reading the slot per use
+    // would reintroduce that skew, and reading it at build time (what a `String`
+    // field did) advertised an address the node had moved off. See
+    // [`NodeRelayUrl`](crate::NodeRelayUrl).
+    let relay_url = state.relay_url.get();
+
     let contexts = {
         let guard = state.broadcast_contexts.read().await;
         if guard.is_empty() {
@@ -107,7 +117,7 @@ pub async fn build_well_known_scp(state: &NodeState) -> WellKnownScp {
                 guard
                     .values()
                     .map(|ctx| {
-                        let encoded_relay = utf8_percent_encode(&state.relay_url, QUERY_VALUE);
+                        let encoded_relay = utf8_percent_encode(&relay_url, QUERY_VALUE);
                         let name_param = ctx
                             .name
                             .as_ref()
@@ -149,7 +159,7 @@ pub async fn build_well_known_scp(state: &NodeState) -> WellKnownScp {
     WellKnownScp {
         version: 1,
         did: state.did.clone(),
-        relay: state.relay_url.clone(),
+        relay: relay_url,
         contexts,
         relay_config: Some(relay_config),
         handles: None,

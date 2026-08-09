@@ -2791,7 +2791,7 @@ mod tests {
     ) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:test".to_owned(),
-            relay_url: "wss://localhost/scp/v1".to_owned(),
+            relay_url: crate::NodeRelayUrl::new("wss://localhost/scp/v1".to_owned()),
             broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
             bridge_secret: zeroize::Zeroizing::new([0u8; 32]),
