@@ -66,9 +66,7 @@ impl TransportRelayQuerier {
     /// [`bind`](Self::bind) once connections are established.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            relays: BoundRelays::new(),
-        }
+        Self::default()
     }
 
     /// Late-binds a live transport adapter for a relay URL.

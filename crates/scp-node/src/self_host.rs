@@ -1402,9 +1402,14 @@ where
 /// [`resolve`](scp_identity::resolver::DidResolver::resolve) is the authoritative
 /// anti-rollback guard, and operating on the node's shared cache keeps the
 /// participant's view consistent with the node's. The relay layer is a
-/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier): the node's own
-/// loopback relay is a protocol-unaware blob pipe (§10.4), not a DID-document
-/// QUERY source, so DID resolution flows through the DHT layer (and cache).
+/// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier) for one honest
+/// reason: no relay-client bind exists yet, so there is no relay to QUERY. That
+/// wiring is SCP-RELAYRES-006. It is emphatically NOT because the node's own
+/// loopback relay is unsuitable — it ships `DidRecordValidation::Enabled` by
+/// default and per §3.10.2/§3.10.4 IS a DID-document QUERY source; §10.4's
+/// "protocol-unaware" design goal is scoped to encrypted payload blobs. Until
+/// #SCP-RELAYRES-006 lands, DID resolution here flows through the DHT layer
+/// (and cache) alone.
 fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
     dht_client: Arc<D>,
     cache: Arc<DidCache>,
@@ -1427,7 +1432,7 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
 /// Constructs the production [`RepublishManager`] (the real `scp-transport`
 /// [`TransportRelayPublisher`] is the `R` type parameter, paired with the node's
 /// DHT client) and drives the self-host node's own DID-document republishing from
-/// a **live view** of the node's published record — or leaves it **fully dormant**
+/// a **live view** of the node's published state — or leaves it **fully dormant**
 /// (manager present, zero arms) while the node has published nothing.
 /// Returns the running cycle for teardown.
 ///
@@ -1441,9 +1446,8 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
 /// - **Relay (6-day cycle).** Always enabled, including when no relay is bound
 ///   yet. [`TransportRelayPublisher::publish`] fails closed with a typed
 ///   `RelayPublishFailed` while unbound, and the relay republish loop backs off
-///   30s → 30min, so an unbound relay costs at most one no-op wakeup per 30
-///   minutes — and the arm **self-heals** the instant a relay is bound, with no
-///   manager reconstruction and no re-drive.
+///   30s → 30min — and the arm **self-heals** the instant a relay is bound, with
+///   no manager reconstruction and no re-drive.
 ///
 /// Sampling relay readiness once, at construction, to decide whether to enable
 /// the arm is what this function used to do, and it was unfixable by
@@ -1453,54 +1457,38 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
 /// DELIBERATE user opt-out (§3.10.6, which mandates a warning); an unbound layer
 /// is not one, so no production path here ever asks for it.
 ///
+/// **Nothing binds a relay yet.** A shipped self-host node therefore keeps the
+/// relay arm failing closed for its whole life; wiring the relay-client bind is
+/// SCP-RELAYRES-006. The arm reports that state honestly rather than pretending
+/// success — the republish loop distinguishes "no relay configured" from "a
+/// configured relay is failing" and rate-limits the former (§3.10.8).
+///
 /// # Full dormancy — honest disclosure (do not read as active resilience)
 ///
-/// While the node has published **no signed record** (the slot holds `None`)
-/// there is nothing to keep alive on either layer, so no arm is scheduled and the
-/// manager sits at zero tasks. `DhtMode::Disabled` — the fail-closed default —
-/// publishes nothing, so that is its permanent state. The `None` is produced by
-/// the publish seam itself, so the log below is literally true: it fires when, and
-/// only when, nothing has been published.
+/// While the node has published **no signed record** (the slot's `record` is
+/// `None`) there is nothing to keep alive on either layer, so no arm is scheduled
+/// and the manager sits at zero tasks. `DhtMode::Disabled` — the fail-closed
+/// default — publishes nothing, so that is its permanent state. The `None` is
+/// produced by the publish seam itself, so the log below is literally true: it
+/// fires when, and only when, nothing has been published.
 ///
 /// # Re-seeding: a live view, not a snapshot
 ///
 /// The cycle takes a [`watch::Receiver`](tokio::sync::watch::Receiver) over the
-/// node's published-record slot, never a `RepublishEntry` by value. Every publish
-/// this node performs writes that slot (see `PublishedDidRecord`), and the
-/// re-seed observer re-points both arms at the new record. A NAT tier change
-/// re-publishes the document with a NEW `(value, signature, seq)`; against a
-/// held snapshot the DHT arm would keep re-putting a superseded `seq` (which
-/// BEP44 nodes reject, so the *current* record stops being kept alive and
-/// expires) and the relay arm would keep pushing a superseded frame (which a
-/// validating relay rejects, miscounted as a publish failure and eventually
-/// reported as `RelayPublishDegraded` while the relay is in fact correct).
-/// Emits the §3.10.6 mandated warning when a DID-resolution layer is disabled.
-///
-/// A named function rather than an inline closure so the wiring is a *value*:
-/// §3.10.6 requires the SDK to warn whenever a resolution layer is turned off,
-/// and a mandate buried in a closure inside a constructor is a mandate no test
-/// can reach.
-fn layer_disabled_warning(message: &str) {
-    tracing::warn!(warning = %message, "§3.10.6 DID resolution layer disabled");
-}
-
-/// The self-host [`RepublishConfig`]: both layers enabled, with the §3.10.6
-/// layer-disabled warning callback wired.
-///
-/// The production path never disables a layer, so the callback is not expected
-/// to fire. It is wired precisely so that it CANNOT be forgotten: if any future
-/// path ever disables one, the mandated warning is emitted mechanically rather
-/// than depending on that path remembering to log it.
-fn self_host_republish_config() -> RepublishConfig {
-    RepublishConfig::default().with_layer_disabled_callback(Arc::new(layer_disabled_warning))
-}
-
+/// node's published-state slot, never a `RepublishEntry` by value; see
+/// `NodePublishedState`. A NAT tier change re-publishes the document with a NEW
+/// `(value, signature, seq)`; against a held snapshot the DHT arm would keep
+/// re-putting a superseded `seq` (which BEP44 nodes reject, so the *current*
+/// record stops being kept alive and expires) and the relay arm would keep
+/// pushing a superseded frame (which a validating relay rejects, miscounted as a
+/// publish failure and eventually reported as `RelayPublishDegraded` while the
+/// relay is in fact correct).
 async fn start_self_did_republishing<D: DhtClient + 'static>(
     dht_client: Arc<D>,
     relay_publisher: Arc<TransportRelayPublisher>,
-    mut records: watch::Receiver<Option<RepublishEntry>>,
+    mut live_state: watch::Receiver<crate::NodePublishedState>,
 ) -> SelfDidRepublishing<D> {
-    let config = self_host_republish_config();
+    let config = RepublishConfig::default();
 
     // Both degraded callbacks are wired: the DHT keep-alive is this node's only
     // resolvability guarantee, so a keep-alive that has been failing for six
@@ -1544,10 +1532,14 @@ async fn start_self_did_republishing<D: DhtClient + 'static>(
     // seen, so a publish racing this line is either included in `current` or
     // still pending for the observer's first `changed()`. Reading and marking as
     // two steps would drop a publish that landed between them.
-    let current = records.borrow_and_update().clone();
-    seed_republish_arms(&manager, current).await;
+    let current = live_state.borrow_and_update().record.clone();
+    seed_republish_arms(&manager, current.clone()).await;
 
-    let reseed_task = tokio::spawn(reseed_republish_arms(Arc::clone(&manager), records));
+    let reseed_task = tokio::spawn(reseed_republish_arms(
+        Arc::clone(&manager),
+        live_state,
+        current,
+    ));
 
     SelfDidRepublishing {
         manager,
@@ -1569,12 +1561,21 @@ struct SelfDidRepublishing<D: DhtClient> {
 impl<D: DhtClient + 'static> SelfDidRepublishing<D> {
     /// Stops the cycle: no arm survives, and none can be started afterwards.
     ///
-    /// Ordering is load-bearing. The observer is aborted FIRST: stopping the
-    /// manager first would leave a window in which an in-flight `changed()`
-    /// wake-up re-starts both arms *after* `stop_all`, leaking two tasks past
-    /// shutdown.
+    /// Ordering is load-bearing, and so is the `await`. `abort` only *requests*
+    /// cancellation: a task already mid-poll runs to its next `Poll::Pending`,
+    /// and the observer's critical section (`seed_republish_arms` → `stop_all` →
+    /// `start_republishing`) has no guaranteed yield — an uncontended
+    /// `Mutex::lock().await` resolves on the first poll, and `tokio::spawn` plus
+    /// the map insert are synchronous. On a multi-thread runtime the whole
+    /// re-seed could therefore complete on another worker AFTER `stop_all`
+    /// drained the maps, detaching two arms that keep republishing this node's
+    /// DID document (a §10.12.1 address disclosure) past shutdown. Joining the
+    /// aborted handle is the only barrier that rules that out.
     async fn stop(self) {
         self.reseed_task.abort();
+        // `Err(cancelled)` is the expected outcome; `Ok` means it finished
+        // first. Both mean the observer can no longer start an arm.
+        let _ = self.reseed_task.await;
         self.manager.stop_all().await;
     }
 }
@@ -1632,7 +1633,7 @@ async fn seed_republish_arms<D: DhtClient + 'static>(
 /// This is what makes re-seeding structural: the observer watches the slot that
 /// the publish seam writes, so ANY re-publish — the NAT tier change today, and
 /// any publish path added later — re-points the arms at the record it produced.
-/// No call site has to remember to re-seed, because no call site is involved.
+/// No call site re-seeds, because no call site is involved.
 ///
 /// # Racing an in-flight tick
 ///
@@ -1644,13 +1645,14 @@ async fn seed_republish_arms<D: DhtClient + 'static>(
 /// the desired outcome — it was asserting a record the node has already replaced.
 async fn reseed_republish_arms<D: DhtClient + 'static>(
     manager: Arc<RepublishManager<D, TransportRelayPublisher>>,
-    mut records: watch::Receiver<Option<RepublishEntry>>,
+    mut live_state: watch::Receiver<crate::NodePublishedState>,
+    mut current: Option<RepublishEntry>,
 ) {
     // The version present at construction was read with `borrow_and_update` by
     // `start_self_did_republishing` and is therefore already marked seen, so the
     // first `changed()` waits for the next *publish* rather than replaying it.
     loop {
-        if records.changed().await.is_err() {
+        if live_state.changed().await.is_err() {
             // Every sender is gone: the node has been dropped, so nothing more
             // will ever be published. The arms keep asserting the last record
             // until teardown aborts them.
@@ -1660,7 +1662,18 @@ async fn reseed_republish_arms<D: DhtClient + 'static>(
             );
             return;
         }
-        let entry = records.borrow_and_update().clone();
+        let entry = live_state.borrow_and_update().record.clone();
+        // The slot also advances when only the node's advertised address moved
+        // (a tier change whose re-publish failed, or a `DhtMode::Disabled`
+        // node's, which publishes nothing). Neither produced a new record, and
+        // tearing both arms down to re-assert the same bytes would be pure
+        // churn — re-seed only on a record that actually changed.
+        if entry.as_ref().map(|e| (e.sequence, e.signature))
+            == current.as_ref().map(|e| (e.sequence, e.signature))
+        {
+            continue;
+        }
+        current = entry.clone();
         seed_republish_arms(manager.as_ref(), entry).await;
     }
 }
@@ -1762,7 +1775,7 @@ where
     //    is deployed and the public surface is open, so an early build/deploy
     //    failure never leaves a republish task running. --
     let relay_publisher = Arc::new(TransportRelayPublisher::new());
-    let published_records = node.subscribe_published_did_record();
+    let published_state = node.subscribe_published_state();
 
     let context_id = self_host_context_id(&node_did);
 
@@ -1838,7 +1851,8 @@ where
 
     // -- Drive self-DID republishing now the node is up and the surface is open.
     //    Runs the DHT keep-alive whenever a signed record exists, plus the relay
-    //    arm once a relay is bound; dormant (zero arms) while nothing has been
+    //    arm unconditionally (it fails closed while unbound, and self-heals the
+    //    instant a relay is bound); dormant (zero arms) while nothing has been
     //    published, and re-seeded automatically on every subsequent publish. The
     //    honest disclosure of why production may be dormant lives in
     //    `start_self_did_republishing`. The returned cycle is held for the serve
@@ -1846,7 +1860,7 @@ where
     let republish = start_self_did_republishing(
         Arc::clone(&dht_client),
         Arc::clone(&relay_publisher),
-        published_records,
+        published_state,
     )
     .await;
 
@@ -2265,7 +2279,8 @@ pub fn build_memory_did_method(
 /// disclosed) and resolve contributes an honest `Ok(None)` — never a fabricated
 /// or in-memory answer (ADR-062 §Decision 1, A2). The method shares the node's
 /// [`DidCache`] with the co-located resolver but carries no signer (it never
-/// publishes). DID resolution still runs: the [`DualLayerResolver`] composes the
+/// publishes). DID resolution still runs: the
+/// [`DualLayerResolver`](scp_identity::DualLayerResolver) composes the
 /// relay layer around the off DHT arm.
 #[must_use]
 pub fn build_disabled_did_method(
@@ -3378,7 +3393,12 @@ mod tests {
         }
     }
 
-    /// A published-record slot pre-seeded with `entry`.
+    /// A node published-state slot pre-seeded with `entry`.
+    ///
+    /// A bare `watch` channel rather than the node's `LiveSlot`: these tests
+    /// drive the OBSERVER, and the slot's writer is private to the module that
+    /// owns `apply_tier_change` (which is exactly the point — see
+    /// `NodePublishedState`). The tests that need the real writer use it.
     ///
     /// Returns the sender alongside the receiver: the sender must outlive the
     /// cycle under test, because dropping every sender is the signal that the
@@ -3386,10 +3406,19 @@ mod tests {
     fn record_slot(
         entry: Option<RepublishEntry>,
     ) -> (
-        watch::Sender<Option<RepublishEntry>>,
-        watch::Receiver<Option<RepublishEntry>>,
+        watch::Sender<crate::NodePublishedState>,
+        watch::Receiver<crate::NodePublishedState>,
     ) {
-        let tx = watch::Sender::new(entry);
+        let tx = watch::Sender::new(crate::NodePublishedState {
+            document: scp_did::DidDocument::new(
+                "did:dht:reseedtest",
+                &[1u8; 32],
+                &[2u8; 32],
+                &[3u8; 32],
+            ),
+            relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            record: entry,
+        });
         let rx = tx.subscribe();
         (tx, rx)
     }
@@ -3664,7 +3693,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Re-seeding the running republish arms on a re-publish
-    // (SCP-RELAYRES-004 — the frozen-snapshot class, tier-change seam)
+    // (SCP-RELAYRES-004 — the tier-change seam; see `NodePublishedState`)
     //
     // `apply_tier_change` re-publishes the node's DID document on a NAT tier
     // change, producing a NEW (value, signature, seq). These tests drive the REAL
@@ -3672,10 +3701,7 @@ mod tests {
     // `apply_tier_change` — and assert the RUNNING arms follow it.
     // -----------------------------------------------------------------------
 
-    use crate::{
-        DidPublisher, NodeDidDocument, NodeDidPublisher, NodeRelayUrl, PublishedDidRecord,
-        apply_tier_change,
-    };
+    use crate::{DidPublisher, LiveSlot, NodeDidPublisher, NodePublishedState, apply_tier_change};
     use scp_did::DidDocument;
     use scp_identity::{DidMethod as _, ScpIdentity};
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
@@ -3708,15 +3734,50 @@ mod tests {
     }
 
     /// The node's publish seam over `did_method`, in a publishing `DhtMode`.
-    fn publish_seam(
-        did_method: &Arc<SigningDidDht>,
-        records: &PublishedDidRecord,
-    ) -> NodeDidPublisher<SigningDidDht> {
+    fn publish_seam(did_method: &Arc<SigningDidDht>) -> NodeDidPublisher<SigningDidDht> {
         NodeDidPublisher {
             inner: Arc::clone(did_method),
             dht_mode: DhtMode::Memory,
-            records: records.clone(),
         }
+    }
+
+    /// The node's live slot as the builders construct it: the startup publish's
+    /// document, address and signed record, together.
+    async fn published_slot(
+        publisher: &NodeDidPublisher<SigningDidDht>,
+        identity: &ScpIdentity,
+        document: DidDocument,
+        relay_url: String,
+    ) -> LiveSlot<NodePublishedState> {
+        let record = publisher
+            .publish(identity, &document)
+            .await
+            .expect("startup publish succeeds");
+        LiveSlot::new(NodePublishedState {
+            document,
+            relay_url,
+            record,
+        })
+    }
+
+    /// Drives ONE real tier change through the real writer, alternating the
+    /// relay endpoint so every call genuinely re-publishes at a new sequence.
+    async fn republish_via_tier_change(
+        live_state: &LiveSlot<NodePublishedState>,
+        publisher: &NodeDidPublisher<SigningDidDht>,
+        identity: &ScpIdentity,
+        nth: u32,
+    ) {
+        let next_url = format!("ws://203.0.113.42:{}/scp/v1", 9000 + nth);
+        apply_tier_change(
+            live_state,
+            &next_url,
+            "test tier change",
+            publisher,
+            identity,
+            None,
+        )
+        .await;
     }
 
     /// Polls `cond` across task hops until it holds, or panics with `label`.
@@ -3750,16 +3811,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn tier_change_reseeds_the_running_republish_arms() {
         let (did_method, identity, document, relay_url) = signing_identity().await;
-        let records = PublishedDidRecord::new();
-        let publisher = publish_seam(&did_method, &records);
-
-        // Startup publish: the seam files the signed record into the slot.
-        publisher
-            .publish(&identity, &document)
-            .await
-            .expect("startup publish succeeds");
-        let first = records
+        let publisher = publish_seam(&did_method);
+        let live_state = published_slot(&publisher, &identity, document, relay_url).await;
+        let first = live_state
             .get()
+            .record
             .expect("the startup publish records its entry");
 
         // The keep-alive layers. These are used ONLY by the republish arms (the
@@ -3772,7 +3828,7 @@ mod tests {
         let republish = start_self_did_republishing(
             Arc::clone(&keep_alive_dht),
             Arc::clone(&relay),
-            records.subscribe(),
+            live_state.subscribe(),
         )
         .await;
 
@@ -3787,30 +3843,29 @@ mod tests {
         // -- A NAT tier change: the node re-publishes with a new relay endpoint,
         //    producing a NEW (value, signature, seq). --
         let new_relay_url = "ws://203.0.113.42:8443/scp/v1";
-        let node_document = NodeDidDocument::new(document);
-        let node_relay_url = NodeRelayUrl::new(relay_url);
         apply_tier_change(
-            &node_relay_url,
+            &live_state,
             new_relay_url,
             "test tier change",
-            &node_document,
             &publisher,
             &identity,
             None,
         )
         .await;
         // `apply_tier_change` returns nothing: success is observable only where
-        // the node actually keeps its state. The relay-URL slot advancing is the
-        // signal the re-publish succeeded (it is written on the success arm
-        // only), which the record assertions below then corroborate.
+        // the node actually keeps its state. The DOCUMENT advancing is the signal
+        // the re-publish succeeded (it is written on the success arm only), which
+        // the record assertions below then corroborate.
+        let state = live_state.get();
+        assert_eq!(state.relay_url, new_relay_url);
         assert_eq!(
-            node_relay_url.get(),
-            new_relay_url,
-            "a successful tier change advances the node's relay-URL slot"
+            state.document.relay_service_urls(),
+            vec![new_relay_url.to_owned()],
+            "a successful tier change advances the node's published document"
         );
 
-        let second = records
-            .get()
+        let second = state
+            .record
             .expect("the tier-change publish records its entry");
         assert!(
             second.sequence > first.sequence,
@@ -3912,13 +3967,9 @@ mod tests {
     async fn reseeding_neither_leaks_nor_double_spawns_tasks() {
         const RESEEDS: u32 = 5;
 
-        let (did_method, identity, document, _relay_url) = signing_identity().await;
-        let records = PublishedDidRecord::new();
-        let publisher = publish_seam(&did_method, &records);
-        publisher
-            .publish(&identity, &document)
-            .await
-            .expect("startup publish succeeds");
+        let (did_method, identity, document, relay_url) = signing_identity().await;
+        let publisher = publish_seam(&did_method);
+        let live_state = published_slot(&publisher, &identity, document, relay_url).await;
 
         let counting_dht = Arc::new(CountingDhtClient::default());
         let relay = Arc::new(TransportRelayPublisher::new());
@@ -3926,7 +3977,7 @@ mod tests {
         let republish = start_self_did_republishing(
             Arc::clone(&counting_dht),
             Arc::clone(&relay),
-            records.subscribe(),
+            live_state.subscribe(),
         )
         .await;
         settle_until("the initial DHT arm to publish", async || {
@@ -3940,10 +3991,7 @@ mod tests {
 
         for n in 0..RESEEDS {
             let expected = counting_dht.count() + 1;
-            publisher
-                .publish(&identity, &document)
-                .await
-                .expect("re-publish succeeds");
+            republish_via_tier_change(&live_state, &publisher, &identity, n).await;
             // Each re-seed publishes immediately on the replacement arm.
             settle_until("the re-seeded DHT arm to publish", async || {
                 counting_dht.count() >= expected
@@ -4001,19 +4049,61 @@ mod tests {
         republish.stop().await;
     }
 
+    /// `stop()` is a real barrier on a MULTI-THREAD runtime, even when a re-seed
+    /// is in flight on another worker.
+    ///
+    /// `JoinHandle::abort` only *requests* cancellation. The observer's critical
+    /// section (`seed_republish_arms` → `stop_all` → `start_republishing`) has no
+    /// guaranteed yield point, so before `stop` joined the aborted handle the
+    /// whole re-seed could complete on W2 *after* `stop_all` had drained the maps
+    /// on W1 — detaching two arms that keep republishing this node's DID document
+    /// (a §10.12.1 address disclosure) for the life of the process. The other
+    /// re-seed tests are current-thread and cannot observe this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_is_a_barrier_even_against_an_in_flight_reseed() {
+        let (did_method, identity, document, relay_url) = signing_identity().await;
+        let publisher = publish_seam(&did_method);
+        let live_state = published_slot(&publisher, &identity, document, relay_url).await;
+
+        let counting_dht = Arc::new(CountingDhtClient::default());
+        let relay = Arc::new(TransportRelayPublisher::new());
+        let _adapter = bind_recording_relay(relay.as_ref());
+        let republish = start_self_did_republishing(
+            Arc::clone(&counting_dht),
+            Arc::clone(&relay),
+            live_state.subscribe(),
+        )
+        .await;
+        settle_until("the initial DHT arm to publish", async || {
+            counting_dht.count() >= 1
+        })
+        .await;
+
+        // Wake the observer and tear down immediately: `stop` races the re-seed.
+        republish_via_tier_change(&live_state, &publisher, &identity, 1).await;
+        republish.stop().await;
+
+        // Nothing may publish after `stop` returned. A detached arm publishes
+        // immediately when it is spawned, so a surviving one shows up here.
+        let after_stop = counting_dht.count();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            counting_dht.count(),
+            after_stop,
+            "an arm survived shutdown and kept republishing this node's DID \
+             document — `abort` alone is not a barrier"
+        );
+    }
+
     /// A re-seed that lands while an arm is MID-PUBLISH is safe: the in-flight
     /// tick is replaced, not duplicated, and the stale record it was asserting
     /// never completes.
     #[tokio::test(start_paused = true)]
     async fn reseed_racing_an_in_flight_tick_replaces_it_safely() {
-        let (did_method, identity, document, _relay_url) = signing_identity().await;
-        let records = PublishedDidRecord::new();
-        let publisher = publish_seam(&did_method, &records);
-        publisher
-            .publish(&identity, &document)
-            .await
-            .expect("startup publish succeeds");
-        let first = records.get().expect("startup record");
+        let (did_method, identity, document, relay_url) = signing_identity().await;
+        let publisher = publish_seam(&did_method);
+        let live_state = published_slot(&publisher, &identity, document, relay_url).await;
+        let first = live_state.get().record.expect("startup record");
 
         // A DHT client whose publish PARKS until the test releases it — the arm
         // is genuinely mid-tick when the re-seed arrives.
@@ -4023,7 +4113,7 @@ mod tests {
         let republish = start_self_did_republishing(
             Arc::clone(&gated),
             Arc::clone(&relay),
-            records.subscribe(),
+            live_state.subscribe(),
         )
         .await;
 
@@ -4037,11 +4127,8 @@ mod tests {
         );
 
         // Re-seed while the tick is parked.
-        publisher
-            .publish(&identity, &document)
-            .await
-            .expect("re-publish succeeds");
-        let second = records.get().expect("re-published record");
+        republish_via_tier_change(&live_state, &publisher, &identity, 1).await;
+        let second = live_state.get().record.expect("re-published record");
         settle_until("the replacement tick to enter publish", async || {
             gated.started() == vec![first.sequence, second.sequence]
         })
@@ -4157,20 +4244,15 @@ mod tests {
         }
     }
 
-    /// B3 / §3.10.6: the production self-host `RepublishConfig` wires the
-    /// layer-disabled warning callback, so a layer can never be turned off
-    /// silently. (`scp-identity`'s
-    /// `disabling_either_layer_fires_the_mandated_warning` proves the callback
-    /// actually fires with the mandated text.)
+    /// B3 / §3.10.6: the production self-host `RepublishConfig` enables BOTH
+    /// layers. (The mandated layer-disabled warning is emitted unconditionally by
+    /// `RepublishConfig::disable_*` itself — see `scp-identity`'s
+    /// `disabling_either_layer_always_logs_the_mandated_warning` — so it is not
+    /// wired here at all.)
     #[test]
-    fn self_host_republish_config_wires_the_layer_disabled_warning() {
-        let config = self_host_republish_config();
+    fn self_host_republish_config_enables_both_layers() {
+        let config = RepublishConfig::default();
 
-        assert!(
-            config.has_layer_disabled_callback(),
-            "§3.10.6 mandates a warning when a resolution layer is disabled — the \
-             production config must carry the callback that emits it"
-        );
         assert!(
             config.is_dht_enabled() && config.is_relay_enabled(),
             "the production path enables BOTH layers (§3.10.6 anti-segmentation); \

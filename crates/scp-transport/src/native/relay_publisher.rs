@@ -27,12 +27,12 @@
 //! # Late binding, fail-closed, and partial reach
 //!
 //! Transports are bound **after** construction via
-//! [`bind`](TransportRelayPublisher::bind) (see
-//! `BoundRelays`). A publish with **no** relay
-//! bound, or one that every bound relay rejects, **fails closed** with a typed
-//! [`IdentityError::RelayPublishFailed`]: an unconnected publisher never reports
-//! a phantom success, so the republish loop's backoff + degraded-warning path
-//! (§3.10.6) engages honestly.
+//! [`bind`](TransportRelayPublisher::bind) (see `BoundRelays`). A publish with
+//! **no** relay bound fails closed with [`IdentityError::NoRelayBound`], and one
+//! that every bound relay rejects with [`IdentityError::RelayPublishFailed`]: an
+//! unconnected publisher never reports a phantom success, so the republish
+//! loop's backoff + degraded-warning path engages honestly — and distinguishes
+//! the unhealable configuration state from an actionable relay fault.
 //!
 //! A publish that reaches at least one relay succeeds — one relay accepting
 //! makes the record resolvable — but the result reports **how many** of the
@@ -52,6 +52,30 @@ use tracing::{debug, warn};
 use crate::native::BoundRelays;
 use crate::traits::{RoutingId, TransportAdapter};
 
+/// Renders relay-supplied text safe to put in a log line.
+///
+/// A rejection error wraps the relay's own `RelayMessage::Err { msg }` — an
+/// UNTRUSTED string from an untrusted party. Embedded newlines/CR would forge
+/// whole operator log lines; other control characters can corrupt a terminal.
+/// Escaped rather than stripped so the original is still legible, and truncated
+/// so a hostile relay cannot flood the log from one rejection.
+fn sanitize_relay_text(text: &str) -> String {
+    const MAX_LEN: usize = 512;
+    let mut out = String::with_capacity(text.len().min(MAX_LEN));
+    for c in text.chars() {
+        if out.len() >= MAX_LEN {
+            out.push('…');
+            break;
+        }
+        if c.is_control() {
+            out.push_str(&c.escape_default().to_string());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Production [`RelayPublisher`] that publishes DID-record frames over a live
 /// transport.
 ///
@@ -70,9 +94,7 @@ impl TransportRelayPublisher {
     /// [`bind`](Self::bind) once connections are established.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            relays: BoundRelays::new(),
-        }
+        Self::default()
     }
 
     /// Late-binds a live transport adapter for a relay URL.
@@ -111,12 +133,11 @@ impl RelayPublisher for TransportRelayPublisher {
         async move {
             if adapters.is_empty() {
                 // Fail-closed: nothing to publish to. An unconnected publisher
-                // never reports a phantom success (§3.10.6 republish backoff
-                // relies on an honest error here).
-                return Err(IdentityError::RelayPublishFailed(
-                    "TransportRelayPublisher: no relay bound — cannot publish DID record"
-                        .to_string(),
-                ));
+                // never reports a phantom success. Its OWN variant, not a
+                // generic publish failure: "nowhere to send it" is a
+                // configuration state no retry heals, and the republish loop
+                // rate-limits its report on exactly that distinction.
+                return Err(IdentityError::NoRelayBound);
             }
 
             let attempted = adapters.len();
@@ -140,11 +161,11 @@ impl RelayPublisher for TransportRelayPublisher {
                         // needs to know WHICH relay.
                         warn!(
                             relay_url = %relay_url,
-                            error = %e,
+                            error = %sanitize_relay_text(&e.to_string()),
                             "TransportRelayPublisher: relay PUBLISH rejected — this relay \
                              will not serve this DID; trying remaining relays"
                         );
-                        last_err = Some(e.to_string());
+                        last_err = Some(sanitize_relay_text(&e.to_string()));
                     }
                 }
             }
@@ -393,8 +414,8 @@ mod tests {
         let publisher = TransportRelayPublisher::new();
         let result = RelayPublisher::publish(&publisher, BLOB_TTL, &record).await;
         assert!(
-            matches!(result, Err(IdentityError::RelayPublishFailed(_))),
-            "an unbound publisher must fail closed"
+            matches!(result, Err(IdentityError::NoRelayBound)),
+            "an unbound publisher must fail closed, and say WHY"
         );
     }
 
@@ -434,6 +455,29 @@ mod tests {
         );
     }
 
+    // A hostile relay's rejection text cannot forge operator log lines.
+    #[test]
+    fn relay_supplied_text_is_escaped_and_bounded() {
+        let forged = sanitize_relay_text(
+            "rejected\n2026-08-08T00:00:00Z  WARN scp: all relays healthy\r\u{7}",
+        );
+        assert!(
+            !forged.contains('\n') && !forged.contains('\r') && !forged.contains('\u{7}'),
+            "control characters must not survive into a log line: {forged}"
+        );
+        assert!(
+            forged.contains("all relays healthy"),
+            "the original text stays legible, just inert: {forged}"
+        );
+
+        let flood = sanitize_relay_text(&"x".repeat(10_000));
+        assert!(
+            flood.chars().count() <= 513,
+            "one rejection cannot flood the log, got {} chars",
+            flood.chars().count()
+        );
+    }
+
     // unbind removes a relay from the publish set.
     #[tokio::test]
     async fn unbind_removes_relay() {
@@ -447,7 +491,7 @@ mod tests {
 
         let result = RelayPublisher::publish(&publisher, BLOB_TTL, &record).await;
         assert!(
-            matches!(result, Err(IdentityError::RelayPublishFailed(_))),
+            matches!(result, Err(IdentityError::NoRelayBound)),
             "after unbind, no relay remains → fail closed"
         );
         assert!(adapter.recorded().is_empty());

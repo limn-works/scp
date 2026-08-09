@@ -214,6 +214,10 @@ pub struct RunningRelay {
 impl RunningRelay {
     /// Returns the WebSocket URL clients should connect to
     /// (e.g., `ws://127.0.0.1:12345/scp/v1`).
+    ///
+    /// Borrowed, unlike `RunningNode::relay_url`, which must return by value: a
+    /// bare relay is bound to a fixed loopback address for its whole life, while
+    /// a node's address is a live slot a NAT tier change re-points.
     #[must_use]
     pub fn relay_url(&self) -> &str {
         &self.relay_url

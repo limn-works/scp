@@ -460,8 +460,12 @@ impl DidSlotRegistry {
 
     /// The storage-authoritative predicate shared by every slot decision: does
     /// `blob` (the immutable, content-addressed bytes at some `blob_id`) decode as
-    /// a binding-and-signature-**Valid** DID-record frame? Returns its
-    /// `(derived_routing_id, seq)` if so.
+    /// a signature-**Valid** DID-record frame?
+    ///
+    /// A plain `bool`, deliberately. The `routing_id` this derives is
+    /// SELF-derived from the frame, never wire-checked, so handing it back would
+    /// invite a future caller to mistake it for an admission-checked address —
+    /// the tautology below made structural instead of documentary.
     ///
     /// A DID-record frame is content-addressed (`blob_id = SHA-256(blob)`, so its
     /// bytes are immutable) and self-certifying (embedded `public_key` + BEP44
@@ -472,8 +476,10 @@ impl DidSlotRegistry {
     /// record. This is the single source of truth behind the DELETE gate and the
     /// cold-index reconciliation of QUERY / establish.
     #[must_use]
-    fn classify_stored_frame(blob: &[u8]) -> Option<([u8; 32], u64)> {
-        let frame = DidRecordV1::decode(blob).ok()?;
+    fn is_protected_did_record(blob: &[u8]) -> bool {
+        let Ok(frame) = DidRecordV1::decode(blob) else {
+            return false;
+        };
         // The routing_id is DERIVED from the frame, so the binding check inside
         // `classify_did_record_frame` below compares this value against itself
         // and is tautological AT THIS SITE — deliberately: the question here is
@@ -487,10 +493,10 @@ impl DidSlotRegistry {
         // (§3.10.2) so this classifier and the WRITE path address the same
         // slot (SCP-RELAYRES-004).
         let routing_id = did_record_routing_id(&frame);
-        match classify_did_record_frame(&routing_id, blob) {
-            DidRecordClass::Valid { seq } => Some((routing_id, seq)),
-            _ => None,
-        }
+        matches!(
+            classify_did_record_frame(&routing_id, blob),
+            DidRecordClass::Valid { .. }
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -669,7 +675,7 @@ impl DidSlotRegistry {
     ///
     /// The gate is **storage-backed** (not index-based) and therefore immune to a
     /// cold/empty index: it reads the immutable, content-addressed blob and
-    /// reconstructs its protected status via [`classify_stored_frame`](Self::classify_stored_frame)
+    /// reconstructs its protected status via [`is_protected_did_record`](Self::is_protected_did_record)
     /// — a DID frame is self-certifying, so protection is derivable from the bytes
     /// alone. Order of operations (defends the CPU-amplifiable classify):
     ///
@@ -704,7 +710,7 @@ impl DidSlotRegistry {
         // (2) Storage-authoritative protection check, fail-closed on error.
         match storage.get(blob_id).await {
             Ok(Some(stored)) => {
-                if Self::classify_stored_frame(&stored.blob).is_some() {
+                if Self::is_protected_did_record(&stored.blob) {
                     DidDeleteGate::Rejected {
                         code: code::DID_RECORD_REJECTED,
                         msg: "blob_id is a claimed DID-record slot; only a superseding \
@@ -1331,7 +1337,7 @@ mod tests {
     ///
     /// The target is a **genuine, binding-valid, signed** DID-record frame that IS
     /// present in storage — so the gate's expensive path (`storage.get` →
-    /// `classify_stored_frame`, an Ed25519 verify) is fully reachable and, when the
+    /// `is_protected_did_record`, an Ed25519 verify) is fully reachable and, when the
     /// limiter permits, actually runs (each within-budget DELETE returns
     /// `DID_RECORD_REJECTED`, proving the classify fired). The over-budget DELETE of
     /// the SAME protected blob must return `RATE_LIMITED`, NOT `DID_RECORD_REJECTED`:

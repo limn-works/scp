@@ -65,6 +65,9 @@ scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] 
 # crate's own test build (per-crate `cargo test -p scp-identity`).
 scp-dht = { path = "../scp-dht", features = ["testing"] }
 ed25519-dalek = { workspace = true }
+# Captures `tracing` output so the §3.10.6 layer-disabled MUST can be asserted
+# mechanically (the warning is unconditional, so no callback observes it).
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [lints]
 workspace = true

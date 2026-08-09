@@ -2791,7 +2791,19 @@ mod tests {
     ) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:test".to_owned(),
-            relay_url: crate::NodeRelayUrl::new("wss://localhost/scp/v1".to_owned()),
+            live_state: crate::LiveSlot::new(crate::NodePublishedState {
+                relay_url: "wss://localhost/scp/v1".to_owned(),
+                record: None,
+                document: scp_did::DidDocument {
+                    context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                    id: "did:dht:test123".to_owned(),
+                    verification_method: vec![],
+                    authentication: vec![],
+                    assertion_method: vec![],
+                    also_known_as: vec![],
+                    service: vec![],
+                },
+            }),
             broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
             bridge_secret: zeroize::Zeroizing::new([0u8; 32]),
@@ -2810,15 +2822,6 @@ mod tests {
             projection_ucan_cache: std::sync::RwLock::new(ProjectionUcanCache::new()),
             tls_config: None,
             cert_resolver: None,
-            did_document: crate::NodeDidDocument::new(scp_did::DidDocument {
-                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
-                id: "did:dht:test".to_owned(),
-                verification_method: vec![],
-                authentication: vec![],
-                assertion_method: vec![],
-                also_known_as: vec![],
-                service: vec![],
-            }),
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
