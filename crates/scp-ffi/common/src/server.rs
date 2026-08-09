@@ -562,8 +562,12 @@ pub enum RunningNode {
 
 impl RunningNode {
     /// Returns the WebSocket URL clients should connect to for this node's relay.
+    ///
+    /// By value, mirroring `ApplicationNode::relay_url`: the node's address lives
+    /// in a live slot that a NAT tier change advances, so a borrow cannot escape
+    /// it and a `&str` could only be a copy that goes stale.
     #[must_use]
-    pub fn relay_url(&self) -> &str {
+    pub fn relay_url(&self) -> String {
         match self {
             Self::InMemory(n) => n.relay_url(),
             Self::Filesystem(n) => n.relay_url(),
