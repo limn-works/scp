@@ -613,13 +613,20 @@ pub enum PreRotationCustodyError {
 /// boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreRotationCustodyKind {
-    /// Shipped-but-degraded default backend: in-process registry. Satisfies
-    /// the §9.7.4.1 §3 type-level isolation requirement (separate custody
-    /// object, distinct handle type) but does NOT satisfy the substrate
-    /// isolation requirement — the pre-rotation key co-resides in the same
-    /// process memory as operational keys. Used as the default in production
-    /// FFI/SDK paths until passkey-PRF / hardware-token / Shamir backends
-    /// are wired in as a follow-up workstream.
+    /// In-process registry. Satisfies the §9.7.4.1 §3 type-level isolation
+    /// requirement (separate custody object, distinct handle type) but does
+    /// NOT satisfy the substrate isolation requirement — the pre-rotation key
+    /// co-resides in the same process memory as operational keys.
+    ///
+    /// **Not reachable from a shipped build.** The only implementation that
+    /// reports this kind is `InMemoryPreRotationCustody`, which lives in this
+    /// crate's `#[cfg(feature = "testing")]` `testing` module (ADR-062
+    /// §Decision 6) — a test-harness nullifier, never compiled into a shipped
+    /// artifact. A production build therefore has *no* `PreRotationCustody`
+    /// backend at all: identity creation fails closed with
+    /// `IdentityError::NoPreRotationBackend`, surfaced across every bridge as
+    /// `SCP-IDENT-1059`. Real backends (passkey-PRF, hardware token, Shamir,
+    /// …) are tracked by #1729 / RFC #2130.
     InMemory,
     /// FIDO2/U2F hardware security key. Highest security per §9.7.4.1 §4.
     HardwareSecurityKey,
@@ -727,10 +734,21 @@ pub enum PreRotationCustodyKind {
 /// backup). Modeling UX inside the trait would force concrete
 /// flows that don't generalize.
 ///
-/// Today's shipped backend ([`InMemoryPreRotationCustody`](super::testing::InMemoryPreRotationCustody))
-/// is process-memory only — it satisfies the trait's type-level
-/// isolation but not §9.7.4.1 §3 substrate isolation. Production
-/// backends are a separate workstream.
+/// # No backend ships today
+///
+/// The only implementation of this trait in the tree is
+/// `InMemoryPreRotationCustody`, and it is test-harness-only — it
+/// lives in this crate's `#[cfg(feature = "testing")]` `testing`
+/// module (ADR-062 §Decision 6), so it is not compiled into a
+/// shipped artifact. It is also process-memory only, satisfying the
+/// trait's type-level isolation but not §9.7.4.1 §3 substrate
+/// isolation.
+///
+/// A shipped build consequently has no backend to select at all, and
+/// identity creation fails closed with
+/// `IdentityError::NoPreRotationBackend` (`SCP-IDENT-1059`) rather
+/// than substituting the nullifier. Production backends are tracked
+/// by #1729 / RFC #2130.
 ///
 /// # Concurrency
 ///
